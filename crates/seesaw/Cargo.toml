@@ -25,5 +25,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 fastrand.workspace = true
-seesaw-outbox = { version = "0.1", path = "../seesaw-outbox" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
