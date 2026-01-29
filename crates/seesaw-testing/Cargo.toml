@@ -6,7 +6,7 @@ license.workspace = true
 description = "Testing utilities for Seesaw framework"
 
 [dependencies]
-seesaw-core = { version = "0.1", path = "../seesaw" }
+seesaw_core = { version = "0.1", path = "../seesaw" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

@@ -6,7 +6,7 @@ license.workspace = true
 description = "PostgreSQL implementation of seesaw job queue"
 
 [dependencies]
-seesaw-core = { version = "0.1", path = "../seesaw" }
+seesaw_core = { version = "0.1", path = "../seesaw" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

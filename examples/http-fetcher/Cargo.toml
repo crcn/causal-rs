@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-seesaw-core = { path = "../../crates/seesaw" }
+seesaw_core = { path = "../../crates/seesaw" }
 tokio = { version = "1.49", features = ["full"] }
 reqwest = "0.12"
 anyhow = "1.0"
