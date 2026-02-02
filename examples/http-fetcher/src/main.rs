@@ -5,7 +5,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use seesaw_core::{Effect, EffectContext, EngineBuilder};
+use seesaw_core::{Edge, EdgeContext, Effect, EffectContext, EngineBuilder, Event};
+use std::sync::Arc;
 use uuid::Uuid;
 
 // ============================================================================
@@ -14,15 +15,13 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 enum FetchEvent {
-    /// User requested a URL to be fetched
+    /// User requested URLs to be fetched
     FetchRequested {
-        fetch_id: Uuid,
-        url: String,
+        urls: Vec<String>,
     },
 
     /// Fetch succeeded
     Fetched {
-        fetch_id: Uuid,
         url: String,
         content: String,
         status: u16,
@@ -30,13 +29,30 @@ enum FetchEvent {
 
     /// Fetch failed
     FetchFailed {
-        fetch_id: Uuid,
         url: String,
         reason: String,
+    },
+
+    /// All fetches complete
+    AllComplete {
+        success_count: usize,
+        failure_count: usize,
     },
 }
 
 // Event is auto-implemented via blanket impl for Clone + Send + Sync + 'static
+
+// ============================================================================
+// State
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct FetchState {
+    urls_to_fetch: Vec<String>,
+    success_count: usize,
+    failure_count: usize,
+    complete: bool,
+}
 
 // ============================================================================
 // Effect (React to events, execute IO, emit new events)
@@ -45,56 +61,153 @@ enum FetchEvent {
 struct FetchEffect;
 
 #[async_trait]
-impl Effect<FetchEvent, Deps> for FetchEffect {
+impl Effect<FetchEvent, Deps, FetchState> for FetchEffect {
     type Event = FetchEvent;
 
     async fn handle(
         &mut self,
         event: FetchEvent,
-        ctx: EffectContext<Deps>,
+        ctx: EffectContext<Deps, FetchState>,
     ) -> Result<Option<FetchEvent>> {
         match event {
-            FetchEvent::FetchRequested { fetch_id, url } => {
-                println!("Fetching: {}", url);
+            FetchEvent::FetchRequested { urls } => {
+                // Fetch first URL
+                if let Some(url) = urls.first() {
+                    let url = url.clone();
+                    println!("Fetching: {}", url);
 
-                // Use reqwest directly - no adapter needed!
-                match ctx.deps().http_client.get(&url).send().await {
-                    Ok(response) => {
-                        let status = response.status().as_u16();
+                    match ctx.deps().http_client.get(&url).send().await {
+                        Ok(response) => {
+                            let status = response.status().as_u16();
 
-                        if response.status().is_success() {
-                            let content = response.text().await?;
+                            if response.status().is_success() {
+                                let content = response.text().await?;
+                                println!("✓ Fetched {} ({} bytes)", url, content.len());
 
-                            println!("✓ Fetched {} ({} bytes)", url, content.len());
+                                Ok(Some(FetchEvent::Fetched {
+                                    url,
+                                    content,
+                                    status,
+                                }))
+                            } else {
+                                println!("✗ Failed {} (HTTP {})", url, status);
 
-                            Ok(Some(FetchEvent::Fetched {
-                                fetch_id,
-                                url,
-                                content,
-                                status,
-                            }))
-                        } else {
-                            println!("✗ Failed {} (HTTP {})", url, status);
+                                Ok(Some(FetchEvent::FetchFailed {
+                                    url,
+                                    reason: format!("HTTP {}", status),
+                                }))
+                            }
+                        }
+                        Err(e) => {
+                            println!("✗ Failed {}: {}", url, e);
 
                             Ok(Some(FetchEvent::FetchFailed {
-                                fetch_id,
                                 url,
-                                reason: format!("HTTP {}", status),
+                                reason: e.to_string(),
                             }))
                         }
                     }
-                    Err(e) => {
-                        println!("✗ Failed {}: {}", url, e);
-
-                        Ok(Some(FetchEvent::FetchFailed {
-                            fetch_id,
-                            url,
-                            reason: e.to_string(),
-                        }))
-                    }
+                } else {
+                    Ok(None)
                 }
             }
-            _ => Ok(None), // Event doesn't apply to this effect
+            FetchEvent::Fetched { .. } => {
+                // Check if more URLs to fetch
+                let state = ctx.state();
+                if !state.urls_to_fetch.is_empty() {
+                    Ok(Some(FetchEvent::FetchRequested {
+                        urls: state.urls_to_fetch.clone(),
+                    }))
+                } else {
+                    Ok(Some(FetchEvent::AllComplete {
+                        success_count: state.success_count,
+                        failure_count: state.failure_count,
+                    }))
+                }
+            }
+            FetchEvent::FetchFailed { .. } => {
+                // Check if more URLs to fetch
+                let state = ctx.state();
+                if !state.urls_to_fetch.is_empty() {
+                    Ok(Some(FetchEvent::FetchRequested {
+                        urls: state.urls_to_fetch.clone(),
+                    }))
+                } else {
+                    Ok(Some(FetchEvent::AllComplete {
+                        success_count: state.success_count,
+                        failure_count: state.failure_count,
+                    }))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+// ============================================================================
+// Reducer (Pure state transformation)
+// ============================================================================
+
+struct FetchReducer;
+
+impl seesaw_core::Reducer<FetchEvent, FetchState> for FetchReducer {
+    fn reduce(&self, state: &FetchState, event: &FetchEvent) -> FetchState {
+        match event {
+            FetchEvent::FetchRequested { urls } => {
+                let mut new_state = state.clone();
+                if new_state.urls_to_fetch.is_empty() {
+                    // Initial request - set all URLs
+                    new_state.urls_to_fetch = urls.clone();
+                }
+                new_state
+            }
+            FetchEvent::Fetched { .. } => {
+                let mut new_state = state.clone();
+                new_state.success_count += 1;
+                if !new_state.urls_to_fetch.is_empty() {
+                    new_state.urls_to_fetch.remove(0);
+                }
+                new_state
+            }
+            FetchEvent::FetchFailed { .. } => {
+                let mut new_state = state.clone();
+                new_state.failure_count += 1;
+                if !new_state.urls_to_fetch.is_empty() {
+                    new_state.urls_to_fetch.remove(0);
+                }
+                new_state
+            }
+            FetchEvent::AllComplete { .. } => {
+                let mut new_state = state.clone();
+                new_state.complete = true;
+                new_state
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Edge (Entry point)
+// ============================================================================
+
+struct FetchEdge {
+    urls: Vec<String>,
+}
+
+impl Edge<FetchState> for FetchEdge {
+    type Data = (usize, usize); // (success_count, failure_count)
+
+    fn execute(&self, _ctx: &EdgeContext<FetchState>) -> Option<Box<dyn Event>> {
+        Some(Box::new(FetchEvent::FetchRequested {
+            urls: self.urls.clone(),
+        }))
+    }
+
+    fn read(&self, state: &FetchState) -> Option<Self::Data> {
+        if state.complete {
+            Some((state.success_count, state.failure_count))
+        } else {
+            None
         }
     }
 }
@@ -119,32 +232,25 @@ async fn main() -> Result<()> {
             .build()?,
     };
 
-    let engine = EngineBuilder::new(deps)
+    let mut engine = EngineBuilder::new(deps)
         .with_effect::<FetchEvent, _>(FetchEffect)
         .build();
 
-    let handle = engine.start();
-
-    // Fetch some URLs
     let urls = vec![
-        "https://example.com",
-        "https://httpbin.org/status/200",
-        "https://httpbin.org/status/404",
+        "https://example.com".to_string(),
+        "https://httpbin.org/status/200".to_string(),
+        "https://httpbin.org/status/404".to_string(),
     ];
 
-    for url in urls {
-        let fetch_id = Uuid::new_v4();
+    let (success, failure) = engine
+        .run(FetchEdge { urls }, FetchState::default())
+        .await?
+        .unwrap_or((0, 0));
 
-        // Emit event and wait for cascading work to complete
-        handle
-            .emit_and_await(FetchEvent::FetchRequested {
-                fetch_id,
-                url: url.to_string(),
-            })
-            .await?;
-    }
-
-    println!("\nAll fetches complete!");
+    println!(
+        "\nAll fetches complete! Success: {}, Failed: {}",
+        success, failure
+    );
 
     Ok(())
 }

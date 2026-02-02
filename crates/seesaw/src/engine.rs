@@ -33,7 +33,6 @@ use crate::core::{CorrelationId, Event, EventEnvelope};
 use crate::dispatch::Dispatcher;
 use crate::edge::Edge;
 use crate::effect_impl::Effect;
-use crate::runtime::Runtime;
 
 // =============================================================================
 // Inflight Tracking
@@ -251,79 +250,10 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default> Engin
     pub fn bus(&self) -> &EventBus {
         &self.bus
     }
-
-    /// Start the engine in background mode.
-    ///
-    /// Returns a handle for emitting events.
-    pub fn start(self) -> EngineHandle<D, S> {
-        let bus = self.bus.clone();
-        let deps = self.deps.clone();
-        let inflight = self.inflight.clone();
-
-        // Spawn runtime in background
-        let runtime = Runtime::new(self.dispatcher, self.bus.clone())
-            .with_inflight(inflight.clone());
-
-        let handle: JoinHandle<Result<()>> = tokio::spawn(async move {
-            runtime.run().await
-        });
-
-        EngineHandle {
-            deps,
-            bus,
-            inflight,
-            runtime_handle: Some(handle),
-            _phantom: std::marker::PhantomData,
-        }
-    }
 }
 
 // Note: Engine doesn't implement Clone because Dispatcher can't be cloned
 // (effects are stateful and wrapped in Arc<Mutex>)
-
-/// Handle for interacting with a running engine.
-pub struct EngineHandle<D, S = ()> {
-    deps: Arc<D>,
-    bus: EventBus,
-    inflight: Arc<InflightTracker>,
-    runtime_handle: Option<JoinHandle<Result<()>>>,
-    _phantom: std::marker::PhantomData<S>,
-}
-
-impl<D, S> EngineHandle<D, S> {
-    /// Emit an event (fire-and-forget).
-    pub fn emit<E: Event>(&self, event: E) {
-        self.bus.emit(event);
-    }
-
-    /// Emit an event and wait for all cascading work to complete.
-    pub async fn emit_and_await<E: Event>(&self, event: E) -> Result<()> {
-        let cid = CorrelationId::new();
-        self.inflight.inc(cid, 1);
-        self.bus.emit_with_correlation(event, cid);
-        self.inflight.wait_for(cid, Duration::from_secs(30)).await
-    }
-
-    /// Get access to the dependencies.
-    pub fn deps(&self) -> &D {
-        &self.deps
-    }
-
-    /// Get access to the event bus.
-    pub fn bus(&self) -> &EventBus {
-        &self.bus
-    }
-
-    /// Stop the runtime (if running).
-    pub async fn stop(mut self) -> Result<()> {
-        if let Some(handle) = self.runtime_handle.take() {
-            handle.abort();
-            Ok(())
-        } else {
-            Ok(())
-        }
-    }
-}
 
 // =============================================================================
 // Builder
@@ -476,16 +406,4 @@ mod tests {
         assert_eq!(engine.deps().value, 42);
     }
 
-    #[tokio::test]
-    async fn test_engine_handle_emit() {
-        let engine = EngineBuilder::new(TestDeps { value: 42 })
-            .with_effect::<TestEvent, _>(TestEffect)
-            .build();
-
-        let handle = engine.start();
-        handle.emit(TestEvent { value: 100 });
-
-        // Clean up
-        handle.stop().await.unwrap();
-    }
 }

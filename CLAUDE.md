@@ -17,7 +17,7 @@ Simple, direct, no ceremony.
 
 - **Is**: Event-driven runtime
 - **Is**: Direct event → effect → event flows
-- **Is Not**: Event sourcing, distributed actors, retry engine, saga orchestrator, workflow engine
+- **Is Not**: Event sourcing, distributed actors, retry engine, saga orchestrator, workflow engine, job queue
 
 ## Core Primitives
 
@@ -286,7 +286,7 @@ Effects can hold state and make decisions. You choose whether to separate pure l
 ### Events close loops
 
 Every long-running workflow should have terminal events:
-- Success events (e.g., `DataPublished`, `JobComplete`)
+- Success events (e.g., `DataPublished`, `WorkflowComplete`)
 - Failure events (e.g., `ScrapeFailed`, `RateLimited`)
 
 Otherwise you get:
@@ -403,13 +403,13 @@ You're putting the source of truth in the wrong place. Effects should query deps
 
 ❌ **Bad**:
 ```rust
-JobStarted → ... → (nothing)  // Job stuck "in progress" forever
+WorkflowStarted → ... → (nothing)  // Workflow stuck "in progress" forever
 ```
 
 ✅ **Better**:
 ```rust
-JobStarted → ... → JobComplete
-                ↘ JobFailed
+WorkflowStarted → ... → WorkflowComplete
+                     ↘ WorkflowFailed
 ```
 
 Every long-running flow needs success and failure terminal events.
@@ -417,14 +417,12 @@ Every long-running flow needs success and failure terminal events.
 ## Engine Usage
 
 ```rust
-let engine = EngineBuilder::new(deps)
+let mut engine = EngineBuilder::new(deps)
     .with_effect::<MyEvent, _>(MyEventEffect)
-    .with_event_tap::<MyEvent, _>(MyTap)  // Optional observers
     .build();
 
-let handle = engine.start();
-handle.emit(MyEvent::Started);                    // Fire-and-forget
-handle.emit_and_await(MyEvent::Started).await?;   // Wait for completion
+// Execute via edge (structured workflow)
+let result = engine.run(MyEdge { data }, initial_state).await?;
 ```
 
 Other builder methods: `.with_bus()`, `.with_inflight()`, `.with_arc(deps)`
@@ -484,31 +482,6 @@ let entry = dispatch_request(
     .result()
 ).await?;
 ```
-
-## Structural Authorization Pattern
-
-Wrap commands in `Authorize<C>` to enforce auth in the type system:
-
-```
-RequestEvent → Machine → Authorize<Cmd> → AuthEffect → Authorized<Cmd> → Forwarder → Cmd → Effect
-```
-
-## Workflow Patterns
-
-| Pattern           | Use For                        | State Location    |
-| ----------------- | ------------------------------ | ----------------- |
-| Enriched Pipeline | Notifications, audit, webhooks | Entity timestamps |
-| State Machine     | AI agents, wizards, sessions   | Machine internal  |
-
-## Background Jobs
-
-Commands with `Background`/`Scheduled` need:
-
-- `fn execution_mode() -> ExecutionMode`
-- `fn job_spec() -> Option<JobSpec>`
-- `fn serialize_to_json() -> Option<serde_json::Value>`
-
-Wire up via `.with_job_queue(queue)` on EngineBuilder or Dispatcher.
 
 ## Outbox Pattern
 

@@ -165,7 +165,6 @@ mod engine;
 mod error;
 mod reducer;
 mod request;
-mod runtime;
 
 // Testing utilities are in the separate seesaw-testing crate
 
@@ -195,11 +194,8 @@ pub use bus::EventBus;
 // Re-export dispatcher types
 pub use dispatch::Dispatcher;
 
-// Re-export runtime types
-pub use runtime::{Runtime, RuntimeBuilder};
-
 // Re-export engine types (primary entry point)
-pub use engine::{Engine, EngineBuilder, EngineHandle, InflightTracker};
+pub use engine::{Engine, EngineBuilder, InflightTracker};
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;

@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use seesaw_core::{Effect, EffectContext, EngineBuilder};
+use seesaw_core::{Edge, EdgeContext, Effect, EffectContext, EngineBuilder, Event};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -39,19 +39,30 @@ enum SummaryEvent {
 // Event is auto-implemented via blanket impl for Clone + Send + Sync + 'static
 
 // ============================================================================
+// State
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct SummaryState {
+    summary: Option<String>,
+    tokens_used: u32,
+    error: Option<String>,
+}
+
+// ============================================================================
 // Effect (React to events, call Anthropic API, emit new events)
 // ============================================================================
 
 struct SummarizeEffect;
 
 #[async_trait]
-impl Effect<SummaryEvent, Deps> for SummarizeEffect {
+impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
     type Event = SummaryEvent;
 
     async fn handle(
         &mut self,
         event: SummaryEvent,
-        ctx: EffectContext<Deps>,
+        ctx: EffectContext<Deps, SummaryState>,
     ) -> Result<Option<SummaryEvent>> {
         match event {
             SummaryEvent::SummarizeRequested { task_id, text } => {
@@ -98,6 +109,57 @@ impl Effect<SummaryEvent, Deps> for SummarizeEffect {
             }
             _ => Ok(None), // Event doesn't apply to this effect
         }
+    }
+}
+
+// ============================================================================
+// Reducer (Pure state transformation)
+// ============================================================================
+
+struct SummaryReducer;
+
+impl seesaw_core::Reducer<SummaryEvent, SummaryState> for SummaryReducer {
+    fn reduce(&self, state: &SummaryState, event: &SummaryEvent) -> SummaryState {
+        match event {
+            SummaryEvent::Summarized {
+                summary,
+                tokens_used,
+                ..
+            } => SummaryState {
+                summary: Some(summary.clone()),
+                tokens_used: *tokens_used,
+                error: None,
+            },
+            SummaryEvent::SummaryFailed { reason, .. } => SummaryState {
+                summary: None,
+                tokens_used: 0,
+                error: Some(reason.clone()),
+            },
+            _ => state.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Edge (Entry point)
+// ============================================================================
+
+struct SummarizeEdge {
+    text: String,
+}
+
+impl Edge<SummaryState> for SummarizeEdge {
+    type Data = String; // The summary
+
+    fn execute(&self, _ctx: &EdgeContext<SummaryState>) -> Option<Box<dyn Event>> {
+        Some(Box::new(SummaryEvent::SummarizeRequested {
+            task_id: Uuid::new_v4(),
+            text: self.text.clone(),
+        }))
+    }
+
+    fn read(&self, state: &SummaryState) -> Option<Self::Data> {
+        state.summary.clone()
     }
 }
 
@@ -184,11 +246,9 @@ async fn main() -> Result<()> {
         api_key,
     };
 
-    let engine = EngineBuilder::new(deps)
+    let mut engine = EngineBuilder::new(deps)
         .with_effect::<SummaryEvent, _>(SummarizeEffect)
         .build();
-
-    let handle = engine.start();
 
     // Summarize some text
     let text = r#"
@@ -199,15 +259,20 @@ async fn main() -> Result<()> {
         lifetime of all references in a program during compilation.
     "#;
 
-    let task_id = Uuid::new_v4();
-
-    // Emit event and wait for cascading work to complete
-    handle
-        .emit_and_await(SummaryEvent::SummarizeRequested {
-            task_id,
-            text: text.to_string(),
-        })
+    let summary = engine
+        .run(
+            SummarizeEdge {
+                text: text.to_string(),
+            },
+            SummaryState::default(),
+        )
         .await?;
+
+    if let Some(summary) = summary {
+        println!("\nFinal summary: {}", summary);
+    } else {
+        println!("\nFailed to generate summary");
+    }
 
     println!("\nDone!");
 

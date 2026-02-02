@@ -1,11 +1,7 @@
 [workspace]
 members = [
     "crates/seesaw",
-    # TODO: Update these crates for new Effect-based API
-    # "crates/seesaw-job-postgres",    # Needs job module restoration
     "crates/seesaw-outbox",
-    # "crates/seesaw-persistence",     # Needs update (no longer uses Machine)
-    # "crates/seesaw-testing",         # Needs update (no longer uses Machine)
     "examples/http-fetcher",
     "examples/ai-summarizer",
 ]

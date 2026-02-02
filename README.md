@@ -9,10 +9,7 @@ Named after the playground equipment that balances back and forth — representi
 This repository is organized as a Cargo workspace:
 
 - **[seesaw-core](./crates/seesaw)** - Core event-driven runtime
-- **[seesaw-job-postgres](./crates/seesaw-job-postgres)** - PostgreSQL job queue implementation
 - **[seesaw-outbox](./crates/seesaw-outbox)** - Transactional outbox pattern for durable events
-- **[seesaw-persistence](./crates/seesaw-persistence)** - State persistence for crash recovery
-- **[seesaw-testing](./crates/seesaw-testing)** - Testing utilities for event-driven workflows
 
 ## Core Principle
 
@@ -30,7 +27,6 @@ Seesaw is **not**:
 - Full event sourcing
 - A saga engine
 - An actor framework
-- A job system replacement
 
 ## Features
 
@@ -335,6 +331,14 @@ let user = engine.run(
     .ok_or_else(|| anyhow!("signup failed"))?;
 ```
 
+## Edge-Based Execution
+
+The primary way to use Seesaw is through edges - structured entry points that trigger event flows and read results:
+
+```rust
+let result = engine.run(MyEdge { data }, initial_state).await?;
+```
+
 ## Request/Response Pattern
 
 For code that needs a response, use `dispatch_request`:
@@ -355,10 +359,6 @@ let entry = dispatch_request(
 ```
 
 This emits an event and waits until a correlated event matches the extractor, or times out (default: 30 seconds).
-
-## Background Jobs
-
-For background execution, effects can be combined with a job queue system. See `seesaw-job-postgres` for a PostgreSQL-based implementation.
 
 ## Durable Event Outbox
 
@@ -430,7 +430,7 @@ async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Resul
 For durability, use:
 
 - Entity status fields for workflow state
-- Jobs for durable command execution
+- Transactional outbox for durable events
 - Reapers for crash recovery
 
 ## Testing
