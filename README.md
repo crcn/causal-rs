@@ -50,84 +50,73 @@ Closure → Event → Reducer → Effect → Event → Effect → ... (until set
 ## Quick Start
 
 ```rust
-use seesaw_core::{Effect, EffectContext, EngineBuilder, RunContext};
+use seesaw_core::{effect, reducer, Engine};
 use anyhow::Result;
 use uuid::Uuid;
 
 // Events are facts - what happened
-// Note: Event trait is auto-implemented for Clone + Send + Sync + 'static
 #[derive(Debug, Clone)]
 enum OrderEvent {
-    Placed { order_id: Uuid },
+    Placed { order_id: Uuid, total: f64 },
     Shipped { order_id: Uuid },
     Delivered { order_id: Uuid },
 }
 
-// Effects react to events and emit new events
-struct ShipEffect;
-
-#[async_trait::async_trait]
-impl Effect<OrderEvent, MyDeps, ()> for ShipEffect {
-    type Event = OrderEvent;
-
-    async fn handle(
-        &mut self,
-        event: OrderEvent,
-        ctx: EffectContext<MyDeps, ()>,
-    ) -> Result<()> {
-        match event {
-            OrderEvent::Placed { order_id } => {
-                // Do IO: ship the order
-                ctx.deps().shipping_api.ship(order_id).await?;
-                // Emit new event
-                ctx.emit(OrderEvent::Shipped { order_id });
-                Ok(())
-            }
-            _ => Ok(()), // Skip unhandled events
-        }
-    }
+#[derive(Clone, Default)]
+struct State {
+    order_count: usize,
+    total_revenue: f64,
 }
 
-struct NotifyEffect;
-
-#[async_trait::async_trait]
-impl Effect<OrderEvent, MyDeps, ()> for NotifyEffect {
-    type Event = OrderEvent;
-
-    async fn handle(
-        &mut self,
-        event: OrderEvent,
-        ctx: EffectContext<MyDeps, ()>,
-    ) -> Result<()> {
-        match event {
-            OrderEvent::Shipped { order_id } => {
-                // Do IO: notify customer
-                ctx.deps().email_service.send(order_id, "Shipped!").await?;
-                // Emit new event
-                ctx.emit(OrderEvent::Delivered { order_id });
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
+#[derive(Clone)]
+struct Deps {
+    shipping_api: ShippingApi,
+    email_service: EmailService,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut engine = EngineBuilder::new(MyDeps::new())
-        .with_effect::<OrderEvent, _>(ShipEffect)
-        .with_effect::<OrderEvent, _>(NotifyEffect)
-        .build();
+    let deps = Deps { /* ... */ };
 
-    // Use closure to trigger event flow
-    engine.run(
-        |ctx: &RunContext<MyDeps, ()>| {
-            let order_id = Uuid::new_v4();
-            ctx.emit(OrderEvent::Placed { order_id });
+    // Define stateless engine with closure-based effects
+    let engine = Engine::new()
+        .with_deps(deps)
+        .with_reducer(reducer::on::<OrderEvent>().run(|state, event| {
+            match event {
+                OrderEvent::Placed { total, .. } => State {
+                    order_count: state.order_count + 1,
+                    total_revenue: state.total_revenue + total,
+                },
+                _ => state.clone(),
+            }
+        }))
+        .with_effect(effect::on::<OrderEvent>().run(|event, ctx| async move {
+            match event.as_ref() {
+                OrderEvent::Placed { order_id, .. } => {
+                    ctx.deps().shipping_api.ship(*order_id).await?;
+                    ctx.emit(OrderEvent::Shipped { order_id: *order_id });
+                }
+                OrderEvent::Shipped { order_id } => {
+                    ctx.deps().email_service.send(*order_id, "Shipped!").await?;
+                    ctx.emit(OrderEvent::Delivered { order_id: *order_id });
+                }
+                _ => {}
+            }
             Ok(())
-        },
-        (),
-    ).await?;
+        }));
+
+    // Activate with initial state
+    let handle = engine.activate(State::default());
+
+    // Run logic that emits events
+    let result = handle.run(|ctx| {
+        let order_id = Uuid::new_v4();
+        ctx.emit(OrderEvent::Placed { order_id, total: 99.99 });
+        Ok(())
+    })?;
+
+    // Wait for all effects to complete
+    handle.settled().await?;
 
     Ok(())
 }
@@ -161,74 +150,114 @@ enum UserEvent {
 
 ### Effects
 
-Effects are event handlers that react to events, perform IO, and optionally emit new events.
+Effects are event handlers that react to events, perform IO, and optionally emit new events. Use the closure-based builder API:
 
 ```rust
-struct SignupEffect;
+use seesaw_core::effect;
 
-#[async_trait::async_trait]
-impl Effect<UserEvent, MyDeps> for SignupEffect {
-    type Event = UserEvent;
+// Basic effect
+effect::on::<UserEvent>().run(|event, ctx| async move {
+    match event.as_ref() {
+        UserEvent::SignupRequested { email, name } => {
+            let user = ctx.deps().db.transaction(|tx| async {
+                let user = User::create(email, name, tx).await?;
+                UserProfile::create(user.id, tx).await?;
+                Ok(user)
+            }).await?;
 
-    async fn handle(
-        &mut self,
-        event: UserEvent,
-        ctx: EffectContext<MyDeps>,
-    ) -> Result<()> {
-        match event {
-            UserEvent::SignupRequested { email, name } => {
-                // Execute IO in one transaction
-                let user = ctx.deps().db.transaction(|tx| async {
-                    let user = User::create(&email, &name, tx).await?;
-                    UserProfile::create(user.id, tx).await?;
-                    Ok(user)
-                }).await?;
-
-                // Emit new event
-                ctx.emit(UserEvent::SignedUp {
-                    user_id: user.id,
-                    email,
-                });
-                Ok(())
-            }
-            _ => Ok(()), // Skip unhandled events
+            ctx.emit(UserEvent::SignedUp {
+                user_id: user.id,
+                email: email.clone(),
+            });
         }
+        _ => {}
     }
-}
+    Ok(())
+})
+
+// Effect with filter
+effect::on::<OrderEvent>()
+    .filter(|e| matches!(e, OrderEvent::HighPriority { .. }))
+    .run(|event, ctx| async move {
+        // Only runs for high-priority orders
+        ctx.deps().notify_urgent(&event).await?;
+        Ok(())
+    })
+
+// Effect with filter_map (combines filter + destructure)
+effect::on::<CrawlEvent>()
+    .filter_map(|e| match e {
+        CrawlEvent::PagesReady { website_id, job_id, page_ids } => {
+            Some((*website_id, *job_id, page_ids.clone()))
+        }
+        _ => None
+    })
+    .run(|(website_id, job_id, page_ids), ctx| async move {
+        // Handler receives extracted fields directly!
+        ctx.deps().extract(website_id, job_id, page_ids).await?;
+        Ok(())
+    })
+
+// Effect with state transition guard
+effect::on::<StatusEvent>()
+    .transition(|prev, next| prev.status != next.status)
+    .run(|event, ctx| async move {
+        // Only runs when status actually changed
+        ctx.deps().notify_status_change(&event).await?;
+        Ok(())
+    })
 ```
 
 Key properties:
 
-- **Can be stateful**: Effects have `&mut self` and can maintain state across invocations
+- **Closure-based**: No trait implementations required
 - **Emit events**: Use `ctx.emit()` to emit new events
-- **Access state**: Via `ctx.state()` for per-execution state
-- **Narrow context**: Only `deps()`, `state()`, `emit()`, and `correlation_id()` available
-- **Batch support**: Override `handle_batch` for optimized bulk operations
+- **Access state**: Via `ctx.prev_state()`, `ctx.next_state()`, and `ctx.curr_state()`
+- **Filter events**: Use `.filter()` to skip events that don't match
+- **Filter + map**: Use `.filter_map()` to filter and extract fields in one step
+- **State transitions**: Use `.transition()` to react only when state changes
+- **Narrow context**: Only `deps()`, state access, and `emit()` available
 
 ### Reducers
 
 Reducers are pure functions that transform state in response to events. They run before effects.
 
 ```rust
-struct IncrementReducer;
+use seesaw_core::reducer;
 
-impl Reducer<CountEvent, AppState> for IncrementReducer {
-    fn reduce(&self, state: &AppState, event: &CountEvent) -> AppState {
-        match event {
-            CountEvent::Incremented { amount } => AppState {
-                counter: state.counter + amount,
-            },
-            _ => state.clone(),
-        }
+// Basic reducer
+reducer::on::<CountEvent>().run(|state, event| {
+    match event {
+        CountEvent::Incremented { amount } => AppState {
+            counter: state.counter + amount,
+        },
+        _ => state.clone(),
     }
-}
+})
+
+// Multiple reducers for different events
+reducer::on::<OrderEvent>().run(|state, event| {
+    match event {
+        OrderEvent::Placed { total, .. } => State {
+            order_count: state.order_count + 1,
+            total_revenue: state.total_revenue + total,
+        },
+        _ => state.clone(),
+    }
+})
+
+// Reset reducer
+reducer::on::<ResetEvent>().run(|_state, _event| {
+    State::default()
+})
 ```
 
 Key properties:
 
 - **Pure**: No side effects, deterministic
+- **Closure-based**: Simple builder pattern
 - **Transform state**: Take current state and event, return new state
-- **Run before effects**: Updated state is passed to effects via `ctx.state()`
+- **Run before effects**: Updated state is passed to effects via `ctx.next_state()`
 
 ### EffectContext
 
@@ -238,47 +267,68 @@ Key properties:
 // Access shared dependencies (database, APIs, config)
 ctx.deps()
 
-// Access per-execution state
-ctx.state()
+// Access state snapshots
+ctx.prev_state()  // State before reducer ran
+ctx.next_state()  // State after reducer ran
+ctx.curr_state()  // Current live state (may have changed)
 
 // Emit new events
 ctx.emit(OrderEvent::Shipped { order_id });
 
-// Get correlation ID for outbox writes
-ctx.outbox_correlation_id()
+// Spawn tracked sub-tasks
+ctx.within(|ctx| async move {
+    // Background work that keeps the engine alive
+    Ok(())
+});
 
-// Get correlation ID directly
-ctx.correlation_id()
+// Check if cancelled
+ctx.is_cancelled()
 ```
 
 ## Engine Usage
 
-The `EngineBuilder` is the primary way to wire up seesaw:
+The `Engine` API uses a stateless pattern - define once, use many times:
 
 ```rust
-let mut engine = EngineBuilder::new(deps)
-    .with_reducer::<OrderEvent, _>(OrderReducer)
-    .with_effect::<OrderEvent, _>(ShipEffect)
-    .with_effect::<OrderEvent, _>(NotifyEffect)
-    .build();
-
-// Run with a closure that emits initial events
-engine.run(
-    |ctx: &RunContext<Deps, OrderState>| {
-        ctx.emit(OrderEvent::Placed { order_id });
+// Define stateless engine (reusable)
+let engine = Engine::new()
+    .with_deps(deps)
+    .with_reducer(reducer::on::<OrderEvent>().run(|state, event| {
+        // Pure state transformation
+        State { count: state.count + 1, ..state }
+    }))
+    .with_effect(effect::on::<OrderEvent>().run(|event, ctx| async move {
+        // Side effects
+        ctx.deps().process(&event).await?;
+        ctx.emit(NextEvent);
         Ok(())
-    },
-    OrderState::default(),
-).await?;
+    }));
+
+// Activate per-request with initial state
+let handle = engine.activate(State::default());
+
+// Run logic that emits events
+let result = handle.run(|ctx| {
+    ctx.emit(OrderEvent::Placed { order_id, total: 99.99 });
+    Ok(Response { status: "ok" })
+})?;
+
+// Wait for all effects to complete
+handle.settled().await?;
 ```
 
 Builder methods:
 
-- `.with_reducer::<Event, _>(reducer)` — Register pure state transformations
-- `.with_effect::<Event, _>(effect)` — Register event handlers
-- `.with_bus(bus)` — Use an existing EventBus
-- `.with_inflight(tracker)` — Use an existing InflightTracker
-- `.with_arc(deps)` — Use Arc-wrapped dependencies
+- `.with_deps(deps)` — Set shared dependencies
+- `.with_reducer(reducer)` — Register pure state transformations
+- `.with_effect(effect)` — Register event handlers
+- `.with_effect_registry(registry)` — Use existing effect registry
+
+Handle methods:
+
+- `.run(closure)` — Execute logic, returns result
+- `.settled().await` — Wait for all effects to complete
+- `.cancel()` — Cancel all tasks
 
 ## Request/Response Pattern
 

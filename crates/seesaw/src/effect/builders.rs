@@ -26,6 +26,9 @@ pub struct NoFilter;
 /// Marker for having a filter predicate.
 pub struct WithFilter<F>(F);
 
+/// Marker for having a filter_map predicate.
+pub struct WithFilterMap<F, T>(F, PhantomData<T>);
+
 /// Marker for no transition predicate.
 pub struct NoTransition;
 
@@ -122,6 +125,39 @@ where
     {
         EffectBuilder {
             filter: WithFilter(predicate),
+            transition: self.transition,
+            started: self.started,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Add a filter and map operation that filters and transforms events.
+    /// The handler receives the mapped value instead of the original event.
+    /// Only available for typed event effects.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// effect::on::<MyEvent>()
+    ///     .filter_map(|e| match e {
+    ///         MyEvent::Variant { field1, field2 } => Some((field1, field2)),
+    ///         _ => None
+    ///     })
+    ///     .run(|(field1, field2), ctx| async move {
+    ///         // Work with extracted fields
+    ///         Ok(())
+    ///     })
+    /// ```
+    pub fn filter_map<F, T>(
+        self,
+        mapper: F,
+    ) -> EffectBuilder<Typed<E>, WithFilterMap<F, T>, Trans, Started>
+    where
+        F: Fn(&E) -> Option<T> + Send + Sync + 'static,
+        T: Clone + Send + Sync + 'static,
+    {
+        EffectBuilder {
+            filter: WithFilterMap(mapper, PhantomData),
             transition: self.transition,
             started: self.started,
             _marker: PhantomData,
@@ -240,6 +276,42 @@ where
 }
 
 // =============================================================================
+// run() - Typed Events, With FilterMap, No Transition, No Started
+// =============================================================================
+
+impl<E, F, T> EffectBuilder<Typed<E>, WithFilterMap<F, T>, NoTransition, NoStarted>
+where
+    E: Send + Sync + 'static,
+    F: Fn(&E) -> Option<T> + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
+{
+    /// Set the handler (terminal operation).
+    /// The handler receives the mapped value instead of the original event.
+    pub fn run<S, D, H, Fut>(self, handler: H) -> Effect<S, D>
+    where
+        S: Clone + Send + Sync + 'static,
+        D: Send + Sync + 'static,
+        H: Fn(T, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let target = TypeId::of::<E>();
+        let mapper = self.filter.0;
+        Effect {
+            can_handle: Arc::new(move |t| t == target),
+            started: None,
+            handler: Arc::new(move |value, _, ctx| {
+                let typed = value.downcast::<E>().expect("type checked by can_handle");
+                if let Some(mapped) = mapper(&typed) {
+                    Box::pin(handler(mapped, ctx))
+                } else {
+                    Box::pin(async { Ok(()) })
+                }
+            }),
+        }
+    }
+}
+
+// =============================================================================
 // run() - Typed Events, No Filter, With Transition, No Started
 // =============================================================================
 
@@ -305,6 +377,47 @@ where
                     return Box::pin(async { Ok(()) });
                 }
                 Box::pin(handler(typed, ctx))
+            }),
+        }
+    }
+}
+
+// =============================================================================
+// run() - Typed Events, With FilterMap, With Transition, No Started
+// =============================================================================
+
+impl<E, S, F, T, P> EffectBuilder<Typed<E>, WithFilterMap<F, T>, WithTransition<S, P>, NoStarted>
+where
+    E: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    F: Fn(&E) -> Option<T> + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
+    P: Fn(&S, &S) -> bool + Send + Sync + 'static,
+{
+    /// Set the handler (terminal operation).
+    /// The handler receives the mapped value instead of the original event.
+    pub fn run<D, H, Fut>(self, handler: H) -> Effect<S, D>
+    where
+        D: Send + Sync + 'static,
+        H: Fn(T, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let target = TypeId::of::<E>();
+        let mapper = self.filter.0;
+        let transition = self.transition.0;
+        Effect {
+            can_handle: Arc::new(move |t| t == target),
+            started: None,
+            handler: Arc::new(move |value, _, ctx| {
+                if !transition(ctx.prev_state(), ctx.next_state()) {
+                    return Box::pin(async { Ok(()) });
+                }
+                let typed = value.downcast::<E>().expect("type checked by can_handle");
+                if let Some(mapped) = mapper(&typed) {
+                    Box::pin(handler(mapped, ctx))
+                } else {
+                    Box::pin(async { Ok(()) })
+                }
             }),
         }
     }
@@ -821,6 +934,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_filter_map_transforms_and_filters() {
+        let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+
+        let effect: Effect<TestState, TestDeps> = on::<TestEvent>()
+            .filter_map(|e| {
+                if e.value > 10 {
+                    Some((e.value, e.value * 2))
+                } else {
+                    None
+                }
+            })
+            .run(move |(original, doubled), _| {
+                let r = received_clone.clone();
+                async move {
+                    r.lock().push((original, doubled));
+                    Ok(())
+                }
+            });
+
+        let ctx = create_test_ctx();
+
+        // Should skip - value <= 10
+        let event1: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 5 });
+        effect
+            .call_handler(event1, TypeId::of::<TestEvent>(), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(received.lock().len(), 0);
+
+        // Should run with transformed value - value > 10
+        let event2: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 15 });
+        effect
+            .call_handler(event2, TypeId::of::<TestEvent>(), ctx)
+            .await
+            .unwrap();
+
+        let results = received.lock().clone();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], (15, 30));
     }
 
     // ==================== TASK TESTS ====================
