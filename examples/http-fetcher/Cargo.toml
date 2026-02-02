@@ -1,11 +1,11 @@
 [package]
 name = "http-fetcher-example"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 publish = false
 
 [dependencies]
-seesaw_core = { version = "0.2", path = "../../crates/seesaw" }
+seesaw_core = { version = "0.2.1", path = "../../crates/seesaw" }
 tokio = { version = "1.49", features = ["full"] }
 reqwest = "0.12"
 anyhow = "1.0"
