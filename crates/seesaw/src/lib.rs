@@ -1,197 +1,94 @@
 //! # Seesaw
 //!
-//! An event-driven runtime for building reactive systems.
+//! A Redux-style state machine with TypeId-based multi-event dispatch.
 //!
-//! ## Core Concepts
-//!
-//! Seesaw is built on events - facts about what happened:
-//! - [`Event`] = Facts (what happened)
-//! - [`Effect`] = Handlers that react to events and emit new events
-//! - [`Edge`] = Entry points that trigger event flows
-//!
-//! The key principle: **Event → Effect → Event**.
-//! Simple, direct flow with clean state management.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! Edge (API/WebSocket)
-//!     │
-//!     ▼ emit()
-//! EventBus ──────────────────────────────────────┐
-//!     │                                          │
-//!     ▼ subscribe()                              │
-//! Runtime.run() loop                             │
-//!     │                                          │
-//!     ├─► Machine A.decide() ─► Some(CmdA) ──┐   │
-//!     │                                      │   │
-//!     ├─► Machine B.decide() ─► None         │   │
-//!     │                                      │   │
-//!     └─► Machine C.decide() ─► Some(CmdC) ──┤   │
-//!                                            │   │
-//!                                            ▼   │
-//!                                     Dispatcher │
-//!                                            │   │
-//!                     ┌──────────────────────┴───┤
-//!                     │                          │
-//!         Inline ─────┤                          │
-//!                     ▼                          │
-//!               Effect.execute()                 │
-//!                     │                          │
-//!                     └─► return Event ──────────┘
-//! ```
-//!
-//! ## Key Invariants
-//!
-//! 1. **Events are facts** - Immutable, describe what happened, no IO
-//! 2. **Commands are intent** - Request for IO with transaction authority
-//! 3. **One Command = One Transaction** - Authority boundaries are explicit
-//! 4. **Machines are pure** - No IO, no async, state is internal
-//! 5. **Effects are stateless** - Commands carry all needed data
-//! 6. **At-most-once delivery** - In-memory events, use status fields for durability
+//! Named after the playground equipment that balances back and forth —
+//! representing the back-and-forth nature of state transitions.
 //!
 //! ## Guarantees
 //!
-//! - **At-most-once delivery**: Slow receivers may miss events
-//! - **In-memory only**: Events are not persisted by seesaw
-//! - **No replay**: Lagged receivers get errors
-//!
-//! For durability, use:
-//! - Entity status fields for workflow state
-//! - Jobs for durable command execution
-//! - Reapers for crash recovery
+//! - **Serial reduction**: Reducers are executed serially under a write lock.
+//!   No two events are ever reduced concurrently, even when emitted from
+//!   multiple tasks.
+//! - **Multi-event dispatch**: Support for multiple event types via TypeId routing.
+//! - **Effect system**: Register handlers that react to events and can emit
+//!   new events, spawn tracked tasks, and access shared dependencies.
+//! - **Per-event reducers**: Register reducers for specific event types.
 //!
 //! ## Example
 //!
 //! ```ignore
-//! use seesaw::{Event, Command, Machine, Effect, EffectContext, EventBus, RuntimeBuilder};
-//! use std::collections::HashSet;
-//! use uuid::Uuid;
+//! use seesaw::{Engine, effect, reducer};
 //!
-//! // 1. Define events (facts)
-//! #[derive(Debug, Clone)]
-//! enum BakeEvent {
-//!     Requested { deck_id: Uuid, recipe_id: Uuid },
-//!     LoafReady { loaf_id: Uuid },
-//!     GenerationComplete { loaf_id: Uuid },
-//! }
-//! impl Event for BakeEvent {}
-//!
-//! // 2. Define commands (intent)
-//! #[derive(Debug, Clone)]
-//! enum BakeCommand {
-//!     SetupLoaf { deck_id: Uuid, recipe_id: Uuid },
-//!     GenerateCards { loaf_id: Uuid },
-//! }
-//! impl Command for BakeCommand {}
-//!
-//! // 3. Define machine (state inside, pure decisions)
-//! struct BakeMachine {
-//!     pending: HashSet<Uuid>,
+//! #[derive(Clone, Debug, Default)]
+//! struct AppState {
+//!     user_count: i32,
+//!     order_count: i32,
 //! }
 //!
-//! impl Machine for BakeMachine {
-//!     type Event = BakeEvent;
-//!     type Command = BakeCommand;
+//! // Define multiple event types
+//! struct UserCreated { name: String }
+//! struct OrderPlaced { amount: f64 }
 //!
-//!     fn decide(&mut self, event: &BakeEvent) -> Option<BakeCommand> {
-//!         match event {
-//!             BakeEvent::Requested { deck_id, recipe_id } => {
-//!                 self.pending.insert(*deck_id);
-//!                 Some(BakeCommand::SetupLoaf {
-//!                     deck_id: *deck_id,
-//!                     recipe_id: *recipe_id,
-//!                 })
-//!             }
-//!             BakeEvent::LoafReady { loaf_id } => {
-//!                 Some(BakeCommand::GenerateCards { loaf_id: *loaf_id })
-//!             }
-//!             _ => None,
-//!         }
-//!     }
-//! }
+//! // Create store with per-event reducers
+//! let store = Engine::new(AppState::default())
+//!     .with_reducer(reducer::on::<UserCreated>().run(|state, _event| AppState {
+//!         user_count: state.user_count + 1,
+//!         ..state
+//!     }))
+//!     .with_reducer(reducer::on::<OrderPlaced>().run(|state, _event| AppState {
+//!         order_count: state.order_count + 1,
+//!         ..state
+//!     }))
+//!     .with_effect(effect::on::<UserCreated>().run(|event, ctx| async move {
+//!         println!("User created: {}", event.name);
+//!         Ok(())
+//!     }));
 //!
-//! // 4. Define effects (IO + return events)
-//! struct SetupEffect;
+//! // Activate and emit events
+//! let handle = store.activate();
+//! handle.context.emit(UserCreated { name: "Alice".into() });
+//! handle.context.emit(OrderPlaced { amount: 99.99 });
+//! handle.settled().await?;
 //!
-//! #[async_trait::async_trait]
-//! impl Effect<BakeCommand, MyDeps> for SetupEffect {
-//!     type Event = BakeEvent;
-//!
-//!     async fn execute(&self, cmd: BakeCommand, ctx: EffectContext<MyDeps>) -> anyhow::Result<BakeEvent> {
-//!         if let BakeCommand::SetupLoaf { deck_id, recipe_id } = cmd {
-//!             let loaf_id = ctx.deps().db.transaction(|tx| async {
-//!                 // Create loaf in transaction
-//!             }).await?;
-//!
-//!             Ok(BakeEvent::LoafReady { loaf_id })
-//!         } else {
-//!             unreachable!()
-//!         }
-//!     }
-//! }
-//!
-//! // 5. Wire together and run
-//! let (runtime, bus) = RuntimeBuilder::new(my_deps)
-//!     .with_machine(BakeMachine { pending: HashSet::new() })
-//!     .with_effect::<BakeCommand, _>(SetupEffect)
-//!     .build();
-//!
-//! tokio::spawn(runtime.run());
-//!
-//! // 6. Emit events to trigger workflows
-//! bus.emit(BakeEvent::Requested { deck_id, recipe_id });
+//! assert_eq!(store.state().user_count, 1);
+//! assert_eq!(store.state().order_count, 1);
 //! ```
-//!
-//! ## What This Is Not
-//!
-//! Seesaw is **not**:
-//! - Full event sourcing
-//! - A saga engine
-//! - An actor framework
-//! - A job system replacement
-//!
-//! Seesaw **is**:
-//! > A deterministic, event-driven coordination layer where machines decide,
-//! > effects execute, and transactions define authority.
 
-// Core modules
-mod bus;
-mod core;
-mod dispatch;
-mod effect_impl;
+// New module structure
+pub mod effect;
+pub mod reducer;
+
+mod effect_registry;
+mod reducer_registry;
 mod engine;
-mod error;
-mod reducer;
-mod request;
+mod task_group;
 
-// Testing utilities are in the separate seesaw-testing crate
+// Service layer (action execution)
+pub mod service;
 
-// Re-export core traits
-pub use crate::core::{
-    CorrelationId, EnvelopeMatch, Event, EventEnvelope, EventRole, MatchChain,
+// OpenTelemetry integration
+#[cfg(feature = "otel")]
+pub mod otel;
+
+// Re-export main types
+pub use effect::{AnyEvent, Effect, EffectContext};
+pub use reducer::Reducer;
+pub use engine::{Handle, Engine};
+pub use task_group::TaskGroup;
+
+// Re-export service types at root level
+pub use service::{
+    ActionResult, ActionWithOpts, EmptyResult, GenericActionResult, IntoAction, Service,
+    ServiceError,
 };
 
-// Re-export request helpers (syntactic sugar over event bus)
-pub use request::{dispatch_request, dispatch_request_timeout, DEFAULT_REQUEST_TIMEOUT};
-
-// Re-export error types
-pub use crate::error::{SeesawError};
-
-// Re-export reducer types (state transformation)
-pub use reducer::Reducer;
-
-// Re-export effect types
-pub use effect_impl::{Effect, EffectContext};
-
-// Re-export bus types
-pub use bus::EventBus;
-
-// Re-export dispatcher types
-pub use dispatch::Dispatcher;
-
-// Re-export engine types (primary entry point)
-pub use engine::{Engine, EngineBuilder, InflightTracker, RunContext};
+// Re-export service submodules for backwards compatibility (use seesaw::action::...)
+pub use service::action;
+pub use service::into_action;
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;
+
+// Re-export pipedream types for convenience
+pub use pipedream::Relay;

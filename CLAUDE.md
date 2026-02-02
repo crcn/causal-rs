@@ -2,6 +2,68 @@
 
 **Mental Model**: Events are signals. Effects react and emit new events. That's it.
 
+## Quick Start - New API
+
+### Stateless Engine Pattern
+
+```rust
+// 1. Define engine once (stateless, reusable)
+let engine = Engine::new()
+    .with_effect(effect::on::<OrderPlaced>().run(|event, ctx| async move {
+        ctx.deps().mailer.send_confirmation(&event).await?;
+        ctx.emit(EmailSent { order_id: event.id });
+        Ok(())
+    }))
+    .with_reducer(reducer::on::<OrderPlaced>().run(|state, event| {
+        State { order_count: state.order_count + 1, ..state }
+    }));
+
+// 2. Activate with initial state (per-execution)
+let handle = engine.activate(State::default());
+
+// 3. Run your logic
+let result = handle.run(|ctx| {
+    ctx.emit(OrderPlaced { id: 123, total: 99.99 });
+    Ok(Response { status: "processed" })
+})?;
+
+// 4. Wait for effects to complete
+handle.settled().await?;
+```
+
+### Edge Function Pattern
+
+```rust
+// Engine is stateless - define once, use many times
+let engine = Engine::new()
+    .with_effect(...)
+    .with_reducer(...);
+
+// Edge function signature
+async fn process_webhook(
+    payload: Webhook,
+    ctx: &EffectContext<State, Deps>
+) -> Result<Response> {
+    ctx.emit(OrderPlaced::from(payload));
+    Ok(Response { status: "ok" })
+}
+
+// Execute per-request
+let handle = engine.activate(State::default());
+let response = handle.run(|ctx| process_webhook(payload, ctx))?;
+handle.settled().await?;
+```
+
+### Key Differences from Old API
+
+- **Engine is stateless**: No state stored in Engine
+- **State per-activation**: Pass initial state to `activate()`
+- **`handle.run()`**: Execute logic and get result
+- **Closure-based**: Use `effect::on()` and `reducer::on()` builders
+- **No traits**: No need to implement Effect/Reducer traits
+
+---
+
 ## What Seesaw Is
 
 Seesaw is an **event-driven runtime** for building reactive systems.
@@ -51,53 +113,78 @@ Events are the only signals in the system.
 Handlers that react to events. Execute IO, emit new events.
 
 ```rust
-#[async_trait]
-impl Effect<ScrapeEvent, Deps, State> for ScrapeEffect {
-    type Event = ScrapeEvent;
+// Simple effect - reacts to one event type
+let scrape_effect = effect::on::<SourceRequested>().run(|event, ctx| async move {
+    let data = ctx.deps().scraper.scrape(event.source_id).await?;
+    ctx.emit(SourceScraped {
+        source_id: event.source_id,
+        data
+    });
+    Ok(())
+});
 
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps, State>) -> Result<()> {
-        match event {
-            ScrapeEvent::SourceRequested { source_id } => {
-                let data = ctx.deps().scraper.scrape(source_id).await?;
-                ctx.emit(ScrapeEvent::SourceScraped { source_id, data });
-                Ok(())
-            }
-            ScrapeEvent::SourceScraped { source_id, data } => {
-                let items = ctx.deps().extractor.extract(&data).await?;
-                ctx.emit(ScrapeEvent::NeedsExtracted { source_id });
-                Ok(())
-            }
-            _ => Ok(()) // Skip unhandled events
-        }
-    }
-}
+// Effect with filter
+let priority_effect = effect::on::<OrderPlaced>()
+    .filter(|event| event.priority > 5)
+    .run(|event, ctx| async move {
+        ctx.deps().notify_urgent(&event).await?;
+        Ok(())
+    });
+
+// Effect with state transition
+let status_effect = effect::on::<StatusChanged>()
+    .transition(|prev, next| prev.status != next.status)
+    .run(|event, ctx| async move {
+        // Only runs when status actually changed
+        ctx.deps().notify_status_change(&event).await?;
+        Ok(())
+    });
 ```
 
 Effects can:
 - Do IO (DB queries, API calls, etc.)
-- Hold state with `&mut self` (if needed)
 - Make decisions
 - Branch on conditions
 - Be pure or impure (your choice)
 - Emit events via `ctx.emit()` or skip with `Ok(())`
+- Filter events with `.filter()`
+- React to state transitions with `.transition()`
 
 EffectContext provides:
 - `deps()` — shared dependencies
-- `state()` — per-execution state (transformed by reducers)
+- `prev_state()` — state before reducer ran
+- `next_state()` — state after reducer ran
+- `curr_state()` — current live state
 - `emit(event)` — emit new events
-- `outbox_correlation_id()` — for outbox writes
-- `correlation_id()` — get correlation ID for this execution
+- `within(closure)` — spawn tracked sub-tasks
 
 ### Reducer
 
 Pure state transformations that run before effects.
 
 ```rust
-impl Reducer<ScrapeEvent, ScrapeState> for ScrapeReducer {
-    fn reduce(&self, state: &ScrapeState, event: &ScrapeEvent) -> ScrapeState {
-        match event {
-            ScrapeEvent::SourceScraped { source_id, data } => {
-                ScrapeState {
+// Simple reducer
+let scrape_reducer = reducer::on::<SourceScraped>().run(|state, event| {
+    State {
+        last_scrape: Some(event.data.clone()),
+        scrape_count: state.scrape_count + 1,
+        ..state
+    }
+});
+
+// Multiple reducers for different events
+let order_reducer = reducer::on::<OrderPlaced>().run(|state, event| {
+    State {
+        order_count: state.order_count + 1,
+        total_revenue: state.total_revenue + event.amount,
+        ..state
+    }
+});
+
+// Reducer that resets state
+let reset_reducer = reducer::on::<Reset>().run(|_state, _event| {
+    State::default()
+});
                     last_scrape: Some(data.clone()),
                     ..state.clone()
                 }
@@ -436,27 +523,38 @@ Every long-running flow needs success and failure terminal events.
 ## Engine Usage
 
 ```rust
-let mut engine = EngineBuilder::new(deps)
-    .with_reducer::<MyEvent, _>(MyReducer)      // Pure state transformations
-    .with_effect::<MyEvent, _>(MyEventEffect)    // Event handlers
-    .build();
-
-// Execute via closure
-engine.run(
-    |ctx: &RunContext<Deps, State>| {
-        ctx.emit(MyEvent::Started { data });
+// Define engine once (stateless, reusable)
+let engine = Engine::new()
+    .with_reducer(reducer::on::<MyEvent>().run(|state, event| {
+        // Pure state transformation
+        State { count: state.count + 1, ..state }
+    }))
+    .with_effect(effect::on::<MyEvent>().run(|event, ctx| async move {
+        // Side effects
+        ctx.deps().notify(&event).await?;
+        ctx.emit(NextEvent);
         Ok(())
-    },
-    initial_state
-).await?;
+    }));
+
+// Execute per-request
+let handle = engine.activate(State::default());
+let result = handle.run(|ctx| {
+    ctx.emit(MyEvent::Started { data });
+    Ok(Response { status: "ok" })
+})?;
+handle.settled().await?;
 ```
 
 Builder methods:
-- `.with_reducer::<Event, _>(reducer)` — Register pure state transformations
-- `.with_effect::<Event, _>(effect)` — Register event handlers
-- `.with_bus(bus)` — Use existing EventBus
-- `.with_inflight(tracker)` — Use existing InflightTracker
-- `.with_arc(deps)` — Use Arc-wrapped dependencies
+- `.with_reducer(reducer)` — Register pure state transformations
+- `.with_effect(effect)` — Register event handlers
+- `.with_deps(deps)` — Create engine with dependencies
+- `.with_effect_registry(registry)` — Use existing effect registry
+
+Handle methods:
+- `.run(closure)` — Execute logic, returns result
+- `.settled().await` — Wait for all effects to complete
+- `.cancel()` — Cancel all tasks
 
 ## Cross-Domain Reactions
 

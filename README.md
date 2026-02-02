@@ -30,14 +30,14 @@ Seesaw is **not**:
 
 ## Features
 
+- **Stateless Engine**: Reusable runtime, state passed per-execution
 - **Event-Driven**: Events are the only signals - facts about what happened
+- **Closure-Based API**: Simple builder pattern with closures (no trait implementations)
 - **Effect Handlers**: React to events, perform IO, emit new events via `ctx.emit()`
 - **Reducers**: Pure state transformations before effects
-- **Type-Erased Bus**: Broadcast events across heterogeneous effects
-- **Correlation Tracking**: Built-in tracking for cascading event flows
-- **Request/Response Pattern**: `dispatch_request` for code that needs responses
+- **Pipedream Integration**: Stream composition and bidirectional piping
 - **State Flow**: Per-execution state flows through reducers and effects
-- **Closure Entry Points**: Simple `engine.run(|ctx| ...)` pattern
+- **Handle Pattern**: `activate(state).run(action).settled()` for clean execution
 
 ## Architecture
 
