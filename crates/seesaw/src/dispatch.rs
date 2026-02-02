@@ -154,9 +154,19 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
                         tracker.record_error(cid_clone, anyhow::anyhow!("{}", e));
                     }
 
+                    // Decrement inflight before returning error
+                    if let Some(tracker) = inflight {
+                        tracker.dec(cid, 1);
+                    }
+
                     return Err(e);
                 }
             }
+        }
+
+        // Decrement inflight counter after successful dispatch
+        if let Some(tracker) = inflight {
+            tracker.dec(cid, 1);
         }
 
         Ok(())
@@ -219,22 +229,14 @@ mod tests {
         name: String,
     }
 
-    impl Event for CreateEvent {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     #[derive(Debug, Clone)]
     struct ResultEvent {
         message: String,
     }
 
-    impl Event for ResultEvent {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     // Test effects
     struct CreateEffect {

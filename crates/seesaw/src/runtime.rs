@@ -195,22 +195,14 @@ mod tests {
         action: String,
     }
 
-    impl Event for TestEvent {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     #[derive(Debug, Clone)]
     struct ResultEvent {
         result: String,
     }
 
-    impl Event for ResultEvent {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     struct TestEffect {
         call_count: Arc<AtomicUsize>,
@@ -234,6 +226,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_processes_events() {
+        use crate::engine::InflightTracker;
+        use crate::core::{CorrelationId, EventEnvelope};
+
         let call_count = Arc::new(AtomicUsize::new(0));
         let bus = EventBus::new();
         let deps = TestDeps { value: 42 };
@@ -243,19 +238,39 @@ mod tests {
                 call_count: call_count.clone(),
             });
 
-        // Emit an event before starting runtime
-        bus.emit(TestEvent {
-            action: "test".to_string(),
+        let inflight = Arc::new(InflightTracker::new());
+
+        // Increment inflight BEFORE starting runtime
+        let cid = CorrelationId::new();
+        inflight.inc(cid, 1);
+
+        let runtime = Runtime::new(dispatcher, bus.clone())
+            .with_inflight(inflight.clone());
+
+        // Spawn runtime in background
+        let runtime_handle = tokio::spawn(async move {
+            runtime.run_with_timeout(Duration::from_secs(1)).await
         });
 
-        let runtime = Runtime::new(dispatcher, bus);
-        runtime.run_with_timeout(Duration::from_millis(100)).await.unwrap();
+        // Give runtime time to subscribe
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Now emit event
+        bus.emit_with_correlation(TestEvent {
+            action: "test".to_string(),
+        }, cid);
+
+        // Wait for runtime to complete
+        runtime_handle.await.unwrap().unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn test_runtime_processes_multiple_events() {
+        use crate::engine::InflightTracker;
+        use crate::core::CorrelationId;
+
         let call_count = Arc::new(AtomicUsize::new(0));
         let bus = EventBus::new();
         let deps = TestDeps { value: 42 };
@@ -265,25 +280,48 @@ mod tests {
                 call_count: call_count.clone(),
             });
 
-        // Emit multiple events
-        bus.emit(TestEvent {
-            action: "first".to_string(),
-        });
-        bus.emit(TestEvent {
-            action: "second".to_string(),
-        });
-        bus.emit(TestEvent {
-            action: "third".to_string(),
+        let inflight = Arc::new(InflightTracker::new());
+
+        // Increment inflight BEFORE starting runtime
+        let cid = CorrelationId::new();
+        inflight.inc(cid, 3);
+
+        let runtime = Runtime::new(dispatcher, bus.clone())
+            .with_inflight(inflight.clone());
+
+        // Spawn runtime in background
+        let runtime_handle = tokio::spawn(async move {
+            runtime.run_with_timeout(Duration::from_secs(1)).await
         });
 
-        let runtime = Runtime::new(dispatcher, bus);
-        runtime.run_with_timeout(Duration::from_millis(100)).await.unwrap();
+        // Give runtime time to subscribe
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Emit multiple events
+        bus.emit_with_correlation(TestEvent {
+            action: "first".to_string(),
+        }, cid);
+        bus.emit_with_correlation(TestEvent {
+            action: "second".to_string(),
+        }, cid);
+        bus.emit_with_correlation(TestEvent {
+            action: "third".to_string(),
+        }, cid);
+
+        // Wait for processing
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Wait for runtime to complete
+        runtime_handle.await.unwrap().unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
     async fn test_runtime_builder() {
+        use crate::engine::InflightTracker;
+        use crate::core::CorrelationId;
+
         let call_count = Arc::new(AtomicUsize::new(0));
         let bus = EventBus::new();
         let deps = TestDeps { value: 42 };
@@ -293,13 +331,34 @@ mod tests {
                 call_count: call_count.clone(),
             });
 
-        let runtime = RuntimeBuilder::new(dispatcher, bus.clone()).build();
+        let inflight = Arc::new(InflightTracker::new());
 
-        bus.emit(TestEvent {
-            action: "test".to_string(),
+        // Increment inflight BEFORE starting runtime
+        let cid = CorrelationId::new();
+        inflight.inc(cid, 1);
+
+        let runtime = RuntimeBuilder::new(dispatcher, bus.clone())
+            .with_inflight(inflight.clone())
+            .build();
+
+        // Spawn runtime in background
+        let runtime_handle = tokio::spawn(async move {
+            runtime.run_with_timeout(Duration::from_secs(1)).await
         });
 
-        runtime.run_with_timeout(Duration::from_millis(100)).await.unwrap();
+        // Give runtime time to subscribe
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Emit event
+        bus.emit_with_correlation(TestEvent {
+            action: "test".to_string(),
+        }, cid);
+
+        // Wait for processing
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Wait for runtime to complete
+        runtime_handle.await.unwrap().unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
     }

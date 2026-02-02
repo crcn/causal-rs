@@ -218,53 +218,6 @@ impl<D, S> EffectContext<D, S> {
     }
 }
 
-/// Context for interactive tool execution.
-///
-/// This is the blessed way to provide context to agent tools that need
-/// to perform interactive operations (calling `dispatch_request`, etc.).
-///
-/// # When to Use
-///
-/// Use `ToolContext` when:
-/// - Agent tools need to call `dispatch_request` for interactive actions
-/// - Tools need access to the kernel/dependencies AND the event bus
-///
-/// # Example
-///
-/// ```ignore
-/// let tool_ctx = ctx.tool_context();
-/// let agent_config = registry
-///     .select_for_container(&container, agent, tool_ctx.kernel.clone(), tool_ctx.bus.clone())
-///     .await?;
-/// ```
-pub struct ToolContext<D> {
-    /// Shared dependencies (kernel, database, etc.)
-    pub deps: Arc<D>,
-    /// Event bus for interactive dispatch_request calls.
-    pub bus: EventBus,
-}
-
-impl<D> Clone for ToolContext<D> {
-    fn clone(&self) -> Self {
-        Self {
-            deps: self.deps.clone(),
-            bus: self.bus.clone(),
-        }
-    }
-}
-
-impl<D, S> EffectContext<D, S> {
-    /// Get a context suitable for interactive tool execution.
-    ///
-    /// This provides the deps and bus needed by agent tools that call
-    /// `dispatch_request` during their execution.
-    pub fn tool_context(&self) -> ToolContext<D> {
-        ToolContext {
-            deps: self.deps.clone(),
-            bus: self.bus.clone(),
-        }
-    }
-}
 
 impl<D, S: Clone> Clone for EffectContext<D, S> {
     fn clone(&self) -> Self {
@@ -525,22 +478,14 @@ mod tests {
         action: String,
     }
 
-    impl Event for TestEvent {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     #[derive(Debug, Clone, PartialEq)]
     struct OutputEvent {
         result: String,
     }
 
-    impl Event for OutputEvent {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     // Test effect
     struct TestEffect {
@@ -665,7 +610,7 @@ mod tests {
         let bus = EventBus::new();
         let ctx = EffectContext::new(deps, state, bus);
 
-        let event: Box<dyn Any + Send + Sync> = Box::new(TestEvent {
+        let event: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent {
             action: "wrapped".to_string(),
         });
 
@@ -673,7 +618,8 @@ mod tests {
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
         assert!(envelope.is_some());
-        let event = envelope.unwrap().downcast_ref::<OutputEvent>().unwrap();
+        let envelope = envelope.unwrap();
+        let event = envelope.downcast_ref::<OutputEvent>().unwrap();
         assert_eq!(event.result, "wrapped with value 50 counter 3");
     }
 
@@ -690,15 +636,11 @@ mod tests {
         let ctx = EffectContext::new(deps, state, bus);
 
         // Wrong event type
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         struct WrongEvent;
-        impl Event for WrongEvent {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        // Event is auto-implemented via blanket impl
 
-        let event: Box<dyn Any + Send + Sync> = Box::new(WrongEvent);
+        let event: Arc<dyn Any + Send + Sync> = Arc::new(WrongEvent);
 
         let result = wrapper.handle_any(event, ctx).await;
         assert!(result.is_err());

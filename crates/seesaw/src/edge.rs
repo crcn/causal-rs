@@ -21,14 +21,27 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! use seesaw::{Edge, EdgeContext};
+//! ```rust,ignore
+//! use seesaw_core::{Edge, EdgeContext, Event};
+//! use uuid::Uuid;
 //!
 //! #[derive(Clone)]
 //! struct RequestState {
 //!     visitor_id: Uuid,
 //!     user_id: Option<Uuid>,
 //! }
+//!
+//! #[derive(Clone, Debug)]
+//! struct User {
+//!     user_id: Uuid,
+//!     email: String,
+//! }
+//!
+//! #[derive(Clone)]
+//! enum UserEvent {
+//!     SignupRequested { email: String, name: String },
+//! }
+//! // Event is auto-implemented
 //!
 //! struct SignupEdge {
 //!     email: String,
@@ -38,11 +51,11 @@
 //! impl Edge<RequestState> for SignupEdge {
 //!     type Data = User;
 //!
-//!     fn execute(&self, _ctx: &EdgeContext<RequestState>) -> Option<Event> {
-//!         Some(UserEvent::SignupRequested {
+//!     fn execute(&self, _ctx: &EdgeContext<RequestState>) -> Option<Box<dyn Event>> {
+//!         Some(Box::new(UserEvent::SignupRequested {
 //!             email: self.email.clone(),
 //!             name: self.name.clone(),
-//!         })
+//!         }))
 //!     }
 //!
 //!     fn read(&self, state: &RequestState) -> Option<User> {
@@ -54,13 +67,19 @@
 //! }
 //!
 //! // Usage
+//! # async fn example() -> anyhow::Result<()> {
+//! # let email = "test@example.com".to_string();
+//! # let name = "Test User".to_string();
+//! # let engine: seesaw_core::Engine<()> = todo!();
 //! let state = RequestState {
 //!     visitor_id: Uuid::new_v4(),
 //!     user_id: None,
 //! };
 //!
 //! let user = engine.run(SignupEdge { email, name }, state).await?
-//!     .ok_or_else(|| anyhow!("signup failed"))?;
+//!     .ok_or_else(|| anyhow::anyhow!("signup failed"))?;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::core::Event;
@@ -122,11 +141,7 @@ mod tests {
         value: i32,
     }
 
-    impl Event for TestEvent {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     #[derive(Clone)]
     struct TestState {

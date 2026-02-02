@@ -421,6 +421,7 @@ impl fmt::Display for CommandFailed {
 /// # Key Principle
 ///
 /// Seesaw exposes truth, not timing. Batches report what actually happened.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum BatchOutcome {
     /// All commands in the batch executed successfully.
@@ -441,6 +442,7 @@ pub enum BatchOutcome {
     },
 }
 
+#[allow(dead_code)]
 impl BatchOutcome {
     /// Returns true if all commands completed successfully.
     pub fn is_complete(&self) -> bool {

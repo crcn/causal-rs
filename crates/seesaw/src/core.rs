@@ -618,7 +618,7 @@ mod tests {
 
         let result: Option<Result<Uuid, &str>> = EnvelopeMatch::new(&envelope)
             .try_match(|e: &UserCreated| Some(Ok(e.user_id)))
-            .or_try(|e: &UserDeleted| Some(Err("deleted")))
+            .or_try(|_e: &UserDeleted| Some(Err("deleted")))
             .result();
 
         assert!(matches!(result, Some(Err("deleted"))));

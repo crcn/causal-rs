@@ -430,11 +430,7 @@ mod tests {
         value: i32,
     }
 
-    impl Event for TestEvent {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     struct TestEdge {
         initial: i32,
@@ -462,8 +458,8 @@ mod tests {
 
         async fn handle(
             &mut self,
-            event: TestEvent,
-            mut ctx: EffectContext<TestDeps, TestState>,
+            _event: TestEvent,
+            _ctx: EffectContext<TestDeps, TestState>,
         ) -> Result<Option<TestEvent>> {
             // Update state (this is a hack for testing - normally reducers would do this)
             // In real usage, we'd use reducers to transform state

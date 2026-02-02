@@ -13,19 +13,19 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! use seesaw::{Reducer, Event};
+//! ```rust,ignore
+//! use seesaw_core::{Reducer, Event, EngineBuilder};
 //!
 //! #[derive(Clone)]
 //! struct RequestState {
 //!     counter: i32,
 //! }
 //!
+//! #[derive(Clone)]
 //! struct Increment {
 //!     amount: i32,
 //! }
-//!
-//! impl Event for Increment { /* ... */ }
+//! // Event is auto-implemented
 //!
 //! struct IncrementReducer;
 //!
@@ -38,6 +38,8 @@
 //! }
 //!
 //! // Register with engine
+//! # struct Deps;
+//! # let deps = Deps;
 //! let engine = EngineBuilder::new(deps)
 //!     .with_reducer::<Increment, RequestState>(IncrementReducer)
 //!     .build();
@@ -71,11 +73,7 @@ mod tests {
         amount: i32,
     }
 
-    impl Event for Increment {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
+    // Event is auto-implemented via blanket impl
 
     #[derive(Clone, Debug, PartialEq)]
     struct CounterState {

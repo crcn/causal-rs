@@ -5,10 +5,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use seesaw_core::{
-    Command, Effect, EffectContext, Engine, EngineBuilder, Event, Machine,
-};
-use std::collections::HashMap;
+use seesaw_core::{Effect, EffectContext, EngineBuilder};
 use uuid::Uuid;
 
 // ============================================================================
@@ -42,89 +39,62 @@ enum FetchEvent {
 // Event is auto-implemented via blanket impl for Clone + Send + Sync + 'static
 
 // ============================================================================
-// Commands (Intent)
-// ============================================================================
-
-#[derive(Debug, Clone)]
-enum FetchCommand {
-    /// Fetch a URL
-    Fetch {
-        fetch_id: Uuid,
-        url: String,
-    },
-}
-
-impl Command for FetchCommand {}
-
-// ============================================================================
-// Machine (Decision Logic)
-// ============================================================================
-
-struct FetchMachine;
-
-impl Machine for FetchMachine {
-    type Event = FetchEvent;
-    type Command = FetchCommand;
-
-    fn decide(&mut self, event: &FetchEvent) -> Option<FetchCommand> {
-        match event {
-            FetchEvent::FetchRequested { fetch_id, url } => {
-                Some(FetchCommand::Fetch {
-                    fetch_id: *fetch_id,
-                    url: url.clone(),
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-// ============================================================================
-// Effect (Execution - Uses reqwest directly)
+// Effect (React to events, execute IO, emit new events)
 // ============================================================================
 
 struct FetchEffect;
 
 #[async_trait]
-impl Effect<FetchCommand, Deps> for FetchEffect {
+impl Effect<FetchEvent, Deps> for FetchEffect {
     type Event = FetchEvent;
 
-    async fn execute(
-        &self,
-        cmd: FetchCommand,
-        ctx: EffectContext<Deps>
-    ) -> Result<FetchEvent> {
-        let FetchCommand::Fetch { fetch_id, url } = cmd;
+    async fn handle(
+        &mut self,
+        event: FetchEvent,
+        ctx: EffectContext<Deps>,
+    ) -> Result<Option<FetchEvent>> {
+        match event {
+            FetchEvent::FetchRequested { fetch_id, url } => {
+                println!("Fetching: {}", url);
 
-        // Use reqwest directly - no adapter needed!
-        match ctx.deps().http_client.get(&url).send().await {
-            Ok(response) => {
-                let status = response.status().as_u16();
+                // Use reqwest directly - no adapter needed!
+                match ctx.deps().http_client.get(&url).send().await {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
 
-                if response.status().is_success() {
-                    let content = response.text().await?;
+                        if response.status().is_success() {
+                            let content = response.text().await?;
 
-                    Ok(FetchEvent::Fetched {
-                        fetch_id,
-                        url,
-                        content,
-                        status,
-                    })
-                } else {
-                    Ok(FetchEvent::FetchFailed {
-                        fetch_id,
-                        url,
-                        reason: format!("HTTP {}", status),
-                    })
+                            println!("✓ Fetched {} ({} bytes)", url, content.len());
+
+                            Ok(Some(FetchEvent::Fetched {
+                                fetch_id,
+                                url,
+                                content,
+                                status,
+                            }))
+                        } else {
+                            println!("✗ Failed {} (HTTP {})", url, status);
+
+                            Ok(Some(FetchEvent::FetchFailed {
+                                fetch_id,
+                                url,
+                                reason: format!("HTTP {}", status),
+                            }))
+                        }
+                    }
+                    Err(e) => {
+                        println!("✗ Failed {}: {}", url, e);
+
+                        Ok(Some(FetchEvent::FetchFailed {
+                            fetch_id,
+                            url,
+                            reason: e.to_string(),
+                        }))
+                    }
                 }
             }
-            Err(e) => {
-                Ok(FetchEvent::FetchFailed {
-                    fetch_id,
-                    url,
-                    reason: e.to_string(),
-                })
-            }
+            _ => Ok(None), // Event doesn't apply to this effect
         }
     }
 }
@@ -150,8 +120,7 @@ async fn main() -> Result<()> {
     };
 
     let engine = EngineBuilder::new(deps)
-        .with_machine(FetchMachine)
-        .with_effect::<FetchCommand, _>(FetchEffect)
+        .with_effect::<FetchEvent, _>(FetchEffect)
         .build();
 
     let handle = engine.start();
@@ -165,15 +134,17 @@ async fn main() -> Result<()> {
 
     for url in urls {
         let fetch_id = Uuid::new_v4();
-        println!("Fetching: {}", url);
 
-        handle.emit_and_await(FetchEvent::FetchRequested {
-            fetch_id,
-            url: url.to_string(),
-        }).await?;
+        // Emit event and wait for cascading work to complete
+        handle
+            .emit_and_await(FetchEvent::FetchRequested {
+                fetch_id,
+                url: url.to_string(),
+            })
+            .await?;
     }
 
-    println!("All fetches complete!");
+    println!("\nAll fetches complete!");
 
     Ok(())
 }

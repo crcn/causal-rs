@@ -5,9 +5,7 @@
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use seesaw_core::{
-    Command, Effect, EffectContext, Engine, EngineBuilder, Event, Machine,
-};
+use seesaw_core::{Effect, EffectContext, EngineBuilder};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -41,90 +39,64 @@ enum SummaryEvent {
 // Event is auto-implemented via blanket impl for Clone + Send + Sync + 'static
 
 // ============================================================================
-// Commands (Intent)
-// ============================================================================
-
-#[derive(Debug, Clone)]
-enum SummaryCommand {
-    Summarize {
-        task_id: Uuid,
-        text: String,
-    },
-}
-
-impl Command for SummaryCommand {}
-
-// ============================================================================
-// Machine (Decision Logic)
-// ============================================================================
-
-struct SummaryMachine;
-
-impl Machine for SummaryMachine {
-    type Event = SummaryEvent;
-    type Command = SummaryCommand;
-
-    fn decide(&mut self, event: &SummaryEvent) -> Option<SummaryCommand> {
-        match event {
-            SummaryEvent::SummarizeRequested { task_id, text } => {
-                Some(SummaryCommand::Summarize {
-                    task_id: *task_id,
-                    text: text.clone(),
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-// ============================================================================
-// Effect (Execution - Calls Anthropic API directly)
+// Effect (React to events, call Anthropic API, emit new events)
 // ============================================================================
 
 struct SummarizeEffect;
 
 #[async_trait]
-impl Effect<SummaryCommand, Deps> for SummarizeEffect {
+impl Effect<SummaryEvent, Deps> for SummarizeEffect {
     type Event = SummaryEvent;
 
-    async fn execute(
-        &self,
-        cmd: SummaryCommand,
-        ctx: EffectContext<Deps>
-    ) -> Result<SummaryEvent> {
-        let SummaryCommand::Summarize { task_id, text } = cmd;
+    async fn handle(
+        &mut self,
+        event: SummaryEvent,
+        ctx: EffectContext<Deps>,
+    ) -> Result<Option<SummaryEvent>> {
+        match event {
+            SummaryEvent::SummarizeRequested { task_id, text } => {
+                println!("Summarizing text...");
 
-        // Call Anthropic API directly using reqwest
-        let request = AnthropicRequest {
-            model: "claude-3-5-sonnet-20241022".to_string(),
-            max_tokens: 1024,
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: format!("Summarize this text in 2-3 sentences:\n\n{}", text),
+                // Call Anthropic API directly using reqwest
+                let request = AnthropicRequest {
+                    model: "claude-3-5-sonnet-20241022".to_string(),
+                    max_tokens: 1024,
+                    messages: vec![Message {
+                        role: "user".to_string(),
+                        content: format!("Summarize this text in 2-3 sentences:\n\n{}", text),
+                    }],
+                };
+
+                match call_anthropic(&ctx.deps().http_client, &ctx.deps().api_key, request).await {
+                    Ok(response) => {
+                        let summary = response
+                            .content
+                            .first()
+                            .and_then(|c| c.text.clone())
+                            .unwrap_or_default();
+
+                        let tokens = response.usage.input_tokens + response.usage.output_tokens;
+
+                        println!("\n✓ Summary: {}", summary);
+                        println!("  Tokens used: {}", tokens);
+
+                        Ok(Some(SummaryEvent::Summarized {
+                            task_id,
+                            summary,
+                            tokens_used: tokens,
+                        }))
+                    }
+                    Err(e) => {
+                        println!("✗ Failed: {}", e);
+
+                        Ok(Some(SummaryEvent::SummaryFailed {
+                            task_id,
+                            reason: e.to_string(),
+                        }))
+                    }
                 }
-            ],
-        };
-
-        match call_anthropic(&ctx.deps().http_client, &ctx.deps().api_key, request).await {
-            Ok(response) => {
-                let summary = response.content
-                    .first()
-                    .and_then(|c| c.text.clone())
-                    .unwrap_or_default();
-
-                Ok(SummaryEvent::Summarized {
-                    task_id,
-                    summary,
-                    tokens_used: response.usage.input_tokens + response.usage.output_tokens,
-                })
             }
-            Err(e) => {
-                Ok(SummaryEvent::SummaryFailed {
-                    task_id,
-                    reason: e.to_string(),
-                })
-            }
+            _ => Ok(None), // Event doesn't apply to this effect
         }
     }
 }
@@ -213,8 +185,7 @@ async fn main() -> Result<()> {
     };
 
     let engine = EngineBuilder::new(deps)
-        .with_machine(SummaryMachine)
-        .with_effect::<SummaryCommand, _>(SummarizeEffect)
+        .with_effect::<SummaryEvent, _>(SummarizeEffect)
         .build();
 
     let handle = engine.start();
@@ -229,14 +200,16 @@ async fn main() -> Result<()> {
     "#;
 
     let task_id = Uuid::new_v4();
-    println!("Summarizing text...");
 
-    handle.emit_and_await(SummaryEvent::SummarizeRequested {
-        task_id,
-        text: text.to_string(),
-    }).await?;
+    // Emit event and wait for cascading work to complete
+    handle
+        .emit_and_await(SummaryEvent::SummarizeRequested {
+            task_id,
+            text: text.to_string(),
+        })
+        .await?;
 
-    println!("Summary complete!");
+    println!("\nDone!");
 
     Ok(())
 }

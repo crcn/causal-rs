@@ -1,17 +1,18 @@
 [workspace]
 members = [
     "crates/seesaw",
-    "crates/seesaw-job-postgres",
+    # TODO: Update these crates for new Effect-based API
+    # "crates/seesaw-job-postgres",    # Needs job module restoration
     "crates/seesaw-outbox",
-    "crates/seesaw-persistence",
-    "crates/seesaw-testing",
+    # "crates/seesaw-persistence",     # Needs update (no longer uses Machine)
+    # "crates/seesaw-testing",         # Needs update (no longer uses Machine)
     "examples/http-fetcher",
     "examples/ai-summarizer",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["Crispin Read <crispin@crispinread.com>"]

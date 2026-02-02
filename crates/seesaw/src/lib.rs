@@ -187,7 +187,7 @@ pub use edge::{Edge, EdgeContext};
 pub use reducer::Reducer;
 
 // Re-export effect types
-pub use effect_impl::{Effect, EffectContext, ToolContext};
+pub use effect_impl::{Effect, EffectContext};
 
 // Re-export bus types
 pub use bus::EventBus;
