@@ -681,7 +681,7 @@ where
                     // Use send_any_with_origin to stamp events with this bridge's unique ID
                     tx.send_any_with_origin(value, type_id, bridge_origin_id)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(|e| anyhow::anyhow!("{:?}", e))
                 })
             })
         },

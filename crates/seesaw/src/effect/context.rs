@@ -1,6 +1,7 @@
 //! Effect context and related types.
 
 use std::any::{Any, TypeId};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -31,6 +32,8 @@ where
     pub ctx: EffectContext<S, D>,
     /// Origin stream ID for echo prevention (0 = internal, will be stamped by stream)
     pub origin: u64,
+    /// Chain of relay IDs this event has visited (for multi-hop echo prevention)
+    pub visited: HashSet<u64>,
 }
 
 /// Context passed to effect handlers.
@@ -47,6 +50,8 @@ where
     pub(crate) tasks: Arc<TaskGroup>,
     /// Current event ID for causation tracking in flow visualization
     pub(crate) current_event_id: Option<Uuid>,
+    /// Chain of relay IDs visited (inherited by emitted events for echo prevention)
+    pub(crate) visited: Arc<HashSet<u64>>,
 }
 
 impl<S, D> Clone for EffectContext<S, D>
@@ -63,6 +68,7 @@ where
             emitter: self.emitter.clone(),
             tasks: self.tasks.clone(),
             current_event_id: self.current_event_id,
+            visited: self.visited.clone(),
         }
     }
 }
@@ -88,6 +94,7 @@ where
             emitter,
             tasks,
             current_event_id: None,
+            visited: Arc::new(HashSet::new()),
         }
     }
 
@@ -130,6 +137,21 @@ where
             emitter: self.emitter.clone(),
             tasks: self.tasks.clone(),
             current_event_id: Some(event_id),
+            visited: self.visited.clone(),
+        }
+    }
+
+    /// Create a new context with an updated visited set.
+    pub(crate) fn with_visited(&self, visited: Arc<HashSet<u64>>) -> Self {
+        Self {
+            prev_state: self.prev_state.clone(),
+            state: self.state.clone(),
+            live_state: self.live_state.clone(),
+            deps: self.deps.clone(),
+            emitter: self.emitter.clone(),
+            tasks: self.tasks.clone(),
+            current_event_id: self.current_event_id,
+            visited,
         }
     }
 
@@ -173,6 +195,7 @@ where
             emitter: self.emitter.clone(),
             tasks: self.tasks.head_or_self(),
             current_event_id: self.current_event_id,
+            visited: self.visited.clone(),
         }
     }
 
@@ -211,6 +234,7 @@ where
             emitter: self.emitter.clone(),
             tasks: self.tasks.transient(),
             current_event_id: self.current_event_id,
+            visited: self.visited.clone(),
         }
     }
 }

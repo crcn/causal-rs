@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use tracing::{info_span, Instrument};
 
 use crate::effect::{Effect, EffectContext, EventEnvelope};
-use pipedream::Relay;
+use pipedream::RelayReceiver;
 
 /// Registry for storing effects.
 pub struct EffectRegistry<S, D>
@@ -48,7 +48,7 @@ where
     ///
     /// This subscribes each effect to the event relay and spawns background
     /// tasks to handle events.
-    pub(crate) fn start_effects(&self, relay: &Relay, ctx: &EffectContext<S, D>) {
+    pub(crate) fn start_effects(&self, relay: &RelayReceiver, ctx: &EffectContext<S, D>) {
         // Create a transient context - tasks here don't block settled()
         // but ARE cancelled when the session settles or cancel() is called
         let bg_ctx = ctx.transient();
