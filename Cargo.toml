@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/seesaw",
+    "examples/simple-order",
     # TODO: Update to new API in follow-up PR
     # "crates/seesaw-outbox",
     # "examples/http-fetcher",

@@ -1,0 +1,10 @@
+[package]
+name = "simple-order-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+seesaw_core = { path = "../../crates/seesaw" }
+anyhow = "1.0"
+tokio = { version = "1.49", features = ["full"] }
+uuid = { version = "1.20", features = ["v4"] }
