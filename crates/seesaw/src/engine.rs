@@ -153,6 +153,31 @@ where
         f(&self.context)
     }
 
+    /// Process events to completion and return the result.
+    ///
+    /// This is a convenience method that combines `run()` and `settled()`.
+    /// Use this when you want to emit events and wait for all cascading
+    /// effects to complete before continuing.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = engine.activate(State::default());
+    /// let result = handle.process(|ctx| {
+    ///     ctx.emit(OrderPlaced { id: 123 });
+    ///     Ok(Response { status: "ok" })
+    /// }).await?;
+    /// println!("All effects completed, result: {:?}", result);
+    /// ```
+    pub async fn process<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&EffectContext<S, D>) -> Result<R>,
+    {
+        let result = f(&self.context)?;
+        self.tasks.settled().await?;
+        Ok(result)
+    }
+
     /// Wait for all tasks to complete.
     pub async fn settled(&self) -> Result<()> {
         self.tasks.settled().await
@@ -534,6 +559,42 @@ mod tests {
 
         result.settled().await.unwrap();
         assert_eq!(handler_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn process_runs_and_settles() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let counter = handler_calls.clone();
+        let store: Engine<Counter> = Engine::new()
+            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+                value: state.value + event.amount,
+            }))
+            .with_effect(
+                effect::on::<Increment>().run(move |_event, _ctx| {
+                    let c = counter.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                }),
+            );
+
+        let handle = store.activate(Counter::default());
+        let result = handle
+            .process(|ctx| {
+                ctx.emit(Increment { amount: 10 });
+                ctx.emit(Increment { amount: 5 });
+                Ok(42) // Return value
+            })
+            .await
+            .unwrap();
+
+        // Should return the result
+        assert_eq!(result, 42);
+        // Effects should have completed
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 2);
+        // State should be updated
+        assert_eq!(handle.context.curr_state().value, 15);
     }
 
     #[tokio::test]

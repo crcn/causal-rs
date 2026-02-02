@@ -304,16 +304,19 @@ let engine = Engine::new()
         Ok(())
     }));
 
-// Activate per-request with initial state
+// Option 1: Process to completion (common pattern)
 let handle = engine.activate(State::default());
+let result = handle.process(|ctx| {
+    ctx.emit(OrderEvent::Placed { order_id, total: 99.99 });
+    Ok(Response { status: "ok" })
+}).await?;
 
-// Run logic that emits events
+// Option 2: Run and settle separately (when you need the handle)
+let handle = engine.activate(State::default());
 let result = handle.run(|ctx| {
     ctx.emit(OrderEvent::Placed { order_id, total: 99.99 });
     Ok(Response { status: "ok" })
 })?;
-
-// Wait for all effects to complete
 handle.settled().await?;
 ```
 
@@ -326,7 +329,8 @@ Builder methods:
 
 Handle methods:
 
-- `.run(closure)` — Execute logic, returns result
+- `.process(closure).await` — Execute logic and wait for all effects (convenience method)
+- `.run(closure)` — Execute logic, returns result immediately
 - `.settled().await` — Wait for all effects to complete
 - `.cancel()` — Cancel all tasks
 
