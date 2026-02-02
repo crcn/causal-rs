@@ -453,7 +453,7 @@ Every long-running flow needs success and failure terminal events.
 let mut engine = EngineBuilder::new(deps)
     .with_reducer::<MyEvent, _>(MyReducer)      // Pure state transformations
     .with_effect::<MyEvent, _>(MyEventEffect)    // Event handlers
-    .with_tap::<MyEvent, _>(MyTap, "metrics")    // Event observers
+    .with_event_tap(MyTap)                       // Event observers
     .build();
 
 // Execute via edge (structured workflow)
@@ -463,7 +463,7 @@ let result = engine.run(MyEdge { data }, initial_state).await?;
 Builder methods:
 - `.with_reducer::<Event, _>(reducer)` — Register pure state transformations
 - `.with_effect::<Event, _>(effect)` — Register event handlers
-- `.with_tap::<Event, _>(tap, name)` — Register event observers
+- `.with_event_tap(tap)` — Register event observers
 - `.with_bus(bus)` — Use existing EventBus
 - `.with_inflight(tracker)` — Use existing InflightTracker
 - `.with_arc(deps)` — Use Arc-wrapped dependencies

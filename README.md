@@ -333,7 +333,7 @@ let mut engine = EngineBuilder::new(deps)
     .with_reducer::<OrderEvent, _>(OrderReducer)
     .with_effect::<OrderEvent, _>(ShipEffect)
     .with_effect::<OrderEvent, _>(NotifyEffect)
-    .with_tap::<OrderEvent, _>(MetricsTap, "metrics")
+    .with_event_tap(MetricsTap)
     .build();
 
 // Run edges to execute event flows
@@ -347,7 +347,7 @@ Builder methods:
 
 - `.with_reducer::<Event, _>(reducer)` — Register pure state transformations
 - `.with_effect::<Event, _>(effect)` — Register event handlers
-- `.with_tap::<Event, _>(tap, name)` — Register event observers
+- `.with_event_tap(tap)` — Register event observers
 - `.with_bus(bus)` — Use an existing EventBus
 - `.with_inflight(tracker)` — Use an existing InflightTracker
 - `.with_arc(deps)` — Use Arc-wrapped dependencies
