@@ -193,8 +193,8 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             };
 
             match result {
-                Ok(new_envelope) => {
-                    // Effect emitted a new event (always does now)
+                Ok(Some(new_envelope)) => {
+                    // Effect emitted a new event
                     // Increment inflight for the new event before emitting
                     if let Some(tracker) = inflight {
                         tracker.inc(new_envelope.cid, 1);
@@ -204,6 +204,9 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
 
                     // Run taps to observe the emitted event
                     self.taps.run_all(&*new_envelope.payload, Some(new_envelope.cid));
+                }
+                Ok(None) => {
+                    // Effect skipped this event - do nothing
                 }
                 Err(e) => {
                     // Effect failed
@@ -311,12 +314,12 @@ mod tests {
             &mut self,
             event: CreateEvent,
             ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<ResultEvent> {
+        ) -> Result<Option<ResultEvent>> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let counter = ctx.state().counter;
-            Ok(ResultEvent {
+            Ok(Some(ResultEvent {
                 message: format!("created {} counter={}", event.name, counter),
-            })
+            }))
         }
     }
 
@@ -332,11 +335,11 @@ mod tests {
             &mut self,
             event: CreateEvent,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<ResultEvent> {
+        ) -> Result<Option<ResultEvent>> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(ResultEvent {
+            Ok(Some(ResultEvent {
                 message: format!("notified about {}", event.name),
-            })
+            }))
         }
     }
 
@@ -435,16 +438,14 @@ mod tests {
                 &mut self,
                 event: CreateEvent,
                 _ctx: EffectContext<TestDeps, TestState>,
-            ) -> Result<ResultEvent> {
-                // Always return an event now
+            ) -> Result<Option<ResultEvent>> {
+                // Return None to skip
                 if event.name == "skip" {
-                    Ok(ResultEvent {
-                        message: "skipped".to_string(),
-                    })
+                    Ok(None)  // Skip this event
                 } else {
-                    Ok(ResultEvent {
+                    Ok(Some(ResultEvent {
                         message: "handled".to_string(),
-                    })
+                    }))
                 }
             }
         }
@@ -467,10 +468,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Should have emitted a "skipped" event
-        let emitted1 = receiver.try_recv().unwrap();
-        let result1 = emitted1.payload.downcast_ref::<ResultEvent>().unwrap();
-        assert_eq!(result1.message, "skipped");
+        // Should NOT have emitted an event (returned None)
+        assert!(receiver.try_recv().is_err());  // No event emitted
 
         // Event that should be handled
         let event2 = CreateEvent {

@@ -68,7 +68,7 @@ impl Effect<FetchEvent, Deps, FetchState> for FetchEffect {
         &mut self,
         event: FetchEvent,
         ctx: EffectContext<Deps, FetchState>,
-    ) -> Result<FetchEvent> {
+    ) -> Result<Option<FetchEvent>> {
         match event {
             FetchEvent::FetchRequested { urls } => {
                 // Fetch first URL
@@ -84,67 +84,67 @@ impl Effect<FetchEvent, Deps, FetchState> for FetchEffect {
                                 let content = response.text().await?;
                                 println!("✓ Fetched {} ({} bytes)", url, content.len());
 
-                                Ok(FetchEvent::Fetched {
+                                Ok(Some(FetchEvent::Fetched {
                                     url,
                                     content,
                                     status,
-                                })
+                                }))
                             } else {
                                 println!("✗ Failed {} (HTTP {})", url, status);
 
-                                Ok(FetchEvent::FetchFailed {
+                                Ok(Some(FetchEvent::FetchFailed {
                                     url,
                                     reason: format!("HTTP {}", status),
-                                })
+                                }))
                             }
                         }
                         Err(e) => {
                             println!("✗ Failed {}: {}", url, e);
 
-                            Ok(FetchEvent::FetchFailed {
+                            Ok(Some(FetchEvent::FetchFailed {
                                 url,
                                 reason: e.to_string(),
-                            })
+                            }))
                         }
                     }
                 } else {
                     // No URLs to fetch
                     let state = ctx.state();
-                    Ok(FetchEvent::AllComplete {
+                    Ok(Some(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    })
+                    }))
                 }
             }
             FetchEvent::Fetched { .. } => {
                 // Check if more URLs to fetch
                 let state = ctx.state();
                 if !state.urls_to_fetch.is_empty() {
-                    Ok(FetchEvent::FetchRequested {
+                    Ok(Some(FetchEvent::FetchRequested {
                         urls: state.urls_to_fetch.clone(),
-                    })
+                    }))
                 } else {
-                    Ok(FetchEvent::AllComplete {
+                    Ok(Some(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    })
+                    }))
                 }
             }
             FetchEvent::FetchFailed { .. } => {
                 // Check if more URLs to fetch
                 let state = ctx.state();
                 if !state.urls_to_fetch.is_empty() {
-                    Ok(FetchEvent::FetchRequested {
+                    Ok(Some(FetchEvent::FetchRequested {
                         urls: state.urls_to_fetch.clone(),
-                    })
+                    }))
                 } else {
-                    Ok(FetchEvent::AllComplete {
+                    Ok(Some(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    })
+                    }))
                 }
             }
-            other => Ok(other), // Pass through other events unchanged
+            _ => Ok(None), // Skip other events
         }
     }
 }

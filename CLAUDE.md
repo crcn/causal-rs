@@ -48,24 +48,24 @@ Events are the only signals in the system.
 
 ### Effect
 
-Handlers that react to events. Execute IO, always emit new events.
+Handlers that react to events. Execute IO, optionally emit new events.
 
 ```rust
 #[async_trait]
 impl Effect<ScrapeEvent, Deps, State> for ScrapeEffect {
     type Event = ScrapeEvent;
 
-    async fn handle(&self, event: ScrapeEvent, ctx: EffectContext<Deps, State>) -> Result<ScrapeEvent> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps, State>) -> Result<Option<ScrapeEvent>> {
         match event {
             ScrapeEvent::SourceRequested { source_id } => {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
-                Ok(ScrapeEvent::SourceScraped { source_id, data })
+                Ok(Some(ScrapeEvent::SourceScraped { source_id, data }))
             }
             ScrapeEvent::SourceScraped { source_id, data } => {
                 let items = ctx.deps().extractor.extract(&data).await?;
-                Ok(ScrapeEvent::NeedsExtracted { source_id })
+                Ok(Some(ScrapeEvent::NeedsExtracted { source_id }))
             }
-            other => Ok(other) // Pass through unhandled events
+            _ => Ok(None) // Skip unhandled events
         }
     }
 }
@@ -198,13 +198,13 @@ enum ScrapeEvent {
 impl Effect<ScrapeEvent, Deps> for ScraperEffect {
     type Event = ScrapeEvent;
 
-    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<Option<ScrapeEvent>> {
         match event {
             ScrapeEvent::SourceRequested { source_id } => {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
-                Ok(ScrapeEvent::SourceScraped { source_id, data })
+                Ok(Some(ScrapeEvent::SourceScraped { source_id, data }))
             }
-            _ => bail!("unhandled")
+            _ => Ok(None)  // Skip unhandled events
         }
     }
 }
@@ -214,13 +214,13 @@ impl Effect<ScrapeEvent, Deps> for ScraperEffect {
 impl Effect<ScrapeEvent, Deps> for ExtractorEffect {
     type Event = ScrapeEvent;
 
-    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<Option<ScrapeEvent>> {
         match event {
             ScrapeEvent::SourceScraped { source_id, data } => {
                 let items = ctx.deps().extractor.extract(&data).await?;
-                Ok(ScrapeEvent::DataExtracted { source_id, items })
+                Ok(Some(ScrapeEvent::DataExtracted { source_id, items }))
             }
-            _ => bail!("unhandled")
+            _ => Ok(None)  // Skip unhandled events
         }
     }
 }
@@ -245,13 +245,13 @@ enum NotificationEvent {
 impl Effect<NotificationEvent, Deps> for EmailEffect {
     type Event = NotificationEvent;
 
-    async fn execute(&self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<NotificationEvent> {
+    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<Option<NotificationEvent>> {
         match event {
             NotificationEvent::UserSignedUp { user_id, email } => {
                 let email_id = ctx.deps().mailer.send_welcome(email).await?;
-                Ok(NotificationEvent::EmailSent { user_id, email_id })
+                Ok(Some(NotificationEvent::EmailSent { user_id, email_id }))
             }
-            _ => bail!("unhandled")
+            _ => Ok(None)  // Skip unhandled events
         }
     }
 }
@@ -260,13 +260,13 @@ impl Effect<NotificationEvent, Deps> for EmailEffect {
 impl Effect<NotificationEvent, Deps> for SlackEffect {
     type Event = NotificationEvent;
 
-    async fn execute(&self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<NotificationEvent> {
+    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<Option<NotificationEvent>> {
         match event {
             NotificationEvent::UserSignedUp { user_id, .. } => {
                 let msg_id = ctx.deps().slack.post("New signup!").await?;
-                Ok(NotificationEvent::SlackPosted { user_id, message_id: msg_id })
+                Ok(Some(NotificationEvent::SlackPosted { user_id, message_id: msg_id }))
             }
-            _ => bail!("unhandled")
+            _ => Ok(None)  // Skip unhandled events
         }
     }
 }
@@ -285,7 +285,7 @@ struct RateLimitedScraperEffect {
 impl Effect<ScrapeEvent, Deps> for RateLimitedScraperEffect {
     type Event = ScrapeEvent;
 
-    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<Option<ScrapeEvent>> {
         match event {
             ScrapeEvent::SourceRequested { source_id } => {
                 // Guard: check if already pending
@@ -303,9 +303,9 @@ impl Effect<ScrapeEvent, Deps> for RateLimitedScraperEffect {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
                 self.pending.write().await.remove(&source_id);
 
-                Ok(ScrapeEvent::SourceScraped { source_id, data })
+                Ok(Some(ScrapeEvent::SourceScraped { source_id, data }))
             }
-            _ => bail!("unhandled")
+            _ => Ok(None)  // Skip unhandled events
         }
     }
 }
@@ -345,13 +345,13 @@ Effects can listen to events from any domain.
 impl Effect<WebsiteEvent, Deps> for CrawlEffect {
     type Event = CrawlEvent;
 
-    async fn execute(&self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<CrawlEvent> {
+    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<Option<CrawlEvent>> {
         match event {
             WebsiteEvent::WebsiteApproved { website_id } => {
                 ctx.deps().crawler.start(website_id).await?;
-                Ok(CrawlEvent::CrawlStarted { website_id })
+                Ok(Some(CrawlEvent::CrawlStarted { website_id }))
             }
-            _ => bail!("unhandled")
+            _ => Ok(None)  // Skip unhandled events
         }
     }
 }
@@ -486,12 +486,13 @@ pub enum WebsiteEvent {
 impl Effect<WebsiteEvent, Deps> for CrawlEffect {
     type Event = CrawlEvent;
 
-    async fn execute(&self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<CrawlEvent> {
+    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<Option<CrawlEvent>> {
         match event {
             WebsiteEvent::WebsiteApproved { website_id } => {
                 ctx.deps().crawler.start(website_id).await?;
-                Ok(CrawlEvent::CrawlStarted { website_id })
+                Ok(Some(CrawlEvent::CrawlStarted { website_id }))
             }
+            _ => Ok(None)  // Skip unhandled events
         }
     }
 }

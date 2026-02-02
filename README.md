@@ -67,7 +67,7 @@ enum OrderEvent {
     Complete { order_id: Uuid },
 }
 
-// Effects react to events and always emit new events
+// Effects react to events and optionally emit new events
 struct ShipEffect;
 
 #[async_trait::async_trait]
@@ -78,15 +78,15 @@ impl Effect<OrderEvent, MyDeps> for ShipEffect {
         &mut self,
         event: OrderEvent,
         ctx: EffectContext<MyDeps>,
-    ) -> Result<OrderEvent> {
+    ) -> Result<Option<OrderEvent>> {
         match event {
             OrderEvent::Placed { order_id } => {
                 // Do IO: ship the order
                 ctx.deps().shipping_api.ship(order_id).await?;
                 // Return new event
-                Ok(OrderEvent::Shipped { order_id })
+                Ok(Some(OrderEvent::Shipped { order_id }))
             }
-            other => Ok(other), // Pass through unhandled events
+            _ => Ok(None), // Skip unhandled events
         }
     }
 }
@@ -101,15 +101,15 @@ impl Effect<OrderEvent, MyDeps> for NotifyEffect {
         &mut self,
         event: OrderEvent,
         ctx: EffectContext<MyDeps>,
-    ) -> Result<OrderEvent> {
+    ) -> Result<Option<OrderEvent>> {
         match event {
             OrderEvent::Shipped { order_id } => {
                 // Do IO: notify customer
                 ctx.deps().email_service.send(order_id, "Shipped!").await?;
                 // Return new event
-                Ok(OrderEvent::Delivered { order_id })
+                Ok(Some(OrderEvent::Delivered { order_id }))
             }
-            other => Ok(other),
+            _ => Ok(None),
         }
     }
 }
@@ -160,7 +160,7 @@ enum UserEvent {
 
 ### Effects
 
-Effects are event handlers that react to events, perform IO, and always emit new events.
+Effects are event handlers that react to events, perform IO, and optionally emit new events.
 
 ```rust
 struct SignupEffect;
@@ -173,7 +173,7 @@ impl Effect<UserEvent, MyDeps> for SignupEffect {
         &mut self,
         event: UserEvent,
         ctx: EffectContext<MyDeps>,
-    ) -> Result<UserEvent> {
+    ) -> Result<Option<UserEvent>> {
         match event {
             UserEvent::SignupRequested { email, name } => {
                 // Execute IO in one transaction
@@ -184,12 +184,12 @@ impl Effect<UserEvent, MyDeps> for SignupEffect {
                 }).await?;
 
                 // Return new event
-                Ok(UserEvent::SignedUp {
+                Ok(Some(UserEvent::SignedUp {
                     user_id: user.id,
                     email,
-                })
+                }))
             }
-            other => Ok(other), // Pass through unhandled events
+            _ => Ok(None), // Skip unhandled events
         }
     }
 }
@@ -198,7 +198,7 @@ impl Effect<UserEvent, MyDeps> for SignupEffect {
 Key properties:
 
 - **Can be stateful**: Effects have `&mut self` and can maintain state across invocations
-- **Always return Event**: Use pattern matching with catch-all to pass through unhandled events
+- **Return Option<Event>**: Return `Some(event)` to emit, `None` to skip unhandled events
 - **Access state**: Via `ctx.state()` for per-execution state
 - **Narrow context**: Only `deps()`, `state()`, `signal()`, and `tool_context()` available
 - **Batch support**: Override `handle_batch` for optimized bulk operations
@@ -416,7 +416,7 @@ impl OutboxEvent for OrderPlaced {
 }
 
 // 2. Write to outbox in same transaction as business data
-async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Result<OrderEvent> {
+async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Result<Option<OrderEvent>> {
     match event {
         OrderEvent::PlaceRequested { customer_id, items } => {
             let mut tx = ctx.deps().db.begin().await?;
@@ -432,9 +432,9 @@ async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Resul
             ).await?;
 
             tx.commit().await?;
-            Ok(OrderEvent::Placed { order_id: order.id })
+            Ok(Some(OrderEvent::Placed { order_id: order.id }))
         }
-        other => Ok(other),
+        _ => Ok(None),
     }
 }
 ```

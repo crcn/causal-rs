@@ -63,7 +63,7 @@ impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
         &mut self,
         event: SummaryEvent,
         ctx: EffectContext<Deps, SummaryState>,
-    ) -> Result<SummaryEvent> {
+    ) -> Result<Option<SummaryEvent>> {
         match event {
             SummaryEvent::SummarizeRequested { task_id, text } => {
                 println!("Summarizing text...");
@@ -91,23 +91,23 @@ impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
                         println!("\n✓ Summary: {}", summary);
                         println!("  Tokens used: {}", tokens);
 
-                        Ok(SummaryEvent::Summarized {
+                        Ok(Some(SummaryEvent::Summarized {
                             task_id,
                             summary,
                             tokens_used: tokens,
-                        })
+                        }))
                     }
                     Err(e) => {
                         println!("✗ Failed: {}", e);
 
-                        Ok(SummaryEvent::SummaryFailed {
+                        Ok(Some(SummaryEvent::SummaryFailed {
                             task_id,
                             reason: e.to_string(),
-                        })
+                        }))
                     }
                 }
             }
-            other => Ok(other), // Pass through other events unchanged
+            _ => Ok(None), // Skip other events
         }
     }
 }

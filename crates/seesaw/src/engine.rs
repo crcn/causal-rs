@@ -421,9 +421,9 @@ mod tests {
             &mut self,
             _event: TestEvent,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<TerminalEvent> {
+        ) -> Result<Option<TerminalEvent>> {
             // Emit terminal event - no effect handles this, so flow terminates
-            Ok(TerminalEvent)
+            Ok(Some(TerminalEvent))
         }
     }
 
