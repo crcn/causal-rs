@@ -139,6 +139,18 @@ let status_effect = effect::on::<StatusChanged>()
         ctx.deps().notify_status_change(&event).await?;
         Ok(())
     });
+
+// Observe ALL events (for logging, metrics, debugging)
+let observer_effect = effect::on_any().run(|event, ctx| async move {
+    // event is AnyEvent with type-erased value
+    ctx.deps().logger.log(event.type_id);
+
+    // Can downcast if needed
+    if let Some(order) = event.downcast::<OrderPlaced>() {
+        ctx.deps().analytics.track("order_placed", order);
+    }
+    Ok(())
+});
 ```
 
 Effects can:

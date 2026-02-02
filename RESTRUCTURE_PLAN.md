@@ -23,7 +23,6 @@ seesaw-rs/
 │   │   │   ├── dispatch.rs       # Dispatcher
 │   │   │   ├── runtime.rs        # Runtime loop
 │   │   │   ├── engine.rs         # Engine orchestration
-│   │   │   ├── tap.rs            # EventTap
 │   │   │   ├── request.rs        # dispatch_request
 │   │   │   ├── error.rs          # SeesawError, CommandFailed
 │   │   │   ├── command_macro.rs  # auto_serialize!
