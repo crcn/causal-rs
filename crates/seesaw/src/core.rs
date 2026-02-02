@@ -2,16 +2,12 @@
 //!
 //! # Overview
 //!
-//! Seesaw separates **facts** from **intent**:
-//! - [`Event`] = Facts (what happened)
-//! - [`Command`] = Intent (requests for IO with transaction authority)
-//!
-//! The key principle: **One Command = One Transaction**. If multiple writes
-//! must be atomic, they belong in one command handled by one effect.
+//! Seesaw is built on events - facts about what happened.
+//! Events flow through effects, which can emit new events.
 //!
 //! # Correlation
 //!
-//! Events and commands can be tagged with a [`CorrelationId`] to track
+//! Events can be tagged with a [`CorrelationId`] to track
 //! related work across the system. This enables:
 //! - Awaiting completion of all work triggered by an API request
 //! - Distributed tracing
@@ -21,100 +17,9 @@ use std::any::{Any, TypeId};
 use std::fmt;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-/// Job specification for background and scheduled commands.
-///
-/// Commands that use `ExecutionMode::Background` or `ExecutionMode::Scheduled`
-/// should return a `JobSpec` from their `job_spec()` method. This provides
-/// all the metadata needed for durable job execution.
-///
-/// # Example
-///
-/// ```ignore
-/// use seesaw::{Command, ExecutionMode, JobSpec};
-///
-/// #[derive(Debug, Clone, Serialize, Deserialize)]
-/// struct SendEmailCommand {
-///     user_id: Uuid,
-///     template: String,
-/// }
-///
-/// impl Command for SendEmailCommand {
-///     fn execution_mode(&self) -> ExecutionMode {
-///         ExecutionMode::Background
-///     }
-///
-///     fn job_spec(&self) -> Option<JobSpec> {
-///         Some(JobSpec::new("email:send")
-///             .with_idempotency_key(format!("email:{}:{}", self.user_id, self.template)))
-///     }
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct JobSpec {
-    /// Stable identifier used for persistence, deserialization, and routing.
-    /// Must not change once jobs exist in the queue.
-    pub job_type: &'static str,
-
-    /// Optional idempotency key for deduplication.
-    /// If provided, only one pending/running job with this key can exist.
-    pub idempotency_key: Option<String>,
-
-    /// Maximum retry attempts on failure.
-    pub max_retries: i32,
-
-    /// Priority for job ordering (higher = sooner).
-    pub priority: i32,
-
-    /// Payload schema version for backward compatibility.
-    /// Versioning/migration logic belongs in the job worker, not here.
-    pub version: i32,
-}
-
-impl JobSpec {
-    /// Create a new JobSpec with default values.
-    ///
-    /// # Arguments
-    ///
-    /// * `job_type` - Stable identifier used for routing (e.g., "email:send")
-    pub fn new(job_type: &'static str) -> Self {
-        Self {
-            job_type,
-            idempotency_key: None,
-            max_retries: 3,
-            priority: 0,
-            version: 1,
-        }
-    }
-
-    /// Set the idempotency key for deduplication.
-    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
-        self.idempotency_key = Some(key.into());
-        self
-    }
-
-    /// Set the maximum number of retry attempts.
-    pub fn with_max_retries(mut self, n: i32) -> Self {
-        self.max_retries = n;
-        self
-    }
-
-    /// Set the job priority (higher values run sooner).
-    pub fn with_priority(mut self, p: i32) -> Self {
-        self.priority = p;
-        self
-    }
-
-    /// Set the payload schema version.
-    pub fn with_version(mut self, v: i32) -> Self {
-        self.version = v;
-        self
-    }
-}
-
-/// Correlation ID for tracking related events and commands.
+/// Correlation ID for tracking related events.
 ///
 /// Each `emit_and_await` call generates a unique correlation ID that propagates
 /// through the system, allowing the caller to wait for all related inline work.
@@ -213,7 +118,7 @@ impl fmt::Display for CorrelationId {
 ///
 /// `EventEnvelope` is the internal transport format for events. It carries:
 /// - The correlation ID for tracking related work
-/// - The type ID for filtering by machines
+/// - The type ID for filtering by effects
 /// - The event payload
 ///
 /// Domain event enums remain clean - correlation is transport-level metadata.
@@ -266,8 +171,6 @@ impl std::fmt::Debug for EventEnvelope {
     }
 }
 
-/// A fact - something that happened.
-///
 /// The role of an event in the system.
 ///
 /// Events flow through a single bus but serve different purposes:
@@ -307,13 +210,10 @@ impl std::fmt::Debug for EventEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventRole {
     /// Edge-originated events (user requests, API calls).
-    /// Machines decide on these to produce commands.
     Input,
     /// Effect-produced events (ground truth).
-    /// These are the facts that machines can react to.
     Fact,
     /// Ephemeral UI notifications (typing indicators, progress).
-    /// Machines should ignore these.
     Signal,
 }
 
@@ -333,15 +233,14 @@ impl EventRole {
         matches!(self, EventRole::Signal)
     }
 
-    /// Returns true if this event should be processed by machines.
+    /// Returns true if this event should be processed by effects.
     /// Signals are typically filtered out.
     pub fn is_actionable(&self) -> bool {
         !self.is_signal()
     }
 }
 
-/// Events are immutable descriptions of what occurred. They contain no IO,
-/// no side effects, and are processed synchronously by machines.
+/// Events are immutable descriptions of what occurred.
 ///
 /// **Note**: This trait is automatically implemented for any type that is
 /// `Clone + Send + Sync + 'static`. You don't need to implement it manually.
@@ -366,275 +265,15 @@ impl EventRole {
 /// }
 /// // Event is automatically implemented!
 /// ```
-pub trait Event: Any + Send + Sync + 'static {}
+pub trait Event: Any + Send + Sync + 'static {
+    /// Downcast to &dyn Any for type checking
+    fn as_any(&self) -> &dyn Any;
+}
 
 // Blanket implementation for any type that meets the requirements
-impl<T: Clone + Send + Sync + 'static> Event for T {}
-
-/// A request for IO with transaction authority.
-///
-/// Commands represent intent to perform side effects. Each command maps to
-/// exactly one effect execution and one database transaction.
-///
-/// # Execution Modes
-///
-/// Commands specify their execution mode via [`Command::execution_mode`]:
-/// - [`ExecutionMode::Inline`] - Execute immediately in the current context
-/// - [`ExecutionMode::Background`] - Queue for durable job execution
-/// - [`ExecutionMode::Scheduled`] - Execute at a specific time in the future
-///
-/// # Job Specification
-///
-/// Commands using `Background` or `Scheduled` execution modes should provide
-/// a [`JobSpec`] via the [`Command::job_spec`] method. This enables the
-/// dispatcher to route the command to the job queue with the appropriate
-/// metadata.
-///
-/// # Example
-///
-/// ```ignore
-/// #[derive(Debug, Clone, Serialize, Deserialize)]
-/// struct SendEmailCommand {
-///     user_id: Uuid,
-///     template: String,
-/// }
-///
-/// impl Command for SendEmailCommand {
-///     fn execution_mode(&self) -> ExecutionMode {
-///         ExecutionMode::Background
-///     }
-///
-///     fn job_spec(&self) -> Option<JobSpec> {
-///         Some(JobSpec::new("email:send")
-///             .with_idempotency_key(format!("email:{}:{}", self.user_id, self.template)))
-///     }
-/// }
-/// ```
-pub trait Command: Any + Send + Sync + 'static {
-    /// Returns the execution mode for this command.
-    ///
-    /// Defaults to [`ExecutionMode::Inline`].
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Inline
-    }
-
-    /// Returns the job specification for background/scheduled commands.
-    ///
-    /// Commands using [`ExecutionMode::Background`] or [`ExecutionMode::Scheduled`]
-    /// should return `Some(JobSpec)`. Inline commands can return `None`.
-    ///
-    /// Returns `None` by default, which is appropriate for inline-only commands.
-    fn job_spec(&self) -> Option<JobSpec> {
-        None
-    }
-
-    /// Serialize the command to JSON for job queue persistence.
-    ///
-    /// For commands that derive `Serialize`, you can use the `auto_serialize!` helper:
-    ///
-    /// ```ignore
-    /// use seesaw::{Command, auto_serialize};
-    /// use serde::{Serialize, Deserialize};
-    ///
-    /// #[derive(Debug, Clone, Serialize, Deserialize)]
-    /// struct SendEmailCommand {
-    ///     user_id: Uuid,
-    ///     template: String,
-    /// }
-    ///
-    /// impl Command for SendEmailCommand {
-    ///     fn execution_mode(&self) -> ExecutionMode {
-    ///         ExecutionMode::Background
-    ///     }
-    ///
-    ///     fn job_spec(&self) -> Option<JobSpec> {
-    ///         Some(JobSpec::new("email:send"))
-    ///     }
-    ///
-    ///     auto_serialize!();  // One-liner instead of manual implementation!
-    /// }
-    /// ```
-    fn serialize_to_json(&self) -> Option<serde_json::Value> {
-        None
-    }
-}
-
-/// Execution mode for commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    /// Execute immediately in the current context.
-    ///
-    /// The effect runs synchronously (from the runtime's perspective) and
-    /// blocks until completion. Use for fast operations that don't need
-    /// durability guarantees.
-    Inline,
-
-    /// Queue for durable background execution.
-    ///
-    /// The command is persisted to a job queue and executed by a worker.
-    /// Use for:
-    /// - Long-running operations (AI, external APIs)
-    /// - Operations that need retry guarantees
-    /// - Operations that can be delayed
-    ///
-    /// **Note**: Commands using this mode must implement [`DurableCommand`].
-    Background,
-
-    /// Schedule for execution at a specific time.
-    ///
-    /// The command is persisted to a job queue with a `run_at` timestamp.
-    /// The job queue is responsible for executing the command at or after
-    /// the specified time.
-    ///
-    /// Use for:
-    /// - Delayed notifications
-    /// - Scheduled reminders
-    /// - Time-based state transitions
-    /// - Retry with exponential backoff
-    ///
-    /// **Note**: Commands using this mode must provide a [`JobSpec`] via
-    /// [`Command::job_spec`] and must be serializable.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// impl Command for ReminderCommand {
-    ///     fn execution_mode(&self) -> ExecutionMode {
-    ///         ExecutionMode::Scheduled { run_at: self.remind_at }
-    ///     }
-    ///
-    ///     fn job_spec(&self) -> Option<JobSpec> {
-    ///         Some(JobSpec::new("reminder:send"))
-    ///     }
-    /// }
-    /// ```
-    Scheduled {
-        /// The time at which to execute the command.
-        run_at: DateTime<Utc>,
-    },
-}
-
-/// Type-erased command trait for internal use.
-///
-/// This trait is automatically implemented for all types that implement [`Command`].
-/// For commands that need to be serialized (background/scheduled execution),
-/// see also [`SerializableCommand`].
-pub trait AnyCommand: Send + Sync {
-    /// Returns the execution mode for this command.
-    fn get_execution_mode(&self) -> ExecutionMode;
-
-    /// Returns the job specification for background/scheduled commands.
-    fn get_job_spec(&self) -> Option<JobSpec>;
-
-    /// Serialize the command to JSON for job queue persistence.
-    fn get_serialize_to_json(&self) -> Option<serde_json::Value>;
-
-    /// Returns the TypeId of this command.
-    fn command_type_id(&self) -> std::any::TypeId;
-
-    /// Downcast to concrete type.
-    fn as_any(&self) -> &dyn Any;
-
-    /// Downcast to concrete type (boxed).
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
-
-    /// Try to get this command as a serializable trait object.
-    ///
-    /// Returns Some if the command implements Serialize, None otherwise.
-    /// This enables automatic serialization for commands that derive Serialize.
-    fn as_serializable(&self) -> Option<&dyn erased_serde::Serialize>;
-}
-
-impl<C: Command> AnyCommand for C {
-    fn get_execution_mode(&self) -> ExecutionMode {
-        Command::execution_mode(self)
-    }
-
-    fn get_job_spec(&self) -> Option<JobSpec> {
-        Command::job_spec(self)
-    }
-
-    fn get_serialize_to_json(&self) -> Option<serde_json::Value> {
-        Command::serialize_to_json(self)
-    }
-
-    fn command_type_id(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<C>()
-    }
-
+impl<T: Clone + Send + Sync + 'static> Event for T {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
-        self
-    }
-
-    fn as_serializable(&self) -> Option<&dyn erased_serde::Serialize> {
-        None
-    }
-}
-
-/// Type-erased serializable command trait for job queue integration.
-///
-/// This trait extends [`AnyCommand`] with serialization capability using
-/// `erased_serde`. Commands that need to be enqueued to a job queue must
-/// implement both [`Command`] and [`serde::Serialize`].
-///
-/// # Example
-///
-/// ```ignore
-/// use seesaw::{Command, ExecutionMode, JobSpec, SerializableCommand};
-/// use serde::{Serialize, Deserialize};
-///
-/// #[derive(Debug, Clone, Serialize, Deserialize)]
-/// struct SendEmailCommand {
-///     user_id: Uuid,
-///     template: String,
-/// }
-///
-/// impl Command for SendEmailCommand {
-///     fn execution_mode(&self) -> ExecutionMode {
-///         ExecutionMode::Background
-///     }
-///
-///     fn job_spec(&self) -> Option<JobSpec> {
-///         Some(JobSpec::new("email:send"))
-///     }
-/// }
-///
-/// // SendEmailCommand automatically implements SerializableCommand
-/// // because it implements both Command and Serialize
-/// ```
-pub trait SerializableCommand: AnyCommand + erased_serde::Serialize {}
-
-impl<C: Command + serde::Serialize> SerializableCommand for C {}
-
-// Enable serialization of boxed SerializableCommand
-impl serde::Serialize for dyn SerializableCommand {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        erased_serde::serialize(self, serializer)
-    }
-}
-
-impl serde::Serialize for dyn SerializableCommand + Send {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        erased_serde::serialize(self, serializer)
-    }
-}
-
-impl serde::Serialize for dyn SerializableCommand + Send + Sync {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        erased_serde::serialize(self, serializer)
     }
 }
 
@@ -734,187 +373,6 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEvent {
         value: i32,
-    }
-    // Event auto-impl by blanket
-
-    #[derive(Debug, Clone)]
-    struct TestCommand {
-        action: String,
-    }
-    impl Command for TestCommand {}
-
-    #[derive(Debug, Clone)]
-    struct BackgroundCommand;
-    impl Command for BackgroundCommand {
-        fn execution_mode(&self) -> ExecutionMode {
-            ExecutionMode::Background
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct ScheduledCommand {
-        run_at: DateTime<Utc>,
-    }
-    impl Command for ScheduledCommand {
-        fn execution_mode(&self) -> ExecutionMode {
-            ExecutionMode::Scheduled {
-                run_at: self.run_at,
-            }
-        }
-    }
-
-    #[test]
-    fn test_event_is_any() {
-        let event = TestEvent { value: 42 };
-        let any: &dyn Any = &event;
-        assert!(any.downcast_ref::<TestEvent>().is_some());
-    }
-
-    #[test]
-    fn test_command_default_execution_mode() {
-        let cmd = TestCommand {
-            action: "test".to_string(),
-        };
-        assert_eq!(cmd.execution_mode(), ExecutionMode::Inline);
-    }
-
-    #[test]
-    fn test_command_background_execution_mode() {
-        let cmd = BackgroundCommand;
-        assert_eq!(cmd.execution_mode(), ExecutionMode::Background);
-    }
-
-    #[test]
-    fn test_command_scheduled_execution_mode() {
-        let run_at = Utc::now() + chrono::Duration::hours(1);
-        let cmd = ScheduledCommand { run_at };
-        assert_eq!(cmd.execution_mode(), ExecutionMode::Scheduled { run_at });
-    }
-
-    #[test]
-    fn test_any_command_type_id() {
-        let cmd = TestCommand {
-            action: "test".to_string(),
-        };
-        let any_cmd: &dyn AnyCommand = &cmd;
-        assert_eq!(
-            any_cmd.command_type_id(),
-            std::any::TypeId::of::<TestCommand>()
-        );
-    }
-
-    #[test]
-    fn test_any_command_downcast() {
-        let cmd = TestCommand {
-            action: "hello".to_string(),
-        };
-        let any_cmd: &dyn AnyCommand = &cmd;
-        let downcasted = any_cmd.as_any().downcast_ref::<TestCommand>();
-        assert!(downcasted.is_some());
-        assert_eq!(downcasted.unwrap().action, "hello");
-    }
-
-    // =========================================================================
-    // JobSpec Tests
-    // =========================================================================
-
-    #[test]
-    fn test_job_spec_new_defaults() {
-        let spec = JobSpec::new("test:job");
-
-        assert_eq!(spec.job_type, "test:job");
-        assert_eq!(spec.idempotency_key, None);
-        assert_eq!(spec.max_retries, 3);
-        assert_eq!(spec.priority, 0);
-        assert_eq!(spec.version, 1);
-    }
-
-    #[test]
-    fn test_job_spec_with_idempotency_key() {
-        let spec = JobSpec::new("email:send").with_idempotency_key("email:user:123");
-
-        assert_eq!(spec.idempotency_key, Some("email:user:123".to_string()));
-    }
-
-    #[test]
-    fn test_job_spec_with_idempotency_key_string() {
-        let key = String::from("dynamic:key:456");
-        let spec = JobSpec::new("email:send").with_idempotency_key(key);
-
-        assert_eq!(spec.idempotency_key, Some("dynamic:key:456".to_string()));
-    }
-
-    #[test]
-    fn test_job_spec_with_max_retries() {
-        let spec = JobSpec::new("flaky:job").with_max_retries(10);
-
-        assert_eq!(spec.max_retries, 10);
-    }
-
-    #[test]
-    fn test_job_spec_with_zero_retries() {
-        let spec = JobSpec::new("critical:job").with_max_retries(0);
-
-        assert_eq!(spec.max_retries, 0);
-    }
-
-    #[test]
-    fn test_job_spec_with_priority() {
-        let spec = JobSpec::new("urgent:job").with_priority(100);
-
-        assert_eq!(spec.priority, 100);
-    }
-
-    #[test]
-    fn test_job_spec_with_negative_priority() {
-        let spec = JobSpec::new("low:priority").with_priority(-50);
-
-        assert_eq!(spec.priority, -50);
-    }
-
-    #[test]
-    fn test_job_spec_with_version() {
-        let spec = JobSpec::new("versioned:job").with_version(3);
-
-        assert_eq!(spec.version, 3);
-    }
-
-    #[test]
-    fn test_job_spec_builder_chaining() {
-        let spec = JobSpec::new("complex:job")
-            .with_idempotency_key("key:123")
-            .with_max_retries(5)
-            .with_priority(10)
-            .with_version(2);
-
-        assert_eq!(spec.job_type, "complex:job");
-        assert_eq!(spec.idempotency_key, Some("key:123".to_string()));
-        assert_eq!(spec.max_retries, 5);
-        assert_eq!(spec.priority, 10);
-        assert_eq!(spec.version, 2);
-    }
-
-    #[test]
-    fn test_job_spec_clone() {
-        let spec = JobSpec::new("clone:test")
-            .with_idempotency_key("original")
-            .with_priority(5);
-
-        let cloned = spec.clone();
-
-        assert_eq!(cloned.job_type, spec.job_type);
-        assert_eq!(cloned.idempotency_key, spec.idempotency_key);
-        assert_eq!(cloned.priority, spec.priority);
-    }
-
-    #[test]
-    fn test_job_spec_debug() {
-        let spec = JobSpec::new("debug:test").with_idempotency_key("test-key");
-
-        let debug = format!("{:?}", spec);
-        assert!(debug.contains("JobSpec"));
-        assert!(debug.contains("debug:test"));
-        assert!(debug.contains("test-key"));
     }
 
     // =========================================================================
@@ -1050,54 +508,6 @@ mod tests {
         assert!(EventRole::Input.is_actionable());
         assert!(EventRole::Fact.is_actionable());
         assert!(!EventRole::Signal.is_actionable());
-    }
-
-    // =========================================================================
-    // ExecutionMode Tests
-    // =========================================================================
-
-    #[test]
-    fn test_execution_mode_inline_eq() {
-        assert_eq!(ExecutionMode::Inline, ExecutionMode::Inline);
-    }
-
-    #[test]
-    fn test_execution_mode_background_eq() {
-        assert_eq!(ExecutionMode::Background, ExecutionMode::Background);
-    }
-
-    #[test]
-    fn test_execution_mode_scheduled_eq() {
-        let time = Utc::now();
-        assert_eq!(
-            ExecutionMode::Scheduled { run_at: time },
-            ExecutionMode::Scheduled { run_at: time }
-        );
-    }
-
-    #[test]
-    fn test_execution_mode_scheduled_ne_different_times() {
-        let time1 = Utc::now();
-        let time2 = time1 + chrono::Duration::hours(1);
-        assert_ne!(
-            ExecutionMode::Scheduled { run_at: time1 },
-            ExecutionMode::Scheduled { run_at: time2 }
-        );
-    }
-
-    #[test]
-    fn test_execution_mode_ne_different_variants() {
-        assert_ne!(ExecutionMode::Inline, ExecutionMode::Background);
-        assert_ne!(
-            ExecutionMode::Background,
-            ExecutionMode::Scheduled { run_at: Utc::now() }
-        );
-    }
-
-    #[test]
-    fn test_execution_mode_debug() {
-        let debug = format!("{:?}", ExecutionMode::Background);
-        assert_eq!(debug, "Background");
     }
 
     // =========================================================================

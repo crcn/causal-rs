@@ -1,16 +1,16 @@
 //! # Seesaw
 //!
-//! A deterministic, event-driven coordination layer where machines decide,
-//! effects execute, and transactions define authority.
+//! An event-driven runtime for building reactive systems.
 //!
 //! ## Core Concepts
 //!
-//! Seesaw separates **facts** from **intent**:
+//! Seesaw is built on events - facts about what happened:
 //! - [`Event`] = Facts (what happened)
-//! - [`Command`] = Intent (requests for IO with transaction authority)
+//! - [`Effect`] = Handlers that react to events and emit new events
+//! - [`Edge`] = Entry points that trigger event flows
 //!
-//! The key principle: **One Command = One Effect = One Transaction**.
-//! If multiple writes must be atomic, they belong in one command handled by one effect.
+//! The key principle: **Event → Effect → Event**.
+//! Simple, direct flow with clean state management.
 //!
 //! ## Architecture
 //!
@@ -157,75 +157,49 @@
 
 // Core modules
 mod bus;
-mod command_macro;
 mod core;
 mod dispatch;
+mod edge;
 mod effect_impl;
 mod engine;
 mod error;
-mod machine;
+mod reducer;
 mod request;
 mod runtime;
-mod tap;
-
-// Job interfaces (policy-light)
-pub mod job;
-
-// Debug auditing for event visibility
-#[cfg(debug_assertions)]
-pub mod audit;
 
 // Testing utilities are in the separate seesaw-testing crate
 
-// Code smell tests (test-only)
-#[cfg(test)]
-mod codesmell_tests;
-
-// Stress tests (test-only)
-#[cfg(test)]
-mod stress_tests;
-
-// Serde auto-serialization tests (test-only)
-#[cfg(test)]
-mod serde_auto_tests;
-
 // Re-export core traits
 pub use crate::core::{
-    AnyCommand, Command, CorrelationId, EnvelopeMatch, Event, EventEnvelope, EventRole,
-    ExecutionMode, JobSpec, MatchChain, SerializableCommand,
+    CorrelationId, EnvelopeMatch, Event, EventEnvelope, EventRole, MatchChain,
 };
 
 // Re-export request helpers (syntactic sugar over event bus)
 pub use request::{dispatch_request, dispatch_request_timeout, DEFAULT_REQUEST_TIMEOUT};
 
 // Re-export error types
-pub use crate::error::{
-    BatchOutcome, Categorizable, CommandFailed, SafeErrorCategory, SeesawError,
-};
+pub use crate::error::{SeesawError};
 
-// Re-export machine types
-pub use machine::Machine;
+// Re-export edge types (entry points)
+pub use edge::{Edge, EdgeContext};
+
+// Re-export reducer types (state transformation)
+pub use reducer::Reducer;
 
 // Re-export effect types
 pub use effect_impl::{Effect, EffectContext, ToolContext};
-
-// Re-export tap types (event observation)
-pub use tap::{EventTap, TapContext};
 
 // Re-export bus types
 pub use bus::EventBus;
 
 // Re-export dispatcher types
-pub use dispatch::{Dispatcher, JobQueue, NoOpJobQueue};
-
-// Re-export job types (policy-light interfaces)
-pub use job::{ClaimedJob, CommandRegistry, DeserializationError, FailureKind, JobStore};
+pub use dispatch::Dispatcher;
 
 // Re-export runtime types
 pub use runtime::{Runtime, RuntimeBuilder};
 
 // Re-export engine types (primary entry point)
-pub use engine::{Engine, EngineBuilder, EngineHandle, InflightBatch, InflightTracker};
+pub use engine::{Engine, EngineBuilder, EngineHandle, InflightTracker};
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;

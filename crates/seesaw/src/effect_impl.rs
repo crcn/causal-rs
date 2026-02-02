@@ -1,14 +1,13 @@
-//! Effect trait and context for command execution.
+//! Effect trait and context for event handling.
 //!
-//! Effects are command handlers that execute IO and return events.
-//! They are **stateless** - commands carry all needed data.
+//! Effects are event handlers that execute IO and emit new events.
 //!
 //! # Key Properties
 //!
-//! - **One Command = One Effect = One Event**
-//! - **Stateless**: No access to machine state, commands carry data
-//! - **Return events**: Effects return events describing outcomes (Runtime emits)
-//! - **Narrow context**: Only `deps()` and `signal()` available
+//! - **Event → Effect → Event**: Simple, direct flow
+//! - **Can be stateful or stateless**: Your choice with `&mut self`
+//! - **Return events**: Effects return `Option<Event>` (Runtime emits)
+//! - **State flow**: Effects receive per-execution state via `EffectContext<D, S>`
 
 use std::any::Any;
 use std::sync::Arc;
@@ -17,11 +16,17 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::bus::EventBus;
-use crate::core::{Command, CorrelationId, Event, EventEnvelope};
+use crate::core::{CorrelationId, Event, EventEnvelope};
 use crate::engine::InflightTracker;
-use crate::error::SeesawError;
 
 /// Context passed to effect handlers.
+///
+/// # State Flow
+///
+/// `EffectContext<D, S>` carries per-execution state that flows through the system:
+/// - Initial state comes from `engine.run(edge, state)`
+/// - Reducers transform state before effects
+/// - Effects access state via `ctx.state()`
 ///
 /// # Immutability Invariant (CRITICAL)
 ///
@@ -30,16 +35,16 @@ use crate::error::SeesawError;
 ///
 /// This invariant is critical for batch operations where `ctx.clone()` is used:
 /// ```ignore
-/// for command in commands {
-///     events.push(self.execute(command, ctx.clone()).await?);
+/// for event in events {
+///     results.push(self.handle(event, ctx.clone()).await?);
 /// }
 /// ```
 ///
 /// **DO NOT add to EffectContext:**
 /// - Counters or timers
-/// - "First command" flags
+/// - "First event" flags
 /// - Retry metadata
-/// - Any per-command mutable state
+/// - Any per-event mutable state
 ///
 /// Such additions would silently break batch semantics.
 ///
@@ -48,35 +53,42 @@ use crate::error::SeesawError;
 /// `EffectContext` is intentionally narrow to prevent effects from
 /// accumulating too much power. Effects should only:
 /// 1. Access dependencies via `deps()`
-/// 2. Return events (Runtime emits)
-/// 3. Optionally signal UI progress via `signal()`
+/// 2. Access state via `state()`
+/// 3. Return events (Runtime emits)
+/// 4. Optionally signal UI progress via `signal()`
 ///
 /// Effects do NOT have access to:
 /// - The raw EventBus (removed)
-/// - Machine state
 /// - Spawning their own emitters
 ///
 /// # Correlation Propagation
 ///
 /// When an effect returns an event, the correlation ID from the original
-/// command is automatically propagated. This enables `emit_and_await`
+/// event is automatically propagated. This enables `emit_and_await`
 /// to track all cascading work.
 ///
 /// # Example
 ///
 /// ```ignore
-/// async fn execute(&self, cmd: CreateUserCommand, ctx: EffectContext<MyDeps>) -> Result<UserEvent> {
-///     // Access dependencies
-///     let user = ctx.deps().db.transaction(|tx| async {
-///         User::create(cmd.email, cmd.name, tx).await
-///     }).await?;
+/// async fn handle(&mut self, event: UserEvent, ctx: EffectContext<MyDeps, RequestState>) -> Result<Option<UserEvent>> {
+///     match event {
+///         UserEvent::SignupRequested { email, name } => {
+///             // Access state
+///             let visitor_id = ctx.state().visitor_id;
 ///
-///     // Return event (Runtime emits with correlation ID)
-///     Ok(UserEvent::Created { user_id: user.id })
+///             // Access dependencies
+///             let user = ctx.deps().db.create_user(&email, &name, visitor_id).await?;
+///
+///             // Return event (Runtime emits with correlation ID)
+///             Ok(Some(UserEvent::SignedUp { user_id: user.id, email }))
+///         }
+///         _ => Ok(None)
+///     }
 /// }
 /// ```
-pub struct EffectContext<D> {
+pub struct EffectContext<D, S = ()> {
     deps: Arc<D>,
+    state: S,
     bus: EventBus,
     /// Correlation ID to propagate on emit (None for fire-and-forget)
     cid: Option<CorrelationId>,
@@ -84,14 +96,15 @@ pub struct EffectContext<D> {
     inflight: Option<Arc<InflightTracker>>,
 }
 
-impl<D> EffectContext<D> {
+impl<D, S> EffectContext<D, S> {
     /// Create a new effect context without correlation (fire-and-forget).
     ///
     /// Use this for edge functions and other contexts outside the seesaw
     /// dispatch loop where correlation tracking is not needed.
-    pub fn new(deps: Arc<D>, bus: EventBus) -> Self {
+    pub fn new(deps: Arc<D>, state: S, bus: EventBus) -> Self {
         Self {
             deps,
+            state,
             bus,
             cid: None,
             inflight: None,
@@ -104,12 +117,14 @@ impl<D> EffectContext<D> {
     /// `emit_and_await` to track cascading work.
     pub(crate) fn with_correlation(
         deps: Arc<D>,
+        state: S,
         bus: EventBus,
         cid: CorrelationId,
         inflight: Option<Arc<InflightTracker>>,
     ) -> Self {
         Self {
             deps,
+            state,
             bus,
             cid: Some(cid),
             inflight,
@@ -124,6 +139,16 @@ impl<D> EffectContext<D> {
     /// - Configuration
     pub fn deps(&self) -> &D {
         &self.deps
+    }
+
+    /// Get the per-execution state.
+    ///
+    /// State flows through the system:
+    /// - Initial state from `engine.run(edge, state)`
+    /// - Transformed by reducers
+    /// - Accessible to effects
+    pub fn state(&self) -> &S {
+        &self.state
     }
 
     /// Get the correlation ID for outbox writes.
@@ -228,7 +253,7 @@ impl<D> Clone for ToolContext<D> {
     }
 }
 
-impl<D> EffectContext<D> {
+impl<D, S> EffectContext<D, S> {
     /// Get a context suitable for interactive tool execution.
     ///
     /// This provides the deps and bus needed by agent tools that call
@@ -241,10 +266,11 @@ impl<D> EffectContext<D> {
     }
 }
 
-impl<D> Clone for EffectContext<D> {
+impl<D, S: Clone> Clone for EffectContext<D, S> {
     fn clone(&self) -> Self {
         Self {
             deps: self.deps.clone(),
+            state: self.state.clone(),
             bus: self.bus.clone(),
             cid: self.cid,
             inflight: self.inflight.clone(),
@@ -252,24 +278,26 @@ impl<D> Clone for EffectContext<D> {
     }
 }
 
-impl<D> std::fmt::Debug for EffectContext<D> {
+impl<D, S> std::fmt::Debug for EffectContext<D, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EffectContext").finish_non_exhaustive()
     }
 }
 
-/// Effect handler for executing commands.
+/// Effect handler for reacting to events.
 ///
-/// Effects are the IO layer of seesaw. They:
-/// 1. Receive commands (intent for IO)
-/// 2. Execute database transactions, API calls, etc.
-/// 3. Return events describing outcomes (Runtime emits them)
+/// Effects are the reactive layer of seesaw. They:
+/// 1. Receive events (signals about what happened)
+/// 2. Execute database transactions, API calls, make decisions, etc.
+/// 3. Return `Option<Event>` describing outcomes (Runtime emits them)
 ///
 /// # Key Principles
 ///
-/// - Effects return `Result<Self::Event>`. The Runtime is the only authority that emits facts.
-/// - Effects may read state but must not retain state across executions.
-/// - This ensures determinism, replayability, and auditability.
+/// - Effects have `&mut self` and can maintain state across invocations
+/// - Effects return `Result<Option<Self::Event>>`. Return `None` if the event doesn't apply.
+/// - Effects can be pure or impure, stateful or stateless - your choice.
+/// - Effects can make decisions, branch on conditions, hold state.
+/// - Effects access per-execution state via `ctx.state()`
 ///
 /// # Transaction Boundaries
 ///
@@ -280,194 +308,198 @@ impl<D> std::fmt::Debug for EffectContext<D> {
 /// # Example
 ///
 /// ```ignore
-/// struct CreateUserEffect;
+/// struct SignupEffect;
 ///
 /// #[async_trait]
-/// impl Effect<CreateUserCommand, MyDeps> for CreateUserEffect {
+/// impl Effect<UserEvent, MyDeps, RequestState> for SignupEffect {
 ///     type Event = UserEvent;
 ///
-///     async fn execute(&self, cmd: CreateUserCommand, ctx: EffectContext<MyDeps>) -> Result<UserEvent> {
-///         let user = ctx.deps().db.transaction(|tx| async {
-///             let user = User::create(&cmd.email, &cmd.name, tx).await?;
-///             UserProfile::create(user.id, tx).await?;
-///             Ok(user)
-///         }).await?;
-///
-///         Ok(UserEvent::Created { user_id: user.id, email: cmd.email })
+///     async fn handle(&mut self, event: UserEvent, ctx: EffectContext<MyDeps, RequestState>) -> Result<Option<UserEvent>> {
+///         match event {
+///             UserEvent::SignupRequested { email, name } => {
+///                 let visitor_id = ctx.state().visitor_id;
+///                 let user = ctx.deps().db.create_user(&email, &name, visitor_id).await?;
+///                 Ok(Some(UserEvent::SignedUp { user_id: user.id, email }))
+///             }
+///             _ => Ok(None)
+///         }
 ///     }
 /// }
 /// ```
 #[async_trait]
-pub trait Effect<C: Command, D>: Send + Sync + 'static {
+pub trait Effect<E: Event + Clone, D, S = ()>: Send + Sync + 'static
+where
+    S: Send,
+{
     /// The event type this effect produces.
     type Event: Event;
 
-    /// Execute a command and return an event.
+    /// Handle an event and optionally return a new event.
     ///
     /// The Runtime wraps the returned event in an EventEnvelope and emits it.
     /// Effects do not emit directly - they return events.
     ///
+    /// Return:
+    /// - `Ok(Some(event))` to emit a new event
+    /// - `Ok(None)` if this event doesn't apply to this effect
+    /// - `Err` if the event handling fails
+    ///
     /// # Errors
     ///
-    /// Return `Err` if the command execution fails. The Runtime converts
-    /// errors to sanitized `CommandFailed` events.
-    async fn execute(&self, command: C, ctx: EffectContext<D>) -> Result<Self::Event>;
+    /// Return `Err` if the event handling fails. Errors will propagate
+    /// and stop the event flow.
+    async fn handle(&mut self, event: E, ctx: EffectContext<D, S>) -> Result<Option<Self::Event>>;
 
-    /// Execute multiple commands of the same type.
+    /// Handle multiple events of the same type.
     ///
-    /// Returns `Vec<Self::Event>` - one event per command.
-    /// The default implementation calls `execute` sequentially with early return on error.
+    /// Returns `Vec<Option<Self::Event>>` - one result per input event.
+    /// The default implementation calls `handle` sequentially with early return on error.
     ///
     /// Override this method to optimize batch operations:
     /// - Bulk database inserts
-    /// - Single transaction for multiple writes
+    /// - Single transaction for multiple operations
     /// - Batch API calls
     ///
     /// # Semantics
     ///
-    /// - Commands are processed in order (no reordering)
+    /// - Events are processed in order (no reordering)
     /// - Default is fail-fast (first error stops processing)
-    /// - Each command produces exactly one event
-    ///
-    /// # ⚠️ NOT TRANSACTIONAL (Critical)
-    ///
-    /// `execute_batch` is **NOT atomic**. It provides:
-    /// - Sequential execution with early abort on first error
-    /// - **NO rollback** of previously executed commands
-    /// - Partial success is possible and common
-    ///
-    /// If 5 commands are submitted and command 3 fails:
-    /// - Commands 1-2: **Executed and committed** (side effects persist)
-    /// - Command 3: **Failed** (error returned)
-    /// - Commands 4-5: **Never attempted**
-    ///
-    /// **This is intentional.** True atomicity across commands would require:
-    /// - Distributed transactions (complexity explosion)
-    /// - Command-level rollback logic (violates stateless effects)
-    /// - Transaction coordinators (wrong abstraction layer)
-    ///
-    /// If you need atomicity, use a single command with a single transaction
-    /// inside the effect. That's the seesaw model: **One Command = One Transaction**.
+    /// - Each input event produces exactly one output (Some event or None)
     ///
     /// # Example
     ///
     /// ```ignore
-    /// async fn execute_batch(&self, commands: Vec<C>, ctx: EffectContext<D>) -> Result<Vec<Self::Event>> {
-    ///     // Single transaction for all commands
-    ///     let ids: Vec<_> = commands.iter().map(|c| c.id).collect();
-    ///     ctx.deps().db.bulk_insert(&commands).await?;
-    ///     Ok(ids.into_iter().map(|id| MyEvent::Created { id }).collect())
+    /// async fn handle_batch(&mut self, events: Vec<E>, ctx: EffectContext<D, S>) -> Result<Vec<Option<Self::Event>>> {
+    ///     // Single transaction for all events
+    ///     let ids: Vec<_> = events.iter().map(|e| e.id).collect();
+    ///     ctx.deps().db.bulk_insert(&events).await?;
+    ///     Ok(ids.into_iter().map(|id| Some(MyEvent::Created { id })).collect())
     /// }
     /// ```
-    async fn execute_batch(
-        &self,
-        commands: Vec<C>,
-        ctx: EffectContext<D>,
-    ) -> Result<Vec<Self::Event>>
+    async fn handle_batch(
+        &mut self,
+        events: Vec<E>,
+        ctx: EffectContext<D, S>,
+    ) -> Result<Vec<Option<Self::Event>>>
     where
         D: Send + Sync + 'static,
+        S: Clone + Send + 'static,
     {
-        let mut events = Vec::with_capacity(commands.len());
-        for command in commands {
-            events.push(self.execute(command, ctx.clone()).await?);
+        let mut output_events = Vec::with_capacity(events.len());
+        for event in events {
+            output_events.push(self.handle(event, ctx.clone()).await?);
         }
-        Ok(events)
+        Ok(output_events)
     }
 }
 
 /// Type-erased effect trait for internal use.
 ///
-/// Returns `EventEnvelope` so the Runtime can emit events.
+/// Returns `Option<EventEnvelope>` so the Runtime can emit events.
 #[async_trait]
-pub(crate) trait AnyEffect<D>: Send + Sync {
-    /// Execute a type-erased command and return an event envelope.
+pub(crate) trait AnyEffect<D, S>: Send + Sync {
+    /// Handle a type-erased event and optionally return an event envelope.
     ///
     /// The Runtime emits the returned envelope - effects never emit directly.
-    async fn execute_any(
-        &self,
-        command: Box<dyn Any + Send + Sync>,
-        ctx: EffectContext<D>,
-    ) -> Result<EventEnvelope>;
+    async fn handle_any(
+        &mut self,
+        event: Arc<dyn Any + Send + Sync>,
+        ctx: EffectContext<D, S>,
+    ) -> Result<Option<EventEnvelope>>;
 
-    /// Execute a batch of type-erased commands and return event envelopes.
+    /// Handle a batch of type-erased events and return event envelopes.
     ///
-    /// Returns one envelope per command. The Runtime emits all of them.
-    async fn execute_any_batch(
-        &self,
-        commands: Vec<Box<dyn Any + Send + Sync>>,
-        ctx: EffectContext<D>,
-    ) -> Result<Vec<EventEnvelope>>;
+    /// Returns one optional envelope per input event. The Runtime emits all non-None results.
+    async fn handle_any_batch(
+        &mut self,
+        events: Vec<Arc<dyn Any + Send + Sync>>,
+        ctx: EffectContext<D, S>,
+    ) -> Result<Vec<Option<EventEnvelope>>>;
 }
 
 /// Wrapper to make concrete effects implement AnyEffect.
-pub(crate) struct EffectWrapper<E, C, D>
+pub(crate) struct EffectWrapper<Eff, E, D, S = ()>
 where
-    E: Effect<C, D>,
-    C: Command,
+    Eff: Effect<E, D, S>,
+    E: Event + Clone,
     D: Send + Sync + 'static,
+    S: Send + 'static,
 {
-    effect: E,
-    _phantom: std::marker::PhantomData<(C, D)>,
+    effect: Arc<tokio::sync::Mutex<Eff>>,
+    _phantom: std::marker::PhantomData<(E, D, S)>,
 }
 
-impl<E, C, D> EffectWrapper<E, C, D>
+impl<Eff, E, D, S> EffectWrapper<Eff, E, D, S>
 where
-    E: Effect<C, D>,
-    C: Command,
+    Eff: Effect<E, D, S>,
+    E: Event + Clone,
     D: Send + Sync + 'static,
+    S: Send + 'static,
 {
-    pub fn new(effect: E) -> Self {
+    pub fn new(effect: Eff) -> Self {
         Self {
-            effect,
+            effect: Arc::new(tokio::sync::Mutex::new(effect)),
             _phantom: std::marker::PhantomData,
         }
     }
 }
 
 #[async_trait]
-impl<Eff, C, D> AnyEffect<D> for EffectWrapper<Eff, C, D>
+impl<Eff, E, D, S> AnyEffect<D, S> for EffectWrapper<Eff, E, D, S>
 where
-    Eff: Effect<C, D>,
-    C: Command,
+    Eff: Effect<E, D, S>,
+    E: Event + Clone,
     D: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    async fn execute_any(
-        &self,
-        command: Box<dyn Any + Send + Sync>,
-        ctx: EffectContext<D>,
-    ) -> Result<EventEnvelope> {
-        let command = command
-            .downcast::<C>()
-            .map_err(|c| SeesawError::CommandTypeMismatch {
-                expected: std::any::type_name::<C>(),
-                actual_type_id: (*c).type_id(),
-            })?;
+    async fn handle_any(
+        &mut self,
+        event: Arc<dyn Any + Send + Sync>,
+        ctx: EffectContext<D, S>,
+    ) -> Result<Option<EventEnvelope>> {
+        // Try to downcast the Arc<dyn Any> to &E
+        let input_event = event
+            .downcast_ref::<E>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "event type mismatch: expected {}, got TypeId {:?}",
+                    std::any::type_name::<E>(),
+                    (*event).type_id()
+                )
+            })?
+            .clone();
+
         let cid = ctx.correlation_id();
-        let event = self.effect.execute(*command, ctx).await?;
-        Ok(EventEnvelope::new(cid, event))
+        let mut effect = self.effect.lock().await;
+        let output_event = effect.handle(input_event, ctx).await?;
+        Ok(output_event.map(|e| EventEnvelope::new(cid, e)))
     }
 
-    async fn execute_any_batch(
-        &self,
-        commands: Vec<Box<dyn Any + Send + Sync>>,
-        ctx: EffectContext<D>,
-    ) -> Result<Vec<EventEnvelope>> {
-        let typed: Result<Vec<C>, _> = commands
+    async fn handle_any_batch(
+        &mut self,
+        events: Vec<Arc<dyn Any + Send + Sync>>,
+        ctx: EffectContext<D, S>,
+    ) -> Result<Vec<Option<EventEnvelope>>> {
+        let typed: Result<Vec<E>, _> = events
             .into_iter()
-            .map(|c| {
-                c.downcast::<C>()
-                    .map(|b| *b)
-                    .map_err(|c| SeesawError::CommandTypeMismatch {
-                        expected: std::any::type_name::<C>(),
-                        actual_type_id: (*c).type_id(),
+            .map(|e| {
+                e.downcast_ref::<E>()
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "event type mismatch: expected {}, got TypeId {:?}",
+                            std::any::type_name::<E>(),
+                            (*e).type_id()
+                        )
                     })
             })
             .collect();
         let cid = ctx.correlation_id();
-        let events = self.effect.execute_batch(typed?, ctx).await?;
-        Ok(events
+        let mut effect = self.effect.lock().await;
+        let output_events = effect.handle_batch(typed?, ctx).await?;
+        Ok(output_events
             .into_iter()
-            .map(|e| EventEnvelope::new(cid, e))
+            .map(|opt| opt.map(|e| EventEnvelope::new(cid, e)))
             .collect())
     }
 }
@@ -483,17 +515,32 @@ mod tests {
         value: i32,
     }
 
-    #[derive(Debug, Clone, PartialEq)]
-    struct TestCommand {
-        action: String,
+    #[derive(Debug, Clone)]
+    struct TestState {
+        counter: i32,
     }
-    impl Command for TestCommand {}
 
     #[derive(Debug, Clone, PartialEq)]
     struct TestEvent {
+        action: String,
+    }
+
+    impl Event for TestEvent {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct OutputEvent {
         result: String,
     }
-    // Event auto-impl by blanket
+
+    impl Event for OutputEvent {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
 
     // Test effect
     struct TestEffect {
@@ -501,50 +548,54 @@ mod tests {
     }
 
     #[async_trait]
-    impl Effect<TestCommand, TestDeps> for TestEffect {
-        type Event = TestEvent;
+    impl Effect<TestEvent, TestDeps, TestState> for TestEffect {
+        type Event = OutputEvent;
 
-        async fn execute(
-            &self,
-            cmd: TestCommand,
-            ctx: EffectContext<TestDeps>,
-        ) -> Result<TestEvent> {
+        async fn handle(
+            &mut self,
+            event: TestEvent,
+            ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<Option<OutputEvent>> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
 
-            // Access deps
+            // Access deps and state
             let value = ctx.deps().value;
+            let counter = ctx.state().counter;
 
             // Return event (Runtime emits)
-            Ok(TestEvent {
-                result: format!("{} with value {}", cmd.action, value),
-            })
+            Ok(Some(OutputEvent {
+                result: format!("{} with value {} counter {}", event.action, value, counter),
+            }))
         }
     }
 
     #[tokio::test]
-    async fn test_effect_context_deps() {
+    async fn test_effect_context_deps_and_state() {
         let deps = Arc::new(TestDeps { value: 42 });
+        let state = TestState { counter: 10 };
         let bus = EventBus::new();
-        let ctx = EffectContext::new(deps, bus);
+        let ctx = EffectContext::new(deps, state, bus);
 
         assert_eq!(ctx.deps().value, 42);
+        assert_eq!(ctx.state().counter, 10);
     }
 
     #[tokio::test]
-    async fn test_effect_execute() {
+    async fn test_effect_handle() {
         let call_count = Arc::new(AtomicUsize::new(0));
-        let effect = TestEffect {
+        let mut effect = TestEffect {
             call_count: call_count.clone(),
         };
 
         let deps = Arc::new(TestDeps { value: 100 });
+        let state = TestState { counter: 5 };
         let bus = EventBus::new();
 
-        let ctx = EffectContext::new(deps, bus);
+        let ctx = EffectContext::new(deps, state, bus);
 
         let event = effect
-            .execute(
-                TestCommand {
+            .handle(
+                TestEvent {
                     action: "test".to_string(),
                 },
                 ctx,
@@ -553,7 +604,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
-        assert_eq!(event.result, "test with value 100");
+        assert_eq!(
+            event.unwrap().result,
+            "test with value 100 counter 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effect_handle_returns_none() {
+        struct FilterEffect;
+
+        #[async_trait]
+        impl Effect<TestEvent, TestDeps, TestState> for FilterEffect {
+            type Event = OutputEvent;
+
+            async fn handle(
+                &mut self,
+                event: TestEvent,
+                _ctx: EffectContext<TestDeps, TestState>,
+            ) -> Result<Option<OutputEvent>> {
+                if event.action == "skip" {
+                    Ok(None)
+                } else {
+                    Ok(Some(OutputEvent {
+                        result: "handled".to_string(),
+                    }))
+                }
+            }
+        }
+
+        let mut effect = FilterEffect;
+        let deps = Arc::new(TestDeps { value: 0 });
+        let state = TestState { counter: 0 };
+        let bus = EventBus::new();
+        let ctx = EffectContext::new(deps, state, bus);
+
+        let result1 = effect
+            .handle(TestEvent { action: "skip".to_string() }, ctx.clone())
+            .await
+            .unwrap();
+        assert!(result1.is_none());
+
+        let result2 = effect
+            .handle(TestEvent { action: "process".to_string() }, ctx)
+            .await
+            .unwrap();
+        assert_eq!(result2.unwrap().result, "handled");
     }
 
     #[tokio::test]
@@ -562,43 +658,49 @@ mod tests {
         let effect = TestEffect {
             call_count: call_count.clone(),
         };
-        let wrapper = EffectWrapper::new(effect);
+        let mut wrapper = EffectWrapper::new(effect);
 
         let deps = Arc::new(TestDeps { value: 50 });
+        let state = TestState { counter: 3 };
         let bus = EventBus::new();
-        let ctx = EffectContext::new(deps, bus);
+        let ctx = EffectContext::new(deps, state, bus);
 
-        let cmd: Box<dyn Any + Send + Sync> = Box::new(TestCommand {
+        let event: Box<dyn Any + Send + Sync> = Box::new(TestEvent {
             action: "wrapped".to_string(),
         });
 
-        let envelope = wrapper.execute_any(cmd, ctx).await.unwrap();
+        let envelope = wrapper.handle_any(event, ctx).await.unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
-        // Verify the envelope contains the expected event
-        let event = envelope.downcast_ref::<TestEvent>().unwrap();
-        assert_eq!(event.result, "wrapped with value 50");
+        assert!(envelope.is_some());
+        let event = envelope.unwrap().downcast_ref::<OutputEvent>().unwrap();
+        assert_eq!(event.result, "wrapped with value 50 counter 3");
     }
 
     #[tokio::test]
-    async fn test_effect_wrapper_wrong_command_type() {
+    async fn test_effect_wrapper_wrong_event_type() {
         let effect = TestEffect {
             call_count: Arc::new(AtomicUsize::new(0)),
         };
-        let wrapper = EffectWrapper::new(effect);
+        let mut wrapper = EffectWrapper::new(effect);
 
         let deps = Arc::new(TestDeps { value: 0 });
+        let state = TestState { counter: 0 };
         let bus = EventBus::new();
-        let ctx = EffectContext::new(deps, bus);
+        let ctx = EffectContext::new(deps, state, bus);
 
-        // Wrong command type
+        // Wrong event type
         #[derive(Debug)]
-        struct WrongCommand;
-        impl Command for WrongCommand {}
+        struct WrongEvent;
+        impl Event for WrongEvent {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
 
-        let cmd: Box<dyn Any + Send + Sync> = Box::new(WrongCommand);
+        let event: Box<dyn Any + Send + Sync> = Box::new(WrongEvent);
 
-        let result = wrapper.execute_any(cmd, ctx).await;
+        let result = wrapper.handle_any(event, ctx).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("type mismatch"));
     }
@@ -607,38 +709,37 @@ mod tests {
     struct FailingEffect;
 
     #[async_trait]
-    impl Effect<TestCommand, TestDeps> for FailingEffect {
-        type Event = TestEvent;
+    impl Effect<TestEvent, TestDeps, TestState> for FailingEffect {
+        type Event = OutputEvent;
 
-        async fn execute(
-            &self,
-            _cmd: TestCommand,
-            _ctx: EffectContext<TestDeps>,
-        ) -> Result<TestEvent> {
-            // Effects that fail just return Err - Runtime converts to CommandFailed
+        async fn handle(
+            &mut self,
+            _event: TestEvent,
+            _ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<Option<OutputEvent>> {
             Err(anyhow::anyhow!("effect failed"))
         }
     }
 
     #[tokio::test]
     async fn test_effect_error() {
-        let effect = FailingEffect;
+        let mut effect = FailingEffect;
 
         let deps = Arc::new(TestDeps { value: 0 });
+        let state = TestState { counter: 0 };
         let bus = EventBus::new();
 
-        let ctx = EffectContext::new(deps, bus);
+        let ctx = EffectContext::new(deps, state, bus);
 
         let result = effect
-            .execute(
-                TestCommand {
+            .handle(
+                TestEvent {
                     action: "fail".to_string(),
                 },
                 ctx,
             )
             .await;
 
-        // Should return error (Runtime converts to CommandFailed event)
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("effect failed"));
     }
@@ -646,11 +747,13 @@ mod tests {
     #[tokio::test]
     async fn test_effect_context_clone() {
         let deps = Arc::new(TestDeps { value: 42 });
+        let state = TestState { counter: 10 };
         let bus = EventBus::new();
-        let ctx1 = EffectContext::new(deps, bus);
+        let ctx1 = EffectContext::new(deps, state, bus);
         let ctx2 = ctx1.clone();
 
         assert_eq!(ctx1.deps().value, ctx2.deps().value);
+        assert_eq!(ctx1.state().counter, ctx2.state().counter);
     }
 
     // Test effect with custom batch implementation
@@ -660,32 +763,32 @@ mod tests {
     }
 
     #[async_trait]
-    impl Effect<TestCommand, TestDeps> for BatchOptimizedEffect {
-        type Event = TestEvent;
+    impl Effect<TestEvent, TestDeps, TestState> for BatchOptimizedEffect {
+        type Event = OutputEvent;
 
-        async fn execute(
-            &self,
-            cmd: TestCommand,
-            _ctx: EffectContext<TestDeps>,
-        ) -> Result<TestEvent> {
+        async fn handle(
+            &mut self,
+            event: TestEvent,
+            _ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<Option<OutputEvent>> {
             self.individual_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(TestEvent {
-                result: format!("individual: {}", cmd.action),
-            })
+            Ok(Some(OutputEvent {
+                result: format!("individual: {}", event.action),
+            }))
         }
 
-        async fn execute_batch(
-            &self,
-            commands: Vec<TestCommand>,
-            _ctx: EffectContext<TestDeps>,
-        ) -> Result<Vec<TestEvent>> {
+        async fn handle_batch(
+            &mut self,
+            events: Vec<TestEvent>,
+            _ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<Vec<Option<OutputEvent>>> {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
 
             // Simulated bulk operation - return one event for the batch
-            let actions: Vec<_> = commands.iter().map(|c| c.action.as_str()).collect();
-            Ok(vec![TestEvent {
+            let actions: Vec<_> = events.iter().map(|e| e.action.as_str()).collect();
+            Ok(vec![Some(OutputEvent {
                 result: format!("batch: [{}]", actions.join(", ")),
-            }])
+            })])
         }
     }
 
@@ -694,68 +797,70 @@ mod tests {
         let individual_calls = Arc::new(AtomicUsize::new(0));
         let batch_calls = Arc::new(AtomicUsize::new(0));
 
-        let effect = BatchOptimizedEffect {
+        let mut effect = BatchOptimizedEffect {
             individual_calls: individual_calls.clone(),
             batch_calls: batch_calls.clone(),
         };
 
         let deps = Arc::new(TestDeps { value: 0 });
+        let state = TestState { counter: 0 };
         let bus = EventBus::new();
 
-        let ctx = EffectContext::new(deps, bus);
+        let ctx = EffectContext::new(deps, state, bus);
 
-        let commands = vec![
-            TestCommand {
+        let events = vec![
+            TestEvent {
                 action: "a".to_string(),
             },
-            TestCommand {
+            TestEvent {
                 action: "b".to_string(),
             },
-            TestCommand {
+            TestEvent {
                 action: "c".to_string(),
             },
         ];
 
-        let events = effect.execute_batch(commands, ctx).await.unwrap();
+        let results = effect.handle_batch(events, ctx).await.unwrap();
 
         // Should use batch path, not individual
         assert_eq!(individual_calls.load(Ordering::Relaxed), 0);
         assert_eq!(batch_calls.load(Ordering::Relaxed), 1);
 
         // Should return single batch event (custom batch can consolidate)
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].result, "batch: [a, b, c]");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().result, "batch: [a, b, c]");
     }
 
     #[tokio::test]
-    async fn test_effect_default_batch_uses_execute() {
+    async fn test_effect_default_batch_uses_handle() {
         let call_count = Arc::new(AtomicUsize::new(0));
-        let effect = TestEffect {
+        let mut effect = TestEffect {
             call_count: call_count.clone(),
         };
 
         let deps = Arc::new(TestDeps { value: 100 });
+        let state = TestState { counter: 2 };
         let bus = EventBus::new();
 
-        let ctx = EffectContext::new(deps, bus);
+        let ctx = EffectContext::new(deps, state, bus);
 
-        let commands = vec![
-            TestCommand {
+        let events = vec![
+            TestEvent {
                 action: "x".to_string(),
             },
-            TestCommand {
+            TestEvent {
                 action: "y".to_string(),
             },
         ];
 
-        let events = effect.execute_batch(commands, ctx).await.unwrap();
+        let results = effect.handle_batch(events, ctx).await.unwrap();
 
-        // Default batch impl calls execute for each
+        // Default batch impl calls handle for each
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
 
         // Should return 2 individual events
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].result, "x with value 100");
-        assert_eq!(events[1].result, "y with value 100");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().result, "x with value 100 counter 2");
+        assert_eq!(results[1].as_ref().unwrap().result, "y with value 100 counter 2");
     }
 }

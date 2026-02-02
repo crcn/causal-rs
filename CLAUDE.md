@@ -1,30 +1,29 @@
 # Seesaw Architecture Guidelines
 
-**Mental Model**: Seesaw machines are pure, replayable decision functions that turn facts into intent, and nothing else.
+**Mental Model**: Events are signals. Effects react and emit new events. That's it.
 
 ## What Seesaw Is
 
-Seesaw is a **deterministic decision engine** for event-driven systems.
+Seesaw is an **event-driven runtime** for building reactive systems.
 
-It sits between:
-- **Facts** (events that already happened)
-- **Intent** (commands describing what should happen next)
+**Core flow**: Event → Effect → Event
 
-**It does not perform actions.** It decides what should be attempted next, given what has occurred so far.
+- **Events** are signals (facts that already happened)
+- **Effects** react to events, perform IO, emit new events
 
-Think: *"Given everything that has happened, what is the single correct next command?"*
+Simple, direct, no ceremony.
 
 ### Key Properties
 
-- **Is**: Coordination kernel for event → decision → command → IO cycles
-- **Is**: A pure decision function with replayable state
+- **Is**: Event-driven runtime
+- **Is**: Direct event → effect → event flows
 - **Is Not**: Event sourcing, distributed actors, retry engine, saga orchestrator, workflow engine
 
 ## Core Primitives
 
 ### Event
 
-A **fact**. Something that already happened. Immutable. Past-tense by convention.
+A **signal**. Something that already happened. Immutable. Past-tense by convention.
 
 ```rust
 #[derive(Debug, Clone)]
@@ -42,82 +41,41 @@ Events may come from:
 - Background jobs
 - External systems
 - Failed attempts
+- Other effects
 
-### Command
-
-An **intent**. A request to attempt an action. Not guaranteed to succeed.
-
-```rust
-#[derive(Debug, Clone)]
-enum ScrapeCommand {
-    ScrapeSource { source_id: Uuid },
-    ExtractNeeds { source_id: Uuid },
-    UpdateNeedStatus { need_id: Uuid, status: Status },
-}
-impl Command for ScrapeCommand {}
-```
-
-A command:
-- May succeed → emits one or more events
-- May fail → emits failure events
-- May emit nothing (noop, dedupe, denied)
-
-Execution modes: `Inline` (default), `Background`, `Scheduled { run_at }`.
-Background/Scheduled commands need `job_spec()` and `serialize_to_json()`.
-
-### Machine
-
-A **pure decision function**. Holds derived state only. Maps `Event → Option<Command>`.
-
-```rust
-impl Machine for ScrapeMachine {
-    type Event = ScrapeEvent;
-    type Command = ScrapeCommand;
-
-    fn decide(&mut self, event: &ScrapeEvent) -> Option<ScrapeCommand> {
-        // Update internal state, return Option<Command>
-        match event {
-            ScrapeEvent::SourceRequested { source_id } => {
-                self.pending.insert(*source_id);
-                Some(ScrapeCommand::ScrapeSource { source_id: *source_id })
-            }
-            ScrapeEvent::SourceScraped { source_id, .. } => {
-                self.pending.remove(source_id);
-                Some(ScrapeCommand::ExtractNeeds { source_id: *source_id })
-            }
-            _ => None
-        }
-    }
-}
-```
-
-The machine:
-- **Never** performs IO
-- **Never** blocks
-- **Never** retries
-- **Never** schedules
-- **Never** looks outside itself
+Events are the only signals in the system.
 
 ### Effect
 
-Stateless command handlers. Execute IO, emit events.
+Handlers that react to events. Execute IO, emit new events.
 
 ```rust
 #[async_trait]
-impl Effect<ScrapeCommand, Deps> for ScrapeEffect {
+impl Effect<ScrapeEvent, Deps> for ScrapeEffect {
     type Event = ScrapeEvent;
 
-    async fn execute(&self, cmd: ScrapeCommand, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
-        match cmd {
-            ScrapeCommand::ScrapeSource { source_id } => {
+    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+        match event {
+            ScrapeEvent::SourceRequested { source_id } => {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
                 Ok(ScrapeEvent::SourceScraped { source_id, data })
             }
-            _ => bail!("unhandled command")
+            ScrapeEvent::SourceScraped { source_id, data } => {
+                let items = ctx.deps().extractor.extract(&data).await?;
+                Ok(ScrapeEvent::NeedsExtracted { source_id })
+            }
+            _ => bail!("unhandled event")
         }
     }
 }
 ```
+
+Effects can:
+- Do IO (DB queries, API calls, etc.)
+- Hold state (if needed)
+- Make decisions
+- Branch on conditions
+- Be pure or impure (your choice)
 
 EffectContext provides:
 - `deps()` — shared dependencies
@@ -148,146 +106,235 @@ impl EventTap<ScrapeEvent> for ScrapeTap {
 
 ## Execution Model
 
-This is how Seesaw actually runs:
+Simple and direct:
 
-1. **An event arrives**
-   - The engine rehydrates the machine from its snapshot
-   - Calls `decide(event)`
-
-2. **The machine may emit a command**
-   - Zero or one (by default)
-   - Deterministic
-
-3. **The command is executed elsewhere**
-   - By a handler, worker, or adapter
-   - Outside the machine
-
-4. **The result comes back as an event**
-   - Success → domain event
-   - Failure → failure event
-   - Authorization → authorization event
-
-5. **Repeat**
-
-**The machine advances only by consuming events.**
-
-⚠️ **Machines never "wait"**. Waiting is modeled as "no command emitted until another event arrives."
-
-## The Seven Hard Rules
-
-**Do not violate these.** These are the Seesaw laws.
-
-### Rule 1: No IO in machines
-
-Ever.
-
-❌ **No**:
-- DB queries
-- Network calls
-- Time (`now()`)
-- Randomness
-- Config lookups
-- Environment variables
-
-If it isn't in the event or the machine's state, it doesn't exist.
-
-### Rule 2: Machines are deterministic
-
-Given:
-- The same prior events
-- The same new event
-
-You **must** get the same command.
-
-If replaying events could produce different commands → **broken**.
-
-### Rule 3: State must be derived, not authoritative
-
-Machine state:
-- Is reconstructed from events
-- May be thrown away at any time
-- Must not be the source of truth
-
-✅ **Good state**:
-```rust
-pending_scrapes: HashSet<Uuid>
-in_flight_jobs: HashMap<Uuid, JobId>
-dedupe_flags: HashSet<String>
-workflow_stage: WorkflowStage
+```
+Event emitted
+  ↓
+All Effects listening to this event
+  ↓
+Execute (IO, decisions, state checks)
+  ↓
+Emit new Event(s)
+  ↓
+Repeat
 ```
 
-❌ **Bad state**:
+**Example**: Scraping pipeline
+
 ```rust
-organization_name: String     // Should come from DB
-user_email: String            // Should come from DB
-need_description: String      // Should come from DB
+ScrapeEvent::SourceRequested
+  → ScrapeEffect.execute()
+    → scrapes URL
+    → emits ScrapeEvent::SourceScraped { data }
+  → ExtractEffect.execute()
+    → extracts items
+    → emits ScrapeEvent::NeedsExtracted { needs }
+  → SyncEffect.execute()
+    → syncs to DB
+    → emits ScrapeEvent::SyncComplete
 ```
 
-**If losing it would corrupt reality, it doesn't belong in the machine.**
+Multiple effects can listen to the same event and run in parallel.
 
-### Rule 4: Commands are requests, not guarantees
+**Example**: Parallel notifications
 
-A command:
-- May be denied
-- May fail
-- May partially succeed
-- May emit nothing
-
-**Never assume success in the machine.** Success must be confirmed by a subsequent event.
-
-❌ **Wrong**:
 ```rust
-emit(CreatePost);
-mark_as_created();  // NO! Haven't received PostCreated yet
+UserEvent::SignedUp
+  ↓
+  ├─→ EmailEffect → sends welcome email → EmailSent
+  ├─→ SlackEffect → posts to Slack → SlackPosted
+  └─→ AnalyticsEffect → tracks event → AnalyticsRecorded
 ```
 
-✅ **Correct**:
+All three effects run concurrently when `SignedUp` is emitted.
+
+## Examples
+
+### Example 1: Scraping pipeline
+
 ```rust
-// In decide():
-ScrapeEvent::SourceRequested => Some(ScrapeCommand::ScrapeSource),
-ScrapeEvent::SourceScraped => {
-    self.completed.insert(source_id);  // Only after success event
-    Some(NextCommand)
+#[derive(Debug, Clone)]
+enum ScrapeEvent {
+    SourceRequested { source_id: Uuid },
+    SourceScraped { source_id: Uuid, data: String },
+    DataExtracted { source_id: Uuid, items: Vec<Item> },
+}
+
+// Effect 1: Scrape on request
+#[async_trait]
+impl Effect<ScrapeEvent, Deps> for ScraperEffect {
+    type Event = ScrapeEvent;
+
+    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+        match event {
+            ScrapeEvent::SourceRequested { source_id } => {
+                let data = ctx.deps().scraper.scrape(source_id).await?;
+                Ok(ScrapeEvent::SourceScraped { source_id, data })
+            }
+            _ => bail!("unhandled")
+        }
+    }
+}
+
+// Effect 2: Extract on scrape
+#[async_trait]
+impl Effect<ScrapeEvent, Deps> for ExtractorEffect {
+    type Event = ScrapeEvent;
+
+    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+        match event {
+            ScrapeEvent::SourceScraped { source_id, data } => {
+                let items = ctx.deps().extractor.extract(&data).await?;
+                Ok(ScrapeEvent::DataExtracted { source_id, items })
+            }
+            _ => bail!("unhandled")
+        }
+    }
+}
+
+let engine = EngineBuilder::new(deps)
+    .with_effect::<ScrapeEvent, _>(ScraperEffect)
+    .with_effect::<ScrapeEvent, _>(ExtractorEffect)
+    .build();
+```
+
+### Example 2: Notification dispatch
+
+```rust
+#[derive(Debug, Clone)]
+enum NotificationEvent {
+    UserSignedUp { user_id: Uuid, email: String },
+    EmailSent { user_id: Uuid, email_id: Uuid },
+    SlackPosted { user_id: Uuid, message_id: String },
+}
+
+#[async_trait]
+impl Effect<NotificationEvent, Deps> for EmailEffect {
+    type Event = NotificationEvent;
+
+    async fn execute(&self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<NotificationEvent> {
+        match event {
+            NotificationEvent::UserSignedUp { user_id, email } => {
+                let email_id = ctx.deps().mailer.send_welcome(email).await?;
+                Ok(NotificationEvent::EmailSent { user_id, email_id })
+            }
+            _ => bail!("unhandled")
+        }
+    }
+}
+
+#[async_trait]
+impl Effect<NotificationEvent, Deps> for SlackEffect {
+    type Event = NotificationEvent;
+
+    async fn execute(&self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<NotificationEvent> {
+        match event {
+            NotificationEvent::UserSignedUp { user_id, .. } => {
+                let msg_id = ctx.deps().slack.post("New signup!").await?;
+                Ok(NotificationEvent::SlackPosted { user_id, message_id: msg_id })
+            }
+            _ => bail!("unhandled")
+        }
+    }
 }
 ```
 
-### Rule 5: Events close loops
+Both effects run in parallel when `UserSignedUp` is emitted. No coordination needed.
 
-Every long-running workflow must have:
-- A success terminal event **or**
-- A failure terminal event
+### Example 3: Effect with guards and state
+
+```rust
+struct RateLimitedScraperEffect {
+    pending: RwLock<HashSet<Uuid>>,
+}
+
+#[async_trait]
+impl Effect<ScrapeEvent, Deps> for RateLimitedScraperEffect {
+    type Event = ScrapeEvent;
+
+    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+        match event {
+            ScrapeEvent::SourceRequested { source_id } => {
+                // Guard: check if already pending
+                if !self.pending.write().await.insert(source_id) {
+                    bail!("already pending");
+                }
+
+                // Guard: check rate limit
+                if !ctx.deps().rate_limiter.check().await? {
+                    self.pending.write().await.remove(&source_id);
+                    bail!("rate limited");
+                }
+
+                // Do the work
+                let data = ctx.deps().scraper.scrape(source_id).await?;
+                self.pending.write().await.remove(&source_id);
+
+                Ok(ScrapeEvent::SourceScraped { source_id, data })
+            }
+            _ => bail!("unhandled")
+        }
+    }
+}
+```
+
+Effects can hold state and make decisions. You choose whether to separate pure logic or keep it together.
+
+## Design Guidelines
+
+### Events close loops
+
+Every long-running workflow should have terminal events:
+- Success events (e.g., `DataPublished`, `JobComplete`)
+- Failure events (e.g., `ScrapeFailed`, `RateLimited`)
 
 Otherwise you get:
 - Permanent "in-flight" state
 - Silent deadlocks
 - Ghost workflows
 
-### Rule 6: Machines don't branch on time
+### Effects can do anything
 
-❌ **No**:
-- `now()`
-- "if older than 5 minutes"
-- timeouts
+Effects are unconstrained. They can:
+- Do IO or be pure
+- Hold state or be stateless
+- Make complex decisions or be simple transforms
+- Branch on time, randomness, config
 
-If time matters:
-- Model it as an event (`JobTimedOut`)
-- Or let an external scheduler emit events
+You decide based on your needs.
 
-### Rule 7: Machines don't coordinate each other
+### Cross-domain listening
 
-One machine:
-- Decides only for its domain
-- Emits commands only for its handlers
+Effects can listen to events from any domain.
 
-Cross-domain coordination happens via **events**, not direct calls.
+```rust
+// CrawlEffect listening to WebsiteEvent
+impl Effect<WebsiteEvent, Deps> for CrawlEffect {
+    type Event = CrawlEvent;
+
+    async fn execute(&self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<CrawlEvent> {
+        match event {
+            WebsiteEvent::WebsiteApproved { website_id } => {
+                ctx.deps().crawler.start(website_id).await?;
+                Ok(CrawlEvent::CrawlStarted { website_id })
+            }
+            _ => bail!("unhandled")
+        }
+    }
+}
+```
+
+This is normal and correct. Cross-domain coordination happens via events.
 
 ## Role Matrix
 
-| Role    | Decide? | Mutate? | Emit? |
-| ------- | ------- | ------- | ----- |
-| Machine | Yes     | No      | No    |
-| Effect  | No      | Yes     | Yes   |
-| Tap     | No      | No      | No    |
+| Role   | React? | Mutate? | Emit?  | Listen To |
+| ------ | ------ | ------- | ------ | --------- |
+| Effect | Yes    | Yes     | Events | Events    |
+| Tap    | No     | No      | No     | Events    |
+
+Effects do the work. Taps observe.
 
 ## What Seesaw Is Not
 
@@ -318,15 +365,18 @@ State is:
 
 You don't "enter" a state. You observe that certain events have occurred.
 
-### ❌ Not business logic execution
+### ❌ Not a framework that forces patterns
 
-The machine decides **what should happen**, not **how it happens**.
+Seesaw doesn't force you to use machines or commands.
 
-Execution lives elsewhere (in Effects).
+If your flow is simple, use events and effects.
+If you need guards or branching, add machines.
 
-## Common Failure Modes
+The runtime supports both without special casing.
 
-### 1. Smuggling IO through events
+## Common Pitfalls
+
+### 1. Smuggling volatile data through events
 
 ❌ **Bad**:
 ```rust
@@ -338,51 +388,38 @@ Event::UserRequested { user_email: String }  // Email might change!
 Event::UserRequested { user_id: Uuid }  // Immutable reference
 ```
 
-Events should reference facts, not embed volatile data.
+Events should reference facts, not embed data that might change.
 
-### 2. Letting machines become mini-services
+### 2. Effects that know too much
 
-If your machine:
+If your effect:
 - Has dozens of fields
 - Mirrors database rows
-- Knows "too much"
+- Holds authoritative data
 
-You're leaking domain state into the decision layer.
+You're putting the source of truth in the wrong place. Effects should query deps, not store domain data.
 
-### 3. Assuming commands succeed
+### 3. Missing terminal events
 
-Classic bug:
+❌ **Bad**:
 ```rust
-emit(CreatePost)
-mark_as_created()  // NO! Only mark after PostCreated event
+JobStarted → ... → (nothing)  // Job stuck "in progress" forever
 ```
 
-### 4. Encoding business rules in handlers
+✅ **Better**:
+```rust
+JobStarted → ... → JobComplete
+                ↘ JobFailed
+```
 
-If rules live in handlers instead of machines:
-- ❌ You lose replayability
-- ❌ You lose auditability
-- ❌ You lose testability
-
-**Handlers execute. Machines decide.**
-
-### 5. Using machines for orchestration across domains
-
-If a machine is coordinating:
-- Payments
-- Emails
-- Search indexing
-- Analytics
-
-It's probably too big. Split by domain.
+Every long-running flow needs success and failure terminal events.
 
 ## Engine Usage
 
 ```rust
 let engine = EngineBuilder::new(deps)
-    .with_machine(MyMachine::new())
-    .with_effect::<MyCommand, _>(MyEffect)
-    .with_event_tap::<MyEvent, _>(MyTap)
+    .with_effect::<MyEvent, _>(MyEventEffect)
+    .with_event_tap::<MyEvent, _>(MyTap)  // Optional observers
     .build();
 
 let handle = engine.start();
@@ -391,6 +428,43 @@ handle.emit_and_await(MyEvent::Started).await?;   // Wait for completion
 ```
 
 Other builder methods: `.with_bus()`, `.with_inflight()`, `.with_arc(deps)`
+
+## Cross-Domain Reactions
+
+Effects can listen to events from other domains. This is normal and correct.
+
+**Pattern**: Domain A emits event → Domain B's effect reacts → Domain B emits its own events
+
+### Example: Website approval triggers crawling
+
+```rust
+// Website domain emits events
+pub enum WebsiteEvent {
+    WebsiteApproved { website_id: Uuid },
+}
+
+// Crawl effect listens to WebsiteEvent
+impl Effect<WebsiteEvent, Deps> for CrawlEffect {
+    type Event = CrawlEvent;
+
+    async fn execute(&self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<CrawlEvent> {
+        match event {
+            WebsiteEvent::WebsiteApproved { website_id } => {
+                ctx.deps().crawler.start(website_id).await?;
+                Ok(CrawlEvent::CrawlStarted { website_id })
+            }
+        }
+    }
+}
+```
+
+**Why this is correct**:
+- No domain logic leakage
+- No tight coupling (depends on event, not internal state)
+- Trivially testable
+- Explicit and localized
+
+The runtime broadcasts events. Effects that care, react. That's it.
 
 ## Request/Response Pattern
 
@@ -450,15 +524,19 @@ tx.commit().await?;
 ## Architecture Flow
 
 ```
-EventBus → Machine.decide() → Command → Dispatcher → Effect.execute() → Runtime → EventBus
-                                                                                        ↓
-                                                                                   EventTaps
+EventBus → Effect.execute(event) → Runtime → EventBus
+                                                 ↓
+                                            EventTaps
 ```
+
+Simple and direct.
 
 ## Design Principles Summary
 
-1. **Effects are reactive, not decisional** — Execute IO, emit ONE event
-2. **Events are facts, not commands** — `UserCreated`, not `CreateUser`
-3. **State drives behavior in machines** — Track state, make decisions
-4. **EffectContext is narrow** — Only `deps()` and `signal()`
-5. **One Command = One Transaction** — Multiple atomic writes belong in one command
+1. **Events are the only signals** — Everything flows through events
+2. **Effects react to events** — Do IO, emit new events
+3. **Effects are unconstrained** — Can do anything, pure or impure, stateful or stateless
+4. **Events are facts, past-tense** — `UserCreated`, not `CreateUser`
+5. **Effects can listen to any domain** — Cross-domain coordination via events
+6. **One Effect execution = One transaction** — Multiple atomic writes belong together
+7. **Terminal events close loops** — Every workflow needs success/failure events
