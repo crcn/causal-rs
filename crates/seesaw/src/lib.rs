@@ -165,6 +165,7 @@ mod engine;
 mod error;
 mod reducer;
 mod request;
+mod tap;
 
 // Testing utilities are in the separate seesaw-testing crate
 
@@ -187,6 +188,9 @@ pub use reducer::Reducer;
 
 // Re-export effect types
 pub use effect_impl::{Effect, EffectContext};
+
+// Re-export tap types (event observation)
+pub use tap::{EventTap, TapContext};
 
 // Re-export bus types
 pub use bus::EventBus;

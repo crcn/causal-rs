@@ -287,25 +287,23 @@ where
     /// The event type this effect produces.
     type Event: Event;
 
-    /// Handle an event and optionally return a new event.
+    /// Handle an event and return a new event.
     ///
     /// The Runtime wraps the returned event in an EventEnvelope and emits it.
     /// Effects do not emit directly - they return events.
     ///
-    /// Return:
-    /// - `Ok(Some(event))` to emit a new event
-    /// - `Ok(None)` if this event doesn't apply to this effect
-    /// - `Err` if the event handling fails
+    /// Effects must handle all event variants they're registered for.
+    /// Use pattern matching and handle all cases explicitly.
     ///
     /// # Errors
     ///
     /// Return `Err` if the event handling fails. Errors will propagate
     /// and stop the event flow.
-    async fn handle(&mut self, event: E, ctx: EffectContext<D, S>) -> Result<Option<Self::Event>>;
+    async fn handle(&mut self, event: E, ctx: EffectContext<D, S>) -> Result<Self::Event>;
 
     /// Handle multiple events of the same type.
     ///
-    /// Returns `Vec<Option<Self::Event>>` - one result per input event.
+    /// Returns `Vec<Self::Event>` - one result per input event.
     /// The default implementation calls `handle` sequentially with early return on error.
     ///
     /// Override this method to optimize batch operations:
@@ -317,23 +315,23 @@ where
     ///
     /// - Events are processed in order (no reordering)
     /// - Default is fail-fast (first error stops processing)
-    /// - Each input event produces exactly one output (Some event or None)
+    /// - Each input event produces exactly one output event
     ///
     /// # Example
     ///
     /// ```ignore
-    /// async fn handle_batch(&mut self, events: Vec<E>, ctx: EffectContext<D, S>) -> Result<Vec<Option<Self::Event>>> {
+    /// async fn handle_batch(&mut self, events: Vec<E>, ctx: EffectContext<D, S>) -> Result<Vec<Self::Event>> {
     ///     // Single transaction for all events
     ///     let ids: Vec<_> = events.iter().map(|e| e.id).collect();
     ///     ctx.deps().db.bulk_insert(&events).await?;
-    ///     Ok(ids.into_iter().map(|id| Some(MyEvent::Created { id })).collect())
+    ///     Ok(ids.into_iter().map(|id| MyEvent::Created { id }).collect())
     /// }
     /// ```
     async fn handle_batch(
         &mut self,
         events: Vec<E>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Vec<Option<Self::Event>>>
+    ) -> Result<Vec<Self::Event>>
     where
         D: Send + Sync + 'static,
         S: Clone + Send + 'static,
@@ -348,26 +346,26 @@ where
 
 /// Type-erased effect trait for internal use.
 ///
-/// Returns `Option<EventEnvelope>` so the Runtime can emit events.
+/// Returns `EventEnvelope` so the Runtime can emit events.
 #[async_trait]
 pub(crate) trait AnyEffect<D, S>: Send + Sync {
-    /// Handle a type-erased event and optionally return an event envelope.
+    /// Handle a type-erased event and return an event envelope.
     ///
     /// The Runtime emits the returned envelope - effects never emit directly.
     async fn handle_any(
         &mut self,
         event: Arc<dyn Any + Send + Sync>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Option<EventEnvelope>>;
+    ) -> Result<EventEnvelope>;
 
     /// Handle a batch of type-erased events and return event envelopes.
     ///
-    /// Returns one optional envelope per input event. The Runtime emits all non-None results.
+    /// Returns one envelope per input event. The Runtime emits all results.
     async fn handle_any_batch(
         &mut self,
         events: Vec<Arc<dyn Any + Send + Sync>>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Vec<Option<EventEnvelope>>>;
+    ) -> Result<Vec<EventEnvelope>>;
 }
 
 /// Wrapper to make concrete effects implement AnyEffect.
@@ -409,7 +407,7 @@ where
         &mut self,
         event: Arc<dyn Any + Send + Sync>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Option<EventEnvelope>> {
+    ) -> Result<EventEnvelope> {
         // Try to downcast the Arc<dyn Any> to &E
         let input_event = event
             .downcast_ref::<E>()
@@ -425,14 +423,14 @@ where
         let cid = ctx.correlation_id();
         let mut effect = self.effect.lock().await;
         let output_event = effect.handle(input_event, ctx).await?;
-        Ok(output_event.map(|e| EventEnvelope::new(cid, e)))
+        Ok(EventEnvelope::new(cid, output_event))
     }
 
     async fn handle_any_batch(
         &mut self,
         events: Vec<Arc<dyn Any + Send + Sync>>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Vec<Option<EventEnvelope>>> {
+    ) -> Result<Vec<EventEnvelope>> {
         let typed: Result<Vec<E>, _> = events
             .into_iter()
             .map(|e| {
@@ -452,7 +450,7 @@ where
         let output_events = effect.handle_batch(typed?, ctx).await?;
         Ok(output_events
             .into_iter()
-            .map(|opt| opt.map(|e| EventEnvelope::new(cid, e)))
+            .map(|e| EventEnvelope::new(cid, e))
             .collect())
     }
 }
@@ -500,7 +498,7 @@ mod tests {
             &mut self,
             event: TestEvent,
             ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<OutputEvent>> {
+        ) -> Result<OutputEvent> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
 
             // Access deps and state
@@ -508,9 +506,9 @@ mod tests {
             let counter = ctx.state().counter;
 
             // Return event (Runtime emits)
-            Ok(Some(OutputEvent {
+            Ok(OutputEvent {
                 result: format!("{} with value {} counter {}", event.action, value, counter),
-            }))
+            })
         }
     }
 
@@ -550,51 +548,42 @@ mod tests {
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
         assert_eq!(
-            event.unwrap().result,
+            event.result,
             "test with value 100 counter 5"
         );
     }
 
     #[tokio::test]
-    async fn test_effect_handle_returns_none() {
-        struct FilterEffect;
+    async fn test_effect_always_returns_event() {
+        struct TransformEffect;
 
         #[async_trait]
-        impl Effect<TestEvent, TestDeps, TestState> for FilterEffect {
+        impl Effect<TestEvent, TestDeps, TestState> for TransformEffect {
             type Event = OutputEvent;
 
             async fn handle(
                 &mut self,
                 event: TestEvent,
                 _ctx: EffectContext<TestDeps, TestState>,
-            ) -> Result<Option<OutputEvent>> {
-                if event.action == "skip" {
-                    Ok(None)
-                } else {
-                    Ok(Some(OutputEvent {
-                        result: "handled".to_string(),
-                    }))
-                }
+            ) -> Result<OutputEvent> {
+                // Effects always return an event now
+                Ok(OutputEvent {
+                    result: format!("transformed: {}", event.action),
+                })
             }
         }
 
-        let mut effect = FilterEffect;
+        let mut effect = TransformEffect;
         let deps = Arc::new(TestDeps { value: 0 });
         let state = TestState { counter: 0 };
         let bus = EventBus::new();
         let ctx = EffectContext::new(deps, state, bus);
 
-        let result1 = effect
-            .handle(TestEvent { action: "skip".to_string() }, ctx.clone())
+        let result = effect
+            .handle(TestEvent { action: "test".to_string() }, ctx)
             .await
             .unwrap();
-        assert!(result1.is_none());
-
-        let result2 = effect
-            .handle(TestEvent { action: "process".to_string() }, ctx)
-            .await
-            .unwrap();
-        assert_eq!(result2.unwrap().result, "handled");
+        assert_eq!(result.result, "transformed: test");
     }
 
     #[tokio::test]
@@ -617,9 +606,7 @@ mod tests {
         let envelope = wrapper.handle_any(event, ctx).await.unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
-        assert!(envelope.is_some());
-        let envelope = envelope.unwrap();
-        let event = envelope.downcast_ref::<OutputEvent>().unwrap();
+        let event = envelope.payload.downcast_ref::<OutputEvent>().unwrap();
         assert_eq!(event.result, "wrapped with value 50 counter 3");
     }
 
@@ -658,7 +645,7 @@ mod tests {
             &mut self,
             _event: TestEvent,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<OutputEvent>> {
+        ) -> Result<OutputEvent> {
             Err(anyhow::anyhow!("effect failed"))
         }
     }
@@ -712,25 +699,25 @@ mod tests {
             &mut self,
             event: TestEvent,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<OutputEvent>> {
+        ) -> Result<OutputEvent> {
             self.individual_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(OutputEvent {
+            Ok(OutputEvent {
                 result: format!("individual: {}", event.action),
-            }))
+            })
         }
 
         async fn handle_batch(
             &mut self,
             events: Vec<TestEvent>,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Vec<Option<OutputEvent>>> {
+        ) -> Result<Vec<OutputEvent>> {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
 
-            // Simulated bulk operation - return one event for the batch
+            // Simulated bulk operation - return events for all inputs
             let actions: Vec<_> = events.iter().map(|e| e.action.as_str()).collect();
-            Ok(vec![Some(OutputEvent {
-                result: format!("batch: [{}]", actions.join(", ")),
-            })])
+            Ok(events.iter().map(|e| OutputEvent {
+                result: format!("batch: {}", e.action),
+            }).collect())
         }
     }
 
@@ -768,9 +755,11 @@ mod tests {
         assert_eq!(individual_calls.load(Ordering::Relaxed), 0);
         assert_eq!(batch_calls.load(Ordering::Relaxed), 1);
 
-        // Should return single batch event (custom batch can consolidate)
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().result, "batch: [a, b, c]");
+        // Should return events for all inputs
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].result, "batch: a");
+        assert_eq!(results[1].result, "batch: b");
+        assert_eq!(results[2].result, "batch: c");
     }
 
     #[tokio::test]
@@ -802,7 +791,7 @@ mod tests {
 
         // Should return 2 individual events
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].as_ref().unwrap().result, "x with value 100 counter 2");
-        assert_eq!(results[1].as_ref().unwrap().result, "y with value 100 counter 2");
+        assert_eq!(results[0].result, "x with value 100 counter 2");
+        assert_eq!(results[1].result, "y with value 100 counter 2");
     }
 }

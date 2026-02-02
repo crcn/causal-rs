@@ -26,13 +26,13 @@ use std::time::Duration;
 use anyhow::Result;
 use dashmap::DashMap;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
 use crate::bus::EventBus;
 use crate::core::{CorrelationId, Event, EventEnvelope};
 use crate::dispatch::Dispatcher;
 use crate::edge::Edge;
 use crate::effect_impl::Effect;
+use crate::tap::EventTap;
 
 // =============================================================================
 // Inflight Tracking
@@ -162,7 +162,7 @@ impl InflightTracker {
 // =============================================================================
 
 /// Engine for running edges and coordinating events/effects.
-pub struct Engine<D, S = ()> {
+pub struct Engine<D, S: Clone = ()> {
     deps: Arc<D>,
     bus: EventBus,
     dispatcher: Dispatcher<D, S>,
@@ -202,15 +202,19 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default> Engin
         // Process events until settled (with timeout)
         let timeout_duration = Duration::from_secs(30);
 
-        tokio::time::timeout(timeout_duration, async {
+        let final_state = tokio::time::timeout(timeout_duration, async {
             let mut receiver = self.bus.subscribe();
+            let mut current_state = state;
 
             loop {
                 match receiver.try_recv() {
                     Ok(envelope) if envelope.cid == cid => {
+                        // Apply reducers to get new state
+                        current_state = self.dispatcher.apply_reducers(&current_state, &envelope);
+
                         // Process this event through effects
                         self.dispatcher
-                            .dispatch_event(envelope, state.clone(), Some(&self.inflight))
+                            .dispatch_event(envelope, current_state.clone(), Some(&self.inflight))
                             .await?;
                     }
                     Ok(_) => {
@@ -233,12 +237,12 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default> Engin
                 }
             }
 
-            Ok::<(), anyhow::Error>(())
+            Ok::<S, anyhow::Error>(current_state)
         })
         .await??;
 
-        // Read final result from edge
-        Ok(edge.read(&state))
+        // Read final result from edge using the final transformed state
+        Ok(edge.read(&final_state))
     }
 
     /// Get access to the dependencies.
@@ -260,7 +264,7 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default> Engin
 // =============================================================================
 
 /// Builder for constructing an engine.
-pub struct EngineBuilder<D, S = ()> {
+pub struct EngineBuilder<D, S: Clone = ()> {
     deps: Arc<D>,
     bus: EventBus,
     dispatcher: Dispatcher<D, S>,
@@ -310,6 +314,18 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default>
         }
     }
 
+    /// Register a reducer for pure state transformations.
+    ///
+    /// Reducers run before effects to transform state in response to events.
+    pub fn with_reducer<E, R>(mut self, reducer: R) -> Self
+    where
+        E: Event + Clone,
+        R: crate::reducer::Reducer<E, S>,
+    {
+        self.dispatcher = self.dispatcher.with_reducer::<E, R>(reducer);
+        self
+    }
+
     /// Register an effect handler.
     pub fn with_effect<E, Eff>(mut self, effect: Eff) -> Self
     where
@@ -317,6 +333,19 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default>
         Eff: Effect<E, D, S>,
     {
         self.dispatcher = self.dispatcher.with_effect::<E, Eff>(effect);
+        self
+    }
+
+    /// Register an event tap for observing events.
+    ///
+    /// Taps are called after effects complete and events are emitted.
+    /// They run fire-and-forget and cannot emit new events.
+    pub fn with_event_tap<E, T>(mut self, tap: T) -> Self
+    where
+        E: Event + Clone,
+        T: EventTap<E>,
+    {
+        self.dispatcher = self.dispatcher.with_event_tap::<E, T>(tap);
         self
     }
 
@@ -340,10 +369,8 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Event;
     use crate::edge::{Edge, EdgeContext};
     use crate::effect_impl::{Effect, EffectContext};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct TestDeps {
@@ -360,19 +387,23 @@ mod tests {
         value: i32,
     }
 
-    // Event is auto-implemented via blanket impl
+    #[derive(Debug, Clone)]
+    struct TerminalEvent;
+
+    // Events are auto-implemented via blanket impl
 
     struct TestEdge {
         initial: i32,
     }
 
     impl Edge<TestState> for TestEdge {
+        type Event = TestEvent;
         type Data = i32;
 
-        fn execute(&self, _ctx: &EdgeContext<TestState>) -> Option<Box<dyn Event>> {
-            Some(Box::new(TestEvent {
+        fn execute(&self, _ctx: &EdgeContext<TestState>) -> Option<TestEvent> {
+            Some(TestEvent {
                 value: self.initial,
-            }))
+            })
         }
 
         fn read(&self, state: &TestState) -> Option<i32> {
@@ -384,18 +415,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Effect<TestEvent, TestDeps, TestState> for TestEffect {
-        type Event = TestEvent;
+        type Event = TerminalEvent;
 
         async fn handle(
             &mut self,
             _event: TestEvent,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<TestEvent>> {
-            // Update state (this is a hack for testing - normally reducers would do this)
-            // In real usage, we'd use reducers to transform state
-            Ok(None) // Don't emit more events
+        ) -> Result<TerminalEvent> {
+            // Emit terminal event - no effect handles this, so flow terminates
+            Ok(TerminalEvent)
         }
     }
+
+    // No effect registered for TerminalEvent, so the flow naturally terminates
 
     #[tokio::test]
     async fn test_engine_builder() {
@@ -404,6 +436,81 @@ mod tests {
             .build();
 
         assert_eq!(engine.deps().value, 42);
+    }
+
+    // Test reducer integration
+    struct TestReducer;
+
+    impl crate::reducer::Reducer<TestEvent, TestState> for TestReducer {
+        fn reduce(&self, _state: &TestState, event: &TestEvent) -> TestState {
+            TestState {
+                result: Some(event.value * 2), // Double the value
+            }
+        }
+    }
+
+    #[test]
+    fn test_engine_builder_with_reducer() {
+        // Test that EngineBuilder accepts reducers
+        let _engine = EngineBuilder::new(TestDeps { value: 42 })
+            .with_reducer::<TestEvent, _>(TestReducer)
+            .with_effect::<TestEvent, _>(TestEffect)
+            .build();
+
+        // If this compiles, the API works correctly
+    }
+
+    #[test]
+    fn test_reducer_applied_in_dispatcher() {
+        use crate::bus::EventBus;
+        use crate::dispatch::Dispatcher;
+
+        let bus = EventBus::new();
+        let dispatcher = Dispatcher::new(TestDeps { value: 42 }, bus)
+            .with_reducer::<TestEvent, _>(TestReducer);
+
+        // Test that reducer is registered
+        let state = TestState { result: None };
+        let event = TestEvent { value: 10 };
+        let envelope = crate::core::EventEnvelope::new_random(event);
+
+        // Apply reducers
+        let new_state = dispatcher.apply_reducers(&state, &envelope);
+
+        // Reducer should have doubled the value
+        assert_eq!(new_state.result, Some(20));
+    }
+
+    #[test]
+    fn test_multiple_reducers_chain() {
+        use crate::bus::EventBus;
+        use crate::dispatch::Dispatcher;
+
+        struct AddReducer {
+            amount: i32,
+        }
+
+        impl crate::reducer::Reducer<TestEvent, TestState> for AddReducer {
+            fn reduce(&self, state: &TestState, _event: &TestEvent) -> TestState {
+                TestState {
+                    result: Some(state.result.unwrap_or(0) + self.amount),
+                }
+            }
+        }
+
+        let bus = EventBus::new();
+        let dispatcher = Dispatcher::new(TestDeps { value: 42 }, bus)
+            .with_reducer::<TestEvent, _>(AddReducer { amount: 5 })
+            .with_reducer::<TestEvent, _>(AddReducer { amount: 10 });
+
+        let state = TestState { result: Some(0) };
+        let event = TestEvent { value: 100 };
+        let envelope = crate::core::EventEnvelope::new_random(event);
+
+        let new_state = dispatcher.apply_reducers(&state, &envelope);
+
+        // First reducer adds 5, second adds 10, so result should be 15
+        assert_eq!(new_state.result, Some(15));
     }
 
 }

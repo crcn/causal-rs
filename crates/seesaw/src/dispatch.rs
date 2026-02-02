@@ -17,6 +17,8 @@ use crate::bus::EventBus;
 use crate::core::{Event, EventEnvelope};
 use crate::effect_impl::{AnyEffect, Effect, EffectContext, EffectWrapper};
 use crate::engine::InflightTracker;
+use crate::reducer::{Reducer, ReducerRegistry};
+use crate::tap::{EventTap, TapRegistry};
 use tracing::error;
 
 /// Event dispatcher for routing events to effects.
@@ -35,11 +37,15 @@ use tracing::error;
 /// let event = UserEvent::SignupRequested { email: "test@example.com".into() };
 /// dispatcher.dispatch_event(EventEnvelope::new_random(event), (), None).await?;
 /// ```
-pub struct Dispatcher<D, S = ()> {
+pub struct Dispatcher<D, S: Clone = ()> {
     // Effects keyed by event type, multiple effects can listen to same event
     effects: HashMap<TypeId, Vec<Box<dyn AnyEffect<D, S>>>>,
     deps: Arc<D>,
     bus: EventBus,
+    // Reducers for pure state transformations before effects
+    reducers: ReducerRegistry<S>,
+    // Taps for observing events after effects
+    taps: TapRegistry,
 }
 
 impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S> {
@@ -49,6 +55,8 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             effects: HashMap::new(),
             deps: Arc::new(deps),
             bus,
+            reducers: ReducerRegistry::new(),
+            taps: TapRegistry::new(),
         }
     }
 
@@ -58,7 +66,22 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             effects: HashMap::new(),
             deps,
             bus,
+            reducers: ReducerRegistry::new(),
+            taps: TapRegistry::new(),
         }
+    }
+
+    /// Register a reducer for pure state transformations.
+    ///
+    /// Reducers run before effects to transform state in response to events.
+    /// Multiple reducers can be registered for the same event type.
+    pub fn with_reducer<E, R>(mut self, reducer: R) -> Self
+    where
+        E: Event + Clone,
+        R: Reducer<E, S>,
+    {
+        self.reducers.register(reducer);
+        self
     }
 
     /// Register an effect handler for an event type.
@@ -78,10 +101,38 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
         self
     }
 
+    /// Register an event tap for observing events.
+    ///
+    /// Taps are called after effects complete and events are emitted.
+    /// They cannot emit new events - only observe.
+    pub fn with_event_tap<E, T>(mut self, tap: T) -> Self
+    where
+        E: Event + Clone,
+        T: EventTap<E>,
+    {
+        self.taps.register(tap, std::any::type_name::<T>());
+        self
+    }
+
+    /// Apply reducers to transform state based on an event.
+    ///
+    /// This is called by the engine before dispatching to effects.
+    /// Returns the transformed state.
+    pub(crate) fn apply_reducers(&self, state: &S, envelope: &EventEnvelope) -> S {
+        if self.reducers.is_empty() {
+            state.clone()
+        } else {
+            self.reducers.reduce_all(state, &*envelope.payload)
+        }
+    }
+
     /// Dispatch an event to all registered effects.
     ///
     /// Routes the event to all effects registered for this event type.
     /// Effects run in parallel and can each emit new events.
+    ///
+    /// Note: State should already be transformed by reducers before calling this.
+    /// The engine loop handles reducer application.
     ///
     /// # Returns
     ///
@@ -101,6 +152,10 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             Some(effs) if !effs.is_empty() => effs,
             _ => {
                 // No effects registered - not an error, just skip
+                // But still decrement inflight if this event was tracked
+                if let Some(tracker) = inflight {
+                    tracker.dec(cid, 1);
+                }
                 return Ok(());
             }
         };
@@ -138,12 +193,17 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             };
 
             match result {
-                Ok(Some(new_envelope)) => {
-                    // Effect emitted a new event
-                    self.bus.emit_envelope(new_envelope);
-                }
-                Ok(None) => {
-                    // Effect didn't emit anything (event didn't apply)
+                Ok(new_envelope) => {
+                    // Effect emitted a new event (always does now)
+                    // Increment inflight for the new event before emitting
+                    if let Some(tracker) = inflight {
+                        tracker.inc(new_envelope.cid, 1);
+                    }
+
+                    self.bus.emit_envelope(new_envelope.clone());
+
+                    // Run taps to observe the emitted event
+                    self.taps.run_all(&*new_envelope.payload, Some(new_envelope.cid));
                 }
                 Err(e) => {
                     // Effect failed
@@ -199,7 +259,7 @@ fn extract_panic_message(panic_info: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-impl<D, S> std::fmt::Debug for Dispatcher<D, S> {
+impl<D, S: Clone> std::fmt::Debug for Dispatcher<D, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let count: usize = self.effects.values().map(|v| v.len()).sum();
         f.debug_struct("Dispatcher")
@@ -251,12 +311,12 @@ mod tests {
             &mut self,
             event: CreateEvent,
             ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<ResultEvent>> {
+        ) -> Result<ResultEvent> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let counter = ctx.state().counter;
-            Ok(Some(ResultEvent {
+            Ok(ResultEvent {
                 message: format!("created {} counter={}", event.name, counter),
-            }))
+            })
         }
     }
 
@@ -272,11 +332,11 @@ mod tests {
             &mut self,
             event: CreateEvent,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<ResultEvent>> {
+        ) -> Result<ResultEvent> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(ResultEvent {
+            Ok(ResultEvent {
                 message: format!("notified about {}", event.name),
-            }))
+            })
         }
     }
 
@@ -375,14 +435,16 @@ mod tests {
                 &mut self,
                 event: CreateEvent,
                 _ctx: EffectContext<TestDeps, TestState>,
-            ) -> Result<Option<ResultEvent>> {
-                // Filter out events that don't match
+            ) -> Result<ResultEvent> {
+                // Always return an event now
                 if event.name == "skip" {
-                    Ok(None)
+                    Ok(ResultEvent {
+                        message: "skipped".to_string(),
+                    })
                 } else {
-                    Ok(Some(ResultEvent {
+                    Ok(ResultEvent {
                         message: "handled".to_string(),
-                    }))
+                    })
                 }
             }
         }
@@ -405,8 +467,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Should not have emitted any event
-        assert!(receiver.try_recv().is_err());
+        // Should have emitted a "skipped" event
+        let emitted1 = receiver.try_recv().unwrap();
+        let result1 = emitted1.payload.downcast_ref::<ResultEvent>().unwrap();
+        assert_eq!(result1.message, "skipped");
 
         // Event that should be handled
         let event2 = CreateEvent {

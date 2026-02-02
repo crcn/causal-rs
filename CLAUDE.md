@@ -6,9 +6,10 @@
 
 Seesaw is an **event-driven runtime** for building reactive systems.
 
-**Core flow**: Event → Effect → Event
+**Core flow**: Event → Reducer → Effect → Event
 
 - **Events** are signals (facts that already happened)
+- **Reducers** transform state before effects (pure functions)
 - **Effects** react to events, perform IO, emit new events
 
 Simple, direct, no ceremony.
@@ -47,14 +48,14 @@ Events are the only signals in the system.
 
 ### Effect
 
-Handlers that react to events. Execute IO, emit new events.
+Handlers that react to events. Execute IO, always emit new events.
 
 ```rust
 #[async_trait]
-impl Effect<ScrapeEvent, Deps> for ScrapeEffect {
+impl Effect<ScrapeEvent, Deps, State> for ScrapeEffect {
     type Event = ScrapeEvent;
 
-    async fn execute(&self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<ScrapeEvent> {
+    async fn handle(&self, event: ScrapeEvent, ctx: EffectContext<Deps, State>) -> Result<ScrapeEvent> {
         match event {
             ScrapeEvent::SourceRequested { source_id } => {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
@@ -64,7 +65,7 @@ impl Effect<ScrapeEvent, Deps> for ScrapeEffect {
                 let items = ctx.deps().extractor.extract(&data).await?;
                 Ok(ScrapeEvent::NeedsExtracted { source_id })
             }
-            _ => bail!("unhandled event")
+            other => Ok(other) // Pass through unhandled events
         }
     }
 }
@@ -72,17 +73,46 @@ impl Effect<ScrapeEvent, Deps> for ScrapeEffect {
 
 Effects can:
 - Do IO (DB queries, API calls, etc.)
-- Hold state (if needed)
+- Hold state with `&mut self` (if needed)
 - Make decisions
 - Branch on conditions
 - Be pure or impure (your choice)
+- Always return an event (use catch-all pattern for pass-through)
 
 EffectContext provides:
 - `deps()` — shared dependencies
+- `state()` — per-execution state (transformed by reducers)
 - `signal(event)` — fire-and-forget UI notifications
 - `tool_context()` — context for interactive tool execution
 - `outbox_correlation_id()` — for outbox writes
 - `correlation_id()` — get correlation ID for this execution
+
+### Reducer
+
+Pure state transformations that run before effects.
+
+```rust
+impl Reducer<ScrapeEvent, ScrapeState> for ScrapeReducer {
+    fn reduce(&self, state: &ScrapeState, event: &ScrapeEvent) -> ScrapeState {
+        match event {
+            ScrapeEvent::SourceScraped { source_id, data } => {
+                ScrapeState {
+                    last_scrape: Some(data.clone()),
+                    ..state.clone()
+                }
+            }
+            _ => state.clone()
+        }
+    }
+}
+```
+
+Reducers:
+- Are pure functions (no side effects)
+- Transform state based on events
+- Run before effects see the event
+- Multiple reducers chain together
+- Provide updated state to effects via `ctx.state()`
 
 ### EventTap
 
@@ -110,6 +140,8 @@ Simple and direct:
 
 ```
 Event emitted
+  ↓
+Reducers transform state
   ↓
 All Effects listening to this event
   ↓
@@ -329,12 +361,13 @@ This is normal and correct. Cross-domain coordination happens via events.
 
 ## Role Matrix
 
-| Role   | React? | Mutate? | Emit?  | Listen To |
-| ------ | ------ | ------- | ------ | --------- |
-| Effect | Yes    | Yes     | Events | Events    |
-| Tap    | No     | No      | No     | Events    |
+| Role    | React? | Mutate? | Emit?  | Listen To | Pure? |
+| ------- | ------ | ------- | ------ | --------- | ----- |
+| Reducer | No     | No      | No     | Events    | Yes   |
+| Effect  | Yes    | Yes     | Events | Events    | No    |
+| Tap     | No     | No      | No     | Events    | No    |
 
-Effects do the work. Taps observe.
+Reducers transform state. Effects do the work. Taps observe.
 
 ## What Seesaw Is Not
 
@@ -418,14 +451,22 @@ Every long-running flow needs success and failure terminal events.
 
 ```rust
 let mut engine = EngineBuilder::new(deps)
-    .with_effect::<MyEvent, _>(MyEventEffect)
+    .with_reducer::<MyEvent, _>(MyReducer)      // Pure state transformations
+    .with_effect::<MyEvent, _>(MyEventEffect)    // Event handlers
+    .with_tap::<MyEvent, _>(MyTap, "metrics")    // Event observers
     .build();
 
 // Execute via edge (structured workflow)
 let result = engine.run(MyEdge { data }, initial_state).await?;
 ```
 
-Other builder methods: `.with_bus()`, `.with_inflight()`, `.with_arc(deps)`
+Builder methods:
+- `.with_reducer::<Event, _>(reducer)` — Register pure state transformations
+- `.with_effect::<Event, _>(effect)` — Register event handlers
+- `.with_tap::<Event, _>(tap, name)` — Register event observers
+- `.with_bus(bus)` — Use existing EventBus
+- `.with_inflight(tracker)` — Use existing InflightTracker
+- `.with_arc(deps)` — Use Arc-wrapped dependencies
 
 ## Cross-Domain Reactions
 
@@ -507,9 +548,11 @@ Simple and direct.
 ## Design Principles Summary
 
 1. **Events are the only signals** — Everything flows through events
-2. **Effects react to events** — Do IO, emit new events
-3. **Effects are unconstrained** — Can do anything, pure or impure, stateful or stateless
-4. **Events are facts, past-tense** — `UserCreated`, not `CreateUser`
-5. **Effects can listen to any domain** — Cross-domain coordination via events
-6. **One Effect execution = One transaction** — Multiple atomic writes belong together
-7. **Terminal events close loops** — Every workflow needs success/failure events
+2. **Reducers transform state** — Pure functions that run before effects
+3. **Effects react to events** — Do IO, always emit new events
+4. **Effects are unconstrained** — Can do anything, pure or impure, stateful or stateless
+5. **Events are facts, past-tense** — `UserCreated`, not `CreateUser`
+6. **Effects can listen to any domain** — Cross-domain coordination via events
+7. **One Effect execution = One transaction** — Multiple atomic writes belong together
+8. **Terminal events close loops** — Every workflow needs success/failure events
+9. **Taps observe, don't act** — Fire-and-forget observers for metrics, logging, webhooks

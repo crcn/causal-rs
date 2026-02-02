@@ -63,7 +63,7 @@ impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
         &mut self,
         event: SummaryEvent,
         ctx: EffectContext<Deps, SummaryState>,
-    ) -> Result<Option<SummaryEvent>> {
+    ) -> Result<SummaryEvent> {
         match event {
             SummaryEvent::SummarizeRequested { task_id, text } => {
                 println!("Summarizing text...");
@@ -91,23 +91,23 @@ impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
                         println!("\n✓ Summary: {}", summary);
                         println!("  Tokens used: {}", tokens);
 
-                        Ok(Some(SummaryEvent::Summarized {
+                        Ok(SummaryEvent::Summarized {
                             task_id,
                             summary,
                             tokens_used: tokens,
-                        }))
+                        })
                     }
                     Err(e) => {
                         println!("✗ Failed: {}", e);
 
-                        Ok(Some(SummaryEvent::SummaryFailed {
+                        Ok(SummaryEvent::SummaryFailed {
                             task_id,
                             reason: e.to_string(),
-                        }))
+                        })
                     }
                 }
             }
-            _ => Ok(None), // Event doesn't apply to this effect
+            other => Ok(other), // Pass through other events unchanged
         }
     }
 }
@@ -149,13 +149,14 @@ struct SummarizeEdge {
 }
 
 impl Edge<SummaryState> for SummarizeEdge {
+    type Event = SummaryEvent;
     type Data = String; // The summary
 
-    fn execute(&self, _ctx: &EdgeContext<SummaryState>) -> Option<Box<dyn Event>> {
-        Some(Box::new(SummaryEvent::SummarizeRequested {
+    fn execute(&self, _ctx: &EdgeContext<SummaryState>) -> Option<SummaryEvent> {
+        Some(SummaryEvent::SummarizeRequested {
             task_id: Uuid::new_v4(),
             text: self.text.clone(),
-        }))
+        })
     }
 
     fn read(&self, state: &SummaryState) -> Option<Self::Data> {

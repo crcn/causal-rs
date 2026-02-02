@@ -68,7 +68,7 @@ impl Effect<FetchEvent, Deps, FetchState> for FetchEffect {
         &mut self,
         event: FetchEvent,
         ctx: EffectContext<Deps, FetchState>,
-    ) -> Result<Option<FetchEvent>> {
+    ) -> Result<FetchEvent> {
         match event {
             FetchEvent::FetchRequested { urls } => {
                 // Fetch first URL
@@ -84,62 +84,67 @@ impl Effect<FetchEvent, Deps, FetchState> for FetchEffect {
                                 let content = response.text().await?;
                                 println!("✓ Fetched {} ({} bytes)", url, content.len());
 
-                                Ok(Some(FetchEvent::Fetched {
+                                Ok(FetchEvent::Fetched {
                                     url,
                                     content,
                                     status,
-                                }))
+                                })
                             } else {
                                 println!("✗ Failed {} (HTTP {})", url, status);
 
-                                Ok(Some(FetchEvent::FetchFailed {
+                                Ok(FetchEvent::FetchFailed {
                                     url,
                                     reason: format!("HTTP {}", status),
-                                }))
+                                })
                             }
                         }
                         Err(e) => {
                             println!("✗ Failed {}: {}", url, e);
 
-                            Ok(Some(FetchEvent::FetchFailed {
+                            Ok(FetchEvent::FetchFailed {
                                 url,
                                 reason: e.to_string(),
-                            }))
+                            })
                         }
                     }
                 } else {
-                    Ok(None)
+                    // No URLs to fetch
+                    let state = ctx.state();
+                    Ok(FetchEvent::AllComplete {
+                        success_count: state.success_count,
+                        failure_count: state.failure_count,
+                    })
                 }
             }
             FetchEvent::Fetched { .. } => {
                 // Check if more URLs to fetch
                 let state = ctx.state();
                 if !state.urls_to_fetch.is_empty() {
-                    Ok(Some(FetchEvent::FetchRequested {
+                    Ok(FetchEvent::FetchRequested {
                         urls: state.urls_to_fetch.clone(),
-                    }))
+                    })
                 } else {
-                    Ok(Some(FetchEvent::AllComplete {
+                    Ok(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    }))
+                    })
                 }
             }
             FetchEvent::FetchFailed { .. } => {
                 // Check if more URLs to fetch
                 let state = ctx.state();
                 if !state.urls_to_fetch.is_empty() {
-                    Ok(Some(FetchEvent::FetchRequested {
+                    Ok(FetchEvent::FetchRequested {
                         urls: state.urls_to_fetch.clone(),
-                    }))
+                    })
                 } else {
-                    Ok(Some(FetchEvent::AllComplete {
+                    Ok(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    }))
+                    })
                 }
             }
-            _ => Ok(None),
+            other => Ok(other), // Pass through other events unchanged
         }
     }
 }
@@ -195,12 +200,13 @@ struct FetchEdge {
 }
 
 impl Edge<FetchState> for FetchEdge {
+    type Event = FetchEvent;
     type Data = (usize, usize); // (success_count, failure_count)
 
-    fn execute(&self, _ctx: &EdgeContext<FetchState>) -> Option<Box<dyn Event>> {
-        Some(Box::new(FetchEvent::FetchRequested {
+    fn execute(&self, _ctx: &EdgeContext<FetchState>) -> Option<FetchEvent> {
+        Some(FetchEvent::FetchRequested {
             urls: self.urls.clone(),
-        }))
+        })
     }
 
     fn read(&self, state: &FetchState) -> Option<Self::Data> {

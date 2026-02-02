@@ -94,6 +94,9 @@ use std::sync::Arc;
 ///
 /// Edges are pure and stateless. All state flows through the generic `S` parameter.
 pub trait Edge<S>: Send + Sync + 'static {
+    /// The event type this edge emits
+    type Event: Event;
+
     /// The data type returned after execution completes
     type Data;
 
@@ -102,7 +105,7 @@ pub trait Edge<S>: Send + Sync + 'static {
     /// This is called once at the start of execution. Return:
     /// - `Some(event)` to trigger event flow
     /// - `None` for query-only edges (no event emission)
-    fn execute(&self, ctx: &EdgeContext<S>) -> Option<Box<dyn Event>>;
+    fn execute(&self, ctx: &EdgeContext<S>) -> Option<Self::Event>;
 
     /// Read the final result from the settled state
     ///
@@ -153,12 +156,13 @@ mod tests {
     }
 
     impl Edge<TestState> for TestEdge {
+        type Event = TestEvent;
         type Data = i32;
 
-        fn execute(&self, _ctx: &EdgeContext<TestState>) -> Option<Box<dyn Event>> {
-            Some(Box::new(TestEvent {
+        fn execute(&self, _ctx: &EdgeContext<TestState>) -> Option<TestEvent> {
+            Some(TestEvent {
                 value: self.initial_value,
-            }))
+            })
         }
 
         fn read(&self, state: &TestState) -> Option<i32> {
@@ -173,8 +177,7 @@ mod tests {
         let ctx = EdgeContext::new(Arc::new(state));
 
         let event = edge.execute(&ctx).unwrap();
-        let test_event = event.as_any().downcast_ref::<TestEvent>().unwrap();
-        assert_eq!(test_event.value, 42);
+        assert_eq!(event.value, 42);
     }
 
     #[test]
