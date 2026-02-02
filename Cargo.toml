@@ -2,10 +2,10 @@
 members = [
     "crates/seesaw",
     "examples/simple-order",
+    "examples/http-fetcher",
+    "examples/ai-summarizer",
     # TODO: Update to new API in follow-up PR
     # "crates/seesaw-outbox",
-    # "examples/http-fetcher",
-    # "examples/ai-summarizer",
 ]
 resolver = "2"
 

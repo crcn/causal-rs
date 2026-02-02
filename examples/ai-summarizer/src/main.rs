@@ -4,8 +4,7 @@
 //! No special adapter - just reqwest + serde.
 
 use anyhow::{bail, Result};
-use async_trait::async_trait;
-use seesaw_core::{Effect, EffectContext, EngineBuilder, RunContext};
+use seesaw_core::{effect, reducer, Engine, EffectContext};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -50,96 +49,10 @@ struct SummaryState {
 }
 
 // ============================================================================
-// Effect (React to events, call Anthropic API, emit new events)
+// Effects and Reducers (Closure-based)
 // ============================================================================
 
-struct SummarizeEffect;
-
-#[async_trait]
-impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
-    type Event = SummaryEvent;
-
-    async fn handle(
-        &mut self,
-        event: SummaryEvent,
-        ctx: EffectContext<Deps, SummaryState>,
-    ) -> Result<()> {
-        match event {
-            SummaryEvent::SummarizeRequested { task_id, text } => {
-                println!("Summarizing text...");
-
-                // Call Anthropic API directly using reqwest
-                let request = AnthropicRequest {
-                    model: "claude-3-5-sonnet-20241022".to_string(),
-                    max_tokens: 1024,
-                    messages: vec![Message {
-                        role: "user".to_string(),
-                        content: format!("Summarize this text in 2-3 sentences:\n\n{}", text),
-                    }],
-                };
-
-                match call_anthropic(&ctx.deps().http_client, &ctx.deps().api_key, request).await {
-                    Ok(response) => {
-                        let summary = response
-                            .content
-                            .first()
-                            .and_then(|c| c.text.clone())
-                            .unwrap_or_default();
-
-                        let tokens = response.usage.input_tokens + response.usage.output_tokens;
-
-                        println!("\n✓ Summary: {}", summary);
-                        println!("  Tokens used: {}", tokens);
-
-                        ctx.emit(SummaryEvent::Summarized {
-                            task_id,
-                            summary,
-                            tokens_used: tokens,
-                        });
-                    }
-                    Err(e) => {
-                        println!("✗ Failed: {}", e);
-
-                        ctx.emit(SummaryEvent::SummaryFailed {
-                            task_id,
-                            reason: e.to_string(),
-                        });
-                    }
-                }
-            }
-            _ => {}, // Skip other events
-        }
-        Ok(())
-    }
-}
-
-// ============================================================================
-// Reducer (Pure state transformation)
-// ============================================================================
-
-struct SummaryReducer;
-
-impl seesaw_core::Reducer<SummaryEvent, SummaryState> for SummaryReducer {
-    fn reduce(&self, state: &SummaryState, event: &SummaryEvent) -> SummaryState {
-        match event {
-            SummaryEvent::Summarized {
-                summary,
-                tokens_used,
-                ..
-            } => SummaryState {
-                summary: Some(summary.clone()),
-                tokens_used: *tokens_used,
-                error: None,
-            },
-            SummaryEvent::SummaryFailed { reason, .. } => SummaryState {
-                summary: None,
-                tokens_used: 0,
-                error: Some(reason.clone()),
-            },
-            _ => state.clone(),
-        }
-    }
-}
+// No struct definitions needed - we use closures directly
 
 // ============================================================================
 // Anthropic API Types (Just plain structs)
@@ -205,6 +118,7 @@ async fn call_anthropic(
 // Dependencies
 // ============================================================================
 
+#[derive(Clone)]
 struct Deps {
     http_client: reqwest::Client,
     api_key: String,
@@ -224,9 +138,74 @@ async fn main() -> Result<()> {
         api_key,
     };
 
-    let mut engine = EngineBuilder::new(deps)
-        .with_effect::<SummaryEvent, _>(SummarizeEffect)
-        .build();
+    // Define engine with closure-based effects and reducers
+    let engine = Engine::with_deps(deps)
+        // Reducer - pure state transformation
+        .with_reducer(reducer::on::<SummaryEvent>().run(|state: SummaryState, event| {
+            match event {
+                SummaryEvent::Summarized {
+                    summary,
+                    tokens_used,
+                    ..
+                } => SummaryState {
+                    summary: Some(summary.clone()),
+                    tokens_used: *tokens_used,
+                    error: None,
+                },
+                SummaryEvent::SummaryFailed { reason, .. } => SummaryState {
+                    summary: None,
+                    tokens_used: 0,
+                    error: Some(reason.clone()),
+                },
+                _ => state,
+            }
+        }))
+        // Effect - call Anthropic API on request
+        .with_effect(effect::on::<SummaryEvent>().run(|event, ctx: EffectContext<SummaryState, Deps>| async move {
+            if let SummaryEvent::SummarizeRequested { task_id, text } = event.as_ref() {
+                println!("Summarizing text...");
+
+                // Call Anthropic API directly using reqwest
+                let request = AnthropicRequest {
+                    model: "claude-3-5-sonnet-20241022".to_string(),
+                    max_tokens: 1024,
+                    messages: vec![Message {
+                        role: "user".to_string(),
+                        content: format!("Summarize this text in 2-3 sentences:\n\n{}", text),
+                    }],
+                };
+
+                match call_anthropic(&ctx.deps().http_client, &ctx.deps().api_key, request).await {
+                    Ok(response) => {
+                        let summary = response
+                            .content
+                            .first()
+                            .and_then(|c| c.text.clone())
+                            .unwrap_or_default();
+
+                        let tokens = response.usage.input_tokens + response.usage.output_tokens;
+
+                        println!("\n✓ Summary: {}", summary);
+                        println!("  Tokens used: {}", tokens);
+
+                        ctx.emit(SummaryEvent::Summarized {
+                            task_id: *task_id,
+                            summary,
+                            tokens_used: tokens,
+                        });
+                    }
+                    Err(e) => {
+                        println!("✗ Failed: {}", e);
+
+                        ctx.emit(SummaryEvent::SummaryFailed {
+                            task_id: *task_id,
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }));
 
     // Summarize some text
     let text = r#"
@@ -237,19 +216,21 @@ async fn main() -> Result<()> {
         lifetime of all references in a program during compilation.
     "#;
 
+    // Activate with initial state
+    let handle = engine.activate(SummaryState::default());
+
     // Run with closure that emits initial event
-    engine
-        .run(
-            |ctx: &RunContext<Deps, SummaryState>| {
-                ctx.emit(SummaryEvent::SummarizeRequested {
-                    task_id: Uuid::new_v4(),
-                    text: text.to_string(),
-                });
-                Ok(())
-            },
-            SummaryState::default(),
-        )
-        .await?;
+    let task_id = Uuid::new_v4();
+    handle.run(|ctx| {
+        ctx.emit(SummaryEvent::SummarizeRequested {
+            task_id,
+            text: text.to_string(),
+        });
+        Ok(())
+    })?;
+
+    // Wait for all effects to complete
+    handle.settled().await?;
 
     println!("\nDone!");
 
