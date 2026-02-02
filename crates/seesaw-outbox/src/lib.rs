@@ -26,7 +26,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use seesaw_core::{CorrelationId, outbox::{OutboxEvent, OutboxWriter}};
+//! use seesaw_outbox::{CorrelationId, OutboxEvent, OutboxWriter};
+//! use seesaw_core::EffectContext;
 //!
 //! // 1. Mark event for outbox persistence
 //! #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +41,10 @@
 //! }
 //!
 //! // 2. In effect, write to outbox in same transaction
-//! async fn execute(&self, cmd: CreateNotificationCmd, ctx: EffectContext<Kernel>) -> Result<()> {
+//! async fn create_notification(
+//!     cmd: CreateNotificationCmd,
+//!     ctx: &EffectContext<State, Deps>,
+//! ) -> Result<()> {
 //!     let mut tx = ctx.deps().db.begin().await?;
 //!
 //!     // Business write
@@ -50,7 +54,7 @@
 //!     let mut writer = PgOutboxWriter::new(&mut tx);
 //!     writer.write_event(
 //!         &NotificationCreated { id: notification.id, user_id: cmd.user_id },
-//!         ctx.outbox_correlation_id(),
+//!         CorrelationId::new(), // or track correlation across operations
 //!     ).await?;
 //!
 //!     tx.commit().await?;
@@ -62,13 +66,64 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
-use seesaw_core::EventBus;
-use seesaw_core::Event;
+// CorrelationId type for outbox tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CorrelationId(Option<Uuid>);
 
-// Re-export CorrelationId from core for backwards compatibility
-pub use seesaw_core::CorrelationId;
+impl CorrelationId {
+    /// No correlation ID.
+    pub const NONE: Self = Self(None);
+
+    /// Create a new random correlation ID.
+    pub fn new() -> Self {
+        Self(Some(Uuid::new_v4()))
+    }
+
+    /// Check if this is NONE.
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Check if this has a value.
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Get the inner UUID (returns nil UUID if NONE).
+    pub fn into_inner(self) -> Uuid {
+        self.0.unwrap_or_else(Uuid::nil)
+    }
+}
+
+impl Default for CorrelationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Uuid> for CorrelationId {
+    fn from(uuid: Uuid) -> Self {
+        Self(Some(uuid))
+    }
+}
+
+impl From<Option<Uuid>> for CorrelationId {
+    fn from(opt: Option<Uuid>) -> Self {
+        Self(opt)
+    }
+}
+
+impl std::fmt::Display for CorrelationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(uuid) => write!(f, "{}", uuid),
+            None => write!(f, "NONE"),
+        }
+    }
+}
 
 // =============================================================================
 // OutboxEvent Trait
@@ -89,7 +144,7 @@ pub use seesaw_core::CorrelationId;
 /// # Example
 ///
 /// ```ignore
-/// use seesaw_core::outbox::OutboxEvent;
+/// use seesaw_outbox::OutboxEvent;
 /// use serde::{Deserialize, Serialize};
 /// use uuid::Uuid;
 ///
@@ -105,7 +160,7 @@ pub use seesaw_core::CorrelationId;
 ///     }
 /// }
 /// ```
-pub trait OutboxEvent: Event + Serialize + DeserializeOwned {
+pub trait OutboxEvent: Send + Sync + Clone + Serialize + DeserializeOwned + 'static {
     /// Returns the versioned event type identifier.
     ///
     /// This is used for:
@@ -276,6 +331,12 @@ pub trait OutboxReader: Send + Sync {
 // OutboxEventRegistry Trait
 // =============================================================================
 
+/// A callback function for emitting events.
+///
+/// The publisher will provide an emit callback that accepts type-erased events.
+/// The registry deserializes entries and calls this callback.
+pub type EmitCallback = Arc<dyn Fn(Arc<dyn std::any::Any + Send + Sync>, std::any::TypeId) + Send + Sync>;
+
 /// Registry for deserializing and emitting outbox events.
 ///
 /// Maps event type strings to deserialize+emit functions. Used by the
@@ -284,8 +345,17 @@ pub trait OutboxReader: Send + Sync {
 /// # Example Implementation
 ///
 /// ```ignore
+/// use std::any::{Any, TypeId};
+/// use std::collections::HashMap;
+/// use std::sync::Arc;
+/// use anyhow::{anyhow, Result};
+/// use seesaw_outbox::{OutboxEvent, OutboxEntry, OutboxEventRegistry, EmitCallback};
+///
 /// pub struct DurableEventRegistry {
-///     handlers: HashMap<&'static str, Box<dyn Fn(&OutboxEntry, &EventBus) -> Result<()> + Send + Sync>>,
+///     handlers: HashMap<
+///         &'static str,
+///         Box<dyn Fn(&OutboxEntry, &EmitCallback) -> Result<()> + Send + Sync>
+///     >,
 /// }
 ///
 /// impl DurableEventRegistry {
@@ -293,11 +363,12 @@ pub trait OutboxReader: Send + Sync {
 ///         Self { handlers: HashMap::new() }
 ///     }
 ///
-///     pub fn register<E: OutboxEvent + 'static>(mut self) -> Self {
-///         self.handlers.insert(E::event_type(), Box::new(|entry, bus| {
+///     pub fn register<E: OutboxEvent>(mut self) -> Self {
+///         self.handlers.insert(E::event_type(), Box::new(|entry, emit| {
 ///             let event: E = serde_json::from_value(entry.payload.clone())?;
-///             let cid = entry.correlation_id.into_inner();
-///             bus.emit_with_correlation(event, cid);
+///             let type_id = TypeId::of::<E>();
+///             let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event);
+///             emit(event_arc, type_id);
 ///             Ok(())
 ///         }));
 ///         self
@@ -305,20 +376,20 @@ pub trait OutboxReader: Send + Sync {
 /// }
 ///
 /// impl OutboxEventRegistry for DurableEventRegistry {
-///     fn emit_entry(&self, entry: &OutboxEntry, bus: &EventBus) -> Result<()> {
+///     fn emit_entry(&self, entry: &OutboxEntry, emit: &EmitCallback) -> Result<()> {
 ///         let handler = self.handlers.get(entry.event_type.as_str())
 ///             .ok_or_else(|| anyhow!("Unknown event type: {}", entry.event_type))?;
-///         handler(entry, bus)
+///         handler(entry, emit)
 ///     }
 /// }
 /// ```
 pub trait OutboxEventRegistry: Send + Sync {
-    /// Deserialize an outbox entry and emit it to the event bus.
+    /// Deserialize an outbox entry and emit it via the callback.
     ///
     /// Returns an error if:
     /// - The event type is not registered
     /// - Deserialization fails
-    fn emit_entry(&self, entry: &OutboxEntry, bus: &EventBus) -> Result<()>;
+    fn emit_entry(&self, entry: &OutboxEntry, emit: &EmitCallback) -> Result<()>;
 }
 
 // =============================================================================

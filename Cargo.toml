@@ -4,8 +4,7 @@ members = [
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
-    # TODO: Update to new API in follow-up PR
-    # "crates/seesaw-outbox",
+    "crates/seesaw-outbox",
 ]
 resolver = "2"
 
