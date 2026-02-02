@@ -625,7 +625,7 @@ where
 /// let store = Engine::new(State::default())
 ///     .with_effect(effect::bridge(tx.weak(), rx.clone()));
 ///
-/// let handle = store.activate();
+/// let handle = store.activate(BridgeState::default());
 /// // Engine stays alive until channel closes (tx dropped)
 /// handle.settled().await;
 /// ```
@@ -889,7 +889,7 @@ mod tests {
 
             let (tx, rx) = Relay::channel();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_reducer(
                     reducer::on::<MessageFromRelay>().run(|state: BridgeState, _| BridgeState {
                         message_count: state.message_count + 1,
@@ -905,7 +905,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give the bridge's within() task time to start polling
             // The bridge subscribes asynchronously via started(), so we need enough
@@ -939,7 +939,7 @@ mod tests {
             assert_eq!(messages.len(), 2);
             assert!(messages.contains(&"hello".to_string()));
             assert!(messages.contains(&"world".to_string()));
-            assert_eq!(store.state().message_count, 2);
+            assert_eq!(handle.context.curr_state().message_count, 2);
         }
 
         #[tokio::test]
@@ -950,7 +950,7 @@ mod tests {
             // Subscribe to relay to capture outgoing events
             let mut subscriber = rx.subscribe::<MessageToRelay>();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 // When we get InternalEvent, emit MessageToRelay
                 .with_effect(effect::on::<InternalEvent>().run(|_event, ctx| async move {
                     ctx.emit(MessageToRelay {
@@ -960,7 +960,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Emit an internal event that triggers sending to relay
             handle.context.emit(InternalEvent);
@@ -998,7 +998,7 @@ mod tests {
             // Subscribe to relay to capture outgoing events
             let mut outgoing_subscriber = rx.subscribe::<MessageToRelay>();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_reducer(
                     reducer::on::<MessageFromRelay>().run(|state: BridgeState, _| BridgeState {
                         message_count: state.message_count + 1,
@@ -1019,7 +1019,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Emit MessageFromRelay directly via context (like bridge_sends_events_to_relay does)
             handle.context.emit(MessageFromRelay {
@@ -1062,7 +1062,7 @@ mod tests {
             let (tx, rx) = Relay::channel();
             let _tx = tx; // Keep channel alive
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_effect(
                     effect::on_any()
                         .started(move |_ctx| {
@@ -1076,7 +1076,7 @@ mod tests {
                 )
                 .with_effect(bridge(_tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Verify started was called
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -1129,7 +1129,7 @@ mod tests {
             let (tx, rx) = Relay::channel();
             let tx_weak = tx.weak();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<MessageFromRelay>().run(move |_event, _ctx| {
                     let r = received_clone.clone();
                     async move {
@@ -1139,7 +1139,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {
@@ -1197,7 +1197,7 @@ mod tests {
 
             let (tx, rx) = Relay::channel();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<MessageFromRelay>().run(move |_event, _ctx| {
                     let p = processed_clone.clone();
                     async move {
@@ -1209,7 +1209,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {
@@ -1250,7 +1250,7 @@ mod tests {
             let (tx, rx) = Relay::channel();
             let tx_weak = tx.weak();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<MessageFromRelay>().run(move |_event, _ctx| {
                     let r = received_clone.clone();
                     async move {
@@ -1260,7 +1260,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {
@@ -1315,7 +1315,7 @@ mod tests {
             let (tx_a, rx_a) = Relay::channel();
             let (tx_b, rx_b) = Relay::channel();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<EventFromRelayA>().run(move |_event, _ctx| {
                     let r = received_a_clone.clone();
                     async move {
@@ -1333,7 +1333,7 @@ mod tests {
                 .with_effect(bridge(tx_a.weak(), rx_a.clone()))
                 .with_effect(bridge(tx_b.weak(), rx_b.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridges time to start
             for _ in 0..10 {
@@ -1382,7 +1382,7 @@ mod tests {
             let (tx, rx) = Relay::channel();
 
             // Engine 1: receives events, counts them
-            let store1: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store1: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<MessageFromRelay>().run(move |_event, _ctx| {
                     let r = store1_clone.clone();
                     async move {
@@ -1393,7 +1393,7 @@ mod tests {
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
             // Engine 2: receives events, counts them
-            let store2: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store2: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<MessageFromRelay>().run(move |_event, _ctx| {
                     let r = store2_clone.clone();
                     async move {
@@ -1403,8 +1403,8 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle1 = store1.activate();
-            let handle2 = store2.activate();
+            let handle1 = store1.activate(BridgeState::default());
+            let handle2 = store2.activate(BridgeState::default());
 
             // Give bridges time to start
             for _ in 0..10 {
@@ -1473,7 +1473,7 @@ mod tests {
             let (tx, rx) = Relay::channel();
             let _tx = tx; // Keep channel alive
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<MessageToRelay>().run(move |_event, _ctx| {
                     let r = effect_runs_clone.clone();
                     async move {
@@ -1483,7 +1483,7 @@ mod tests {
                 }))
                 .with_effect(bridge(_tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {
@@ -1523,7 +1523,7 @@ mod tests {
 
                 let (tx, rx) = Relay::channel();
 
-                let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+                let store: Engine<BridgeState> = Engine::new()
                     .with_effect(effect::on::<MessageFromRelay>().run(move |_event, _ctx| {
                         let r = received_clone.clone();
                         async move {
@@ -1533,7 +1533,7 @@ mod tests {
                     }))
                     .with_effect(bridge(tx.weak(), rx.clone()));
 
-                let handle = store.activate();
+                let handle = store.activate(BridgeState::default());
 
                 // Give bridge time to start
                 for _ in 0..5 {
@@ -1575,9 +1575,9 @@ mod tests {
             let _tx = tx; // Keep channel alive
 
             let store: Engine<BridgeState> =
-                Engine::new(BridgeState::default()).with_effect(bridge(_tx.weak(), rx.clone()));
+                Engine::new().with_effect(bridge(_tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {
@@ -1600,9 +1600,9 @@ mod tests {
             let (tx, rx) = Relay::channel();
 
             let store: Engine<BridgeState> =
-                Engine::new(BridgeState::default()).with_effect(bridge(tx.weak(), rx.clone()));
+                Engine::new().with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {
@@ -1645,7 +1645,7 @@ mod tests {
             let (tx, rx) = Relay::channel();
             let mut outgoing_subscriber = rx.subscribe::<MessageToRelay>();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 // When we receive from relay, record it and reply
                 .with_effect(effect::on::<MessageFromRelay>().run(move |event, ctx| {
                     let r = received_clone.clone();
@@ -1660,7 +1660,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {
@@ -1710,7 +1710,7 @@ mod tests {
 
             let (tx, rx) = Relay::channel();
 
-            let store: Engine<BridgeState> = Engine::new(BridgeState::default())
+            let store: Engine<BridgeState> = Engine::new()
                 .with_effect(effect::on::<MessageFromRelay>().run(move |event, _ctx| {
                     let r = received_clone.clone();
                     async move {
@@ -1720,7 +1720,7 @@ mod tests {
                 }))
                 .with_effect(bridge(tx.weak(), rx.clone()));
 
-            let handle = store.activate();
+            let handle = store.activate(BridgeState::default());
 
             // Give bridge time to start
             for _ in 0..10 {

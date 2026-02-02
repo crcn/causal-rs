@@ -474,13 +474,14 @@ mod tests {
 
     #[tokio::test]
     async fn store_returns_initial_state() {
-        let store: Engine<Counter> = Engine::new(Counter { value: 42 });
-        assert_eq!(store.state(), Counter { value: 42 });
+        let store: Engine<Counter> = Engine::new();
+        let result = store.activate(Counter { value: 42 });
+        assert_eq!(result.context.curr_state(), Counter { value: 42 });
     }
 
     #[tokio::test]
     async fn store_with_reducer_applies_on_emit() {
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -488,21 +489,21 @@ mod tests {
                 value: state.value - event.amount,
             }));
 
-        let result = store.activate();
+        let result = store.activate(Counter::default());
         result.context.emit(Increment { amount: 5 });
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert_eq!(store.state().value, 5);
+        assert_eq!(result.context.curr_state().value, 5);
 
         result.context.emit(Decrement { amount: 2 });
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert_eq!(store.state().value, 3);
+        assert_eq!(result.context.curr_state().value, 3);
     }
 
     #[tokio::test]
     async fn store_with_handler_receives_events() {
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let counter = handler_calls.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<Increment>().run(move |_event, _ctx| {
                 let c = counter.clone();
                 async move {
@@ -512,7 +513,7 @@ mod tests {
             }),
         );
 
-        let result = store.activate();
+        let result = store.activate(Counter::default());
         result.context.emit(Increment { amount: 1 });
         result.context.emit(Increment { amount: 2 });
 
@@ -524,7 +525,7 @@ mod tests {
     async fn store_reducer_and_handler_together() {
         let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let log_clone = log.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -536,7 +537,7 @@ mod tests {
                 }
             }));
 
-        let result = store.activate();
+        let result = store.activate(Counter::default());
         result.context.emit(Increment { amount: 10 });
         result.context.emit(Increment { amount: 5 });
 
@@ -545,12 +546,12 @@ mod tests {
         let logged = log.lock().clone();
         assert!(logged.contains(&10));
         assert!(logged.contains(&5));
-        assert_eq!(store.state().value, 15);
+        assert_eq!(result.context.curr_state().value, 15);
     }
 
     #[tokio::test]
     async fn store_multiple_event_types() {
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -559,19 +560,19 @@ mod tests {
             }))
             .with_reducer(reducer::on::<Reset>().run(|_: Counter, _| Counter { value: 0 }));
 
-        let result = store.activate();
+        let result = store.activate(Counter::default());
 
         result.context.emit(Increment { amount: 100 });
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert_eq!(store.state().value, 100);
+        assert_eq!(result.context.curr_state().value, 100);
 
         result.context.emit(Decrement { amount: 30 });
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert_eq!(store.state().value, 70);
+        assert_eq!(result.context.curr_state().value, 70);
 
         result.context.emit(Reset);
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert_eq!(store.state().value, 0);
+        assert_eq!(result.context.curr_state().value, 0);
     }
 
     #[tokio::test]
@@ -587,7 +588,7 @@ mod tests {
         }
 
         let store: Engine<Counter, Deps> =
-            Engine::with_deps(Counter::default(), Deps { multiplier: 3 })
+            Engine::with_deps(Deps { multiplier: 3 })
                 .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                     value: state.value + event.amount,
                 }))
@@ -600,11 +601,11 @@ mod tests {
                     Ok(())
                 }));
 
-        let result = store.activate();
+        let result = store.activate(Counter::default());
         result.context.emit(Increment { amount: 10 });
 
         result.settled().await.unwrap();
-        assert_eq!(store.state().value, 30);
+        assert_eq!(result.context.curr_state().value, 30);
     }
 
     #[tokio::test]
@@ -614,15 +615,15 @@ mod tests {
         // for each activation.
         static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<Increment>().run(|_event, _ctx| async move {
                 CALL_COUNT.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }));
 
         // Create two contexts
-        let result1 = store.activate();
-        let result2 = store.activate();
+        let result1 = store.activate(Counter::default());
+        let result2 = store.activate(Counter::default());
 
         // Emit to both
         result1.context.emit(Increment { amount: 1 });
@@ -646,7 +647,7 @@ mod tests {
         let handled = Arc::new(AtomicUsize::new(0));
         let handled_clone = handled.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(
                 effect::on_any()
                     .started(|ctx| async move {
@@ -665,7 +666,7 @@ mod tests {
                 }
             }));
 
-        let session = store.activate();
+        let session = store.activate(Counter::default());
         session.settled().await.unwrap();
 
         assert_eq!(
@@ -697,7 +698,7 @@ mod tests {
         let c_counter = Arc::new(AtomicUsize::new(0));
         let c_counter_clone = c_counter.clone();
 
-        let store: Engine<ChainState> = Engine::new(ChainState::default())
+        let store: Engine<ChainState> = Engine::new()
             .with_reducer(reducer::on::<EventA>().run(|state: ChainState, _| ChainState {
                 a_count: state.a_count + 1,
                 ..state
@@ -726,19 +727,19 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(ChainState::default());
         handle.context.emit(EventA);
         handle.settled().await.unwrap();
 
         // All three events should have been processed
-        assert_eq!(store.state().a_count, 1, "EventA should be reduced");
+        assert_eq!(handle.context.curr_state().a_count, 1, "EventA should be reduced");
         assert_eq!(
-            store.state().b_count,
+            handle.context.curr_state().b_count,
             1,
             "EventB should be reduced (cascaded from A)"
         );
         assert_eq!(
-            store.state().c_count,
+            handle.context.curr_state().c_count,
             1,
             "EventC should be reduced (cascaded from B)"
         );
@@ -762,7 +763,7 @@ mod tests {
 
         const MAX_DEPTH: i32 = 10;
 
-        let store: Engine<DeepState> = Engine::new(DeepState::default())
+        let store: Engine<DeepState> = Engine::new()
             .with_reducer(reducer::on::<DepthEvent>().run(|state: DeepState, event| DeepState {
                 depth_reached: state.depth_reached.max(event.0),
             }))
@@ -773,12 +774,12 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(DeepState::default());
         handle.context.emit(DepthEvent(0));
         handle.settled().await.unwrap();
 
         assert_eq!(
-            store.state().depth_reached,
+            handle.context.curr_state().depth_reached,
             MAX_DEPTH,
             "Should reach depth {MAX_DEPTH} through cascading"
         );
@@ -795,7 +796,7 @@ mod tests {
         let c2 = counter.clone();
         let c3 = counter.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<SharedEvent>().run(move |_event, _ctx| {
                 let c = c1.clone();
                 async move {
@@ -818,7 +819,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(SharedEvent);
         handle.settled().await.unwrap();
 
@@ -838,7 +839,7 @@ mod tests {
         let transitions = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let transitions_clone = transitions.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter { value: 0 })
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<SetValue>().run(|_: Counter, event| Counter { value: event.0 }))
             .with_effect(effect::on::<SetValue>().run(move |_event, ctx: EffectContext<Counter, ()>| {
                 let t = transitions_clone.clone();
@@ -850,7 +851,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(SetValue(10));
         handle.context.emit(SetValue(20));
         handle.context.emit(SetValue(30));
@@ -879,7 +880,7 @@ mod tests {
 
         const THRESHOLD: i32 = 100;
 
-        let store: Engine<PointsState> = Engine::new(PointsState::default())
+        let store: Engine<PointsState> = Engine::new()
             .with_reducer(reducer::on::<AddPoints>().run(|state: PointsState, event| PointsState {
                 points: state.points + event.0,
                 ..state
@@ -898,16 +899,16 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(PointsState::default());
         handle.context.emit(AddPoints(30)); // 30, below threshold
         handle.context.emit(AddPoints(40)); // 70, below threshold
         handle.context.emit(AddPoints(50)); // 120, crosses threshold!
         handle.context.emit(AddPoints(10)); // 130, already above
         handle.settled().await.unwrap();
 
-        assert_eq!(store.state().points, 130);
+        assert_eq!(handle.context.curr_state().points, 130);
         assert_eq!(
-            store.state().threshold_events,
+            handle.context.curr_state().threshold_events,
             1,
             "Threshold should be crossed exactly once"
         );
@@ -933,7 +934,7 @@ mod tests {
             branch_c_count: i32,
         }
 
-        let store: Engine<FanOutState> = Engine::new(FanOutState::default())
+        let store: Engine<FanOutState> = Engine::new()
             .with_reducer(reducer::on::<TriggerEvent>().run(|state: FanOutState, _| FanOutState {
                 trigger_count: state.trigger_count + 1,
                 ..state
@@ -963,14 +964,14 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(FanOutState::default());
         handle.context.emit(TriggerEvent);
         handle.settled().await.unwrap();
 
-        assert_eq!(store.state().trigger_count, 1);
-        assert_eq!(store.state().branch_a_count, 1, "BranchA should be emitted");
-        assert_eq!(store.state().branch_b_count, 1, "BranchB should be emitted");
-        assert_eq!(store.state().branch_c_count, 1, "BranchC should be emitted");
+        assert_eq!(handle.context.curr_state().trigger_count, 1);
+        assert_eq!(handle.context.curr_state().branch_a_count, 1, "BranchA should be emitted");
+        assert_eq!(handle.context.curr_state().branch_b_count, 1, "BranchB should be emitted");
+        assert_eq!(handle.context.curr_state().branch_c_count, 1, "BranchC should be emitted");
     }
 
     // ==================== STRESS TESTS ====================
@@ -978,12 +979,12 @@ mod tests {
     #[tokio::test]
     async fn stress_many_rapid_events() {
         // Test: Rapid emission of many events
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         const EVENT_COUNT: i32 = 1000;
         for _ in 0..EVENT_COUNT {
@@ -991,7 +992,7 @@ mod tests {
         }
 
         handle.settled().await.unwrap();
-        assert_eq!(store.state().value, EVENT_COUNT);
+        assert_eq!(handle.context.curr_state().value, EVENT_COUNT);
     }
 
     #[tokio::test]
@@ -1011,7 +1012,7 @@ mod tests {
         }
 
         // Use smaller event count to avoid overwhelming the async task queue
-        let store: Engine<CascadeState> = Engine::new(CascadeState::default())
+        let store: Engine<CascadeState> = Engine::new()
             .with_reducer(reducer::on::<Source>().run(|state: CascadeState, event| CascadeState {
                 source_sum: state.source_sum + event.0,
                 ..state
@@ -1025,7 +1026,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(CascadeState::default());
 
         const EVENT_COUNT: i32 = 20;
         for i in 1..=EVENT_COUNT {
@@ -1037,8 +1038,8 @@ mod tests {
         let expected_source = (EVENT_COUNT * (EVENT_COUNT + 1)) / 2; // sum 1..20 = 210
         let expected_derived = expected_source * 2; // 420
 
-        assert_eq!(store.state().source_sum, expected_source);
-        assert_eq!(store.state().derived_sum, expected_derived);
+        assert_eq!(handle.context.curr_state().source_sum, expected_source);
+        assert_eq!(handle.context.curr_state().derived_sum, expected_derived);
     }
 
     #[tokio::test]
@@ -1047,12 +1048,12 @@ mod tests {
         #[derive(Clone, Debug)]
         struct FailEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<FailEvent>()
                 .run(|_event, _ctx| async move { Err(anyhow::anyhow!("intentional failure")) }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(FailEvent);
 
         let result = handle.settled().await;
@@ -1070,7 +1071,7 @@ mod tests {
         let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter { value: 0 })
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<UpdateValue>().run(|_: Counter, event| Counter { value: event.0 }))
             .with_effect(effect::on::<CheckState>().run(move |_event, ctx: EffectContext<Counter, ()>| {
                 let obs = observed_clone.clone();
@@ -1084,7 +1085,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         // Emit check first, then updates - the check should see the updated values
         handle.context.emit(CheckState);
         handle.context.emit(UpdateValue(100));
@@ -1112,7 +1113,7 @@ mod tests {
         let order_started = order.clone();
         let order_handle = order.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<RegularEvent>()
                 .started(move |_ctx| {
                     let o = order_started.clone();
@@ -1130,7 +1131,7 @@ mod tests {
                 }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(RegularEvent);
         handle.settled().await.unwrap();
 
@@ -1150,7 +1151,7 @@ mod tests {
         let completed_clone = completed.clone();
 
         let store: Engine<Counter> =
-            Engine::new(Counter::default()).with_effect(effect::on::<LongEvent>().run(
+            Engine::new().with_effect(effect::on::<LongEvent>().run(
                 move |_event, ctx| {
                     let s = started_clone.clone();
                     let c = completed_clone.clone();
@@ -1169,7 +1170,7 @@ mod tests {
                 },
             ));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(LongEvent);
 
         // Give it time to start
@@ -1195,12 +1196,12 @@ mod tests {
     #[tokio::test]
     async fn event_stream_receives_downcasted_events() {
         // Test: External subscribers can receive raw events via event_stream
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Subscribe to raw Increment events on the event_stream
         let mut sub = handle.event_stream.subscribe::<Increment>();
@@ -1220,7 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn event_stream_receives_multiple_event_types() {
         // Test: Multiple event types are properly downcasted
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -1228,7 +1229,7 @@ mod tests {
                 value: state.value - event.amount,
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         let mut inc_sub = handle.event_stream.subscribe::<Increment>();
         let mut dec_sub = handle.event_stream.subscribe::<Decrement>();
@@ -1268,14 +1269,14 @@ mod tests {
             value: i32,
         }
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<TriggerEvent>().run(|_event, ctx| async move {
                 ctx.emit(CascadedEvent { value: 123 });
                 Ok(())
             }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         let mut trigger_sub = handle.event_stream.subscribe::<TriggerEvent>();
         let mut cascaded_sub = handle.event_stream.subscribe::<CascadedEvent>();
@@ -1302,9 +1303,9 @@ mod tests {
     #[tokio::test]
     async fn event_stream_multiple_subscribers_same_type() {
         // Test: Multiple subscribers to the same event type all receive events
-        let store: Engine<Counter> = Engine::new(Counter::default());
+        let store: Engine<Counter> = Engine::new();
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         let mut sub1 = handle.event_stream.subscribe::<Increment>();
         let mut sub2 = handle.event_stream.subscribe::<Increment>();
@@ -1333,9 +1334,9 @@ mod tests {
     #[tokio::test]
     async fn event_stream_rapid_events() {
         // Test: Rapid event emission works correctly with downcasting
-        let store: Engine<Counter> = Engine::new(Counter::default());
+        let store: Engine<Counter> = Engine::new();
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         let mut sub = handle.event_stream.subscribe::<Increment>();
 
         const EVENT_COUNT: i32 = 100;
@@ -1370,9 +1371,9 @@ mod tests {
     #[tokio::test]
     async fn event_stream_filter_works() {
         // Test: Pipedream filter operations work on the event_stream
-        let store: Engine<Counter> = Engine::new(Counter::default());
+        let store: Engine<Counter> = Engine::new();
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Filter to only Increment events with amount > 50
         let filtered = handle
@@ -1406,9 +1407,9 @@ mod tests {
         #[derive(Clone, Debug, PartialEq)]
         struct IncrementAmount(i32);
 
-        let store: Engine<Counter> = Engine::new(Counter::default());
+        let store: Engine<Counter> = Engine::new();
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Map Increment events to just their amounts
         let mapped = handle
@@ -1452,7 +1453,7 @@ mod tests {
         let received = Arc::new(AtomicUsize::new(0));
         let received_clone = received.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<TriggerEvent>().run(|_event, ctx| async move {
                 // Spawn a background task (like the scheduler does)
                 tokio::spawn(async move {
@@ -1471,7 +1472,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(TriggerEvent);
 
         // Wait for the spawned task to emit and the receiver to process
@@ -1496,7 +1497,7 @@ mod tests {
             amount: i32,
         }
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<ScheduledIncrement>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -1509,14 +1510,14 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(StartScheduler);
 
         // Wait for spawned task
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         assert_eq!(
-            store.state().value,
+            handle.context.curr_state().value,
             100,
             "State should be updated by event from tokio::spawn"
         );
@@ -1540,7 +1541,7 @@ mod tests {
         let final_received = Arc::new(AtomicUsize::new(0));
         let final_received_clone = final_received.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<StartEvent>().run(|_event, ctx| async move {
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -1563,7 +1564,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(StartEvent);
 
         // Wait for cascade
@@ -1586,7 +1587,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct PanicEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<PanicEvent>().run(|_event, ctx| async move {
                 ctx.within(|_| async move {
                     panic!("intentional panic for testing");
@@ -1595,7 +1596,7 @@ mod tests {
             }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(PanicEvent);
 
         let result = handle.settled().await;
@@ -1618,7 +1619,7 @@ mod tests {
         let order1 = order.clone();
         let order2 = order.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<MultiFailEvent>().run(move |_event, _ctx| {
                 let o = order1.clone();
                 async move {
@@ -1634,7 +1635,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(MultiFailEvent);
 
         let result = handle.settled().await;
@@ -1659,13 +1660,13 @@ mod tests {
         #[derive(Clone, Debug)]
         struct AnyEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<AnyEvent>()
                 .started(|_ctx| async move { Err(anyhow::anyhow!("started hook failure")) })
                 .run(|_event, _ctx| async move { Ok(()) }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         // Don't even emit any events - started() should still fail
 
         let result = handle.settled().await;
@@ -1691,7 +1692,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct CascadedEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<TriggerEvent>().run(|_event, ctx| async move {
                 ctx.emit(CascadedEvent);
                 Ok(())
@@ -1700,7 +1701,7 @@ mod tests {
                 Err(anyhow::anyhow!("cascade failure"))
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(TriggerEvent);
 
         let result = handle.settled().await;
@@ -1720,14 +1721,14 @@ mod tests {
         #[derive(Clone, Debug)]
         struct SubtaskEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<SubtaskEvent>().run(|_event, ctx| async move {
                 ctx.within(|_| async move { Err(anyhow::anyhow!("subtask failure")) });
                 Ok(())
             }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(SubtaskEvent);
 
         let result = handle.settled().await;
@@ -1747,7 +1748,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct NestedEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<NestedEvent>().run(|_event, ctx| async move {
                 ctx.within(|ctx1| async move {
                     ctx1.within(|ctx2| async move {
@@ -1762,7 +1763,7 @@ mod tests {
             }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(NestedEvent);
 
         let result = handle.settled().await;
@@ -1793,7 +1794,7 @@ mod tests {
         let head_completed_clone = head_completed.clone();
 
         let store: Engine<Counter> =
-            Engine::new(Counter::default()).with_effect(effect::on::<TransientEvent>().run(
+            Engine::new().with_effect(effect::on::<TransientEvent>().run(
                 move |_event, ctx| {
                     let completed = head_completed_clone.clone();
                     async move {
@@ -1811,7 +1812,7 @@ mod tests {
                 },
             ));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(TransientEvent);
 
         // Head should settle successfully even though transient will fail
@@ -1840,7 +1841,7 @@ mod tests {
         let success_count = Arc::new(AtomicUsize::new(0));
         let success_count_clone = success_count.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<FailingEventType>().run(|_event, _ctx| async move {
                 Err(anyhow::anyhow!("failing event error"))
             }))
@@ -1852,7 +1853,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Emit multiple events - some will fail, some will succeed
         handle.context.emit(SuccessEventType);
@@ -1882,7 +1883,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<IncrementWithEffect>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -1899,7 +1900,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Emit 3 events - the second one's effect will fail
         handle.context.emit(IncrementWithEffect { amount: 10 });
@@ -1911,7 +1912,7 @@ mod tests {
         // State should have been updated by all reducers (60 total)
         // Reducers run synchronously before effects
         assert_eq!(
-            store.state().value,
+            handle.context.curr_state().value,
             60,
             "All reducers should have run despite effect failure"
         );
@@ -1927,7 +1928,7 @@ mod tests {
         let started_clone = started.clone();
 
         let store: Engine<Counter> =
-            Engine::new(Counter::default()).with_effect(effect::on::<SlowEvent>().run(
+            Engine::new().with_effect(effect::on::<SlowEvent>().run(
                 move |_event, ctx| {
                     let s = started_clone.clone();
                     async move {
@@ -1946,7 +1947,7 @@ mod tests {
                 },
             ));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(SlowEvent);
 
         // Give it a moment to start
@@ -1975,7 +1976,7 @@ mod tests {
         let observed_prev_clone = observed_prev.clone();
         let observed_next_clone = observed_next.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter { value: 100 })
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<StatefulFailEvent>().run(|_state: Counter, event| Counter {
                 value: event.new_value,
             }))
@@ -1991,7 +1992,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter { value: 100 });
         handle.context.emit(StatefulFailEvent { new_value: 500 });
 
         let _ = handle.settled().await; // Ignore error
@@ -2014,7 +2015,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct MultiErrorEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default()).with_effect(
+        let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<MultiErrorEvent>().run(|_event, ctx| async move {
                 // Spawn multiple failing tasks
                 for i in 0..5 {
@@ -2028,7 +2029,7 @@ mod tests {
             }),
         );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(MultiErrorEvent);
 
         let result = handle.settled().await;
@@ -2058,7 +2059,7 @@ mod tests {
         let reached = Arc::new(AtomicUsize::new(0));
         let reached_clone = reached.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<StartCascade>().run(|_event, ctx| async move {
                 ctx.emit(MiddleCascade);
                 Ok(())
@@ -2075,7 +2076,7 @@ mod tests {
                 Err(anyhow::anyhow!("final cascade failure"))
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(StartCascade);
 
         let result = handle.settled().await;
@@ -2104,13 +2105,13 @@ mod tests {
         #[derive(Clone, Debug)]
         struct DelayedErrorEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<DelayedErrorEvent>().run(|_event, _ctx| async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 Err(anyhow::anyhow!("delayed error"))
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(DelayedErrorEvent);
 
         let result = handle.settled().await;
@@ -2129,12 +2130,12 @@ mod tests {
     async fn concurrent_emits_from_multiple_tasks() {
         // Test: Multiple tokio tasks emitting events concurrently
         // This tests the reducer lock contention and event ordering
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         const TASK_COUNT: usize = 10;
         const EVENTS_PER_TASK: i32 = 100;
@@ -2157,7 +2158,7 @@ mod tests {
         handle.settled().await.unwrap();
 
         assert_eq!(
-            store.state().value,
+            handle.context.curr_state().value,
             (TASK_COUNT as i32) * EVENTS_PER_TASK,
             "All events from concurrent tasks should be processed"
         );
@@ -2177,7 +2178,7 @@ mod tests {
             derived_count: i32,
         }
 
-        let store: Engine<ConcurrentState> = Engine::new(ConcurrentState::default())
+        let store: Engine<ConcurrentState> = Engine::new()
             .with_reducer(reducer::on::<Source>().run(|state: ConcurrentState, _| ConcurrentState {
                 source_count: state.source_count + 1,
                 ..state
@@ -2191,7 +2192,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(ConcurrentState::default());
 
         const TASK_COUNT: usize = 5;
         const EVENTS_PER_TASK: i32 = 50;
@@ -2213,8 +2214,8 @@ mod tests {
         handle.settled().await.unwrap();
 
         let expected = (TASK_COUNT as i32) * EVENTS_PER_TASK;
-        assert_eq!(store.state().source_count, expected);
-        assert_eq!(store.state().derived_count, expected);
+        assert_eq!(handle.context.curr_state().source_count, expected);
+        assert_eq!(handle.context.curr_state().derived_count, expected);
     }
 
     #[tokio::test]
@@ -2226,7 +2227,7 @@ mod tests {
 
         let processed = Arc::new(AtomicUsize::new(0));
         let processed_clone = processed.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<FastEvent>().run(|state: Counter, _| Counter {
                 value: state.value + 1,
             }))
@@ -2240,7 +2241,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         const EVENT_COUNT: i32 = 100;
         for i in 0..EVENT_COUNT {
@@ -2249,7 +2250,7 @@ mod tests {
 
         handle.settled().await.unwrap();
 
-        assert_eq!(store.state().value, EVENT_COUNT);
+        assert_eq!(handle.context.curr_state().value, EVENT_COUNT);
         assert_eq!(processed.load(Ordering::Relaxed), EVENT_COUNT as usize);
     }
 
@@ -2261,7 +2262,7 @@ mod tests {
 
         let observations = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let observations_clone = observations.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<OrderedEvent>().run(|state: Counter, event| Counter {
                 value: state.value + event.0,
             }))
@@ -2275,7 +2276,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Emit from multiple tasks
         let mut handles = Vec::new();
@@ -2318,7 +2319,7 @@ mod tests {
 
         let started = Arc::new(AtomicUsize::new(0));
         let started_clone = started.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<InterleaveEvent>().run(move |_event, ctx| {
                 let s = started_clone.clone();
                 async move {
@@ -2334,7 +2335,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Start emitting events
         let ctx = handle.context.clone();
@@ -2362,13 +2363,13 @@ mod tests {
     #[tokio::test]
     async fn multiple_activations_independent() {
         // Test: Multiple activations of the same store are independent
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
-        let handle1 = store.activate();
-        let handle2 = store.activate();
+        let handle1 = store.activate(Counter::default());
+        let handle2 = store.activate(Counter::default());
 
         // Emit to both handles
         handle1.context.emit(Increment { amount: 10 });
@@ -2377,11 +2378,16 @@ mod tests {
         handle1.settled().await.unwrap();
         handle2.settled().await.unwrap();
 
-        // Both should have updated the shared state
+        // Each activation has independent state
         assert_eq!(
-            store.state().value,
-            110,
-            "Both activations should update shared state"
+            handle1.context.curr_state().value,
+            10,
+            "First activation should have value 10"
+        );
+        assert_eq!(
+            handle2.context.curr_state().value,
+            100,
+            "Second activation should have value 100 (independent state)"
         );
     }
 
@@ -2397,7 +2403,7 @@ mod tests {
 
         let success_count = Arc::new(AtomicUsize::new(0));
         let success_count_clone = success_count.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<MixedEvent>().run(move |event, _ctx| {
                 let sc = success_count_clone.clone();
                 async move {
@@ -2410,7 +2416,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Emit events concurrently
         let mut handles = Vec::new();
@@ -2443,7 +2449,7 @@ mod tests {
             value: i32,
         }
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<FailAfterUpdate>().run(|state: Counter, event| Counter {
                 value: state.value + event.value,
             }))
@@ -2455,7 +2461,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         handle.context.emit(FailAfterUpdate { value: 30 });
         handle.context.emit(FailAfterUpdate { value: 60 }); // Will fail effect
@@ -2465,7 +2471,7 @@ mod tests {
 
         // State should still be accessible and updated by reducers
         assert_eq!(
-            store.state().value,
+            handle.context.curr_state().value,
             100,
             "State should reflect all reducer updates"
         );
@@ -2491,7 +2497,7 @@ mod tests {
             branch_b_child: bool,
         }
 
-        let store: Engine<FanOutState> = Engine::new(FanOutState::default())
+        let store: Engine<FanOutState> = Engine::new()
             .with_reducer(reducer::on::<BranchAChild>().run(|state, _| FanOutState {
                 branch_a_child: true,
                 ..state
@@ -2514,14 +2520,14 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(FanOutState::default());
         handle.context.emit(TriggerFanOut);
 
         let result = handle.settled().await;
         assert!(result.is_err(), "Should have error from branch A");
 
         // Branch B should still have processed
-        let state = store.state();
+        let state = handle.context.curr_state();
         assert!(
             state.branch_a_child,
             "Branch A child should have been emitted before error"
@@ -2538,12 +2544,12 @@ mod tests {
         #[derive(Clone, Debug)]
         struct EmptyErrorEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<EmptyErrorEvent>().run(|_event, _ctx| async move {
                 Err(anyhow::anyhow!(""))
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(EmptyErrorEvent);
 
         let result = handle.settled().await;
@@ -2556,13 +2562,13 @@ mod tests {
         #[derive(Clone, Debug)]
         struct ChainedErrorEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<ChainedErrorEvent>().run(|_event, _ctx| async move {
                 let inner = anyhow::anyhow!("inner error");
                 Err(inner.context("outer context"))
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(ChainedErrorEvent);
 
         let result = handle.settled().await;
@@ -2586,12 +2592,12 @@ mod tests {
         #[derive(Clone, Debug)]
         struct DirectPanicEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<DirectPanicEvent>().run(|_event, _ctx| async move {
                 panic!("direct panic in effect handle");
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(DirectPanicEvent);
 
         let result = handle.settled().await;
@@ -2610,7 +2616,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct NestedPanicEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<NestedPanicEvent>().run(|_event, ctx| async move {
                 ctx.within(|ctx1| async move {
                     ctx1.within(|ctx2| async move {
@@ -2624,7 +2630,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(NestedPanicEvent);
 
         let result = handle.settled().await;
@@ -2643,7 +2649,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct NonStringPanicEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<NonStringPanicEvent>().run(|_event, ctx| async move {
                 ctx.within(|_| async move {
                     std::panic::panic_any(42i32);
@@ -2651,7 +2657,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(NonStringPanicEvent);
 
         let result = handle.settled().await;
@@ -2673,7 +2679,7 @@ mod tests {
 
         let ran = Arc::new(AtomicUsize::new(0));
         let ran_clone = ran.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<MultiEffectPanicEvent>().run(|_event, ctx| async move {
                 ctx.within(|_| async move {
                     panic!("effect panics");
@@ -2688,7 +2694,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(MultiEffectPanicEvent);
 
         let result = handle.settled().await;
@@ -2708,7 +2714,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct AnyEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(
                 effect::on::<AnyEvent>()
                     .started(|_ctx| async move {
@@ -2717,7 +2723,7 @@ mod tests {
                     .run(|_event, _ctx| async move { Ok(()) }),
             );
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         let result = handle.settled().await;
         assert!(result.is_err(), "Panic in started should be captured");
@@ -2735,7 +2741,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct MultiPanicEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<MultiPanicEvent>().run(|_event, ctx| async move {
                 // Spawn multiple panicking tasks with different delays
                 for i in 0..5 {
@@ -2748,7 +2754,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(MultiPanicEvent);
 
         let result = handle.settled().await;
@@ -2769,7 +2775,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct PanicAndErrorEvent;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<PanicAndErrorEvent>().run(|_event, ctx| async move {
                 // Error task - no delay
                 ctx.within(|_| async { Err(anyhow::anyhow!("error before panic")) });
@@ -2783,7 +2789,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(PanicAndErrorEvent);
 
         let result = handle.settled().await;
@@ -2805,7 +2811,7 @@ mod tests {
 
         let head_completed = Arc::new(AtomicUsize::new(0));
         let head_completed_clone = head_completed.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<TransientPanicEvent>().run(move |_event, ctx| {
                 let completed = head_completed_clone.clone();
                 async move {
@@ -2822,7 +2828,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         handle.context.emit(TransientPanicEvent);
 
         let result = handle.settled().await;
@@ -2843,7 +2849,7 @@ mod tests {
             should_panic: bool,
         }
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<IncrementThenPanic>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -2856,7 +2862,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         handle.context.emit(IncrementThenPanic {
             amount: 10,
@@ -2875,7 +2881,7 @@ mod tests {
 
         // State should be consistent - reducers run before effects
         assert_eq!(
-            store.state().value,
+            handle.context.curr_state().value,
             60,
             "State should be updated by all reducers despite panic"
         );
@@ -2899,14 +2905,14 @@ mod tests {
         #[derive(Clone, Debug)]
         struct AudioReceived;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<AudioReceived>().run(|_event, ctx| async move {
                 // Emit InputAudio when AudioReceived is processed
                 ctx.emit(InputAudio(vec![1, 2, 3, 4]));
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Create external stream and pipe from store (spawn as background task)
         let external_stream = Relay::new();
@@ -2948,14 +2954,14 @@ mod tests {
         #[derive(Clone, Debug)]
         struct Trigger;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<Trigger>().run(|_event, ctx| async move {
                 ctx.emit(TextChunk("hello".to_string()));
                 ctx.emit(AudioChunk(vec![5, 6, 7, 8]));
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Create external stream and pipe from store
         let external_stream = Relay::new();
@@ -3018,13 +3024,13 @@ mod tests {
         #[derive(Clone, Debug)]
         struct Trigger;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<Trigger>().run(|_event, ctx| async move {
                 ctx.emit(InputAudio(vec![1, 2, 3]));
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Create external stream (simulates valet_session)
         let external_stream = Relay::new();
@@ -3075,7 +3081,7 @@ mod tests {
         let recv_count = Arc::new(AtomicUsize::new(0));
         let rc = recv_count.clone();
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<ExternalEvent>().run(move |_event, _ctx| {
                 let c = rc.clone();
                 async move {
@@ -3084,7 +3090,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         let external_stream = Relay::new();
         // Bidirectional piping: external → handle and handle → external (spawn as background tasks)
@@ -3125,7 +3131,7 @@ mod tests {
 
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<ExternalIncrement>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
@@ -3137,7 +3143,7 @@ mod tests {
                 }
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         let external_stream = Relay::new();
         // Bidirectional piping: external → handle and handle → external (spawn as background tasks)
         let ext_clone = external_stream.clone();
@@ -3158,7 +3164,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         assert_eq!(
-            store.state().value,
+            handle.context.curr_state().value,
             5,
             "Reducer should process external event"
         );
@@ -3177,8 +3183,8 @@ mod tests {
         #[derive(Clone, Debug, PartialEq)]
         struct ExternalPing(u8);
 
-        let store: Engine<Counter> = Engine::new(Counter::default());
-        let handle = store.activate();
+        let store: Engine<Counter> = Engine::new();
+        let handle = store.activate(Counter::default());
 
         let external_stream = Relay::new();
         // Bidirectional piping: external → handle and handle → external (spawn as background tasks)
@@ -3218,11 +3224,11 @@ mod tests {
     async fn downcast_envelope_forwarder_closes_when_source_closes() {
         // When the source stream closes, downcast_envelope forwarder should stop
 
-        let store: Engine<Counter> = Engine::new(Counter::default());
+        let store: Engine<Counter> = Engine::new();
 
         let external_stream = Relay::new();
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
         // Spawn forward as background task
         let ext_clone = external_stream.clone();
         let stream = handle.event_stream.clone();
@@ -3254,7 +3260,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct StartRapid;
 
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_effect(effect::on::<StartRapid>().run(|_event, ctx| async move {
                 // Emit many events rapidly
                 for i in 0..100 {
@@ -3263,7 +3269,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         let external_stream = Relay::with_channel_size(256);
         // Spawn forward as background task
@@ -3299,12 +3305,12 @@ mod tests {
     #[tokio::test]
     async fn store_state_updates_between_events() {
         // Test: store.state() returns real-time state updates
-        let store: Engine<Counter> = Engine::new(Counter::default())
+        let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(Counter::default());
 
         // Emit multiple events
         handle.context.emit(Increment { amount: 10 });
@@ -3312,14 +3318,14 @@ mod tests {
 
         handle.settled().await.unwrap();
 
-        // store.state() should reflect all updates
-        assert_eq!(store.state().value, 30);
+        // handle.context.curr_state() should reflect all updates
+        assert_eq!(handle.context.curr_state().value, 30);
 
         // Emit more
         handle.context.emit(Increment { amount: 5 });
         handle.settled().await.unwrap();
 
-        assert_eq!(store.state().value, 35);
+        assert_eq!(handle.context.curr_state().value, 35);
     }
 
     // ==================== EXTERNAL PIPE TESTS ====================
@@ -3345,7 +3351,7 @@ mod tests {
             total: i32,
         }
 
-        let store: Engine<PipeState> = Engine::new(PipeState::default())
+        let store: Engine<PipeState> = Engine::new()
             .with_reducer(reducer::on::<InputEvent>().run(|state: PipeState, event| PipeState {
                 total: state.total + event.value,
             }))
@@ -3357,7 +3363,7 @@ mod tests {
                 Ok(())
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(PipeState::default());
 
         // Create external relay and wire bidirectionally (spawn as background tasks)
         let external = Relay::new();
@@ -3381,7 +3387,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // State should be updated by reducer
-        assert_eq!(store.state().total, 10);
+        assert_eq!(handle.context.curr_state().total, 10);
 
         // Should receive output event on external
         let output =
@@ -3409,12 +3415,12 @@ mod tests {
             ping_count: i32,
         }
 
-        let store: Engine<EchoState> = Engine::new(EchoState::default())
+        let store: Engine<EchoState> = Engine::new()
             .with_reducer(reducer::on::<PingEvent>().run(|state: EchoState, _event| EchoState {
                 ping_count: state.ping_count + 1,
             }));
 
-        let handle = store.activate();
+        let handle = store.activate(EchoState::default());
 
         let external = Relay::new();
         // Spawn forward calls as background tasks
@@ -3446,7 +3452,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // State should be updated (reducer ran)
-        assert_eq!(store.state().ping_count, 1);
+        assert_eq!(handle.context.curr_state().ping_count, 1);
 
         // Should receive exactly once (from send), not twice (would indicate echo)
         assert_eq!(
@@ -3466,12 +3472,12 @@ mod tests {
         #[derive(Clone, Default, Debug)]
         struct DropState;
 
-        let store: Engine<DropState> = Engine::new(DropState::default());
+        let store: Engine<DropState> = Engine::new();
 
         let external = Relay::new();
 
         {
-            let handle = store.activate();
+            let handle = store.activate(DropState::default());
             // Spawn forward calls as background tasks
             let ext_clone = external.clone();
             let stream = handle.event_stream.clone();
