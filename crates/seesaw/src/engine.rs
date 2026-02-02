@@ -163,17 +163,20 @@ where
     ///
     /// ```ignore
     /// let handle = engine.activate(State::default());
-    /// let result = handle.process(|ctx| {
-    ///     ctx.emit(OrderPlaced { id: 123 });
+    /// let result = handle.process(|ctx| async move {
+    ///     // Can do async work here
+    ///     let data = fetch_data().await?;
+    ///     ctx.emit(OrderPlaced { id: 123, data });
     ///     Ok(Response { status: "ok" })
     /// }).await?;
     /// println!("All effects completed, result: {:?}", result);
     /// ```
-    pub async fn process<F, R>(&self, f: F) -> Result<R>
+    pub async fn process<'a, F, Fut, R>(&'a self, f: F) -> Result<R>
     where
-        F: FnOnce(&EffectContext<S, D>) -> Result<R>,
+        F: FnOnce(&'a EffectContext<S, D>) -> Fut,
+        Fut: std::future::Future<Output = Result<R>> + Send + 'a,
     {
-        let result = f(&self.context)?;
+        let result = f(&self.context).await?;
         self.tasks.settled().await?;
         Ok(result)
     }
@@ -581,7 +584,7 @@ mod tests {
 
         let handle = store.activate(Counter::default());
         let result = handle
-            .process(|ctx| {
+            .process(|ctx| async move {
                 ctx.emit(Increment { amount: 10 });
                 ctx.emit(Increment { amount: 5 });
                 Ok(42) // Return value
