@@ -5,9 +5,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use seesaw_core::{Edge, EdgeContext, Effect, EffectContext, EngineBuilder, Event};
+use seesaw_core::{Effect, EffectContext, EngineBuilder, RunContext};
 use std::sync::Arc;
-use uuid::Uuid;
 
 // ============================================================================
 // Events (Facts)
@@ -68,7 +67,7 @@ impl Effect<FetchEvent, Deps, FetchState> for FetchEffect {
         &mut self,
         event: FetchEvent,
         ctx: EffectContext<Deps, FetchState>,
-    ) -> Result<Option<FetchEvent>> {
+    ) -> Result<()> {
         match event {
             FetchEvent::FetchRequested { urls } => {
                 // Fetch first URL
@@ -84,68 +83,69 @@ impl Effect<FetchEvent, Deps, FetchState> for FetchEffect {
                                 let content = response.text().await?;
                                 println!("✓ Fetched {} ({} bytes)", url, content.len());
 
-                                Ok(Some(FetchEvent::Fetched {
+                                ctx.emit(FetchEvent::Fetched {
                                     url,
                                     content,
                                     status,
-                                }))
+                                });
                             } else {
                                 println!("✗ Failed {} (HTTP {})", url, status);
 
-                                Ok(Some(FetchEvent::FetchFailed {
+                                ctx.emit(FetchEvent::FetchFailed {
                                     url,
                                     reason: format!("HTTP {}", status),
-                                }))
+                                });
                             }
                         }
                         Err(e) => {
                             println!("✗ Failed {}: {}", url, e);
 
-                            Ok(Some(FetchEvent::FetchFailed {
+                            ctx.emit(FetchEvent::FetchFailed {
                                 url,
                                 reason: e.to_string(),
-                            }))
+                            });
                         }
                     }
                 } else {
                     // No URLs to fetch
                     let state = ctx.state();
-                    Ok(Some(FetchEvent::AllComplete {
+                    ctx.emit(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    }))
+                    });
                 }
             }
             FetchEvent::Fetched { .. } => {
                 // Check if more URLs to fetch
                 let state = ctx.state();
                 if !state.urls_to_fetch.is_empty() {
-                    Ok(Some(FetchEvent::FetchRequested {
+                    ctx.emit(FetchEvent::FetchRequested {
                         urls: state.urls_to_fetch.clone(),
-                    }))
+                    });
                 } else {
-                    Ok(Some(FetchEvent::AllComplete {
+                    ctx.emit(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    }))
+                    });
                 }
             }
             FetchEvent::FetchFailed { .. } => {
                 // Check if more URLs to fetch
                 let state = ctx.state();
                 if !state.urls_to_fetch.is_empty() {
-                    Ok(Some(FetchEvent::FetchRequested {
+                    ctx.emit(FetchEvent::FetchRequested {
                         urls: state.urls_to_fetch.clone(),
-                    }))
+                    });
                 } else {
-                    Ok(Some(FetchEvent::AllComplete {
+                    ctx.emit(FetchEvent::AllComplete {
                         success_count: state.success_count,
                         failure_count: state.failure_count,
-                    }))
+                    });
                 }
             }
-            _ => Ok(None), // Skip other events
+            _ => {}, // Skip other events
         }
+        Ok(())
     }
 }
 
@@ -192,33 +192,6 @@ impl seesaw_core::Reducer<FetchEvent, FetchState> for FetchReducer {
 }
 
 // ============================================================================
-// Edge (Entry point)
-// ============================================================================
-
-struct FetchEdge {
-    urls: Vec<String>,
-}
-
-impl Edge<FetchState> for FetchEdge {
-    type Event = FetchEvent;
-    type Data = (usize, usize); // (success_count, failure_count)
-
-    fn execute(&self, _ctx: &EdgeContext<FetchState>) -> Option<FetchEvent> {
-        Some(FetchEvent::FetchRequested {
-            urls: self.urls.clone(),
-        })
-    }
-
-    fn read(&self, state: &FetchState) -> Option<Self::Data> {
-        if state.complete {
-            Some((state.success_count, state.failure_count))
-        } else {
-            None
-        }
-    }
-}
-
-// ============================================================================
 // Dependencies
 // ============================================================================
 
@@ -248,15 +221,20 @@ async fn main() -> Result<()> {
         "https://httpbin.org/status/404".to_string(),
     ];
 
-    let (success, failure) = engine
-        .run(FetchEdge { urls }, FetchState::default())
-        .await?
-        .unwrap_or((0, 0));
+    // Run with closure that emits initial event
+    engine
+        .run(
+            |ctx: &RunContext<Deps, FetchState>| {
+                ctx.emit(FetchEvent::FetchRequested {
+                    urls: urls.clone(),
+                });
+                Ok(())
+            },
+            FetchState::default(),
+        )
+        .await?;
 
-    println!(
-        "\nAll fetches complete! Success: {}, Failed: {}",
-        success, failure
-    );
+    println!("\nAll fetches complete!");
 
     Ok(())
 }

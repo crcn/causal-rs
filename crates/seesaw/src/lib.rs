@@ -159,13 +159,11 @@
 mod bus;
 mod core;
 mod dispatch;
-mod edge;
 mod effect_impl;
 mod engine;
 mod error;
 mod reducer;
 mod request;
-mod tap;
 
 // Testing utilities are in the separate seesaw-testing crate
 
@@ -180,17 +178,11 @@ pub use request::{dispatch_request, dispatch_request_timeout, DEFAULT_REQUEST_TI
 // Re-export error types
 pub use crate::error::{SeesawError};
 
-// Re-export edge types (entry points)
-pub use edge::{Edge, EdgeContext};
-
 // Re-export reducer types (state transformation)
 pub use reducer::Reducer;
 
 // Re-export effect types
 pub use effect_impl::{Effect, EffectContext};
-
-// Re-export tap types (event observation)
-pub use tap::{EventTap, TapContext};
 
 // Re-export bus types
 pub use bus::EventBus;
@@ -199,7 +191,7 @@ pub use bus::EventBus;
 pub use dispatch::Dispatcher;
 
 // Re-export engine types (primary entry point)
-pub use engine::{Engine, EngineBuilder, InflightTracker};
+pub use engine::{Engine, EngineBuilder, InflightTracker, RunContext};
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;

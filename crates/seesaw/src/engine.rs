@@ -1,22 +1,25 @@
-//! Seesaw Engine - unified orchestration for edges, effects, and event bus.
+//! Seesaw Engine - unified orchestration for effects and event bus.
 //!
 //! The Engine is the central coordinator for the seesaw architecture:
 //!
 //! ```text
-//! Edge → Events → Effects → Events → Effects → ... (until settled)
+//! Closure → Events → Effects → Events → Effects → ... (until settled)
 //! ```
 //!
 //! # Usage
 //!
 //! ```ignore
-//! use seesaw::{EngineBuilder, EventBus, Edge};
+//! use seesaw::{EngineBuilder, EventBus};
 //!
-//! let engine = EngineBuilder::new(deps)
+//! let mut engine = EngineBuilder::new(deps)
 //!     .with_effect::<MyEvent, _, ()>(MyEffect)
 //!     .build();
 //!
-//! // Run an edge with state
-//! let result = engine.run(MyEdge { data }, initial_state).await?;
+//! // Run with closure
+//! let result = engine.run(
+//!     |ctx| action::do_something(arg, ctx),
+//!     initial_state
+//! ).await?;
 //! ```
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,9 +33,7 @@ use tokio::sync::Notify;
 use crate::bus::EventBus;
 use crate::core::{CorrelationId, Event, EventEnvelope};
 use crate::dispatch::Dispatcher;
-use crate::edge::Edge;
 use crate::effect_impl::Effect;
-use crate::tap::EventTap;
 
 // =============================================================================
 // Inflight Tracking
@@ -158,10 +159,44 @@ impl InflightTracker {
 }
 
 // =============================================================================
+// RunContext
+// =============================================================================
+
+/// Context provided to closures in engine.run()
+///
+/// This context allows closures to emit events and access dependencies.
+pub struct RunContext<'a, D, S> {
+    deps: &'a Arc<D>,
+    bus: &'a EventBus,
+    cid: CorrelationId,
+    inflight: &'a Arc<InflightTracker>,
+    _phantom: std::marker::PhantomData<S>,
+}
+
+impl<'a, D, S> RunContext<'a, D, S> {
+    /// Get shared dependencies
+    pub fn deps(&self) -> &D {
+        self.deps
+    }
+
+    /// Emit an event with correlation tracking
+    pub fn emit<E: Event>(&self, event: E) {
+        // Increment inflight before emitting
+        self.inflight.inc(self.cid, 1);
+        self.bus.emit_with_correlation(event, self.cid);
+    }
+
+    /// Get the correlation ID
+    pub fn correlation_id(&self) -> CorrelationId {
+        self.cid
+    }
+}
+
+// =============================================================================
 // Engine
 // =============================================================================
 
-/// Engine for running edges and coordinating events/effects.
+/// Engine for running closures and coordinating events/effects.
 pub struct Engine<D, S: Clone = ()> {
     deps: Arc<D>,
     bus: EventBus,
@@ -170,39 +205,44 @@ pub struct Engine<D, S: Clone = ()> {
 }
 
 impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default> Engine<D, S> {
-    /// Run an edge with the given state.
+    /// Run a closure with the given state.
     ///
     /// This is the main entry point for executing event flows:
-    /// 1. Execute edge to get initial event
-    /// 2. Process events through effects until settled
-    /// 3. Read final result from edge
+    /// 1. Call closure with RunContext
+    /// 2. Closure emits events and returns result
+    /// 3. Process events through effects until settled
+    /// 4. Return result from closure
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let user = engine.run(SignupEdge { email, name }, request_state).await?
-    ///     .ok_or_else(|| anyhow!("signup failed"))?;
+    /// let user = engine.run(
+    ///     |ctx| action::create_user(email, name, ctx),
+    ///     request_state
+    /// ).await?;
     /// ```
-    pub async fn run<E>(&mut self, edge: E, state: S) -> Result<Option<E::Data>>
+    pub async fn run<F, R>(&mut self, f: F, state: S) -> Result<R>
     where
-        E: Edge<S>,
+        F: FnOnce(&RunContext<D, S>) -> Result<R>,
+        R: Send + 'static,
     {
         // Create correlation ID for tracking
         let cid = CorrelationId::new();
 
-        // Execute edge to get initial event (if any)
-        let ctx = crate::edge::EdgeContext::new(Arc::new(state.clone()));
-        if let Some(event) = edge.execute(&ctx) {
-            // Emit initial event with correlation
-            self.inflight.inc(cid, 1);
-            let envelope = EventEnvelope::new(cid, event);
-            self.bus.emit_envelope(envelope);
-        }
+        // Call closure with context
+        let ctx = RunContext {
+            deps: &self.deps,
+            bus: &self.bus,
+            cid,
+            inflight: &self.inflight,
+            _phantom: std::marker::PhantomData,
+        };
+        let result = f(&ctx)?;
 
         // Process events until settled (with timeout)
         let timeout_duration = Duration::from_secs(30);
 
-        let final_state = tokio::time::timeout(timeout_duration, async {
+        tokio::time::timeout(timeout_duration, async {
             let mut receiver = self.bus.subscribe();
             let mut current_state = state;
 
@@ -237,12 +277,11 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default> Engin
                 }
             }
 
-            Ok::<S, anyhow::Error>(current_state)
+            Ok::<(), anyhow::Error>(())
         })
         .await??;
 
-        // Read final result from edge using the final transformed state
-        Ok(edge.read(&final_state))
+        Ok(result)
     }
 
     /// Get access to the dependencies.
@@ -336,19 +375,6 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default>
         self
     }
 
-    /// Register an event tap for observing events.
-    ///
-    /// Taps are called after effects complete and events are emitted.
-    /// They run fire-and-forget and cannot emit new events.
-    pub fn with_event_tap<E, T>(mut self, tap: T) -> Self
-    where
-        E: Event + Clone,
-        T: EventTap<E>,
-    {
-        self.dispatcher = self.dispatcher.with_event_tap::<E, T>(tap);
-        self
-    }
-
     /// Enable inflight tracking.
     pub fn with_inflight(mut self, inflight: Arc<InflightTracker>) -> Self {
         self.inflight = Some(inflight);
@@ -369,7 +395,6 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static + Default>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge::{Edge, EdgeContext};
     use crate::effect_impl::{Effect, EffectContext};
 
     #[derive(Clone)]
@@ -392,25 +417,6 @@ mod tests {
 
     // Events are auto-implemented via blanket impl
 
-    struct TestEdge {
-        initial: i32,
-    }
-
-    impl Edge<TestState> for TestEdge {
-        type Event = TestEvent;
-        type Data = i32;
-
-        fn execute(&self, _ctx: &EdgeContext<TestState>) -> Option<TestEvent> {
-            Some(TestEvent {
-                value: self.initial,
-            })
-        }
-
-        fn read(&self, state: &TestState) -> Option<i32> {
-            state.result
-        }
-    }
-
     struct TestEffect;
 
     #[async_trait::async_trait]
@@ -420,10 +426,11 @@ mod tests {
         async fn handle(
             &mut self,
             _event: TestEvent,
-            _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<TerminalEvent>> {
+            ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<()> {
             // Emit terminal event - no effect handles this, so flow terminates
-            Ok(Some(TerminalEvent))
+            ctx.emit(TerminalEvent);
+            Ok(())
         }
     }
 

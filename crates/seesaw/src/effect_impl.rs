@@ -6,7 +6,7 @@
 //!
 //! - **Event → Effect → Event**: Simple, direct flow
 //! - **Can be stateful or stateless**: Your choice with `&mut self`
-//! - **Return events**: Effects return `Option<Event>` (Runtime emits)
+//! - **Emit events**: Effects emit via `ctx.emit()` (not returned)
 //! - **State flow**: Effects receive per-execution state via `EffectContext<D, S>`
 
 use std::any::Any;
@@ -16,7 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::bus::EventBus;
-use crate::core::{CorrelationId, Event, EventEnvelope};
+use crate::core::{CorrelationId, Event};
 use crate::engine::InflightTracker;
 
 /// Context passed to effect handlers.
@@ -54,8 +54,7 @@ use crate::engine::InflightTracker;
 /// accumulating too much power. Effects should only:
 /// 1. Access dependencies via `deps()`
 /// 2. Access state via `state()`
-/// 3. Return events (Runtime emits)
-/// 4. Optionally signal UI progress via `signal()`
+/// 3. Emit events via `emit()`
 ///
 /// Effects do NOT have access to:
 /// - The raw EventBus (removed)
@@ -63,14 +62,14 @@ use crate::engine::InflightTracker;
 ///
 /// # Correlation Propagation
 ///
-/// When an effect returns an event, the correlation ID from the original
-/// event is automatically propagated. This enables `emit_and_await`
+/// When an effect emits an event via `ctx.emit()`, the correlation ID from
+/// the original event is automatically propagated. This enables `emit_and_await`
 /// to track all cascading work.
 ///
 /// # Example
 ///
 /// ```ignore
-/// async fn handle(&mut self, event: UserEvent, ctx: EffectContext<MyDeps, RequestState>) -> Result<Option<UserEvent>> {
+/// async fn handle(&mut self, event: UserEvent, ctx: EffectContext<MyDeps, RequestState>) -> Result<()> {
 ///     match event {
 ///         UserEvent::SignupRequested { email, name } => {
 ///             // Access state
@@ -79,10 +78,11 @@ use crate::engine::InflightTracker;
 ///             // Access dependencies
 ///             let user = ctx.deps().db.create_user(&email, &name, visitor_id).await?;
 ///
-///             // Return event (Runtime emits with correlation ID)
-///             Ok(Some(UserEvent::SignedUp { user_id: user.id, email }))
+///             // Emit event (with correlation ID)
+///             ctx.emit(UserEvent::SignedUp { user_id: user.id, email });
+///             Ok(())
 ///         }
-///         _ => Ok(None)
+///         _ => Ok(())
 ///     }
 /// }
 /// ```
@@ -185,36 +185,36 @@ impl<D, S> EffectContext<D, S> {
         self.cid.unwrap_or(CorrelationId::NONE)
     }
 
-    /// Fire-and-forget signal for UI observability.
+    /// Emit an event with correlation tracking.
     ///
-    /// Signals are NOT fact events - they are transient UI updates
-    /// like typing indicators and progress notifications.
-    ///
-    /// # Constraints (Frozen)
-    ///
-    /// - **Not persisted** - signals are ephemeral
-    /// - **Not replayed** - excluded from event streams
-    /// - **Not observed by machines** - machines only react to fact events
-    /// - **Not used for correctness** - system behavior unchanged if dropped
-    /// - **Cannot trigger commands** - directly or indirectly (no "reactive UI machines")
+    /// Events are emitted with the same correlation ID as the triggering event,
+    /// enabling `emit_and_await` to track cascading work.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// async fn execute(&self, cmd: ProcessCommand, ctx: EffectContext<Deps>) -> Result<ProcessEvent> {
-    ///     // Signal progress started (UI-only, not a fact)
-    ///     ctx.signal(ProgressSignal { task_id: cmd.task_id, percent: 0 });
-    ///
-    ///     // Do the actual work...
-    ///     let result = process_data(...).await?;
-    ///
-    ///     // Return the fact event
-    ///     Ok(ProcessEvent::Completed { task_id: cmd.task_id, result })
+    /// async fn handle(&mut self, event: UserEvent, ctx: EffectContext<Deps, State>) -> Result<()> {
+    ///     match event {
+    ///         UserEvent::SignupRequested { email, name } => {
+    ///             let user = ctx.deps().db.create_user(&email, &name).await?;
+    ///             ctx.emit(UserEvent::SignedUp { user_id: user.id, email });
+    ///             Ok(())
+    ///         }
+    ///         _ => Ok(())
+    ///     }
     /// }
     /// ```
-    pub fn signal<E: Event>(&self, event: E) {
-        // Signals use random correlation (fire-and-forget, no tracking)
-        self.bus.emit(event);
+    pub fn emit<E: Event>(&self, event: E) {
+        if let Some(cid) = self.cid {
+            // Increment inflight before emitting (for emit_and_await tracking)
+            if let Some(tracker) = &self.inflight {
+                tracker.inc(cid, 1);
+            }
+            self.bus.emit_with_correlation(event, cid);
+        } else {
+            // No correlation - fire-and-forget
+            self.bus.emit(event);
+        }
     }
 }
 
@@ -242,12 +242,12 @@ impl<D, S> std::fmt::Debug for EffectContext<D, S> {
 /// Effects are the reactive layer of seesaw. They:
 /// 1. Receive events (signals about what happened)
 /// 2. Execute database transactions, API calls, make decisions, etc.
-/// 3. Return `Option<Event>` describing outcomes (Runtime emits them)
+/// 3. Emit new events via `ctx.emit()`
 ///
 /// # Key Principles
 ///
 /// - Effects have `&mut self` and can maintain state across invocations
-/// - Effects return `Result<Option<Self::Event>>`. Return `None` if the event doesn't apply.
+/// - Effects return `Result<()>`. Emit events via `ctx.emit()`.
 /// - Effects can be pure or impure, stateful or stateless - your choice.
 /// - Effects can make decisions, branch on conditions, hold state.
 /// - Effects access per-execution state via `ctx.state()`
@@ -267,14 +267,15 @@ impl<D, S> std::fmt::Debug for EffectContext<D, S> {
 /// impl Effect<UserEvent, MyDeps, RequestState> for SignupEffect {
 ///     type Event = UserEvent;
 ///
-///     async fn handle(&mut self, event: UserEvent, ctx: EffectContext<MyDeps, RequestState>) -> Result<Option<UserEvent>> {
+///     async fn handle(&mut self, event: UserEvent, ctx: EffectContext<MyDeps, RequestState>) -> Result<()> {
 ///         match event {
 ///             UserEvent::SignupRequested { email, name } => {
 ///                 let visitor_id = ctx.state().visitor_id;
 ///                 let user = ctx.deps().db.create_user(&email, &name, visitor_id).await?;
-///                 Ok(Some(UserEvent::SignedUp { user_id: user.id, email }))
+///                 ctx.emit(UserEvent::SignedUp { user_id: user.id, email });
+///                 Ok(())
 ///             }
-///             _ => Ok(None)
+///             _ => Ok(())
 ///         }
 ///     }
 /// }
@@ -287,24 +288,19 @@ where
     /// The event type this effect produces.
     type Event: Event;
 
-    /// Handle an event and optionally return a new event.
+    /// Handle an event and emit new events via `ctx.emit()`.
     ///
-    /// Return `Ok(Some(event))` to emit a new event, or `Ok(None)` to skip this event.
-    /// The Runtime wraps returned events in an EventEnvelope and emits them.
-    /// Effects do not emit directly - they return events.
-    ///
-    /// Use `Ok(None)` when this effect doesn't handle a particular event variant.
-    /// This prevents infinite loops and avoids verbose match arms.
+    /// Effects emit events via `ctx.emit()` instead of returning them.
+    /// This allows effects to emit multiple events or skip events cleanly.
     ///
     /// # Errors
     ///
     /// Return `Err` if the event handling fails. Errors will propagate
     /// and stop the event flow.
-    async fn handle(&mut self, event: E, ctx: EffectContext<D, S>) -> Result<Option<Self::Event>>;
+    async fn handle(&mut self, event: E, ctx: EffectContext<D, S>) -> Result<()>;
 
     /// Handle multiple events of the same type.
     ///
-    /// Returns `Vec<Option<Self::Event>>` - one result per input event.
     /// The default implementation calls `handle` sequentially with early return on error.
     ///
     /// Override this method to optimize batch operations:
@@ -316,58 +312,57 @@ where
     ///
     /// - Events are processed in order (no reordering)
     /// - Default is fail-fast (first error stops processing)
-    /// - Each input event produces one output (Some) or skip (None)
     ///
     /// # Example
     ///
     /// ```ignore
-    /// async fn handle_batch(&mut self, events: Vec<E>, ctx: EffectContext<D, S>) -> Result<Vec<Option<Self::Event>>> {
+    /// async fn handle_batch(&mut self, events: Vec<E>, ctx: EffectContext<D, S>) -> Result<()> {
     ///     // Single transaction for all events
     ///     let ids: Vec<_> = events.iter().map(|e| e.id).collect();
     ///     ctx.deps().db.bulk_insert(&events).await?;
-    ///     Ok(ids.into_iter().map(|id| Some(MyEvent::Created { id })).collect())
+    ///     // Emit events for all inserts
+    ///     for id in ids {
+    ///         ctx.emit(MyEvent::Created { id });
+    ///     }
+    ///     Ok(())
     /// }
     /// ```
     async fn handle_batch(
         &mut self,
         events: Vec<E>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Vec<Option<Self::Event>>>
+    ) -> Result<()>
     where
         D: Send + Sync + 'static,
         S: Clone + Send + 'static,
     {
-        let mut output_events = Vec::with_capacity(events.len());
         for event in events {
-            output_events.push(self.handle(event, ctx.clone()).await?);
+            self.handle(event, ctx.clone()).await?;
         }
-        Ok(output_events)
+        Ok(())
     }
 }
 
 /// Type-erased effect trait for internal use.
-///
-/// Returns `Option<EventEnvelope>` so the Runtime can emit events or skip.
 #[async_trait]
 pub(crate) trait AnyEffect<D, S>: Send + Sync {
-    /// Handle a type-erased event and optionally return an event envelope.
+    /// Handle a type-erased event.
     ///
-    /// The Runtime emits the returned envelope if Some - effects never emit directly.
-    /// Returns None if this effect skips the event.
+    /// Effects emit events via ctx.emit() during execution.
     async fn handle_any(
         &mut self,
         event: Arc<dyn Any + Send + Sync>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Option<EventEnvelope>>;
+    ) -> Result<()>;
 
-    /// Handle a batch of type-erased events and return event envelopes.
+    /// Handle a batch of type-erased events.
     ///
-    /// Returns Option per input event. The Runtime emits Some results, skips None.
+    /// Effects emit events via ctx.emit() during execution.
     async fn handle_any_batch(
         &mut self,
         events: Vec<Arc<dyn Any + Send + Sync>>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Vec<Option<EventEnvelope>>>;
+    ) -> Result<()>;
 }
 
 /// Wrapper to make concrete effects implement AnyEffect.
@@ -409,7 +404,7 @@ where
         &mut self,
         event: Arc<dyn Any + Send + Sync>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Option<EventEnvelope>> {
+    ) -> Result<()> {
         // Try to downcast the Arc<dyn Any> to &E
         let input_event = event
             .downcast_ref::<E>()
@@ -422,19 +417,15 @@ where
             })?
             .clone();
 
-        let cid = ctx.correlation_id();
         let mut effect = self.effect.lock().await;
-        let output_event = effect.handle(input_event, ctx).await?;
-
-        // Map Option<Event> to Option<EventEnvelope>
-        Ok(output_event.map(|e| EventEnvelope::new(cid, e)))
+        effect.handle(input_event, ctx).await
     }
 
     async fn handle_any_batch(
         &mut self,
         events: Vec<Arc<dyn Any + Send + Sync>>,
         ctx: EffectContext<D, S>,
-    ) -> Result<Vec<Option<EventEnvelope>>> {
+    ) -> Result<()> {
         let typed: Result<Vec<E>, _> = events
             .into_iter()
             .map(|e| {
@@ -449,15 +440,8 @@ where
                     })
             })
             .collect();
-        let cid = ctx.correlation_id();
         let mut effect = self.effect.lock().await;
-        let output_events = effect.handle_batch(typed?, ctx).await?;
-
-        // Map Vec<Option<Event>> to Vec<Option<EventEnvelope>>
-        Ok(output_events
-            .into_iter()
-            .map(|opt| opt.map(|e| EventEnvelope::new(cid, e)))
-            .collect())
+        effect.handle_batch(typed?, ctx).await
     }
 }
 
@@ -504,17 +488,18 @@ mod tests {
             &mut self,
             event: TestEvent,
             ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<OutputEvent>> {
+        ) -> Result<()> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
 
             // Access deps and state
             let value = ctx.deps().value;
             let counter = ctx.state().counter;
 
-            // Return event (Runtime emits)
-            Ok(Some(OutputEvent {
+            // Emit event
+            ctx.emit(OutputEvent {
                 result: format!("{} with value {} counter {}", event.action, value, counter),
-            }))
+            });
+            Ok(())
         }
     }
 
@@ -540,9 +525,12 @@ mod tests {
         let state = TestState { counter: 5 };
         let bus = EventBus::new();
 
+        // Subscribe to receive emitted events
+        let mut sub = bus.subscribe();
+
         let ctx = EffectContext::new(deps, state, bus);
 
-        let event = effect
+        effect
             .handle(
                 TestEvent {
                     action: "test".to_string(),
@@ -550,10 +538,13 @@ mod tests {
                 ctx,
             )
             .await
-            .unwrap()
             .unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+        // Receive emitted event
+        let envelope = sub.recv().await.unwrap();
+        let event = envelope.payload.downcast_ref::<OutputEvent>().unwrap();
         assert_eq!(
             event.result,
             "test with value 100 counter 5"
@@ -561,7 +552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_effect_always_returns_event() {
+    async fn test_effect_emits_event() {
         struct TransformEffect;
 
         #[async_trait]
@@ -571,12 +562,13 @@ mod tests {
             async fn handle(
                 &mut self,
                 event: TestEvent,
-                _ctx: EffectContext<TestDeps, TestState>,
-            ) -> Result<Option<OutputEvent>> {
-                // Effects can return Some or None
-                Ok(Some(OutputEvent {
+                ctx: EffectContext<TestDeps, TestState>,
+            ) -> Result<()> {
+                // Effects emit events
+                ctx.emit(OutputEvent {
                     result: format!("transformed: {}", event.action),
-                }))
+                });
+                Ok(())
             }
         }
 
@@ -584,13 +576,17 @@ mod tests {
         let deps = Arc::new(TestDeps { value: 0 });
         let state = TestState { counter: 0 };
         let bus = EventBus::new();
+        let mut sub = bus.subscribe();
         let ctx = EffectContext::new(deps, state, bus);
 
-        let result = effect
+        effect
             .handle(TestEvent { action: "test".to_string() }, ctx)
             .await
             .unwrap();
-        assert_eq!(result.unwrap().result, "transformed: test");
+
+        let envelope = sub.recv().await.unwrap();
+        let event = envelope.payload.downcast_ref::<OutputEvent>().unwrap();
+        assert_eq!(event.result, "transformed: test");
     }
 
     #[tokio::test]
@@ -604,15 +600,17 @@ mod tests {
         let deps = Arc::new(TestDeps { value: 50 });
         let state = TestState { counter: 3 };
         let bus = EventBus::new();
+        let mut sub = bus.subscribe();
         let ctx = EffectContext::new(deps, state, bus);
 
         let event: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent {
             action: "wrapped".to_string(),
         });
 
-        let envelope = wrapper.handle_any(event, ctx).await.unwrap().unwrap();
+        wrapper.handle_any(event, ctx).await.unwrap();
 
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        let envelope = sub.recv().await.unwrap();
         let event = envelope.payload.downcast_ref::<OutputEvent>().unwrap();
         assert_eq!(event.result, "wrapped with value 50 counter 3");
     }
@@ -652,7 +650,7 @@ mod tests {
             &mut self,
             _event: TestEvent,
             _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<OutputEvent>> {
+        ) -> Result<()> {
             Err(anyhow::anyhow!("effect failed"))
         }
     }
@@ -705,26 +703,29 @@ mod tests {
         async fn handle(
             &mut self,
             event: TestEvent,
-            _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<OutputEvent>> {
+            ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<()> {
             self.individual_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(OutputEvent {
+            ctx.emit(OutputEvent {
                 result: format!("individual: {}", event.action),
-            }))
+            });
+            Ok(())
         }
 
         async fn handle_batch(
             &mut self,
             events: Vec<TestEvent>,
-            _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Vec<Option<OutputEvent>>> {
+            ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<()> {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
 
-            // Simulated bulk operation - return events for all inputs
-            let actions: Vec<_> = events.iter().map(|e| e.action.as_str()).collect();
-            Ok(events.iter().map(|e| Some(OutputEvent {
-                result: format!("batch: {}", e.action),
-            })).collect())
+            // Simulated bulk operation - emit events for all inputs
+            for e in events.iter() {
+                ctx.emit(OutputEvent {
+                    result: format!("batch: {}", e.action),
+                });
+            }
+            Ok(())
         }
     }
 
@@ -741,6 +742,7 @@ mod tests {
         let deps = Arc::new(TestDeps { value: 0 });
         let state = TestState { counter: 0 };
         let bus = EventBus::new();
+        let mut sub = bus.subscribe();
 
         let ctx = EffectContext::new(deps, state, bus);
 
@@ -756,17 +758,22 @@ mod tests {
             },
         ];
 
-        let results = effect.handle_batch(events, ctx).await.unwrap();
+        effect.handle_batch(events, ctx).await.unwrap();
 
         // Should use batch path, not individual
         assert_eq!(individual_calls.load(Ordering::Relaxed), 0);
         assert_eq!(batch_calls.load(Ordering::Relaxed), 1);
 
-        // Should return events for all inputs
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].as_ref().unwrap().result, "batch: a");
-        assert_eq!(results[1].as_ref().unwrap().result, "batch: b");
-        assert_eq!(results[2].as_ref().unwrap().result, "batch: c");
+        // Should emit events for all inputs
+        let env1 = sub.recv().await.unwrap();
+        let env2 = sub.recv().await.unwrap();
+        let env3 = sub.recv().await.unwrap();
+        let e1 = env1.payload.downcast_ref::<OutputEvent>().unwrap();
+        let e2 = env2.payload.downcast_ref::<OutputEvent>().unwrap();
+        let e3 = env3.payload.downcast_ref::<OutputEvent>().unwrap();
+        assert_eq!(e1.result, "batch: a");
+        assert_eq!(e2.result, "batch: b");
+        assert_eq!(e3.result, "batch: c");
     }
 
     #[tokio::test]
@@ -779,6 +786,7 @@ mod tests {
         let deps = Arc::new(TestDeps { value: 100 });
         let state = TestState { counter: 2 };
         let bus = EventBus::new();
+        let mut sub = bus.subscribe();
 
         let ctx = EffectContext::new(deps, state, bus);
 
@@ -791,14 +799,17 @@ mod tests {
             },
         ];
 
-        let results = effect.handle_batch(events, ctx).await.unwrap();
+        effect.handle_batch(events, ctx).await.unwrap();
 
         // Default batch impl calls handle for each
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
 
-        // Should return 2 individual events
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].as_ref().unwrap().result, "x with value 100 counter 2");
-        assert_eq!(results[1].as_ref().unwrap().result, "y with value 100 counter 2");
+        // Should emit 2 individual events
+        let env1 = sub.recv().await.unwrap();
+        let env2 = sub.recv().await.unwrap();
+        let e1 = env1.payload.downcast_ref::<OutputEvent>().unwrap();
+        let e2 = env2.payload.downcast_ref::<OutputEvent>().unwrap();
+        assert_eq!(e1.result, "x with value 100 counter 2");
+        assert_eq!(e2.result, "y with value 100 counter 2");
     }
 }

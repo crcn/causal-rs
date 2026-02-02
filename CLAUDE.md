@@ -48,24 +48,26 @@ Events are the only signals in the system.
 
 ### Effect
 
-Handlers that react to events. Execute IO, optionally emit new events.
+Handlers that react to events. Execute IO, emit new events.
 
 ```rust
 #[async_trait]
 impl Effect<ScrapeEvent, Deps, State> for ScrapeEffect {
     type Event = ScrapeEvent;
 
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps, State>) -> Result<Option<ScrapeEvent>> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps, State>) -> Result<()> {
         match event {
             ScrapeEvent::SourceRequested { source_id } => {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
-                Ok(Some(ScrapeEvent::SourceScraped { source_id, data }))
+                ctx.emit(ScrapeEvent::SourceScraped { source_id, data });
+                Ok(())
             }
             ScrapeEvent::SourceScraped { source_id, data } => {
                 let items = ctx.deps().extractor.extract(&data).await?;
-                Ok(Some(ScrapeEvent::NeedsExtracted { source_id }))
+                ctx.emit(ScrapeEvent::NeedsExtracted { source_id });
+                Ok(())
             }
-            _ => Ok(None) // Skip unhandled events
+            _ => Ok(()) // Skip unhandled events
         }
     }
 }
@@ -77,13 +79,12 @@ Effects can:
 - Make decisions
 - Branch on conditions
 - Be pure or impure (your choice)
-- Always return an event (use catch-all pattern for pass-through)
+- Emit events via `ctx.emit()` or skip with `Ok(())`
 
 EffectContext provides:
 - `deps()` — shared dependencies
 - `state()` — per-execution state (transformed by reducers)
-- `signal(event)` — fire-and-forget UI notifications
-- `tool_context()` — context for interactive tool execution
+- `emit(event)` — emit new events
 - `outbox_correlation_id()` — for outbox writes
 - `correlation_id()` — get correlation ID for this execution
 
@@ -114,26 +115,6 @@ Reducers:
 - Multiple reducers chain together
 - Provide updated state to effects via `ctx.state()`
 
-### EventTap
-
-Observe committed facts after effects. No decisions, no mutations, no emit.
-
-```rust
-#[async_trait]
-impl EventTap<ScrapeEvent> for ScrapeTap {
-    async fn on_event(&self, event: &ScrapeEvent, ctx: &TapContext) -> Result<()> {
-        // Publish to NATS, webhooks, metrics, audit logging
-        match event {
-            ScrapeEvent::SourceScraped { source_id, .. } => {
-                ctx.nats.publish("scrapes", source_id).await?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-}
-```
-
 ## Execution Model
 
 Simple and direct:
@@ -156,13 +137,13 @@ Repeat
 
 ```rust
 ScrapeEvent::SourceRequested
-  → ScrapeEffect.execute()
+  → ScrapeEffect.handle()
     → scrapes URL
     → emits ScrapeEvent::SourceScraped { data }
-  → ExtractEffect.execute()
+  → ExtractEffect.handle()
     → extracts items
     → emits ScrapeEvent::NeedsExtracted { needs }
-  → SyncEffect.execute()
+  → SyncEffect.handle()
     → syncs to DB
     → emits ScrapeEvent::SyncComplete
 ```
@@ -198,13 +179,14 @@ enum ScrapeEvent {
 impl Effect<ScrapeEvent, Deps> for ScraperEffect {
     type Event = ScrapeEvent;
 
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<Option<ScrapeEvent>> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<()> {
         match event {
             ScrapeEvent::SourceRequested { source_id } => {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
-                Ok(Some(ScrapeEvent::SourceScraped { source_id, data }))
+                ctx.emit(ScrapeEvent::SourceScraped { source_id, data });
+                Ok(())
             }
-            _ => Ok(None)  // Skip unhandled events
+            _ => Ok(())  // Skip unhandled events
         }
     }
 }
@@ -214,13 +196,14 @@ impl Effect<ScrapeEvent, Deps> for ScraperEffect {
 impl Effect<ScrapeEvent, Deps> for ExtractorEffect {
     type Event = ScrapeEvent;
 
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<Option<ScrapeEvent>> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<()> {
         match event {
             ScrapeEvent::SourceScraped { source_id, data } => {
                 let items = ctx.deps().extractor.extract(&data).await?;
-                Ok(Some(ScrapeEvent::DataExtracted { source_id, items }))
+                ctx.emit(ScrapeEvent::DataExtracted { source_id, items });
+                Ok(())
             }
-            _ => Ok(None)  // Skip unhandled events
+            _ => Ok(())  // Skip unhandled events
         }
     }
 }
@@ -245,13 +228,14 @@ enum NotificationEvent {
 impl Effect<NotificationEvent, Deps> for EmailEffect {
     type Event = NotificationEvent;
 
-    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<Option<NotificationEvent>> {
+    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<()> {
         match event {
             NotificationEvent::UserSignedUp { user_id, email } => {
                 let email_id = ctx.deps().mailer.send_welcome(email).await?;
-                Ok(Some(NotificationEvent::EmailSent { user_id, email_id }))
+                ctx.emit(NotificationEvent::EmailSent { user_id, email_id });
+                Ok(())
             }
-            _ => Ok(None)  // Skip unhandled events
+            _ => Ok(())  // Skip unhandled events
         }
     }
 }
@@ -260,13 +244,14 @@ impl Effect<NotificationEvent, Deps> for EmailEffect {
 impl Effect<NotificationEvent, Deps> for SlackEffect {
     type Event = NotificationEvent;
 
-    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<Option<NotificationEvent>> {
+    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<()> {
         match event {
             NotificationEvent::UserSignedUp { user_id, .. } => {
                 let msg_id = ctx.deps().slack.post("New signup!").await?;
-                Ok(Some(NotificationEvent::SlackPosted { user_id, message_id: msg_id }))
+                ctx.emit(NotificationEvent::SlackPosted { user_id, message_id: msg_id });
+                Ok(())
             }
-            _ => Ok(None)  // Skip unhandled events
+            _ => Ok(())  // Skip unhandled events
         }
     }
 }
@@ -285,7 +270,7 @@ struct RateLimitedScraperEffect {
 impl Effect<ScrapeEvent, Deps> for RateLimitedScraperEffect {
     type Event = ScrapeEvent;
 
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<Option<ScrapeEvent>> {
+    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<()> {
         match event {
             ScrapeEvent::SourceRequested { source_id } => {
                 // Guard: check if already pending
@@ -303,9 +288,10 @@ impl Effect<ScrapeEvent, Deps> for RateLimitedScraperEffect {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
                 self.pending.write().await.remove(&source_id);
 
-                Ok(Some(ScrapeEvent::SourceScraped { source_id, data }))
+                ctx.emit(ScrapeEvent::SourceScraped { source_id, data });
+                Ok(())
             }
-            _ => Ok(None)  // Skip unhandled events
+            _ => Ok(())  // Skip unhandled events
         }
     }
 }
@@ -345,13 +331,14 @@ Effects can listen to events from any domain.
 impl Effect<WebsiteEvent, Deps> for CrawlEffect {
     type Event = CrawlEvent;
 
-    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<Option<CrawlEvent>> {
+    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<()> {
         match event {
             WebsiteEvent::WebsiteApproved { website_id } => {
                 ctx.deps().crawler.start(website_id).await?;
-                Ok(Some(CrawlEvent::CrawlStarted { website_id }))
+                ctx.emit(CrawlEvent::CrawlStarted { website_id });
+                Ok(())
             }
-            _ => Ok(None)  // Skip unhandled events
+            _ => Ok(())  // Skip unhandled events
         }
     }
 }
@@ -365,9 +352,8 @@ This is normal and correct. Cross-domain coordination happens via events.
 | ------- | ------ | ------- | ------ | --------- | ----- |
 | Reducer | No     | No      | No     | Events    | Yes   |
 | Effect  | Yes    | Yes     | Events | Events    | No    |
-| Tap     | No     | No      | No     | Events    | No    |
 
-Reducers transform state. Effects do the work. Taps observe.
+Reducers transform state. Effects do the work.
 
 ## What Seesaw Is Not
 
@@ -453,17 +439,21 @@ Every long-running flow needs success and failure terminal events.
 let mut engine = EngineBuilder::new(deps)
     .with_reducer::<MyEvent, _>(MyReducer)      // Pure state transformations
     .with_effect::<MyEvent, _>(MyEventEffect)    // Event handlers
-    .with_event_tap(MyTap)                       // Event observers
     .build();
 
-// Execute via edge (structured workflow)
-let result = engine.run(MyEdge { data }, initial_state).await?;
+// Execute via closure
+engine.run(
+    |ctx: &RunContext<Deps, State>| {
+        ctx.emit(MyEvent::Started { data });
+        Ok(())
+    },
+    initial_state
+).await?;
 ```
 
 Builder methods:
 - `.with_reducer::<Event, _>(reducer)` — Register pure state transformations
 - `.with_effect::<Event, _>(effect)` — Register event handlers
-- `.with_event_tap(tap)` — Register event observers
 - `.with_bus(bus)` — Use existing EventBus
 - `.with_inflight(tracker)` — Use existing InflightTracker
 - `.with_arc(deps)` — Use Arc-wrapped dependencies
@@ -486,13 +476,14 @@ pub enum WebsiteEvent {
 impl Effect<WebsiteEvent, Deps> for CrawlEffect {
     type Event = CrawlEvent;
 
-    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<Option<CrawlEvent>> {
+    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<()> {
         match event {
             WebsiteEvent::WebsiteApproved { website_id } => {
                 ctx.deps().crawler.start(website_id).await?;
-                Ok(Some(CrawlEvent::CrawlStarted { website_id }))
+                ctx.emit(CrawlEvent::CrawlStarted { website_id });
+                Ok(())
             }
-            _ => Ok(None)  // Skip unhandled events
+            _ => Ok(())  // Skip unhandled events
         }
     }
 }
@@ -539,9 +530,7 @@ tx.commit().await?;
 ## Architecture Flow
 
 ```
-EventBus → Effect.execute(event) → Runtime → EventBus
-                                                 ↓
-                                            EventTaps
+EventBus → Effect.handle(event) → ctx.emit() → EventBus
 ```
 
 Simple and direct.
@@ -550,10 +539,9 @@ Simple and direct.
 
 1. **Events are the only signals** — Everything flows through events
 2. **Reducers transform state** — Pure functions that run before effects
-3. **Effects react to events** — Do IO, always emit new events
+3. **Effects react to events** — Do IO, emit new events
 4. **Effects are unconstrained** — Can do anything, pure or impure, stateful or stateless
 5. **Events are facts, past-tense** — `UserCreated`, not `CreateUser`
 6. **Effects can listen to any domain** — Cross-domain coordination via events
 7. **One Effect execution = One transaction** — Multiple atomic writes belong together
 8. **Terminal events close loops** — Every workflow needs success/failure events
-9. **Taps observe, don't act** — Fire-and-forget observers for metrics, logging, webhooks

@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use seesaw_core::{Edge, EdgeContext, Effect, EffectContext, EngineBuilder, Event};
+use seesaw_core::{Effect, EffectContext, EngineBuilder, RunContext};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -63,7 +63,7 @@ impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
         &mut self,
         event: SummaryEvent,
         ctx: EffectContext<Deps, SummaryState>,
-    ) -> Result<Option<SummaryEvent>> {
+    ) -> Result<()> {
         match event {
             SummaryEvent::SummarizeRequested { task_id, text } => {
                 println!("Summarizing text...");
@@ -91,24 +91,25 @@ impl Effect<SummaryEvent, Deps, SummaryState> for SummarizeEffect {
                         println!("\n✓ Summary: {}", summary);
                         println!("  Tokens used: {}", tokens);
 
-                        Ok(Some(SummaryEvent::Summarized {
+                        ctx.emit(SummaryEvent::Summarized {
                             task_id,
                             summary,
                             tokens_used: tokens,
-                        }))
+                        });
                     }
                     Err(e) => {
                         println!("✗ Failed: {}", e);
 
-                        Ok(Some(SummaryEvent::SummaryFailed {
+                        ctx.emit(SummaryEvent::SummaryFailed {
                             task_id,
                             reason: e.to_string(),
-                        }))
+                        });
                     }
                 }
             }
-            _ => Ok(None), // Skip other events
+            _ => {}, // Skip other events
         }
+        Ok(())
     }
 }
 
@@ -137,30 +138,6 @@ impl seesaw_core::Reducer<SummaryEvent, SummaryState> for SummaryReducer {
             },
             _ => state.clone(),
         }
-    }
-}
-
-// ============================================================================
-// Edge (Entry point)
-// ============================================================================
-
-struct SummarizeEdge {
-    text: String,
-}
-
-impl Edge<SummaryState> for SummarizeEdge {
-    type Event = SummaryEvent;
-    type Data = String; // The summary
-
-    fn execute(&self, _ctx: &EdgeContext<SummaryState>) -> Option<SummaryEvent> {
-        Some(SummaryEvent::SummarizeRequested {
-            task_id: Uuid::new_v4(),
-            text: self.text.clone(),
-        })
-    }
-
-    fn read(&self, state: &SummaryState) -> Option<Self::Data> {
-        state.summary.clone()
     }
 }
 
@@ -260,20 +237,19 @@ async fn main() -> Result<()> {
         lifetime of all references in a program during compilation.
     "#;
 
-    let summary = engine
+    // Run with closure that emits initial event
+    engine
         .run(
-            SummarizeEdge {
-                text: text.to_string(),
+            |ctx: &RunContext<Deps, SummaryState>| {
+                ctx.emit(SummaryEvent::SummarizeRequested {
+                    task_id: Uuid::new_v4(),
+                    text: text.to_string(),
+                });
+                Ok(())
             },
             SummaryState::default(),
         )
         .await?;
-
-    if let Some(summary) = summary {
-        println!("\nFinal summary: {}", summary);
-    } else {
-        println!("\nFailed to generate summary");
-    }
 
     println!("\nDone!");
 

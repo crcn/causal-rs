@@ -19,8 +19,8 @@ This repository is organized as a Cargo workspace:
 
 Seesaw **is**:
 
-> An event-driven runtime where events flow through effects, which can emit new events.
-> State flows through reducers. Edges provide clean entry points.
+> An event-driven runtime where events flow through effects, which emit new events.
+> State flows through reducers. Clean entry points via closures.
 
 Seesaw is **not**:
 
@@ -31,29 +31,26 @@ Seesaw is **not**:
 ## Features
 
 - **Event-Driven**: Events are the only signals - facts about what happened
-- **Effect Handlers**: React to events, perform IO, always emit new events
+- **Effect Handlers**: React to events, perform IO, emit new events via `ctx.emit()`
 - **Reducers**: Pure state transformations before effects
-- **EventTap**: Observe events after effects for metrics, logging, webhooks
-- **Edges**: Clean entry points for triggering event flows
 - **Type-Erased Bus**: Broadcast events across heterogeneous effects
 - **Correlation Tracking**: Built-in tracking for cascading event flows
-- **Request/Response Pattern**: `dispatch_request` for edge code that needs responses
+- **Request/Response Pattern**: `dispatch_request` for code that needs responses
 - **State Flow**: Per-execution state flows through reducers and effects
+- **Closure Entry Points**: Simple `engine.run(|ctx| ...)` pattern
 
 ## Architecture
 
 ```
-Edge → Event → Reducer → Effect → Event → Effect → ... (until settled)
-                  ↓         ↓
-              State'    Returns Event
+Closure → Event → Reducer → Effect → Event → Effect → ... (until settled)
+                     ↓         ↓
+                 State'    ctx.emit(Event)
 ```
 
 ## Quick Start
 
 ```rust
-use seesaw_core::{
-    Effect, EffectContext, EngineBuilder,
-};
+use seesaw_core::{Effect, EffectContext, EngineBuilder, RunContext};
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -64,29 +61,29 @@ enum OrderEvent {
     Placed { order_id: Uuid },
     Shipped { order_id: Uuid },
     Delivered { order_id: Uuid },
-    Complete { order_id: Uuid },
 }
 
-// Effects react to events and optionally emit new events
+// Effects react to events and emit new events
 struct ShipEffect;
 
 #[async_trait::async_trait]
-impl Effect<OrderEvent, MyDeps> for ShipEffect {
+impl Effect<OrderEvent, MyDeps, ()> for ShipEffect {
     type Event = OrderEvent;
 
     async fn handle(
         &mut self,
         event: OrderEvent,
-        ctx: EffectContext<MyDeps>,
-    ) -> Result<Option<OrderEvent>> {
+        ctx: EffectContext<MyDeps, ()>,
+    ) -> Result<()> {
         match event {
             OrderEvent::Placed { order_id } => {
                 // Do IO: ship the order
                 ctx.deps().shipping_api.ship(order_id).await?;
-                // Return new event
-                Ok(Some(OrderEvent::Shipped { order_id }))
+                // Emit new event
+                ctx.emit(OrderEvent::Shipped { order_id });
+                Ok(())
             }
-            _ => Ok(None), // Skip unhandled events
+            _ => Ok(()), // Skip unhandled events
         }
     }
 }
@@ -94,22 +91,23 @@ impl Effect<OrderEvent, MyDeps> for ShipEffect {
 struct NotifyEffect;
 
 #[async_trait::async_trait]
-impl Effect<OrderEvent, MyDeps> for NotifyEffect {
+impl Effect<OrderEvent, MyDeps, ()> for NotifyEffect {
     type Event = OrderEvent;
 
     async fn handle(
         &mut self,
         event: OrderEvent,
-        ctx: EffectContext<MyDeps>,
-    ) -> Result<Option<OrderEvent>> {
+        ctx: EffectContext<MyDeps, ()>,
+    ) -> Result<()> {
         match event {
             OrderEvent::Shipped { order_id } => {
                 // Do IO: notify customer
                 ctx.deps().email_service.send(order_id, "Shipped!").await?;
-                // Return new event
-                Ok(Some(OrderEvent::Delivered { order_id }))
+                // Emit new event
+                ctx.emit(OrderEvent::Delivered { order_id });
+                Ok(())
             }
-            _ => Ok(None),
+            _ => Ok(()),
         }
     }
 }
@@ -121,10 +119,14 @@ async fn main() -> Result<()> {
         .with_effect::<OrderEvent, _>(NotifyEffect)
         .build();
 
-    // Use edges to run event flows
-    let result = engine.run(
-        OrderEdge { order_id: Uuid::new_v4() },
-        OrderState::default(),
+    // Use closure to trigger event flow
+    engine.run(
+        |ctx: &RunContext<MyDeps, ()>| {
+            let order_id = Uuid::new_v4();
+            ctx.emit(OrderEvent::Placed { order_id });
+            Ok(())
+        },
+        (),
     ).await?;
 
     Ok(())
@@ -154,9 +156,8 @@ enum UserEvent {
 
 | Role   | Description                           | Example            |
 | ------ | ------------------------------------- | ------------------ |
-| Input  | Edge-originated requests              | `SignupRequested`  |
+| Input  | User/closure-originated requests      | `SignupRequested`  |
 | Fact   | Effect-produced ground truth          | `SignedUp`         |
-| Signal | Ephemeral UI updates (via `signal()`) | Typing indicators  |
 
 ### Effects
 
@@ -173,7 +174,7 @@ impl Effect<UserEvent, MyDeps> for SignupEffect {
         &mut self,
         event: UserEvent,
         ctx: EffectContext<MyDeps>,
-    ) -> Result<Option<UserEvent>> {
+    ) -> Result<()> {
         match event {
             UserEvent::SignupRequested { email, name } => {
                 // Execute IO in one transaction
@@ -183,13 +184,14 @@ impl Effect<UserEvent, MyDeps> for SignupEffect {
                     Ok(user)
                 }).await?;
 
-                // Return new event
-                Ok(Some(UserEvent::SignedUp {
+                // Emit new event
+                ctx.emit(UserEvent::SignedUp {
                     user_id: user.id,
                     email,
-                }))
+                });
+                Ok(())
             }
-            _ => Ok(None), // Skip unhandled events
+            _ => Ok(()), // Skip unhandled events
         }
     }
 }
@@ -198,9 +200,9 @@ impl Effect<UserEvent, MyDeps> for SignupEffect {
 Key properties:
 
 - **Can be stateful**: Effects have `&mut self` and can maintain state across invocations
-- **Return Option<Event>**: Return `Some(event)` to emit, `None` to skip unhandled events
+- **Emit events**: Use `ctx.emit()` to emit new events
 - **Access state**: Via `ctx.state()` for per-execution state
-- **Narrow context**: Only `deps()`, `state()`, `signal()`, and `tool_context()` available
+- **Narrow context**: Only `deps()`, `state()`, `emit()`, and `correlation_id()` available
 - **Batch support**: Override `handle_batch` for optimized bulk operations
 
 ### Reducers
@@ -228,81 +230,6 @@ Key properties:
 - **Transform state**: Take current state and event, return new state
 - **Run before effects**: Updated state is passed to effects via `ctx.state()`
 
-### Edges
-
-Edges are clean entry points that trigger event flows.
-
-```rust
-struct SignupEdge {
-    email: String,
-    name: String,
-}
-
-impl Edge<RequestState> for SignupEdge {
-    type Event = UserEvent;
-    type Data = User;
-
-    fn execute(&self, _ctx: &EdgeContext<RequestState>) -> Option<UserEvent> {
-        // Return initial event to trigger flow
-        Some(UserEvent::SignupRequested {
-            email: self.email.clone(),
-            name: self.name.clone(),
-        })
-    }
-
-    fn read(&self, state: &RequestState) -> Option<User> {
-        // Read final result from state
-        state.user.clone()
-    }
-}
-
-// Usage
-let user = engine.run(SignupEdge { email, name }, initial_state).await?
-    .ok_or_else(|| anyhow!("signup failed"))?;
-```
-
-Key properties:
-
-- **Entry points**: Where external inputs enter the system
-- **Type-safe**: Associated `Event` type for compile-time checking
-- **Execute once**: Return initial event to trigger event flow
-- **Read result**: Extract final data from settled state
-
-### EventTap
-
-EventTaps observe events after effects complete, without affecting the event flow. Perfect for metrics, logging, webhooks, and analytics.
-
-```rust
-struct MetricsTap;
-
-#[async_trait::async_trait]
-impl EventTap<OrderEvent> for MetricsTap {
-    async fn on_event(&self, event: &OrderEvent, ctx: &TapContext) -> Result<()> {
-        match event {
-            OrderEvent::Shipped { order_id } => {
-                // Record metrics
-                metrics::increment("orders.shipped");
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
-// Register with engine
-let engine = EngineBuilder::new(deps)
-    .with_effect::<OrderEvent, _>(ShipEffect)
-    .with_event_tap(MetricsTap)
-    .build();
-```
-
-Key properties:
-
-- **Fire-and-forget**: Taps run async but don't block the event flow
-- **Cannot emit events**: Read-only observers
-- **Run after effects**: See committed facts, not speculative work
-- **Auto-named**: Type name used for debugging
-
 ### EffectContext
 
 `EffectContext` provides a narrow API to effects:
@@ -314,8 +241,8 @@ ctx.deps()
 // Access per-execution state
 ctx.state()
 
-// Fire-and-forget signal for UI observability (typing indicators, progress)
-ctx.signal(MySignalEvent::Progress { percent: 50 });
+// Emit new events
+ctx.emit(OrderEvent::Shipped { order_id });
 
 // Get correlation ID for outbox writes
 ctx.outbox_correlation_id()
@@ -333,12 +260,14 @@ let mut engine = EngineBuilder::new(deps)
     .with_reducer::<OrderEvent, _>(OrderReducer)
     .with_effect::<OrderEvent, _>(ShipEffect)
     .with_effect::<OrderEvent, _>(NotifyEffect)
-    .with_event_tap(MetricsTap)
     .build();
 
-// Run edges to execute event flows
-let result = engine.run(
-    OrderEdge { order_id },
+// Run with a closure that emits initial events
+engine.run(
+    |ctx: &RunContext<Deps, OrderState>| {
+        ctx.emit(OrderEvent::Placed { order_id });
+        Ok(())
+    },
     OrderState::default(),
 ).await?;
 ```
@@ -347,34 +276,9 @@ Builder methods:
 
 - `.with_reducer::<Event, _>(reducer)` — Register pure state transformations
 - `.with_effect::<Event, _>(effect)` — Register event handlers
-- `.with_event_tap(tap)` — Register event observers
 - `.with_bus(bus)` — Use an existing EventBus
 - `.with_inflight(tracker)` — Use an existing InflightTracker
 - `.with_arc(deps)` — Use Arc-wrapped dependencies
-
-### Using Edges
-
-For structured workflows with state:
-
-```rust
-let mut engine = EngineBuilder::new(deps)
-    .with_effect::<UserEvent, _>(SignupEffect)
-    .build();
-
-let user = engine.run(
-    SignupEdge { email, name },
-    RequestState::new(),
-).await?
-    .ok_or_else(|| anyhow!("signup failed"))?;
-```
-
-## Edge-Based Execution
-
-The primary way to use Seesaw is through edges - structured entry points that trigger event flows and read results:
-
-```rust
-let result = engine.run(MyEdge { data }, initial_state).await?;
-```
 
 ## Request/Response Pattern
 
@@ -416,7 +320,7 @@ impl OutboxEvent for OrderPlaced {
 }
 
 // 2. Write to outbox in same transaction as business data
-async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Result<Option<OrderEvent>> {
+async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Result<()> {
     match event {
         OrderEvent::PlaceRequested { customer_id, items } => {
             let mut tx = ctx.deps().db.begin().await?;
@@ -432,16 +336,17 @@ async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Resul
             ).await?;
 
             tx.commit().await?;
-            Ok(Some(OrderEvent::Placed { order_id: order.id }))
+            ctx.emit(OrderEvent::Placed { order_id: order.id });
+            Ok(())
         }
-        _ => Ok(None),
+        _ => Ok(()),
     }
 }
 ```
 
 **Key differences from in-memory events:**
 
-| Aspect      | Effect return         | Outbox                |
+| Aspect      | Effect emit           | Outbox                |
 | ----------- | --------------------- | --------------------- |
 | Durability  | Lost on crash         | Survives crash        |
 | Delivery    | At-most-once          | At-least-once         |
@@ -480,14 +385,18 @@ async fn test_effect_handles_event() {
     let mut effect = ShipEffect;
     let deps = Arc::new(MockDeps::new());
     let bus = EventBus::new();
+    let mut receiver = bus.subscribe();
     let ctx = EffectContext::new(deps, (), bus);
 
-    let result = effect.handle(
+    effect.handle(
         OrderEvent::Placed { order_id },
         ctx,
     ).await.unwrap();
 
-    assert!(matches!(result, OrderEvent::Shipped { .. }));
+    // Check emitted event
+    let envelope = receiver.recv().await.unwrap();
+    let event = envelope.downcast_ref::<OrderEvent>().unwrap();
+    assert!(matches!(event, OrderEvent::Shipped { .. }));
 }
 ```
 

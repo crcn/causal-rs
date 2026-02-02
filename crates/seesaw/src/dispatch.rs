@@ -18,7 +18,6 @@ use crate::core::{Event, EventEnvelope};
 use crate::effect_impl::{AnyEffect, Effect, EffectContext, EffectWrapper};
 use crate::engine::InflightTracker;
 use crate::reducer::{Reducer, ReducerRegistry};
-use crate::tap::{EventTap, TapRegistry};
 use tracing::error;
 
 /// Event dispatcher for routing events to effects.
@@ -44,8 +43,6 @@ pub struct Dispatcher<D, S: Clone = ()> {
     bus: EventBus,
     // Reducers for pure state transformations before effects
     reducers: ReducerRegistry<S>,
-    // Taps for observing events after effects
-    taps: TapRegistry,
 }
 
 impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S> {
@@ -56,7 +53,6 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             deps: Arc::new(deps),
             bus,
             reducers: ReducerRegistry::new(),
-            taps: TapRegistry::new(),
         }
     }
 
@@ -67,7 +63,6 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             deps,
             bus,
             reducers: ReducerRegistry::new(),
-            taps: TapRegistry::new(),
         }
     }
 
@@ -98,19 +93,6 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             .entry(type_id)
             .or_insert_with(Vec::new)
             .push(Box::new(EffectWrapper::new(effect)));
-        self
-    }
-
-    /// Register an event tap for observing events.
-    ///
-    /// Taps are called after effects complete and events are emitted.
-    /// They cannot emit new events - only observe.
-    pub fn with_event_tap<E, T>(mut self, tap: T) -> Self
-    where
-        E: Event + Clone,
-        T: EventTap<E>,
-    {
-        self.taps.register(tap, std::any::type_name::<T>());
         self
     }
 
@@ -193,20 +175,9 @@ impl<D: Send + Sync + 'static, S: Clone + Send + Sync + 'static> Dispatcher<D, S
             };
 
             match result {
-                Ok(Some(new_envelope)) => {
-                    // Effect emitted a new event
-                    // Increment inflight for the new event before emitting
-                    if let Some(tracker) = inflight {
-                        tracker.inc(new_envelope.cid, 1);
-                    }
-
-                    self.bus.emit_envelope(new_envelope.clone());
-
-                    // Run taps to observe the emitted event
-                    self.taps.run_all(&*new_envelope.payload, Some(new_envelope.cid));
-                }
-                Ok(None) => {
-                    // Effect skipped this event - do nothing
+                Ok(()) => {
+                    // Effect completed successfully
+                    // Events were emitted via ctx.emit() if any
                 }
                 Err(e) => {
                     // Effect failed
@@ -314,12 +285,13 @@ mod tests {
             &mut self,
             event: CreateEvent,
             ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<ResultEvent>> {
+        ) -> Result<()> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let counter = ctx.state().counter;
-            Ok(Some(ResultEvent {
+            ctx.emit(ResultEvent {
                 message: format!("created {} counter={}", event.name, counter),
-            }))
+            });
+            Ok(())
         }
     }
 
@@ -334,12 +306,13 @@ mod tests {
         async fn handle(
             &mut self,
             event: CreateEvent,
-            _ctx: EffectContext<TestDeps, TestState>,
-        ) -> Result<Option<ResultEvent>> {
+            ctx: EffectContext<TestDeps, TestState>,
+        ) -> Result<()> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(ResultEvent {
+            ctx.emit(ResultEvent {
                 message: format!("notified about {}", event.name),
-            }))
+            });
+            Ok(())
         }
     }
 
@@ -437,16 +410,15 @@ mod tests {
             async fn handle(
                 &mut self,
                 event: CreateEvent,
-                _ctx: EffectContext<TestDeps, TestState>,
-            ) -> Result<Option<ResultEvent>> {
-                // Return None to skip
-                if event.name == "skip" {
-                    Ok(None)  // Skip this event
-                } else {
-                    Ok(Some(ResultEvent {
+                ctx: EffectContext<TestDeps, TestState>,
+            ) -> Result<()> {
+                // Skip if event.name == "skip"
+                if event.name != "skip" {
+                    ctx.emit(ResultEvent {
                         message: "handled".to_string(),
-                    }))
+                    });
                 }
+                Ok(())
             }
         }
 
