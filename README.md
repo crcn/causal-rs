@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
         // Effect that reacts to Placed and returns Shipped
         .with_effect(
             effect::on::<OrderEvent>()
-                .filter_map(|e| match e {
+                .extract(|e| match e {
                     OrderEvent::Placed { order_id, .. } => Some(*order_id),
                     _ => None,
                 })
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         // Effect that reacts to Shipped and returns Delivered
         .with_effect(
             effect::on::<OrderEvent>()
-                .filter_map(|e| match e {
+                .extract(|e| match e {
                     OrderEvent::Shipped { order_id } => Some(*order_id),
                     _ => None,
                 })
@@ -164,7 +164,7 @@ use seesaw_core::effect;
 
 // Basic effect - returns event to dispatch
 effect::on::<UserEvent>()
-    .filter_map(|e| match e {
+    .extract(|e| match e {
         UserEvent::SignupRequested { email, name } => Some((email.clone(), name.clone())),
         _ => None,
     })
@@ -183,7 +183,7 @@ effect::on::<UserEvent>()
 
 // Effect with filter_map (combines filter + destructure)
 effect::on::<CrawlEvent>()
-    .filter_map(|e| match e {
+    .extract(|e| match e {
         CrawlEvent::PagesReady { website_id, job_id, page_ids } => {
             Some((*website_id, *job_id, page_ids.clone()))
         }
@@ -217,12 +217,43 @@ effect::on_any().then(|event, ctx| async move {
 })
 ```
 
+#### `on!` Macro for Multi-Variant Matching
+
+When handling enum events with multiple variants, the `on!` macro provides concise syntax:
+
+```rust
+use seesaw_core::on;
+
+// Instead of multiple effect::on::<E>().extract(...).then(...) calls:
+let effects = on!(CrawlEvent {
+    // Multiple variants with | - same fields required
+    WebsiteIngested { website_id, job_id, .. } |
+    WebsitePostsRegenerated { website_id, job_id, .. } => |ctx| async move {
+        ctx.deps().jobs.enqueue(ExtractPostsJob {
+            website_id,
+            parent_job_id: job_id,
+        }).await?;
+        Ok(CrawlEvent::ExtractJobEnqueued { website_id })
+    },
+
+    // Single variant
+    PostsExtractedFromPages { website_id, posts, .. } => |ctx| async move {
+        ctx.deps().jobs.enqueue(SyncPostsJob { website_id, posts }).await?;
+        Ok(CrawlEvent::SyncJobEnqueued { website_id })
+    },
+});
+
+// Returns Vec<Effect<S, D>> - add to engine
+let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
+```
+
 Key properties:
 
 - **Closure-based**: No trait implementations required
 - **Return events**: Effects return `Ok(Event)` to dispatch, or `Ok(())` to dispatch nothing
 - **Access state**: Via `ctx.prev_state()`, `ctx.next_state()`, and `ctx.curr_state()`
-- **Filter + map**: Use `.filter_map()` to filter and extract fields in one step
+- **Filter + map**: Use `.extract()` to filter and extract fields in one step
+- **Multi-variant matching**: Use `on!` macro for ergonomic enum variant handling
 - **State transitions**: Use `.transition()` to react only when state changes
 - **Narrow context**: Only `deps()` and state access available
 
@@ -307,7 +338,7 @@ let engine = Engine::new()
     }))
     .with_effect(
         effect::on::<OrderEvent>()
-            .filter_map(|e| match e {
+            .extract(|e| match e {
                 OrderEvent::Placed { order_id, .. } => Some(*order_id),
                 _ => None,
             })
@@ -388,7 +419,7 @@ impl OutboxEvent for OrderPlaced {
 
 // 2. Write to outbox in same transaction as business data
 effect::on::<OrderEvent>()
-    .filter_map(|e| match e {
+    .extract(|e| match e {
         OrderEvent::PlaceRequested { customer_id, items } => {
             Some((*customer_id, items.clone()))
         }
@@ -454,7 +485,7 @@ async fn test_effect_returns_event() {
         .with_deps(MockDeps::new())
         .with_effect(
             effect::on::<OrderEvent>()
-                .filter_map(|e| match e {
+                .extract(|e| match e {
                     OrderEvent::Placed { order_id, .. } => Some(*order_id),
                     _ => None,
                 })

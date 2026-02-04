@@ -38,10 +38,24 @@
 //!     effect::on::<EventA>().then(handle_a),
 //!     effect::on::<EventB>().then(handle_b),
 //! ]));
+//!
+//! // on! macro for multi-variant matching
+//! use seesaw::on;
+//!
+//! let effects = on!(MyEvent {
+//!     VariantA { id, data, .. } |
+//!     VariantB { id, data, .. } => |ctx| async move {
+//!         Ok(MyEvent::Processed { id })
+//!     },
+//!     VariantC { id, .. } => |ctx| async move {
+//!         Ok(MyEvent::Handled { id })
+//!     },
+//! });
 //! ```
 
 mod builders;
-mod context;
+pub(crate) mod context;
+mod macros;
 mod types;
 
 pub use builders::{bridge, group, on, on_any, task};
