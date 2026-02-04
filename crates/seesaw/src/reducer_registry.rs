@@ -78,7 +78,7 @@ mod tests {
     fn test_reducer_registry_registers() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::on::<IncrementEvent>().run(|state: TestState, event| TestState {
+        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
             count: state.count + event.amount,
         }));
 
@@ -89,7 +89,7 @@ mod tests {
     fn test_reducer_registry_applies() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::on::<IncrementEvent>().run(|state: TestState, event| TestState {
+        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
             count: state.count + event.amount,
         }));
 
@@ -104,10 +104,10 @@ mod tests {
     fn test_reducer_registry_multiple_reducers() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::on::<IncrementEvent>().run(|state: TestState, event| TestState {
+        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
             count: state.count + event.amount,
         }));
-        registry.register(reducer::on::<DecrementEvent>().run(|state: TestState, event| TestState {
+        registry.register(reducer::fold::<DecrementEvent>().into(|state: TestState, event| TestState {
             count: state.count - event.amount,
         }));
 
@@ -127,10 +127,10 @@ mod tests {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
         registry.register(reducer::group([
-            reducer::on::<IncrementEvent>().run(|state: TestState, event| TestState {
+            reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
                 count: state.count + event.amount,
             }),
-            reducer::on::<DecrementEvent>().run(|state: TestState, event| TestState {
+            reducer::fold::<DecrementEvent>().into(|state: TestState, event| TestState {
                 count: state.count - event.amount,
             }),
         ]));
@@ -150,7 +150,7 @@ mod tests {
     fn test_reducer_registry_unhandled_event() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::on::<IncrementEvent>().run(|state: TestState, event| TestState {
+        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
             count: state.count + event.amount,
         }));
 

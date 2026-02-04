@@ -18,7 +18,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use seesaw::{Engine, effect, reducer};
+//! use seesaw::{Engine, on, fold};
 //!
 //! #[derive(Clone, Debug, Default)]
 //! struct AppState {
@@ -26,7 +26,7 @@
 //!     order_count: i32,
 //! }
 //!
-//! // Define multiple event types
+//! // Define event types (struct-per-event pattern)
 //! #[derive(Clone)]
 //! struct UserCreated { name: String }
 //! #[derive(Clone)]
@@ -34,25 +34,27 @@
 //! #[derive(Clone)]
 //! struct UserWelcomed { name: String }
 //!
-//! // Create engine with per-event reducers and effects
+//! // Create engine with fold (reducers) and on (effects)
 //! let engine = Engine::new()
-//!     .with_reducer(reducer::on::<UserCreated>().run(|state, _event| AppState {
+//!     // Fold events into state
+//!     .with_reducer(fold::<UserCreated>().into(|state, _| AppState {
 //!         user_count: state.user_count + 1,
 //!         ..state
 //!     }))
-//!     .with_reducer(reducer::on::<OrderPlaced>().run(|state, _event| AppState {
+//!     .with_reducer(fold::<OrderPlaced>().into(|state, _| AppState {
 //!         order_count: state.order_count + 1,
 //!         ..state
 //!     }))
-//!     .with_effect(effect::on::<UserCreated>().then(|event, _ctx| async move {
+//!     // On event, then return next event
+//!     .with_effect(on::<UserCreated>().then(|event, _ctx| async move {
 //!         println!("User created: {}", event.name);
 //!         Ok(UserWelcomed { name: event.name.clone() })
 //!     }));
 //!
 //! // Activate and dispatch events via run()
 //! let handle = engine.activate(AppState::default());
-//! handle.run(|_ctx| Ok(UserCreated { name: "Alice".into() }))?;
-//! handle.run(|_ctx| Ok(OrderPlaced { amount: 99.99 }))?;
+//! handle.run(|_| Ok(UserCreated { name: "Alice".into() }))?;
+//! handle.run(|_| Ok(OrderPlaced { amount: 99.99 }))?;
 //! handle.settled().await?;
 //! ```
 
@@ -77,6 +79,10 @@ pub use effect::{AnyEvent, Effect, EffectContext};
 pub use reducer::Reducer;
 pub use engine::{Handle, Engine};
 pub use task_group::TaskGroup;
+
+// Top-level builder functions
+pub use effect::on;
+pub use reducer::fold;
 
 // Re-export service types at root level
 pub use service::{

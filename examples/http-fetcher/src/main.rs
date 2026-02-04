@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     // Define engine with closure-based effects and reducers
     let engine = Engine::with_deps(deps)
         // Reducer - pure state transformation
-        .with_reducer(reducer::on::<FetchEvent>().run(|state: FetchState, event| {
+        .with_reducer(reducer::fold::<FetchEvent>().into(|state: FetchState, event| {
             match event {
                 FetchEvent::FetchRequested { urls } => {
                     let mut new_state = state.clone();
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         // Effect 1 - Fetch URLs when requested
         .with_effect(
             effect::on::<FetchEvent>()
-                .filter_map(|e| match e {
+                .extract(|e| match e {
                     FetchEvent::FetchRequested { urls } => Some(urls.clone()),
                     _ => None,
                 })
@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
         // Effect 2 - Continue fetching after success/failure
         .with_effect(
             effect::on::<FetchEvent>()
-                .filter_map(|e| match e {
+                .extract(|e| match e {
                     FetchEvent::Fetched { .. } | FetchEvent::FetchFailed { .. } => Some(()),
                     _ => None,
                 })

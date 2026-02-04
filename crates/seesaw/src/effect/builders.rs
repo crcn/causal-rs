@@ -116,13 +116,13 @@ where
         }
     }
 
-    /// Filter and transform events. Handler receives the mapped value.
+    /// Extract data from events. Handler receives the extracted value.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// effect::on::<MyEvent>()
-    ///     .filter_map(|e| match e {
+    /// on::<MyEvent>()
+    ///     .extract(|e| match e {
     ///         MyEvent::Variant { id, data } => Some((*id, data.clone())),
     ///         _ => None
     ///     })
@@ -130,16 +130,16 @@ where
     ///         Ok(MyEvent::Processed { id, data })
     ///     })
     /// ```
-    pub fn filter_map<F, T>(
+    pub fn extract<F, T>(
         self,
-        mapper: F,
+        extractor: F,
     ) -> EffectBuilder<Typed<E>, WithFilterMap<F, T>, Trans, Started>
     where
         F: Fn(&E) -> Option<T> + Send + Sync + 'static,
         T: Clone + Send + Sync + 'static,
     {
         EffectBuilder {
-            filter: WithFilterMap(mapper, PhantomData),
+            filter: WithFilterMap(extractor, PhantomData),
             transition: self.transition,
             started: self.started,
             _marker: PhantomData,
@@ -794,7 +794,7 @@ mod tests {
     #[tokio::test]
     async fn test_filter_map_transforms_and_filters() {
         let effect: Effect<TestState, TestDeps> = on::<TestEvent>()
-            .filter_map(|e| {
+            .extract(|e| {
                 if e.value > 10 {
                     Some((e.value, e.value * 2))
                 } else {

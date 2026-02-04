@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
     // Define engine with closure-based effects and reducers
     let engine = Engine::with_deps(deps)
         // Reducer - pure state transformation
-        .with_reducer(reducer::on::<SummaryEvent>().run(|state: SummaryState, event| {
+        .with_reducer(reducer::fold::<SummaryEvent>().into(|state: SummaryState, event| {
             match event {
                 SummaryEvent::Summarized { summary, tokens_used, .. } => SummaryState {
                     summary: Some(summary.clone()),
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
         // Effect - call Anthropic API on request, return Summarized or SummaryFailed
         .with_effect(
             effect::on::<SummaryEvent>()
-                .filter_map(|e| match e {
+                .extract(|e| match e {
                     SummaryEvent::SummarizeRequested { task_id, text } => {
                         Some((task_id.clone(), text.clone()))
                     }

@@ -7,32 +7,41 @@ use std::sync::Arc;
 use super::types::{AnyEventRef, Reducer};
 
 // =============================================================================
-// on::<E>() - Single typed event
+// fold::<E>() / on::<E>() - Single typed event
 // =============================================================================
 
-/// Create a reducer that handles a specific event type.
+/// Create a reducer that folds an event into state.
 ///
 /// # Example
 ///
 /// ```ignore
-/// reducer::on::<Increment>().run(|state, event| {
+/// fold::<Increment>().into(|state, event| {
 ///     State { count: state.count + event.amount, ..state }
 /// })
 /// ```
-pub fn on<E: Send + Sync + 'static>() -> OnBuilder<E> {
-    OnBuilder {
+pub fn fold<E: Send + Sync + 'static>() -> FoldBuilder<E> {
+    FoldBuilder {
         _marker: PhantomData,
     }
 }
 
 /// Builder for typed event reducers.
-pub struct OnBuilder<E> {
+pub struct FoldBuilder<E> {
     _marker: PhantomData<E>,
 }
 
-impl<E: Send + Sync + 'static> OnBuilder<E> {
-    /// Set the reducer function (terminal operation).
-    pub fn run<S, R>(self, reducer: R) -> Reducer<S>
+impl<E: Send + Sync + 'static> FoldBuilder<E> {
+    /// Fold the event into state (terminal operation).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fold::<Increment>().into(|state, event| State {
+    ///     count: state.count + event.amount,
+    ///     ..state
+    /// })
+    /// ```
+    pub fn into<S, R>(self, reducer: R) -> Reducer<S>
     where
         S: Clone + Send + Sync + 'static,
         R: Fn(S, &E) -> S + Send + Sync + 'static,
@@ -104,9 +113,9 @@ impl OnAnyBuilder {
 ///
 /// ```ignore
 /// reducer::group([
-///     reducer::on::<EventA>().run(reduce_a),
-///     reducer::on::<EventB>().run(reduce_b),
-///     reducer::on::<EventC>().run(reduce_c),
+///     reducer::fold::<EventA>().into(reduce_a),
+///     reducer::fold::<EventB>().into(reduce_b),
+///     reducer::fold::<EventC>().into(reduce_c),
 /// ])
 /// ```
 pub fn group<S>(reducers: impl IntoIterator<Item = Reducer<S>>) -> Reducer<S>
@@ -156,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_on_can_handle() {
-        let reducer: Reducer<TestState> = on::<Increment>().run(|state: TestState, event| TestState {
+        let reducer: Reducer<TestState> = fold::<Increment>().into(|state: TestState, event| TestState {
             count: state.count + event.amount,
         });
 
@@ -176,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_on_reduces() {
-        let reducer: Reducer<TestState> = on::<Increment>().run(|state: TestState, event| TestState {
+        let reducer: Reducer<TestState> = fold::<Increment>().into(|state: TestState, event| TestState {
             count: state.count + event.amount,
         });
 
@@ -217,10 +226,10 @@ mod tests {
     #[test]
     fn test_group_can_handle() {
         let reducer: Reducer<TestState> = group([
-            on::<Increment>().run(|state: TestState, event| TestState {
+            fold::<Increment>().into(|state: TestState, event| TestState {
                 count: state.count + event.amount,
             }),
-            on::<Decrement>().run(|state: TestState, event| TestState {
+            fold::<Decrement>().into(|state: TestState, event| TestState {
                 count: state.count - event.amount,
             }),
         ]);
@@ -233,10 +242,10 @@ mod tests {
     #[test]
     fn test_group_reduces() {
         let reducer: Reducer<TestState> = group([
-            on::<Increment>().run(|state: TestState, event| TestState {
+            fold::<Increment>().into(|state: TestState, event| TestState {
                 count: state.count + event.amount,
             }),
-            on::<Decrement>().run(|state: TestState, event| TestState {
+            fold::<Decrement>().into(|state: TestState, event| TestState {
                 count: state.count - event.amount,
             }),
         ]);
@@ -254,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_reducer_clone() {
-        let reducer: Reducer<TestState> = on::<Increment>().run(|state: TestState, event| TestState {
+        let reducer: Reducer<TestState> = fold::<Increment>().into(|state: TestState, event| TestState {
             count: state.count + event.amount,
         });
 

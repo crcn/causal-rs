@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         shipping_enabled: true,
     })
     // Reducer - pure state transformation
-    .with_reducer(reducer::on::<OrderEvent>().run(|state: OrderState, event| {
+    .with_reducer(reducer::fold::<OrderEvent>().into(|state: OrderState, event| {
         match event {
             OrderEvent::Placed { order_id, total } => OrderState {
                 total_orders: state.total_orders + 1,
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     // Effect chain: Placed -> ship -> Shipped
     .with_effect(
         effect::on::<OrderEvent>()
-            .filter_map(|e| match e {
+            .extract(|e| match e {
                 OrderEvent::Placed { order_id, .. } => Some(*order_id),
                 _ => None,
             })
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     // Effect chain: Shipped -> notify -> Delivered
     .with_effect(
         effect::on::<OrderEvent>()
-            .filter_map(|e| match e {
+            .extract(|e| match e {
                 OrderEvent::Shipped { order_id } => Some(*order_id),
                 _ => None,
             })

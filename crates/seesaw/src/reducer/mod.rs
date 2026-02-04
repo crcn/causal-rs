@@ -7,20 +7,20 @@
 //! ```ignore
 //! use seesaw::reducer;
 //!
-//! // Single event
-//! store.with_reducer(reducer::on::<MyEvent>().run(|state, event| {
+//! // Fold event into state
+//! store.with_reducer(fold::<MyEvent>().into(|state, event| {
 //!     State { count: state.count + event.amount, ..state }
 //! }));
 //!
 //! // Group multiple reducers
 //! store.with_reducer(reducer::group([
-//!     reducer::on::<EventA>().run(reduce_a),
-//!     reducer::on::<EventB>().run(reduce_b),
+//!     fold::<EventA>().into(reduce_a),
+//!     fold::<EventB>().into(reduce_b),
 //! ]));
 //! ```
 
 mod builders;
 mod types;
 
-pub use builders::{group, on, on_any};
+pub use builders::{fold, group, on_any, FoldBuilder};
 pub use types::{AnyEventRef, Reducer};

@@ -261,7 +261,7 @@ where
     /// ```ignore
     /// use seesaw::reducer;
     ///
-    /// store.with_reducer(reducer::on::<MyEvent>().run(|state, event| {
+    /// store.with_reducer(reducer::fold::<MyEvent>().into(|state, event| {
     ///     State { count: state.count + event.amount, ..state }
     /// }))
     /// ```
@@ -532,10 +532,10 @@ mod tests {
     #[tokio::test]
     async fn store_with_reducer_applies_on_emit() {
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_reducer(reducer::on::<Decrement>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Decrement>().into(|state: Counter, event| Counter {
                 value: state.value - event.amount,
             }));
 
@@ -576,7 +576,7 @@ mod tests {
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let counter = handler_calls.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
             .with_effect(
@@ -609,7 +609,7 @@ mod tests {
         let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let log_clone = log.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
             .with_effect(effect::on::<Increment>().then(move |event, _ctx| {
@@ -635,13 +635,13 @@ mod tests {
     #[tokio::test]
     async fn store_multiple_event_types() {
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_reducer(reducer::on::<Decrement>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Decrement>().into(|state: Counter, event| Counter {
                 value: state.value - event.amount,
             }))
-            .with_reducer(reducer::on::<Reset>().run(|_: Counter, _| Counter { value: 0 }));
+            .with_reducer(reducer::fold::<Reset>().into(|_: Counter, _| Counter { value: 0 }));
 
         let result = store.activate(Counter::default());
 
@@ -672,10 +672,10 @@ mod tests {
 
         let store: Engine<Counter, Deps> =
             Engine::with_deps(Deps { multiplier: 3 })
-                .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+                .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                     value: state.value + event.amount,
                 }))
-                .with_reducer(reducer::on::<Bonus>().run(|state: Counter, event| Counter {
+                .with_reducer(reducer::fold::<Bonus>().into(|state: Counter, event| Counter {
                     value: state.value + event.amount,
                 }))
                 .with_effect(effect::on::<Increment>().then(|event, ctx: EffectContext<Counter, Deps>| async move {
@@ -782,15 +782,15 @@ mod tests {
         let c_counter_clone = c_counter.clone();
 
         let store: Engine<ChainState> = Engine::new()
-            .with_reducer(reducer::on::<EventA>().run(|state: ChainState, _| ChainState {
+            .with_reducer(reducer::fold::<EventA>().into(|state: ChainState, _| ChainState {
                 a_count: state.a_count + 1,
                 ..state
             }))
-            .with_reducer(reducer::on::<EventB>().run(|state: ChainState, _| ChainState {
+            .with_reducer(reducer::fold::<EventB>().into(|state: ChainState, _| ChainState {
                 b_count: state.b_count + 1,
                 ..state
             }))
-            .with_reducer(reducer::on::<EventC>().run(|state: ChainState, _| ChainState {
+            .with_reducer(reducer::fold::<EventC>().into(|state: ChainState, _| ChainState {
                 c_count: state.c_count + 1,
                 ..state
             }))
@@ -847,7 +847,7 @@ mod tests {
         const MAX_DEPTH: i32 = 10;
 
         let store: Engine<DeepState> = Engine::new()
-            .with_reducer(reducer::on::<DepthEvent>().run(|state: DeepState, event| DeepState {
+            .with_reducer(reducer::fold::<DepthEvent>().into(|state: DeepState, event| DeepState {
                 depth_reached: state.depth_reached.max(event.0),
             }))
             .with_effect(effect::on::<DepthEvent>().then(move |event, ctx| async move {
@@ -923,7 +923,7 @@ mod tests {
         let transitions_clone = transitions.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<SetValue>().run(|_: Counter, event| Counter { value: event.0 }))
+            .with_reducer(reducer::fold::<SetValue>().into(|_: Counter, event| Counter { value: event.0 }))
             .with_effect(effect::on::<SetValue>().then(move |_event, ctx: EffectContext<Counter, ()>| {
                 let t = transitions_clone.clone();
                 async move {
@@ -964,11 +964,11 @@ mod tests {
         const THRESHOLD: i32 = 100;
 
         let store: Engine<PointsState> = Engine::new()
-            .with_reducer(reducer::on::<AddPoints>().run(|state: PointsState, event| PointsState {
+            .with_reducer(reducer::fold::<AddPoints>().into(|state: PointsState, event| PointsState {
                 points: state.points + event.0,
                 ..state
             }))
-            .with_reducer(reducer::on::<ThresholdReached>().run(|state: PointsState, _| PointsState {
+            .with_reducer(reducer::fold::<ThresholdReached>().into(|state: PointsState, _| PointsState {
                 threshold_events: state.threshold_events + 1,
                 ..state
             }))
@@ -1018,19 +1018,19 @@ mod tests {
         }
 
         let store: Engine<FanOutState> = Engine::new()
-            .with_reducer(reducer::on::<TriggerEvent>().run(|state: FanOutState, _| FanOutState {
+            .with_reducer(reducer::fold::<TriggerEvent>().into(|state: FanOutState, _| FanOutState {
                 trigger_count: state.trigger_count + 1,
                 ..state
             }))
-            .with_reducer(reducer::on::<BranchA>().run(|state: FanOutState, _| FanOutState {
+            .with_reducer(reducer::fold::<BranchA>().into(|state: FanOutState, _| FanOutState {
                 branch_a_count: state.branch_a_count + 1,
                 ..state
             }))
-            .with_reducer(reducer::on::<BranchB>().run(|state: FanOutState, _| FanOutState {
+            .with_reducer(reducer::fold::<BranchB>().into(|state: FanOutState, _| FanOutState {
                 branch_b_count: state.branch_b_count + 1,
                 ..state
             }))
-            .with_reducer(reducer::on::<BranchC>().run(|state: FanOutState, _| FanOutState {
+            .with_reducer(reducer::fold::<BranchC>().into(|state: FanOutState, _| FanOutState {
                 branch_c_count: state.branch_c_count + 1,
                 ..state
             }))
@@ -1063,7 +1063,7 @@ mod tests {
     async fn stress_many_rapid_events() {
         // Test: Rapid emission of many events
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
@@ -1096,11 +1096,11 @@ mod tests {
 
         // Use smaller event count to avoid overwhelming the async task queue
         let store: Engine<CascadeState> = Engine::new()
-            .with_reducer(reducer::on::<Source>().run(|state: CascadeState, event| CascadeState {
+            .with_reducer(reducer::fold::<Source>().into(|state: CascadeState, event| CascadeState {
                 source_sum: state.source_sum + event.0,
                 ..state
             }))
-            .with_reducer(reducer::on::<Derived>().run(|state: CascadeState, event| CascadeState {
+            .with_reducer(reducer::fold::<Derived>().into(|state: CascadeState, event| CascadeState {
                 derived_sum: state.derived_sum + event.0,
                 ..state
             }))
@@ -1155,7 +1155,7 @@ mod tests {
         let observed_clone = observed.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<UpdateValue>().run(|_: Counter, event| Counter { value: event.0 }))
+            .with_reducer(reducer::fold::<UpdateValue>().into(|_: Counter, event| Counter { value: event.0 }))
             .with_effect(effect::on::<CheckState>().then(move |_event, ctx: EffectContext<Counter, ()>| {
                 let obs = observed_clone.clone();
                 async move {
@@ -1280,7 +1280,7 @@ mod tests {
     async fn event_stream_receives_downcasted_events() {
         // Test: External subscribers can receive raw events via event_stream
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
@@ -1305,10 +1305,10 @@ mod tests {
     async fn event_stream_receives_multiple_event_types() {
         // Test: Multiple event types are properly downcasted
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_reducer(reducer::on::<Decrement>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Decrement>().into(|state: Counter, event| Counter {
                 value: state.value - event.amount,
             }));
 
@@ -1558,7 +1558,7 @@ mod tests {
         }
 
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<ScheduledIncrement>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<ScheduledIncrement>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
             .with_effect(effect::on::<StartScheduler>().then(|_event, ctx| async move {
@@ -1944,7 +1944,7 @@ mod tests {
         let call_count_clone = call_count.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<IncrementWithEffect>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<IncrementWithEffect>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
             .with_effect(effect::on::<IncrementWithEffect>().then(move |_event, _ctx| {
@@ -2037,7 +2037,7 @@ mod tests {
         let observed_next_clone = observed_next.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<StatefulFailEvent>().run(|_state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<StatefulFailEvent>().into(|_state: Counter, event| Counter {
                 value: event.new_value,
             }))
             .with_effect(effect::on::<StatefulFailEvent>().then(move |_event, ctx: EffectContext<Counter, ()>| {
@@ -2191,7 +2191,7 @@ mod tests {
         // Test: Multiple tokio tasks emitting events concurrently
         // This tests the reducer lock contention and event ordering
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
@@ -2239,11 +2239,11 @@ mod tests {
         }
 
         let store: Engine<ConcurrentState> = Engine::new()
-            .with_reducer(reducer::on::<Source>().run(|state: ConcurrentState, _| ConcurrentState {
+            .with_reducer(reducer::fold::<Source>().into(|state: ConcurrentState, _| ConcurrentState {
                 source_count: state.source_count + 1,
                 ..state
             }))
-            .with_reducer(reducer::on::<Derived>().run(|state: ConcurrentState, _| ConcurrentState {
+            .with_reducer(reducer::fold::<Derived>().into(|state: ConcurrentState, _| ConcurrentState {
                 derived_count: state.derived_count + 1,
                 ..state
             }))
@@ -2288,7 +2288,7 @@ mod tests {
         let processed = Arc::new(AtomicUsize::new(0));
         let processed_clone = processed.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<FastEvent>().run(|state: Counter, _| Counter {
+            .with_reducer(reducer::fold::<FastEvent>().into(|state: Counter, _| Counter {
                 value: state.value + 1,
             }))
             .with_effect(effect::on::<FastEvent>().then(move |_event, _ctx| {
@@ -2323,7 +2323,7 @@ mod tests {
         let observations = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let observations_clone = observations.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<OrderedEvent>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<OrderedEvent>().into(|state: Counter, event| Counter {
                 value: state.value + event.0,
             }))
             .with_effect(effect::on::<OrderedEvent>().then(move |_event, ctx: EffectContext<Counter, ()>| {
@@ -2424,7 +2424,7 @@ mod tests {
     async fn multiple_activations_independent() {
         // Test: Multiple activations of the same store are independent
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
@@ -2510,7 +2510,7 @@ mod tests {
         }
 
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<FailAfterUpdate>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<FailAfterUpdate>().into(|state: Counter, event| Counter {
                 value: state.value + event.value,
             }))
             .with_effect(effect::on::<FailAfterUpdate>().then(|event, _ctx| async move {
@@ -2558,11 +2558,11 @@ mod tests {
         }
 
         let store: Engine<FanOutState> = Engine::new()
-            .with_reducer(reducer::on::<BranchAChild>().run(|state, _| FanOutState {
+            .with_reducer(reducer::fold::<BranchAChild>().into(|state, _| FanOutState {
                 branch_a_child: true,
                 ..state
             }))
-            .with_reducer(reducer::on::<BranchBChild>().run(|state, _| FanOutState {
+            .with_reducer(reducer::fold::<BranchBChild>().into(|state, _| FanOutState {
                 branch_b_child: true,
                 ..state
             }))
@@ -2912,7 +2912,7 @@ mod tests {
         }
 
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<IncrementThenPanic>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<IncrementThenPanic>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
             .with_effect(effect::on::<IncrementThenPanic>().then(|event, ctx| async move {
@@ -3172,7 +3172,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<ExternalIncrement>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<ExternalIncrement>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
             .with_effect(effect::on::<ExternalIncrement>().then(move |_event, _ctx| {
@@ -3327,7 +3327,7 @@ mod tests {
     async fn store_state_updates_between_events() {
         // Test: store.state() returns real-time state updates
         let store: Engine<Counter> = Engine::new()
-            .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }));
 
@@ -3373,7 +3373,7 @@ mod tests {
         }
 
         let store: Engine<PipeState> = Engine::new()
-            .with_reducer(reducer::on::<InputEvent>().run(|state: PipeState, event| PipeState {
+            .with_reducer(reducer::fold::<InputEvent>().into(|state: PipeState, event| PipeState {
                 total: state.total + event.value,
             }))
             .with_effect(effect::on::<InputEvent>().then(|event, ctx| async move {
@@ -3432,7 +3432,7 @@ mod tests {
         }
 
         let store: Engine<EchoState> = Engine::new()
-            .with_reducer(reducer::on::<PingEvent>().run(|state: EchoState, _event| EchoState {
+            .with_reducer(reducer::fold::<PingEvent>().into(|state: EchoState, _event| EchoState {
                 ping_count: state.ping_count + 1,
             }));
 
@@ -3524,14 +3524,14 @@ mod tests {
 
         // Create two engines
         let engine1: Engine<ChainState> = Engine::new()
-            .with_reducer(reducer::on::<ChainEvent>().run(|state: ChainState, event| {
+            .with_reducer(reducer::fold::<ChainEvent>().into(|state: ChainState, event| {
                 ChainState {
                     count: state.count + event.value,
                 }
             }));
 
         let engine2: Engine<ChainState> = Engine::new()
-            .with_reducer(reducer::on::<ChainEvent>().run(|state: ChainState, event| {
+            .with_reducer(reducer::fold::<ChainEvent>().into(|state: ChainState, event| {
                 ChainState {
                     count: state.count + event.value * 10,
                 }
