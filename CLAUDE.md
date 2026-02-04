@@ -1,18 +1,17 @@
 # Seesaw Architecture Guidelines
 
-**Mental Model**: Events are signals. Effects react and emit new events. That's it.
+**Mental Model**: Events are signals. Effects react and return new events. That's it.
 
-## Quick Start - New API
+## Quick Start - v0.7.0 API
 
 ### Stateless Engine Pattern
 
 ```rust
 // 1. Define engine once (stateless, reusable)
 let engine = Engine::new()
-    .with_effect(effect::on::<OrderPlaced>().run(|event, ctx| async move {
+    .with_effect(effect::on::<OrderPlaced>().then(|event, ctx| async move {
         ctx.deps().mailer.send_confirmation(&event).await?;
-        ctx.emit(EmailSent { order_id: event.id });
-        Ok(())
+        Ok(EmailSent { order_id: event.id })  // Return event to dispatch
     }))
     .with_reducer(reducer::on::<OrderPlaced>().run(|state, event| {
         State { order_count: state.order_count + 1, ..state }
@@ -21,11 +20,8 @@ let engine = Engine::new()
 // 2. Activate with initial state (per-execution)
 let handle = engine.activate(State::default());
 
-// 3. Run your logic
-let result = handle.run(|ctx| {
-    ctx.emit(OrderPlaced { id: 123, total: 99.99 });
-    Ok(Response { status: "processed" })
-})?;
+// 3. Run your logic - return event to dispatch
+handle.run(|_ctx| Ok(OrderPlaced { id: 123, total: 99.99 }))?;
 
 // 4. Wait for effects to complete
 handle.settled().await?;
@@ -39,28 +35,23 @@ let engine = Engine::new()
     .with_effect(...)
     .with_reducer(...);
 
-// Edge function signature
-async fn process_webhook(
-    payload: Webhook,
-    ctx: &EffectContext<State, Deps>
-) -> Result<Response> {
-    ctx.emit(OrderPlaced::from(payload));
-    Ok(Response { status: "ok" })
+// Edge function returns event to dispatch
+fn process_webhook(payload: Webhook) -> OrderPlaced {
+    OrderPlaced::from(payload)
 }
 
 // Execute per-request
 let handle = engine.activate(State::default());
-let response = handle.run(|ctx| process_webhook(payload, ctx))?;
+handle.run(|_ctx| Ok(process_webhook(payload)))?;
 handle.settled().await?;
 ```
 
-### Key Differences from Old API
+### Key Differences from v0.6
 
-- **Engine is stateless**: No state stored in Engine
-- **State per-activation**: Pass initial state to `activate()`
-- **`handle.run()`**: Execute logic and get result
-- **Closure-based**: Use `effect::on()` and `reducer::on()` builders
-- **No traits**: No need to implement Effect/Reducer traits
+- **Effects return events**: Use `.then()` and return `Ok(Event)` instead of `ctx.emit()`
+- **`handle.run()` returns event**: Return the event to dispatch, not arbitrary values
+- **`ctx.emit()` removed from public API**: Effects and edge functions return events
+- **Observer pattern**: Return `Ok(())` to dispatch nothing
 
 ---
 
@@ -72,7 +63,7 @@ Seesaw is an **event-driven runtime** for building reactive systems.
 
 - **Events** are signals (facts that already happened)
 - **Reducers** transform state before effects (pure functions)
-- **Effects** react to events, perform IO, emit new events
+- **Effects** react to events, perform IO, return new events
 
 Simple, direct, no ceremony.
 
@@ -110,42 +101,45 @@ Events are the only signals in the system.
 
 ### Effect
 
-Handlers that react to events. Execute IO, emit new events.
+Handlers that react to events and return new events.
 
 ```rust
-// Simple effect - reacts to one event type
-let scrape_effect = effect::on::<SourceRequested>().run(|event, ctx| async move {
+// Simple effect - reacts to one event type, returns new event
+let scrape_effect = effect::on::<SourceRequested>().then(|event, ctx| async move {
     let data = ctx.deps().scraper.scrape(event.source_id).await?;
-    ctx.emit(SourceScraped {
+    Ok(SourceScraped {
         source_id: event.source_id,
         data
-    });
-    Ok(())
+    })
 });
 
-// Effect with filter
+// Effect with filter_map - extract data and return event
 let priority_effect = effect::on::<OrderPlaced>()
-    .filter(|event| event.priority > 5)
-    .run(|event, ctx| async move {
+    .filter_map(|event| {
+        if event.priority > 5 { Some(event.clone()) } else { None }
+    })
+    .then(|event, ctx| async move {
         ctx.deps().notify_urgent(&event).await?;
-        Ok(())
+        Ok(UrgentNotified { order_id: event.id })
     });
 
 // Effect with state transition
 let status_effect = effect::on::<StatusChanged>()
     .transition(|prev, next| prev.status != next.status)
-    .run(|event, ctx| async move {
-        // Only runs when status actually changed
+    .then(|event, ctx| async move {
         ctx.deps().notify_status_change(&event).await?;
-        Ok(())
+        Ok(StatusNotified { id: event.id })
     });
 
-// Observe ALL events (for logging, metrics, debugging)
-let observer_effect = effect::on_any().run(|event, ctx| async move {
-    // event is AnyEvent with type-erased value
-    ctx.deps().logger.log(event.type_id);
+// Observer effect - returns () to dispatch nothing
+let logger_effect = effect::on::<OrderPlaced>().then(|event, ctx| async move {
+    ctx.deps().logger.log(&event);
+    Ok(())  // No event dispatched
+});
 
-    // Can downcast if needed
+// Observe ALL events (for logging, metrics, debugging)
+let observer_effect = effect::on_any().then(|event, ctx| async move {
+    ctx.deps().logger.log(event.type_id);
     if let Some(order) = event.downcast::<OrderPlaced>() {
         ctx.deps().analytics.track("order_placed", order);
     }
@@ -158,8 +152,8 @@ Effects can:
 - Make decisions
 - Branch on conditions
 - Be pure or impure (your choice)
-- Emit events via `ctx.emit()` or skip with `Ok(())`
-- Filter events with `.filter()`
+- Return events to dispatch, or `Ok(())` to dispatch nothing
+- Filter events with `.filter_map()`
 - React to state transitions with `.transition()`
 
 EffectContext provides:
@@ -167,7 +161,6 @@ EffectContext provides:
 - `prev_state()` — state before reducer ran
 - `next_state()` — state after reducer ran
 - `curr_state()` — current live state
-- `emit(event)` — emit new events
 - `within(closure)` — spawn tracked sub-tasks
 
 ### Reducer
@@ -197,14 +190,6 @@ let order_reducer = reducer::on::<OrderPlaced>().run(|state, event| {
 let reset_reducer = reducer::on::<Reset>().run(|_state, _event| {
     State::default()
 });
-                    last_scrape: Some(data.clone()),
-                    ..state.clone()
-                }
-            }
-            _ => state.clone()
-        }
-    }
-}
 ```
 
 Reducers:
@@ -219,7 +204,7 @@ Reducers:
 Simple and direct:
 
 ```
-Event emitted
+Event dispatched
   ↓
 Reducers transform state
   ↓
@@ -227,7 +212,7 @@ All Effects listening to this event
   ↓
 Execute (IO, decisions, state checks)
   ↓
-Emit new Event(s)
+Return new Event (or () for none)
   ↓
 Repeat
 ```
@@ -236,15 +221,9 @@ Repeat
 
 ```rust
 ScrapeEvent::SourceRequested
-  → ScrapeEffect.handle()
-    → scrapes URL
-    → emits ScrapeEvent::SourceScraped { data }
-  → ExtractEffect.handle()
-    → extracts items
-    → emits ScrapeEvent::NeedsExtracted { needs }
-  → SyncEffect.handle()
-    → syncs to DB
-    → emits ScrapeEvent::SyncComplete
+  → ScrapeEffect → scrapes URL → returns SourceScraped { data }
+  → ExtractEffect → extracts items → returns DataExtracted { items }
+  → SyncEffect → syncs to DB → returns SyncComplete
 ```
 
 Multiple effects can listen to the same event and run in parallel.
@@ -254,12 +233,12 @@ Multiple effects can listen to the same event and run in parallel.
 ```rust
 UserEvent::SignedUp
   ↓
-  ├─→ EmailEffect → sends welcome email → EmailSent
-  ├─→ SlackEffect → posts to Slack → SlackPosted
-  └─→ AnalyticsEffect → tracks event → AnalyticsRecorded
+  ├─→ EmailEffect → sends welcome email → returns EmailSent
+  ├─→ SlackEffect → posts to Slack → returns SlackPosted
+  └─→ AnalyticsEffect → tracks event → returns ()
 ```
 
-All three effects run concurrently when `SignedUp` is emitted.
+All three effects run concurrently when `SignedUp` is dispatched.
 
 ## Examples
 
@@ -273,44 +252,31 @@ enum ScrapeEvent {
     DataExtracted { source_id: Uuid, items: Vec<Item> },
 }
 
-// Effect 1: Scrape on request
-#[async_trait]
-impl Effect<ScrapeEvent, Deps> for ScraperEffect {
-    type Event = ScrapeEvent;
-
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<()> {
-        match event {
-            ScrapeEvent::SourceRequested { source_id } => {
+let engine = Engine::with_deps(deps)
+    // Effect 1: Scrape on request
+    .with_effect(
+        effect::on::<ScrapeEvent>()
+            .filter_map(|e| match e {
+                ScrapeEvent::SourceRequested { source_id } => Some(*source_id),
+                _ => None,
+            })
+            .then(|source_id, ctx| async move {
                 let data = ctx.deps().scraper.scrape(source_id).await?;
-                ctx.emit(ScrapeEvent::SourceScraped { source_id, data });
-                Ok(())
-            }
-            _ => Ok(())  // Skip unhandled events
-        }
-    }
-}
-
-// Effect 2: Extract on scrape
-#[async_trait]
-impl Effect<ScrapeEvent, Deps> for ExtractorEffect {
-    type Event = ScrapeEvent;
-
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<()> {
-        match event {
-            ScrapeEvent::SourceScraped { source_id, data } => {
+                Ok(ScrapeEvent::SourceScraped { source_id, data })
+            })
+    )
+    // Effect 2: Extract on scrape
+    .with_effect(
+        effect::on::<ScrapeEvent>()
+            .filter_map(|e| match e {
+                ScrapeEvent::SourceScraped { source_id, data } => Some((*source_id, data.clone())),
+                _ => None,
+            })
+            .then(|(source_id, data), ctx| async move {
                 let items = ctx.deps().extractor.extract(&data).await?;
-                ctx.emit(ScrapeEvent::DataExtracted { source_id, items });
-                Ok(())
-            }
-            _ => Ok(())  // Skip unhandled events
-        }
-    }
-}
-
-let engine = EngineBuilder::new(deps)
-    .with_effect::<ScrapeEvent, _>(ScraperEffect)
-    .with_effect::<ScrapeEvent, _>(ExtractorEffect)
-    .build();
+                Ok(ScrapeEvent::DataExtracted { source_id, items })
+            })
+    );
 ```
 
 ### Example 2: Notification dispatch
@@ -323,80 +289,59 @@ enum NotificationEvent {
     SlackPosted { user_id: Uuid, message_id: String },
 }
 
-#[async_trait]
-impl Effect<NotificationEvent, Deps> for EmailEffect {
-    type Event = NotificationEvent;
-
-    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<()> {
-        match event {
-            NotificationEvent::UserSignedUp { user_id, email } => {
+let engine = Engine::with_deps(deps)
+    // Email effect
+    .with_effect(
+        effect::on::<NotificationEvent>()
+            .filter_map(|e| match e {
+                NotificationEvent::UserSignedUp { user_id, email } => Some((*user_id, email.clone())),
+                _ => None,
+            })
+            .then(|(user_id, email), ctx| async move {
                 let email_id = ctx.deps().mailer.send_welcome(email).await?;
-                ctx.emit(NotificationEvent::EmailSent { user_id, email_id });
-                Ok(())
-            }
-            _ => Ok(())  // Skip unhandled events
-        }
-    }
-}
-
-#[async_trait]
-impl Effect<NotificationEvent, Deps> for SlackEffect {
-    type Event = NotificationEvent;
-
-    async fn handle(&mut self, event: NotificationEvent, ctx: EffectContext<Deps>) -> Result<()> {
-        match event {
-            NotificationEvent::UserSignedUp { user_id, .. } => {
+                Ok(NotificationEvent::EmailSent { user_id, email_id })
+            })
+    )
+    // Slack effect
+    .with_effect(
+        effect::on::<NotificationEvent>()
+            .filter_map(|e| match e {
+                NotificationEvent::UserSignedUp { user_id, .. } => Some(*user_id),
+                _ => None,
+            })
+            .then(|user_id, ctx| async move {
                 let msg_id = ctx.deps().slack.post("New signup!").await?;
-                ctx.emit(NotificationEvent::SlackPosted { user_id, message_id: msg_id });
-                Ok(())
-            }
-            _ => Ok(())  // Skip unhandled events
-        }
-    }
-}
+                Ok(NotificationEvent::SlackPosted { user_id, message_id: msg_id })
+            })
+    );
 ```
 
-Both effects run in parallel when `UserSignedUp` is emitted. No coordination needed.
+Both effects run in parallel when `UserSignedUp` is dispatched. No coordination needed.
 
-### Example 3: Effect with guards and state
+### Example 3: Conditional event dispatch
 
 ```rust
-struct RateLimitedScraperEffect {
-    pending: RwLock<HashSet<Uuid>>,
-}
-
-#[async_trait]
-impl Effect<ScrapeEvent, Deps> for RateLimitedScraperEffect {
-    type Event = ScrapeEvent;
-
-    async fn handle(&mut self, event: ScrapeEvent, ctx: EffectContext<Deps>) -> Result<()> {
-        match event {
-            ScrapeEvent::SourceRequested { source_id } => {
-                // Guard: check if already pending
-                if !self.pending.write().await.insert(source_id) {
-                    bail!("already pending");
-                }
-
-                // Guard: check rate limit
-                if !ctx.deps().rate_limiter.check().await? {
-                    self.pending.write().await.remove(&source_id);
-                    bail!("rate limited");
-                }
-
-                // Do the work
-                let data = ctx.deps().scraper.scrape(source_id).await?;
-                self.pending.write().await.remove(&source_id);
-
-                ctx.emit(ScrapeEvent::SourceScraped { source_id, data });
-                Ok(())
-            }
-            _ => Ok(())  // Skip unhandled events
+// Effect that conditionally returns different events
+effect::on::<ScrapeEvent>()
+    .filter_map(|e| match e {
+        ScrapeEvent::SourceRequested { source_id } => Some(*source_id),
+        _ => None,
+    })
+    .then(|source_id, ctx| async move {
+        // Check rate limit
+        if !ctx.deps().rate_limiter.check().await? {
+            return Ok(ScrapeEvent::RateLimited { source_id });
         }
-    }
-}
+
+        // Do the work
+        match ctx.deps().scraper.scrape(source_id).await {
+            Ok(data) => Ok(ScrapeEvent::SourceScraped { source_id, data }),
+            Err(e) => Ok(ScrapeEvent::ScrapeFailed { source_id, reason: e.to_string() }),
+        }
+    })
 ```
 
-Effects can hold state and make decisions. You choose whether to separate pure logic or keep it together.
+Effects return events based on outcomes - success, failure, or rate-limited all flow as events.
 
 ## Design Guidelines
 
@@ -423,36 +368,31 @@ You decide based on your needs.
 
 ### Cross-domain listening
 
-Effects can listen to events from any domain.
+Effects can listen to events from any domain and return events from another.
 
 ```rust
-// CrawlEffect listening to WebsiteEvent
-impl Effect<WebsiteEvent, Deps> for CrawlEffect {
-    type Event = CrawlEvent;
-
-    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<()> {
-        match event {
-            WebsiteEvent::WebsiteApproved { website_id } => {
-                ctx.deps().crawler.start(website_id).await?;
-                ctx.emit(CrawlEvent::CrawlStarted { website_id });
-                Ok(())
-            }
-            _ => Ok(())  // Skip unhandled events
-        }
-    }
-}
+// Effect listening to WebsiteEvent, returning CrawlEvent
+effect::on::<WebsiteEvent>()
+    .filter_map(|e| match e {
+        WebsiteEvent::WebsiteApproved { website_id } => Some(*website_id),
+        _ => None,
+    })
+    .then(|website_id, ctx| async move {
+        ctx.deps().crawler.start(website_id).await?;
+        Ok(CrawlEvent::CrawlStarted { website_id })
+    })
 ```
 
 This is normal and correct. Cross-domain coordination happens via events.
 
 ## Role Matrix
 
-| Role    | React? | Mutate? | Emit?  | Listen To | Pure? |
-| ------- | ------ | ------- | ------ | --------- | ----- |
-| Reducer | No     | No      | No     | Events    | Yes   |
-| Effect  | Yes    | Yes     | Events | Events    | No    |
+| Role    | React? | Mutate? | Returns | Listen To | Pure? |
+| ------- | ------ | ------- | ------- | --------- | ----- |
+| Reducer | No     | No      | State   | Events    | Yes   |
+| Effect  | Yes    | Yes     | Event   | Events    | No    |
 
-Reducers transform state. Effects do the work.
+Reducers transform state. Effects do the work and return events.
 
 ## What Seesaw Is Not
 
@@ -541,30 +481,27 @@ let engine = Engine::new()
         // Pure state transformation
         State { count: state.count + 1, ..state }
     }))
-    .with_effect(effect::on::<MyEvent>().run(|event, ctx| async move {
-        // Side effects
+    .with_effect(effect::on::<MyEvent>().then(|event, ctx| async move {
+        // Side effects - return event to dispatch
         ctx.deps().notify(&event).await?;
-        ctx.emit(NextEvent);
-        Ok(())
+        Ok(NextEvent { id: event.id })
     }));
 
-// Execute per-request
+// Execute per-request - return event to dispatch
 let handle = engine.activate(State::default());
-let result = handle.run(|ctx| {
-    ctx.emit(MyEvent::Started { data });
-    Ok(Response { status: "ok" })
-})?;
+handle.run(|_ctx| Ok(MyEvent::Started { data }))?;
 handle.settled().await?;
 ```
 
 Builder methods:
 - `.with_reducer(reducer)` — Register pure state transformations
-- `.with_effect(effect)` — Register event handlers
+- `.with_effect(effect)` — Register event handlers (use `.then()` to return events)
 - `.with_deps(deps)` — Create engine with dependencies
 - `.with_effect_registry(registry)` — Use existing effect registry
 
 Handle methods:
-- `.run(closure)` — Execute logic, returns result
+- `.run(closure)` — Execute logic, return event to dispatch (or `()` for none)
+- `.process(async_closure).await` — Async version of `run()`
 - `.settled().await` — Wait for all effects to complete
 - `.cancel()` — Cancel all tasks
 
@@ -572,31 +509,26 @@ Handle methods:
 
 Effects can listen to events from other domains. This is normal and correct.
 
-**Pattern**: Domain A emits event → Domain B's effect reacts → Domain B emits its own events
+**Pattern**: Domain A dispatches event → Domain B's effect reacts → Domain B returns its own events
 
 ### Example: Website approval triggers crawling
 
 ```rust
-// Website domain emits events
+// Website domain dispatches events
 pub enum WebsiteEvent {
     WebsiteApproved { website_id: Uuid },
 }
 
-// Crawl effect listens to WebsiteEvent
-impl Effect<WebsiteEvent, Deps> for CrawlEffect {
-    type Event = CrawlEvent;
-
-    async fn handle(&mut self, event: WebsiteEvent, ctx: EffectContext<Deps>) -> Result<()> {
-        match event {
-            WebsiteEvent::WebsiteApproved { website_id } => {
-                ctx.deps().crawler.start(website_id).await?;
-                ctx.emit(CrawlEvent::CrawlStarted { website_id });
-                Ok(())
-            }
-            _ => Ok(())  // Skip unhandled events
-        }
-    }
-}
+// Crawl effect listens to WebsiteEvent, returns CrawlEvent
+effect::on::<WebsiteEvent>()
+    .filter_map(|e| match e {
+        WebsiteEvent::WebsiteApproved { website_id } => Some(*website_id),
+        _ => None,
+    })
+    .then(|website_id, ctx| async move {
+        ctx.deps().crawler.start(website_id).await?;
+        Ok(CrawlEvent::CrawlStarted { website_id })
+    })
 ```
 
 **Why this is correct**:
@@ -605,7 +537,7 @@ impl Effect<WebsiteEvent, Deps> for CrawlEffect {
 - Trivially testable
 - Explicit and localized
 
-The runtime broadcasts events. Effects that care, react. That's it.
+The runtime broadcasts events. Effects that care, react and return new events. That's it.
 
 ## Request/Response Pattern
 
@@ -640,7 +572,7 @@ tx.commit().await?;
 ## Architecture Flow
 
 ```
-EventBus → Effect.handle(event) → ctx.emit() → EventBus
+EventBus → Effect.then(event) → returns Event → EventBus
 ```
 
 Simple and direct.
@@ -649,7 +581,7 @@ Simple and direct.
 
 1. **Events are the only signals** — Everything flows through events
 2. **Reducers transform state** — Pure functions that run before effects
-3. **Effects react to events** — Do IO, emit new events
+3. **Effects react to events** — Do IO, return new events
 4. **Effects are unconstrained** — Can do anything, pure or impure, stateful or stateless
 5. **Events are facts, past-tense** — `UserCreated`, not `CreateUser`
 6. **Effects can listen to any domain** — Cross-domain coordination via events

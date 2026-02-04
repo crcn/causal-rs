@@ -737,7 +737,7 @@ mod tests {
                         ctx.emit(Started);
                         Ok(())
                     })
-                    .run(|_, _| async { Ok(()) }),
+                    .then(|_, _| async { Ok(()) }),
             )
             .with_effect(effect::on::<Started>().then(move |_event, _ctx| {
                 let h = handled_clone.clone();

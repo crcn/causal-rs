@@ -27,11 +27,15 @@
 //! }
 //!
 //! // Define multiple event types
+//! #[derive(Clone)]
 //! struct UserCreated { name: String }
+//! #[derive(Clone)]
 //! struct OrderPlaced { amount: f64 }
+//! #[derive(Clone)]
+//! struct UserWelcomed { name: String }
 //!
-//! // Create store with per-event reducers
-//! let store = Engine::new(AppState::default())
+//! // Create engine with per-event reducers and effects
+//! let engine = Engine::new()
 //!     .with_reducer(reducer::on::<UserCreated>().run(|state, _event| AppState {
 //!         user_count: state.user_count + 1,
 //!         ..state
@@ -40,19 +44,16 @@
 //!         order_count: state.order_count + 1,
 //!         ..state
 //!     }))
-//!     .with_effect(effect::on::<UserCreated>().run(|event, ctx| async move {
+//!     .with_effect(effect::on::<UserCreated>().then(|event, _ctx| async move {
 //!         println!("User created: {}", event.name);
-//!         Ok(())
+//!         Ok(UserWelcomed { name: event.name.clone() })
 //!     }));
 //!
-//! // Activate and emit events
-//! let handle = store.activate();
-//! handle.context.emit(UserCreated { name: "Alice".into() });
-//! handle.context.emit(OrderPlaced { amount: 99.99 });
+//! // Activate and dispatch events via run()
+//! let handle = engine.activate(AppState::default());
+//! handle.run(|_ctx| Ok(UserCreated { name: "Alice".into() }))?;
+//! handle.run(|_ctx| Ok(OrderPlaced { amount: 99.99 }))?;
 //! handle.settled().await?;
-//!
-//! assert_eq!(store.state().user_count, 1);
-//! assert_eq!(store.state().order_count, 1);
 //! ```
 
 // New module structure

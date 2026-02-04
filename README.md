@@ -19,7 +19,7 @@ This repository is organized as a Cargo workspace:
 
 Seesaw **is**:
 
-> An event-driven runtime where events flow through effects, which emit new events.
+> An event-driven runtime where events flow through effects, which return new events.
 > State flows through reducers. Clean entry points via closures.
 
 Seesaw is **not**:
@@ -33,18 +33,18 @@ Seesaw is **not**:
 - **Stateless Engine**: Reusable runtime, state passed per-execution
 - **Event-Driven**: Events are the only signals - facts about what happened
 - **Closure-Based API**: Simple builder pattern with closures (no trait implementations)
-- **Effect Handlers**: React to events, perform IO, emit new events via `ctx.emit()`
+- **Effect Handlers**: React to events, perform IO, return new events
 - **Reducers**: Pure state transformations before effects
 - **Pipedream Integration**: Stream composition and bidirectional piping
 - **State Flow**: Per-execution state flows through reducers and effects
-- **Handle Pattern**: `activate(state).run(action).settled()` for clean execution
+- **Handle Pattern**: `activate(state).run(|_| Ok(event)).settled()` for clean execution
 
 ## Architecture
 
 ```
 Closure → Event → Reducer → Effect → Event → Effect → ... (until settled)
                      ↓         ↓
-                 State'    ctx.emit(Event)
+                 State'    returns Event
 ```
 
 ## Quick Start
@@ -90,30 +90,37 @@ async fn main() -> Result<()> {
                 _ => state.clone(),
             }
         }))
-        .with_effect(effect::on::<OrderEvent>().run(|event, ctx| async move {
-            match event.as_ref() {
-                OrderEvent::Placed { order_id, .. } => {
-                    ctx.deps().shipping_api.ship(*order_id).await?;
-                    ctx.emit(OrderEvent::Shipped { order_id: *order_id });
-                }
-                OrderEvent::Shipped { order_id } => {
-                    ctx.deps().email_service.send(*order_id, "Shipped!").await?;
-                    ctx.emit(OrderEvent::Delivered { order_id: *order_id });
-                }
-                _ => {}
-            }
-            Ok(())
-        }));
+        // Effect that reacts to Placed and returns Shipped
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .filter_map(|e| match e {
+                    OrderEvent::Placed { order_id, .. } => Some(*order_id),
+                    _ => None,
+                })
+                .then(|order_id, ctx| async move {
+                    ctx.deps().shipping_api.ship(order_id).await?;
+                    Ok(OrderEvent::Shipped { order_id })
+                })
+        )
+        // Effect that reacts to Shipped and returns Delivered
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .filter_map(|e| match e {
+                    OrderEvent::Shipped { order_id } => Some(*order_id),
+                    _ => None,
+                })
+                .then(|order_id, ctx| async move {
+                    ctx.deps().email_service.send(order_id, "Shipped!").await?;
+                    Ok(OrderEvent::Delivered { order_id })
+                })
+        );
 
     // Activate with initial state
     let handle = engine.activate(State::default());
 
-    // Run logic that emits events
-    let result = handle.run(|ctx| {
-        let order_id = Uuid::new_v4();
-        ctx.emit(OrderEvent::Placed { order_id, total: 99.99 });
-        Ok(())
-    })?;
+    // Run logic - return event to dispatch
+    let order_id = Uuid::new_v4();
+    handle.run(|_ctx| Ok(OrderEvent::Placed { order_id, total: 99.99 }))?;
 
     // Wait for all effects to complete
     handle.settled().await?;
@@ -150,38 +157,28 @@ enum UserEvent {
 
 ### Effects
 
-Effects are event handlers that react to events, perform IO, and optionally emit new events. Use the closure-based builder API:
+Effects are event handlers that react to events, perform IO, and return new events. Use the closure-based builder API with `.then()`:
 
 ```rust
 use seesaw_core::effect;
 
-// Basic effect
-effect::on::<UserEvent>().run(|event, ctx| async move {
-    match event.as_ref() {
-        UserEvent::SignupRequested { email, name } => {
-            let user = ctx.deps().db.transaction(|tx| async {
-                let user = User::create(email, name, tx).await?;
-                UserProfile::create(user.id, tx).await?;
-                Ok(user)
-            }).await?;
+// Basic effect - returns event to dispatch
+effect::on::<UserEvent>()
+    .filter_map(|e| match e {
+        UserEvent::SignupRequested { email, name } => Some((email.clone(), name.clone())),
+        _ => None,
+    })
+    .then(|(email, name), ctx| async move {
+        let user = ctx.deps().db.transaction(|tx| async {
+            let user = User::create(&email, &name, tx).await?;
+            UserProfile::create(user.id, tx).await?;
+            Ok(user)
+        }).await?;
 
-            ctx.emit(UserEvent::SignedUp {
-                user_id: user.id,
-                email: email.clone(),
-            });
-        }
-        _ => {}
-    }
-    Ok(())
-})
-
-// Effect with filter
-effect::on::<OrderEvent>()
-    .filter(|e| matches!(e, OrderEvent::HighPriority { .. }))
-    .run(|event, ctx| async move {
-        // Only runs for high-priority orders
-        ctx.deps().notify_urgent(&event).await?;
-        Ok(())
+        Ok(UserEvent::SignedUp {
+            user_id: user.id,
+            email,
+        })
     })
 
 // Effect with filter_map (combines filter + destructure)
@@ -192,31 +189,42 @@ effect::on::<CrawlEvent>()
         }
         _ => None
     })
-    .run(|(website_id, job_id, page_ids), ctx| async move {
+    .then(|(website_id, job_id, page_ids), ctx| async move {
         // Handler receives extracted fields directly!
         ctx.deps().extract(website_id, job_id, page_ids).await?;
-        Ok(())
+        Ok(CrawlEvent::Extracted { website_id, job_id })
     })
 
 // Effect with state transition guard
 effect::on::<StatusEvent>()
     .transition(|prev, next| prev.status != next.status)
-    .run(|event, ctx| async move {
+    .then(|event, ctx| async move {
         // Only runs when status actually changed
         ctx.deps().notify_status_change(&event).await?;
-        Ok(())
+        Ok(StatusEvent::Notified { id: event.id })
     })
+
+// Observer effect - returns () to dispatch nothing
+effect::on::<OrderEvent>().then(|event, ctx| async move {
+    ctx.deps().logger.log(&event);
+    Ok(())  // No event dispatched
+})
+
+// Observe ALL events
+effect::on_any().then(|event, ctx| async move {
+    ctx.deps().metrics.track(event.type_id);
+    Ok(())
+})
 ```
 
 Key properties:
 
 - **Closure-based**: No trait implementations required
-- **Emit events**: Use `ctx.emit()` to emit new events
+- **Return events**: Effects return `Ok(Event)` to dispatch, or `Ok(())` to dispatch nothing
 - **Access state**: Via `ctx.prev_state()`, `ctx.next_state()`, and `ctx.curr_state()`
-- **Filter events**: Use `.filter()` to skip events that don't match
 - **Filter + map**: Use `.filter_map()` to filter and extract fields in one step
 - **State transitions**: Use `.transition()` to react only when state changes
-- **Narrow context**: Only `deps()`, state access, and `emit()` available
+- **Narrow context**: Only `deps()` and state access available
 
 ### Reducers
 
@@ -272,9 +280,6 @@ ctx.prev_state()  // State before reducer ran
 ctx.next_state()  // State after reducer ran
 ctx.curr_state()  // Current live state (may have changed)
 
-// Emit new events
-ctx.emit(OrderEvent::Shipped { order_id });
-
 // Spawn tracked sub-tasks
 ctx.within(|ctx| async move {
     // Background work that keeps the engine alive
@@ -283,6 +288,9 @@ ctx.within(|ctx| async move {
 
 // Check if cancelled
 ctx.is_cancelled()
+
+// Note: Effects return events instead of calling ctx.emit()
+// Return Ok(SomeEvent) to dispatch, or Ok(()) to dispatch nothing
 ```
 
 ## Engine Usage
@@ -297,40 +305,45 @@ let engine = Engine::new()
         // Pure state transformation
         State { count: state.count + 1, ..state }
     }))
-    .with_effect(effect::on::<OrderEvent>().run(|event, ctx| async move {
-        // Side effects
-        ctx.deps().process(&event).await?;
-        ctx.emit(NextEvent);
-        Ok(())
-    }));
+    .with_effect(
+        effect::on::<OrderEvent>()
+            .filter_map(|e| match e {
+                OrderEvent::Placed { order_id, .. } => Some(*order_id),
+                _ => None,
+            })
+            .then(|order_id, ctx| async move {
+                // Side effects - return event to dispatch
+                ctx.deps().process(order_id).await?;
+                Ok(OrderEvent::Processed { order_id })
+            })
+    );
 
 // Option 1: Process to completion (common pattern)
 let handle = engine.activate(State::default());
-let result = handle.process(|ctx| {
-    ctx.emit(OrderEvent::Placed { order_id, total: 99.99 });
-    Ok(Response { status: "ok" })
+handle.process(|_ctx| async {
+    Ok(OrderEvent::Placed { order_id, total: 99.99 })
 }).await?;
 
 // Option 2: Run and settle separately (when you need the handle)
 let handle = engine.activate(State::default());
-let result = handle.run(|ctx| {
-    ctx.emit(OrderEvent::Placed { order_id, total: 99.99 });
-    Ok(Response { status: "ok" })
-})?;
+handle.run(|_ctx| Ok(OrderEvent::Placed { order_id, total: 99.99 }))?;
 handle.settled().await?;
+
+// Return () to dispatch nothing
+handle.run(|_ctx| Ok(()))?;
 ```
 
 Builder methods:
 
 - `.with_deps(deps)` — Set shared dependencies
 - `.with_reducer(reducer)` — Register pure state transformations
-- `.with_effect(effect)` — Register event handlers
+- `.with_effect(effect)` — Register event handlers (use `.then()` to return events)
 - `.with_effect_registry(registry)` — Use existing effect registry
 
 Handle methods:
 
-- `.process(closure).await` — Execute logic and wait for all effects (convenience method)
-- `.run(closure)` — Execute logic, returns result immediately
+- `.run(closure)` — Execute logic, return event to dispatch (or `()` for none)
+- `.process(async_closure).await` — Async version of `run()`, waits for completion
 - `.settled().await` — Wait for all effects to complete
 - `.cancel()` — Cancel all tasks
 
@@ -374,33 +387,34 @@ impl OutboxEvent for OrderPlaced {
 }
 
 // 2. Write to outbox in same transaction as business data
-async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Result<()> {
-    match event {
+effect::on::<OrderEvent>()
+    .filter_map(|e| match e {
         OrderEvent::PlaceRequested { customer_id, items } => {
-            let mut tx = ctx.deps().db.begin().await?;
-
-            // Business write
-            let order = Order::create(customer_id, &items, &mut tx).await?;
-
-            // Outbox write (same transaction) - survives crashes
-            let mut writer = PgOutboxWriter::new(&mut tx);
-            writer.write_event(
-                &OrderPlaced { order_id: order.id, customer_id },
-                ctx.outbox_correlation_id(),
-            ).await?;
-
-            tx.commit().await?;
-            ctx.emit(OrderEvent::Placed { order_id: order.id });
-            Ok(())
+            Some((*customer_id, items.clone()))
         }
-        _ => Ok(()),
-    }
-}
+        _ => None,
+    })
+    .then(|(customer_id, items), ctx| async move {
+        let mut tx = ctx.deps().db.begin().await?;
+
+        // Business write
+        let order = Order::create(customer_id, &items, &mut tx).await?;
+
+        // Outbox write (same transaction) - survives crashes
+        let mut writer = PgOutboxWriter::new(&mut tx);
+        writer.write_event(
+            &OrderPlaced { order_id: order.id, customer_id },
+            ctx.outbox_correlation_id(),
+        ).await?;
+
+        tx.commit().await?;
+        Ok(OrderEvent::Placed { order_id: order.id })
+    })
 ```
 
 **Key differences from in-memory events:**
 
-| Aspect      | Effect emit           | Outbox                |
+| Aspect      | Effect return         | Outbox                |
 | ----------- | --------------------- | --------------------- |
 | Durability  | Lost on crash         | Survives crash        |
 | Delivery    | At-most-once          | At-least-once         |
@@ -411,9 +425,9 @@ async fn handle(&mut self, event: OrderEvent, ctx: EffectContext<Deps>) -> Resul
 
 1. **Events are Facts**: Immutable descriptions of what happened
 2. **Event → Effect → Event**: Simple, direct flow
-3. **Effects Can Be Stateful or Stateless**: Your choice with `&mut self`
+3. **Effects Return Events**: Return `Ok(Event)` to dispatch, `Ok(())` for nothing
 4. **Reducers are Pure**: State transformations with no side effects
-5. **Effects Have Narrow Context**: Only deps, state, signal, and tool_context
+5. **Effects Have Narrow Context**: Only deps and state access available
 6. **Fan-out via Multiple Effects**: Many effects can react to the same event
 7. **State Flows Through System**: Per-execution state via reducers and effects
 
@@ -431,26 +445,31 @@ For durability, use:
 
 ## Testing
 
-Test effects by calling `handle` directly:
+Test effects using the Engine:
 
 ```rust
 #[tokio::test]
-async fn test_effect_handles_event() {
-    let mut effect = ShipEffect;
-    let deps = Arc::new(MockDeps::new());
-    let bus = EventBus::new();
-    let mut receiver = bus.subscribe();
-    let ctx = EffectContext::new(deps, (), bus);
+async fn test_effect_returns_event() {
+    let engine = Engine::new()
+        .with_deps(MockDeps::new())
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .filter_map(|e| match e {
+                    OrderEvent::Placed { order_id, .. } => Some(*order_id),
+                    _ => None,
+                })
+                .then(|order_id, ctx| async move {
+                    ctx.deps().shipping_api.ship(order_id).await?;
+                    Ok(OrderEvent::Shipped { order_id })
+                })
+        );
 
-    effect.handle(
-        OrderEvent::Placed { order_id },
-        ctx,
-    ).await.unwrap();
+    let handle = engine.activate(State::default());
+    handle.run(|_ctx| Ok(OrderEvent::Placed { order_id, total: 99.99 }))?;
+    handle.settled().await?;
 
-    // Check emitted event
-    let envelope = receiver.recv().await.unwrap();
-    let event = envelope.downcast_ref::<OrderEvent>().unwrap();
-    assert!(matches!(event, OrderEvent::Shipped { .. }));
+    // Verify side effects were called
+    assert!(handle.deps().shipping_api.was_called());
 }
 ```
 
@@ -459,12 +478,18 @@ Test reducers as pure functions:
 ```rust
 #[test]
 fn test_reducer_transforms_state() {
-    let reducer = OrderReducer;
-    let state = OrderState { status: None };
-    let event = OrderEvent::Placed { order_id };
+    let reducer = reducer::on::<OrderEvent>().run(|state, event| {
+        match event {
+            OrderEvent::Placed { .. } => State { status: Some(Status::Placed), ..state },
+            _ => state.clone(),
+        }
+    });
 
-    let new_state = reducer.reduce(&state, &event);
+    let state = State { status: None };
+    let event = OrderEvent::Placed { order_id, total: 99.99 };
 
+    // Reducers are pure functions
+    let new_state = (reducer.reducer)(&state, &event);
     assert_eq!(new_state.status, Some(Status::Placed));
 }
 ```

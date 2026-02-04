@@ -81,7 +81,7 @@ pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoTra
 /// # Example
 ///
 /// ```ignore
-/// effect::on_any().run(|event, ctx| async move {
+/// effect::on_any().then(|event, ctx| async move {
 ///     ctx.deps().metrics.increment("events");
 ///     Ok(())
 /// })
@@ -375,13 +375,13 @@ where
 }
 
 // =============================================================================
-// run() - Untyped Events (on_any) - Observer Pattern
+// then() - Untyped Events (on_any) - Observer Pattern
 // =============================================================================
 
 impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
     /// Set the handler for observing all events (terminal operation).
     /// Returns `Result<()>` - observers don't produce events.
-    pub fn run<S, D, H, Fut>(self, handler: H) -> Effect<S, D>
+    pub fn then<S, D, H, Fut>(self, handler: H) -> Effect<S, D>
     where
         S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
@@ -410,7 +410,7 @@ where
 {
     /// Set the handler for state transitions (terminal operation).
     /// Handler receives only context since transitions are about state changes.
-    pub fn run<D, H, Fut>(self, handler: H) -> Effect<S, D>
+    pub fn then<D, H, Fut>(self, handler: H) -> Effect<S, D>
     where
         D: Send + Sync + 'static,
         H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
@@ -442,7 +442,7 @@ where
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
     /// Set the handler for observing all events with started (terminal operation).
-    pub fn run<H, Fut>(self, handler: H) -> Effect<S, D>
+    pub fn then<H, Fut>(self, handler: H) -> Effect<S, D>
     where
         H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -472,7 +472,7 @@ where
     P: Fn(&S, &S) -> bool + Send + Sync + 'static,
 {
     /// Set the handler for state transitions with started (terminal operation).
-    pub fn run<H, Fut>(self, handler: H) -> Effect<S, D>
+    pub fn then<H, Fut>(self, handler: H) -> Effect<S, D>
     where
         H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_on_any_can_handle() {
-        let effect: Effect<TestState, TestDeps> = on_any().run(|_, _| async { Ok(()) });
+        let effect: Effect<TestState, TestDeps> = on_any().then(|_, _| async { Ok(()) });
 
         assert!(effect.can_handle(TypeId::of::<TestEvent>()));
         assert!(effect.can_handle(TypeId::of::<OtherEvent>()));
