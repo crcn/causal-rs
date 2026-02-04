@@ -163,7 +163,7 @@ where
     /// Emit a new event to the store.
     /// Events are always handled on the head (foreground) task group,
     /// even when emit() is called from a background context.
-    pub fn emit<E: Send + Sync + 'static>(&self, event: E) {
+    pub(crate) fn emit<E: Send + Sync + 'static>(&self, event: E) {
         let type_id = TypeId::of::<E>();
         let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event);
         let emitter = self.emitter.clone();
@@ -176,7 +176,7 @@ where
 
     /// Emit a type-erased event to the store.
     /// Used for forwarding events from external sources where the type is not known at compile time.
-    pub fn emit_any(&self, event: Arc<dyn Any + Send + Sync>, type_id: TypeId) {
+    pub(crate) fn emit_any(&self, event: Arc<dyn Any + Send + Sync>, type_id: TypeId) {
         let emitter = self.emitter.clone();
 
         self.with_head_task().within(move |ctx| async move {

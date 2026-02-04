@@ -112,8 +112,15 @@ where
 
                             envelope.ctx.within(move |handler_ctx| {
                                 async move {
-                                    // Propagate effect errors to settled()
-                                    (effect.handler)(event, event_type, handler_ctx).await
+                                    // Run effect handler
+                                    let result = (effect.handler)(event, event_type, handler_ctx.clone()).await?;
+
+                                    // If effect returned an event, dispatch it
+                                    if let Some(output) = result {
+                                        handler_ctx.emit_any(output.value, output.type_id);
+                                    }
+
+                                    Ok(())
                                 }
                                 .instrument(span)
                             });
@@ -156,10 +163,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct EventA;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct EventB;
 
     #[derive(Clone)]
@@ -169,7 +176,7 @@ mod tests {
     async fn test_effect_registry_registers_effects() {
         let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
 
-        registry.register(effect::on::<EventA>().run(|_, _| async { Ok(()) }));
+        registry.register(effect::on::<EventA>().then(|_, _| async { Ok(()) }));
 
         assert_eq!(registry.effects.read().len(), 1);
     }
@@ -178,8 +185,8 @@ mod tests {
     async fn test_multiple_effects() {
         let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
 
-        registry.register(effect::on::<EventA>().run(|_, _| async { Ok(()) }));
-        registry.register(effect::on::<EventB>().run(|_, _| async { Ok(()) }));
+        registry.register(effect::on::<EventA>().then(|_, _| async { Ok(()) }));
+        registry.register(effect::on::<EventB>().then(|_, _| async { Ok(()) }));
 
         assert_eq!(registry.effects.read().len(), 2);
     }
@@ -188,7 +195,7 @@ mod tests {
     async fn test_effect_can_handle() {
         let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
 
-        registry.register(effect::on::<EventA>().run(|_, _| async { Ok(()) }));
+        registry.register(effect::on::<EventA>().then(|_, _| async { Ok(()) }));
 
         let effects = registry.effects.read();
         assert!(effects[0].can_handle(TypeId::of::<EventA>()));
@@ -204,14 +211,14 @@ mod tests {
         let counter_b = counter.clone();
 
         registry.register(effect::group([
-            effect::on::<EventA>().run(move |_, _| {
+            effect::on::<EventA>().then(move |_, _| {
                 let c = counter_a.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }
             }),
-            effect::on::<EventB>().run(move |_, _| {
+            effect::on::<EventB>().then(move |_, _| {
                 let c = counter_b.clone();
                 async move {
                     c.fetch_add(10, Ordering::SeqCst);

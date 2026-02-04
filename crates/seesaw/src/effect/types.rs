@@ -12,6 +12,36 @@ use super::context::EffectContext;
 /// A boxed future for async effect handlers.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
+/// Output from an effect handler that returns an event.
+///
+/// Used by `.then()` effects to return events for dispatch by the engine.
+/// The event is type-erased but includes its TypeId for proper routing.
+#[derive(Clone)]
+pub struct EventOutput {
+    /// The TypeId of the event type.
+    pub type_id: TypeId,
+    /// The type-erased event value.
+    pub value: Arc<dyn Any + Send + Sync>,
+}
+
+impl EventOutput {
+    /// Create a new EventOutput from a typed event.
+    pub fn new<E: Send + Sync + 'static>(event: E) -> Self {
+        Self {
+            type_id: TypeId::of::<E>(),
+            value: Arc::new(event),
+        }
+    }
+}
+
+impl std::fmt::Debug for EventOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventOutput")
+            .field("type_id", &self.type_id)
+            .finish()
+    }
+}
+
 /// Payload for effects that receive all events (type-erased).
 #[derive(Clone)]
 pub struct AnyEvent {
@@ -41,7 +71,7 @@ impl AnyEvent {
 /// An effect handler - no traits, just data with closures.
 ///
 /// Effects react to events and can perform side effects like I/O,
-/// emit new events, or spawn background tasks.
+/// and optionally return new events for dispatch.
 pub struct Effect<S, D>
 where
     S: Clone + Send + Sync + 'static,
@@ -57,8 +87,11 @@ where
 
     /// Called for each event that passes `can_handle`.
     /// Receives the type-erased event, its TypeId, and the effect context.
+    /// Returns `Option<EventOutput>`:
+    /// - `None`: Effect completed, no event to dispatch (observer pattern)
+    /// - `Some(EventOutput)`: Effect completed, dispatch this event
     pub(crate) handler: Arc<
-        dyn Fn(Arc<dyn Any + Send + Sync>, TypeId, EffectContext<S, D>) -> BoxFuture<Result<()>>
+        dyn Fn(Arc<dyn Any + Send + Sync>, TypeId, EffectContext<S, D>) -> BoxFuture<Result<Option<EventOutput>>>
             + Send
             + Sync,
     >,
@@ -98,12 +131,13 @@ where
     }
 
     /// Call the event handler.
+    /// Returns `Option<EventOutput>` - if `Some`, the engine should dispatch the returned event.
     pub async fn call_handler(
         &self,
         value: Arc<dyn Any + Send + Sync>,
         type_id: TypeId,
         ctx: EffectContext<S, D>,
-    ) -> Result<()> {
+    ) -> Result<Option<EventOutput>> {
         (self.handler)(value, type_id, ctx).await
     }
 }

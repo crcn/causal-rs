@@ -1,10 +1,10 @@
 //! Simple Order Processing Example
 //!
 //! Demonstrates the new stateless Engine API with:
-//! - Closure-based effects and reducers
+//! - Closure-based effects with `.then()` returning events
 //! - Per-execution state
 //! - Handle::run() pattern
-//! - Edge function style
+//! - Event chains: Placed -> Shipped -> Delivered
 
 use anyhow::Result;
 use seesaw_core::{effect, reducer, Engine, EffectContext};
@@ -48,14 +48,9 @@ impl Deps {
     }
 }
 
-// Edge function - simple signature
-fn place_order(
-    order_id: Uuid,
-    total: f64,
-    ctx: &EffectContext<OrderState, Deps>,
-) -> Result<Uuid> {
-    ctx.emit(OrderEvent::Placed { order_id, total });
-    Ok(order_id)
+// Edge function - returns event to dispatch
+fn place_order(order_id: Uuid, total: f64) -> OrderEvent {
+    OrderEvent::Placed { order_id, total }
 }
 
 #[tokio::main]
@@ -71,32 +66,36 @@ async fn main() -> Result<()> {
         match event {
             OrderEvent::Placed { order_id, total } => OrderState {
                 total_orders: state.total_orders + 1,
-                total_revenue: state.total_revenue + total,
+                total_revenue: state.total_revenue + *total,
                 last_order_id: Some(*order_id),
             },
             _ => state,
         }
     }))
-    // Effect - ship when order placed
-    .with_effect(effect::on::<OrderEvent>().run(|event, ctx: EffectContext<OrderState, Deps>| async move {
-        if let OrderEvent::Placed { order_id, .. } = event.as_ref() {
-            ctx.deps().ship(*order_id).await?;
-            ctx.emit(OrderEvent::Shipped {
-                order_id: *order_id,
-            });
-        }
-        Ok(())
-    }))
-    // Effect - notify when shipped
-    .with_effect(effect::on::<OrderEvent>().run(|event, ctx: EffectContext<OrderState, Deps>| async move {
-        if let OrderEvent::Shipped { order_id } = event.as_ref() {
-            ctx.deps().notify(*order_id, "Your order has shipped!").await?;
-            ctx.emit(OrderEvent::Delivered {
-                order_id: *order_id,
-            });
-        }
-        Ok(())
-    }));
+    // Effect chain: Placed -> ship -> Shipped
+    .with_effect(
+        effect::on::<OrderEvent>()
+            .filter_map(|e| match e {
+                OrderEvent::Placed { order_id, .. } => Some(*order_id),
+                _ => None,
+            })
+            .then(|order_id, ctx: EffectContext<OrderState, Deps>| async move {
+                ctx.deps().ship(order_id).await?;
+                Ok(OrderEvent::Shipped { order_id })
+            })
+    )
+    // Effect chain: Shipped -> notify -> Delivered
+    .with_effect(
+        effect::on::<OrderEvent>()
+            .filter_map(|e| match e {
+                OrderEvent::Shipped { order_id } => Some(*order_id),
+                _ => None,
+            })
+            .then(|order_id, ctx: EffectContext<OrderState, Deps>| async move {
+                ctx.deps().notify(order_id, "Your order has shipped!").await?;
+                Ok(OrderEvent::Delivered { order_id })
+            })
+    );
 
     println!("✓ Engine configured with effects and reducers\n");
 
@@ -107,11 +106,11 @@ async fn main() -> Result<()> {
         // Activate with initial state
         let handle = engine.activate(OrderState::default());
 
-        // Run the edge function
+        // Run the edge function - returns event to dispatch
         let order_id = Uuid::new_v4();
-        let result = handle.run(|ctx| place_order(order_id, 99.99 * i as f64, ctx))?;
+        handle.run(|_ctx| Ok(place_order(order_id, 99.99 * i as f64)))?;
 
-        println!("✓ Order {} placed", result);
+        println!("✓ Order {} placed", order_id);
 
         // Wait for all effects to complete
         handle.settled().await?;

@@ -27,7 +27,7 @@ pub use into_action::{ActionWithOpts, IntoAction};
 /// use seesaw::{Service, effect, GenericActionResult, IntoAction};
 ///
 /// let service: Service<MyState, MyKernel> = Service::new(kernel)
-///     .with_effect(effect::on::<MyEvent>().run(handle_my_event));
+///     .with_effect(effect::on::<MyEvent>().then(handle_my_event));
 ///
 /// let result = service.run(MyState::default(), my_action.with(opts)).await?;
 /// ```
@@ -60,7 +60,7 @@ where
     /// ```ignore
     /// use seesaw::effect;
     ///
-    /// service.with_effect(effect::on::<MyEvent>().run(handle_my_event))
+    /// service.with_effect(effect::on::<MyEvent>().then(handle_my_event))
     /// ```
     pub fn with_effect(self, effect: Effect<State, Kernel>) -> Self {
         self.registry.register(effect);
@@ -187,8 +187,8 @@ mod tests {
         struct TriggerEvent;
 
         let service: Service<TestState, TestKernel> =
-            Service::new(TestKernel).with_effect(effect::on::<TriggerEvent>().run(|_, _| async {
-                Err(anyhow::anyhow!("effect error during action"))
+            Service::new(TestKernel).with_effect(effect::on::<TriggerEvent>().then(|_, _| async {
+                Err::<(), _>(anyhow::anyhow!("effect error during action"))
             }));
 
         async fn action_that_emits(
@@ -223,7 +223,7 @@ mod tests {
         let counter_clone = counter.clone();
 
         let service: Service<TestState, TestKernel> =
-            Service::new(TestKernel).with_effect(effect::on::<SuccessEvent>().run(move |_, _| {
+            Service::new(TestKernel).with_effect(effect::on::<SuccessEvent>().then(move |_, _| {
                 let c = counter_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
@@ -258,7 +258,7 @@ mod tests {
         let counter_clone = counter.clone();
 
         let service: Service<TestState, TestKernel> = Service::new(TestKernel)
-            .with_effect(effect::on::<MultiEvent>().run(move |_, _| {
+            .with_effect(effect::on::<MultiEvent>().then(move |_, _| {
                 let c = counter_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
@@ -267,7 +267,7 @@ mod tests {
             }))
             .with_effect(
                 effect::on::<MultiEvent>()
-                    .run(|_, _| async { Err(anyhow::anyhow!("one effect fails")) }),
+                    .then(|_, _| async { Err::<(), _>(anyhow::anyhow!("one effect fails")) }),
             );
 
         async fn emit_multi(
@@ -299,7 +299,7 @@ mod tests {
         let counter_clone = counter.clone();
 
         let service: Service<TestState, TestKernel> = Service::new(TestKernel).with_effect(
-            effect::on::<NeverEmittedEvent>().run(move |_, _| {
+            effect::on::<NeverEmittedEvent>().then(move |_, _| {
                 let c = counter_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);

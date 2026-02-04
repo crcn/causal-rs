@@ -1,37 +1,43 @@
 //! Effect system with builder API.
 //!
-//! Effects are side-effect handlers that react to events and state changes.
+//! Effects are side-effect handlers that react to events and optionally return new events.
 //!
 //! ## Example
 //!
 //! ```ignore
 //! use seesaw::effect;
 //!
-//! // Single event
-//! store.with_effect(effect::on::<MyEvent>().run(handle_my_event));
+//! // Typed effect that returns a new event
+//! store.with_effect(effect::on::<MyEvent>().then(|event, ctx| async move {
+//!     ctx.deps().process(&event).await?;
+//!     Ok(EventProcessed { id: event.id })
+//! }));
+//!
+//! // Typed effect as observer (returns ())
+//! store.with_effect(effect::on::<MyEvent>().then(|event, ctx| async move {
+//!     ctx.deps().log(&event).await?;
+//!     Ok(())
+//! }));
 //!
 //! // With setup
 //! store.with_effect(
 //!     effect::on::<MyEvent>()
 //!         .started(setup_handler)
-//!         .run(handle_my_event)
+//!         .then(handle_my_event)
 //! );
 //!
-//! // State transition
+//! // on_any() observer pattern (uses .run())
 //! store.with_effect(
 //!     effect::on_any()
 //!         .transition(|prev, next| prev.status != next.status)
-//!         .run(|ctx| async move { Ok(()) })
+//!         .run(|event, ctx| async move { Ok(()) })
 //! );
 //!
 //! // Group multiple effects
 //! store.with_effect(effect::group([
-//!     effect::on::<EventA>().run(handle_a),
-//!     effect::on::<EventB>().run(handle_b),
+//!     effect::on::<EventA>().then(handle_a),
+//!     effect::on::<EventB>().then(handle_b),
 //! ]));
-//!
-//! // Bridge to pipeline
-//! store.with_effect(effect::bridge(|ctx| ctx.deps().valet.clone()));
 //! ```
 
 mod builders;
@@ -40,7 +46,7 @@ mod types;
 
 pub use builders::{bridge, group, on, on_any, task};
 pub use context::EffectContext;
-pub use types::{AnyEvent, Effect};
+pub use types::{AnyEvent, Effect, EventOutput};
 
 // Re-export for internal use
 pub(crate) use context::{BoxedEmitter, EventEmitter, EventEnvelope};

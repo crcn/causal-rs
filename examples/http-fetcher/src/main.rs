@@ -1,7 +1,7 @@
 //! # HTTP Fetcher Example
 //!
-//! Shows how to use `reqwest` directly in Seesaw effects.
-//! No adapters, no ceremony - just standard library usage.
+//! Shows how to use `reqwest` directly in Seesaw effects with `.then()`.
+//! Effects return events directly - no ctx.emit() needed.
 
 use anyhow::Result;
 use seesaw_core::{effect, reducer, Engine, EffectContext};
@@ -13,31 +13,17 @@ use seesaw_core::{effect, reducer, Engine, EffectContext};
 #[derive(Debug, Clone)]
 enum FetchEvent {
     /// User requested URLs to be fetched
-    FetchRequested {
-        urls: Vec<String>,
-    },
+    FetchRequested { urls: Vec<String> },
 
     /// Fetch succeeded
-    Fetched {
-        url: String,
-        content: String,
-        status: u16,
-    },
+    Fetched { url: String, content: String, status: u16 },
 
     /// Fetch failed
-    FetchFailed {
-        url: String,
-        reason: String,
-    },
+    FetchFailed { url: String, reason: String },
 
     /// All fetches complete
-    AllComplete {
-        success_count: usize,
-        failure_count: usize,
-    },
+    AllComplete { success_count: usize, failure_count: usize },
 }
-
-// Event is auto-implemented via blanket impl for Clone + Send + Sync + 'static
 
 // ============================================================================
 // State
@@ -50,12 +36,6 @@ struct FetchState {
     failure_count: usize,
     complete: bool,
 }
-
-// ============================================================================
-// Effects and Reducers (Closure-based)
-// ============================================================================
-
-// No struct definitions needed - we use closures directly
 
 // ============================================================================
 // Dependencies
@@ -86,7 +66,6 @@ async fn main() -> Result<()> {
                 FetchEvent::FetchRequested { urls } => {
                     let mut new_state = state.clone();
                     if new_state.urls_to_fetch.is_empty() {
-                        // Initial request - set all URLs
                         new_state.urls_to_fetch = urls.clone();
                     }
                     new_state
@@ -114,11 +93,14 @@ async fn main() -> Result<()> {
                 }
             }
         }))
-        // Effect 1 - Fetch URLs
-        .with_effect(effect::on::<FetchEvent>().run(|event, ctx: EffectContext<FetchState, Deps>| async move {
-            match event.as_ref() {
-                FetchEvent::FetchRequested { urls } => {
-                    // Fetch first URL
+        // Effect 1 - Fetch URLs when requested
+        .with_effect(
+            effect::on::<FetchEvent>()
+                .filter_map(|e| match e {
+                    FetchEvent::FetchRequested { urls } => Some(urls.clone()),
+                    _ => None,
+                })
+                .then(|urls, ctx: EffectContext<FetchState, Deps>| async move {
                     if let Some(url) = urls.first() {
                         let url = url.clone();
                         println!("Fetching: {}", url);
@@ -131,63 +113,54 @@ async fn main() -> Result<()> {
                                     let content = response.text().await?;
                                     println!("✓ Fetched {} ({} bytes)", url, content.len());
 
-                                    ctx.emit(FetchEvent::Fetched {
-                                        url,
-                                        content,
-                                        status,
-                                    });
+                                    Ok(FetchEvent::Fetched { url, content, status })
                                 } else {
                                     println!("✗ Failed {} (HTTP {})", url, status);
-
-                                    ctx.emit(FetchEvent::FetchFailed {
+                                    Ok(FetchEvent::FetchFailed {
                                         url,
                                         reason: format!("HTTP {}", status),
-                                    });
+                                    })
                                 }
                             }
                             Err(e) => {
                                 println!("✗ Failed {}: {}", url, e);
-
-                                ctx.emit(FetchEvent::FetchFailed {
+                                Ok(FetchEvent::FetchFailed {
                                     url,
                                     reason: e.to_string(),
-                                });
+                                })
                             }
                         }
                     } else {
-                        // No URLs to fetch
+                        // No URLs to fetch - complete
                         let state = ctx.curr_state();
-                        ctx.emit(FetchEvent::AllComplete {
+                        Ok(FetchEvent::AllComplete {
                             success_count: state.success_count,
                             failure_count: state.failure_count,
-                        });
+                        })
                     }
-                }
-                _ => {} // Skip other events
-            }
-            Ok(())
-        }))
+                })
+        )
         // Effect 2 - Continue fetching after success/failure
-        .with_effect(effect::on::<FetchEvent>().run(|event, ctx: EffectContext<FetchState, Deps>| async move {
-            match event.as_ref() {
-                FetchEvent::Fetched { .. } | FetchEvent::FetchFailed { .. } => {
-                    // Check if more URLs to fetch
+        .with_effect(
+            effect::on::<FetchEvent>()
+                .filter_map(|e| match e {
+                    FetchEvent::Fetched { .. } | FetchEvent::FetchFailed { .. } => Some(()),
+                    _ => None,
+                })
+                .then(|_, ctx: EffectContext<FetchState, Deps>| async move {
                     let state = ctx.curr_state();
                     if !state.urls_to_fetch.is_empty() {
-                        ctx.emit(FetchEvent::FetchRequested {
+                        Ok(FetchEvent::FetchRequested {
                             urls: state.urls_to_fetch.clone(),
-                        });
+                        })
                     } else {
-                        ctx.emit(FetchEvent::AllComplete {
+                        Ok(FetchEvent::AllComplete {
                             success_count: state.success_count,
                             failure_count: state.failure_count,
-                        });
+                        })
                     }
-                }
-                _ => {} // Skip other events
-            }
-            Ok(())
-        }));
+                })
+        );
 
     let urls = vec![
         "https://example.com".to_string(),
@@ -198,12 +171,9 @@ async fn main() -> Result<()> {
     // Activate with initial state
     let handle = engine.activate(FetchState::default());
 
-    // Run with closure that emits initial event
-    handle.run(|ctx| {
-        ctx.emit(FetchEvent::FetchRequested {
-            urls: urls.clone(),
-        });
-        Ok(())
+    // Run with closure that returns initial event
+    handle.run(|_ctx| {
+        Ok(FetchEvent::FetchRequested { urls: urls.clone() })
     })?;
 
     // Wait for all effects to complete

@@ -132,53 +132,60 @@ where
     S: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    /// Execute an action with the effect context.
+    /// Execute an action that returns an event to dispatch.
     ///
-    /// Returns the result from the action. The action can emit events
-    /// which will trigger effects. Use `settled()` to wait for all
-    /// effects to complete.
+    /// The returned event (if not `()`) will be dispatched to trigger effects.
+    /// Use `settled()` to wait for all effects to complete.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let handle = engine.activate(State::default());
-    /// let result = handle.run(|ctx| process_order(order, ctx))?;
-    /// println!("Processed: {:?}", result);
+    /// handle.run(|ctx| Ok(OrderPlaced { id: 123, total: 99.99 }))?;
     /// handle.settled().await?;
     /// ```
-    pub fn run<F, R>(&self, f: F) -> Result<R>
+    pub fn run<F, E>(&self, f: F) -> Result<()>
     where
-        F: FnOnce(&EffectContext<S, D>) -> Result<R>,
+        F: FnOnce(&EffectContext<S, D>) -> Result<E>,
+        E: Send + Sync + 'static,
     {
-        f(&self.context)
+        let event = f(&self.context)?;
+        // Dispatch the event if it's not ()
+        if std::any::TypeId::of::<E>() != std::any::TypeId::of::<()>() {
+            self.context.emit(event);
+        }
+        Ok(())
     }
 
-    /// Process events to completion and return the result.
+    /// Process an event to completion.
     ///
     /// This is a convenience method that combines `run()` and `settled()`.
-    /// Use this when you want to emit events and wait for all cascading
-    /// effects to complete before continuing.
+    /// The returned event will be dispatched and all cascading effects
+    /// will complete before this method returns.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let handle = engine.activate(State::default());
-    /// let result = handle.process(|ctx| async move {
-    ///     // Can do async work here
+    /// handle.process(|ctx| async move {
     ///     let data = fetch_data().await?;
-    ///     ctx.emit(OrderPlaced { id: 123, data });
-    ///     Ok(Response { status: "ok" })
+    ///     Ok(OrderPlaced { id: 123, data })
     /// }).await?;
-    /// println!("All effects completed, result: {:?}", result);
+    /// println!("All effects completed");
     /// ```
-    pub async fn process<'a, F, Fut, R>(&'a self, f: F) -> Result<R>
+    pub async fn process<'a, F, Fut, E>(&'a self, f: F) -> Result<()>
     where
         F: FnOnce(&'a EffectContext<S, D>) -> Fut,
-        Fut: std::future::Future<Output = Result<R>> + Send + 'a,
+        Fut: std::future::Future<Output = Result<E>> + Send + 'a,
+        E: Send + Sync + 'static,
     {
-        let result = f(&self.context).await?;
+        let event = f(&self.context).await?;
+        // Dispatch the event if it's not ()
+        if std::any::TypeId::of::<E>() != std::any::TypeId::of::<()>() {
+            self.context.emit(event);
+        }
         self.tasks.settled().await?;
-        Ok(result)
+        Ok(())
     }
 
     /// Wait for all tasks to complete.
@@ -270,7 +277,7 @@ where
     /// ```ignore
     /// use seesaw::effect;
     ///
-    /// store.with_effect(effect::on::<MyEvent>().run(handle_my_event))
+    /// store.with_effect(effect::on::<MyEvent>().then(handle_my_event))
     /// ```
     pub fn with_effect(self, effect: Effect<S, D>) -> Self {
         self.effect_registry.register(effect);
@@ -547,7 +554,7 @@ mod tests {
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let counter = handler_calls.clone();
         let store: Engine<Counter> = Engine::new().with_effect(
-            effect::on::<Increment>().run(move |_event, _ctx| {
+            effect::on::<Increment>().then(move |_event, _ctx| {
                 let c = counter.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
@@ -573,7 +580,7 @@ mod tests {
                 value: state.value + event.amount,
             }))
             .with_effect(
-                effect::on::<Increment>().run(move |_event, _ctx| {
+                effect::on::<Increment>().then(move |_event, _ctx| {
                     let c = counter.clone();
                     async move {
                         c.fetch_add(1, Ordering::Relaxed);
@@ -583,17 +590,14 @@ mod tests {
             );
 
         let handle = store.activate(Counter::default());
-        let result = handle
-            .process(|ctx| async move {
-                ctx.emit(Increment { amount: 10 });
-                ctx.emit(Increment { amount: 5 });
-                Ok(42) // Return value
-            })
-            .await
-            .unwrap();
 
-        // Should return the result
-        assert_eq!(result, 42);
+        // Use run() to dispatch events, then settled() to wait
+        handle.run(|_ctx| Ok(Increment { amount: 10 })).unwrap();
+        handle.run(|_ctx| Ok(Increment { amount: 5 })).unwrap();
+
+        // Wait for effects
+        handle.settled().await.unwrap();
+
         // Effects should have completed
         assert_eq!(handler_calls.load(Ordering::Relaxed), 2);
         // State should be updated
@@ -608,7 +612,7 @@ mod tests {
             .with_reducer(reducer::on::<Increment>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_effect(effect::on::<Increment>().run(move |event, _ctx| {
+            .with_effect(effect::on::<Increment>().then(move |event, _ctx| {
                 let l = log_clone.clone();
                 async move {
                     l.lock().push(event.amount);
@@ -674,7 +678,7 @@ mod tests {
                 .with_reducer(reducer::on::<Bonus>().run(|state: Counter, event| Counter {
                     value: state.value + event.amount,
                 }))
-                .with_effect(effect::on::<Increment>().run(|event, ctx: EffectContext<Counter, Deps>| async move {
+                .with_effect(effect::on::<Increment>().then(|event, ctx: EffectContext<Counter, Deps>| async move {
                     let bonus = event.amount * (ctx.deps().multiplier - 1);
                     ctx.emit(Bonus { amount: bonus });
                     Ok(())
@@ -695,7 +699,7 @@ mod tests {
         static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<Increment>().run(|_event, _ctx| async move {
+            .with_effect(effect::on::<Increment>().then(|_event, _ctx| async move {
                 CALL_COUNT.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }));
@@ -735,7 +739,7 @@ mod tests {
                     })
                     .run(|_, _| async { Ok(()) }),
             )
-            .with_effect(effect::on::<Started>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<Started>().then(move |_event, _ctx| {
                 let h = handled_clone.clone();
                 async move {
                     // Small delay to ensure this is actually waited on
@@ -790,15 +794,15 @@ mod tests {
                 c_count: state.c_count + 1,
                 ..state
             }))
-            .with_effect(effect::on::<EventA>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<EventA>().then(|_event, ctx| async move {
                 ctx.emit(EventB);
                 Ok(())
             }))
-            .with_effect(effect::on::<EventB>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<EventB>().then(|_event, ctx| async move {
                 ctx.emit(EventC);
                 Ok(())
             }))
-            .with_effect(effect::on::<EventC>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<EventC>().then(move |_event, _ctx| {
                 let counter = c_counter_clone.clone();
                 async move {
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -846,7 +850,7 @@ mod tests {
             .with_reducer(reducer::on::<DepthEvent>().run(|state: DeepState, event| DeepState {
                 depth_reached: state.depth_reached.max(event.0),
             }))
-            .with_effect(effect::on::<DepthEvent>().run(move |event, ctx| async move {
+            .with_effect(effect::on::<DepthEvent>().then(move |event, ctx| async move {
                 if event.0 < MAX_DEPTH {
                     ctx.emit(DepthEvent(event.0 + 1));
                 }
@@ -876,21 +880,21 @@ mod tests {
         let c3 = counter.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<SharedEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<SharedEvent>().then(move |_event, _ctx| {
                 let c = c1.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 }
             }))
-            .with_effect(effect::on::<SharedEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<SharedEvent>().then(move |_event, _ctx| {
                 let c = c2.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 }
             }))
-            .with_effect(effect::on::<SharedEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<SharedEvent>().then(move |_event, _ctx| {
                 let c = c3.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
@@ -920,7 +924,7 @@ mod tests {
 
         let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<SetValue>().run(|_: Counter, event| Counter { value: event.0 }))
-            .with_effect(effect::on::<SetValue>().run(move |_event, ctx: EffectContext<Counter, ()>| {
+            .with_effect(effect::on::<SetValue>().then(move |_event, ctx: EffectContext<Counter, ()>| {
                 let t = transitions_clone.clone();
                 async move {
                     let prev = ctx.prev_state().value;
@@ -968,7 +972,7 @@ mod tests {
                 threshold_events: state.threshold_events + 1,
                 ..state
             }))
-            .with_effect(effect::on::<AddPoints>().run(move |_event, ctx: EffectContext<PointsState, ()>| async move {
+            .with_effect(effect::on::<AddPoints>().then(move |_event, ctx: EffectContext<PointsState, ()>| async move {
                 let prev = ctx.prev_state().points;
                 let next = ctx.next_state().points;
                 // Only emit if we crossed the threshold
@@ -1030,15 +1034,15 @@ mod tests {
                 branch_c_count: state.branch_c_count + 1,
                 ..state
             }))
-            .with_effect(effect::on::<TriggerEvent>().run(|_, ctx| async move {
+            .with_effect(effect::on::<TriggerEvent>().then(|_, ctx| async move {
                 ctx.emit(BranchA);
                 Ok(())
             }))
-            .with_effect(effect::on::<TriggerEvent>().run(|_, ctx| async move {
+            .with_effect(effect::on::<TriggerEvent>().then(|_, ctx| async move {
                 ctx.emit(BranchB);
                 Ok(())
             }))
-            .with_effect(effect::on::<TriggerEvent>().run(|_, ctx| async move {
+            .with_effect(effect::on::<TriggerEvent>().then(|_, ctx| async move {
                 ctx.emit(BranchC);
                 Ok(())
             }));
@@ -1100,7 +1104,7 @@ mod tests {
                 derived_sum: state.derived_sum + event.0,
                 ..state
             }))
-            .with_effect(effect::on::<Source>().run(|event, ctx| async move {
+            .with_effect(effect::on::<Source>().then(|event, ctx| async move {
                 ctx.emit(Derived(event.0 * 2));
                 Ok(())
             }));
@@ -1129,7 +1133,7 @@ mod tests {
 
         let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<FailEvent>()
-                .run(|_event, _ctx| async move { Err(anyhow::anyhow!("intentional failure")) }),
+                .then(|_event, _ctx| async move { Err::<(), _>(anyhow::anyhow!("intentional failure")) }),
         );
 
         let handle = store.activate(Counter::default());
@@ -1152,7 +1156,7 @@ mod tests {
 
         let store: Engine<Counter> = Engine::new()
             .with_reducer(reducer::on::<UpdateValue>().run(|_: Counter, event| Counter { value: event.0 }))
-            .with_effect(effect::on::<CheckState>().run(move |_event, ctx: EffectContext<Counter, ()>| {
+            .with_effect(effect::on::<CheckState>().then(move |_event, ctx: EffectContext<Counter, ()>| {
                 let obs = observed_clone.clone();
                 async move {
                     // Small delay to let other events process
@@ -1201,7 +1205,7 @@ mod tests {
                         Ok(())
                     }
                 })
-                .run(move |_event, _ctx| {
+                .then(move |_event, _ctx| {
                     let o = order_handle.clone();
                     async move {
                         o.lock().push("handle");
@@ -1230,7 +1234,7 @@ mod tests {
         let completed_clone = completed.clone();
 
         let store: Engine<Counter> =
-            Engine::new().with_effect(effect::on::<LongEvent>().run(
+            Engine::new().with_effect(effect::on::<LongEvent>().then(
                 move |_event, ctx| {
                     let s = started_clone.clone();
                     let c = completed_clone.clone();
@@ -1349,7 +1353,7 @@ mod tests {
         }
 
         let store: Engine<Counter> = Engine::new().with_effect(
-            effect::on::<TriggerEvent>().run(|_event, ctx| async move {
+            effect::on::<TriggerEvent>().then(|_event, ctx| async move {
                 ctx.emit(CascadedEvent { value: 123 });
                 Ok(())
             }),
@@ -1510,7 +1514,7 @@ mod tests {
         let received_clone = received.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<TriggerEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, ctx| async move {
                 // Spawn a background task (like the scheduler does)
                 tokio::spawn(async move {
                     // Small delay to simulate scheduler interval
@@ -1520,7 +1524,7 @@ mod tests {
                 });
                 Ok(())
             }))
-            .with_effect(effect::on::<SpawnedEvent>().run(move |event, _ctx| {
+            .with_effect(effect::on::<SpawnedEvent>().then(move |event, _ctx| {
                 let r = received_clone.clone();
                 async move {
                     r.fetch_add(event.value as usize, Ordering::Relaxed);
@@ -1557,7 +1561,7 @@ mod tests {
             .with_reducer(reducer::on::<ScheduledIncrement>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_effect(effect::on::<StartScheduler>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<StartScheduler>().then(|_event, ctx| async move {
                 // Spawn like the job scheduler does
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -1598,21 +1602,21 @@ mod tests {
         let final_received_clone = final_received.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<StartEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<StartEvent>().then(|_event, ctx| async move {
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     ctx.emit(MiddleEvent { value: 10 });
                 });
                 Ok(())
             }))
-            .with_effect(effect::on::<MiddleEvent>().run(|event, ctx| async move {
+            .with_effect(effect::on::<MiddleEvent>().then(|event, ctx| async move {
                 // This effect is triggered by the spawned event and emits another
                 ctx.emit(FinalEvent {
                     value: event.value * 2,
                 });
                 Ok(())
             }))
-            .with_effect(effect::on::<FinalEvent>().run(move |event, _ctx| {
+            .with_effect(effect::on::<FinalEvent>().then(move |event, _ctx| {
                 let r = final_received_clone.clone();
                 async move {
                     r.fetch_add(event.value as usize, Ordering::Relaxed);
@@ -1644,7 +1648,7 @@ mod tests {
         struct PanicEvent;
 
         let store: Engine<Counter> = Engine::new().with_effect(
-            effect::on::<PanicEvent>().run(|_event, ctx| async move {
+            effect::on::<PanicEvent>().then(|_event, ctx| async move {
                 ctx.within(|_| async move {
                     panic!("intentional panic for testing");
                 });
@@ -1676,18 +1680,18 @@ mod tests {
         let order2 = order.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<MultiFailEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<MultiFailEvent>().then(move |_event, _ctx| {
                 let o = order1.clone();
                 async move {
                     o.lock().push("first");
-                    Err(anyhow::anyhow!("first error"))
+                    Err::<(), _>(anyhow::anyhow!("first error"))
                 }
             }))
-            .with_effect(effect::on::<MultiFailEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<MultiFailEvent>().then(move |_event, _ctx| {
                 let o = order2.clone();
                 async move {
                     o.lock().push("second");
-                    Err(anyhow::anyhow!("second error"))
+                    Err::<(), _>(anyhow::anyhow!("second error"))
                 }
             }));
 
@@ -1718,8 +1722,8 @@ mod tests {
 
         let store: Engine<Counter> = Engine::new().with_effect(
             effect::on::<AnyEvent>()
-                .started(|_ctx| async move { Err(anyhow::anyhow!("started hook failure")) })
-                .run(|_event, _ctx| async move { Ok(()) }),
+                .started(|_ctx| async move { Err::<(), _>(anyhow::anyhow!("started hook failure")) })
+                .then(|_event, _ctx| async move { Ok(()) }),
         );
 
         let handle = store.activate(Counter::default());
@@ -1749,12 +1753,12 @@ mod tests {
         struct CascadedEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<TriggerEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, ctx| async move {
                 ctx.emit(CascadedEvent);
                 Ok(())
             }))
-            .with_effect(effect::on::<CascadedEvent>().run(|_event, _ctx| async move {
-                Err(anyhow::anyhow!("cascade failure"))
+            .with_effect(effect::on::<CascadedEvent>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("cascade failure"))
             }));
 
         let handle = store.activate(Counter::default());
@@ -1778,8 +1782,8 @@ mod tests {
         struct SubtaskEvent;
 
         let store: Engine<Counter> = Engine::new().with_effect(
-            effect::on::<SubtaskEvent>().run(|_event, ctx| async move {
-                ctx.within(|_| async move { Err(anyhow::anyhow!("subtask failure")) });
+            effect::on::<SubtaskEvent>().then(|_event, ctx| async move {
+                ctx.within(|_| async move { Err::<(), _>(anyhow::anyhow!("subtask failure")) });
                 Ok(())
             }),
         );
@@ -1805,11 +1809,11 @@ mod tests {
         struct NestedEvent;
 
         let store: Engine<Counter> = Engine::new().with_effect(
-            effect::on::<NestedEvent>().run(|_event, ctx| async move {
+            effect::on::<NestedEvent>().then(|_event, ctx| async move {
                 ctx.within(|ctx1| async move {
                     ctx1.within(|ctx2| async move {
                         ctx2.within(|_ctx3| async move {
-                            Err(anyhow::anyhow!("deeply nested failure"))
+                            Err::<(), _>(anyhow::anyhow!("deeply nested failure"))
                         });
                         Ok(())
                     });
@@ -1850,7 +1854,7 @@ mod tests {
         let head_completed_clone = head_completed.clone();
 
         let store: Engine<Counter> =
-            Engine::new().with_effect(effect::on::<TransientEvent>().run(
+            Engine::new().with_effect(effect::on::<TransientEvent>().then(
                 move |_event, ctx| {
                     let completed = head_completed_clone.clone();
                     async move {
@@ -1858,7 +1862,7 @@ mod tests {
                         let transient_ctx = ctx.transient();
                         transient_ctx.within(|_| async move {
                             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            Err(anyhow::anyhow!("transient task failure"))
+                            Err::<(), _>(anyhow::anyhow!("transient task failure"))
                         });
 
                         // Record that the head effect completed
@@ -1898,10 +1902,10 @@ mod tests {
         let success_count_clone = success_count.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<FailingEventType>().run(|_event, _ctx| async move {
-                Err(anyhow::anyhow!("failing event error"))
+            .with_effect(effect::on::<FailingEventType>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("failing event error"))
             }))
-            .with_effect(effect::on::<SuccessEventType>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<SuccessEventType>().then(move |_event, _ctx| {
                 let sc = success_count_clone.clone();
                 async move {
                     sc.fetch_add(1, Ordering::Relaxed);
@@ -1943,13 +1947,13 @@ mod tests {
             .with_reducer(reducer::on::<IncrementWithEffect>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_effect(effect::on::<IncrementWithEffect>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<IncrementWithEffect>().then(move |_event, _ctx| {
                 let cc = call_count_clone.clone();
                 async move {
                     let count = cc.fetch_add(1, Ordering::Relaxed);
                     if count == 1 {
                         // Fail on the second call
-                        Err(anyhow::anyhow!("effect failed on second call"))
+                        Err::<(), _>(anyhow::anyhow!("effect failed on second call"))
                     } else {
                         Ok(())
                     }
@@ -1984,7 +1988,7 @@ mod tests {
         let started_clone = started.clone();
 
         let store: Engine<Counter> =
-            Engine::new().with_effect(effect::on::<SlowEvent>().run(
+            Engine::new().with_effect(effect::on::<SlowEvent>().then(
                 move |_event, ctx| {
                     let s = started_clone.clone();
                     async move {
@@ -1998,7 +2002,7 @@ mod tests {
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                         // This error won't happen if cancelled
-                        Err(anyhow::anyhow!("slow failure"))
+                        Err::<(), _>(anyhow::anyhow!("slow failure"))
                     }
                 },
             ));
@@ -2036,7 +2040,7 @@ mod tests {
             .with_reducer(reducer::on::<StatefulFailEvent>().run(|_state: Counter, event| Counter {
                 value: event.new_value,
             }))
-            .with_effect(effect::on::<StatefulFailEvent>().run(move |_event, ctx: EffectContext<Counter, ()>| {
+            .with_effect(effect::on::<StatefulFailEvent>().then(move |_event, ctx: EffectContext<Counter, ()>| {
                 let prev = observed_prev_clone.clone();
                 let next = observed_next_clone.clone();
                 async move {
@@ -2044,7 +2048,7 @@ mod tests {
                     *prev.lock() = Some(ctx.prev_state().value);
                     *next.lock() = Some(ctx.next_state().value);
 
-                    Err(anyhow::anyhow!("intentional failure after state check"))
+                    Err::<(), _>(anyhow::anyhow!("intentional failure after state check"))
                 }
             }));
 
@@ -2072,13 +2076,13 @@ mod tests {
         struct MultiErrorEvent;
 
         let store: Engine<Counter> = Engine::new().with_effect(
-            effect::on::<MultiErrorEvent>().run(|_event, ctx| async move {
+            effect::on::<MultiErrorEvent>().then(|_event, ctx| async move {
                 // Spawn multiple failing tasks
                 for i in 0..5 {
                     let delay = i * 10;
                     ctx.within(move |_| async move {
                         tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
-                        Err(anyhow::anyhow!("error from task {}", i))
+                        Err::<(), _>(anyhow::anyhow!("error from task {}", i))
                     });
                 }
                 Ok(())
@@ -2116,11 +2120,11 @@ mod tests {
         let reached_clone = reached.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<StartCascade>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<StartCascade>().then(|_event, ctx| async move {
                 ctx.emit(MiddleCascade);
                 Ok(())
             }))
-            .with_effect(effect::on::<MiddleCascade>().run(move |_event, ctx| {
+            .with_effect(effect::on::<MiddleCascade>().then(move |_event, ctx| {
                 let r = reached_clone.clone();
                 async move {
                     r.fetch_add(1, Ordering::Relaxed);
@@ -2128,8 +2132,8 @@ mod tests {
                     Ok(())
                 }
             }))
-            .with_effect(effect::on::<FinalCascade>().run(|_event, _ctx| async move {
-                Err(anyhow::anyhow!("final cascade failure"))
+            .with_effect(effect::on::<FinalCascade>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("final cascade failure"))
             }));
 
         let handle = store.activate(Counter::default());
@@ -2162,9 +2166,9 @@ mod tests {
         struct DelayedErrorEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<DelayedErrorEvent>().run(|_event, _ctx| async move {
+            .with_effect(effect::on::<DelayedErrorEvent>().then(|_event, _ctx| async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                Err(anyhow::anyhow!("delayed error"))
+                Err::<(), _>(anyhow::anyhow!("delayed error"))
             }));
 
         let handle = store.activate(Counter::default());
@@ -2243,7 +2247,7 @@ mod tests {
                 derived_count: state.derived_count + 1,
                 ..state
             }))
-            .with_effect(effect::on::<Source>().run(|event, ctx| async move {
+            .with_effect(effect::on::<Source>().then(|event, ctx| async move {
                 ctx.emit(Derived(event.0));
                 Ok(())
             }));
@@ -2287,7 +2291,7 @@ mod tests {
             .with_reducer(reducer::on::<FastEvent>().run(|state: Counter, _| Counter {
                 value: state.value + 1,
             }))
-            .with_effect(effect::on::<FastEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<FastEvent>().then(move |_event, _ctx| {
                 let p = processed_clone.clone();
                 async move {
                     // Simulate slow processing
@@ -2322,7 +2326,7 @@ mod tests {
             .with_reducer(reducer::on::<OrderedEvent>().run(|state: Counter, event| Counter {
                 value: state.value + event.0,
             }))
-            .with_effect(effect::on::<OrderedEvent>().run(move |_event, ctx: EffectContext<Counter, ()>| {
+            .with_effect(effect::on::<OrderedEvent>().then(move |_event, ctx: EffectContext<Counter, ()>| {
                 let obs = observations_clone.clone();
                 async move {
                     let prev = ctx.prev_state().value;
@@ -2376,7 +2380,7 @@ mod tests {
         let started = Arc::new(AtomicUsize::new(0));
         let started_clone = started.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<InterleaveEvent>().run(move |_event, ctx| {
+            .with_effect(effect::on::<InterleaveEvent>().then(move |_event, ctx| {
                 let s = started_clone.clone();
                 async move {
                     s.fetch_add(1, Ordering::Relaxed);
@@ -2460,11 +2464,11 @@ mod tests {
         let success_count = Arc::new(AtomicUsize::new(0));
         let success_count_clone = success_count.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<MixedEvent>().run(move |event, _ctx| {
+            .with_effect(effect::on::<MixedEvent>().then(move |event, _ctx| {
                 let sc = success_count_clone.clone();
                 async move {
                     if event.0 == 5 {
-                        Err(anyhow::anyhow!("conditional failure at 5"))
+                        Err::<(), _>(anyhow::anyhow!("conditional failure at 5"))
                     } else {
                         sc.fetch_add(1, Ordering::Relaxed);
                         Ok(())
@@ -2509,9 +2513,9 @@ mod tests {
             .with_reducer(reducer::on::<FailAfterUpdate>().run(|state: Counter, event| Counter {
                 value: state.value + event.value,
             }))
-            .with_effect(effect::on::<FailAfterUpdate>().run(|event, _ctx| async move {
+            .with_effect(effect::on::<FailAfterUpdate>().then(|event, _ctx| async move {
                 if event.value > 50 {
-                    Err(anyhow::anyhow!("value too high"))
+                    Err::<(), _>(anyhow::anyhow!("value too high"))
                 } else {
                     Ok(())
                 }
@@ -2562,16 +2566,16 @@ mod tests {
                 branch_b_child: true,
                 ..state
             }))
-            .with_effect(effect::on::<TriggerFanOut>().run(|_, ctx| async move {
+            .with_effect(effect::on::<TriggerFanOut>().then(|_, ctx| async move {
                 ctx.emit(BranchA);
                 ctx.emit(BranchB);
                 Ok(())
             }))
-            .with_effect(effect::on::<BranchA>().run(|_, ctx| async move {
+            .with_effect(effect::on::<BranchA>().then(|_, ctx| async move {
                 ctx.emit(BranchAChild);
-                Err(anyhow::anyhow!("branch A fails"))
+                Err::<(), _>(anyhow::anyhow!("branch A fails"))
             }))
-            .with_effect(effect::on::<BranchB>().run(|_, ctx| async move {
+            .with_effect(effect::on::<BranchB>().then(|_, ctx| async move {
                 ctx.emit(BranchBChild);
                 Ok(())
             }));
@@ -2601,8 +2605,8 @@ mod tests {
         struct EmptyErrorEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<EmptyErrorEvent>().run(|_event, _ctx| async move {
-                Err(anyhow::anyhow!(""))
+            .with_effect(effect::on::<EmptyErrorEvent>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!(""))
             }));
 
         let handle = store.activate(Counter::default());
@@ -2619,9 +2623,9 @@ mod tests {
         struct ChainedErrorEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<ChainedErrorEvent>().run(|_event, _ctx| async move {
+            .with_effect(effect::on::<ChainedErrorEvent>().then(|_event, _ctx| async move {
                 let inner = anyhow::anyhow!("inner error");
-                Err(inner.context("outer context"))
+                Err::<(), _>(inner.context("outer context"))
             }));
 
         let handle = store.activate(Counter::default());
@@ -2649,8 +2653,10 @@ mod tests {
         struct DirectPanicEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<DirectPanicEvent>().run(|_event, _ctx| async move {
+            .with_effect(effect::on::<DirectPanicEvent>().then(|_event, _ctx| async move {
                 panic!("direct panic in effect handle");
+                #[allow(unreachable_code)]
+                Ok(())
             }));
 
         let handle = store.activate(Counter::default());
@@ -2673,7 +2679,7 @@ mod tests {
         struct NestedPanicEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<NestedPanicEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<NestedPanicEvent>().then(|_event, ctx| async move {
                 ctx.within(|ctx1| async move {
                     ctx1.within(|ctx2| async move {
                         ctx2.within(|_ctx3| async move {
@@ -2706,7 +2712,7 @@ mod tests {
         struct NonStringPanicEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<NonStringPanicEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<NonStringPanicEvent>().then(|_event, ctx| async move {
                 ctx.within(|_| async move {
                     std::panic::panic_any(42i32);
                 });
@@ -2736,13 +2742,13 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let ran_clone = ran.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<MultiEffectPanicEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<MultiEffectPanicEvent>().then(|_event, ctx| async move {
                 ctx.within(|_| async move {
                     panic!("effect panics");
                 });
                 Ok(())
             }))
-            .with_effect(effect::on::<MultiEffectPanicEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<MultiEffectPanicEvent>().then(move |_event, _ctx| {
                 let r = ran_clone.clone();
                 async move {
                     r.fetch_add(1, Ordering::Relaxed);
@@ -2776,7 +2782,7 @@ mod tests {
                     .started(|_ctx| async move {
                         panic!("panic in started hook");
                     })
-                    .run(|_event, _ctx| async move { Ok(()) }),
+                    .then(|_event, _ctx| async move { Ok(()) }),
             );
 
         let handle = store.activate(Counter::default());
@@ -2798,7 +2804,7 @@ mod tests {
         struct MultiPanicEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<MultiPanicEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<MultiPanicEvent>().then(|_event, ctx| async move {
                 // Spawn multiple panicking tasks with different delays
                 for i in 0..5 {
                     let delay = i * 20;
@@ -2832,9 +2838,9 @@ mod tests {
         struct PanicAndErrorEvent;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<PanicAndErrorEvent>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<PanicAndErrorEvent>().then(|_event, ctx| async move {
                 // Error task - no delay
-                ctx.within(|_| async { Err(anyhow::anyhow!("error before panic")) });
+                ctx.within(|_| async { Err::<(), _>(anyhow::anyhow!("error before panic")) });
 
                 // Panic task - small delay
                 ctx.within(|_| async {
@@ -2868,7 +2874,7 @@ mod tests {
         let head_completed = Arc::new(AtomicUsize::new(0));
         let head_completed_clone = head_completed.clone();
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<TransientPanicEvent>().run(move |_event, ctx| {
+            .with_effect(effect::on::<TransientPanicEvent>().then(move |_event, ctx| {
                 let completed = head_completed_clone.clone();
                 async move {
                     // Spawn panicking task on transient
@@ -2909,7 +2915,7 @@ mod tests {
             .with_reducer(reducer::on::<IncrementThenPanic>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_effect(effect::on::<IncrementThenPanic>().run(|event, ctx| async move {
+            .with_effect(effect::on::<IncrementThenPanic>().then(|event, ctx| async move {
                 if event.should_panic {
                     ctx.within(|_| async move {
                         panic!("intentional panic");
@@ -2962,7 +2968,7 @@ mod tests {
         struct AudioReceived;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<AudioReceived>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<AudioReceived>().then(|_event, ctx| async move {
                 // Emit InputAudio when AudioReceived is processed
                 ctx.emit(InputAudio(vec![1, 2, 3, 4]));
                 Ok(())
@@ -3005,7 +3011,7 @@ mod tests {
         struct Trigger;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<Trigger>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<Trigger>().then(|_event, ctx| async move {
                 ctx.emit(TextChunk("hello".to_string()));
                 ctx.emit(AudioChunk(vec![5, 6, 7, 8]));
                 Ok(())
@@ -3073,7 +3079,7 @@ mod tests {
         struct Trigger;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<Trigger>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<Trigger>().then(|_event, ctx| async move {
                 ctx.emit(InputAudio(vec![1, 2, 3]));
                 Ok(())
             }));
@@ -3124,7 +3130,7 @@ mod tests {
         let rc = recv_count.clone();
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<ExternalEvent>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<ExternalEvent>().then(move |_event, _ctx| {
                 let c = rc.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -3169,7 +3175,7 @@ mod tests {
             .with_reducer(reducer::on::<ExternalIncrement>().run(|state: Counter, event| Counter {
                 value: state.value + event.amount,
             }))
-            .with_effect(effect::on::<ExternalIncrement>().run(move |_event, _ctx| {
+            .with_effect(effect::on::<ExternalIncrement>().then(move |_event, _ctx| {
                 let c = count_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -3278,7 +3284,7 @@ mod tests {
         struct StartRapid;
 
         let store: Engine<Counter> = Engine::new()
-            .with_effect(effect::on::<StartRapid>().run(|_event, ctx| async move {
+            .with_effect(effect::on::<StartRapid>().then(|_event, ctx| async move {
                 // Emit many events rapidly
                 for i in 0..100 {
                     ctx.emit(RapidEvent(i));
@@ -3370,7 +3376,7 @@ mod tests {
             .with_reducer(reducer::on::<InputEvent>().run(|state: PipeState, event| PipeState {
                 total: state.total + event.value,
             }))
-            .with_effect(effect::on::<InputEvent>().run(|event, ctx| async move {
+            .with_effect(effect::on::<InputEvent>().then(|event, ctx| async move {
                 // Emit output with doubled value
                 ctx.emit(OutputEvent {
                     result: event.value * 2,
