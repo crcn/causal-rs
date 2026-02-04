@@ -202,17 +202,12 @@ async fn main() -> Result<()> {
     // Activate with initial state
     let handle = engine.activate(SummaryState::default());
 
-    // Run with closure that returns initial event
+    // Process returns initial event and waits for all effects
     let task_id = Uuid::new_v4();
-    handle.run(|_ctx| {
-        Ok(SummaryEvent::SummarizeRequested {
-            task_id,
-            text: text.to_string(),
-        })
-    })?;
-
-    // Wait for all effects to complete
-    handle.settled().await?;
+    let text = text.to_string();
+    handle.process(|_| async move {
+        Ok(SummaryEvent::SummarizeRequested { task_id, text })
+    }).await?;
 
     println!("\nDone!");
 
