@@ -106,14 +106,12 @@ async fn main() -> Result<()> {
         // Activate with initial state
         let handle = engine.activate(OrderState::default());
 
-        // Run the edge function - returns event to dispatch
+        // Process the edge function - returns event, waits for completion
         let order_id = Uuid::new_v4();
-        handle.run(|_ctx| Ok(place_order(order_id, 99.99 * i as f64)))?;
+        let total = 99.99 * i as f64;
+        handle.process(|_| async move { Ok(place_order(order_id, total)) }).await?;
 
         println!("✓ Order {} placed", order_id);
-
-        // Wait for all effects to complete
-        handle.settled().await?;
 
         // Check final state
         let final_state = handle.context.curr_state();

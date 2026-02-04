@@ -171,13 +171,10 @@ async fn main() -> Result<()> {
     // Activate with initial state
     let handle = engine.activate(FetchState::default());
 
-    // Run with closure that returns initial event
-    handle.run(|_ctx| {
-        Ok(FetchEvent::FetchRequested { urls: urls.clone() })
-    })?;
-
-    // Wait for all effects to complete
-    handle.settled().await?;
+    // Process returns initial event and waits for all effects
+    handle.process(|_| async move {
+        Ok(FetchEvent::FetchRequested { urls })
+    }).await?;
 
     println!("\nAll fetches complete!");
 

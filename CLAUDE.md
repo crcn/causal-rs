@@ -149,16 +149,16 @@ let observer_effect = effect::on_any().then(|event, ctx| async move {
 
 #### `on!` Macro for Multi-Variant Matching
 
-When handling enum events with multiple variants, the `on!` macro provides concise syntax:
+When handling enum events with multiple variants, the `on!` macro provides concise syntax that mirrors Rust's `match`:
 
 ```rust
 use seesaw::on;
 
-// Instead of multiple effect::on::<E>().extract(...).then(...) calls:
-let effects = on!(CrawlEvent {
+// Match-like syntax with Event::Variant patterns
+let effects = on! {
     // Multiple variants with | - same fields required
-    WebsiteIngested { website_id, job_id, .. } |
-    WebsitePostsRegenerated { website_id, job_id, .. } => |ctx| async move {
+    CrawlEvent::WebsiteIngested { website_id, job_id, .. } |
+    CrawlEvent::WebsitePostsRegenerated { website_id, job_id, .. } => |ctx| async move {
         ctx.deps().jobs.enqueue(ExtractPostsJob {
             website_id,
             parent_job_id: job_id,
@@ -167,11 +167,11 @@ let effects = on!(CrawlEvent {
     },
 
     // Single variant
-    PostsExtractedFromPages { website_id, posts, .. } => |ctx| async move {
+    CrawlEvent::PostsExtractedFromPages { website_id, posts, .. } => |ctx| async move {
         ctx.deps().jobs.enqueue(SyncPostsJob { website_id, posts }).await?;
         Ok(CrawlEvent::SyncJobEnqueued { website_id })
     },
-});
+};
 
 // Returns Vec<Effect<S, D>> - add to engine
 let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
