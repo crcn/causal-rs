@@ -4,7 +4,6 @@ pub mod event_worker;
 pub mod effect_worker;
 
 use anyhow::Result;
-use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -48,7 +47,7 @@ impl Runtime {
         config: RuntimeConfig,
     ) -> Self
     where
-        S: Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Default + 'static,
         D: Send + Sync + 'static,
         St: Store,
     {

@@ -83,7 +83,7 @@ impl<St: Store> Future for ProcessFuture<St> {
         };
 
         // Spawn publish task
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         tokio::spawn(async move {
             let result = store.publish(queued_event).await;
             let _ = tx.send(result);

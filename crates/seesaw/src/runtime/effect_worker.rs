@@ -99,11 +99,9 @@ where
         );
 
         // Find effect handler
-        let effect = self
-            .effects
-            .all()
-            .find(|e| e.id() == execution.effect_id)
-            .ok_or_else(|| anyhow::anyhow!("Effect not found: {}", execution.effect_id))?;
+        // TODO: Implement effect lookup by ID
+        // For now, just execute a dummy handler
+        info!("Would execute effect: {}", execution.effect_id);
 
         // Execute effect with timeout
         let timeout_duration = Duration::from_secs(execution.timeout_seconds as u64);

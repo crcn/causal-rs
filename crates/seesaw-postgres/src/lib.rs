@@ -28,6 +28,14 @@ impl PostgresStore {
     }
 }
 
+impl Clone for PostgresStore {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+        }
+    }
+}
+
 #[async_trait]
 impl Store for PostgresStore {
     // =========================================================================

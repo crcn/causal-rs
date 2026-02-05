@@ -3,23 +3,23 @@
 //! Simplified Engine that publishes to Store instead of in-memory dispatch.
 //! Workers (EventWorker, EffectWorker) poll from store and execute.
 
-use anyhow::Result;
-use std::any::TypeId;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::effect::Effect;
 use crate::effect_registry::EffectRegistry;
 use crate::process::ProcessFuture;
+use crate::reducer::Reducer;
 use crate::reducer_registry::ReducerRegistry;
-use crate::{Effect, Reducer, Store};
+use crate::Store;
 
 /// Queue-backed Engine
 ///
 /// Publishes events to Store, workers poll and execute.
 pub struct Engine<S, D, St>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Default + 'static,
     D: Send + Sync + 'static,
     St: Store,
 {
@@ -32,7 +32,7 @@ where
 
 impl<S, D, St> Engine<S, D, St>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Default + 'static,
     D: Send + Sync + 'static,
     St: Store,
 {
@@ -48,7 +48,7 @@ where
     }
 
     /// Register a reducer
-    pub fn with_reducer(mut self, reducer: impl Reducer<S> + 'static) -> Self {
+    pub fn with_reducer(mut self, reducer: Reducer<S>) -> Self {
         Arc::get_mut(&mut self.reducers)
             .expect("Cannot add reducer after cloning")
             .register(reducer);
@@ -56,7 +56,7 @@ where
     }
 
     /// Register an effect
-    pub fn with_effect(mut self, effect: impl Effect<S, D> + 'static) -> Self {
+    pub fn with_effect(mut self, effect: Effect<S, D>) -> Self {
         Arc::get_mut(&mut self.effects)
             .expect("Cannot add effect after cloning")
             .register(effect);
@@ -68,7 +68,7 @@ where
     /// Event is serialized and published to store when future is polled.
     pub fn process<E>(&self, event: E) -> ProcessFuture<St>
     where
-        E: Clone + Send + Sync + 'static,
+        E: Clone + Send + Sync + serde::Serialize + 'static,
     {
         self.process_saga(Uuid::new_v4(), event)
     }
@@ -76,7 +76,7 @@ where
     /// Process event with saga ID
     pub fn process_saga<E>(&self, saga_id: Uuid, event: E) -> ProcessFuture<St>
     where
-        E: Clone + Send + Sync + 'static,
+        E: Clone + Send + Sync + serde::Serialize + 'static,
     {
         self.process_saga_with_id(Uuid::new_v4(), saga_id, event)
     }
@@ -89,7 +89,7 @@ where
         event: E,
     ) -> ProcessFuture<St>
     where
-        E: Clone + Send + Sync + 'static,
+        E: Clone + Send + Sync + serde::Serialize + 'static,
     {
         let event_type = std::any::type_name::<E>().to_string();
         let payload = serde_json::to_value(&event)
@@ -129,7 +129,7 @@ where
 
 impl<S, D, St> Clone for Engine<S, D, St>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Default + 'static,
     D: Send + Sync + 'static,
     St: Store,
 {

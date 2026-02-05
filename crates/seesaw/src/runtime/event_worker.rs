@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use crate::effect_registry::EffectRegistry;
 use crate::reducer_registry::ReducerRegistry;
@@ -32,7 +31,7 @@ impl Default for EventWorkerConfig {
 /// Event worker - polls and processes events
 pub struct EventWorker<S, D, St>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Default + 'static,
     D: Send + Sync + 'static,
     St: Store,
 {
@@ -121,11 +120,9 @@ where
             });
 
         // Run reducers (pure state transformations)
-        let prev_state = state.clone();
-        for reducer in self.reducers.all() {
-            // TODO: Type matching for reducers
-            // For now, skip reducer execution
-        }
+        let _prev_state = state.clone();
+        // TODO: Implement reducer iteration
+        // Need to add .iter() or .all() method to ReducerRegistry
 
         // Save updated state (optimistic locking)
         let new_version = self
@@ -139,39 +136,23 @@ where
         );
 
         // Execute effects (branch on inline vs queued)
-        for effect in self.effects.all() {
-            // TODO: Check if effect matches event type
-
-            // TODO: Determine if effect is inline or queued
-            let is_inline = false; // Default to queued for now
-
-            if is_inline {
-                // Inline effect: Execute NOW in this transaction
-                info!("Executing inline effect: {}", effect.id());
-
-                // TODO: Execute effect handler
-                // TODO: Record execution in seesaw_effect_executions (completed)
-                // TODO: Emit next events (same transaction - atomicity!)
-            } else {
-                // Queued effect: Insert intent for effect worker
-                info!("Queueing effect for async execution: {}", effect.id());
-
-                self.store
-                    .insert_effect_intent(
-                        event.event_id,
-                        effect.id().to_string(),
-                        event.saga_id,
-                        event.event_type.clone(),
-                        event.payload.clone(),
-                        event.parent_id,
-                        chrono::Utc::now(), // Execute immediately
-                        30,                 // Default timeout
-                        3,                  // Default max attempts
-                        10,                 // Default priority
-                    )
-                    .await?;
-            }
-        }
+        // TODO: Implement effect iteration
+        // Need to add .iter() or .all() method to EffectRegistry
+        // For now, insert a dummy effect intent to test the flow
+        self.store
+            .insert_effect_intent(
+                event.event_id,
+                "test_effect".to_string(),
+                event.saga_id,
+                event.event_type.clone(),
+                event.payload.clone(),
+                event.parent_id,
+                chrono::Utc::now(), // Execute immediately
+                30,                 // Default timeout
+                3,                  // Default max attempts
+                10,                 // Default priority
+            )
+            .await?;
 
         // Mark event as processed
         self.store.ack(event.id).await?;
