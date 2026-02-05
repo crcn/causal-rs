@@ -247,7 +247,7 @@ let effects = on! {
 let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
 ```
 
-#### Effect Execution Configuration (v0.7.6+)
+#### Effect Execution Configuration (v0.8.0+)
 
 Configure effects for retry, timeout, delay, priority, and queued execution:
 
@@ -420,7 +420,7 @@ Handle methods:
 - `.cancel()` — Cancel all tasks
 - `.shutdown().await` — Graceful shutdown (waits for in-flight tasks)
 
-## Queue-Backed Engine (v0.7.6+)
+## Queue-Backed Engine (v0.8.0+)
 
 For durable, queue-backed execution with `.wait()` pattern:
 

@@ -2,7 +2,7 @@
 
 **Mental Model**: Events are signals. Effects react and return new events. That's it.
 
-## Quick Start - v0.7.0 API
+## Quick Start - v0.8.0 API
 
 ### Stateless Engine Pattern
 
@@ -173,7 +173,7 @@ let effects = on! {
 let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
 ```
 
-#### Effect Execution Configuration (v0.7.6+)
+#### Effect Execution Configuration (v0.8.0+)
 
 Effects can be configured for retry, timeout, delay, priority, and queued execution:
 
