@@ -3663,76 +3663,83 @@ let result = dispatch_request(
 
 #### `.wait()` Pattern (Fluent API)
 
-**Most ergonomic** - Chain directly from `process()`:
+**Idiomatic Rust** - Runtime variant matching with closure:
 
 ```rust
-// Example: GraphQL mutation that waits for result
-async fn submit_website(
+// Example: GraphQL mutation with multiple terminal events
+async fn crawl_site(
     ctx: &Context<'_>,
     url: String,
-) -> Result<Website> {
+) -> Result<CrawlResult> {
     let engine = ctx.data::<Arc<Engine<AppState, ServerDeps, PostgresStore>>>()?;
+    let job_id = Uuid::new_v4();
 
-    engine.process(WebsiteSubmitted { url })
-        .await?
-        .wait()
-        .on_match(|e: &WebsiteCreated| Ok(e.website.clone()))
-        .on_match(|e: &WebsiteScrapeFailure| Err(anyhow!("Scraping failed: {}", e.reason)))
-        .timeout(Duration::from_secs(300))
+    engine
+        .process(ListingEvent::SiteCrawlRequested { url, job_id })
+        .wait(|event: &ListingEvent| match event {
+            ListingEvent::RelationshipsResolved { extraction_ids, .. } => {
+                Some(Ok(CrawlResult {
+                    success: true,
+                    extractions_count: extraction_ids.len(),
+                    job_id,
+                }))
+            }
+            ListingEvent::SiteCrawlFailed { reason, .. } => {
+                Some(Err(anyhow!("Crawl failed: {}", reason)))
+            }
+            ListingEvent::InformationDetectionFailed { reason, .. } => {
+                Some(Err(anyhow!("Detection failed: {}", reason)))
+            }
+            _ => None, // Not a terminal event, keep waiting
+        })
+        .timeout(Duration::from_secs(900))
         .await
 }
 ```
 
-**Concise version** for simple success-only cases:
+**API Design**:
+- `process()` returns lazy future (doesn't publish until polled)
+- `.wait(closure)` chains directly, no intermediate `.await?`
+- Closure returns `Option<Result<T>>`:
+  - `None` = not a terminal event, keep waiting
+  - `Some(Ok(value))` = success, return value
+  - `Some(Err(error))` = failure, propagate error
+- Pattern match on full enum (idiomatic Rust)
+
+**Concise version** for single success event:
 
 ```rust
-let created = engine
+let website = engine
     .process(WebsiteSubmitted { url })
-    .await?
-    .wait::<WebsiteCreated>()
+    .wait(|event: &WebsiteEvent| match event {
+        WebsiteEvent::WebsiteCreated { website, .. } => Some(Ok(website.clone())),
+        WebsiteEvent::WebsiteFailed { reason, .. } => Some(Err(anyhow!(reason))),
+        _ => None,
+    })
     .timeout(Duration::from_secs(300))
     .await?;
-
-Ok(created.website)
 ```
 
-**Comparison with `dispatch_request`**:
+**Fire-and-forget** (no wait):
 
 ```rust
-// dispatch_request (functional style)
-dispatch_request(
-    WebsiteSubmitted { url },
-    &engine,
-    |m| m.try_match(|e: &WebsiteCreated| Some(Ok(e.website.clone())))
-         .or_try(|e: &WebsiteScrapeFailure| Some(Err(anyhow!("failed: {}", e.reason))))
-         .result()
-).await
-
-// .wait() (builder style)
-engine.process(WebsiteSubmitted { url })
-    .await?
-    .wait()
-    .on_match(|e: &WebsiteCreated| Ok(e.website.clone()))
-    .on_match(|e: &WebsiteScrapeFailure| Err(anyhow!("failed: {}", e.reason)))
-    .timeout(Duration::from_secs(300))
-    .await
+// Just publish, don't wait for result
+engine.process(AnalyticsEvent::PageViewed { .. }).await?;
 ```
 
-**Use when**:
-- Same as `dispatch_request` (HTTP handlers, GraphQL resolvers)
-- You prefer builder/chaining style over functional style
-- You want type inference from `process()` result
+**Why this design**:
+- **Lazy evaluation**: `process()` only publishes when chained with `.wait()` or `.await`
+- **Single match**: No weird `.on_match()` chaining, just pattern match
+- **Exhaustiveness**: Compiler checks if you don't use `_`
+- **Flexible**: `None` means keep waiting, `Some(T)` means done
+- **Type-safe**: Closure sees full event enum
 
 **Implementation**:
-- `ProcessHandle::wait()` returns `WaitBuilder`
-- `WaitBuilder::on_match<E>()` registers terminal event matcher
-- Uses LISTEN/NOTIFY same as `dispatch_request`
-- Timeout handled by `tokio::time::timeout`
-
-**Behavior**:
-- Identical to `dispatch_request` (both use LISTEN/NOTIFY)
-- More compositional (chains from process result)
-- Builder pattern allows incremental terminal event registration
+- `Engine::process()` returns `ProcessFuture`
+- `ProcessFuture::wait(closure)` subscribes to saga via LISTEN/NOTIFY
+- When event arrives, runs closure, keeps waiting if `None`
+- Returns when closure returns `Some(T)`
+- Timeout via `tokio::time::timeout`
 
 ---
 
