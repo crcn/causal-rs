@@ -201,6 +201,127 @@ COMMENT ON TABLE seesaw_dlq IS 'Dead letter queue - effects that failed permanen
 COMMENT ON COLUMN seesaw_dlq.reason IS 'Why it failed: failed (retry exhausted), timeout, infinite_loop';
 
 -- ============================================================
+-- Observability Stream (for real-time visualization)
+-- ============================================================
+
+-- Stream of all workflow events and effect transitions
+-- Append-only table for real-time monitoring and debugging
+CREATE TABLE seesaw_stream (
+    seq BIGSERIAL PRIMARY KEY,
+    stream_type VARCHAR(50) NOT NULL,  -- 'event_dispatched', 'effect_started', 'effect_completed', 'effect_failed'
+    correlation_id UUID NOT NULL,
+    event_id UUID,
+    effect_event_id UUID,              -- For effects: the triggering event_id
+    effect_id VARCHAR(255),             -- For effects: the effect identifier
+    status VARCHAR(50),                 -- For effects: 'executing', 'completed', 'failed'
+    error TEXT,                         -- For failures: error message
+    payload JSONB,                      -- Event payload or effect result
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Fast lookups by sequence (for cursor-based pagination)
+CREATE INDEX idx_stream_seq ON seesaw_stream(seq DESC);
+
+-- Filter by correlation_id (for workflow-specific streams)
+CREATE INDEX idx_stream_correlation ON seesaw_stream(correlation_id, seq DESC);
+
+-- Time-based cleanup/archival
+CREATE INDEX idx_stream_created ON seesaw_stream(created_at DESC);
+
+COMMENT ON TABLE seesaw_stream IS 'Observability stream - append-only log for real-time visualization';
+COMMENT ON COLUMN seesaw_stream.seq IS 'Global sequence number for cursor-based pagination';
+COMMENT ON COLUMN seesaw_stream.stream_type IS 'Event type: event_dispatched, effect_started, effect_completed, effect_failed';
+
+-- Trigger: Stream event dispatches
+CREATE OR REPLACE FUNCTION stream_event_dispatched()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO seesaw_stream (
+        stream_type,
+        correlation_id,
+        event_id,
+        payload,
+        created_at
+    ) VALUES (
+        'event_dispatched',
+        NEW.correlation_id,
+        NEW.event_id,
+        jsonb_build_object(
+            'event_type', NEW.event_type,
+            'hops', NEW.hops,
+            'payload', NEW.payload
+        ),
+        NEW.created_at
+    );
+
+    -- NOTIFY for SSE wake-up (correlation_id only, clients fetch from stream table)
+    PERFORM pg_notify('seesaw_stream', NEW.correlation_id::text);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER seesaw_events_stream
+    AFTER INSERT ON seesaw_events
+    FOR EACH ROW
+    EXECUTE FUNCTION stream_event_dispatched();
+
+-- Trigger: Stream effect execution lifecycle
+CREATE OR REPLACE FUNCTION stream_effect_transition()
+RETURNS TRIGGER AS $$
+DECLARE
+    stream_type_val VARCHAR(50);
+BEGIN
+    -- Determine stream type based on status transition
+    IF TG_OP = 'INSERT' THEN
+        stream_type_val := 'effect_started';
+    ELSIF NEW.status = 'completed' AND OLD.status != 'completed' THEN
+        stream_type_val := 'effect_completed';
+    ELSIF NEW.status = 'failed' AND OLD.status != 'failed' THEN
+        stream_type_val := 'effect_failed';
+    ELSE
+        -- No stream entry for other transitions (e.g., retry attempts)
+        RETURN NEW;
+    END IF;
+
+    INSERT INTO seesaw_stream (
+        stream_type,
+        correlation_id,
+        event_id,
+        effect_event_id,
+        effect_id,
+        status,
+        error,
+        payload,
+        created_at
+    ) VALUES (
+        stream_type_val,
+        NEW.correlation_id,
+        NULL,  -- No new event for effect lifecycle
+        NEW.event_id,
+        NEW.effect_id,
+        NEW.status,
+        NEW.error,
+        NEW.result,
+        NOW()
+    );
+
+    -- NOTIFY for SSE wake-up
+    PERFORM pg_notify('seesaw_stream', NEW.correlation_id::text);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER seesaw_effect_executions_stream
+    AFTER INSERT OR UPDATE ON seesaw_effect_executions
+    FOR EACH ROW
+    EXECUTE FUNCTION stream_effect_transition();
+
+COMMENT ON FUNCTION stream_event_dispatched IS 'Trigger: Log event dispatches to observability stream';
+COMMENT ON FUNCTION stream_effect_transition IS 'Trigger: Log effect lifecycle transitions to observability stream';
+
+-- ============================================================
 -- Operational Tables
 -- ============================================================
 

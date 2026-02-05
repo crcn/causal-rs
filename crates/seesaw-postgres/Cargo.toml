@@ -8,7 +8,7 @@ description = "PostgreSQL adapter for Seesaw event-driven runtime"
 
 [dependencies]
 # Seesaw core
-seesaw_core = { version = "0.8.1", path = "../seesaw" }
+seesaw_core = { version = "0.8.2", path = "../seesaw" }
 
 # Async runtime
 anyhow.workspace = true

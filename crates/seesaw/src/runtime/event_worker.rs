@@ -153,7 +153,20 @@ where
                 "Event exceeded max hops ({}), sending to DLQ: event_id={}",
                 self.config.max_hops, event.event_id
             );
-            // TODO: Send to DLQ
+            // DLQ the event using a synthetic effect_id to record the failure
+            let error = format!(
+                "Event exceeded maximum hop count ({}) - infinite loop detected",
+                self.config.max_hops
+            );
+            self.store
+                .dlq_effect(
+                    event.event_id,
+                    "__event_max_hops__".to_string(),
+                    error,
+                    "infinite_loop".to_string(),
+                    event.hops,
+                )
+                .await?;
             self.store.ack(event.id).await?;
             return Ok(());
         }
@@ -492,6 +505,16 @@ mod tests {
             _attempts: i32,
         ) -> Result<()> {
             Ok(())
+        }
+
+        async fn get_workflow_status(&self, _correlation_id: Uuid) -> Result<crate::WorkflowStatus> {
+            Ok(crate::WorkflowStatus {
+                correlation_id: _correlation_id,
+                state: None,
+                pending_effects: 0,
+                is_settled: true,
+                last_event: None,
+            })
         }
 
         async fn subscribe_saga_events(

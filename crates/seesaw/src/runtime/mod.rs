@@ -245,6 +245,16 @@ mod tests {
             Ok(())
         }
 
+        async fn get_workflow_status(&self, _correlation_id: Uuid) -> Result<crate::WorkflowStatus> {
+            Ok(crate::WorkflowStatus {
+                correlation_id: _correlation_id,
+                state: None,
+                pending_effects: 0,
+                is_settled: true,
+                last_event: None,
+            })
+        }
+
         async fn subscribe_saga_events(
             &self,
             _correlation_id: Uuid,

@@ -9,7 +9,13 @@ Named after the playground equipment that balances back and forth — representi
 This repository is organized as a Cargo workspace:
 
 - **[seesaw-core](./crates/seesaw)** - Core event-driven runtime
-- **[seesaw-outbox](./crates/seesaw-outbox)** - Transactional outbox pattern for durable events
+- **[seesaw-postgres](./crates/seesaw-postgres)** - PostgreSQL backend for queue-backed execution
+- **[seesaw-insight](./crates/seesaw-insight)** - Real-time observability and visualization
+
+## Documentation
+
+- **[IMPLEMENTATION_SUMMARY.md](./IMPLEMENTATION_SUMMARY.md)** - Tree visualization & WebSocket implementation details
+- **[INTEGRATION_MNDIGITALAID.md](./INTEGRATION_MNDIGITALAID.md)** - Upgrading from v0.7.8 to v0.8.1 guide
 
 ## Core Principle
 
@@ -450,13 +456,21 @@ let correlation_id = handle.correlation_id;  // Return to client
 let result = engine
     .process(CreateOrder { user_id: 123 })
     .wait(|event| {
-        // Pattern match on terminal events
-        if let Some(created) = event.downcast_ref::<OrderCreated>() {
-            Some(Ok(created.clone()))
-        } else if let Some(failed) = event.downcast_ref::<OrderFailed>() {
-            Some(Err(anyhow!("Failed: {}", failed.reason)))
+        // Match on SagaEvent (contains event_type and JSON payload)
+        if let Some(saga_event) = event.downcast_ref::<seesaw_core::SagaEvent>() {
+            match saga_event.event_type.as_str() {
+                "OrderCreated" => {
+                    let order_id = saga_event.payload["order_id"].as_str()?;
+                    Some(Ok(order_id.to_string()))
+                }
+                "OrderFailed" => {
+                    let reason = saga_event.payload["reason"].as_str()?;
+                    Some(Err(anyhow!("Failed: {}", reason)))
+                }
+                _ => None  // Keep waiting
+            }
         } else {
-            None  // Keep waiting
+            None
         }
     })
     .timeout(Duration::from_secs(30))
@@ -492,6 +506,43 @@ pub struct WorkflowStatus {
 **Key distinction:**
 - `is_settled` - No effects running right now (workflow is idle, but can start again)
 - Terminal events - User-defined events that signal true completion (e.g., `OrderCompleted`)
+
+### Real-time Observability (Seesaw Insight)
+
+Visualize your workflows in real-time with the Insight server:
+
+```bash
+# Start the insight server
+export DATABASE_URL="postgres://localhost/seesaw"
+cargo run -p seesaw-insight
+
+# Open http://localhost:3000
+```
+
+**Features:**
+- **Live Stream**: Real-time view of all workflow events and effects
+- **Tree Visualization**: Interactive causality tree showing event relationships
+- **Dual Protocols**: Both WebSocket and SSE support (toggle in UI)
+- **Real-time Stats**: Total events, active effects, recent activity
+- **Cursor-based Pagination**: Efficient streaming of large event volumes
+
+**Dashboard Views:**
+- **Live Stream Tab**: Scrolling list of all workflow activity
+- **Tree View Tab**: Click any workflow ID to see its causality tree with parent-child relationships and effect executions
+
+The `seesaw_stream` table automatically captures:
+- `event_dispatched` - New events published to the queue
+- `effect_started` - Effect execution began
+- `effect_completed` - Effect finished successfully
+- `effect_failed` - Effect failed with error
+
+Triggers populate this table automatically - no code changes needed!
+
+**API Endpoints:**
+- `GET /api/stream` - SSE endpoint
+- `WS /api/ws` - WebSocket endpoint
+- `GET /api/tree/:correlation_id` - Causality tree
+- `GET /api/stats` - Current metrics
 
 **EffectContext in queue-backed mode:**
 ```rust

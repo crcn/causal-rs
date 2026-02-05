@@ -4,12 +4,13 @@ members = [
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
-    "crates/seesaw-viz", "crates/seesaw-postgres",
+    "crates/seesaw-postgres",
+    "crates/seesaw-insight",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license = "MIT"
 authors = ["Crispin Read <crispin@crispinread.com>"]
