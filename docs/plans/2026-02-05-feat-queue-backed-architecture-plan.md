@@ -3661,6 +3661,81 @@ let result = dispatch_request(
 
 ---
 
+#### `.wait()` Pattern (Fluent API)
+
+**Most ergonomic** - Chain directly from `process()`:
+
+```rust
+// Example: GraphQL mutation that waits for result
+async fn submit_website(
+    ctx: &Context<'_>,
+    url: String,
+) -> Result<Website> {
+    let engine = ctx.data::<Arc<Engine<AppState, ServerDeps, PostgresStore>>>()?;
+
+    engine.process(WebsiteSubmitted { url })
+        .await?
+        .wait()
+        .on_match(|e: &WebsiteCreated| Ok(e.website.clone()))
+        .on_match(|e: &WebsiteScrapeFailure| Err(anyhow!("Scraping failed: {}", e.reason)))
+        .timeout(Duration::from_secs(300))
+        .await
+}
+```
+
+**Concise version** for simple success-only cases:
+
+```rust
+let created = engine
+    .process(WebsiteSubmitted { url })
+    .await?
+    .wait::<WebsiteCreated>()
+    .timeout(Duration::from_secs(300))
+    .await?;
+
+Ok(created.website)
+```
+
+**Comparison with `dispatch_request`**:
+
+```rust
+// dispatch_request (functional style)
+dispatch_request(
+    WebsiteSubmitted { url },
+    &engine,
+    |m| m.try_match(|e: &WebsiteCreated| Some(Ok(e.website.clone())))
+         .or_try(|e: &WebsiteScrapeFailure| Some(Err(anyhow!("failed: {}", e.reason))))
+         .result()
+).await
+
+// .wait() (builder style)
+engine.process(WebsiteSubmitted { url })
+    .await?
+    .wait()
+    .on_match(|e: &WebsiteCreated| Ok(e.website.clone()))
+    .on_match(|e: &WebsiteScrapeFailure| Err(anyhow!("failed: {}", e.reason)))
+    .timeout(Duration::from_secs(300))
+    .await
+```
+
+**Use when**:
+- Same as `dispatch_request` (HTTP handlers, GraphQL resolvers)
+- You prefer builder/chaining style over functional style
+- You want type inference from `process()` result
+
+**Implementation**:
+- `ProcessHandle::wait()` returns `WaitBuilder`
+- `WaitBuilder::on_match<E>()` registers terminal event matcher
+- Uses LISTEN/NOTIFY same as `dispatch_request`
+- Timeout handled by `tokio::time::timeout`
+
+**Behavior**:
+- Identical to `dispatch_request` (both use LISTEN/NOTIFY)
+- More compositional (chains from process result)
+- Builder pattern allows incremental terminal event registration
+
+---
+
 ## Decision: GO
 
 **Recommendation**: Build the queue-backed version with production hardening.
