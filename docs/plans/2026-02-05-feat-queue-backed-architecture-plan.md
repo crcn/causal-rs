@@ -328,15 +328,17 @@ External Event → engine.process() → Queue.publish()
 
 ### Components
 
-1. **Queue Trait** - Abstraction for event persistence (publish/subscribe)
-2. **PostgresQueue** - Durable implementation using SKIP LOCKED pattern
-   - Owns two worker pools (event workers + effect workers)
-   - Calls back to Engine for business logic
+1. **Runtime** - Orchestrates the system (owns workers + coordinates engine + queue)
+   - Spawns event workers and effect workers
+   - Manages lifecycle (startup, shutdown, graceful drain)
+2. **PostgresQueue** - Passive durable storage using SKIP LOCKED pattern
+   - Stores events and effect intents
+   - Workers poll from it, but it doesn't own them
 3. **Engine** - Business logic (reducers + effects)
-   - Receives queue via dependency injection
-   - Doesn't know about workers
-4. **PostgresStateStore** - Per-saga state isolation with versioning
-5. **Idempotency Layer** - ProcessedEvents + EffectExecutions tables
+   - Receives queue reference via dependency injection
+   - Stateless and reusable
+4. **PostgresStateStore** - Per-saga state isolation with versioning (embedded in PostgresQueue)
+5. **Idempotency Layer** - seesaw_events.event_id + seesaw_effect_executions tables
 
 ### Two-Phase Worker Architecture
 
@@ -357,31 +359,32 @@ Poll seesaw_effect_executions (where pending AND execute_at <= NOW) → Run Effe
 
 ### Key Design Decisions
 
-#### 1. Queue & State Store Traits (Production-Grade)
+#### 1. Concrete Types (No Trait Abstractions in v1)
 
-**Build abstractions from day one**:
+**Locked Decision**: Use concrete `PostgresQueue` and `StateStore` types in v1.
+
+**Rationale**:
+- Traits create false flexibility (Postgres IS the control plane)
+- Redis/NATS/Kafka are orthogonal (data plane, not queue replacement)
+- Generic `Q: Queue` breaks type inference for `publish(envelope: EventEnvelope)`
+- Adding abstractions prematurely creates maintenance burden
+- Can refactor to traits later if truly needed (breaking change)
+
+**Concrete API**:
 ```rust
-trait Queue: Send + Sync + Clone {
-    async fn publish(&self, event: impl Event, priority: i32, hops: i32) -> Result<()>;
-    async fn start_workers(self, event_workers: usize, effect_workers: usize, engine: Arc<Engine>) -> Result<Self>;
+pub struct PostgresQueue {
+    pool: PgPool,
 }
 
-trait StateStore<S>: Send + Sync + Clone {
-    async fn load(&self, saga_id: Uuid) -> Result<Option<(S, i32)>>;  // Returns (state, version)
-    async fn save(&self, saga_id: Uuid, state: &S, expected_version: i32) -> Result<bool>;  // Returns success
-    async fn delete(&self, saga_id: Uuid) -> Result<()>;
+impl PostgresQueue {
+    pub fn new(pool: PgPool) -> Self;
+    async fn poll_event(&self) -> Result<Option<EventEnvelope>>;
+    async fn poll_effect(&self) -> Result<Option<EffectIntent>>;
+    async fn publish(&self, envelope: EventEnvelope) -> Result<()>;
 }
 ```
 
-**Rationale**:
-- **Not YAGNI** - You WILL need multiple backends at scale
-- Postgres for control plane (orders, workflows)
-- NATS/Kafka for data plane (analytics, logs)
-- Redis for hot saga caching
-- In-memory for testing (fast, deterministic)
-- Clean boundaries enable horizontal scaling
-
-#### 2. Postgres Only (For Now)
+#### 2. Postgres Only (Production-Grade)
 
 **Don't build**: NATS, Kafka, SQS, Redis implementations
 
@@ -402,19 +405,21 @@ handle.run(|_| Ok(Event)).await?;
 handle.settled().await?;
 ```
 
-**New API** (queue-backed, keeps `process()` pattern):
+**New API** (queue-backed, Runtime owns workers):
 ```rust
-let queue = PostgresQueue::new(pool).start_workers(4, engine.clone()).await?;
-let engine = Engine::with_queue(queue, deps);
+let queue = Arc::new(PostgresQueue::new(pool));
+let engine = Engine::with_deps(deps).with_queue(queue.clone());
+let mut runtime = Runtime::new(engine.clone(), queue);
+runtime.spawn_workers(2, 4);  // 2 event workers, 4 effect workers
 
 // Process external events (webhooks, HTTP handlers)
-engine.process(|| async { Ok(Event) }).await?;
+engine.process(OrderPlaced { ... }).await?;
 
 // Shutdown
-engine.shutdown().await?;
+runtime.shutdown().await?;
 ```
 
-**Rationale**: You're the only user - no need for dual-mode support. Queue owns workers, engine processes events.
+**Rationale**: You're the only user - no need for dual-mode support. Runtime owns workers, queue is passive storage.
 
 #### 4. Framework-Guaranteed Idempotency (Critical!)
 
@@ -879,10 +884,9 @@ async fn effect_worker_loop(&self) -> Result<()> {
         .fetch_one(&self.pool)
         .await?;
 
-        // 4. Build context
+        // 4. Build context (latest state only)
         let ctx = EffectContext {
-            prev_state: state.clone(),
-            next_state: state,
+            state: state,  // Latest state from DB
             deps: self.deps.clone(),
             saga_id: event.saga_id,
             event_id: pending.event_id,
@@ -901,9 +905,33 @@ async fn effect_worker_loop(&self) -> Result<()> {
 
         match result {
             Ok(Ok(Some(next_event))) => {
-                // Effect succeeded, publish next event with incremented hops
-                self.queue.publish_with_hops(next_event, event.hops + 1).await?;
+                // ATOMIC: Insert event + mark effect complete in single transaction
+                let mut tx = self.pool.begin().await?;
 
+                // Generate deterministic event_id
+                let next_event_id = Uuid::new_v5(
+                    &NAMESPACE_SEESAW,
+                    format!("{}-{}-{}", pending.event_id, pending.effect_id,
+                            std::any::type_name_of_val(&next_event)).as_bytes()
+                );
+
+                // Insert emitted event (idempotent via event_id unique constraint)
+                sqlx::query!(
+                    "INSERT INTO seesaw_events
+                     (event_id, parent_id, saga_id, event_type, payload, hops)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (event_id) DO NOTHING",
+                    next_event_id,
+                    pending.event_id,
+                    event.saga_id,
+                    std::any::type_name_of_val(&next_event),
+                    Json(&next_event),
+                    event.hops + 1
+                )
+                .execute(&mut *tx)
+                .await?;
+
+                // Mark effect complete (same transaction)
                 sqlx::query!(
                     "UPDATE seesaw_effect_executions
                      SET status = 'completed', completed_at = NOW()
@@ -911,8 +939,10 @@ async fn effect_worker_loop(&self) -> Result<()> {
                     pending.event_id,
                     pending.effect_id
                 )
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+
+                tx.commit().await?;  // Both succeed or both fail
             }
             Ok(Ok(None)) => {
                 // Observer effect
@@ -1644,24 +1674,19 @@ async fn main() -> Result<()> {
             })
         );
 
-    // Create queue and start two-phase workers (queue owns workers)
-    let queue = PostgresQueue::new(pool)
-        .start_workers(
-            2,   // Event workers (fast - state updates)
-            20,  // Effect workers (slow - IO-bound)
-            engine.clone()
-        )
-        .await?;
-
-    // Inject queue into engine
-    let engine = engine.with_queue(queue);
+    // Create queue and runtime (Runtime owns workers)
+    let queue = Arc::new(PostgresQueue::new(pool));
+    let engine = engine.with_queue(queue.clone());
+    let mut runtime = Runtime::new(engine.clone(), queue);
+    runtime.spawn_workers(
+        2,   // Event workers (fast - state updates)
+        20,  // Effect workers (slow - IO-bound)
+    );
 
     // Process initial event - framework generates saga_id
-    let saga_id = engine.process(|| async {
-        Ok(OrderPlaced {
-            order_id: 123,
-            // No saga_id! Envelope carries it ✅
-        })
+    let saga_id = engine.process(OrderPlaced {
+        order_id: 123,
+        // No saga_id! Envelope carries it ✅
     }).await?;
 
     info!("Started saga: {}", saga_id);
@@ -1677,12 +1702,10 @@ async fn main() -> Result<()> {
 
 ```rust
 // Day 1: Order placed - NEW saga
-let saga_id = engine.process(|| async {
-    Ok(OrderPlaced {
-        order_id: Uuid::new_v4(),
-        customer_email: "user@example.com",
-        // No saga_id in event! ✅
-    })
+let saga_id = engine.process(OrderPlaced {
+    order_id: Uuid::new_v4(),
+    customer_email: "user@example.com",
+    // No saga_id in event! ✅
 }).await?;
 
 // Store saga_id for later (e.g., in your orders table)
@@ -1733,8 +1756,8 @@ async fn handle_approval_webhook(order_id: Uuid) -> Result<()> {
 effect::on::<ApprovalReceived>()
     .id("finalize_order")
     .then(|event, ctx| async move {
-        // ctx.next_state() contains accumulated state from Day 1
-        finalize_order(event.order_id, &ctx.next_state()).await?;
+        // ctx.state() loads LATEST state (accumulated since Day 1)
+        finalize_order(event.order_id, ctx.state()).await?;
 
         Ok(OrderCompleted {
             order_id: event.order_id,
@@ -1897,32 +1920,45 @@ engine.resolve_dlq(event_id, "charge_payment").await?;
 
 | v0.7 Stateless API | Queue-Backed API | Notes |
 |-------------------|------------------|-------|
-| `engine.activate(state)` | `queue.start_workers(N, engine)` | Queue owns workers, not engine |
-| `handle.run(\|_\| Ok(Event))` | `engine.process(\|\| async { Ok(Event) })` | **Keeps process() pattern!** Returns saga_id |
+| `engine.activate(state)` | `runtime.spawn_workers(N, M)` | Runtime owns workers, not queue |
+| `handle.run(\|_\| Ok(Event))` | `engine.process(event).await` | Direct event dispatch, returns saga_id |
 | `handle.settled().await` | `engine.shutdown().await` | Graceful worker drain |
 | `effect::on::<E>().then(...)` | `effect::on::<E>().id("name").then(...)` | **ID required** for idempotency |
 | Event has saga_id field | **saga_id in envelope** | Events are pure business data |
 | N/A | `ctx.saga_id`, `ctx.event_id` | Context exposes envelope metadata |
 | N/A | `ctx.idempotency_key` | UUID v5 for external API idempotency |
 
-### Queue Trait (New)
+### Runtime Methods (Owns Workers)
 
 ```rust
-trait Queue: Send + Sync + Clone {
-    // Internal: publish event to queue
-    async fn publish(&self, event: impl Event, priority: i32, hops: i32) -> Result<()>;
-
-    // Start two-phase workers
-    async fn start_workers(
-        self,
-        event_workers: usize,   // Phase 1: Event → State → Effect intents
-        effect_workers: usize,  // Phase 2: Effect intents → Effects
-        engine: Arc<Engine<S, D>>
-    ) -> Result<Self>;
+pub struct Runtime<S, D> {
+    engine: Arc<Engine<S, D>>,
+    queue: Arc<PostgresQueue>,
+    event_workers: JoinSet<()>,
+    effect_workers: JoinSet<()>,
 }
 
+impl<S, D> Runtime<S, D> {
+    pub fn new(engine: Arc<Engine<S, D>>, queue: Arc<PostgresQueue>) -> Self;
+
+    pub fn spawn_workers(&mut self, event_count: usize, effect_count: usize);
+
+    pub fn engine(&self) -> &Arc<Engine<S, D>>;
+
+    pub async fn shutdown(self) -> Result<()>;
+}
+```
+
+### PostgresQueue Methods (Passive Storage)
+
+```rust
 impl PostgresQueue {
     pub fn new(pool: PgPool) -> Self;
+
+    // Internal: Called by workers
+    async fn poll_event(&self) -> Result<Option<EventEnvelope>>;
+    async fn poll_effect(&self) -> Result<Option<EffectIntent>>;
+    async fn publish(&self, envelope: EventEnvelope) -> Result<()>;
 }
 ```
 
@@ -1932,7 +1968,8 @@ impl PostgresQueue {
 impl Engine<S, D> {
     // Setup
     pub fn new(deps: D) -> Self;
-    pub fn with_queue<Q: Queue>(self, queue: Q) -> Self;
+    pub fn with_deps(deps: D) -> Self;  // Alias for clarity
+    pub fn with_queue(self, queue: Arc<PostgresQueue>) -> Self;  // Concrete type
 
     // Process external events (entry points)
     pub async fn process(&self, event: impl Event) -> Result<Uuid>;  // Returns saga_id
@@ -2170,7 +2207,7 @@ queue.retry_from_dlq(event_id, "send_email").await?;
 ### Migration Checklist
 
 - [ ] **Remove `saga_id` from all event structs** - now in envelope
-- [ ] Create `PostgresQueue` and start workers: `queue.start_workers(N, engine)`
+- [ ] Create `Runtime` and spawn workers: `runtime.spawn_workers(event_count, effect_count)`
 - [ ] Replace `handle.run(|_| Ok(Event))` with `engine.process(event)`
 - [ ] For webhooks, use `engine.process_with_id(webhook_id, event)` for idempotency
 - [ ] Replace `handle.settled()` with `engine.shutdown()`
@@ -2454,7 +2491,7 @@ OrderPlaced { .. } => |ctx| async move {
 
 ```rust
 // Control plane (durable, transactional)
-engine.process(|| Ok(OrderPlaced { .. })).await?;  // → Postgres
+engine.process(OrderPlaced { .. }).await?;  // → Postgres
 
 // Data plane (high-volume, lossy OK)
 nats.publish("metrics.page_view", PageView { .. }).await?;  // → NATS
@@ -2740,7 +2777,7 @@ Prevention:
 ```rust
 // Simulate 1000 events/sec for 1 hour
 for _ in 0..1000 {
-    engine.process(|| Ok(OrderPlaced { .. })).await?;
+    engine.process(OrderPlaced { .. }).await?;
 }
 ```
 
@@ -2754,7 +2791,7 @@ async fn test_worker_crashes() {
 
     // Process events
     for i in 0..100 {
-        engine.process(|| Ok(Event { id: i })).await?;
+        engine.process(Event { id: i }).await?;
     }
 
     // Kill half the workers
