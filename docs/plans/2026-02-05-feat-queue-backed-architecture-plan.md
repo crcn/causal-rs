@@ -110,6 +110,193 @@ engine.start_workers(4).await?;  // New queue-backed API
 
 **Rationale**: You're the only user - no need for dual-mode support.
 
+#### 4. Framework-Guaranteed Idempotency (Critical!)
+
+**Problem**: Requiring users to handle idempotency manually is a DX footgun:
+```rust
+// BAD: Easy to forget, duplicate side effects!
+effect::on::<OrderPlaced>().then(|event, ctx| async move {
+    ctx.deps().mailer.send_email(event.email).await?;  // Could send twice!
+    Ok(EmailSent { ... })
+});
+```
+
+**Solution**: Framework guarantees idempotency automatically.
+
+**API Design**:
+```rust
+engine.with_effect(
+    effect::on::<OrderPlaced>()
+        .id("send_welcome_email")  // ← Required! Compile error if missing
+        .then(|event, ctx| async move {
+            // Write naturally - framework handles idempotency!
+            ctx.deps().mailer.send(event.email).await?;
+            Ok(EmailSent { order_id: event.order_id })
+        })
+)
+```
+
+**How it works**:
+1. Effect ID required at compile time (type-state pattern)
+2. Track executions in `seesaw_effect_executions` table
+3. Cache results, skip on replay
+4. Provide `ctx.idempotency_key` for external APIs
+
+**Schema**:
+```sql
+CREATE TABLE seesaw_effect_executions (
+    event_id UUID NOT NULL,
+    effect_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'executing',  -- executing, completed, failed
+    result JSONB,
+    error TEXT,
+    attempts INT NOT NULL DEFAULT 0,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    last_attempted_at TIMESTAMPTZ,
+    PRIMARY KEY (event_id, effect_id)
+);
+
+CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
+```
+
+**Compile-Time Enforcement**:
+```rust
+// Type-state pattern ensures .id() is called
+pub struct EffectBuilder<E, HasId> {
+    effect_id: Option<String>,
+    _phantom: PhantomData<(E, HasId)>,
+}
+
+pub struct NoId;
+pub struct HasIdTag;
+
+impl<E> EffectBuilder<E, NoId> {
+    pub fn id(self, id: &str) -> EffectBuilder<E, HasIdTag> {
+        EffectBuilder {
+            effect_id: Some(id.to_string()),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+// Can only call .then() if HasIdTag
+impl<E> EffectBuilder<E, HasIdTag> {
+    pub fn then<F>(self, handler: F) -> Effect<E> {
+        Effect {
+            id: self.effect_id.unwrap(),  // Safe - HasIdTag guarantees it
+            handler: Box::new(handler),
+        }
+    }
+}
+
+// Forget .id() → Compile error!
+effect::on::<OrderPlaced>()
+    .then(|event, ctx| { ... })  // ← Error: id() required!
+```
+
+**Runtime Idempotency**:
+```rust
+async fn run_effect_idempotent(
+    &self,
+    event_id: Uuid,
+    effect: &Effect,
+    event: &Event,
+    ctx: &Context
+) -> Result<Option<Event>> {
+    let mut tx = self.pool.begin().await?;
+
+    // Check if already executed
+    let cached = sqlx::query!(
+        "INSERT INTO seesaw_effect_executions (event_id, effect_id, status)
+         VALUES ($1, $2, 'executing')
+         ON CONFLICT (event_id, effect_id)
+         DO UPDATE SET last_attempted_at = NOW()
+         RETURNING status, result, error, attempts",
+        event_id,
+        effect.id
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    // Already completed - return cached result!
+    if cached.status == "completed" {
+        return Ok(cached.result.map(|r| deserialize(&r)?));
+    }
+
+    // Failed too many times - don't retry
+    if cached.status == "failed" && cached.attempts >= 3 {
+        return Err(anyhow!("Effect permanently failed: {}", cached.error));
+    }
+
+    // Execute effect (outside transaction - can take time)
+    match effect.handler.handle(event, ctx).await {
+        Ok(result) => {
+            // Store success
+            sqlx::query!(
+                "UPDATE seesaw_effect_executions
+                 SET status = 'completed', result = $1, completed_at = NOW()
+                 WHERE event_id = $2 AND effect_id = $3",
+                Json(&result),
+                event_id,
+                effect.id
+            )
+            .execute(&self.pool)
+            .await?;
+
+            Ok(result)
+        }
+        Err(e) => {
+            // Store failure (will retry up to 3 times)
+            sqlx::query!(
+                "UPDATE seesaw_effect_executions
+                 SET status = 'failed', error = $1, attempts = attempts + 1
+                 WHERE event_id = $2 AND effect_id = $3",
+                e.to_string(),
+                event_id,
+                effect.id
+            )
+            .execute(&self.pool)
+            .await?;
+
+            Err(e)
+        }
+    }
+}
+```
+
+**Guarantees Provided**:
+- ✅ Effects execute at-least-once (queue redelivery)
+- ✅ Results cached in database (idempotent replay)
+- ✅ Effect ID required at compile time (no footgun)
+- ✅ Idempotency key provided in context (for external APIs)
+- ✅ Automatic retry with limit (3 attempts default)
+
+**For External APIs**:
+```rust
+effect::on::<OrderPlaced>()
+    .id("charge_payment")
+    .then(|event, ctx| async move {
+        // Framework provides idempotency key = hash(event_id + effect_id)
+        ctx.deps().stripe.charge(
+            amount,
+            &ctx.idempotency_key  // ← Framework provides this!
+        ).await?;
+        Ok(PaymentCharged { order_id: event.order_id })
+    })
+```
+
+**Comparison**:
+
+| Approach | LOC | Footguns | Guarantees |
+|----------|-----|----------|------------|
+| **Manual** | 15 lines per effect | High (easy to forget) | None |
+| **Framework** | 6 lines per effect | None (compile error) | Idempotency guaranteed |
+
+**Rationale**: This is critical infrastructure. Users should never have to think about idempotency.
+
 ## Implementation Plan
 
 ### Phase 1: Core Queue (Week 1)
@@ -165,11 +352,31 @@ CREATE TABLE seesaw_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Idempotency
+-- Event idempotency
 CREATE TABLE seesaw_processed (
     event_id UUID PRIMARY KEY,
-    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    saga_id UUID NOT NULL,
+    state_committed_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Effect idempotency (framework-guaranteed)
+CREATE TABLE seesaw_effect_executions (
+    event_id UUID NOT NULL,
+    effect_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'executing',
+    result JSONB,
+    error TEXT,
+    attempts INT NOT NULL DEFAULT 0,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    last_attempted_at TIMESTAMPTZ,
+    PRIMARY KEY (event_id, effect_id)
+);
+
+CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
+CREATE INDEX idx_effect_executions_status ON seesaw_effect_executions(status, attempts);
 ```
 
 **Core methods**:
@@ -187,9 +394,9 @@ impl PostgresStateStore<S> {
 
 **Deliverable**: Can load/save state per saga
 
-### Phase 3: Worker Loop (Week 3)
+### Phase 3: Worker Loop + Effect Idempotency (Week 3)
 
-**Core logic**:
+**Core logic** (with framework-guaranteed idempotency):
 ```rust
 async fn process_next_event(&self) -> Result<()> {
     // 1. Poll next event (SKIP LOCKED)
@@ -198,42 +405,170 @@ async fn process_next_event(&self) -> Result<()> {
         return Ok(());
     };
 
-    // 2. Check idempotency
-    if self.already_processed(queued.event_id).await? {
+    // 2. Atomic event idempotency claim
+    let mut tx = self.pool.begin().await?;
+
+    let claimed = sqlx::query!(
+        "INSERT INTO seesaw_processed (event_id, saga_id)
+         VALUES ($1, $2)
+         ON CONFLICT (event_id) DO NOTHING
+         RETURNING event_id",
+        queued.event_id,
+        queued.saga_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if claimed.is_none() {
+        // Another worker claimed this event
+        tx.rollback().await?;
         self.queue.ack(queued.id).await?;
         return Ok(());
     }
 
-    // 3. Load state
-    let prev_state = self.state_store.load(queued.saga_id).await?;
+    // 3. Load state with FOR UPDATE lock
+    let (prev_state, version) = sqlx::query!(
+        "SELECT state, version FROM seesaw_state
+         WHERE saga_id = $1 FOR UPDATE",
+        queued.saga_id
+    )
+    .fetch_one(&mut *tx)
+    .await?;
 
-    // 4. Run reducer
+    // 4. Run reducer (pure, fast)
     let next_state = self.reducers.apply(prev_state.clone(), &queued.event);
 
-    // 5. Save state
-    self.state_store.save(queued.saga_id, &next_state).await?;
+    // 5. Save state with version check
+    sqlx::query!(
+        "UPDATE seesaw_state
+         SET state = $1, version = $2, updated_at = NOW()
+         WHERE saga_id = $3 AND version = $4",
+        Json(&next_state),
+        version + 1,
+        queued.saga_id,
+        version
+    )
+    .execute(&mut *tx)
+    .await?;
 
-    // 6. Run effects
+    // 6. Mark state committed
+    sqlx::query!(
+        "UPDATE seesaw_processed SET state_committed_at = NOW()
+         WHERE event_id = $1",
+        queued.event_id
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // 7. Commit transaction (state is now durable)
+    tx.commit().await?;
+
+    // 8. Run effects with framework-guaranteed idempotency
     let ctx = EffectContext {
         prev_state,
         next_state: next_state.clone(),
         deps: self.deps.clone(),
         saga_id: queued.saga_id,
+        idempotency_key: format!("{}-{}", queued.event_id, "..."),  // Per-effect
     };
 
     for effect in self.effects.handlers_for(&queued.event_type) {
-        if let Some(next_event) = effect.handle(&queued.event, &ctx).await? {
-            self.queue.publish(next_event).await?;
+        // run_effect_idempotent checks cache and skips if already executed
+        match self.run_effect_idempotent(queued.event_id, effect, &queued.event, &ctx).await {
+            Ok(Some(next_event)) => {
+                self.queue.publish(next_event).await?;
+            }
+            Ok(None) => {
+                // Observer effect or cached result was None
+            }
+            Err(e) => {
+                // Effect failed - logged but don't fail entire event
+                tracing::error!("Effect {} failed: {}", effect.id, e);
+            }
         }
     }
 
-    // 7. Mark processed
-    self.mark_processed(queued.event_id).await?;
+    // 9. Mark fully processed
+    sqlx::query!(
+        "UPDATE seesaw_processed SET completed_at = NOW()
+         WHERE event_id = $1",
+        queued.event_id
+    )
+    .execute(&self.pool)
+    .await?;
 
-    // 8. Ack
+    // 10. Ack queue
     self.queue.ack(queued.id).await?;
 
     Ok(())
+}
+
+// Helper: Run effect with idempotency guarantee
+async fn run_effect_idempotent(
+    &self,
+    event_id: Uuid,
+    effect: &Effect,
+    event: &Event,
+    ctx: &Context
+) -> Result<Option<Event>> {
+    let mut tx = self.pool.begin().await?;
+
+    // Atomic check-and-claim
+    let cached = sqlx::query!(
+        "INSERT INTO seesaw_effect_executions (event_id, effect_id, status)
+         VALUES ($1, $2, 'executing')
+         ON CONFLICT (event_id, effect_id)
+         DO UPDATE SET last_attempted_at = NOW()
+         RETURNING status, result, error, attempts",
+        event_id,
+        effect.id
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    // Already completed - return cached!
+    if cached.status == "completed" {
+        return Ok(cached.result.map(|r| deserialize(&r)?));
+    }
+
+    // Failed too many times
+    if cached.status == "failed" && cached.attempts >= 3 {
+        return Err(anyhow!("Permanently failed"));
+    }
+
+    // Execute effect
+    match effect.handler.handle(event, ctx).await {
+        Ok(result) => {
+            sqlx::query!(
+                "UPDATE seesaw_effect_executions
+                 SET status = 'completed', result = $1, completed_at = NOW()
+                 WHERE event_id = $2 AND effect_id = $3",
+                Json(&result),
+                event_id,
+                effect.id
+            )
+            .execute(&self.pool)
+            .await?;
+
+            Ok(result)
+        }
+        Err(e) => {
+            sqlx::query!(
+                "UPDATE seesaw_effect_executions
+                 SET status = 'failed', error = $1, attempts = attempts + 1
+                 WHERE event_id = $2 AND effect_id = $3",
+                e.to_string(),
+                event_id,
+                effect.id
+            )
+            .execute(&self.pool)
+            .await?;
+
+            Err(e)
+        }
+    }
 }
 ```
 

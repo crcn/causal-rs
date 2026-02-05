@@ -75,7 +75,7 @@ impl MermaidRenderer {
 
         // Group spans by component
         for chain in chains {
-            chain.walk(|span| {
+            chain.walk(&mut |span| {
                 if self.should_render(span) {
                     let component = span.component();
                     components.entry(component).or_default().push(span.clone());
@@ -115,7 +115,7 @@ impl MermaidRenderer {
 
         // Render all nodes
         for chain in chains {
-            chain.walk(|span| {
+            chain.walk(&mut |span| {
                 if self.should_render(span) {
                     let node_id = self.node_id(span);
                     if !rendered.contains(&node_id) {

@@ -170,13 +170,13 @@ pub struct CausalChain {
 
 impl CausalChain {
     /// Traverse the chain depth-first
-    pub fn walk<F>(&self, mut f: F)
+    pub fn walk<F>(&self, f: &mut F)
     where
         F: FnMut(&EventSpan),
     {
         f(&self.span);
         for child in &self.children {
-            child.walk(&mut f);
+            child.walk(f);
         }
     }
 
