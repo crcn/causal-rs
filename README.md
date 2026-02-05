@@ -442,7 +442,11 @@ let engine = QueueEngine::new(deps, store)
     )
     .with_reducer(reducer);
 
-// Wait for terminal event using LISTEN/NOTIFY
+// Pattern 1: Fire and forget - get correlation_id
+let handle = engine.process(CreateOrder { user_id: 123 }).await?;
+let correlation_id = handle.correlation_id;  // Return to client
+
+// Pattern 2: Wait for terminal event using LISTEN/NOTIFY
 let result = engine
     .process(CreateOrder { user_id: 123 })
     .wait(|event| {
@@ -457,6 +461,14 @@ let result = engine
     })
     .timeout(Duration::from_secs(30))
     .await?;
+
+// Pattern 3: Check workflow status
+let status = store.get_workflow_status(correlation_id).await?;
+println!("Workflow {} - settled: {}, pending: {}",
+    status.correlation_id,
+    status.is_settled,  // true when no effects running
+    status.pending_effects
+);
 ```
 
 **Benefits:**
@@ -464,12 +476,28 @@ let result = engine
 - **Durable**: Events survive crashes
 - **Distributed**: Multiple workers process from queue
 - **Wait for completion**: `.wait()` blocks until terminal event
+- **Status tracking**: Query workflow status at any time
+
+**Workflow Status:**
+```rust
+pub struct WorkflowStatus {
+    pub correlation_id: Uuid,
+    pub state: Option<serde_json::Value>,
+    pub pending_effects: i64,
+    pub is_settled: bool,  // true when no effects pending/executing
+    pub last_event: Option<String>,
+}
+```
+
+**Key distinction:**
+- `is_settled` - No effects running right now (workflow is idle, but can start again)
+- Terminal events - User-defined events that signal true completion (e.g., `OrderCompleted`)
 
 **EffectContext in queue-backed mode:**
 ```rust
-ctx.correlation_id        // Saga ID from event envelope
-ctx.event_id       // Current event's unique ID
-ctx.effect_id      // Effect's identifier
+ctx.correlation_id   // Workflow identifier
+ctx.event_id         // Current event's unique ID
+ctx.effect_id        // Effect's identifier
 ctx.idempotency_key  // UUID v5(event_id + effect_id) for idempotent API calls
 ```
 
