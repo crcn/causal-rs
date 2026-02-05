@@ -127,14 +127,23 @@ CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 
 **Implementation**:
 ```sql
--- Worker query enforces per-saga FIFO
-SELECT * FROM seesaw_events
+-- Worker query enforces per-saga FIFO with advisory locks
+SELECT
+    pg_advisory_xact_lock(hashtext(saga_id::text)),  -- ← Lock saga for transaction
+    *
+FROM seesaw_events
 WHERE processed_at IS NULL
   AND (locked_until IS NULL OR locked_until < NOW())
-ORDER BY saga_id, created_at ASC  -- ← Per-saga FIFO
+ORDER BY priority DESC, created_at ASC  -- Priority first, then FIFO
 LIMIT 1
 FOR UPDATE SKIP LOCKED;
 ```
+
+**How it works**:
+1. `pg_advisory_xact_lock(hash(saga_id))` acquires per-saga lock for transaction duration
+2. Only one worker can process events from a given saga at a time
+3. Other workers skip locked sagas (via SKIP LOCKED) and grab events from different sagas
+4. Ensures strict per-saga FIFO ordering
 
 **Non-Guarantee**: No **cross-saga** ordering. `saga_A.event_1` and `saga_B.event_1` may process in any order.
 
@@ -458,11 +467,24 @@ engine.with_effect(
 CREATE TABLE seesaw_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
-    status VARCHAR(50) NOT NULL DEFAULT 'executing',  -- executing, completed, failed
+    saga_id UUID NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
     result JSONB,
     error TEXT,
     attempts INT NOT NULL DEFAULT 0,
-    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Event payload (survives 30-day retention deletion)
+    event_type VARCHAR(255) NOT NULL,
+    event_payload JSONB NOT NULL,
+    parent_event_id UUID,
+
+    -- Execution properties
+    execute_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    timeout_seconds INT NOT NULL DEFAULT 30,
+    max_attempts INT NOT NULL DEFAULT 3,
+    priority INT NOT NULL DEFAULT 10,
+
+    claimed_at TIMESTAMPTZ,  -- NULL until claimed
     completed_at TIMESTAMPTZ,
     last_attempted_at TIMESTAMPTZ,
     PRIMARY KEY (event_id, effect_id)
@@ -652,7 +674,21 @@ impl PostgresQueue {
     }
 
     async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
-        // UPDATE ... FOR UPDATE SKIP LOCKED pattern
+        // Per-saga FIFO with advisory locks
+        sqlx::query_as!(
+            QueuedEvent,
+            "SELECT
+                pg_advisory_xact_lock(hashtext(saga_id::text)),
+                id, event_id, saga_id, event_type, payload, hops
+             FROM seesaw_events
+             WHERE processed_at IS NULL
+               AND (locked_until IS NULL OR locked_until < NOW())
+             ORDER BY priority DESC, created_at ASC
+             LIMIT 1
+             FOR UPDATE SKIP LOCKED"
+        )
+        .fetch_optional(&self.pool)
+        .await
     }
 
     async fn ack(&self, id: i64) -> Result<()> {
@@ -693,6 +729,11 @@ CREATE TABLE seesaw_effect_executions (
     result JSONB,
     error TEXT,
     attempts INT NOT NULL DEFAULT 0,
+
+    -- Event payload (for delayed effects >30 days)
+    event_type VARCHAR(255) NOT NULL,
+    event_payload JSONB NOT NULL,  -- ← Copied from seesaw_events, survives retention deletion
+    parent_event_id UUID,           -- For causality tracking
 
     -- Execution properties (from effect builder)
     execute_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- When to execute (for .delayed())
@@ -813,17 +854,22 @@ async fn event_worker_loop(&self) -> Result<()> {
         .execute(&mut *tx)
         .await?;
 
-        // 7. Insert effect execution intents (with execution properties)
+        // 7. Insert effect execution intents (with event payload for retention safety)
         for effect in self.effects.handlers_for(&event.event_type) {
             sqlx::query!(
                 "INSERT INTO seesaw_effect_executions (
-                    event_id, effect_id, status,
+                    event_id, effect_id, saga_id, status,
+                    event_type, event_payload, parent_event_id,
                     execute_at, timeout_seconds, max_attempts, priority
                  )
-                 VALUES ($1, $2, 'pending', $3, $4, $5, $6)
+                 VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10)
                  ON CONFLICT DO NOTHING",
                 event.event_id,
                 effect.id,
+                event.saga_id,
+                event.event_type,
+                Json(&event.payload),  // ← Copy payload (survives 30-day deletion)
+                event.parent_id,
                 Utc::now() + effect.config.delay,
                 effect.config.timeout.as_secs(),
                 effect.config.max_attempts,
@@ -868,27 +914,33 @@ async fn effect_worker_loop(&self) -> Result<()> {
             continue;
         };
 
-        // 2. Get event payload
-        let event = sqlx::query!(
-            "SELECT payload, saga_id, hops FROM seesaw_events WHERE event_id = $1",
-            pending.event_id
+        // 2. Event payload is already in pending (survives retention deletion)
+        // No need to query seesaw_events - it might have been deleted after 30 days
+        let event_payload = pending.event_payload;
+        let saga_id = pending.saga_id;
+
+        // Get hops from parent event (if still exists, otherwise default to 0)
+        let hops = sqlx::query_scalar!(
+            "SELECT hops FROM seesaw_events WHERE event_id = $1",
+            pending.parent_event_id
         )
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0);
 
         // 3. Get state for context
         let state = sqlx::query!(
             "SELECT state FROM seesaw_state WHERE saga_id = $1",
-            event.saga_id
+            saga_id
         )
         .fetch_one(&self.pool)
         .await?;
 
         // 4. Build context (latest state only)
         let ctx = EffectContext {
-            state: state,  // Latest state from DB
+            state: Arc::new(state),  // Wrap in Arc for cheap cloning (safe across .await)
             deps: self.deps.clone(),
-            saga_id: event.saga_id,
+            saga_id: saga_id,
             event_id: pending.event_id,
             idempotency_key: Uuid::new_v5(
                 &NAMESPACE_SEESAW,
@@ -900,7 +952,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
         let effect = self.effects.get(&pending.effect_id);
         let result = tokio::time::timeout(
             Duration::from_secs(pending.timeout_seconds as u64),
-            effect.handler.handle(&event.payload, &ctx)
+            effect.handler.handle(&event_payload, &ctx)
         ).await;
 
         match result {
@@ -923,10 +975,10 @@ async fn effect_worker_loop(&self) -> Result<()> {
                      ON CONFLICT (event_id) DO NOTHING",
                     next_event_id,
                     pending.event_id,
-                    event.saga_id,
+                    saga_id,
                     std::any::type_name_of_val(&next_event),
                     Json(&next_event),
-                    event.hops + 1
+                    hops + 1
                 )
                 .execute(&mut *tx)
                 .await?;
@@ -1975,6 +2027,32 @@ impl Engine<S, D> {
     pub async fn process(&self, event: impl Event) -> Result<Uuid>;  // Returns saga_id
     pub async fn process_with_id(&self, event_id: Uuid, event: impl Event) -> Result<Uuid>;
 
+    /// Process with string key (generates UUID v5 for idempotency)
+    ///
+    /// Use for webhooks with non-UUID IDs (Stripe, Twilio, etc.)
+    ///
+    /// # Example
+    /// ```rust
+    /// // Stripe webhook with string ID
+    /// engine.process_with_key(
+    ///     "stripe",  // namespace
+    ///     &webhook.id,  // "evt_1ABC..."
+    ///     PaymentReceived { ... }
+    /// ).await?;
+    /// ```
+    pub async fn process_with_key(
+        &self,
+        namespace: &str,
+        key: &str,
+        event: impl Event
+    ) -> Result<Uuid> {
+        let event_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("{}/{}", namespace, key).as_bytes()
+        );
+        self.process_with_id(event_id, event).await
+    }
+
     // Lifecycle
     pub async fn shutdown(&self) -> Result<()>;
 
@@ -2088,8 +2166,8 @@ effect::on::<CrawlEvent>()
 
 ```rust
 pub struct EffectContext<S, D> {
-    // State access (loads latest from DB)
-    state: Arc<RwLock<S>>,        // ← Latest state, loaded fresh
+    // State access (loaded fresh from DB, immutable snapshot)
+    state: Arc<S>,                // ← Latest state, safe to clone across .await
 
     // Dependencies
     pub deps: Arc<D>,
@@ -2100,10 +2178,16 @@ pub struct EffectContext<S, D> {
     pub idempotency_key: String,  // ← UUID v5(event_id + effect_id)
 }
 
-impl<S, D> EffectContext<S, D> {
-    /// Get current state (read-only reference)
-    pub fn state(&self) -> RwLockReadGuard<S> {
-        self.state.read().unwrap()
+impl<S, D> EffectContext<S, D>
+where
+    S: Clone,
+{
+    /// Get current state (cheap Arc clone, safe across .await)
+    ///
+    /// Returns Arc<S> to avoid deadlock risk from holding RwLockReadGuard across .await.
+    /// State is loaded fresh from DB by effect worker, so this is the latest state.
+    pub fn state(&self) -> Arc<S> {
+        self.state.clone()  // Arc::clone is cheap (just pointer + refcount)
     }
 
     /// Get dependencies
