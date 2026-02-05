@@ -66,6 +66,7 @@ mod effect_registry;
 mod reducer_registry;
 mod engine;
 mod task_group;
+mod process;
 
 // Service layer (action execution)
 pub mod service;
@@ -80,6 +81,7 @@ pub use reducer::Reducer;
 pub use engine::{Handle, Engine};
 pub use task_group::TaskGroup;
 pub use store::{Store, QueuedEvent, QueuedEffectExecution};
+pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
 
 // Top-level builder functions
 pub use effect::on;
