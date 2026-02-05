@@ -1,13 +1,13 @@
 //! Core types for event span tracking and visualization
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::any::TypeId;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Represents a single event execution span
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EventSpan {
     /// Unique span ID
     pub span_id: Uuid,
@@ -22,6 +22,7 @@ pub struct EventSpan {
     pub event_type: String,
 
     /// Event type ID (for filtering)
+    #[serde(skip)]
     pub event_type_id: TypeId,
 
     /// Effect name that processed this event
@@ -80,7 +81,7 @@ impl EventSpan {
 }
 
 /// A graph of event spans with causal relationships
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct SpanGraph {
     /// All spans indexed by span_id
     pub spans: HashMap<Uuid, EventSpan>,

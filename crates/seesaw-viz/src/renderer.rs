@@ -70,7 +70,7 @@ impl MermaidRenderer {
     /// Render with component subgraphs (P2 priority)
     fn render_with_components(&self, chains: &[CausalChain]) -> String {
         let mut output = String::new();
-        let mut components: HashMap<String, Vec<&EventSpan>> = HashMap::new();
+        let mut components: HashMap<String, Vec<EventSpan>> = HashMap::new();
         let mut edges = Vec::new();
 
         // Group spans by component
@@ -78,7 +78,7 @@ impl MermaidRenderer {
             chain.walk(|span| {
                 if self.should_render(span) {
                     let component = span.component();
-                    components.entry(component).or_default().push(span);
+                    components.entry(component).or_default().push(span.clone());
                 }
             });
         }

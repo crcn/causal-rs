@@ -47,13 +47,16 @@ pub struct SpanCollector<S> {
     config: CollectorConfig,
 
     /// Sender for span commands
-    tx: mpsc::Sender<SpanCommand<S>>,
+    tx: mpsc::Sender<SpanCommand>,
 
     /// Shared graph (read-only for queries)
     graph: Arc<RwLock<SpanGraph>>,
 
     /// Sampling strategy
     sampler: Arc<dyn SamplingStrategy>,
+
+    /// Phantom data to keep S type parameter
+    _phantom: std::marker::PhantomData<S>,
 }
 
 impl<S> SpanCollector<S>
@@ -89,6 +92,7 @@ where
             tx,
             graph,
             sampler: Arc::new(crate::sampling::AlwaysSample), // Default: sample everything
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -112,6 +116,7 @@ where
             tx: self.tx.clone(),
             formatter,
             sampler: Arc::clone(&self.sampler),
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -191,9 +196,10 @@ where
 /// Observer that can be attached to Seesaw's on_any() effect
 #[derive(Clone)]
 pub struct SpanObserver<S, F> {
-    tx: mpsc::Sender<SpanCommand<S>>,
+    tx: mpsc::Sender<SpanCommand>,
     formatter: F,
     sampler: Arc<dyn SamplingStrategy>,
+    _phantom: std::marker::PhantomData<S>,
 }
 
 impl<S, F> SpanObserver<S, F>
@@ -250,7 +256,7 @@ where
 }
 
 /// Commands sent to the background processor
-enum SpanCommand<S> {
+enum SpanCommand {
     Start {
         span_id: Uuid,
         event_id: Uuid,
@@ -281,13 +287,13 @@ enum SpanCommand<S> {
 }
 
 /// Background processor that builds the span graph
-struct SpanProcessor<S> {
-    rx: mpsc::Receiver<SpanCommand<S>>,
+struct SpanProcessor {
+    rx: mpsc::Receiver<SpanCommand>,
     graph: Arc<RwLock<SpanGraph>>,
     config: CollectorConfig,
 }
 
-impl<S> SpanProcessor<S> {
+impl SpanProcessor {
     async fn run(mut self) {
         let mut pending_spans: HashMap<Uuid, EventSpan> = HashMap::new();
 
@@ -393,7 +399,7 @@ impl<S> SpanProcessor<S> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectorStats {
     pub total_spans: usize,
     pub root_spans: usize,

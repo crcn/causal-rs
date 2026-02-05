@@ -6,7 +6,7 @@ license.workspace = true
 description = "Transactional outbox pattern for Seesaw framework"
 
 [dependencies]
-seesaw_core = { version = "0.7.2", path = "../seesaw" }
+seesaw_core = { version = "0.7.8", path = "../seesaw" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

@@ -29,7 +29,7 @@ pub async fn start_viewer<S>(
     addr: &str,
 ) -> Result<(), anyhow::Error>
 where
-    S: Send + 'static,
+    S: Send + Sync + 'static,
 {
     let state = Arc::new(ViewerState { collector });
 
@@ -56,14 +56,14 @@ async fn index_handler() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
-async fn graph_handler<S: Send + 'static>(
+async fn graph_handler<S: Send + Sync + 'static>(
     State(state): State<Arc<ViewerState<S>>>,
 ) -> impl IntoResponse {
     let graph = state.collector.graph().await;
     axum::Json(graph)
 }
 
-async fn diagram_handler<S: Send + 'static>(
+async fn diagram_handler<S: Send + Sync + 'static>(
     State(state): State<Arc<ViewerState<S>>>,
 ) -> impl IntoResponse {
     let graph = state.collector.graph().await;
