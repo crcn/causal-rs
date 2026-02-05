@@ -60,6 +60,7 @@
 // New module structure
 pub mod effect;
 pub mod reducer;
+pub mod store;
 
 mod effect_registry;
 mod reducer_registry;
@@ -78,6 +79,7 @@ pub use effect::{AnyEvent, Effect, EffectContext, EffectError};
 pub use reducer::Reducer;
 pub use engine::{Handle, Engine};
 pub use task_group::TaskGroup;
+pub use store::{Store, QueuedEvent, QueuedEffectExecution};
 
 // Top-level builder functions
 pub use effect::on;
