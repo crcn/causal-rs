@@ -20,11 +20,8 @@ let engine = Engine::new()
 // 2. Activate with initial state (per-execution)
 let handle = engine.activate(State::default());
 
-// 3. Run your logic - return event to dispatch
-handle.run(|_ctx| Ok(OrderPlaced { id: 123, total: 99.99 }))?;
-
-// 4. Wait for effects to complete
-handle.settled().await?;
+// 3. Process your logic - return event to dispatch, waits for effects
+handle.process(|_ctx| async { Ok(OrderPlaced { id: 123, total: 99.99 }) }).await?;
 ```
 
 ### Edge Function Pattern
@@ -42,14 +39,13 @@ fn process_webhook(payload: Webhook) -> OrderPlaced {
 
 // Execute per-request
 let handle = engine.activate(State::default());
-handle.run(|_ctx| Ok(process_webhook(payload)))?;
-handle.settled().await?;
+handle.process(|_ctx| async { Ok(process_webhook(payload)) }).await?;
 ```
 
 ### Key Differences from v0.6
 
 - **Effects return events**: Use `.then()` and return `Ok(Event)` instead of `ctx.emit()`
-- **`handle.run()` returns event**: Return the event to dispatch, not arbitrary values
+- **`handle.process()` for dispatch**: Async method that dispatches event and waits for effects
 - **`ctx.emit()` removed from public API**: Effects and edge functions return events
 - **Observer pattern**: Return `Ok(())` to dispatch nothing
 
@@ -426,6 +422,109 @@ effect::on::<WebsiteEvent>()
 
 This is normal and correct. Cross-domain coordination happens via events.
 
+## Error Handling Pattern
+
+Effects can handle errors in two ways:
+
+### Preferred: Explicit Failure Events
+
+```rust
+// Define explicit failure events
+#[derive(Clone)]
+enum OrderEvent {
+    OrderPlaced { order_id: Uuid, total: f64 },
+    PaymentCharged { order_id: Uuid },
+    PaymentChargeFailed { order_id: Uuid, reason: String },
+    OrderCancelled { order_id: Uuid, reason: String },
+}
+
+// Handle failures explicitly
+effect::on::<OrderEvent>()
+    .extract(|e| match e {
+        OrderEvent::OrderPlaced { order_id, total, .. } => Some((*order_id, *total)),
+        _ => None,
+    })
+    .then(|(order_id, total), ctx| async move {
+        match ctx.deps().payment.charge(total).await {
+            Ok(_) => Ok(OrderEvent::PaymentCharged { order_id }),
+            Err(e) => Ok(OrderEvent::PaymentChargeFailed {
+                order_id,
+                reason: e.to_string(),
+            })
+        }
+    });
+
+// Compensation
+effect::on::<OrderEvent>()
+    .extract(|e| match e {
+        OrderEvent::PaymentChargeFailed { order_id, reason, .. } => Some((*order_id, reason.clone())),
+        _ => None,
+    })
+    .then(|(order_id, reason), ctx| async move {
+        if reason.contains("network") {
+            // Retry
+            Ok(OrderEvent::PaymentRetryScheduled { order_id })
+        } else {
+            // Give up
+            Ok(OrderEvent::OrderCancelled { order_id, reason })
+        }
+    });
+```
+
+### Fallback: EffectError for Ergonomic `?` Usage
+
+```rust
+// Use ? for ergonomics
+effect::on::<OrderPlaced>().then(|order, ctx| async move {
+    ctx.deps().payment.charge(order.total).await?;  // Propagates error
+    Ok(PaymentCharged { order_id: order.id })
+})
+
+// Generic EffectError handler
+effect::on::<EffectError>()
+    .filter(|err| {
+        // Explicit retry logic
+        err.source_event_type == TypeId::of::<OrderPlaced>() &&
+        err.error.to_string().contains("timeout")
+    })
+    .then(|err, ctx| async move {
+        // Custom retry logic
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Re-emit original event or emit retry event
+        Ok(RetryScheduled)
+    });
+
+// Typed error handling
+effect::on::<EffectError>()
+    .extract(|err| {
+        // Filter by source event + error type
+        if err.source_event_type == TypeId::of::<OrderPlaced>() {
+            err.downcast::<PaymentError>()
+                .map(|pe| (err.source_event.downcast_ref::<OrderPlaced>().unwrap().clone(), pe.clone()))
+        } else {
+            None
+        }
+    })
+    .then(|(order, payment_err), ctx| async move {
+        // Domain-specific compensation based on error type
+        if payment_err.is_retryable() {
+            Ok(PaymentRetryScheduled { order_id: order.id })
+        } else {
+            Ok(OrderCancelled {
+                order_id: order.id,
+                reason: payment_err.to_string(),
+            })
+        }
+    });
+```
+
+### Guidelines
+
+1. **Use explicit failure events** for critical flows where you need fine-grained control
+2. **Use EffectError** for convenience when you just want to use `?`
+3. **Write explicit logic** - no magic helpers for "transient" or "should_retry"
+4. **Compensation effects should be infallible** - catch errors internally, don't propagate
+
 ## Role Matrix
 
 | Role    | React? | Mutate? | Returns | Listen To | Pure? |
@@ -530,8 +629,7 @@ let engine = Engine::new()
 
 // Execute per-request - return event to dispatch
 let handle = engine.activate(State::default());
-handle.run(|_ctx| Ok(MyEvent::Started { data }))?;
-handle.settled().await?;
+handle.process(|_ctx| async { Ok(MyEvent::Started { data }) }).await?;
 ```
 
 Builder methods:
@@ -541,8 +639,7 @@ Builder methods:
 - `.with_effect_registry(registry)` — Use existing effect registry
 
 Handle methods:
-- `.run(closure)` — Execute logic, return event to dispatch (or `()` for none)
-- `.process(async_closure).await` — Async version of `run()`
+- `.process(async_closure).await` — Execute logic, dispatch event, wait for effects to complete
 - `.settled().await` — Wait for all effects to complete
 - `.cancel()` — Cancel all tasks
 

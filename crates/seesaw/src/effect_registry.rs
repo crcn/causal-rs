@@ -124,6 +124,9 @@ where
 
                             envelope.ctx.within(move |handler_ctx| {
                                 async move {
+                                    // Clone event for error handling (before it's moved into handler)
+                                    let event_for_error = event.clone();
+
                                     // Run effect handler
                                     let result = (effect.handler)(event, event_type, handler_ctx.clone()).await;
 
@@ -137,12 +140,26 @@ where
                                         }
                                         Err(e) => {
                                             // Effect error - isolate it so chain continues
-                                            // Capture error for settled() to return
+                                            // Capture error for settled() to return (backwards compatibility)
                                             handler_ctx.capture_error_for_settled(&e);
 
-                                            // Call error handler if present
+                                            // Convert error to EffectError event (preserves error for downcast)
+                                            let effect_error = crate::effect::EffectError::new(
+                                                event_for_error,
+                                                event_type,
+                                                e,
+                                            );
+
+                                            // Dispatch EffectError using same path as Ok(Some(output))
+                                            let effect_error_output = crate::effect::EventOutput::new(effect_error);
+                                            handler_ctx.emit_any(effect_error_output.value, effect_error_output.type_id);
+
+                                            // Note: on_error callback is now deprecated
+                                            // Error is emitted as EffectError event instead
                                             if let Some(ref handler) = err_handler {
-                                                handler(e, event_type, handler_ctx).await;
+                                                // Create a reference error for the callback
+                                                let callback_error = anyhow::anyhow!("Effect error (see EffectError event for details)");
+                                                handler(callback_error, event_type, handler_ctx).await;
                                             }
                                         }
                                     }

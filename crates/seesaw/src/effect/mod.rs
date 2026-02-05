@@ -26,11 +26,11 @@
 //!         .then(handle_my_event)
 //! );
 //!
-//! // on_any() observer pattern (uses .run())
+//! // on_any() observer pattern
 //! store.with_effect(
 //!     effect::on_any()
 //!         .transition(|prev, next| prev.status != next.status)
-//!         .run(|event, ctx| async move { Ok(()) })
+//!         .then(|event, ctx| async move { Ok(()) })
 //! );
 //!
 //! // Group multiple effects
@@ -55,11 +55,13 @@
 
 mod builders;
 pub(crate) mod context;
+mod error_event;
 mod macros;
 mod types;
 
 pub use builders::{bridge, group, on, on_any, task};
 pub use context::EffectContext;
+pub use error_event::EffectError;
 pub use types::{AnyEvent, Effect, ErrorHandler, EventOutput};
 
 // Re-export for internal use

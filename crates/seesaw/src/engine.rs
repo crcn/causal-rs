@@ -132,31 +132,6 @@ where
     S: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    /// Execute an action that returns an event to dispatch.
-    ///
-    /// The returned event (if not `()`) will be dispatched to trigger effects.
-    /// Use `settled()` to wait for all effects to complete.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let handle = engine.activate(State::default());
-    /// handle.run(|ctx| Ok(OrderPlaced { id: 123, total: 99.99 }))?;
-    /// handle.settled().await?;
-    /// ```
-    pub fn run<F, E>(&self, f: F) -> Result<()>
-    where
-        F: FnOnce(&EffectContext<S, D>) -> Result<E>,
-        E: Send + Sync + 'static,
-    {
-        let event = f(&self.context)?;
-        // Dispatch the event if it's not ()
-        if std::any::TypeId::of::<E>() != std::any::TypeId::of::<()>() {
-            self.context.emit(event);
-        }
-        Ok(())
-    }
-
     /// Process to completion and return a value.
     ///
     /// If the returned value is an event type (not `()`), it will be dispatched
@@ -332,8 +307,7 @@ where
     ///
     /// ```ignore
     /// let handle = engine.activate(State::default());
-    /// let result = handle.run(|ctx| process_order(order, ctx))?;
-    /// handle.settled().await?;
+    /// let result = handle.process(|ctx| async { process_order(order, ctx) }).await?;
     /// ```
     pub fn activate(&self, initial_state: S) -> Handle<S, D> {
         let state = Arc::new(RwLock::new(initial_state));
@@ -630,8 +604,8 @@ mod tests {
         let handle = store.activate(Counter::default());
 
         // Use run() to dispatch events, then settled() to wait
-        handle.run(|_ctx| Ok(Increment { amount: 10 })).unwrap();
-        handle.run(|_ctx| Ok(Increment { amount: 5 })).unwrap();
+        handle.process(|_ctx| async { Ok(Increment { amount: 10 }) }).await.unwrap();
+        handle.process(|_ctx| async { Ok(Increment { amount: 5 }) }).await.unwrap();
 
         // Wait for effects
         handle.settled().await.unwrap();
@@ -3758,7 +3732,7 @@ mod tests {
             }));
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let _ = handle.settled().await; // May return error
 
@@ -3800,7 +3774,7 @@ mod tests {
             );
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let _ = handle.settled().await;
 
@@ -3821,7 +3795,7 @@ mod tests {
             }));
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let result = handle.settled().await;
 
@@ -3855,7 +3829,7 @@ mod tests {
             );
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let _ = handle.settled().await;
 
@@ -3882,7 +3856,7 @@ mod tests {
             }));
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let result = handle.settled().await;
 
@@ -3910,7 +3884,7 @@ mod tests {
             }));
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let _ = handle.settled().await;
 
@@ -3932,7 +3906,7 @@ mod tests {
         );
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let result = handle.settled().await;
 
@@ -3967,8 +3941,8 @@ mod tests {
             );
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap(); // This errors
-        handle.run(|_| Ok(TriggerEvent { id: 2 })).unwrap(); // This succeeds
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap(); // This errors
+        handle.process(|_| async { Ok(TriggerEvent { id: 2 }) }).await.unwrap(); // This succeeds
 
         let _ = handle.settled().await;
 
@@ -4000,7 +3974,7 @@ mod tests {
             );
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         // This should complete even if error handler panics
         let result = tokio::time::timeout(
@@ -4040,7 +4014,7 @@ mod tests {
             );
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let _ = handle.settled().await;
 
@@ -4075,7 +4049,7 @@ mod tests {
         }
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let result = handle.settled().await;
 
@@ -4101,7 +4075,7 @@ mod tests {
             }));
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(Increment { amount: 10 })).unwrap();
+        handle.process(|_| async { Ok(Increment { amount: 10 }) }).await.unwrap();
 
         let _ = handle.settled().await;
 
@@ -4120,7 +4094,7 @@ mod tests {
             }));
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let result = handle.settled().await;
 
@@ -4155,7 +4129,7 @@ mod tests {
             ]));
 
         let handle = engine.activate(Counter::default());
-        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+        handle.process(|_| async { Ok(TriggerEvent { id: 1 }) }).await.unwrap();
 
         let _ = handle.settled().await;
 

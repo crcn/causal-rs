@@ -51,11 +51,10 @@
 //!         Ok(UserWelcomed { name: event.name.clone() })
 //!     }));
 //!
-//! // Activate and dispatch events via run()
+//! // Activate and dispatch events via process()
 //! let handle = engine.activate(AppState::default());
-//! handle.run(|_| Ok(UserCreated { name: "Alice".into() }))?;
-//! handle.run(|_| Ok(OrderPlaced { amount: 99.99 }))?;
-//! handle.settled().await?;
+//! handle.process(|_| async { Ok(UserCreated { name: "Alice".into() }) }).await?;
+//! handle.process(|_| async { Ok(OrderPlaced { amount: 99.99 }) }).await?;
 //! ```
 
 // New module structure
@@ -75,7 +74,7 @@ pub mod service;
 pub mod otel;
 
 // Re-export main types
-pub use effect::{AnyEvent, Effect, EffectContext};
+pub use effect::{AnyEvent, Effect, EffectContext, EffectError};
 pub use reducer::Reducer;
 pub use engine::{Handle, Engine};
 pub use task_group::TaskGroup;
