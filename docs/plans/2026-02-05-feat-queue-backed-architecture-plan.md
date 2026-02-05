@@ -1662,6 +1662,75 @@ RETURNING *;
 engine.publish_with_priority(SystemReset { ... }, priority: 1).await?;  // Jump to front
 ```
 
+##### 11. State Size Wall (Gemini's Gotcha)
+
+**Problem**: Loading multi-megabyte JSONB state on every effect → IO spike → system slowdown
+
+**Symptoms**:
+- Effect latency increases as saga progresses
+- Database CPU spikes
+- Query time > 100ms for state load
+
+**Fix**: Keep state lean, store large blobs externally
+
+**Bad** (state bloat):
+```rust
+struct OrderState {
+    order_id: Uuid,
+    customer_name: String,
+    invoice_pdf: Vec<u8>,      // ❌ 2MB PDF in state
+    email_html: String,         // ❌ 50KB HTML in state
+    product_images: Vec<Vec<u8>>, // ❌ 5MB of images
+}
+```
+
+**Good** (external storage):
+```rust
+struct OrderState {
+    order_id: Uuid,
+    customer_name: String,
+    invoice_url: String,        // ✅ S3 reference only
+    email_template_id: Uuid,    // ✅ Just the ID
+    image_urls: Vec<String>,    // ✅ CDN URLs
+}
+
+// Load blobs on-demand in effects
+effect::on::<GenerateInvoice>()
+    .id("send_invoice")
+    .then(|event, ctx| async move {
+        let state = ctx.state();
+
+        // Fetch blob only when needed
+        let pdf = ctx.deps().s3.get_object(
+            "invoices",
+            &format!("{}.pdf", state.invoice_url)
+        ).await?;
+
+        ctx.deps().mailer.send_with_attachment(pdf).await?;
+        Ok(())
+    });
+```
+
+**Rule of thumb**: Keep `seesaw_state` under **10KB per saga**
+- Under 1KB: Excellent (IDs, enums, small strings)
+- 1-10KB: Good (reasonable domain data)
+- 10-100KB: Warning (consider slimming)
+- 100KB+: Critical (will impact performance at scale)
+
+**Monitoring**:
+```sql
+-- Alert on large states
+SELECT saga_id,
+       LENGTH(state::text) as state_bytes,
+       state::jsonb -> 'order_id' as order_id
+FROM seesaw_state
+WHERE LENGTH(state::text) > 10240  -- >10KB
+ORDER BY state_bytes DESC
+LIMIT 10;
+```
+
+**Invariant**: State is for **coordination data** (IDs, status, counters), not **content blobs** (PDFs, images, large text).
+
 #### Updated Estimates
 
 **Additional LOC**: ~200 LOC (production hardening)
