@@ -233,6 +233,7 @@ where
     reducers: Arc<ReducerRegistry<S>>,
     deps: Arc<D>,
     effect_registry: Arc<EffectRegistry<S, D>>,
+    error_handler: Option<crate::effect::ErrorHandler<S, D>>,
 }
 
 impl<S> Engine<S, ()>
@@ -256,7 +257,37 @@ where
             reducers: Arc::new(ReducerRegistry::new()),
             deps: Arc::new(deps),
             effect_registry: Arc::new(EffectRegistry::new()),
+            error_handler: None,
         }
+    }
+
+    /// Register an error handler called when effects return errors.
+    ///
+    /// The handler receives the error, event TypeId, and context.
+    /// It can emit failure events or log errors. The chain continues regardless.
+    /// `settled()` will still return the first error for awareness.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use seesaw::Engine;
+    ///
+    /// let engine = Engine::new()
+    ///     .on_error(|error, type_id, ctx| async move {
+    ///         tracing::error!(?error, ?type_id, "effect failed");
+    ///         ctx.emit(EffectFailed { error: error.to_string() });
+    ///     })
+    ///     .with_effect(effect::on::<MyEvent>().then(handle_event));
+    /// ```
+    pub fn on_error<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(anyhow::Error, TypeId, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.error_handler = Some(Arc::new(move |error, type_id, ctx| {
+            Box::pin(handler(error, type_id, ctx))
+        }));
+        self
     }
 
     /// Register a reducer.
@@ -338,7 +369,8 @@ where
         );
 
         // Effects subscribe to EventEnvelope<S, D>
-        self.effect_registry.start_effects(&internal_rx, &context);
+        self.effect_registry
+            .start_effects(&internal_rx, &context, self.error_handler.clone());
 
         // External interface: raw events with origin tracking for echo prevention
         let (external_tx, external_rx) = Relay::channel();
@@ -487,6 +519,7 @@ where
             reducers: self.reducers.clone(),
             deps: self.deps.clone(),
             effect_registry: self.effect_registry.clone(),
+            error_handler: self.error_handler.clone(),
         }
     }
 }
@@ -3686,6 +3719,452 @@ mod tests {
         );
 
         handle.cancel();
+    }
+
+    // =========================================================================
+    // ON_ERROR TESTS - Effect error isolation
+    // =========================================================================
+
+    #[derive(Clone, Debug)]
+    struct TriggerEvent {
+        id: u32,
+    }
+
+    #[derive(Clone, Debug)]
+    struct EffectFailed {
+        error: String,
+        event_type_id: TypeId,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SuccessEvent {
+        id: u32,
+    }
+
+    #[tokio::test]
+    async fn on_error_handler_is_called_when_effect_errors() {
+        let error_calls = Arc::new(AtomicUsize::new(0));
+        let error_calls_clone = error_calls.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(move |_error, _type_id, _ctx| {
+                let c = error_calls_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("intentional error"))
+            }));
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let _ = handle.settled().await; // May return error
+
+        assert_eq!(
+            error_calls.load(Ordering::SeqCst),
+            1,
+            "on_error handler should be called once"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_error_chain_continues_after_error() {
+        let effect_a_calls = Arc::new(AtomicUsize::new(0));
+        let effect_b_calls = Arc::new(AtomicUsize::new(0));
+        let a_clone = effect_a_calls.clone();
+        let b_clone = effect_b_calls.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_effect(
+                effect::on::<TriggerEvent>().then(move |_event, _ctx| {
+                    let c = a_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), _>(anyhow::anyhow!("effect A error"))
+                    }
+                }),
+            )
+            .with_effect(
+                effect::on::<TriggerEvent>().then(move |_event, _ctx| {
+                    let c = b_clone.clone();
+                    async move {
+                        // Small delay to ensure ordering
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            );
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let _ = handle.settled().await;
+
+        assert_eq!(effect_a_calls.load(Ordering::SeqCst), 1, "Effect A ran");
+        assert_eq!(
+            effect_b_calls.load(Ordering::SeqCst),
+            1,
+            "Effect B should run despite Effect A error"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_error_settled_returns_first_error() {
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("first error"))
+            }));
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let result = handle.settled().await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("first error"));
+    }
+
+    #[tokio::test]
+    async fn on_error_handler_can_emit_failure_events() {
+        let failure_events = Arc::new(AtomicUsize::new(0));
+        let failure_clone = failure_events.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|error, type_id, ctx| async move {
+                ctx.emit(EffectFailed {
+                    error: error.to_string(),
+                    event_type_id: type_id,
+                });
+            })
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("trigger error"))
+            }))
+            .with_effect(
+                effect::on::<EffectFailed>().then(move |_event, _ctx| {
+                    let c = failure_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            );
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let _ = handle.settled().await;
+
+        assert_eq!(
+            failure_events.load(Ordering::SeqCst),
+            1,
+            "EffectFailed event should be emitted and handled"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_error_multiple_errors_captures_first() {
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_effect(
+                effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                    // No delay - this should error first
+                    Err::<(), _>(anyhow::anyhow!("first error"))
+                }),
+            )
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                Err::<(), _>(anyhow::anyhow!("second error"))
+            }));
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let result = handle.settled().await;
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("first error"),
+            "Should capture first error"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_error_receives_correct_event_type() {
+        let captured_type_id = Arc::new(parking_lot::Mutex::new(None));
+        let type_id_clone = captured_type_id.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(move |_error, type_id, _ctx| {
+                let tid = type_id_clone.clone();
+                async move {
+                    *tid.lock() = Some(type_id);
+                }
+            })
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("error"))
+            }));
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let _ = handle.settled().await;
+
+        let captured = captured_type_id.lock().clone();
+        assert_eq!(
+            captured,
+            Some(TypeId::of::<TriggerEvent>()),
+            "Error handler should receive correct event TypeId"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_on_error_still_captures_error_for_settled() {
+        // Without on_error handler, errors should still be captured for settled()
+        let engine: Engine<Counter> = Engine::new().with_effect(
+            effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("no handler error"))
+            }),
+        );
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let result = handle.settled().await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no handler error"));
+    }
+
+    #[tokio::test]
+    async fn on_error_success_effects_still_emit_events() {
+        let success_events = Arc::new(AtomicUsize::new(0));
+        let success_clone = success_events.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_effect(
+                effect::on::<TriggerEvent>().then(|event, _ctx| async move {
+                    if event.id == 1 {
+                        Err::<SuccessEvent, _>(anyhow::anyhow!("error for id=1"))
+                    } else {
+                        Ok(SuccessEvent { id: event.id })
+                    }
+                }),
+            )
+            .with_effect(
+                effect::on::<SuccessEvent>().then(move |_event, _ctx| {
+                    let c = success_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            );
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap(); // This errors
+        handle.run(|_| Ok(TriggerEvent { id: 2 })).unwrap(); // This succeeds
+
+        let _ = handle.settled().await;
+
+        assert_eq!(
+            success_events.load(Ordering::SeqCst),
+            1,
+            "Successful effect should emit event"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_error_handler_error_is_ignored() {
+        // Error handler itself throws - shouldn't break anything
+        let effect_calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = effect_calls.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {
+                panic!("error handler panics");
+            })
+            .with_effect(
+                effect::on::<TriggerEvent>().then(move |_event, _ctx| {
+                    let c = calls_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), _>(anyhow::anyhow!("effect error"))
+                    }
+                }),
+            );
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        // This should complete even if error handler panics
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            handle.settled(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "settled() should complete");
+        assert_eq!(effect_calls.load(Ordering::SeqCst), 1, "Effect ran");
+    }
+
+    #[tokio::test]
+    async fn on_error_cascading_events_still_work() {
+        // Effect A errors, but also emits an event before erroring
+        // Effect B should handle that event
+        let effect_b_calls = Arc::new(AtomicUsize::new(0));
+        let b_clone = effect_b_calls.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_effect(
+                effect::on::<TriggerEvent>().then(|event, ctx| async move {
+                    // Emit success event before erroring
+                    ctx.emit(SuccessEvent { id: event.id });
+                    Err::<(), _>(anyhow::anyhow!("error after emit"))
+                }),
+            )
+            .with_effect(
+                effect::on::<SuccessEvent>().then(move |_event, _ctx| {
+                    let c = b_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            );
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let _ = handle.settled().await;
+
+        assert_eq!(
+            effect_b_calls.load(Ordering::SeqCst),
+            1,
+            "Cascaded event should still be handled"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_error_many_concurrent_errors() {
+        // Stress test: many effects all erroring at once
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let err_clone = error_count.clone();
+
+        let mut engine: Engine<Counter> = Engine::new()
+            .on_error(move |_error, _type_id, _ctx| {
+                let c = err_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+        // Add 10 effects that all error
+        for i in 0..10 {
+            engine = engine.with_effect(
+                effect::on::<TriggerEvent>().then(move |_event, _ctx| async move {
+                    Err::<(), _>(anyhow::anyhow!("error from effect {}", i))
+                }),
+            );
+        }
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let result = handle.settled().await;
+
+        // settled() returns first error
+        assert!(result.is_err());
+        // All error handlers should have been called
+        assert_eq!(
+            error_count.load(Ordering::SeqCst),
+            10,
+            "All 10 error handlers should be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_error_with_reducer_state_still_updates() {
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_reducer(reducer::fold::<Increment>().into(|state: Counter, event| Counter {
+                value: state.value + event.amount,
+            }))
+            .with_effect(effect::on::<Increment>().then(|_event, _ctx| async move {
+                Err::<(), _>(anyhow::anyhow!("effect error"))
+            }));
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(Increment { amount: 10 })).unwrap();
+
+        let _ = handle.settled().await;
+
+        // State should still be updated by reducer despite effect error
+        assert_eq!(handle.context.curr_state().value, 10);
+    }
+
+    #[tokio::test]
+    async fn on_error_async_errors_are_captured() {
+        // Error happens after async operation
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_effect(effect::on::<TriggerEvent>().then(|_event, _ctx| async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                Err::<(), _>(anyhow::anyhow!("async error"))
+            }));
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let result = handle.settled().await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("async error"));
+    }
+
+    #[tokio::test]
+    async fn on_error_grouped_effects_all_continue() {
+        let effect_a_calls = Arc::new(AtomicUsize::new(0));
+        let effect_b_calls = Arc::new(AtomicUsize::new(0));
+        let a_clone = effect_a_calls.clone();
+        let b_clone = effect_b_calls.clone();
+
+        let engine: Engine<Counter> = Engine::new()
+            .on_error(|_error, _type_id, _ctx| async move {})
+            .with_effect(effect::group([
+                effect::on::<TriggerEvent>().then(move |_event, _ctx| {
+                    let c = a_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), _>(anyhow::anyhow!("group effect A error"))
+                    }
+                }),
+                effect::on::<TriggerEvent>().then(move |_event, _ctx| {
+                    let c = b_clone.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            ]));
+
+        let handle = engine.activate(Counter::default());
+        handle.run(|_| Ok(TriggerEvent { id: 1 })).unwrap();
+
+        let _ = handle.settled().await;
+
+        assert_eq!(effect_a_calls.load(Ordering::SeqCst), 1, "Group effect A ran");
+        assert_eq!(
+            effect_b_calls.load(Ordering::SeqCst),
+            1,
+            "Group effect B should run despite A's error"
+        );
     }
 }
 

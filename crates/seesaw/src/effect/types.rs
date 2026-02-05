@@ -5,9 +5,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 
 use super::context::EffectContext;
+
+/// Error handler called when an effect returns an error.
+///
+/// The handler receives the error, event type that caused it, and context.
+/// It can emit failure events or log the error. The chain continues regardless.
+pub type ErrorHandler<S, D> = Arc<
+    dyn Fn(Error, TypeId, EffectContext<S, D>) -> BoxFuture<()> + Send + Sync
+>;
 
 /// A boxed future for async effect handlers.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;

@@ -125,26 +125,21 @@ impl TaskGroup {
         }
     }
 
-    /// Wait for all tasks to complete or first error.
+    /// Wait for all tasks to complete, then return first error if any.
     /// Cancels background groups when complete.
+    ///
+    /// Note: Errors don't cause early exit. All tasks complete before returning.
+    /// This ensures effect chains complete even when individual effects error.
     pub fn settled(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            // Wait for our own pending tasks
+            // Wait for all pending tasks to complete
             loop {
-                if self.error.lock().is_some() {
-                    break;
-                }
                 if self.pending.load(Ordering::Relaxed) == 0 {
                     break;
                 }
                 self.notify.notified().await;
-            }
-
-            // Check for error first
-            if let Some(err) = self.error.lock().take() {
-                return Err(err);
             }
 
             self.settled.store(true, Ordering::SeqCst);
@@ -152,6 +147,11 @@ impl TaskGroup {
             // Cancel all background groups
             for bg in self.transient_groups.lock().iter() {
                 bg.cancel();
+            }
+
+            // Return first error after all tasks complete
+            if let Some(err) = self.error.lock().take() {
+                return Err(err);
             }
 
             Ok(())

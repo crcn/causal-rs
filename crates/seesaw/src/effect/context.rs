@@ -237,6 +237,16 @@ where
             visited: self.visited.clone(),
         }
     }
+
+    /// Capture an error for `settled()` to return without stopping the chain.
+    ///
+    /// Only the first error is captured. The effect chain continues regardless.
+    pub(crate) fn capture_error_for_settled(&self, error: &anyhow::Error) {
+        // Create a new error with the same message since we can't clone anyhow::Error
+        self.tasks
+            .head_or_self()
+            .capture_error(anyhow::anyhow!("{}", error));
+    }
 }
 
 #[cfg(test)]

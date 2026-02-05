@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use parking_lot::RwLock;
 use tracing::{info_span, Instrument};
 
-use crate::effect::{Effect, EffectContext, EventEnvelope};
+use crate::effect::{Effect, EffectContext, ErrorHandler, EventEnvelope};
 use pipedream::RelayReceiver;
 
 /// Registry for storing effects.
@@ -48,7 +48,15 @@ where
     ///
     /// This subscribes each effect to the event relay and spawns background
     /// tasks to handle events.
-    pub(crate) fn start_effects(&self, relay: &RelayReceiver, ctx: &EffectContext<S, D>) {
+    ///
+    /// If `error_handler` is provided, it's called when effects error.
+    /// The chain continues regardless of errors.
+    pub(crate) fn start_effects(
+        &self,
+        relay: &RelayReceiver,
+        ctx: &EffectContext<S, D>,
+        error_handler: Option<ErrorHandler<S, D>>,
+    ) {
         // Create a transient context - tasks here don't block settled()
         // but ARE cancelled when the session settles or cancel() is called
         let bg_ctx = ctx.transient();
@@ -84,6 +92,9 @@ where
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             ready_signals.push(ready_rx);
 
+            // Clone error handler for this effect's loop
+            let err_handler_for_loop = error_handler.clone();
+
             // Spawn on background TaskGroup - this tracks the JoinHandle
             // so it gets aborted when cancel() is called or session settles
             bg_ctx.within(move |_| {
@@ -103,6 +114,7 @@ where
                             let event = envelope.event.clone();
                             let event_type = envelope.event_type;
                             let event_id = envelope.ctx.current_event_id();
+                            let err_handler = err_handler_for_loop.clone();
 
                             // Create tracing span for effect handling
                             let span = info_span!(
@@ -113,11 +125,26 @@ where
                             envelope.ctx.within(move |handler_ctx| {
                                 async move {
                                     // Run effect handler
-                                    let result = (effect.handler)(event, event_type, handler_ctx.clone()).await?;
+                                    let result = (effect.handler)(event, event_type, handler_ctx.clone()).await;
 
-                                    // If effect returned an event, dispatch it
-                                    if let Some(output) = result {
-                                        handler_ctx.emit_any(output.value, output.type_id);
+                                    match result {
+                                        Ok(Some(output)) => {
+                                            // Effect returned an event, dispatch it
+                                            handler_ctx.emit_any(output.value, output.type_id);
+                                        }
+                                        Ok(None) => {
+                                            // Observer effect, no event to dispatch
+                                        }
+                                        Err(e) => {
+                                            // Effect error - isolate it so chain continues
+                                            // Capture error for settled() to return
+                                            handler_ctx.capture_error_for_settled(&e);
+
+                                            // Call error handler if present
+                                            if let Some(ref handler) = err_handler {
+                                                handler(e, event_type, handler_ctx).await;
+                                            }
+                                        }
                                     }
 
                                     Ok(())

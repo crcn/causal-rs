@@ -546,12 +546,26 @@ where
                     let effects = effects.clone();
                     Box::pin(async move {
                         let mut last_output = None;
+                        let mut first_error: Option<anyhow::Error> = None;
                         for effect in effects.iter() {
                             if (effect.can_handle)(type_id) {
-                                if let Some(output) = (effect.handler)(value.clone(), type_id, ctx.clone()).await? {
-                                    last_output = Some(output);
+                                match (effect.handler)(value.clone(), type_id, ctx.clone()).await {
+                                    Ok(Some(output)) => {
+                                        last_output = Some(output);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        // Capture first error but continue processing
+                                        if first_error.is_none() {
+                                            first_error = Some(e);
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        // Return first error after all effects have run
+                        if let Some(err) = first_error {
+                            return Err(err);
                         }
                         Ok(last_output)
                     })
