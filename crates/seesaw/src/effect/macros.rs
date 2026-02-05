@@ -47,7 +47,7 @@
 /// ```
 #[macro_export]
 macro_rules! on {
-    // Internal: Single variant arm
+    // Internal: Single variant arm (untyped)
     (@arm $event:ident;
         [ $variant:ident { $($field:ident),* $(,)? .. } ]
         => |$ctx:ident| $body:expr
@@ -61,7 +61,21 @@ macro_rules! on {
             .then(|($($field),*), $ctx| $body)
     };
 
-    // Internal: Two variant arm (with |)
+    // Internal: Single variant arm (typed)
+    (@arm $event:ident;
+        [ $variant:ident { $($field:ident),* $(,)? .. } ]
+        => |$ctx:ident : $ty:ty| $body:expr
+    ) => {
+        $crate::effect::on::<$event>()
+            .extract(|__e| match __e {
+                $event::$variant { $($field),*, .. } => Some(($($field.clone()),*)),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .then(|($($field),*), $ctx: $ty| $body)
+    };
+
+    // Internal: Two variant arm (untyped)
     (@arm $event:ident;
         [ $variant1:ident { $($field1:ident),* $(,)? .. } | $variant2:ident { $($field2:ident),* $(,)? .. } ]
         => |$ctx:ident| $body:expr
@@ -76,7 +90,22 @@ macro_rules! on {
             .then(|($($field1),*), $ctx| $body)
     };
 
-    // Internal: Three variant arm (with |)
+    // Internal: Two variant arm (typed)
+    (@arm $event:ident;
+        [ $variant1:ident { $($field1:ident),* $(,)? .. } | $variant2:ident { $($field2:ident),* $(,)? .. } ]
+        => |$ctx:ident : $ty:ty| $body:expr
+    ) => {
+        $crate::effect::on::<$event>()
+            .extract(|__e| match __e {
+                $event::$variant1 { $($field1),*, .. } => Some(($($field1.clone()),*)),
+                $event::$variant2 { $($field2),*, .. } => Some(($($field2.clone()),*)),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .then(|($($field1),*), $ctx: $ty| $body)
+    };
+
+    // Internal: Three variant arm (untyped)
     (@arm $event:ident;
         [ $variant1:ident { $($field1:ident),* $(,)? .. } | $variant2:ident { $($field2:ident),* $(,)? .. } | $variant3:ident { $($field3:ident),* $(,)? .. } ]
         => |$ctx:ident| $body:expr
@@ -92,7 +121,23 @@ macro_rules! on {
             .then(|($($field1),*), $ctx| $body)
     };
 
-    // Internal: Four variant arm (with |)
+    // Internal: Three variant arm (typed)
+    (@arm $event:ident;
+        [ $variant1:ident { $($field1:ident),* $(,)? .. } | $variant2:ident { $($field2:ident),* $(,)? .. } | $variant3:ident { $($field3:ident),* $(,)? .. } ]
+        => |$ctx:ident : $ty:ty| $body:expr
+    ) => {
+        $crate::effect::on::<$event>()
+            .extract(|__e| match __e {
+                $event::$variant1 { $($field1),*, .. } => Some(($($field1.clone()),*)),
+                $event::$variant2 { $($field2),*, .. } => Some(($($field2.clone()),*)),
+                $event::$variant3 { $($field3),*, .. } => Some(($($field3.clone()),*)),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .then(|($($field1),*), $ctx: $ty| $body)
+    };
+
+    // Internal: Four variant arm (untyped)
     (@arm $event:ident;
         [ $variant1:ident { $($field1:ident),* $(,)? .. } | $variant2:ident { $($field2:ident),* $(,)? .. } | $variant3:ident { $($field3:ident),* $(,)? .. } | $variant4:ident { $($field4:ident),* $(,)? .. } ]
         => |$ctx:ident| $body:expr
@@ -109,11 +154,29 @@ macro_rules! on {
             .then(|($($field1),*), $ctx| $body)
     };
 
+    // Internal: Four variant arm (typed)
+    (@arm $event:ident;
+        [ $variant1:ident { $($field1:ident),* $(,)? .. } | $variant2:ident { $($field2:ident),* $(,)? .. } | $variant3:ident { $($field3:ident),* $(,)? .. } | $variant4:ident { $($field4:ident),* $(,)? .. } ]
+        => |$ctx:ident : $ty:ty| $body:expr
+    ) => {
+        $crate::effect::on::<$event>()
+            .extract(|__e| match __e {
+                $event::$variant1 { $($field1),*, .. } => Some(($($field1.clone()),*)),
+                $event::$variant2 { $($field2),*, .. } => Some(($($field2.clone()),*)),
+                $event::$variant3 { $($field3),*, .. } => Some(($($field3.clone()),*)),
+                $event::$variant4 { $($field4),*, .. } => Some(($($field4.clone()),*)),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .then(|($($field1),*), $ctx: $ty| $body)
+    };
+
     // ============================================================
     // New syntax: Event::Variant { ... } => |ctx| async move { ... }
+    // Supports optional type annotation: |ctx: Type| async move { ... }
     // ============================================================
 
-    // Single arm, single variant
+    // Single arm, single variant (untyped)
     {
         $event:ident :: $variant:ident { $($field:ident),* $(,)? .. } => |$ctx:ident| $body:expr
         $(,)?
@@ -123,7 +186,17 @@ macro_rules! on {
         ])
     }};
 
-    // Single arm, two variants with |
+    // Single arm, single variant (typed)
+    {
+        $event:ident :: $variant:ident { $($field:ident),* $(,)? .. } => |$ctx:ident : $ty:ty| $body:expr
+        $(,)?
+    } => {{
+        $crate::effect::group(vec![
+            $crate::on!(@arm $event; [ $variant { $($field),* .. } ] => |$ctx: $ty| $body)
+        ])
+    }};
+
+    // Single arm, two variants with | (untyped)
     {
         $event:ident :: $variant1:ident { $($field1:ident),* $(,)? .. } |
         $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx:ident| $body:expr
@@ -134,7 +207,18 @@ macro_rules! on {
         ])
     }};
 
-    // Single arm, three variants with |
+    // Single arm, two variants with | (typed)
+    {
+        $event:ident :: $variant1:ident { $($field1:ident),* $(,)? .. } |
+        $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx:ident : $ty:ty| $body:expr
+        $(,)?
+    } => {{
+        $crate::effect::group(vec![
+            $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } | $variant2 { $($field2),* .. } ] => |$ctx: $ty| $body)
+        ])
+    }};
+
+    // Single arm, three variants with | (untyped)
     {
         $event:ident :: $variant1:ident { $($field1:ident),* $(,)? .. } |
         $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } |
@@ -146,7 +230,19 @@ macro_rules! on {
         ])
     }};
 
-    // Single arm, four variants with |
+    // Single arm, three variants with | (typed)
+    {
+        $event:ident :: $variant1:ident { $($field1:ident),* $(,)? .. } |
+        $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } |
+        $event3:ident :: $variant3:ident { $($field3:ident),* $(,)? .. } => |$ctx:ident : $ty:ty| $body:expr
+        $(,)?
+    } => {{
+        $crate::effect::group(vec![
+            $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } | $variant2 { $($field2),* .. } | $variant3 { $($field3),* .. } ] => |$ctx: $ty| $body)
+        ])
+    }};
+
+    // Single arm, four variants with | (untyped)
     {
         $event:ident :: $variant1:ident { $($field1:ident),* $(,)? .. } |
         $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } |
@@ -156,6 +252,19 @@ macro_rules! on {
     } => {{
         $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } | $variant2 { $($field2),* .. } | $variant3 { $($field3),* .. } | $variant4 { $($field4),* .. } ] => |$ctx| $body)
+        ])
+    }};
+
+    // Single arm, four variants with | (typed)
+    {
+        $event:ident :: $variant1:ident { $($field1:ident),* $(,)? .. } |
+        $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } |
+        $event3:ident :: $variant3:ident { $($field3:ident),* $(,)? .. } |
+        $event4:ident :: $variant4:ident { $($field4:ident),* $(,)? .. } => |$ctx:ident : $ty:ty| $body:expr
+        $(,)?
+    } => {{
+        $crate::effect::group(vec![
+            $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } | $variant2 { $($field2),* .. } | $variant3 { $($field3),* .. } | $variant4 { $($field4),* .. } ] => |$ctx: $ty| $body)
         ])
     }};
 
@@ -628,6 +737,36 @@ mod tests {
                 Ok(TestEvent::ResultA { id })
             }
         });
+
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
+    }
+
+    // ============================================================
+    // Typed closure tests
+    // ============================================================
+
+    #[test]
+    fn test_on_macro_typed_closure_single_variant() {
+        let effect: Effect<TestState, TestDeps> = on! {
+            TestEvent::VariantA { id, data, .. } => |_ctx: EffectContext<TestState, TestDeps>| async move {
+                let _ = data;
+                Ok(TestEvent::ResultA { id })
+            }
+        };
+
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
+    }
+
+    #[test]
+    fn test_on_macro_typed_closure_two_variants() {
+        // When using |, all variants must have the same extracted field types
+        let effect: Effect<TestState, TestDeps> = on! {
+            TestEvent::VariantA { id, data, .. } |
+            TestEvent::VariantB { id, data, .. } => |_ctx: EffectContext<TestState, TestDeps>| async move {
+                let _ = data;
+                Ok(TestEvent::ResultA { id })
+            }
+        };
 
         assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
