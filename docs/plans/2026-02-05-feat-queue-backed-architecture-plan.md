@@ -134,7 +134,7 @@ SELECT
 FROM seesaw_events
 WHERE processed_at IS NULL
   AND (locked_until IS NULL OR locked_until < NOW())
-ORDER BY priority DESC, created_at ASC  -- Priority first, then FIFO
+ORDER BY created_at ASC  -- FIFO within available events
 LIMIT 1
 FOR UPDATE SKIP LOCKED;
 ```
@@ -324,7 +324,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 ```
 External Event → engine.process() → Queue.publish()
                                          ↓
-                                    Worker Pool (owned by Queue)
+                                    Worker Pool (owned by Runtime)
                                          ↓
                               Poll → Engine.process_event()
                                          ↓
@@ -648,21 +648,16 @@ CREATE TABLE seesaw_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed_at TIMESTAMPTZ,
     locked_until TIMESTAMPTZ,
-    retry_count INT NOT NULL DEFAULT 0,
-    priority INT NOT NULL DEFAULT 10
+    retry_count INT NOT NULL DEFAULT 0
+    -- No priority on events - priority is on effects only
 );
 
 -- Idempotency: prevent duplicate event_ids (webhooks, crash+retry)
 CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 
--- Per-saga FIFO ordering
-CREATE INDEX idx_events_saga_order
-ON seesaw_events(saga_id, created_at ASC)
-WHERE processed_at IS NULL;
-
--- Priority queue for worker polling
-CREATE INDEX idx_events_pending_priority
-ON seesaw_events(priority DESC, created_at ASC)
+-- Per-saga FIFO with advisory locks (no separate priority index needed)
+CREATE INDEX idx_events_pending
+ON seesaw_events(created_at ASC)
 WHERE processed_at IS NULL;
 ```
 
@@ -683,7 +678,7 @@ impl PostgresQueue {
              FROM seesaw_events
              WHERE processed_at IS NULL
                AND (locked_until IS NULL OR locked_until < NOW())
-             ORDER BY priority DESC, created_at ASC
+             ORDER BY created_at ASC
              LIMIT 1
              FOR UPDATE SKIP LOCKED"
         )
@@ -711,12 +706,17 @@ CREATE TABLE seesaw_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Event idempotency
+-- Event processing ledger (separate from queue)
+-- Purpose: Atomic claim + processing phase tracking + historical record
+-- Why not just use seesaw_events.processed_at?
+--   1. Atomic claim: Worker inserts here at transaction start (ON CONFLICT = already claimed)
+--   2. Phase tracking: Tracks state commit vs full completion separately
+--   3. Audit trail: Persists even after event deleted from queue (30-day retention)
 CREATE TABLE seesaw_processed (
     event_id UUID PRIMARY KEY,
     saga_id UUID NOT NULL,
-    state_committed_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
+    state_committed_at TIMESTAMPTZ,  -- When Phase 1 (reducers) completed
+    completed_at TIMESTAMPTZ,        -- When Phase 2 (all effects) completed
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -2026,32 +2026,6 @@ impl Engine<S, D> {
     // Process external events (entry points)
     pub async fn process(&self, event: impl Event) -> Result<Uuid>;  // Returns saga_id
     pub async fn process_with_id(&self, event_id: Uuid, event: impl Event) -> Result<Uuid>;
-
-    /// Process with string key (generates UUID v5 for idempotency)
-    ///
-    /// Use for webhooks with non-UUID IDs (Stripe, Twilio, etc.)
-    ///
-    /// # Example
-    /// ```rust
-    /// // Stripe webhook with string ID
-    /// engine.process_with_key(
-    ///     "stripe",  // namespace
-    ///     &webhook.id,  // "evt_1ABC..."
-    ///     PaymentReceived { ... }
-    /// ).await?;
-    /// ```
-    pub async fn process_with_key(
-        &self,
-        namespace: &str,
-        key: &str,
-        event: impl Event
-    ) -> Result<Uuid> {
-        let event_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("{}/{}", namespace, key).as_bytes()
-        );
-        self.process_with_id(event_id, event).await
-    }
 
     // Lifecycle
     pub async fn shutdown(&self) -> Result<()>;
