@@ -1233,9 +1233,88 @@ tokio::spawn(async move {
         )
         .execute(&pool)
         .await?;
+
+        // Record heartbeat (critical for monitoring)
+        sqlx::query!(
+            "INSERT INTO seesaw_reaper_heartbeat (last_run, events_reaped, effects_reaped)
+             VALUES (NOW(),
+                     (SELECT COUNT(*) FROM seesaw_events WHERE retry_count > 0),
+                     (SELECT COUNT(*) FROM seesaw_dlq))
+             ON CONFLICT (id) DO UPDATE
+             SET last_run = NOW(),
+                 events_reaped = EXCLUDED.events_reaped,
+                 effects_reaped = EXCLUDED.effects_reaped"
+        )
+        .execute(&pool)
+        .await?;
     }
 });
 ```
+
+##### 3.5. Reaper Heartbeat Monitor (Critical for Production)
+
+**Problem**: Reaper hangs → zombies accumulate → queue depth hits 100k → system dies silently
+
+**Solution**: Heartbeat table + alert on stale heartbeat
+
+**Schema**:
+```sql
+CREATE TABLE seesaw_reaper_heartbeat (
+    id INT PRIMARY KEY DEFAULT 1,  -- Single row table
+    last_run TIMESTAMPTZ NOT NULL,
+    events_reaped INT NOT NULL DEFAULT 0,
+    effects_reaped INT NOT NULL DEFAULT 0,
+    CHECK (id = 1)  -- Enforce single row
+);
+
+CREATE INDEX idx_reaper_heartbeat_last_run ON seesaw_reaper_heartbeat(last_run);
+```
+
+**Alert Query** (run every 5 minutes via monitoring):
+```sql
+-- Alert if reaper hasn't run in 3 minutes (2× expected interval)
+SELECT
+    EXTRACT(EPOCH FROM (NOW() - last_run)) as seconds_since_last_run,
+    events_reaped,
+    effects_reaped
+FROM seesaw_reaper_heartbeat
+WHERE last_run < NOW() - INTERVAL '3 minutes';
+```
+
+**Grafana/Datadog Alert**:
+```yaml
+alert: ReaperDead
+expr: time() - seesaw_reaper_last_run_seconds > 180  # 3 minutes
+severity: critical
+message: |
+  Seesaw Reaper has not run in {{ $value }}s.
+  Zombie events/effects are accumulating.
+  Check reaper process health immediately.
+```
+
+**Health Check Endpoint** (for load balancer):
+```rust
+// GET /health/reaper
+pub async fn reaper_health_check(pool: &PgPool) -> Result<StatusCode> {
+    let heartbeat = sqlx::query!(
+        "SELECT last_run FROM seesaw_reaper_heartbeat"
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let elapsed = Utc::now() - heartbeat.last_run;
+
+    if elapsed.num_seconds() > 180 {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);  // 503
+    }
+
+    Ok(StatusCode::OK)  // 200
+}
+```
+
+**Invariant**: If reaper misses 2 consecutive runs (3 minutes), the system is unhealthy. Alert immediately.
+
+---
 
 ##### 4. Transactional Effect Intents (Gemini's Fix)
 
@@ -2268,19 +2347,53 @@ async fn setup_database(pool: &PgPool) -> Result<()> {
 
 #### 1. Postgres Bloat
 **Problem**: INSERT + UPDATE = table bloat at 1000+ events/sec
-**Solution**:
-- Aggressive autovacuum
-- Partition `seesaw_events` by day, drop old partitions
-- Archive processed events after 30 days
+**The Math**:
+- 1000 events/sec = **86.4 million events/day**
+- Every event is created and then marked `processed_at` (soft delete)
+- Postgres VACUUM must reclaim 86M rows/day
+- **Without partitioning**: `DELETE FROM seesaw_events WHERE processed_at < NOW() - 30 days` will lock table for **hours**
 
+**Solution** (Mandatory, Not Optional):
+
+1. **Daily Table Partitioning** - Drop partition = instant metadata operation
 ```sql
--- Partition by day
-CREATE TABLE seesaw_events_2026_02_05 PARTITION OF seesaw_events
-FOR VALUES FROM ('2026-02-05') TO ('2026-02-06');
+-- Create partitioned table (one-time setup)
+CREATE TABLE seesaw_events (
+    id BIGSERIAL,
+    event_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- ... other columns
+) PARTITION BY RANGE (created_at);
 
--- Drop old partitions weekly
-DROP TABLE seesaw_events_2026_01_29;
+-- Create today's partition (run daily via cron)
+CREATE TABLE seesaw_events_2026_02_05 PARTITION OF seesaw_events
+FOR VALUES FROM ('2026-02-05 00:00:00') TO ('2026-02-06 00:00:00');
+
+-- Drop 30-day-old partitions (instant, no table lock)
+DROP TABLE IF EXISTS seesaw_events_2026_01_06;
 ```
+
+2. **Aggressive Autovacuum** (tune for high churn)
+```sql
+ALTER TABLE seesaw_events SET (
+    autovacuum_vacuum_scale_factor = 0.01,  -- Vacuum at 1% dead tuples (not 20%)
+    autovacuum_analyze_scale_factor = 0.005,
+    autovacuum_vacuum_cost_limit = 10000     -- Faster vacuuming
+);
+```
+
+3. **Archive Hot Partitions** (for debugging/compliance)
+```sql
+-- Weekly: archive processed events from yesterday's partition
+INSERT INTO seesaw_events_archive
+SELECT * FROM seesaw_events_2026_02_04
+WHERE processed_at IS NOT NULL;
+
+-- Then drop the partition
+DROP TABLE seesaw_events_2026_02_04;
+```
+
+**Invariant**: At 1000+ eps, partitioning is **not optional**. Without it, VACUUM becomes the bottleneck within 2 weeks.
 
 #### 2. Hot Saga Bottleneck
 **Problem**: `FOR UPDATE` on single saga serializes all events for that user
