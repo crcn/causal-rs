@@ -4,7 +4,6 @@ members = [
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
-    "crates/seesaw-outbox",
     "crates/seesaw-viz",
 ]
 resolver = "2"
