@@ -1,16 +1,17 @@
 //! Effect macros for ergonomic multi-variant matching.
 
-/// Create multiple effects from pattern-matched event variants.
+/// Create an effect group from pattern-matched event variants.
 ///
 /// This macro provides a concise way to handle multiple event variants
 /// with separate effects, avoiding verbose `.extract()` boilerplate.
+/// Returns a single grouped `Effect` that can be added directly to the engine.
 ///
 /// # Example
 ///
 /// ```ignore
 /// use seesaw::on;
 ///
-/// let effects = on! {
+/// let effect = on! {
 ///     // Multiple patterns with | - same fields required
 ///     CrawlEvent::WebsiteIngested { website_id, job_id, .. } |
 ///     CrawlEvent::WebsitePostsRegenerated { website_id, job_id, .. } => |ctx| async move {
@@ -28,8 +29,8 @@
 ///     },
 /// };
 ///
-/// // Add all effects to engine
-/// let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
+/// // Add effect directly to engine
+/// let engine = Engine::new().with_effect(effect);
 /// ```
 ///
 /// # Generated Code
@@ -117,9 +118,9 @@ macro_rules! on {
         $event:ident :: $variant:ident { $($field:ident),* $(,)? .. } => |$ctx:ident| $body:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant { $($field),* .. } ] => |$ctx| $body)
-        ]
+        ])
     }};
 
     // Single arm, two variants with |
@@ -128,9 +129,9 @@ macro_rules! on {
         $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx:ident| $body:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } | $variant2 { $($field2),* .. } ] => |$ctx| $body)
-        ]
+        ])
     }};
 
     // Single arm, three variants with |
@@ -140,9 +141,9 @@ macro_rules! on {
         $event3:ident :: $variant3:ident { $($field3:ident),* $(,)? .. } => |$ctx:ident| $body:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } | $variant2 { $($field2),* .. } | $variant3 { $($field3),* .. } ] => |$ctx| $body)
-        ]
+        ])
     }};
 
     // Single arm, four variants with |
@@ -153,9 +154,9 @@ macro_rules! on {
         $event4:ident :: $variant4:ident { $($field4:ident),* $(,)? .. } => |$ctx:ident| $body:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } | $variant2 { $($field2),* .. } | $variant3 { $($field3),* .. } | $variant4 { $($field4),* .. } ] => |$ctx| $body)
-        ]
+        ])
     }};
 
     // Two arms, both single variant
@@ -164,10 +165,10 @@ macro_rules! on {
         $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx2:ident| $body2:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event1; [ $variant1 { $($field1),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event2; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2)
-        ]
+        ])
     }};
 
     // Two arms, first has two variants with |
@@ -177,10 +178,10 @@ macro_rules! on {
         $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx2:ident| $body2:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event1a; [ $variant1a { $($field1a),* .. } | $variant1b { $($field1b),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event2; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2)
-        ]
+        ])
     }};
 
     // Two arms, first has three variants with |
@@ -191,10 +192,10 @@ macro_rules! on {
         $event2:ident :: $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx2:ident| $body2:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event1a; [ $variant1a { $($field1a),* .. } | $variant1b { $($field1b),* .. } | $variant1c { $($field1c),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event2; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2)
-        ]
+        ])
     }};
 
     // Three arms, all single variant
@@ -204,11 +205,11 @@ macro_rules! on {
         $event3:ident :: $variant3:ident { $($field3:ident),* $(,)? .. } => |$ctx3:ident| $body3:expr
         $(,)?
     } => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event1; [ $variant1 { $($field1),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event2; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2),
             $crate::on!(@arm $event3; [ $variant3 { $($field3),* .. } ] => |$ctx3| $body3)
-        ]
+        ])
     }};
 
     // ============================================================
@@ -220,9 +221,9 @@ macro_rules! on {
         $variant:ident { $($field:ident),* $(,)? .. } => |$ctx:ident| $body:expr
         $(,)?
     }) => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant { $($field),* .. } ] => |$ctx| $body)
-        ]
+        ])
     }};
 
     // Entry: two arms, first is single variant
@@ -231,10 +232,10 @@ macro_rules! on {
         $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx2:ident| $body2:expr
         $(,)?
     }) => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2)
-        ]
+        ])
     }};
 
     // Entry: two arms, first has two variants with |
@@ -244,10 +245,10 @@ macro_rules! on {
         $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx2:ident| $body2:expr
         $(,)?
     }) => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1a { $($field1a),* .. } | $variant1b { $($field1b),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2)
-        ]
+        ])
     }};
 
     // Entry: two arms, first has three variants with |
@@ -258,10 +259,10 @@ macro_rules! on {
         $variant2:ident { $($field2:ident),* $(,)? .. } => |$ctx2:ident| $body2:expr
         $(,)?
     }) => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1a { $($field1a),* .. } | $variant1b { $($field1b),* .. } | $variant1c { $($field1c),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2)
-        ]
+        ])
     }};
 
     // Entry: three arms
@@ -271,11 +272,11 @@ macro_rules! on {
         $variant3:ident { $($field3:ident),* $(,)? .. } => |$ctx3:ident| $body3:expr
         $(,)?
     }) => {{
-        vec![
+        $crate::effect::group(vec![
             $crate::on!(@arm $event; [ $variant1 { $($field1),* .. } ] => |$ctx1| $body1),
             $crate::on!(@arm $event; [ $variant2 { $($field2),* .. } ] => |$ctx2| $body2),
             $crate::on!(@arm $event; [ $variant3 { $($field3),* .. } ] => |$ctx3| $body3)
-        ]
+        ])
     }};
 }
 
@@ -333,8 +334,8 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn test_on_macro_new_syntax_generates_effects() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on! {
+    fn test_on_macro_new_syntax_generates_grouped_effect() {
+        let effect: Effect<TestState, TestDeps> = on! {
             TestEvent::VariantA { id, data, .. } |
             TestEvent::VariantB { id, data, .. } => |_ctx| async move {
                 let _ = (id, data);
@@ -347,12 +348,13 @@ mod tests {
             }
         };
 
-        assert_eq!(effects.len(), 2);
+        // Grouped effect handles TestEvent
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
 
     #[test]
     fn test_on_macro_new_syntax_can_handle() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on! {
+        let effect: Effect<TestState, TestDeps> = on! {
             TestEvent::VariantA { id, data, .. } |
             TestEvent::VariantB { id, data, .. } => |_ctx| async move {
                 let _ = (id, data);
@@ -365,15 +367,12 @@ mod tests {
             }
         };
 
-        // Both effects handle TestEvent
-        for effect in &effects {
-            assert!(effect.can_handle(TypeId::of::<TestEvent>()));
-        }
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
 
     #[tokio::test]
-    async fn test_on_macro_new_syntax_first_arm_handles_variant_a() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on! {
+    async fn test_on_macro_new_syntax_handles_variant_a() {
+        let effect: Effect<TestState, TestDeps> = on! {
             TestEvent::VariantA { id, data, .. } |
             TestEvent::VariantB { id, data, .. } => |_ctx| async move {
                 let _ = data;
@@ -392,28 +391,19 @@ mod tests {
             data: "test".into(),
         });
 
-        // First effect should handle VariantA
-        let result = effects[0]
-            .call_handler(event.clone(), TypeId::of::<TestEvent>(), ctx.clone())
+        let result = effect
+            .call_handler(event, TypeId::of::<TestEvent>(), ctx)
             .await
             .unwrap();
 
         assert!(result.is_some());
         let output = result.unwrap();
         assert_eq!(output.type_id, TypeId::of::<TestEvent>());
-
-        // Second effect should NOT handle VariantA (returns None)
-        let result2 = effects[1]
-            .call_handler(event, TypeId::of::<TestEvent>(), ctx)
-            .await
-            .unwrap();
-
-        assert!(result2.is_none());
     }
 
     #[tokio::test]
-    async fn test_on_macro_new_syntax_first_arm_handles_variant_b() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on! {
+    async fn test_on_macro_new_syntax_handles_variant_b() {
+        let effect: Effect<TestState, TestDeps> = on! {
             TestEvent::VariantA { id, data, .. } |
             TestEvent::VariantB { id, data, .. } => |_ctx| async move {
                 let _ = data;
@@ -432,8 +422,7 @@ mod tests {
             data: "other".into(),
         });
 
-        // First effect should also handle VariantB (via | pattern)
-        let result = effects[0]
+        let result = effect
             .call_handler(event, TypeId::of::<TestEvent>(), ctx)
             .await
             .unwrap();
@@ -442,8 +431,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_macro_new_syntax_second_arm_handles_variant_c() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on! {
+    async fn test_on_macro_new_syntax_handles_variant_c() {
+        let effect: Effect<TestState, TestDeps> = on! {
             TestEvent::VariantA { id, data, .. } |
             TestEvent::VariantB { id, data, .. } => |_ctx| async move {
                 let _ = data;
@@ -462,37 +451,29 @@ mod tests {
             items: vec!["a".into(), "b".into()],
         });
 
-        // First effect should NOT handle VariantC
-        let result1 = effects[0]
-            .call_handler(event.clone(), TypeId::of::<TestEvent>(), ctx.clone())
-            .await
-            .unwrap();
-        assert!(result1.is_none());
-
-        // Second effect should handle VariantC
-        let result2 = effects[1]
+        let result = effect
             .call_handler(event, TypeId::of::<TestEvent>(), ctx)
             .await
             .unwrap();
-        assert!(result2.is_some());
+
+        assert!(result.is_some());
     }
 
     #[test]
     fn test_on_macro_new_syntax_single_arm() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on! {
+        let effect: Effect<TestState, TestDeps> = on! {
             TestEvent::VariantA { id, data, .. } => |_ctx| async move {
                 let _ = data;
                 Ok(TestEvent::ResultA { id })
             }
         };
 
-        assert_eq!(effects.len(), 1);
-        assert!(effects[0].can_handle(TypeId::of::<TestEvent>()));
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
 
     #[test]
     fn test_on_macro_new_syntax_three_arms() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on! {
+        let effect: Effect<TestState, TestDeps> = on! {
             TestEvent::VariantA { id, data, .. } => |_ctx| async move {
                 let _ = data;
                 Ok(TestEvent::ResultA { id })
@@ -507,7 +488,7 @@ mod tests {
             }
         };
 
-        assert_eq!(effects.len(), 3);
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
 
     // ============================================================
@@ -515,8 +496,8 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn test_on_macro_legacy_generates_effects() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on!(TestEvent {
+    fn test_on_macro_legacy_generates_grouped_effect() {
+        let effect: Effect<TestState, TestDeps> = on!(TestEvent {
             VariantA { id, data, .. } |
             VariantB { id, data, .. } => |_ctx| async move {
                 let _ = (id, data);
@@ -529,12 +510,12 @@ mod tests {
             }
         });
 
-        assert_eq!(effects.len(), 2);
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
 
     #[test]
     fn test_on_macro_legacy_can_handle() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on!(TestEvent {
+        let effect: Effect<TestState, TestDeps> = on!(TestEvent {
             VariantA { id, data, .. } |
             VariantB { id, data, .. } => |_ctx| async move {
                 let _ = (id, data);
@@ -547,15 +528,12 @@ mod tests {
             }
         });
 
-        // Both effects handle TestEvent
-        for effect in &effects {
-            assert!(effect.can_handle(TypeId::of::<TestEvent>()));
-        }
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
 
     #[tokio::test]
-    async fn test_on_macro_legacy_first_arm_handles_variant_a() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on!(TestEvent {
+    async fn test_on_macro_legacy_handles_variant_a() {
+        let effect: Effect<TestState, TestDeps> = on!(TestEvent {
             VariantA { id, data, .. } |
             VariantB { id, data, .. } => |_ctx| async move {
                 let _ = data;
@@ -574,28 +552,19 @@ mod tests {
             data: "test".into(),
         });
 
-        // First effect should handle VariantA
-        let result = effects[0]
-            .call_handler(event.clone(), TypeId::of::<TestEvent>(), ctx.clone())
+        let result = effect
+            .call_handler(event, TypeId::of::<TestEvent>(), ctx)
             .await
             .unwrap();
 
         assert!(result.is_some());
         let output = result.unwrap();
         assert_eq!(output.type_id, TypeId::of::<TestEvent>());
-
-        // Second effect should NOT handle VariantA (returns None)
-        let result2 = effects[1]
-            .call_handler(event, TypeId::of::<TestEvent>(), ctx)
-            .await
-            .unwrap();
-
-        assert!(result2.is_none());
     }
 
     #[tokio::test]
-    async fn test_on_macro_legacy_first_arm_handles_variant_b() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on!(TestEvent {
+    async fn test_on_macro_legacy_handles_variant_b() {
+        let effect: Effect<TestState, TestDeps> = on!(TestEvent {
             VariantA { id, data, .. } |
             VariantB { id, data, .. } => |_ctx| async move {
                 let _ = data;
@@ -614,8 +583,7 @@ mod tests {
             data: "other".into(),
         });
 
-        // First effect should also handle VariantB (via | pattern)
-        let result = effects[0]
+        let result = effect
             .call_handler(event, TypeId::of::<TestEvent>(), ctx)
             .await
             .unwrap();
@@ -624,8 +592,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_macro_legacy_second_arm_handles_variant_c() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on!(TestEvent {
+    async fn test_on_macro_legacy_handles_variant_c() {
+        let effect: Effect<TestState, TestDeps> = on!(TestEvent {
             VariantA { id, data, .. } |
             VariantB { id, data, .. } => |_ctx| async move {
                 let _ = data;
@@ -644,31 +612,23 @@ mod tests {
             items: vec!["a".into(), "b".into()],
         });
 
-        // First effect should NOT handle VariantC
-        let result1 = effects[0]
-            .call_handler(event.clone(), TypeId::of::<TestEvent>(), ctx.clone())
-            .await
-            .unwrap();
-        assert!(result1.is_none());
-
-        // Second effect should handle VariantC
-        let result2 = effects[1]
+        let result = effect
             .call_handler(event, TypeId::of::<TestEvent>(), ctx)
             .await
             .unwrap();
-        assert!(result2.is_some());
+
+        assert!(result.is_some());
     }
 
     #[test]
     fn test_on_macro_legacy_single_arm() {
-        let effects: Vec<Effect<TestState, TestDeps>> = on!(TestEvent {
+        let effect: Effect<TestState, TestDeps> = on!(TestEvent {
             VariantA { id, data, .. } => |_ctx| async move {
                 let _ = data;
                 Ok(TestEvent::ResultA { id })
             }
         });
 
-        assert_eq!(effects.len(), 1);
-        assert!(effects[0].can_handle(TypeId::of::<TestEvent>()));
+        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
     }
 }
