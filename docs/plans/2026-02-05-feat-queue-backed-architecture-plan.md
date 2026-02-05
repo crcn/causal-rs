@@ -3743,6 +3743,242 @@ engine.process(AnalyticsEvent::PageViewed { .. }).await?;
 
 ---
 
+### 8. Real-World Examples (MN Together Codebase)
+
+These examples show how the `.wait()` API integrates with GraphQL resolvers in a production Rails-like Rust application.
+
+#### Example 1: Submit Resource Link (Public User)
+
+Public users submit URLs for scraping. Wait for AI extraction to complete:
+
+```rust
+// packages/server/src/domains/listings/edges/graphql.rs
+
+#[Object]
+impl ListingMutation {
+    /// Public users submit resource URLs (no auth required)
+    async fn submit_resource_link(
+        &self,
+        ctx: &Context<'_>,
+        url: String,
+        context: Option<String>,
+        submitter_contact: Option<String>,
+    ) -> Result<SubmitResourceLinkResult> {
+        let engine = ctx.data::<Arc<Engine<AppState, ServerDeps, PostgresStore>>>()?;
+
+        engine
+            .process(ListingEvent::SubmitResourceLinkRequested {
+                url,
+                context,
+                submitter_contact,
+            })
+            .wait(|event: &ListingEvent| match event {
+                ListingEvent::ResourceLinkListingsExtracted { listings, .. } => {
+                    Some(Ok(SubmitResourceLinkResult {
+                        success: true,
+                        listings_count: listings.len(),
+                        message: format!("Extracted {} listings", listings.len()),
+                    }))
+                }
+                ListingEvent::ResourceLinkScrapeFailed { reason, .. } => {
+                    Some(Err(anyhow!("Scraping failed: {}", reason)))
+                }
+                _ => None, // Keep waiting for terminal event
+            })
+            .timeout(Duration::from_secs(300))
+            .await
+    }
+}
+```
+
+**User experience**: GraphQL mutation blocks until scraping + AI extraction completes, returns immediate feedback.
+
+---
+
+#### Example 2: Scrape Source (Admin Dashboard)
+
+Admin triggers manual scrape of organization. Wait for full pipeline (scrape → extract → sync):
+
+```rust
+#[Object]
+impl ListingMutation {
+    /// Admin triggers manual scrape of an organization
+    #[graphql(guard = "AdminGuard")]
+    async fn scrape_source(
+        &self,
+        ctx: &Context<'_>,
+        source_id: Uuid,
+    ) -> Result<ScrapeSummary> {
+        let engine = ctx.data::<Arc<Engine<AppState, ServerDeps, PostgresStore>>>()?;
+        let user_id = ctx.data::<UserId>()?;
+        let job_id = Uuid::new_v4();
+
+        engine
+            .process(ListingEvent::ScrapeSourceRequested {
+                source_id,
+                job_id,
+                requested_by: *user_id,
+                is_admin: true,
+            })
+            .wait(|event: &ListingEvent| match event {
+                ListingEvent::ListingsSynced {
+                    new_count,
+                    changed_count,
+                    disappeared_count,
+                    ..
+                } => Some(Ok(ScrapeSummary {
+                    new_listings: *new_count,
+                    updated_listings: *changed_count,
+                    removed_listings: *disappeared_count,
+                })),
+                ListingEvent::ScrapeFailed { reason, .. } => {
+                    Some(Err(anyhow!("Scrape failed: {}", reason)))
+                }
+                ListingEvent::ExtractFailed { reason, .. } => {
+                    Some(Err(anyhow!("Extract failed: {}", reason)))
+                }
+                ListingEvent::SyncFailed { reason, .. } => {
+                    Some(Err(anyhow!("Sync failed: {}", reason)))
+                }
+                _ => None,
+            })
+            .timeout(Duration::from_secs(600))
+            .await
+    }
+}
+```
+
+**User experience**: Admin clicks "Scrape Now" → spinner shows → returns counts (5 new, 2 updated, 1 removed).
+
+---
+
+#### Example 3: Approve Listing (Admin Workflow)
+
+Admin approves pending listing. Wait for post creation, then fetch from read model:
+
+```rust
+#[Object]
+impl ListingMutation {
+    /// Admin approves a pending listing (creates post)
+    #[graphql(guard = "AdminGuard")]
+    async fn approve_listing(
+        &self,
+        ctx: &Context<'_>,
+        listing_id: Uuid,
+    ) -> Result<Post> {
+        let engine = ctx.data::<Arc<Engine<AppState, ServerDeps, PostgresStore>>>()?;
+        let pool = ctx.data::<PgPool>()?;
+        let user_id = ctx.data::<UserId>()?;
+
+        let post_id = engine
+            .process(ListingEvent::ApproveListingRequested {
+                listing_id,
+                requested_by: *user_id,
+                is_admin: true,
+            })
+            .wait(|event: &ListingEvent| match event {
+                ListingEvent::PostCreated { post_id, .. } => Some(Ok(*post_id)),
+                ListingEvent::AuthorizationDenied { reason, .. } => {
+                    Some(Err(anyhow!("Permission denied: {}", reason)))
+                }
+                _ => None,
+            })
+            .timeout(Duration::from_secs(10))
+            .await?;
+
+        // Fetch created post from DB (read model)
+        let post = sqlx::query_as!(Post, "SELECT * FROM posts WHERE id = $1", post_id)
+            .fetch_one(pool)
+            .await?;
+
+        Ok(post)
+    }
+}
+```
+
+**User experience**: Admin clicks "Approve" → post appears immediately in dashboard with generated content.
+
+---
+
+#### Example 4: Intelligent Site Crawler (Multi-Phase)
+
+Admin triggers intelligent crawler. Wait for full pipeline (crawl → detect → extract → resolve):
+
+```rust
+#[Object]
+impl ListingMutation {
+    /// Admin triggers intelligent site crawler
+    #[graphql(guard = "AdminGuard")]
+    async fn crawl_site(
+        &self,
+        ctx: &Context<'_>,
+        url: String,
+    ) -> Result<CrawlResult> {
+        let engine = ctx.data::<Arc<Engine<AppState, ServerDeps, PostgresStore>>>()?;
+        let job_id = Uuid::new_v4();
+
+        engine
+            .process(ListingEvent::SiteCrawlRequested { url, job_id })
+            .wait(|event: &ListingEvent| match event {
+                ListingEvent::RelationshipsResolved { extraction_ids, .. } => {
+                    Some(Ok(CrawlResult {
+                        success: true,
+                        extractions_count: extraction_ids.len(),
+                        job_id,
+                    }))
+                }
+                ListingEvent::SiteCrawlFailed { reason, .. } => {
+                    Some(Err(anyhow!("Crawl failed: {}", reason)))
+                }
+                ListingEvent::InformationDetectionFailed { reason, .. } => {
+                    Some(Err(anyhow!("Detection failed: {}", reason)))
+                }
+                _ => None,
+            })
+            .timeout(Duration::from_secs(900))
+            .await
+    }
+}
+```
+
+**User experience**: Admin submits domain → spinner for 2-3 minutes → returns extracted opportunities count.
+
+---
+
+#### Example 5: Fire-and-Forget Analytics
+
+Track post views without waiting (no response needed):
+
+```rust
+#[Object]
+impl ListingMutation {
+    /// Track post view (fire-and-forget)
+    async fn track_post_view(&self, ctx: &Context<'_>, post_id: Uuid) -> Result<bool> {
+        let engine = ctx.data::<Arc<Engine<AppState, ServerDeps, PostgresStore>>>()?;
+
+        // Fire-and-forget - no wait needed
+        engine
+            .process(ListingEvent::PostViewedRequested { post_id })
+            .await?;
+
+        Ok(true)
+    }
+}
+```
+
+**User experience**: Instant response, analytics processed asynchronously in background.
+
+---
+
+**Key Benefits**:
+1. **No polling** - GraphQL subscriptions not needed, LISTEN/NOTIFY handles it
+2. **Type-safe** - Compiler ensures all terminal events handled
+3. **Clear UX** - Admin actions show immediate results, not "queued for processing"
+4. **Error handling** - Authorization, scrape failures, timeouts all handled gracefully
+5. **Observable** - Can add logging in match arms for debugging
+
+---
+
 ## Decision: GO
 
 **Recommendation**: Build the queue-backed version with production hardening.
