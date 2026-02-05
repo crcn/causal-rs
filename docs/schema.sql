@@ -44,6 +44,29 @@ COMMENT ON TABLE seesaw_events IS 'Event queue - workers poll with SKIP LOCKED f
 COMMENT ON COLUMN seesaw_events.hops IS 'Incremented on each event emission - DLQ after 50 to prevent infinite loops';
 COMMENT ON COLUMN seesaw_events.saga_id IS 'Envelope metadata - groups related events into a workflow';
 
+-- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
+-- Enables engine.process(event).wait::<TerminalEvent>().await
+CREATE OR REPLACE FUNCTION notify_saga_event()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify(
+        'seesaw_saga_' || NEW.saga_id::text,
+        json_build_object(
+            'event_type', NEW.event_type,
+            'payload', NEW.payload
+        )::text
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER seesaw_events_notify
+    AFTER INSERT ON seesaw_events
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_saga_event();
+
+COMMENT ON FUNCTION notify_saga_event IS 'Push notification for wait() pattern - enables CQRS without polling';
+
 -- Create initial partitions (daily partitions - must create before inserts)
 -- In production, automate partition creation (cron job or pg_partman)
 CREATE TABLE seesaw_events_2026_02_05 PARTITION OF seesaw_events

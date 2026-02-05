@@ -659,6 +659,26 @@ CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 CREATE INDEX idx_events_pending
 ON seesaw_events(created_at ASC)
 WHERE processed_at IS NULL;
+
+-- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
+CREATE OR REPLACE FUNCTION notify_saga_event()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify(
+        'seesaw_saga_' || NEW.saga_id::text,
+        json_build_object(
+            'event_type', NEW.event_type,
+            'payload', NEW.payload
+        )::text
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER seesaw_events_notify
+    AFTER INSERT ON seesaw_events
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_saga_event();
 ```
 
 **Core methods**:
@@ -1940,6 +1960,56 @@ effect::on::<OrderPlaced>()
     });
 ```
 
+### CQRS Pattern with Wait (Read-After-Write Consistency)
+
+**Problem**: Queue-backed architecture is eventually consistent. How do you ensure state is updated before querying?
+
+**Solution**: Use `.wait()` to block until terminal event is emitted (state guaranteed committed).
+
+```rust
+// ❌ Eventual consistency - state might not be ready yet
+engine.process(CreateOrder { user_id: 123 });
+let order = db.query_order(order_id).await?;  // Might return None!
+
+// ✅ Wait for terminal event - state guaranteed updated
+let order = engine
+    .process(CreateOrder { user_id: 123 })
+    .wait::<OrderCreated>()
+    .timeout(Duration::from_secs(30))
+    .await?;
+
+// ✅ Handle success or failure
+use seesaw::matches;
+let result = engine
+    .process(CreateOrder { user_id: 123 })
+    .wait(matches! {
+        OrderCreated(order) => Ok(order),
+        OrderFailed(err) => Err(anyhow!("Order creation failed: {}", err.reason)),
+        PaymentDeclined(decline) => Err(anyhow!("Payment declined: {}", decline.reason)),
+    })
+    .await?;
+
+// ✅ Builder pattern for multiple terminal events
+let result = engine
+    .process(CreateOrder { user_id: 123 })
+    .wait_any()
+    .on::<OrderCreated>(|order| Ok(order))
+    .on::<OrderFailed>(|err| Err(anyhow!("Failed: {}", err.reason)))
+    .on::<PaymentDeclined>(|decline| Err(anyhow!("Declined: {}", decline.reason)))
+    .timeout(Duration::from_secs(30))
+    .await?;
+```
+
+**How It Works**:
+1. `.wait()` subscribes to `LISTEN seesaw_saga_{saga_id}` **before** publishing
+2. `process()` publishes event to queue
+3. Workers process event → reducers update state → effects run → terminal event emitted
+4. Trigger fires `NOTIFY seesaw_saga_{saga_id}` with event payload
+5. `.wait()` receives notification, returns typed event
+6. ✅ State is guaranteed committed (terminal event = workflow done)
+
+**Performance**: Push-based (LISTEN/NOTIFY), not polling. Zero overhead when not using `.wait()`.
+
 ### Priority Handling
 
 **Decision**: Priority is set on **effects**, not on external events.
@@ -2042,8 +2112,9 @@ engine.resolve_dlq(event_id, "charge_payment").await?;
 | v0.7 Stateless API | Queue-Backed API | Notes |
 |-------------------|------------------|-------|
 | `engine.activate(state)` | `runtime.spawn_workers(N, M)` | Runtime owns workers, not queue |
-| `handle.run(\|_\| Ok(Event))` | `engine.process(event).await` | Direct event dispatch, returns saga_id |
-| `handle.settled().await` | `engine.shutdown().await` | Graceful worker drain |
+| `handle.run(\|_\| Ok(Event))` | `engine.process(event)` | Fire-and-forget (no await) |
+| `handle.settled().await` | `engine.process(e).wait::<E>().await` | Wait for terminal event via LISTEN/NOTIFY |
+| N/A | `engine.shutdown().await` | Graceful worker drain |
 | `effect::on::<E>().then(...)` | `effect::on::<E>().id("name").then(...)` | **ID required** for idempotency |
 | Event has saga_id field | **saga_id in envelope** | Events are pure business data |
 | N/A | `ctx.saga_id`, `ctx.event_id` | Context exposes envelope metadata |
@@ -2093,8 +2164,7 @@ impl Engine<S, D> {
     pub fn with_queue(self, queue: Arc<PostgresQueue>) -> Self;  // Concrete type
 
     // Process external events (entry points)
-    pub async fn process(&self, event: impl Event) -> Result<Uuid>;  // Returns saga_id
-    pub async fn process_with_id(&self, event_id: Uuid, event: impl Event) -> Result<Uuid>;
+    pub fn process(&self, event: impl Event) -> ProcessHandle;  // Returns handle for wait/fire-and-forget
 
     // Lifecycle
     pub async fn shutdown(&self) -> Result<()>;
@@ -2102,6 +2172,119 @@ impl Engine<S, D> {
     // Internal: called by workers (not public API)
     async fn process_event(&self, envelope: EventEnvelope) -> Result<Vec<Event>>;
 }
+
+// ProcessHandle - enables wait or fire-and-forget patterns
+pub struct ProcessHandle {
+    queue: Arc<PostgresQueue>,
+    saga_id: Uuid,
+    event: Box<dyn Event>,
+}
+
+impl ProcessHandle {
+    // Wait for specific terminal event (type-safe)
+    pub fn wait<E: Event>(self) -> WaitHandle<E>;
+
+    // Wait for multiple terminal events with pattern matching
+    pub fn wait<R>(self, matcher: impl EventMatcher<R>) -> WaitHandle<R>;
+
+    // Wait for any of multiple event types (builder pattern)
+    pub fn wait_any(self) -> WaitAnyHandle;
+}
+
+// Drop impl publishes event asynchronously (fire-and-forget)
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // Spawns background task to publish event
+    }
+}
+
+// WaitHandle - awaitable future that publishes event and waits for terminal event
+pub struct WaitHandle<E> {
+    queue: Arc<PostgresQueue>,
+    saga_id: Uuid,
+    event: Box<dyn Event>,
+    timeout: Option<Duration>,
+}
+
+impl<E: Event> WaitHandle<E> {
+    pub fn timeout(self, duration: Duration) -> Self;
+}
+
+// Implements IntoFuture - publishes event, then waits via LISTEN/NOTIFY
+impl<E: Event> IntoFuture for WaitHandle<E> {
+    type Output = Result<E>;
+    // ... LISTEN/NOTIFY implementation
+}
+
+// WaitAnyHandle - builder for matching multiple terminal events
+pub struct WaitAnyHandle {
+    queue: Arc<PostgresQueue>,
+    saga_id: Uuid,
+    event: Box<dyn Event>,
+    matchers: Vec<Box<dyn EventMatcher>>,
+    timeout: Option<Duration>,
+}
+
+impl WaitAnyHandle {
+    pub fn on<E: Event, R>(self, handler: impl Fn(E) -> Result<R>) -> Self;
+    pub fn timeout(self, duration: Duration) -> Self;
+}
+
+impl<R> IntoFuture for WaitAnyHandle {
+    type Output = Result<R>;
+    // Waits for first matching event, applies handler
+}
+
+// Trait for matching events (supports matches! macro)
+pub trait EventMatcher<R> {
+    fn try_match(&self, event: &dyn Event) -> Option<Result<R>>;
+}
+
+// Macro for ergonomic pattern matching
+#[macro_export]
+macro_rules! matches {
+    ($($pattern:pat => $result:expr),+ $(,)?) => {
+        // Generates EventMatcher implementation
+    };
+}
+```
+
+**Usage Patterns**:
+
+```rust
+// Fire-and-forget (no await, publishes on drop)
+engine.process(OrderPlaced { ... });
+
+// Wait for terminal event (CQRS-friendly)
+let order = engine
+    .process(OrderPlaced { ... })
+    .wait::<OrderCreated>()
+    .await?;
+
+// With timeout
+let order = engine
+    .process(OrderPlaced { ... })
+    .wait::<OrderCreated>()
+    .timeout(Duration::from_secs(30))
+    .await?;
+
+// Handle multiple terminal events (success or failure)
+use seesaw::matches;
+let result = engine
+    .process(OrderPlaced { ... })
+    .wait(matches! {
+        OrderCreated(order) => Ok(order),
+        OrderFailed(err) => Err(anyhow!("Order failed: {}", err.reason)),
+    })
+    .await?;
+
+// Alternative: wait_any with type-safe matching
+let result = engine
+    .process(OrderPlaced { ... })
+    .wait_any()
+    .on::<OrderCreated>(|order| Ok(order))
+    .on::<OrderFailed>(|err| Err(anyhow!("Failed: {}", err.reason)))
+    .await?;
 ```
 
 ### EffectBuilder Changes
