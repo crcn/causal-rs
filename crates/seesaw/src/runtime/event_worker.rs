@@ -44,7 +44,7 @@ where
 
 impl<S, D, St> EventWorker<S, D, St>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + Default + 'static,
     D: Send + Sync + 'static,
     St: Store,
 {
