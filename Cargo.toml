@@ -4,7 +4,7 @@ members = [
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
-    "crates/seesaw-viz",
+    "crates/seesaw-viz", "crates/seesaw-postgres",
 ]
 resolver = "2"
 
