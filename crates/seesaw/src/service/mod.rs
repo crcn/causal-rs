@@ -80,8 +80,8 @@ where
         Ret: ActionResult<Data> + Send + Sync + 'static,
         Data: Send + Sync + 'static,
     {
-        let store = Engine::with_deps(self.kernel.clone())
-            .with_effect_registry(self.registry.clone());
+        let store =
+            Engine::with_deps(self.kernel.clone()).with_effect_registry(self.registry.clone());
 
         let session = store.activate(initial_state);
         let ret = (action.action)(action.opts, session.context.clone()).await?;
@@ -186,8 +186,8 @@ mod tests {
         #[derive(Clone, Debug)]
         struct TriggerEvent;
 
-        let service: Service<TestState, TestKernel> =
-            Service::new(TestKernel).with_effect(effect::on::<TriggerEvent>().then(|_, _| async {
+        let service: Service<TestState, TestKernel> = Service::new(TestKernel)
+            .with_effect(effect::on::<TriggerEvent>().then(|_, _| async {
                 Err::<(), _>(anyhow::anyhow!("effect error during action"))
             }));
 

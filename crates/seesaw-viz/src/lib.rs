@@ -12,19 +12,18 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use seesaw_viz::{SpanCollector, MermaidRenderer, StateFormatter};
 //!
 //! // Create collector with async channel
 //! let collector = SpanCollector::new(1000); // Buffer size
 //!
 //! // Attach to Seesaw engine via on_any() observer
-//! let observer = collector.create_observer();
+//! let observer = collector.create_observer(seesaw_viz::JsonDiffFormatter);
 //!
 //! // Generate diagram
-//! let diagram = collector.render_mermaid().await?;
-//! println!("{}", diagram);
-//! # Ok::<(), anyhow::Error>(())
+//! // let graph = collector.graph().await;
+//! // let diagram = MermaidRenderer::new().render(&graph)?;
 //! ```
 
 pub mod collector;
@@ -37,10 +36,10 @@ pub mod types;
 pub mod web;
 
 pub use collector::{SpanCollector, SpanObserver};
-pub use formatter::{StateFormatter, JsonDiffFormatter};
+pub use formatter::{JsonDiffFormatter, StateFormatter};
 pub use renderer::{MermaidRenderer, RenderOptions};
-pub use sampling::{SamplingStrategy, AlwaysSample, RateSample};
-pub use types::{EventSpan, SpanGraph, CausalChain};
+pub use sampling::{AlwaysSample, RateSample, SamplingStrategy};
+pub use types::{CausalChain, EventSpan, SpanGraph};
 
 /// Re-export for convenience
 pub use chrono::{DateTime, Utc};

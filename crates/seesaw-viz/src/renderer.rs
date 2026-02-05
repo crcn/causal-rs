@@ -190,7 +190,10 @@ impl MermaidRenderer {
 
     /// Generate unique node ID
     fn node_id(&self, span: &EventSpan) -> String {
-        format!("N{}", span.event_id.to_string().replace("-", "")[..8].to_string())
+        format!(
+            "N{}",
+            span.event_id.to_string().replace("-", "")[..8].to_string()
+        )
     }
 
     /// Collect edges recursively
@@ -297,6 +300,9 @@ mod tests {
     #[test]
     fn test_truncate() {
         assert_eq!(truncate("short".into(), 10), "short");
-        assert_eq!(truncate("this is a very long string".into(), 10), "this is...");
+        assert_eq!(
+            truncate("this is a very long string".into(), 10),
+            "this is..."
+        );
     }
 }

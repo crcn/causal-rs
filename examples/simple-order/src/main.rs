@@ -7,7 +7,7 @@
 //! - Event chains: Placed -> Shipped -> Delivered
 
 use anyhow::Result;
-use seesaw_core::{effect, reducer, Engine, EffectContext};
+use seesaw_core::{effect, reducer, EffectContext, Engine};
 use uuid::Uuid;
 
 // Events - facts about what happened
@@ -42,7 +42,10 @@ impl Deps {
     }
 
     async fn notify(&self, order_id: Uuid, message: &str) -> Result<()> {
-        println!("📧 Notifying customer about order {}: {}", order_id, message);
+        println!(
+            "📧 Notifying customer about order {}: {}",
+            order_id, message
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         Ok(())
     }
@@ -62,16 +65,16 @@ async fn main() -> Result<()> {
         shipping_enabled: true,
     })
     // Reducer - pure state transformation
-    .with_reducer(reducer::fold::<OrderEvent>().into(|state: OrderState, event| {
-        match event {
+    .with_reducer(
+        reducer::fold::<OrderEvent>().into(|state: OrderState, event| match event {
             OrderEvent::Placed { order_id, total } => OrderState {
                 total_orders: state.total_orders + 1,
                 total_revenue: state.total_revenue + *total,
                 last_order_id: Some(*order_id),
             },
             _ => state,
-        }
-    }))
+        }),
+    )
     // Effect chain: Placed -> ship -> Shipped
     .with_effect(
         effect::on::<OrderEvent>()
@@ -79,10 +82,12 @@ async fn main() -> Result<()> {
                 OrderEvent::Placed { order_id, .. } => Some(*order_id),
                 _ => None,
             })
-            .then(|order_id, ctx: EffectContext<OrderState, Deps>| async move {
-                ctx.deps().ship(order_id).await?;
-                Ok(OrderEvent::Shipped { order_id })
-            })
+            .then(
+                |order_id, ctx: EffectContext<OrderState, Deps>| async move {
+                    ctx.deps().ship(order_id).await?;
+                    Ok(OrderEvent::Shipped { order_id })
+                },
+            ),
     )
     // Effect chain: Shipped -> notify -> Delivered
     .with_effect(
@@ -91,10 +96,14 @@ async fn main() -> Result<()> {
                 OrderEvent::Shipped { order_id } => Some(*order_id),
                 _ => None,
             })
-            .then(|order_id, ctx: EffectContext<OrderState, Deps>| async move {
-                ctx.deps().notify(order_id, "Your order has shipped!").await?;
-                Ok(OrderEvent::Delivered { order_id })
-            })
+            .then(
+                |order_id, ctx: EffectContext<OrderState, Deps>| async move {
+                    ctx.deps()
+                        .notify(order_id, "Your order has shipped!")
+                        .await?;
+                    Ok(OrderEvent::Delivered { order_id })
+                },
+            ),
     );
 
     println!("✓ Engine configured with effects and reducers\n");
@@ -109,7 +118,9 @@ async fn main() -> Result<()> {
         // Process the edge function - returns event, waits for completion
         let order_id = Uuid::new_v4();
         let total = 99.99 * i as f64;
-        handle.process(|_| async move { Ok(place_order(order_id, total)) }).await?;
+        handle
+            .process(|_| async move { Ok(place_order(order_id, total)) })
+            .await?;
 
         println!("✓ Order {} placed", order_id);
 

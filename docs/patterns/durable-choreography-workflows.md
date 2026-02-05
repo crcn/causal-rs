@@ -44,7 +44,7 @@ let event = OrderPlaced {
     customer_id: customer.id,
     items: vec![...],
     total: 1000.00,
-    saga_id: Uuid::new_v4(), // ← Workflow correlation
+    correlation_id: Uuid::new_v4(), // ← Workflow correlation
     saga_state: SagaState::Started,
     initiated_at: Utc::now(),
 };
@@ -66,13 +66,13 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
     ctx.deps().mailer.send_approval_request(
         event.order_id,
         "manager@company.com",
-        approval_url(&event.saga_id)
+        approval_url(&event.correlation_id)
     ).await?;
 
     // Return event with context
     Ok(ManagerApprovalRequested {
         order_id: event.order_id,
-        saga_id: event.saga_id, // ← Preserve workflow context
+        correlation_id: event.correlation_id, // ← Preserve workflow context
         requested_at: Utc::now(),
         expires_at: Utc::now() + Duration::days(3),
     })
@@ -90,7 +90,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 async fn approval_webhook(approval: Approval) -> Result<()> {
     let event = ManagerApproved {
         order_id: approval.order_id,
-        saga_id: approval.saga_id, // ← Context from URL
+        correlation_id: approval.correlation_id, // ← Context from URL
         approved_by: "manager@company.com".into(),
         approved_at: Utc::now(),
     };
@@ -125,12 +125,12 @@ effect::on::<ManagerApproved>().then(|event, ctx| async move {
     ctx.deps().mailer.send_approval_request(
         event.order_id,
         "director@company.com",
-        approval_url(&event.saga_id)
+        approval_url(&event.correlation_id)
     ).await?;
 
     Ok(DirectorApprovalRequested {
         order_id: event.order_id,
-        saga_id: event.saga_id, // ← Still carrying context
+        correlation_id: event.correlation_id, // ← Still carrying context
         requested_at: Utc::now(),
         expires_at: Utc::now() + Duration::days(2),
     })
@@ -163,7 +163,7 @@ effect::on::<DirectorApproved>().then(|event, ctx| async move {
     // Terminal event
     Ok(OrderCompleted {
         order_id: event.order_id,
-        saga_id: event.saga_id,
+        correlation_id: event.correlation_id,
         completed_at: Utc::now(),
     })
 });
@@ -180,7 +180,7 @@ pub struct WorkflowEvent {
     pub data: EventData,
 
     // Workflow context (CRITICAL)
-    pub saga_id: Uuid,           // Workflow identifier
+    pub correlation_id: Uuid,           // Workflow identifier
     pub order_id: Uuid,          // Entity identifier
     pub correlation_id: Uuid,    // Request trace
     pub initiated_at: DateTime<Utc>,
@@ -207,7 +207,7 @@ effect::on::<DirectorApproved>().then(|event, ctx| async move {
     let order = ctx.deps().db.get_order(event.order_id).await?;
 
     // ❌ WRONG: Don't try to reconstruct from event history
-    // let order = reconstruct_from_events(event.saga_id).await?;
+    // let order = reconstruct_from_events(event.correlation_id).await?;
 
     // Process with current state
     if order.is_fully_approved() {
@@ -236,7 +236,7 @@ effect::on::<ManagerApprovalRequested>().then(|event, ctx| async move {
     ctx.deps().scheduler.schedule_webhook(
         Utc::now() + Duration::days(3),
         "/api/check-approval-timeout",
-        json!({ "saga_id": event.saga_id, "order_id": event.order_id })
+        json!({ "correlation_id": event.correlation_id, "order_id": event.order_id })
     ).await?;
 
     Ok(())
@@ -250,7 +250,7 @@ async fn check_approval_timeout(payload: TimeoutCheck) -> Result<()> {
         // Still waiting, timeout expired
         let event = ApprovalTimedOut {
             order_id: payload.order_id,
-            saga_id: payload.saga_id,
+            correlation_id: payload.correlation_id,
             timed_out_at: Utc::now(),
         };
 
@@ -301,7 +301,7 @@ effect::on::<ManagerApproved>().then(|event, ctx| async move {
 
     Ok(DirectorApprovalRequested {
         order_id: event.order_id,
-        saga_id: event.saga_id,
+        correlation_id: event.correlation_id,
     })
 });
 ```
@@ -338,14 +338,14 @@ effect::on::<ManagerApproved>().then(|event, ctx| async move {
 
 - [ ] **Durable Queue**: NATS JetStream, AWS SQS, or Kafka with persistence
 - [ ] **Transactional Outbox**: Atomic writes (event + state) to database
-- [ ] **Event Context**: Every event carries `saga_id`, `correlation_id`, `event_id`
+- [ ] **Event Context**: Every event carries `correlation_id`, `correlation_id`, `event_id`
 - [ ] **Idempotency Guards**: Check event_id or state before processing
 - [ ] **State in Database**: Don't rely on event replay for state
 - [ ] **Terminal Events**: Define success/failure completion events
 - [ ] **Timeout Handling**: External scheduler or queue timeout + DLQ
 - [ ] **Correlation Tracking**: Propagate context through entire workflow
 - [ ] **Dead Letter Queue**: Handle poison messages and permanent failures
-- [ ] **Monitoring**: Track workflow progress via saga_id
+- [ ] **Monitoring**: Track workflow progress via correlation_id
 
 ## Example: Complete Implementation
 

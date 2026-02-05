@@ -4,6 +4,8 @@ use std::any::TypeId;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::event_codec::EventCodec;
+
 use super::types::{AnyEventRef, Reducer};
 
 // =============================================================================
@@ -48,9 +50,48 @@ impl<E: Send + Sync + 'static> FoldBuilder<E> {
     {
         let target = TypeId::of::<E>();
         Reducer {
+            codecs: Vec::new(),
             can_handle: Arc::new(move |t| t == target),
             reduce: Arc::new(move |state, event, _| {
-                let typed = event.downcast_ref::<E>().expect("type checked by can_handle");
+                let typed = event
+                    .downcast_ref::<E>()
+                    .expect("type checked by can_handle");
+                reducer(state, typed)
+            }),
+        }
+    }
+
+    /// Fold the event into state with queue codec metadata.
+    ///
+    /// Use this for reducers that should run in queue-backed workers.
+    pub fn into_queue<S, R>(self, reducer: R) -> Reducer<S>
+    where
+        S: Clone + Send + Sync + 'static,
+        E: Clone + serde::Serialize + serde::de::DeserializeOwned,
+        R: Fn(S, &E) -> S + Send + Sync + 'static,
+    {
+        let target = TypeId::of::<E>();
+        let codec = Arc::new(EventCodec {
+            event_type: std::any::type_name::<E>().to_string(),
+            type_id: target,
+            decode: Arc::new(|payload| {
+                let event: E = serde_json::from_value(payload.clone())?;
+                Ok(Arc::new(event))
+            }),
+            encode: Arc::new(|event_any| {
+                event_any
+                    .downcast_ref::<E>()
+                    .and_then(|event| serde_json::to_value(event).ok())
+            }),
+        });
+
+        Reducer {
+            codecs: vec![codec],
+            can_handle: Arc::new(move |t| t == target),
+            reduce: Arc::new(move |state, event, _| {
+                let typed = event
+                    .downcast_ref::<E>()
+                    .expect("type checked by can_handle");
                 reducer(state, typed)
             }),
         }
@@ -88,6 +129,7 @@ impl OnAnyBuilder {
         R: Fn(S, AnyEventRef) -> S + Send + Sync + 'static,
     {
         Reducer {
+            codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
             reduce: Arc::new(move |state, event, type_id| {
                 let event_ref = AnyEventRef {
@@ -124,7 +166,13 @@ where
 {
     let reducers: Arc<Vec<Reducer<S>>> = Arc::new(reducers.into_iter().collect());
 
+    let mut codecs = Vec::new();
+    for reducer in reducers.iter() {
+        codecs.extend(reducer.codecs().iter().cloned());
+    }
+
     Reducer {
+        codecs,
         can_handle: {
             let reducers = reducers.clone();
             Arc::new(move |type_id| reducers.iter().any(|r| (r.can_handle)(type_id)))
@@ -165,9 +213,10 @@ mod tests {
 
     #[test]
     fn test_on_can_handle() {
-        let reducer: Reducer<TestState> = fold::<Increment>().into(|state: TestState, event| TestState {
-            count: state.count + event.amount,
-        });
+        let reducer: Reducer<TestState> =
+            fold::<Increment>().into(|state: TestState, event| TestState {
+                count: state.count + event.amount,
+            });
 
         assert!(reducer.can_handle(TypeId::of::<Increment>()));
         assert!(!reducer.can_handle(TypeId::of::<Decrement>()));
@@ -185,9 +234,10 @@ mod tests {
 
     #[test]
     fn test_on_reduces() {
-        let reducer: Reducer<TestState> = fold::<Increment>().into(|state: TestState, event| TestState {
-            count: state.count + event.amount,
-        });
+        let reducer: Reducer<TestState> =
+            fold::<Increment>().into(|state: TestState, event| TestState {
+                count: state.count + event.amount,
+            });
 
         let state = TestState { count: 10 };
         let event = Increment { amount: 5 };
@@ -263,9 +313,10 @@ mod tests {
 
     #[test]
     fn test_reducer_clone() {
-        let reducer: Reducer<TestState> = fold::<Increment>().into(|state: TestState, event| TestState {
-            count: state.count + event.amount,
-        });
+        let reducer: Reducer<TestState> =
+            fold::<Increment>().into(|state: TestState, event| TestState {
+                count: state.count + event.amount,
+            });
 
         let reducer2 = reducer.clone();
 

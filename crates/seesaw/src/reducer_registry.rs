@@ -1,9 +1,11 @@
 //! Reducer registry for TypeId-based state reduction.
 
 use std::any::{Any, TypeId};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::event_codec::EventCodec;
 use crate::reducer::Reducer;
 
 /// Registry for storing and applying reducers.
@@ -52,6 +54,30 @@ where
         }
         state
     }
+
+    /// Find a queue codec by event type name.
+    pub(crate) fn find_codec_by_event_type(&self, event_type: &str) -> Option<Arc<EventCodec>> {
+        for reducer in self.reducers.read().iter() {
+            for codec in reducer.codecs() {
+                if codec.event_type == event_type {
+                    return Some(codec.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a queue codec by Rust TypeId.
+    pub(crate) fn find_codec_by_type_id(&self, type_id: TypeId) -> Option<Arc<EventCodec>> {
+        for reducer in self.reducers.read().iter() {
+            for codec in reducer.codecs() {
+                if codec.type_id == type_id {
+                    return Some(codec.clone());
+                }
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -78,9 +104,11 @@ mod tests {
     fn test_reducer_registry_registers() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
-            count: state.count + event.amount,
-        }));
+        registry.register(
+            reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
+                count: state.count + event.amount,
+            }),
+        );
 
         assert_eq!(registry.reducers.read().len(), 1);
     }
@@ -89,9 +117,11 @@ mod tests {
     fn test_reducer_registry_applies() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
-            count: state.count + event.amount,
-        }));
+        registry.register(
+            reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
+                count: state.count + event.amount,
+            }),
+        );
 
         let state = TestState { count: 0 };
         let event = IncrementEvent { amount: 5 };
@@ -104,12 +134,16 @@ mod tests {
     fn test_reducer_registry_multiple_reducers() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
-            count: state.count + event.amount,
-        }));
-        registry.register(reducer::fold::<DecrementEvent>().into(|state: TestState, event| TestState {
-            count: state.count - event.amount,
-        }));
+        registry.register(
+            reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
+                count: state.count + event.amount,
+            }),
+        );
+        registry.register(
+            reducer::fold::<DecrementEvent>().into(|state: TestState, event| TestState {
+                count: state.count - event.amount,
+            }),
+        );
 
         let state = TestState { count: 10 };
 
@@ -150,9 +184,11 @@ mod tests {
     fn test_reducer_registry_unhandled_event() {
         let registry: ReducerRegistry<TestState> = ReducerRegistry::new();
 
-        registry.register(reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
-            count: state.count + event.amount,
-        }));
+        registry.register(
+            reducer::fold::<IncrementEvent>().into(|state: TestState, event| TestState {
+                count: state.count + event.amount,
+            }),
+        );
 
         let state = TestState { count: 10 };
         let event = DecrementEvent { amount: 5 };

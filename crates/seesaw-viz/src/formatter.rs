@@ -2,7 +2,6 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use std::fmt;
 
 /// Trait for formatting state snapshots for visualization
 ///
@@ -28,6 +27,7 @@ pub trait StateFormatter<S>: Send + Sync {
 }
 
 /// Default JSON-based formatter using serde
+#[derive(Clone)]
 pub struct JsonDiffFormatter;
 
 impl<S: Serialize + PartialEq> StateFormatter<S> for JsonDiffFormatter {

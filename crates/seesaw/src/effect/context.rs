@@ -47,8 +47,8 @@ where
     /// Deterministic idempotency key for external API calls
     /// Generated from event_id + effect_id, stable across retries
     pub idempotency_key: String,
-    /// Saga ID from event envelope - groups related events together
-    pub saga_id: Uuid,
+    /// Correlation ID from event envelope - groups related events together
+    pub correlation_id: Uuid,
     /// Current event's unique ID from envelope
     pub event_id: Uuid,
     pub(crate) prev_state: Arc<S>,
@@ -70,7 +70,7 @@ where
         Self {
             effect_id: self.effect_id.clone(),
             idempotency_key: self.idempotency_key.clone(),
-            saga_id: self.saga_id,
+            correlation_id: self.correlation_id,
             event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),
@@ -91,7 +91,7 @@ where
     pub(crate) fn new(
         effect_id: String,
         idempotency_key: String,
-        saga_id: Uuid,
+        correlation_id: Uuid,
         event_id: Uuid,
         prev_state: Arc<S>,
         state: Arc<S>,
@@ -103,7 +103,7 @@ where
         Self {
             effect_id,
             idempotency_key,
-            saga_id,
+            correlation_id,
             event_id,
             prev_state,
             state,
@@ -175,7 +175,7 @@ where
         Self {
             effect_id: self.effect_id.clone(),
             idempotency_key: self.idempotency_key.clone(),
-            saga_id: self.saga_id,
+            correlation_id: self.correlation_id,
             event_id,
             prev_state,
             state,
@@ -192,7 +192,7 @@ where
         Self {
             effect_id: self.effect_id.clone(),
             idempotency_key: self.idempotency_key.clone(),
-            saga_id: self.saga_id,
+            correlation_id: self.correlation_id,
             event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),
@@ -239,7 +239,7 @@ where
         Self {
             effect_id: self.effect_id.clone(),
             idempotency_key: self.idempotency_key.clone(),
-            saga_id: self.saga_id,
+            correlation_id: self.correlation_id,
             event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),
@@ -281,7 +281,7 @@ where
         Self {
             effect_id: self.effect_id.clone(),
             idempotency_key: self.idempotency_key.clone(),
-            saga_id: self.saga_id,
+            correlation_id: self.correlation_id,
             event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),

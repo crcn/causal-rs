@@ -19,8 +19,8 @@ pub struct QueuedEvent {
     pub event_id: Uuid,
     /// Parent event ID (for causality tracking)
     pub parent_id: Option<Uuid>,
-    /// Saga ID (workflow identifier)
-    pub saga_id: Uuid,
+    /// Correlation ID (workflow identifier)
+    pub correlation_id: Uuid,
     /// Event type name (for routing to handlers)
     pub event_type: String,
     /// Event payload (JSON)
@@ -46,7 +46,7 @@ pub struct EmittedEvent {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SagaEvent {
     pub event_id: Uuid,
-    pub saga_id: Uuid,
+    pub correlation_id: Uuid,
     pub event_type: String,
     pub payload: serde_json::Value,
 }
@@ -90,14 +90,14 @@ pub trait Store: Send + Sync + 'static {
     /// Load state for saga
     ///
     /// Returns None if saga has no state yet.
-    async fn load_state<S>(&self, saga_id: Uuid) -> Result<Option<(S, i32)>>
+    async fn load_state<S>(&self, correlation_id: Uuid) -> Result<Option<(S, i32)>>
     where
         S: for<'de> Deserialize<'de> + Send;
 
     /// Save state for saga (optimistic locking)
     ///
     /// Returns error if version mismatch (concurrent modification detected).
-    async fn save_state<S>(&self, saga_id: Uuid, state: &S, expected_version: i32) -> Result<i32>
+    async fn save_state<S>(&self, correlation_id: Uuid, state: &S, expected_version: i32) -> Result<i32>
     where
         S: Serialize + Send + Sync;
 
@@ -113,7 +113,7 @@ pub trait Store: Send + Sync + 'static {
         &self,
         event_id: Uuid,
         effect_id: String,
-        saga_id: Uuid,
+        correlation_id: Uuid,
         event_type: String,
         event_payload: serde_json::Value,
         parent_event_id: Option<Uuid>,
@@ -130,7 +130,12 @@ pub trait Store: Send + Sync + 'static {
     async fn poll_next_effect(&self) -> Result<Option<QueuedEffectExecution>>;
 
     /// Mark effect execution as completed
-    async fn complete_effect(&self, event_id: Uuid, effect_id: String, result: serde_json::Value) -> Result<()>;
+    async fn complete_effect(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        result: serde_json::Value,
+    ) -> Result<()>;
 
     /// Complete effect and atomically publish emitted events (crash-safe)
     ///
@@ -145,10 +150,23 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<()>;
 
     /// Mark effect execution as failed
-    async fn fail_effect(&self, event_id: Uuid, effect_id: String, error: String, attempts: i32) -> Result<()>;
+    async fn fail_effect(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        error: String,
+        attempts: i32,
+    ) -> Result<()>;
 
     /// Move effect to DLQ (permanently failed)
-    async fn dlq_effect(&self, event_id: Uuid, effect_id: String, error: String, reason: String, attempts: i32) -> Result<()>;
+    async fn dlq_effect(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        error: String,
+        reason: String,
+        attempts: i32,
+    ) -> Result<()>;
 
     // =========================================================================
     // LISTEN/NOTIFY Operations (for .wait() pattern)
@@ -160,8 +178,34 @@ pub trait Store: Send + Sync + 'static {
     /// Used by the .wait() pattern to efficiently wait for terminal events.
     async fn subscribe_saga_events(
         &self,
-        saga_id: Uuid,
+        correlation_id: Uuid,
     ) -> Result<Box<dyn futures::Stream<Item = SagaEvent> + Send + Unpin>>;
+
+    // =========================================================================
+    // Workflow Status Operations
+    // =========================================================================
+
+    /// Get workflow status for a correlation ID
+    ///
+    /// Returns status including pending effects count and whether workflow is settled.
+    /// A workflow is "settled" when no effects are pending/executing, but can start
+    /// up again if new events arrive. Use terminal events for true completion.
+    async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<WorkflowStatus>;
+}
+
+/// Workflow status for a correlation ID
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStatus {
+    /// Correlation ID (workflow identifier)
+    pub correlation_id: Uuid,
+    /// Current state (if exists)
+    pub state: Option<serde_json::Value>,
+    /// Number of effects pending/executing
+    pub pending_effects: i64,
+    /// True when no effects are pending/executing (workflow is idle)
+    pub is_settled: bool,
+    /// Most recent event type
+    pub last_event: Option<String>,
 }
 
 /// Queued effect execution from store
@@ -169,7 +213,7 @@ pub trait Store: Send + Sync + 'static {
 pub struct QueuedEffectExecution {
     pub event_id: Uuid,
     pub effect_id: String,
-    pub saga_id: Uuid,
+    pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
     pub parent_event_id: Option<Uuid>,
@@ -185,8 +229,8 @@ impl fmt::Display for QueuedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Event(id={}, event_id={}, saga_id={}, type={}, hops={})",
-            self.id, self.event_id, self.saga_id, self.event_type, self.hops
+            "Event(id={}, event_id={}, correlation_id={}, type={}, hops={})",
+            self.id, self.event_id, self.correlation_id, self.event_type, self.hops
         )
     }
 }
@@ -195,8 +239,13 @@ impl fmt::Display for QueuedEffectExecution {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Effect(event_id={}, effect_id={}, saga_id={}, priority={}, attempts={}/{})",
-            self.event_id, self.effect_id, self.saga_id, self.priority, self.attempts, self.max_attempts
+            "Effect(event_id={}, effect_id={}, correlation_id={}, priority={}, attempts={}/{})",
+            self.event_id,
+            self.effect_id,
+            self.correlation_id,
+            self.priority,
+            self.attempts,
+            self.max_attempts
         )
     }
 }

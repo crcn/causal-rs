@@ -115,7 +115,7 @@ This document tracks implementation progress against the plan in `docs/plans/202
 - `dispatched_at TIMESTAMPTZ` - When engine dispatched event
 - `state_version BIGINT` - State snapshot at dispatch time
 - `metadata JSONB` - Extensible key-value pairs
-- Consider renaming: saga_id → correlation_id, parent_id → causation_id, hops → depth
+- Consider renaming: correlation_id → correlation_id, parent_id → causation_id, hops → depth
 
 **Missing Code**:
 - QueuedEvent doesn't have envelope fields
@@ -204,7 +204,7 @@ This document tracks implementation progress against the plan in `docs/plans/202
 **Missing**:
 - WaitFuture doesn't actually listen to PostgreSQL notifications
 - Current implementation is stubbed (doesn't wait)
-- No connection to LISTEN channel `seesaw_saga_{saga_id}`
+- No connection to LISTEN channel `seesaw_saga_{correlation_id}`
 
 **Impact**:
 - `.wait()` doesn't work
@@ -323,13 +323,13 @@ This document tracks implementation progress against the plan in `docs/plans/202
 
 From plan line 2902-2912:
 
-- [ ] **Remove `saga_id` from all event structs** - now in envelope
+- [ ] **Remove `correlation_id` from all event structs** - now in envelope
 - [ ] Create `Runtime` and spawn workers ✅ (done)
 - [ ] Replace `handle.run(|_| Ok(Event))` with `engine.process(event)` ✅ (done)
 - [ ] For webhooks, use `engine.process_with_id(webhook_id, event)` ❌ (missing)
 - [ ] Replace `handle.settled()` with `engine.shutdown()` ❌ (missing)
 - [ ] Add `.id("name")` to all effects ❌ (missing - compile won't enforce yet)
-- [ ] Use `ctx.saga_id` instead of `event.saga_id` ✅ (done)
+- [ ] Use `ctx.correlation_id` instead of `event.correlation_id` ✅ (done)
 - [ ] Use `ctx.idempotency_key` for external API calls ❌ (missing)
 - [ ] Add database setup (migrations for queue tables) ✅ (done)
 - [ ] Configure connection pool sizing ⚠️ (not configured)

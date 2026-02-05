@@ -65,11 +65,8 @@ mod tests {
         let event = TestEvent { id: 42 };
         let error = anyhow::anyhow!("test error");
 
-        let effect_error = EffectError::new(
-            Arc::new(event.clone()),
-            TypeId::of::<TestEvent>(),
-            error,
-        );
+        let effect_error =
+            EffectError::new(Arc::new(event.clone()), TypeId::of::<TestEvent>(), error);
 
         assert_eq!(effect_error.source_event_type, TypeId::of::<TestEvent>());
         assert!(effect_error.error.to_string().contains("test error"));
@@ -83,11 +80,7 @@ mod tests {
         };
         let error = anyhow::Error::from(custom_error);
 
-        let effect_error = EffectError::new(
-            Arc::new(event),
-            TypeId::of::<TestEvent>(),
-            error,
-        );
+        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         // Should successfully downcast to CustomError
         let downcasted = effect_error.downcast::<CustomError>();
@@ -100,11 +93,7 @@ mod tests {
         let event = TestEvent { id: 42 };
         let error = anyhow::anyhow!("generic error");
 
-        let effect_error = EffectError::new(
-            Arc::new(event),
-            TypeId::of::<TestEvent>(),
-            error,
-        );
+        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         // Should fail to downcast to CustomError
         let downcasted = effect_error.downcast::<CustomError>();
@@ -116,11 +105,7 @@ mod tests {
         let event = TestEvent { id: 42 };
         let error = anyhow::anyhow!("formatting test");
 
-        let effect_error = EffectError::new(
-            Arc::new(event),
-            TypeId::of::<TestEvent>(),
-            error,
-        );
+        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         let debug_str = format!("{:?}", effect_error);
         assert!(debug_str.contains("EffectError"));
@@ -132,11 +117,7 @@ mod tests {
         let event = TestEvent { id: 42 };
         let error = anyhow::anyhow!("clone test");
 
-        let effect_error = EffectError::new(
-            Arc::new(event),
-            TypeId::of::<TestEvent>(),
-            error,
-        );
+        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         let cloned = effect_error.clone();
         assert_eq!(cloned.source_event_type, effect_error.source_event_type);

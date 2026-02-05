@@ -8,15 +8,15 @@ use std::time::Duration;
 
 use anyhow::{Error, Result};
 
+use crate::event_codec::EventCodec;
 use super::context::EffectContext;
 
 /// Error handler called when an effect returns an error.
 ///
 /// The handler receives the error, event type that caused it, and context.
 /// It can emit failure events or log the error. The chain continues regardless.
-pub type ErrorHandler<S, D> = Arc<
-    dyn Fn(Error, TypeId, EffectContext<S, D>) -> BoxFuture<()> + Send + Sync
->;
+pub type ErrorHandler<S, D> =
+    Arc<dyn Fn(Error, TypeId, EffectContext<S, D>) -> BoxFuture<()> + Send + Sync>;
 
 /// A boxed future for async effect handlers.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -29,6 +29,8 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 pub struct EventOutput {
     /// The TypeId of the event type.
     pub type_id: TypeId,
+    /// Fully-qualified Rust type name of the event.
+    pub event_type: String,
     /// The type-erased event value.
     pub value: Arc<dyn Any + Send + Sync>,
 }
@@ -38,6 +40,7 @@ impl EventOutput {
     pub fn new<E: Send + Sync + 'static>(event: E) -> Self {
         Self {
             type_id: TypeId::of::<E>(),
+            event_type: std::any::type_name::<E>().to_string(),
             value: Arc::new(event),
         }
     }
@@ -47,6 +50,7 @@ impl std::fmt::Debug for EventOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventOutput")
             .field("type_id", &self.type_id)
+            .field("event_type", &self.event_type)
             .finish()
     }
 }
@@ -90,13 +94,17 @@ where
     /// Used for debugging, tracing, and the `produced_by` field in event envelopes.
     pub id: String,
 
+    /// Queue codec metadata for typed event handling/serialization.
+    pub(crate) codecs: Vec<std::sync::Arc<EventCodec>>,
+
     /// Determines if this effect handles the given event type.
     /// Returns true if this effect should receive events of the given TypeId.
     pub(crate) can_handle: Arc<dyn Fn(TypeId) -> bool + Send + Sync>,
 
     /// Called once when the store is activated.
     /// Used for setup, spawning background tasks, etc.
-    pub(crate) started: Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>>,
+    pub(crate) started:
+        Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>>,
 
     /// Called for each event that passes `can_handle`.
     /// Receives the type-erased event, its TypeId, and the effect context.
@@ -104,7 +112,11 @@ where
     /// - `None`: Effect completed, no event to dispatch (observer pattern)
     /// - `Some(EventOutput)`: Effect completed, dispatch this event
     pub(crate) handler: Arc<
-        dyn Fn(Arc<dyn Any + Send + Sync>, TypeId, EffectContext<S, D>) -> BoxFuture<Result<Option<EventOutput>>>
+        dyn Fn(
+                Arc<dyn Any + Send + Sync>,
+                TypeId,
+                EffectContext<S, D>,
+            ) -> BoxFuture<Result<Option<EventOutput>>>
             + Send
             + Sync,
     >,
@@ -130,6 +142,7 @@ where
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
+            codecs: self.codecs.clone(),
             can_handle: self.can_handle.clone(),
             started: self.started.clone(),
             handler: self.handler.clone(),
@@ -170,6 +183,11 @@ where
         ctx: EffectContext<S, D>,
     ) -> Result<Option<EventOutput>> {
         (self.handler)(value, type_id, ctx).await
+    }
+
+    /// Internal queue codec metadata.
+    pub(crate) fn codecs(&self) -> &[std::sync::Arc<EventCodec>] {
+        &self.codecs
     }
 
     /// Check if this effect should execute inline (in same transaction as event processing)

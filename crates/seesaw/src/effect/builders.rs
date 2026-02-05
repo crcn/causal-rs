@@ -7,10 +7,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+#[cfg(test)]
 use uuid::Uuid;
 
+use crate::event_codec::EventCodec;
 use super::context::EffectContext;
 use super::types::{AnyEvent, BoxFuture, Effect, EventOutput};
+
+#[track_caller]
+fn default_effect_id(prefix: &str) -> String {
+    let location = std::panic::Location::caller();
+    format!(
+        "{prefix}@{}:{}:{}",
+        location.file(),
+        location.line(),
+        location.column()
+    )
+}
 
 // =============================================================================
 // Type-State Markers
@@ -357,7 +370,9 @@ where
     S: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    fn into_started(self) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>>;
+    fn into_started(
+        self,
+    ) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>>;
 }
 
 impl<S, D> StartedHandler<S, D> for NoStarted
@@ -365,7 +380,9 @@ where
     S: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    fn into_started(self) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    fn into_started(
+        self,
+    ) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         None
     }
 }
@@ -377,7 +394,9 @@ where
     St: Fn(EffectContext<S, D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
-    fn into_started(self) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    fn into_started(
+        self,
+    ) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         let started = self.0;
         Some(Arc::new(move |ctx| Box::pin(started(ctx))))
     }
@@ -412,6 +431,7 @@ where
     ///     Ok(())
     /// })
     /// ```
+    #[track_caller]
     pub fn then<S, D, T, H, Fut, O>(self, handler: H) -> Effect<S, D>
     where
         S: Clone + Send + Sync + 'static,
@@ -429,10 +449,92 @@ where
         let filter = self.filter;
         let transition = self.transition;
 
-        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
+        let id = self
+            .id
+            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
 
         Effect {
             id,
+            codecs: Vec::new(),
+            can_handle: Arc::new(move |t| t == target),
+            started: self.started.into_started(),
+            handler: Arc::new(move |value, _, ctx| {
+                let typed = value.downcast::<E>().expect("type checked by can_handle");
+
+                // Check transition
+                if !transition.should_run(ctx.prev_state(), ctx.next_state()) {
+                    return Box::pin(async { Ok(None) });
+                }
+
+                // Extract/filter
+                match filter.extract(&typed) {
+                    Some(extracted) => {
+                        let fut = handler(extracted, ctx);
+                        Box::pin(async move {
+                            let output = fut.await?;
+                            // Special case: () means no event to dispatch (observer pattern)
+                            if output_is_unit {
+                                Ok(None)
+                            } else {
+                                Ok(Some(EventOutput::new(output)))
+                            }
+                        })
+                    }
+                    None => Box::pin(async { Ok(None) }),
+                }
+            }),
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
+        }
+    }
+
+    /// Queue-capable variant of [`then`].
+    ///
+    /// Adds serde-based codec metadata so queue-backed workers can decode and
+    /// execute this typed effect from persisted JSON events.
+    #[track_caller]
+    pub fn then_queue<S, D, T, H, Fut, O>(self, handler: H) -> Effect<S, D>
+    where
+        S: Clone + Send + Sync + 'static,
+        D: Send + Sync + 'static,
+        E: Clone + serde::Serialize + serde::de::DeserializeOwned,
+        T: Clone + Send + 'static,
+        Filter: Extractor<E, T>,
+        Trans: TransitionChecker<S>,
+        Started: StartedHandler<S, D>,
+        H: Fn(T, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+        O: Send + Sync + 'static,
+    {
+        let target = TypeId::of::<E>();
+        let output_is_unit = TypeId::of::<O>() == TypeId::of::<()>();
+        let filter = self.filter;
+        let transition = self.transition;
+
+        let id = self
+            .id
+            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
+
+        let codec = Arc::new(EventCodec {
+            event_type: std::any::type_name::<E>().to_string(),
+            type_id: target,
+            decode: Arc::new(|payload| {
+                let event: E = serde_json::from_value(payload.clone())?;
+                Ok(Arc::new(event))
+            }),
+            encode: Arc::new(|event_any| {
+                event_any
+                    .downcast_ref::<E>()
+                    .and_then(|event| serde_json::to_value(event).ok())
+            }),
+        });
+
+        Effect {
+            id,
+            codecs: vec![codec],
             can_handle: Arc::new(move |t| t == target),
             started: self.started.into_started(),
             handler: Arc::new(move |value, _, ctx| {
@@ -476,6 +578,7 @@ where
 impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
     /// Set the handler for observing all events (terminal operation).
     /// Returns `Result<()>` - observers don't produce events.
+    #[track_caller]
     pub fn then<S, D, H, Fut>(self, handler: H) -> Effect<S, D>
     where
         S: Clone + Send + Sync + 'static,
@@ -483,10 +586,13 @@ impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
         H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
+        let id = self
+            .id
+            .unwrap_or_else(|| default_effect_id("effect_any"));
 
         Effect {
             id,
+            codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
             started: None,
             handler: Arc::new(move |value, type_id, ctx| {
@@ -513,17 +619,21 @@ where
 {
     /// Set the handler for state transitions (terminal operation).
     /// Handler receives only context since transitions are about state changes.
+    #[track_caller]
     pub fn then<D, H, Fut>(self, handler: H) -> Effect<S, D>
     where
         D: Send + Sync + 'static,
         H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
+        let id = self
+            .id
+            .unwrap_or_else(|| default_effect_id("effect_transition"));
         let transition = self.transition.0;
 
         Effect {
             id,
+            codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
             started: None,
             handler: Arc::new(move |_, _, ctx| {
@@ -553,16 +663,20 @@ where
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
     /// Set the handler for observing all events with started (terminal operation).
+    #[track_caller]
     pub fn then<H, Fut>(self, handler: H) -> Effect<S, D>
     where
         H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
+        let id = self
+            .id
+            .unwrap_or_else(|| default_effect_id("effect_any_started"));
         let started = self.started.0;
 
         Effect {
             id,
+            codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
             started: Some(Arc::new(move |ctx| Box::pin(started(ctx)))),
             handler: Arc::new(move |value, type_id, ctx| {
@@ -582,7 +696,8 @@ where
     }
 }
 
-impl<S, D, St, StFut, P> EffectBuilder<Untyped, NoFilter, WithTransition<S, P>, WithStarted<S, D, St>>
+impl<S, D, St, StFut, P>
+    EffectBuilder<Untyped, NoFilter, WithTransition<S, P>, WithStarted<S, D, St>>
 where
     S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -591,17 +706,21 @@ where
     P: Fn(&S, &S) -> bool + Send + Sync + 'static,
 {
     /// Set the handler for state transitions with started (terminal operation).
+    #[track_caller]
     pub fn then<H, Fut>(self, handler: H) -> Effect<S, D>
     where
         H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
+        let id = self
+            .id
+            .unwrap_or_else(|| default_effect_id("effect_transition_started"));
         let started = self.started.0;
         let transition = self.transition.0;
 
         Effect {
             id,
+            codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
             started: Some(Arc::new(move |ctx| Box::pin(started(ctx)))),
             handler: Arc::new(move |_, _, ctx| {
@@ -638,15 +757,21 @@ where
 ///     effect::on::<EventB>().then(handle_b),
 /// ])
 /// ```
+#[track_caller]
 pub fn group<S, D>(effects: impl IntoIterator<Item = Effect<S, D>>) -> Effect<S, D>
 where
     S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     let effects: Arc<Vec<Effect<S, D>>> = Arc::new(effects.into_iter().collect());
+    let mut codecs = Vec::new();
+    for effect in effects.iter() {
+        codecs.extend(effect.codecs().iter().cloned());
+    }
 
     Effect {
-        id: format!("effect_group_{}", Uuid::new_v4()),
+        id: default_effect_id("effect_group"),
+        codecs,
         can_handle: {
             let effects = effects.clone();
             Arc::new(move |type_id| effects.iter().any(|e| (e.can_handle)(type_id)))
@@ -726,6 +851,7 @@ where
 ///     Ok(())
 /// })
 /// ```
+#[track_caller]
 pub fn task<S, D, F, Fut>(f: F) -> Effect<S, D>
 where
     S: Clone + Send + Sync + 'static,
@@ -734,7 +860,8 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     Effect {
-        id: format!("effect_task_{}", Uuid::new_v4()),
+        id: default_effect_id("effect_task"),
+        codecs: Vec::new(),
         can_handle: Arc::new(|_| false),
         started: Some(Arc::new(move |ctx| Box::pin(f(ctx)))),
         handler: Arc::new(|_, _, _| Box::pin(async { Ok(None) })),
@@ -754,6 +881,7 @@ where
 ///
 /// Forwards store events to relay and relay events back to store.
 /// Prevents feedback loops using unique origin tracking.
+#[track_caller]
 pub fn bridge<S, D>(tx: pipedream::WeakSender, rx: pipedream::RelayReceiver) -> Effect<S, D>
 where
     S: Clone + Send + Sync + 'static,
@@ -768,7 +896,8 @@ where
     let rx = Arc::new(rx);
 
     Effect {
-        id: format!("effect_bridge_{}", Uuid::new_v4()),
+        id: default_effect_id("effect_bridge"),
+        codecs: Vec::new(),
         can_handle: Arc::new(|_| true),
         started: {
             let rx = rx.clone();
@@ -898,10 +1027,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_then_returns_event() {
-        let effect: Effect<TestState, TestDeps> =
-            on::<TestEvent>().then(|event, _| async move {
-                Ok(OutputEvent { result: event.value * 2 })
-            });
+        let effect: Effect<TestState, TestDeps> = on::<TestEvent>().then(|event, _| async move {
+            Ok(OutputEvent {
+                result: event.value * 2,
+            })
+        });
 
         let ctx = create_test_ctx();
         let event: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 21 });
@@ -923,15 +1053,18 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
-        let effect: Effect<TestState, TestDeps> = on::<TestEvent>()
-            .filter(|e| e.value > 10)
-            .then(move |event, _| {
-                let counter = counter_clone.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(OutputEvent { result: event.value })
-                }
-            });
+        let effect: Effect<TestState, TestDeps> =
+            on::<TestEvent>()
+                .filter(|e| e.value > 10)
+                .then(move |event, _| {
+                    let counter = counter_clone.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(OutputEvent {
+                            result: event.value,
+                        })
+                    }
+                });
 
         let ctx = create_test_ctx();
 
@@ -965,7 +1098,9 @@ mod tests {
                 }
             })
             .then(|(original, doubled), _| async move {
-                Ok(OutputEvent { result: original + doubled })
+                Ok(OutputEvent {
+                    result: original + doubled,
+                })
             });
 
         let ctx = create_test_ctx();

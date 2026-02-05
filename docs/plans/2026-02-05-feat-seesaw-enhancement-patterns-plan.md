@@ -317,7 +317,7 @@ effect::on::<InventoryReleased>().then(|event, ctx| async move {
 // Track saga progress in database
 #[derive(Debug, Clone)]
 pub struct SagaState {
-    saga_id: Uuid,
+    correlation_id: Uuid,
     status: SagaStatus,
     completed_steps: Vec<String>,
     started_at: DateTime<Utc>,
@@ -334,26 +334,26 @@ pub enum SagaStatus {
 // Reducer tracks saga state
 let saga_reducer = reducer::fold::<SagaEvent>().into(|mut state, event| {
     match event {
-        SagaEvent::Started { saga_id } => {
-            state.sagas.insert(saga_id, SagaState {
-                saga_id,
+        SagaEvent::Started { correlation_id } => {
+            state.sagas.insert(correlation_id, SagaState {
+                correlation_id,
                 status: SagaStatus::InProgress,
                 completed_steps: vec![],
                 started_at: Utc::now(),
             });
         }
-        SagaEvent::StepCompleted { saga_id, step } => {
-            if let Some(saga) = state.sagas.get_mut(&saga_id) {
+        SagaEvent::StepCompleted { correlation_id, step } => {
+            if let Some(saga) = state.sagas.get_mut(&correlation_id) {
                 saga.completed_steps.push(step);
             }
         }
-        SagaEvent::Failed { saga_id } => {
-            if let Some(saga) = state.sagas.get_mut(&saga_id) {
+        SagaEvent::Failed { correlation_id } => {
+            if let Some(saga) = state.sagas.get_mut(&correlation_id) {
                 saga.status = SagaStatus::Compensating;
             }
         }
-        SagaEvent::Completed { saga_id } => {
-            if let Some(saga) = state.sagas.get_mut(&saga_id) {
+        SagaEvent::Completed { correlation_id } => {
+            if let Some(saga) = state.sagas.get_mut(&correlation_id) {
                 saga.status = SagaStatus::Completed;
             }
         }
@@ -369,17 +369,17 @@ effect::on::<SagaStarted>().then(|event, ctx| async move {
     // Schedule timeout check (5 minutes)
     ctx.deps().scheduler.schedule_after(
         Duration::from_secs(300),
-        CheckSagaTimeout { saga_id: event.saga_id }
+        CheckSagaTimeout { correlation_id: event.correlation_id }
     ).await?;
     Ok(())
 });
 
 // Timeout checker emits failure if not complete
 effect::on::<CheckSagaTimeout>().then(|event, ctx| async move {
-    let saga_state = ctx.deps().saga_store.get(event.saga_id).await?;
+    let saga_state = ctx.deps().saga_store.get(event.correlation_id).await?;
 
     if !matches!(saga_state.status, SagaStatus::Completed) {
-        Ok(SagaTimedOut { saga_id: event.saga_id })
+        Ok(SagaTimedOut { correlation_id: event.correlation_id })
     } else {
         Ok(()) // Saga completed, no timeout event
     }
@@ -925,7 +925,7 @@ Event → Transactional Outbox → Durable Queue → Worker → Effect → New E
 
 **Key Requirements:**
 1. **All events durable**: Use transactional outbox + persistent queue
-2. **Event context**: Every event carries `saga_id`, `correlation_id`, `event_id`
+2. **Event context**: Every event carries `correlation_id`, `correlation_id`, `event_id`
 3. **State in database**: Load current state from DB, not event replay (thin events)
 4. **Idempotency guards**: Formal Inbox pattern with ProcessedEvents table
 5. **Timeout handling**: Reaper/Sweeper pattern for ghost sagas
@@ -939,7 +939,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
     ctx.deps().mailer.send_approval_request(event.order_id).await?;
     Ok(ApprovalRequested {
         order_id: event.order_id,
-        saga_id: event.saga_id, // ← Workflow context
+        correlation_id: event.correlation_id, // ← Workflow context
         expires_at: Utc::now() + Duration::days(3),
     })
 });
@@ -969,7 +969,7 @@ In multi-day workflows, events can be "fat" (carry domain data) or "thin" (carry
 #[derive(Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
-    saga_id: Uuid,
+    correlation_id: Uuid,
     customer_email: String,       // ← Domain data in event
     items: Vec<OrderItem>,         // ← Domain data in event
     total: Decimal,                // ← Domain data in event
@@ -982,7 +982,7 @@ struct OrderPlaced {
 #[derive(Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
-    saga_id: Uuid,
+    correlation_id: Uuid,
     initiated_at: DateTime<Utc>,  // Workflow context only
 }
 
@@ -1009,7 +1009,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 #[derive(Clone, Serialize, Deserialize)]
 struct WorkflowEvent {
     // Fat: workflow metadata
-    saga_id: Uuid,
+    correlation_id: Uuid,
     correlation_id: Uuid,
     parent_event_id: Option<Uuid>,
     initiated_at: DateTime<Utc>,
@@ -1022,7 +1022,7 @@ struct WorkflowEvent {
 
 **Rationale**:
 - In a 5-day workflow, if the Order schema changes on Day 2, a fat event from Day 1 may lack required fields
-- Workflow context (saga_id, correlation_id) doesn't change - safe to include
+- Workflow context (correlation_id, correlation_id) doesn't change - safe to include
 - Domain data should always be loaded fresh from database
 
 **Example with "stale event" problem**:
@@ -1061,13 +1061,13 @@ CREATE TABLE processed_events (
     event_id UUID PRIMARY KEY,
     event_type VARCHAR(255) NOT NULL,
     processed_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    saga_id UUID,
+    correlation_id UUID,
     -- Optional: store result for debugging
     result_event_type VARCHAR(255),
     result_event_id UUID
 );
 
-CREATE INDEX idx_processed_events_saga ON processed_events(saga_id);
+CREATE INDEX idx_processed_events_saga ON processed_events(correlation_id);
 ```
 
 **Implementation Pattern**:
@@ -1096,11 +1096,11 @@ effect::on::<InventoryReserved>().then(|event, ctx| async move {
 
     // 3. Mark event as processed
     sqlx::query!(
-        "INSERT INTO processed_events (event_id, event_type, saga_id, result_event_type)
+        "INSERT INTO processed_events (event_id, event_type, correlation_id, result_event_type)
          VALUES ($1, $2, $3, $4)",
         event.event_id,
         "InventoryReserved",
-        event.saga_id,
+        event.correlation_id,
         "PaymentProcessed"
     )
     .execute(&mut *tx)
@@ -1169,7 +1169,7 @@ consumer_config.ack_wait = Duration::from_days(3);
 ```rust
 // Store saga state in DB with timeout
 CREATE TABLE sagas (
-    saga_id UUID PRIMARY KEY,
+    correlation_id UUID PRIMARY KEY,
     status VARCHAR(50) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -1180,13 +1180,13 @@ CREATE TABLE sagas (
 CREATE INDEX idx_sagas_timeout ON sagas(status, timeout_at);
 
 // Cron job queries for expired sagas
-SELECT saga_id FROM sagas
+SELECT correlation_id FROM sagas
 WHERE status = 'AwaitingApproval'
   AND timeout_at < NOW();
 
 // Emit timeout event for each expired saga
 for saga in expired_sagas {
-    queue.publish(SagaTimedOut { saga_id }).await?;
+    queue.publish(SagaTimedOut { correlation_id }).await?;
 }
 ```
 
@@ -1198,8 +1198,8 @@ RETURNS trigger AS $$
 BEGIN
     IF NEW.status = 'AwaitingApproval' AND NEW.timeout_at < NOW() THEN
         -- Write to outbox
-        INSERT INTO outbox_events (event_type, payload, saga_id)
-        VALUES ('SagaTimedOut', jsonb_build_object('saga_id', NEW.saga_id), NEW.saga_id);
+        INSERT INTO outbox_events (event_type, payload, correlation_id)
+        VALUES ('SagaTimedOut', jsonb_build_object('correlation_id', NEW.correlation_id), NEW.correlation_id);
     END IF;
     RETURN NEW;
 END;
@@ -1212,7 +1212,7 @@ effect::on::<SagaTimedOut>().then(|event, ctx| async move {
     let mut tx = ctx.deps().db.begin().await?;
 
     // Load current saga state
-    let saga = ctx.deps().db.get_saga(event.saga_id).await?;
+    let saga = ctx.deps().db.get_saga(event.correlation_id).await?;
 
     // Only timeout if still waiting
     if saga.status != SagaStatus::AwaitingApproval {
@@ -1224,7 +1224,7 @@ effect::on::<SagaTimedOut>().then(|event, ctx| async move {
 
     // Trigger compensation
     ctx.deps().outbox.write_event(
-        &SagaCompensationRequired { saga_id: event.saga_id },
+        &SagaCompensationRequired { correlation_id: event.correlation_id },
         &mut tx
     ).await?;
 
@@ -1488,7 +1488,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
   - **Seesaw CAN handle this** if you:
     - Make ALL events durable (NATS JetStream, SQS, Kafka)
     - Implement transactional outbox pattern
-    - Track workflow context in events (saga_id, correlation_id)
+    - Track workflow context in events (correlation_id, correlation_id)
     - Handle timeouts via external scheduler
     - Implement idempotency guards
     - Store state in database (not event replay)
@@ -1904,7 +1904,7 @@ This plan moves Seesaw from **"how do I use this?"** to **"how do I build produc
 ### Key Discovery: Multi-Day Workflows ARE Possible
 **With "Everything in Queue" pattern:**
 - All events → durable queue (NATS JetStream, SQS)
-- Event context tracking (saga_id, correlation_id)
+- Event context tracking (correlation_id, correlation_id)
 - State in database, not event replay
 - External timeout handling
 - Idempotency guards

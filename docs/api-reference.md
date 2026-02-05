@@ -58,24 +58,24 @@ where
     /// Process an external event (new saga, generates event_id)
     ///
     /// Use this for: user actions, cron jobs, manual triggers
-    /// Returns: saga_id for the new workflow
+    /// Returns: correlation_id for the new workflow
     ///
     /// # Example
     /// ```rust
-    /// let saga_id = engine.process(OrderPlaced {
+    /// let correlation_id = engine.process(OrderPlaced {
     ///     order_id: "12345",
     ///     user_id: "user_42",
     ///     amount: 99.99,
     /// }).await?;
     ///
-    /// println!("Started saga: {}", saga_id);
+    /// println!("Started saga: {}", correlation_id);
     /// ```
     pub async fn process(&self, event: impl Event) -> Result<Uuid>;
 
     /// Process with explicit event_id (for webhook idempotency)
     ///
     /// Use this for: webhooks, external APIs with idempotency keys
-    /// Returns: saga_id for the workflow
+    /// Returns: correlation_id for the workflow
     ///
     /// # Example
     /// ```rust
@@ -388,13 +388,13 @@ where
 
     /// Get saga ID (workflow identifier)
     ///
-    /// All events emitted by this effect inherit this saga_id.
+    /// All events emitted by this effect inherit this correlation_id.
     ///
     /// # Example
     /// ```rust
-    /// tracing::info!("Processing saga {}", ctx.saga_id());
+    /// tracing::info!("Processing saga {}", ctx.correlation_id());
     /// ```
-    pub fn saga_id(&self) -> Uuid;
+    pub fn correlation_id(&self) -> Uuid;
 
     /// Get event ID (unique event identifier)
     ///
@@ -548,7 +548,7 @@ impl PostgresQueue {
     /// ```rust
     /// queue.publish(EventEnvelope {
     ///     event_id: Uuid::new_v4(),
-    ///     saga_id,
+    ///     correlation_id,
     ///     event_type: "OrderPlaced",
     ///     payload: json!(event),
     ///     priority: 10,
@@ -606,11 +606,11 @@ impl PostgresQueue {
     ///
     /// # Example
     /// ```rust
-    /// let state: CrawlState = queue.get_saga_state(saga_id).await?
+    /// let state: CrawlState = queue.get_saga_state(correlation_id).await?
     ///     .ok_or_else(|| anyhow!("Saga not found"))?;
     /// println!("Pages crawled: {}/{}", state.pages_crawled, state.pages_total);
     /// ```
-    pub async fn get_saga_state<S>(&self, saga_id: Uuid) -> Result<Option<S>>
+    pub async fn get_saga_state<S>(&self, correlation_id: Uuid) -> Result<Option<S>>
     where
         S: serde::de::DeserializeOwned;
 
@@ -620,7 +620,7 @@ impl PostgresQueue {
     ///
     /// # Example
     /// ```rust
-    /// let effects = queue.list_saga_effects(saga_id).await?;
+    /// let effects = queue.list_saga_effects(correlation_id).await?;
     /// for effect in effects {
     ///     println!("{}: {} (attempts: {})",
     ///         effect.effect_id,
@@ -629,7 +629,7 @@ impl PostgresQueue {
     ///     );
     /// }
     /// ```
-    pub async fn list_saga_effects(&self, saga_id: Uuid) -> Result<Vec<EffectExecution>>;
+    pub async fn list_saga_effects(&self, correlation_id: Uuid) -> Result<Vec<EffectExecution>>;
 
     /// Get saga summary (effect counts by status)
     ///
@@ -638,12 +638,12 @@ impl PostgresQueue {
     ///
     /// # Example
     /// ```rust
-    /// let summary = queue.get_saga_summary(saga_id).await?;
+    /// let summary = queue.get_saga_summary(correlation_id).await?;
     /// let progress = summary.completed as f64 /
     ///     (summary.completed + summary.pending + summary.executing) as f64;
     /// println!("Progress: {:.0}%", progress * 100.0);
     /// ```
-    pub async fn get_saga_summary(&self, saga_id: Uuid) -> Result<SagaSummary>;
+    pub async fn get_saga_summary(&self, correlation_id: Uuid) -> Result<SagaSummary>;
 
     /// List all active sagas (have pending/executing effects)
     ///
@@ -654,7 +654,7 @@ impl PostgresQueue {
     /// let sagas = queue.list_active_sagas().await?;
     /// println!("Active sagas: {}", sagas.len());
     /// for saga in sagas {
-    ///     println!("  {} - {} effects", saga.saga_id, saga.total_effects);
+    ///     println!("  {} - {} effects", saga.correlation_id, saga.total_effects);
     /// }
     /// ```
     pub async fn list_active_sagas(&self) -> Result<Vec<SagaInfo>>;
@@ -680,7 +680,7 @@ impl PostgresQueue {
 pub struct DlqEntry {
     pub event_id: Uuid,
     pub effect_id: String,
-    pub saga_id: Uuid,
+    pub correlation_id: Uuid,
     pub error: String,
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,

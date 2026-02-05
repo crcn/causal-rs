@@ -74,17 +74,17 @@ where
     }
 
     /// Process event with saga ID
-    pub fn process_saga<E>(&self, saga_id: Uuid, event: E) -> ProcessFuture<St>
+    pub fn process_saga<E>(&self, correlation_id: Uuid, event: E) -> ProcessFuture<St>
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
-        self.process_saga_with_id(Uuid::new_v4(), saga_id, event)
+        self.process_saga_with_id(Uuid::new_v4(), correlation_id, event)
     }
 
     /// Process event with external event ID (webhook idempotency)
     ///
     /// Uses provided event_id for idempotency (e.g., Stripe webhook ID).
-    /// Generates a new saga_id.
+    /// Generates a new correlation_id.
     ///
     /// # Example
     /// ```ignore
@@ -108,20 +108,19 @@ where
     pub fn process_saga_with_id<E>(
         &self,
         event_id: Uuid,
-        saga_id: Uuid,
+        correlation_id: Uuid,
         event: E,
     ) -> ProcessFuture<St>
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
         let event_type = std::any::type_name::<E>().to_string();
-        let payload = serde_json::to_value(&event)
-            .expect("Event must be serializable");
+        let payload = serde_json::to_value(&event).expect("Event must be serializable");
 
         ProcessFuture::new(
             self.store.clone(),
             event_id,
-            saga_id,
+            correlation_id,
             None, // parent_id will be set by workers
             event_type,
             payload,

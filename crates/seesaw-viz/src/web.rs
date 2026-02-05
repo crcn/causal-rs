@@ -24,10 +24,7 @@ use tower_http::cors::CorsLayer;
 /// start_viewer(collector, "127.0.0.1:3000").await?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-pub async fn start_viewer<S>(
-    collector: SpanCollector<S>,
-    addr: &str,
-) -> Result<(), anyhow::Error>
+pub async fn start_viewer<S>(collector: SpanCollector<S>, addr: &str) -> Result<(), anyhow::Error>
 where
     S: Send + Sync + 'static,
 {

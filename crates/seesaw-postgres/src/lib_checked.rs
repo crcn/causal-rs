@@ -45,13 +45,13 @@ impl Store for PostgresStore {
     async fn publish(&self, event: QueuedEvent) -> Result<()> {
         sqlx::query!(
             "INSERT INTO seesaw_events (
-                event_id, parent_id, saga_id, event_type, payload, hops, created_at
+                event_id, parent_id, correlation_id, event_type, payload, hops, created_at
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (event_id, created_at) DO NOTHING",
             event.event_id,
             event.parent_id,
-            event.saga_id,
+            event.correlation_id,
             event.event_type,
             event.payload,
             event.hops,
@@ -69,8 +69,8 @@ impl Store for PostgresStore {
         let row = sqlx::query!(
             r#"
             SELECT
-                pg_advisory_xact_lock(hashtext(saga_id::text)),
-                id, event_id, parent_id, saga_id, event_type, payload, hops, created_at
+                pg_advisory_xact_lock(hashtext(correlation_id::text)),
+                id, event_id, parent_id, correlation_id, event_type, payload, hops, created_at
             FROM seesaw_events
             WHERE processed_at IS NULL
               AND (locked_until IS NULL OR locked_until < NOW())
@@ -87,7 +87,7 @@ impl Store for PostgresStore {
                 id: r.id,
                 event_id: r.event_id,
                 parent_id: r.parent_id,
-                saga_id: r.saga_id,
+                correlation_id: r.correlation_id,
                 event_type: r.event_type,
                 payload: r.payload,
                 hops: r.hops,
@@ -129,13 +129,13 @@ impl Store for PostgresStore {
     // State Operations
     // =========================================================================
 
-    async fn load_state<S>(&self, saga_id: Uuid) -> Result<Option<(S, i32)>>
+    async fn load_state<S>(&self, correlation_id: Uuid) -> Result<Option<(S, i32)>>
     where
         S: for<'de> Deserialize<'de> + Send,
     {
         let row = sqlx::query!(
-            "SELECT state, version FROM seesaw_state WHERE saga_id = $1",
-            saga_id
+            "SELECT state, version FROM seesaw_state WHERE correlation_id = $1",
+            correlation_id
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -149,7 +149,7 @@ impl Store for PostgresStore {
         }
     }
 
-    async fn save_state<S>(&self, saga_id: Uuid, state: &S, expected_version: i32) -> Result<i32>
+    async fn save_state<S>(&self, correlation_id: Uuid, state: &S, expected_version: i32) -> Result<i32>
     where
         S: Serialize + Send + Sync,
     {
@@ -158,14 +158,14 @@ impl Store for PostgresStore {
 
         // Optimistic locking: only update if version matches
         let result = sqlx::query!(
-            "INSERT INTO seesaw_state (saga_id, state, version, updated_at)
+            "INSERT INTO seesaw_state (correlation_id, state, version, updated_at)
              VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (saga_id) DO UPDATE
+             ON CONFLICT (correlation_id) DO UPDATE
              SET state = $2,
                  version = $3,
                  updated_at = NOW()
              WHERE seesaw_state.version = $4",
-            saga_id,
+            correlation_id,
             state_json,
             new_version,
             expected_version
@@ -188,7 +188,7 @@ impl Store for PostgresStore {
         &self,
         event_id: Uuid,
         effect_id: String,
-        saga_id: Uuid,
+        correlation_id: Uuid,
         event_type: String,
         event_payload: serde_json::Value,
         parent_event_id: Option<Uuid>,
@@ -199,14 +199,14 @@ impl Store for PostgresStore {
     ) -> Result<()> {
         sqlx::query!(
             "INSERT INTO seesaw_effect_executions (
-                event_id, effect_id, saga_id, status,
+                event_id, effect_id, correlation_id, status,
                 event_type, event_payload, parent_event_id,
                 execute_at, timeout_seconds, max_attempts, priority
              )
              VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10)",
             event_id,
             effect_id,
-            saga_id,
+            correlation_id,
             event_type,
             event_payload,
             parent_event_id,
@@ -226,7 +226,7 @@ impl Store for PostgresStore {
         let row = sqlx::query!(
             r#"
             SELECT
-                event_id, effect_id, saga_id, event_type, event_payload, parent_event_id,
+                event_id, effect_id, correlation_id, event_type, event_payload, parent_event_id,
                 execute_at, timeout_seconds, max_attempts, priority, attempts
             FROM seesaw_effect_executions
             WHERE status = 'pending'
@@ -258,7 +258,7 @@ impl Store for PostgresStore {
                 Ok(Some(QueuedEffectExecution {
                     event_id: r.event_id,
                     effect_id: r.effect_id,
-                    saga_id: r.saga_id,
+                    correlation_id: r.correlation_id,
                     event_type: r.event_type,
                     event_payload: r.event_payload,
                     parent_event_id: r.parent_event_id,
@@ -328,7 +328,7 @@ impl Store for PostgresStore {
     ) -> Result<()> {
         // Get effect details for DLQ
         let effect = sqlx::query!(
-            "SELECT saga_id, event_type, event_payload FROM seesaw_effect_executions
+            "SELECT correlation_id, event_type, event_payload FROM seesaw_effect_executions
              WHERE event_id = $1 AND effect_id = $2",
             event_id,
             effect_id
@@ -339,12 +339,12 @@ impl Store for PostgresStore {
         // Insert into DLQ
         sqlx::query!(
             "INSERT INTO seesaw_dlq (
-                event_id, effect_id, saga_id, error, event_type, event_payload, reason, attempts
+                event_id, effect_id, correlation_id, error, event_type, event_payload, reason, attempts
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             event_id,
             effect_id,
-            effect.saga_id,
+            effect.correlation_id,
             error,
             effect.event_type,
             effect.event_payload,
@@ -364,5 +364,53 @@ impl Store for PostgresStore {
         .await?;
 
         Ok(())
+    }
+
+    async fn subscribe_saga_events(
+        &self,
+        _correlation_id: Uuid,
+    ) -> Result<Box<dyn futures::Stream<Item = seesaw_core::SagaEvent> + Send + Unpin>> {
+        todo!("subscribe_saga_events not implemented in checked version")
+    }
+
+    async fn get_workflow_status(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<seesaw_core::WorkflowStatus> {
+        let state = sqlx::query_as::<_, (serde_json::Value,)>(
+            "SELECT state FROM seesaw_state WHERE correlation_id = $1"
+        )
+        .bind(correlation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|r| r.0);
+
+        let pending_effects = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM seesaw_effect_executions
+             WHERE correlation_id = $1 AND status IN ('pending', 'executing')"
+        )
+        .bind(correlation_id)
+        .fetch_one(&self.pool)
+        .await?
+        .0;
+
+        let last_event = sqlx::query_as::<_, (String,)>(
+            "SELECT event_type FROM seesaw_events
+             WHERE correlation_id = $1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1"
+        )
+        .bind(correlation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|r| r.0);
+
+        Ok(seesaw_core::WorkflowStatus {
+            correlation_id,
+            state,
+            pending_effects,
+            is_settled: pending_effects == 0,
+            last_event,
+        })
     }
 }

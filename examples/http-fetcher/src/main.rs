@@ -4,7 +4,7 @@
 //! Effects return events directly - no ctx.emit() needed.
 
 use anyhow::Result;
-use seesaw_core::{effect, reducer, Engine, EffectContext};
+use seesaw_core::{effect, reducer, EffectContext, Engine};
 
 // ============================================================================
 // Events (Facts)
@@ -16,13 +16,20 @@ enum FetchEvent {
     FetchRequested { urls: Vec<String> },
 
     /// Fetch succeeded
-    Fetched { url: String, content: String, status: u16 },
+    Fetched {
+        url: String,
+        content: String,
+        status: u16,
+    },
 
     /// Fetch failed
     FetchFailed { url: String, reason: String },
 
     /// All fetches complete
-    AllComplete { success_count: usize, failure_count: usize },
+    AllComplete {
+        success_count: usize,
+        failure_count: usize,
+    },
 }
 
 // ============================================================================
@@ -61,8 +68,8 @@ async fn main() -> Result<()> {
     // Define engine with closure-based effects and reducers
     let engine = Engine::with_deps(deps)
         // Reducer - pure state transformation
-        .with_reducer(reducer::fold::<FetchEvent>().into(|state: FetchState, event| {
-            match event {
+        .with_reducer(
+            reducer::fold::<FetchEvent>().into(|state: FetchState, event| match event {
                 FetchEvent::FetchRequested { urls } => {
                     let mut new_state = state.clone();
                     if new_state.urls_to_fetch.is_empty() {
@@ -91,8 +98,8 @@ async fn main() -> Result<()> {
                     new_state.complete = true;
                     new_state
                 }
-            }
-        }))
+            }),
+        )
         // Effect 1 - Fetch URLs when requested
         .with_effect(
             effect::on::<FetchEvent>()
@@ -113,7 +120,11 @@ async fn main() -> Result<()> {
                                     let content = response.text().await?;
                                     println!("✓ Fetched {} ({} bytes)", url, content.len());
 
-                                    Ok(FetchEvent::Fetched { url, content, status })
+                                    Ok(FetchEvent::Fetched {
+                                        url,
+                                        content,
+                                        status,
+                                    })
                                 } else {
                                     println!("✗ Failed {} (HTTP {})", url, status);
                                     Ok(FetchEvent::FetchFailed {
@@ -138,7 +149,7 @@ async fn main() -> Result<()> {
                             failure_count: state.failure_count,
                         })
                     }
-                })
+                }),
         )
         // Effect 2 - Continue fetching after success/failure
         .with_effect(
@@ -159,7 +170,7 @@ async fn main() -> Result<()> {
                             failure_count: state.failure_count,
                         })
                     }
-                })
+                }),
         );
 
     let urls = vec![
@@ -172,9 +183,9 @@ async fn main() -> Result<()> {
     let handle = engine.activate(FetchState::default());
 
     // Process returns initial event and waits for all effects
-    handle.process(|_| async move {
-        Ok(FetchEvent::FetchRequested { urls })
-    }).await?;
+    handle
+        .process(|_| async move { Ok(FetchEvent::FetchRequested { urls }) })
+        .await?;
 
     println!("\nAll fetches complete!");
 

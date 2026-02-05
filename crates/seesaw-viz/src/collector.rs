@@ -121,7 +121,11 @@ where
     }
 
     /// Start a new span (manual API)
-    pub async fn start_span(&self, event_id: Uuid, event_type: String) -> Result<Uuid, CollectorError> {
+    pub async fn start_span(
+        &self,
+        event_id: Uuid,
+        event_type: String,
+    ) -> Result<Uuid, CollectorError> {
         let span_id = Uuid::new_v4();
 
         if !self.sampler.should_sample(&event_type, &HashMap::new()) {
@@ -228,7 +232,8 @@ where
         let span_id = Uuid::new_v4();
 
         // Serialize state if provided
-        let (prev_val, next_val, diff) = if let (Some(prev), Some(next)) = (prev_state, next_state) {
+        let (prev_val, next_val, diff) = if let (Some(prev), Some(next)) = (prev_state, next_state)
+        {
             let prev_val = self.formatter.serialize(&prev).ok();
             let next_val = self.formatter.serialize(&next).ok();
             let diff = self.formatter.diff(&prev, &next).ok().flatten();
@@ -338,7 +343,11 @@ impl SpanProcessor {
                     if let Some(mut span) = pending_spans.remove(&span_id) {
                         let completed_at = Utc::now();
                         span.completed_at = Some(completed_at);
-                        span.duration_us = Some((completed_at - span.started_at).num_microseconds().unwrap_or(0) as u64);
+                        span.duration_us = Some(
+                            (completed_at - span.started_at)
+                                .num_microseconds()
+                                .unwrap_or(0) as u64,
+                        );
                         span.success = success;
                         span.error = error;
 

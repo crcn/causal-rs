@@ -192,7 +192,7 @@ async fn create_order(
     db: &PgPool,
 ) -> Result<Json<OrderResponse>> {
     // Start new saga
-    let saga_id = engine.process(|| async move {
+    let correlation_id = engine.process(|| async move {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
             customer_email: payload.email,
@@ -200,16 +200,16 @@ async fn create_order(
         })
     }).await?;
 
-    // Store saga_id for later
+    // Store correlation_id for later
     sqlx::query!(
-        "UPDATE orders SET saga_id = $1 WHERE order_id = $2",
-        saga_id,
+        "UPDATE orders SET correlation_id = $1 WHERE order_id = $2",
+        correlation_id,
         order_id
     )
     .execute(db)
     .await?;
 
-    Ok(Json(OrderResponse { order_id, saga_id }))
+    Ok(Json(OrderResponse { order_id, correlation_id }))
 }
 ```
 
@@ -228,17 +228,17 @@ async fn handle_approval(
     engine: Arc<Engine<OrderState, Deps>>,
     db: &PgPool,
 ) -> Result<Json<()>> {
-    // Lookup saga_id
-    let saga_id = sqlx::query!(
-        "SELECT saga_id FROM orders WHERE order_id = $1",
+    // Lookup correlation_id
+    let correlation_id = sqlx::query!(
+        "SELECT correlation_id FROM orders WHERE order_id = $1",
         payload.order_id
     )
     .fetch_one(db)
     .await?
-    .saga_id;
+    .correlation_id;
 
     // Continue existing saga (state from Day 1 is still there!)
-    engine.process_saga(saga_id, || async move {
+    engine.process_saga(correlation_id, || async move {
         Ok(ApprovalReceived {
             order_id: payload.order_id,
         })
@@ -389,7 +389,7 @@ async fn test_order_workflow() {
     let engine = engine.with_queue(queue);
 
     // Place order
-    let saga_id = engine.process(|| async {
+    let correlation_id = engine.process(|| async {
         Ok(OrderPlaced { order_id, email, amount })
     }).await?;
 
@@ -397,15 +397,15 @@ async fn test_order_workflow() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check state
-    let state = get_state(&pool, saga_id).await?;
+    let state = get_state(&pool, correlation_id).await?;
     assert!(state.payment_charged);
 
     // Simulate time passing (for delayed effects)
-    fast_forward_time(&pool, saga_id, Duration::from_days(2)).await?;
+    fast_forward_time(&pool, correlation_id, Duration::from_days(2)).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check approval requested
-    let state = get_state(&pool, saga_id).await?;
+    let state = get_state(&pool, correlation_id).await?;
     assert!(state.approval_requested);
 
     engine.shutdown().await?;
@@ -418,12 +418,12 @@ async fn test_order_workflow() {
 
 If you're coming from v0.7 (stateless):
 
-1. **Remove saga_id from events** - Framework manages it now
+1. **Remove correlation_id from events** - Framework manages it now
 2. **Add `.id()` to effects** - Compile enforces idempotency
 3. **Add delays** - Use `.delayed(7days)` for time-based execution
 4. **Start workers** - Replace `activate()` with `start_workers()`
 5. **Use `process()`** - Replace `run()` with `engine.process()`
-6. **Store saga_id** - For webhook continuations
+6. **Store correlation_id** - For webhook continuations
 
 See [API Migration Guide](./api-migration-guide.md) for detailed before/after examples.
 
@@ -432,7 +432,7 @@ See [API Migration Guide](./api-migration-guide.md) for detailed before/after ex
 ## Next Steps
 
 1. Run migrations: `sqlx migrate run`
-2. Update your events (remove saga_id)
+2. Update your events (remove correlation_id)
 3. Add `.id()` to all effects
 4. Add `.delayed()` for time-based logic
 5. Deploy with workers

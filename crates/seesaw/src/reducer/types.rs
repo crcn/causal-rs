@@ -3,6 +3,8 @@
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 
+use crate::event_codec::EventCodec;
+
 /// Reference to a type-erased event for reducers that handle all events.
 pub struct AnyEventRef<'a> {
     /// Reference to the type-erased event value.
@@ -31,6 +33,9 @@ pub struct Reducer<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    /// Queue codec metadata for typed event reducers.
+    pub(crate) codecs: Vec<Arc<EventCodec>>,
+
     /// Determines if this reducer handles the given event type.
     pub(crate) can_handle: Arc<dyn Fn(TypeId) -> bool + Send + Sync>,
 
@@ -45,6 +50,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
+            codecs: self.codecs.clone(),
             can_handle: self.can_handle.clone(),
             reduce: self.reduce.clone(),
         }
@@ -63,6 +69,11 @@ where
     /// Apply the reducer to produce a new state.
     pub fn apply(&self, state: S, event: &dyn Any, type_id: TypeId) -> S {
         (self.reduce)(state, event, type_id)
+    }
+
+    /// Internal queue codec metadata, if available.
+    pub(crate) fn codecs(&self) -> &[Arc<EventCodec>] {
+        &self.codecs
     }
 }
 

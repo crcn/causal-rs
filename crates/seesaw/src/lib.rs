@@ -60,15 +60,16 @@
 // New module structure
 pub mod effect;
 pub mod reducer;
-pub mod store;
 pub mod runtime;
+pub mod store;
 
 mod effect_registry;
-mod reducer_registry;
 mod engine;
 mod engine_v2;
-mod task_group;
+mod event_codec;
 mod process;
+mod reducer_registry;
+mod task_group;
 
 // Service layer (action execution)
 pub mod service;
@@ -79,13 +80,16 @@ pub mod otel;
 
 // Re-export main types
 pub use effect::{AnyEvent, Effect, EffectContext, EffectError};
-pub use reducer::Reducer;
-pub use engine::{Handle, Engine};
+pub use engine::{Engine, Handle};
 pub use engine_v2::Engine as QueueEngine; // New queue-backed engine
-pub use task_group::TaskGroup;
-pub use store::{EmittedEvent, QueuedEffectExecution, QueuedEvent, SagaEvent, Store, NAMESPACE_SEESAW};
 pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
+pub use reducer::Reducer;
 pub use runtime::{Runtime, RuntimeConfig};
+pub use store::{
+    EmittedEvent, QueuedEffectExecution, QueuedEvent, SagaEvent, Store, WorkflowStatus,
+    NAMESPACE_SEESAW,
+};
+pub use task_group::TaskGroup;
 
 // Top-level builder functions
 pub use effect::on;

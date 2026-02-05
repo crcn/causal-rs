@@ -62,11 +62,11 @@ let mut tx = pool.begin().await?;
 
 // 1. Insert emitted event (deterministic ID = idempotent)
 sqlx::query!(
-    "INSERT INTO seesaw_events (event_id, saga_id, event_type, payload, parent_id)
+    "INSERT INTO seesaw_events (event_id, correlation_id, event_type, payload, parent_id)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (event_id) DO NOTHING",  // ← Already published if crash+retry
     emitted_event_id,
-    saga_id,
+    correlation_id,
     type_name::<PaymentCharged>(),
     json!(next_event),
     current_event_id
@@ -129,7 +129,7 @@ CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 ```sql
 -- Worker query enforces per-saga FIFO with advisory locks
 SELECT
-    pg_advisory_xact_lock(hashtext(saga_id::text)),  -- ← Lock saga for transaction
+    pg_advisory_xact_lock(hashtext(correlation_id::text)),  -- ← Lock saga for transaction
     *
 FROM seesaw_events
 WHERE processed_at IS NULL
@@ -140,7 +140,7 @@ FOR UPDATE SKIP LOCKED;
 ```
 
 **How it works**:
-1. `pg_advisory_xact_lock(hash(saga_id))` acquires per-saga lock for transaction duration
+1. `pg_advisory_xact_lock(hash(correlation_id))` acquires per-saga lock for transaction duration
 2. Only one worker can process events from a given saga at a time
 3. Other workers skip locked sagas (via SKIP LOCKED) and grab events from different sagas
 4. Ensures strict per-saga FIFO ordering
@@ -219,14 +219,14 @@ pub struct Runtime<S, D> {
 
 | Component | Throughput | Bottleneck | Mitigation |
 |-----------|------------|------------|------------|
-| **Event Workers** (Reducers) | 500-1000 events/sec | `FOR UPDATE` lock contention | Partition by `saga_id` |
+| **Event Workers** (Reducers) | 500-1000 events/sec | `FOR UPDATE` lock contention | Partition by `correlation_id` |
 | **Effect Workers** (IO) | 50-200 effects/sec | External API latency | Increase worker count (20+) |
 | **Database Writes** | 5000 events/sec | WAL write speed | Async commit + batching |
 | **Storage Growth** | ~15GB/month | Disk space | Partition tables + retention policy |
 
 **Scaling Path**:
 1. **0-100k users**: Single Postgres instance, 2 event workers, 10 effect workers
-2. **100k-1M users**: Read replicas + partition by `saga_id` hash
+2. **100k-1M users**: Read replicas + partition by `correlation_id` hash
 3. **1M+ users**: Dedicated queue shards + distributed tracing
 
 **Invariant**: Postgres is the **control plane**. High-throughput data plane (e.g., analytics events) belongs in NATS/Kafka, not this queue.
@@ -240,9 +240,9 @@ pub struct Runtime<S, D> {
 -- 1. Unique constraint on event_id (idempotency)
 CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 
--- 2. Add saga_id to effect_executions (efficient queries)
-ALTER TABLE seesaw_effect_executions ADD COLUMN saga_id UUID NOT NULL;
-CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(saga_id);
+-- 2. Add correlation_id to effect_executions (efficient queries)
+ALTER TABLE seesaw_effect_executions ADD COLUMN correlation_id UUID NOT NULL;
+CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(correlation_id);
 
 -- 3. Fix claimed_at default (should be NULL for pending rows)
 ALTER TABLE seesaw_effect_executions
@@ -480,8 +480,8 @@ pub trait Queue: Send + Sync + 'static {
 
 #[async_trait]
 pub trait StateStore: Send + Sync + 'static {
-    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>>;
-    async fn save<S: Serialize + Send>(&self, saga_id: Uuid, state: &S, version: i32) -> Result<()>;
+    async fn load<S: DeserializeOwned + Send>(&self, correlation_id: Uuid) -> Result<Option<S>>;
+    async fn save<S: Serialize + Send>(&self, correlation_id: Uuid, state: &S, version: i32) -> Result<()>;
 }
 ```
 
@@ -506,8 +506,8 @@ pub struct PostgresStateStore {
 
 #[async_trait]
 impl StateStore for PostgresStateStore {
-    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>> {
-        let row = sqlx::query!("SELECT state FROM seesaw_state WHERE saga_id = $1", saga_id)
+    async fn load<S: DeserializeOwned + Send>(&self, correlation_id: Uuid) -> Result<Option<S>> {
+        let row = sqlx::query!("SELECT state FROM seesaw_state WHERE correlation_id = $1", correlation_id)
             .fetch_optional(&self.pool).await?;
         match row {
             Some(r) => Ok(Some(serde_json::from_value(r.state)?)),
@@ -639,7 +639,7 @@ engine.with_effect(
 CREATE TABLE seesaw_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
-    saga_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending',
     result JSONB,
     error TEXT,
@@ -808,14 +808,14 @@ effect::on::<OrderPlaced>()
 
 **Schema**:
 ```sql
--- Events queue (envelope carries saga_id as metadata)
+-- Events queue (envelope carries correlation_id as metadata)
 CREATE TABLE seesaw_events (
     id BIGSERIAL PRIMARY KEY,
     event_id UUID NOT NULL,
     parent_id UUID,
-    saga_id UUID NOT NULL,           -- ← Envelope metadata, not in user events
+    correlation_id UUID NOT NULL,           -- ← Envelope metadata, not in user events
     event_type VARCHAR(255) NOT NULL,
-    payload JSONB NOT NULL,          -- User event data (no saga_id inside)
+    payload JSONB NOT NULL,          -- User event data (no correlation_id inside)
     hops INT NOT NULL DEFAULT 0,     -- ← Infinite loop protection
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed_at TIMESTAMPTZ,
@@ -837,7 +837,7 @@ CREATE OR REPLACE FUNCTION notify_saga_event()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify(
-        'seesaw_saga_' || NEW.saga_id::text,
+        'seesaw_saga_' || NEW.correlation_id::text,
         json_build_object(
             'event_type', NEW.event_type,
             'payload', NEW.payload
@@ -865,8 +865,8 @@ impl PostgresQueue {
         sqlx::query_as!(
             QueuedEvent,
             "SELECT
-                pg_advisory_xact_lock(hashtext(saga_id::text)),
-                id, event_id, saga_id, event_type, payload, hops
+                pg_advisory_xact_lock(hashtext(correlation_id::text)),
+                id, event_id, correlation_id, event_type, payload, hops
              FROM seesaw_events
              WHERE processed_at IS NULL
                AND (locked_until IS NULL OR locked_until < NOW())
@@ -892,7 +892,7 @@ impl PostgresQueue {
 ```sql
 -- State per saga
 CREATE TABLE seesaw_state (
-    saga_id UUID PRIMARY KEY,
+    correlation_id UUID PRIMARY KEY,
     state JSONB NOT NULL,
     version INT NOT NULL DEFAULT 1,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -902,7 +902,7 @@ CREATE TABLE seesaw_state (
 CREATE TABLE seesaw_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
-    saga_id UUID NOT NULL,  -- ← For efficient per-saga queries
+    correlation_id UUID NOT NULL,  -- ← For efficient per-saga queries
     status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, executing, completed, failed
     result JSONB,
     error TEXT,
@@ -934,7 +934,7 @@ WHERE status = 'pending' AND execute_at <= NOW();
 CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
 
 -- Lookup effects by saga (for per-saga queries)
-CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(saga_id);
+CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(correlation_id);
 
 -- Retry monitoring (find failing effects)
 CREATE INDEX idx_effect_executions_status ON seesaw_effect_executions(status, attempts);
@@ -943,11 +943,11 @@ CREATE INDEX idx_effect_executions_status ON seesaw_effect_executions(status, at
 **Core methods**:
 ```rust
 impl PostgresStateStore<S> {
-    async fn load(&self, saga_id: Uuid) -> Result<S> {
-        // SELECT state FROM seesaw_state WHERE saga_id = $1
+    async fn load(&self, correlation_id: Uuid) -> Result<S> {
+        // SELECT state FROM seesaw_state WHERE correlation_id = $1
     }
 
-    async fn save(&self, saga_id: Uuid, state: &S) -> Result<()> {
+    async fn save(&self, correlation_id: Uuid, state: &S) -> Result<()> {
         // INSERT ... ON CONFLICT DO UPDATE
     }
 }
@@ -999,10 +999,10 @@ async fn event_worker_loop(&self) -> Result<()> {
 
         // 4. Initialize or load state
         sqlx::query!(
-            "INSERT INTO seesaw_state (saga_id, state, version)
+            "INSERT INTO seesaw_state (correlation_id, state, version)
              VALUES ($1, $2, 1)
-             ON CONFLICT (saga_id) DO NOTHING",
-            event.saga_id,
+             ON CONFLICT (correlation_id) DO NOTHING",
+            event.correlation_id,
             Json(&S::default())
         )
         .execute(&mut *tx)
@@ -1010,8 +1010,8 @@ async fn event_worker_loop(&self) -> Result<()> {
 
         let (prev_state, version) = sqlx::query!(
             "SELECT state, version FROM seesaw_state
-             WHERE saga_id = $1 FOR UPDATE",
-            event.saga_id
+             WHERE correlation_id = $1 FOR UPDATE",
+            event.correlation_id
         )
         .fetch_one(&mut *tx)
         .await?;
@@ -1023,10 +1023,10 @@ async fn event_worker_loop(&self) -> Result<()> {
         sqlx::query!(
             "UPDATE seesaw_state
              SET state = $1, version = $2, updated_at = NOW()
-             WHERE saga_id = $3 AND version = $4",
+             WHERE correlation_id = $3 AND version = $4",
             Json(&next_state),
             version + 1,
-            event.saga_id,
+            event.correlation_id,
             version
         )
         .execute(&mut *tx)
@@ -1034,7 +1034,7 @@ async fn event_worker_loop(&self) -> Result<()> {
 
         // 7. Process effects: inline (execute now) vs queued (insert intent)
         let ctx = EffectContext {
-            saga_id: event.saga_id,
+            correlation_id: event.correlation_id,
             event_id: event.event_id,
             state: Arc::new(next_state.clone()),
             deps: self.deps.clone(),
@@ -1065,12 +1065,12 @@ async fn event_worker_loop(&self) -> Result<()> {
                 // Record execution (idempotency)
                 sqlx::query!(
                     "INSERT INTO seesaw_effect_executions (
-                        event_id, effect_id, saga_id, status, result, completed_at
+                        event_id, effect_id, correlation_id, status, result, completed_at
                      )
                      VALUES ($1, $2, $3, 'completed', $4, NOW())",
                     event.event_id,
                     effect.id,
-                    event.saga_id,
+                    event.correlation_id,
                     Json(&result)
                 )
                 .execute(&mut *tx)
@@ -1085,12 +1085,12 @@ async fn event_worker_loop(&self) -> Result<()> {
 
                     sqlx::query!(
                         "INSERT INTO seesaw_events (
-                            event_id, saga_id, parent_id, event_type, payload, hops
+                            event_id, correlation_id, parent_id, event_type, payload, hops
                          )
                          VALUES ($1, $2, $3, $4, $5, $6)
                          ON CONFLICT DO NOTHING",
                         next_event_id,
-                        event.saga_id,
+                        event.correlation_id,
                         event.event_id,
                         std::any::type_name_of_val(&next_event),
                         Json(&next_event),
@@ -1103,7 +1103,7 @@ async fn event_worker_loop(&self) -> Result<()> {
                 // QUEUED: Insert intent for effect worker
                 sqlx::query!(
                     "INSERT INTO seesaw_effect_executions (
-                        event_id, effect_id, saga_id, status,
+                        event_id, effect_id, correlation_id, status,
                         event_type, event_payload, parent_event_id,
                         execute_at, timeout_seconds, max_attempts, priority
                      )
@@ -1111,7 +1111,7 @@ async fn event_worker_loop(&self) -> Result<()> {
                      ON CONFLICT DO NOTHING",
                     event.event_id,
                     effect.id,
-                    event.saga_id,
+                    event.correlation_id,
                     event.event_type,
                     Json(&event.payload),  // Copy payload (survives 30-day deletion)
                     event.parent_id,
@@ -1173,7 +1173,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
         // 2. Event payload is already in pending (survives retention deletion)
         // No need to query seesaw_events - it might have been deleted after 30 days
         let event_payload = pending.event_payload;
-        let saga_id = pending.saga_id;
+        let correlation_id = pending.correlation_id;
 
         // Get hops from parent event (if still exists, otherwise default to 0)
         let hops = sqlx::query_scalar!(
@@ -1186,8 +1186,8 @@ async fn effect_worker_loop(&self) -> Result<()> {
 
         // 3. Get state for context
         let state = sqlx::query!(
-            "SELECT state FROM seesaw_state WHERE saga_id = $1",
-            saga_id
+            "SELECT state FROM seesaw_state WHERE correlation_id = $1",
+            correlation_id
         )
         .fetch_one(&self.pool)
         .await?;
@@ -1196,7 +1196,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
         let ctx = EffectContext {
             state: Arc::new(state),  // Wrap in Arc for cheap cloning (safe across .await)
             deps: self.deps.clone(),
-            saga_id: saga_id,
+            correlation_id: correlation_id,
             event_id: pending.event_id,
             idempotency_key: Uuid::new_v5(
                 &NAMESPACE_SEESAW,
@@ -1226,12 +1226,12 @@ async fn effect_worker_loop(&self) -> Result<()> {
                 // Insert emitted event (idempotent via event_id unique constraint)
                 sqlx::query!(
                     "INSERT INTO seesaw_events
-                     (event_id, parent_id, saga_id, event_type, payload, hops)
+                     (event_id, parent_id, correlation_id, event_type, payload, hops)
                      VALUES ($1, $2, $3, $4, $5, $6)
                      ON CONFLICT (event_id) DO NOTHING",
                     next_event_id,
                     pending.event_id,
-                    saga_id,
+                    correlation_id,
                     std::any::type_name_of_val(&next_event),
                     Json(&next_event),
                     hops + 1
@@ -1303,10 +1303,10 @@ async fn effect_worker_loop(&self) -> Result<()> {
 ```rust
 // Before step 3 in process_next_event:
 sqlx::query!(
-    "INSERT INTO seesaw_state (saga_id, state, version)
+    "INSERT INTO seesaw_state (correlation_id, state, version)
      VALUES ($1, $2, 1)
-     ON CONFLICT (saga_id) DO NOTHING",
-    queued.saga_id,
+     ON CONFLICT (correlation_id) DO NOTHING",
+    queued.correlation_id,
     Json(&S::default())
 )
 .execute(&mut *tx)
@@ -1536,16 +1536,16 @@ tx.commit().await?;
 **Per-Saga Throughput**: ~10 events/sec per saga due to serialization lock.
 
 If you have high-throughput sagas:
-- Partition work across multiple saga_ids
-- Use saga_id as sharding key
+- Partition work across multiple correlation_ids
+- Use correlation_id as sharding key
 ```
 
 **Option B: Optimistic locking** (remove FOR UPDATE)
 ```rust
 // Load without lock
 let (prev_state, version) = sqlx::query!(
-    "SELECT state, version FROM seesaw_state WHERE saga_id = $1",
-    queued.saga_id
+    "SELECT state, version FROM seesaw_state WHERE correlation_id = $1",
+    queued.correlation_id
 )
 .fetch_one(&mut *tx)
 .await?;
@@ -1554,8 +1554,8 @@ let (prev_state, version) = sqlx::query!(
 let rows_affected = sqlx::query!(
     "UPDATE seesaw_state
      SET state = $1, version = $2
-     WHERE saga_id = $3 AND version = $4",
-    Json(&next_state), version + 1, queued.saga_id, version
+     WHERE correlation_id = $3 AND version = $4",
+    Json(&next_state), version + 1, queued.correlation_id, version
 )
 .execute(&mut *tx)
 .await?
@@ -1798,7 +1798,7 @@ effect::on::<GenerateInvoice>()
 **Monitoring**:
 ```sql
 -- Alert on large states
-SELECT saga_id,
+SELECT correlation_id,
        LENGTH(state::text) as state_bytes,
        state::jsonb -> 'order_id' as order_id
 FROM seesaw_state
@@ -1885,10 +1885,10 @@ async fn main() -> Result<()> {
         20,  // Effect workers (slow - IO-bound)
     );
 
-    // Process initial event - framework generates saga_id
+    // Process initial event - framework generates correlation_id
     engine.process(OrderPlaced {
         order_id: 123,
-        // No saga_id! Envelope carries it ✅
+        // No correlation_id! Envelope carries it ✅
     });
 
     info!("Started saga");
@@ -1937,16 +1937,16 @@ async fn main() -> Result<()> {
 
 ```rust
 // Day 1: Order placed - NEW saga
-let saga_id = engine.process(OrderPlaced {
+let correlation_id = engine.process(OrderPlaced {
     order_id: Uuid::new_v4(),
     customer_email: "user@example.com",
-    // No saga_id in event! ✅
+    // No correlation_id in event! ✅
 }).await?;
 
-// Store saga_id for later (e.g., in your orders table)
+// Store correlation_id for later (e.g., in your orders table)
 db.query!(
-    "UPDATE orders SET saga_id = $1 WHERE order_id = $2",
-    saga_id, order_id
+    "UPDATE orders SET correlation_id = $1 WHERE order_id = $2",
+    correlation_id, order_id
 ).await?;
 
 // Effect 1: Send immediate confirmation
@@ -1970,17 +1970,17 @@ effect::on::<OrderPlaced>()
 
 // Day 3: Approval received via webhook - CONTINUE existing saga
 async fn handle_approval_webhook(order_id: Uuid) -> Result<()> {
-    // Lookup saga_id from your database
-    let saga_id = db.query!(
-        "SELECT saga_id FROM orders WHERE order_id = $1",
+    // Lookup correlation_id from your database
+    let correlation_id = db.query!(
+        "SELECT correlation_id FROM orders WHERE order_id = $1",
         order_id
-    ).fetch_one().await?.saga_id;
+    ).fetch_one().await?.correlation_id;
 
     // Process event in existing saga
-    engine.process_saga(saga_id, || async move {
+    engine.process_saga(correlation_id, || async move {
         Ok(ApprovalReceived {
             order_id,
-            // No saga_id in event! ✅
+            // No correlation_id in event! ✅
         })
     }).await?;
 
@@ -1996,16 +1996,16 @@ effect::on::<ApprovalReceived>()
 
         Ok(OrderCompleted {
             order_id: event.order_id,
-            // No saga_id! ✅
+            // No correlation_id! ✅
         })
     });
 ```
 
 **Key**:
 - Events persist in queue between Day 1 and Day 3
-- saga_id is envelope metadata, not in user events
-- Effects automatically inherit saga_id from context
-- State is durable and isolated per saga_id
+- correlation_id is envelope metadata, not in user events
+- Effects automatically inherit correlation_id from context
+- State is durable and isolated per correlation_id
 
 ### External API Integration & Execution Properties
 
@@ -2045,7 +2045,7 @@ effect::on::<OrderPlaced>()
     .retry(1)  // Don't retry logs
     .then(|event, ctx| async move {
         tracing::info!(
-            saga_id = %ctx.saga_id,
+            correlation_id = %ctx.correlation_id,
             event_id = %ctx.event_id,
             order_id = %event.order_id,
             "Processing order"
@@ -2095,10 +2095,10 @@ let result = engine
 ```
 
 **How It Works**:
-1. `.wait()` subscribes to `LISTEN seesaw_saga_{saga_id}` **before** publishing
+1. `.wait()` subscribes to `LISTEN seesaw_saga_{correlation_id}` **before** publishing
 2. `process()` publishes event to queue
 3. Workers process event → reducers update state → effects run → terminal event emitted
-4. Trigger fires `NOTIFY seesaw_saga_{saga_id}` with event payload
+4. Trigger fires `NOTIFY seesaw_saga_{correlation_id}` with event payload
 5. `.wait()` receives notification, returns typed event
 6. ✅ State is guaranteed committed (terminal event = workflow done)
 
@@ -2233,8 +2233,8 @@ engine.resolve_dlq(event_id, "charge_payment").await?;
 | `handle.settled().await` | `engine.process(e).wait::<E>().await` | Wait for terminal event via LISTEN/NOTIFY |
 | N/A | `engine.shutdown().await` | Graceful worker drain |
 | `effect::on::<E>().then(...)` | `effect::on::<E>().id("name").then(...)` | **ID required** for idempotency |
-| Event has saga_id field | **saga_id in envelope** | Events are pure business data |
-| N/A | `ctx.saga_id`, `ctx.event_id` | Context exposes envelope metadata |
+| Event has correlation_id field | **correlation_id in envelope** | Events are pure business data |
+| N/A | `ctx.correlation_id`, `ctx.event_id` | Context exposes envelope metadata |
 | N/A | `ctx.idempotency_key` | UUID v5 for external API idempotency |
 
 ### Runtime Methods (Owns Workers)
@@ -2272,8 +2272,8 @@ pub trait Queue: Send + Sync + 'static {
 
 #[async_trait]
 pub trait StateStore: Send + Sync + 'static {
-    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>>;
-    async fn save<S: Serialize + Send>(&self, saga_id: Uuid, state: &S, version: i32) -> Result<()>;
+    async fn load<S: DeserializeOwned + Send>(&self, correlation_id: Uuid) -> Result<Option<S>>;
+    async fn save<S: Serialize + Send>(&self, correlation_id: Uuid, state: &S, version: i32) -> Result<()>;
 }
 ```
 
@@ -2307,8 +2307,8 @@ impl PostgresStateStore {
 
 #[async_trait]
 impl StateStore for PostgresStateStore {
-    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>>;
-    async fn save<S: Serialize + Send>(&self, saga_id: Uuid, state: &S, version: i32) -> Result<()>;
+    async fn load<S: DeserializeOwned + Send>(&self, correlation_id: Uuid) -> Result<Option<S>>;
+    async fn save<S: Serialize + Send>(&self, correlation_id: Uuid, state: &S, version: i32) -> Result<()>;
 }
 ```
 
@@ -2342,7 +2342,7 @@ impl<S, D, Q: Queue, St: StateStore> Engine<S, D, Q, St> {
 // ProcessHandle - enables wait or fire-and-forget patterns
 pub struct ProcessHandle {
     queue: Arc<PostgresQueue>,
-    saga_id: Uuid,
+    correlation_id: Uuid,
     event: Box<dyn Event>,
 }
 
@@ -2367,7 +2367,7 @@ impl Drop for ProcessHandle {
 // WaitHandle - awaitable future that publishes event and waits for terminal event
 pub struct WaitHandle<E> {
     queue: Arc<PostgresQueue>,
-    saga_id: Uuid,
+    correlation_id: Uuid,
     event: Box<dyn Event>,
     timeout: Option<Duration>,
 }
@@ -2385,7 +2385,7 @@ impl<E: Event> IntoFuture for WaitHandle<E> {
 // WaitAnyHandle - builder for matching multiple terminal events
 pub struct WaitAnyHandle {
     queue: Arc<PostgresQueue>,
-    saga_id: Uuid,
+    correlation_id: Uuid,
     event: Box<dyn Event>,
     matchers: Vec<Box<dyn EventMatcher>>,
     timeout: Option<Duration>,
@@ -2585,7 +2585,7 @@ pub struct EffectContext<S, D> {
     pub deps: Arc<D>,
 
     // Envelope metadata (NEW)
-    pub saga_id: Uuid,            // ← From envelope, not user event
+    pub correlation_id: Uuid,            // ← From envelope, not user event
     pub event_id: Uuid,           // ← Current event's unique ID
     pub idempotency_key: String,  // ← UUID v5(event_id + effect_id)
 }
@@ -2615,7 +2615,7 @@ effect::on::<OrderPlaced>()
         let state = ctx.state();  // ← Fresh from DB
         ctx.deps().mailer.send(state.user_email).await?;
 
-        // Event inherits ctx.saga_id automatically ✅
+        // Event inherits ctx.correlation_id automatically ✅
         Ok(EmailSent { order_id: event.order_id })
     });
 ```
@@ -2648,8 +2648,8 @@ impl PostgresQueue {
 
         // Move from DLQ back to effect_executions
         sqlx::query!(
-            "INSERT INTO seesaw_effect_executions (event_id, effect_id, saga_id, status, attempts)
-             SELECT event_id, effect_id, saga_id, 'pending', 0
+            "INSERT INTO seesaw_effect_executions (event_id, effect_id, correlation_id, status, attempts)
+             SELECT event_id, effect_id, correlation_id, 'pending', 0
              FROM seesaw_dlq
              WHERE event_id = $1 AND effect_id = $2",
             event_id,
@@ -2711,13 +2711,13 @@ impl PostgresQueue {
     // ============ Saga Progress Tracking ============
 
     /// Get current state for a saga
-    pub async fn get_saga_state<S>(&self, saga_id: Uuid) -> Result<Option<S>>
+    pub async fn get_saga_state<S>(&self, correlation_id: Uuid) -> Result<Option<S>>
     where
         S: serde::de::DeserializeOwned,
     {
         let row = sqlx::query!(
-            "SELECT state FROM seesaw_state WHERE saga_id = $1",
-            saga_id
+            "SELECT state FROM seesaw_state WHERE correlation_id = $1",
+            correlation_id
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -2729,22 +2729,22 @@ impl PostgresQueue {
     }
 
     /// Get all effect executions for a saga (detailed view)
-    pub async fn list_saga_effects(&self, saga_id: Uuid) -> Result<Vec<EffectExecution>> {
+    pub async fn list_saga_effects(&self, correlation_id: Uuid) -> Result<Vec<EffectExecution>> {
         sqlx::query_as!(
             EffectExecution,
             "SELECT event_id, effect_id, status, execute_at,
                     completed_at, attempts, error, event_type
              FROM seesaw_effect_executions
-             WHERE saga_id = $1
+             WHERE correlation_id = $1
              ORDER BY execute_at",
-            saga_id
+            correlation_id
         )
         .fetch_all(&self.pool)
         .await
     }
 
     /// Get saga summary (effect counts by status)
-    pub async fn get_saga_summary(&self, saga_id: Uuid) -> Result<SagaSummary> {
+    pub async fn get_saga_summary(&self, correlation_id: Uuid) -> Result<SagaSummary> {
         let row = sqlx::query!(
             "SELECT
                 COUNT(*) FILTER (WHERE status = 'pending') as pending,
@@ -2752,14 +2752,14 @@ impl PostgresQueue {
                 COUNT(*) FILTER (WHERE status = 'completed') as completed,
                 COUNT(*) FILTER (WHERE status = 'failed') as failed
              FROM seesaw_effect_executions
-             WHERE saga_id = $1",
-            saga_id
+             WHERE correlation_id = $1",
+            correlation_id
         )
         .fetch_one(&self.pool)
         .await?;
 
         Ok(SagaSummary {
-            saga_id,
+            correlation_id,
             pending: row.pending.unwrap_or(0) as u32,
             executing: row.executing.unwrap_or(0) as u32,
             completed: row.completed.unwrap_or(0) as u32,
@@ -2771,12 +2771,12 @@ impl PostgresQueue {
     pub async fn list_active_sagas(&self) -> Result<Vec<SagaInfo>> {
         sqlx::query_as!(
             SagaInfo,
-            "SELECT DISTINCT saga_id,
+            "SELECT DISTINCT correlation_id,
                     MIN(execute_at) as started_at,
                     COUNT(*) as total_effects
              FROM seesaw_effect_executions
              WHERE status IN ('pending', 'executing')
-             GROUP BY saga_id
+             GROUP BY correlation_id
              ORDER BY started_at DESC"
         )
         .fetch_all(&self.pool)
@@ -2797,7 +2797,7 @@ pub struct EffectExecution {
 }
 
 pub struct SagaSummary {
-    pub saga_id: Uuid,
+    pub correlation_id: Uuid,
     pub pending: u32,
     pub executing: u32,
     pub completed: u32,
@@ -2805,7 +2805,7 @@ pub struct SagaSummary {
 }
 
 pub struct SagaInfo {
-    pub saga_id: Uuid,
+    pub correlation_id: Uuid,
     pub started_at: DateTime<Utc>,
     pub total_effects: i64,
 }
@@ -2814,23 +2814,23 @@ pub struct SagaInfo {
 **Usage Example: Crawl Progress API**
 
 ```rust
-#[get("/crawl/{saga_id}/progress")]
+#[get("/crawl/{correlation_id}/progress")]
 async fn crawl_progress(
-    saga_id: web::Path<Uuid>,
+    correlation_id: web::Path<Uuid>,
     queue: web::Data<Arc<PostgresQueue>>
 ) -> Result<Json<CrawlProgress>> {
     // Get effect summary (one efficient query)
-    let summary = queue.get_saga_summary(*saga_id).await?;
+    let summary = queue.get_saga_summary(*correlation_id).await?;
 
     // Get domain state
-    let state: CrawlState = queue.get_saga_state(*saga_id).await?
+    let state: CrawlState = queue.get_saga_state(*correlation_id).await?
         .ok_or_else(|| anyhow!("Saga not found"))?;
 
     // Get detailed effects if needed
-    let effects = queue.list_saga_effects(*saga_id).await?;
+    let effects = queue.list_saga_effects(*correlation_id).await?;
 
     Ok(Json(CrawlProgress {
-        saga_id: *saga_id,
+        correlation_id: *correlation_id,
         status: state.status,
         pages_crawled: state.pages_crawled,
         pages_total: state.pages_total,
@@ -2850,7 +2850,7 @@ async fn crawl_progress(
 // Frontend polls this endpoint every 2s
 // GET /crawl/550e8400-e29b-41d4-a716-446655440000/progress
 // {
-//   "saga_id": "550e8400-e29b-41d4-a716-446655440000",
+//   "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
 //   "status": "Crawling",
 //   "pages_crawled": 42,
 //   "pages_total": 100,
@@ -2873,9 +2873,9 @@ async fn list_sagas(
 
     let mut items = vec![];
     for saga in sagas {
-        if let Some(state) = queue.get_saga_state::<CrawlState>(saga.saga_id).await? {
+        if let Some(state) = queue.get_saga_state::<CrawlState>(saga.correlation_id).await? {
             items.push(SagaListItem {
-                saga_id: saga.saga_id,
+                correlation_id: saga.correlation_id,
                 website_url: state.website_url,
                 status: state.status,
                 started_at: saga.started_at,
@@ -2899,13 +2899,13 @@ async fn list_sagas(
 
 ### Migration Checklist
 
-- [ ] **Remove `saga_id` from all event structs** - now in envelope
+- [ ] **Remove `correlation_id` from all event structs** - now in envelope
 - [ ] Create `Runtime` and spawn workers: `runtime.spawn_workers(event_count, effect_count)`
 - [ ] Replace `handle.run(|_| Ok(Event))` with `engine.process(event)`
 - [ ] For webhooks, use `engine.process_with_id(webhook_id, event)` for idempotency
 - [ ] Replace `handle.settled()` with `engine.shutdown()`
 - [ ] Add `.id("name")` to all effects (compile will enforce)
-- [ ] Use `ctx.saga_id` instead of `event.saga_id`
+- [ ] Use `ctx.correlation_id` instead of `event.correlation_id`
 - [ ] Use `ctx.idempotency_key` for external API calls (Stripe, etc.)
 - [ ] Add database setup (migrations for queue tables)
 - [ ] Configure connection pool sizing (`max_connections = workers * 2`)
@@ -2982,7 +2982,7 @@ Total:              ~30-120ms
 **4 Workers**: ~40-400 events/sec (aggregate across all sagas)
 **Bottleneck**: Usually your business logic, not the queue
 
-**Per-Saga Limit**: ~10 events/sec per saga_id (due to FOR UPDATE serialization)
+**Per-Saga Limit**: ~10 events/sec per correlation_id (due to FOR UPDATE serialization)
 - Multiple sagas process in parallel
 - Single hot saga serializes on state lock
 - See Phase 3.5 #5 for mitigation strategies
@@ -3000,7 +3000,7 @@ Total:              ~30-120ms
 
 **If you hit database limits**:
 - Add read replicas (for state loads)
-- Shard by saga_id
+- Shard by correlation_id
 - Or switch to distributed queue (NATS)
 
 ## Trade-offs Accepted
@@ -3133,8 +3133,8 @@ DROP TABLE seesaw_events_2026_02_04;
 // No FOR UPDATE - check version on save
 let rows = sqlx::query!(
     "UPDATE seesaw_state SET state = $1, version = version + 1
-     WHERE saga_id = $2 AND version = $3",
-    state, saga_id, version
+     WHERE correlation_id = $2 AND version = $3",
+    state, correlation_id, version
 ).execute(&tx).await?.rows_affected();
 
 if rows == 0 {
@@ -3288,8 +3288,8 @@ impl ThrottledEffectWorker {
         let (state, event_payload) = {
             let mut conn = pool.acquire().await?;
             let state = sqlx::query!(
-                "SELECT state FROM seesaw_state WHERE saga_id = $1",
-                pending.saga_id
+                "SELECT state FROM seesaw_state WHERE correlation_id = $1",
+                pending.correlation_id
             )
             .fetch_one(&mut *conn)
             .await?;
@@ -3308,7 +3308,7 @@ impl ThrottledEffectWorker {
         // Build context
         let ctx = EffectContext {
             state,
-            saga_id: pending.saga_id,
+            correlation_id: pending.correlation_id,
             event_id: pending.event_id,
             idempotency_key: /* ... */,
             deps: engine.deps.clone(),
@@ -3525,7 +3525,7 @@ Postgres:
 **Scaling strategy**:
 - **0-100k users**: Single Postgres, 2+20 workers
 - **100k-1M users**: Read replicas, partitioning, 5+50 workers
-- **1M+ users**: Sharding by saga_id, split control/data plane
+- **1M+ users**: Sharding by correlation_id, split control/data plane
 
 ---
 
@@ -3585,17 +3585,17 @@ engine.process(OrderPlaced { id: 123, total: 99.99 }).await?;
 
 **Behavior**:
 - Generates random UUID v4 for event_id
-- Generates random UUID v4 for saga_id
+- Generates random UUID v4 for correlation_id
 - Returns after event is queued (doesn't wait for effects)
 
 ---
 
-#### `process_saga(saga_id, event)` - Saga Continuation
+#### `process_saga(correlation_id, event)` - Saga Continuation
 
 ```rust
-let saga_id = Uuid::new_v4();
-engine.process_saga(saga_id, OrderPlaced { ... }).await?;
-engine.process_saga(saga_id, PaymentReceived { ... }).await?;
+let correlation_id = Uuid::new_v4();
+engine.process_saga(correlation_id, OrderPlaced { ... }).await?;
+engine.process_saga(correlation_id, PaymentReceived { ... }).await?;
 ```
 
 **Use when**:
@@ -3604,9 +3604,9 @@ engine.process_saga(saga_id, PaymentReceived { ... }).await?;
 - You need per-saga state isolation
 
 **Behavior**:
-- Uses provided saga_id (caller must generate or track it)
+- Uses provided correlation_id (caller must generate or track it)
 - Generates random UUID v4 for event_id
-- All events with same saga_id share state and process FIFO
+- All events with same correlation_id share state and process FIFO
 
 ---
 
@@ -3617,7 +3617,7 @@ For idempotent event submission (webhooks, retries), derive deterministic UUIDs:
 ```rust
 // Webhook with idempotency key
 let event_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, webhook_id.as_bytes());
-engine.process_with_id(event_id, saga_id, OrderPlaced { ... }).await?;
+engine.process_with_id(event_id, correlation_id, OrderPlaced { ... }).await?;
 ```
 
 **Use when**:
@@ -3627,7 +3627,7 @@ engine.process_with_id(event_id, saga_id, OrderPlaced { ... }).await?;
 
 **Behavior**:
 - Uses provided event_id (must be deterministic for idempotency)
-- Uses provided saga_id
+- Uses provided correlation_id
 - Duplicate event_id fails silently (UNIQUE constraint on seesaw_events.event_id)
 
 ---
@@ -4009,7 +4009,7 @@ impl ListingMutation {
 - Transactional Outbox (automatic via queue)
 - SKIP LOCKED (Postgres queue polling)
 - Inbox Pattern (ProcessedEvents table)
-- Per-Saga State Isolation (saga_id partitioning)
+- Per-Saga State Isolation (correlation_id partitioning)
 - Worker Pool (multiple consumers)
 
 ### Similar Systems

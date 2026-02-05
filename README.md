@@ -467,7 +467,7 @@ let result = engine
 
 **EffectContext in queue-backed mode:**
 ```rust
-ctx.saga_id        // Saga ID from event envelope
+ctx.correlation_id        // Saga ID from event envelope
 ctx.event_id       // Current event's unique ID
 ctx.effect_id      // Effect's identifier
 ctx.idempotency_key  // UUID v5(event_id + effect_id) for idempotent API calls

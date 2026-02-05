@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use seesaw_core::{EmittedEvent, QueuedEffectExecution, QueuedEvent, Store, NAMESPACE_SEESAW};
+use seesaw_core::{EmittedEvent, QueuedEvent, Store, NAMESPACE_SEESAW};
 use seesaw_postgres::PostgresStore;
 use sqlx::PgPool;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
@@ -24,10 +24,7 @@ impl TestDb {
             .try_init();
 
         // Start Postgres container
-        let container = Postgres::default()
-            .with_tag("16-alpine")
-            .start()
-            .await?;
+        let container = Postgres::default().with_tag("16-alpine").start().await?;
 
         let host = container.get_host().await?;
         let port = container.get_host_port_ipv4(5432).await?;
@@ -62,7 +59,7 @@ async fn test_publish_and_poll() -> Result<()> {
         id: 0,
         event_id: Uuid::new_v4(),
         parent_id: None,
-        saga_id: Uuid::new_v4(),
+        correlation_id: Uuid::new_v4(),
         event_type: "TestEvent".to_string(),
         payload: serde_json::json!({"data": "test"}),
         hops: 0,
@@ -73,10 +70,14 @@ async fn test_publish_and_poll() -> Result<()> {
     db.store.publish(event.clone()).await?;
 
     // Poll event
-    let polled = db.store.poll_next().await?.expect("Event should be available");
+    let polled = db
+        .store
+        .poll_next()
+        .await?
+        .expect("Event should be available");
 
     assert_eq!(polled.event_id, event.event_id);
-    assert_eq!(polled.saga_id, event.saga_id);
+    assert_eq!(polled.correlation_id, event.correlation_id);
     assert_eq!(polled.event_type, event.event_type);
     assert_eq!(polled.payload, event.payload);
 
@@ -88,13 +89,13 @@ async fn test_idempotent_publish() -> Result<()> {
     let db = TestDb::new().await?;
 
     let event_id = Uuid::new_v4();
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
 
     let event = QueuedEvent {
         id: 0,
         event_id,
         parent_id: None,
-        saga_id,
+        correlation_id,
         event_type: "TestEvent".to_string(),
         payload: serde_json::json!({"data": "test"}),
         hops: 0,
@@ -122,7 +123,7 @@ async fn test_idempotent_publish() -> Result<()> {
 async fn test_per_saga_fifo_ordering() -> Result<()> {
     let db = TestDb::new().await?;
 
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
 
     // Publish 3 events for same saga
     for i in 0..3 {
@@ -130,7 +131,7 @@ async fn test_per_saga_fifo_ordering() -> Result<()> {
             id: 0,
             event_id: Uuid::new_v4(),
             parent_id: None,
-            saga_id,
+            correlation_id,
             event_type: format!("Event{}", i),
             payload: serde_json::json!({"order": i}),
             hops: 0,
@@ -155,16 +156,14 @@ async fn test_per_saga_fifo_ordering() -> Result<()> {
 async fn test_skip_locked_concurrent_workers() -> Result<()> {
     let db = TestDb::new().await?;
 
-    let saga_id = Uuid::new_v4();
-
-    // Publish 10 events
+    // Publish 10 events with DIFFERENT correlation_ids so they can be processed concurrently
     for i in 0..10 {
         db.store
             .publish(QueuedEvent {
                 id: 0,
                 event_id: Uuid::new_v4(),
                 parent_id: None,
-                saga_id,
+                correlation_id: Uuid::new_v4(), // Different correlation_id for each event
                 event_type: format!("Event{}", i),
                 payload: serde_json::json!({}),
                 hops: 0,
@@ -218,7 +217,7 @@ async fn test_ack_and_nack() -> Result<()> {
         id: 0,
         event_id: Uuid::new_v4(),
         parent_id: None,
-        saga_id: Uuid::new_v4(),
+        correlation_id: Uuid::new_v4(),
         event_type: "TestEvent".to_string(),
         payload: serde_json::json!({}),
         hops: 0,
@@ -252,6 +251,96 @@ async fn test_ack_and_nack() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_poll_next_claims_event_until_ack_or_nack() -> Result<()> {
+    let db = TestDb::new().await?;
+
+    let event = QueuedEvent {
+        id: 0,
+        event_id: Uuid::new_v4(),
+        parent_id: None,
+        correlation_id: Uuid::new_v4(),
+        event_type: "ClaimedEvent".to_string(),
+        payload: serde_json::json!({}),
+        hops: 0,
+        created_at: Utc::now(),
+    };
+
+    db.store.publish(event.clone()).await?;
+
+    let first = db
+        .store
+        .poll_next()
+        .await?
+        .expect("first poll should claim the event");
+
+    // Without ack/nack, same event must not be re-delivered.
+    let second = db.store.poll_next().await?;
+    assert!(
+        second.is_none(),
+        "claimed event should not be re-delivered before ack/nack"
+    );
+
+    // Nack releases claim and should make event available again.
+    db.store.nack(first.id, 0).await?;
+    let retried = db
+        .store
+        .poll_next()
+        .await?
+        .expect("nacked event should become available again");
+    assert_eq!(retried.event_id, first.event_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_publish_deduplicates_event_id_even_with_different_timestamps() -> Result<()> {
+    let db = TestDb::new().await?;
+
+    let event_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let base_time = Utc::now();
+
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: "WebhookReceived".to_string(),
+            payload: serde_json::json!({ "attempt": 1 }),
+            hops: 0,
+            created_at: base_time,
+        })
+        .await?;
+
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: "WebhookReceived".to_string(),
+            payload: serde_json::json!({ "attempt": 2 }),
+            hops: 0,
+            created_at: base_time + chrono::Duration::seconds(1),
+        })
+        .await?;
+
+    let duplicate_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM seesaw_events WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_one(&db.pool)
+            .await?;
+
+    assert_eq!(
+        duplicate_count, 1,
+        "event_id idempotency must hold even when created_at differs"
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // State Operations Tests
 // ============================================================================
@@ -266,19 +355,18 @@ struct TestState {
 async fn test_save_and_load_state() -> Result<()> {
     let db = TestDb::new().await?;
 
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
     let state = TestState {
         count: 42,
         name: "test".to_string(),
     };
 
     // Save state
-    let version = db.store.save_state(saga_id, &state, 0).await?;
+    let version = db.store.save_state(correlation_id, &state, 0).await?;
     assert_eq!(version, 1);
 
     // Load state
-    let (loaded, loaded_version): (TestState, i32) =
-        db.store.load_state(saga_id).await?.unwrap();
+    let (loaded, loaded_version): (TestState, i32) = db.store.load_state(correlation_id).await?.unwrap();
 
     assert_eq!(loaded, state);
     assert_eq!(loaded_version, 1);
@@ -290,21 +378,21 @@ async fn test_save_and_load_state() -> Result<()> {
 async fn test_optimistic_locking() -> Result<()> {
     let db = TestDb::new().await?;
 
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
     let state = TestState {
         count: 1,
         name: "initial".to_string(),
     };
 
     // Initial save
-    db.store.save_state(saga_id, &state, 0).await?;
+    db.store.save_state(correlation_id, &state, 0).await?;
 
     // Update with correct version
     let new_state = TestState {
         count: 2,
         name: "updated".to_string(),
     };
-    let v2 = db.store.save_state(saga_id, &new_state, 1).await?;
+    let v2 = db.store.save_state(correlation_id, &new_state, 1).await?;
     assert_eq!(v2, 2);
 
     // Try to update with stale version (should fail)
@@ -312,13 +400,10 @@ async fn test_optimistic_locking() -> Result<()> {
         count: 3,
         name: "stale".to_string(),
     };
-    let result = db.store.save_state(saga_id, &stale_state, 1).await;
+    let result = db.store.save_state(correlation_id, &stale_state, 1).await;
 
     assert!(result.is_err(), "Should fail with version conflict");
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Version conflict"));
+    assert!(result.unwrap_err().to_string().contains("Version conflict"));
 
     Ok(())
 }
@@ -327,8 +412,8 @@ async fn test_optimistic_locking() -> Result<()> {
 async fn test_load_nonexistent_state() -> Result<()> {
     let db = TestDb::new().await?;
 
-    let saga_id = Uuid::new_v4();
-    let result: Option<(TestState, i32)> = db.store.load_state(saga_id).await?;
+    let correlation_id = Uuid::new_v4();
+    let result: Option<(TestState, i32)> = db.store.load_state(correlation_id).await?;
 
     assert!(result.is_none(), "Should return None for nonexistent state");
 
@@ -344,14 +429,14 @@ async fn test_insert_and_poll_effect() -> Result<()> {
     let db = TestDb::new().await?;
 
     let event_id = Uuid::new_v4();
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
 
     // Insert effect intent
     db.store
         .insert_effect_intent(
             event_id,
             "test_effect".to_string(),
-            saga_id,
+            correlation_id,
             "TestEvent".to_string(),
             serde_json::json!({"data": "test"}),
             None,
@@ -367,7 +452,7 @@ async fn test_insert_and_poll_effect() -> Result<()> {
 
     assert_eq!(effect.event_id, event_id);
     assert_eq!(effect.effect_id, "test_effect");
-    assert_eq!(effect.saga_id, saga_id);
+    assert_eq!(effect.correlation_id, correlation_id);
     assert_eq!(effect.attempts, 1); // Should increment on poll
 
     Ok(())
@@ -377,7 +462,7 @@ async fn test_insert_and_poll_effect() -> Result<()> {
 async fn test_effect_priority_ordering() -> Result<()> {
     let db = TestDb::new().await?;
 
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
 
     // Insert effects with different priorities
     for (i, priority) in [(0, 5), (1, 1), (2, 10)].iter() {
@@ -385,7 +470,7 @@ async fn test_effect_priority_ordering() -> Result<()> {
             .insert_effect_intent(
                 Uuid::new_v4(),
                 format!("effect_{}", i),
-                saga_id,
+                correlation_id,
                 "TestEvent".to_string(),
                 serde_json::json!({}),
                 None,
@@ -502,7 +587,7 @@ async fn test_fail_and_dlq_effect() -> Result<()> {
 async fn test_complete_event_workflow() -> Result<()> {
     let db = TestDb::new().await?;
 
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
 
     // 1. Publish event
@@ -511,7 +596,7 @@ async fn test_complete_event_workflow() -> Result<()> {
             id: 0,
             event_id,
             parent_id: None,
-            saga_id,
+            correlation_id,
             event_type: "OrderPlaced".to_string(),
             payload: serde_json::json!({"order_id": 123}),
             hops: 0,
@@ -528,14 +613,14 @@ async fn test_complete_event_workflow() -> Result<()> {
         count: 1,
         name: "order_placed".to_string(),
     };
-    db.store.save_state(saga_id, &state, 0).await?;
+    db.store.save_state(correlation_id, &state, 0).await?;
 
     // 4. Insert effect intent
     db.store
         .insert_effect_intent(
             event_id,
             "send_email".to_string(),
-            saga_id,
+            correlation_id,
             "OrderPlaced".to_string(),
             event.payload.clone(),
             None,
@@ -563,7 +648,7 @@ async fn test_complete_event_workflow() -> Result<()> {
         .await?;
 
     // 8. Verify final state
-    let (final_state, version): (TestState, i32) = db.store.load_state(saga_id).await?.unwrap();
+    let (final_state, version): (TestState, i32) = db.store.load_state(correlation_id).await?.unwrap();
     assert_eq!(final_state.count, 1);
     assert_eq!(version, 1);
 
@@ -575,16 +660,16 @@ async fn test_concurrent_saga_processing() -> Result<()> {
     let db = TestDb::new().await?;
 
     // Create 3 different sagas, each with 3 events
-    let saga_ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+    let correlation_ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
 
-    for saga_id in &saga_ids {
+    for correlation_id in &correlation_ids {
         for i in 0..3 {
             db.store
                 .publish(QueuedEvent {
                     id: 0,
                     event_id: Uuid::new_v4(),
                     parent_id: None,
-                    saga_id: *saga_id,
+                    correlation_id: *correlation_id,
                     event_type: format!("Event{}", i),
                     payload: serde_json::json!({}),
                     hops: 0,
@@ -611,20 +696,21 @@ async fn test_concurrent_saga_processing() -> Result<()> {
 #[tokio::test]
 async fn test_deterministic_event_emission() -> Result<()> {
     let db = TestDb::new().await?;
-    let saga_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
 
     // Publish initial event
+    let parent_created_at = Utc::now();
     db.store
         .publish(QueuedEvent {
             id: 0,
             event_id,
             parent_id: None,
-            saga_id,
+            correlation_id,
             event_type: "OrderPlaced".to_string(),
             payload: serde_json::json!({ "order_id": 123 }),
             hops: 0,
-            created_at: Utc::now(),
+            created_at: parent_created_at,
         })
         .await?;
 
@@ -633,7 +719,7 @@ async fn test_deterministic_event_emission() -> Result<()> {
         .insert_effect_intent(
             event_id,
             "charge_payment".to_string(),
-            saga_id,
+            correlation_id,
             "OrderPlaced".to_string(),
             serde_json::json!({ "order_id": 123 }),
             None,
@@ -656,6 +742,17 @@ async fn test_deterministic_event_emission() -> Result<()> {
         },
     ];
 
+    // Ack the initial OrderPlaced event BEFORE completing the effect
+    // (emitted events use midnight timestamp which sorts before parent's Utc::now())
+    let initial_event = db
+        .store
+        .poll_next()
+        .await?
+        .expect("Initial event should exist");
+    assert_eq!(initial_event.event_id, event_id);
+    db.store.ack(initial_event.id).await?;
+
+    // Now complete the effect and emit new events
     db.store
         .complete_effect_with_events(
             event_id,
@@ -664,11 +761,6 @@ async fn test_deterministic_event_emission() -> Result<()> {
             emitted_events.clone(),
         )
         .await?;
-
-    // Ack the initial OrderPlaced event before polling emitted events
-    let initial_event = db.store.poll_next().await?.expect("Initial event should exist");
-    assert_eq!(initial_event.event_id, event_id);
-    db.store.ack(initial_event.id).await?;
 
     // Compute expected deterministic IDs (same logic as PostgresStore)
     let expected_payment_id = Uuid::new_v5(
@@ -681,7 +773,11 @@ async fn test_deterministic_event_emission() -> Result<()> {
     );
 
     // Compute expected timestamp (midnight UTC today)
-    let _expected_timestamp = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let _expected_timestamp = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
 
     // Poll emitted events (order may vary, so collect both)
     let event1 = db
@@ -716,10 +812,17 @@ async fn test_deterministic_event_emission() -> Result<()> {
         .get("PaymentCharged")
         .expect("PaymentCharged event should exist");
 
-    assert_eq!(payment_event.event_id, expected_payment_id,
-        "Deterministic ID mismatch for PaymentCharged");
+    assert_eq!(
+        payment_event.event_id, expected_payment_id,
+        "Deterministic ID mismatch for PaymentCharged"
+    );
     assert_eq!(payment_event.parent_id, Some(event_id));
     assert_eq!(payment_event.hops, 1);
+    assert_eq!(
+        payment_event.created_at.date_naive(),
+        parent_created_at.date_naive(),
+        "emitted event should stay in parent partition day"
+    );
 
     let email_event = events_by_type
         .get("EmailQueued")
@@ -727,6 +830,11 @@ async fn test_deterministic_event_emission() -> Result<()> {
     assert_eq!(email_event.event_id, expected_email_id);
     assert_eq!(email_event.parent_id, Some(event_id));
     assert_eq!(email_event.hops, 1);
+    assert_eq!(
+        email_event.created_at.date_naive(),
+        parent_created_at.date_naive(),
+        "emitted event should stay in parent partition day"
+    );
 
     // Verify effect is marked complete
     let execution_status: Option<String> = sqlx::query_scalar(

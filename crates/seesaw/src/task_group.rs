@@ -158,6 +158,26 @@ impl TaskGroup {
         })
     }
 
+    /// Wait until all currently pending tasks complete.
+    ///
+    /// Unlike `settled()`, this:
+    /// - does not cancel transient groups
+    /// - does not consume or return captured errors
+    ///
+    /// Useful for per-call synchronization where the session should remain active.
+    pub fn wait_pending(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                if self.pending.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                self.notify.notified().await;
+            }
+        })
+    }
+
     /// Cancel all tracked tasks and background groups.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
@@ -614,6 +634,37 @@ mod tests {
 
         // Second settle should also work (no pending tasks)
         group.settled().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_pending_does_not_cancel_transient() {
+        let head = TaskGroup::new();
+        let transient = head.transient();
+
+        transient.spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        });
+
+        head.wait_pending().await;
+
+        assert!(
+            !transient.is_cancelled(),
+            "wait_pending() should not cancel transient groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_pending_does_not_consume_error() {
+        let group = TaskGroup::new();
+
+        group.spawn(async { Err(anyhow!("pending error")) });
+
+        group.wait_pending().await;
+
+        let result = group.settled().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("pending error"));
     }
 
     #[tokio::test]

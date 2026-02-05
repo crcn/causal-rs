@@ -17,7 +17,7 @@ Each saga (workflow) has its own state stored in the database:
 
 ```sql
 CREATE TABLE seesaw_state (
-    saga_id UUID PRIMARY KEY,
+    correlation_id UUID PRIMARY KEY,
     state JSONB NOT NULL,
     version INT NOT NULL DEFAULT 1,  -- For optimistic locking
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -59,7 +59,7 @@ State is created when first event is processed:
 
 ```rust
 // User action: place order
-let saga_id = engine.process(OrderPlaced {
+let correlation_id = engine.process(OrderPlaced {
     order_id: "ORD-123",
     user_id: "user_42",
     items: vec![...],
@@ -67,8 +67,8 @@ let saga_id = engine.process(OrderPlaced {
 }).await?;
 
 // Framework creates initial state:
-// INSERT INTO seesaw_state (saga_id, state, version)
-// VALUES ($saga_id, '{"order_id":"ORD-123",...}', 1)
+// INSERT INTO seesaw_state (correlation_id, state, version)
+// VALUES ($correlation_id, '{"order_id":"ORD-123",...}', 1)
 ```
 
 ---
@@ -176,7 +176,7 @@ async fn process_event_worker(queue: &Queue, engine: &Engine) {
     let event = queue.poll_next().await?;
 
     // 2. Load current state
-    let (mut state, version) = state_store.load(event.saga_id).await?;
+    let (mut state, version) = state_store.load(event.correlation_id).await?;
 
     // 3. Run all reducers (pure, in-memory)
     for reducer in engine.reducers() {
@@ -192,10 +192,10 @@ async fn process_event_worker(queue: &Queue, engine: &Engine) {
     sqlx::query!(
         "UPDATE seesaw_state
          SET state = $1, version = $2, updated_at = NOW()
-         WHERE saga_id = $3 AND version = $4",
+         WHERE correlation_id = $3 AND version = $4",
         Json(&state),
         version + 1,
-        event.saga_id,
+        event.correlation_id,
         version
     )
     .execute(&mut *tx)
@@ -206,11 +206,11 @@ async fn process_event_worker(queue: &Queue, engine: &Engine) {
         if effect.matches(&event) {
             sqlx::query!(
                 "INSERT INTO seesaw_effect_executions
-                 (event_id, effect_id, saga_id, status, priority, execute_at)
+                 (event_id, effect_id, correlation_id, status, priority, execute_at)
                  VALUES ($1, $2, $3, 'pending', $4, $5)",
                 event.event_id,
                 effect.id,
-                event.saga_id,
+                event.correlation_id,
                 effect.priority,
                 Utc::now() + effect.delay
             )
@@ -255,13 +255,13 @@ async fn process_effect_worker(queue: &Queue, engine: &Engine) {
     let pending = queue.poll_next_effect().await?;
 
     // 2. Load LATEST state (NOT snapshot!)
-    let state = state_store.load(pending.saga_id).await?;  // ← Fresh load
+    let state = state_store.load(pending.correlation_id).await?;  // ← Fresh load
 
     // 3. Build context
     let ctx = EffectContext {
         state,  // ← Latest state
         deps: engine.deps(),
-        saga_id: pending.saga_id,
+        correlation_id: pending.correlation_id,
         event_id: pending.event_id,
         idempotency_key: format!("{}:{}", pending.event_id, pending.effect_id),
     };
@@ -281,11 +281,11 @@ async fn process_effect_worker(queue: &Queue, engine: &Engine) {
 
         // Insert next event (ON CONFLICT DO NOTHING = idempotent)
         sqlx::query!(
-            "INSERT INTO seesaw_events (event_id, saga_id, event_type, payload)
+            "INSERT INTO seesaw_events (event_id, correlation_id, event_type, payload)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (event_id) DO NOTHING",
             next_event_id,
-            pending.saga_id,
+            pending.correlation_id,
             type_name_of_val(&next_event),
             Json(&next_event)
         )
@@ -383,9 +383,9 @@ Worker 2: Load state (v1) → Reducer → Save state (v2) ❌ Conflict!
 let rows = sqlx::query!(
     "UPDATE seesaw_state
      SET state = $1, version = version + 1
-     WHERE saga_id = $2 AND version = $3",  // ← Version check
+     WHERE correlation_id = $2 AND version = $3",  // ← Version check
     Json(&new_state),
-    saga_id,
+    correlation_id,
     expected_version
 )
 .execute(&tx)

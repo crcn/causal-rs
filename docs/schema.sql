@@ -15,7 +15,7 @@ CREATE TABLE seesaw_events (
     id BIGSERIAL,
     event_id UUID NOT NULL,
     parent_id UUID,
-    saga_id UUID NOT NULL,           -- Workflow identifier (envelope metadata)
+    correlation_id UUID NOT NULL,           -- Workflow identifier (envelope metadata)
     event_type VARCHAR(255) NOT NULL,
     payload JSONB NOT NULL,
     hops INT NOT NULL DEFAULT 0,     -- Infinite loop protection (DLQ after 50)
@@ -36,7 +36,7 @@ CREATE INDEX idx_events_pending ON seesaw_events(created_at ASC)
 WHERE processed_at IS NULL;
 
 -- Lookup events by saga (for introspection/debugging)
-CREATE INDEX idx_events_saga ON seesaw_events(saga_id, created_at);
+CREATE INDEX idx_events_saga ON seesaw_events(correlation_id, created_at);
 
 -- Cleanup: Find old events for archival
 CREATE INDEX idx_events_cleanup ON seesaw_events(processed_at)
@@ -44,7 +44,7 @@ WHERE processed_at IS NOT NULL;
 
 COMMENT ON TABLE seesaw_events IS 'Event queue - workers poll with SKIP LOCKED for parallel processing';
 COMMENT ON COLUMN seesaw_events.hops IS 'Incremented on each event emission - DLQ after 50 to prevent infinite loops';
-COMMENT ON COLUMN seesaw_events.saga_id IS 'Envelope metadata - groups related events into a workflow';
+COMMENT ON COLUMN seesaw_events.correlation_id IS 'Envelope metadata - groups related events into a workflow';
 
 -- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
 -- Enables engine.process(event).wait::<TerminalEvent>().await
@@ -52,8 +52,10 @@ CREATE OR REPLACE FUNCTION notify_saga_event()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify(
-        'seesaw_saga_' || NEW.saga_id::text,
+        'seesaw_saga_' || NEW.correlation_id::text,
         json_build_object(
+            'event_id', NEW.event_id,
+            'correlation_id', NEW.correlation_id,
             'event_type', NEW.event_type,
             'payload', NEW.payload
         )::text
@@ -85,7 +87,7 @@ FOR VALUES FROM ('2026-02-07') TO ('2026-02-08');
 
 -- State per saga (optimistic locking with version column)
 CREATE TABLE seesaw_state (
-    saga_id UUID PRIMARY KEY,
+    correlation_id UUID PRIMARY KEY,
     state JSONB NOT NULL,             -- User's domain state (keep under 10KB!)
     version INT NOT NULL DEFAULT 1,   -- Optimistic locking
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -101,13 +103,13 @@ COMMENT ON COLUMN seesaw_state.version IS 'Incremented on each update - detects 
 -- Purpose: Separate from queue for atomic claiming and historical record
 CREATE TABLE seesaw_processed (
     event_id UUID PRIMARY KEY,
-    saga_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
     state_committed_at TIMESTAMPTZ,  -- When Phase 1 (reducers) completed
     completed_at TIMESTAMPTZ,        -- When Phase 2 (all effects) completed
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_processed_saga ON seesaw_processed(saga_id);
+CREATE INDEX idx_processed_saga ON seesaw_processed(correlation_id);
 CREATE INDEX idx_processed_completed ON seesaw_processed(completed_at DESC)
 WHERE completed_at IS NOT NULL;
 
@@ -120,7 +122,7 @@ COMMENT ON COLUMN seesaw_processed.completed_at IS 'Phase 2 complete - all effec
 CREATE TABLE seesaw_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
-    saga_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, executing, completed, failed
     result JSONB,
     error TEXT,
@@ -155,7 +157,7 @@ WHERE status = 'pending';
 CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
 
 -- Lookup effects by saga (for progress tracking)
-CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(saga_id);
+CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(correlation_id);
 
 -- Monitor failures
 CREATE INDEX idx_effect_executions_failed ON seesaw_effect_executions(status, attempts)
@@ -173,7 +175,7 @@ COMMENT ON COLUMN seesaw_effect_executions.priority IS 'Worker polling priority 
 CREATE TABLE seesaw_dlq (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
-    saga_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
     error TEXT NOT NULL,
     event_type VARCHAR(255) NOT NULL,
     event_payload JSONB NOT NULL,
@@ -193,7 +195,7 @@ CREATE INDEX idx_dlq_reason ON seesaw_dlq(reason, failed_at DESC)
 WHERE resolved_at IS NULL;
 
 -- Find DLQ entries by saga
-CREATE INDEX idx_dlq_saga ON seesaw_dlq(saga_id);
+CREATE INDEX idx_dlq_saga ON seesaw_dlq(correlation_id);
 
 COMMENT ON TABLE seesaw_dlq IS 'Dead letter queue - effects that failed permanently';
 COMMENT ON COLUMN seesaw_dlq.reason IS 'Why it failed: failed (retry exhausted), timeout, infinite_loop';
@@ -319,7 +321,7 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 -- WHERE processed_at IS NULL;
 
 -- Alert: State size > 10KB (performance risk)
--- SELECT saga_id, LENGTH(state::text) as state_bytes
+-- SELECT correlation_id, LENGTH(state::text) as state_bytes
 -- FROM seesaw_state
 -- WHERE LENGTH(state::text) > 10240
 -- ORDER BY state_bytes DESC;
@@ -332,7 +334,7 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 -- WHERE completed_at > NOW() - INTERVAL '5 minutes';
 
 -- Dashboard: Active sagas
--- SELECT COUNT(DISTINCT saga_id) as active_sagas
+-- SELECT COUNT(DISTINCT correlation_id) as active_sagas
 -- FROM seesaw_effect_executions
 -- WHERE status IN ('pending', 'executing');
 

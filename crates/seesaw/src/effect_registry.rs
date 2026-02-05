@@ -1,11 +1,14 @@
 //! Effect registry for storing and starting effects.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
+use futures::FutureExt;
 use parking_lot::RwLock;
 use tracing::{info_span, Instrument};
 
 use crate::effect::{Effect, EffectContext, ErrorHandler, EventEnvelope};
+use crate::event_codec::EventCodec;
 use pipedream::RelayReceiver;
 
 /// Registry for storing effects.
@@ -42,6 +45,47 @@ where
     /// Register an effect.
     pub fn register(&self, effect: Effect<S, D>) {
         self.effects.write().push(effect);
+    }
+
+    /// Get all registered effects (cloned).
+    pub(crate) fn all(&self) -> Vec<Effect<S, D>> {
+        self.effects.read().iter().cloned().collect()
+    }
+
+    /// Find effect by stable ID.
+    pub(crate) fn find_by_id(&self, effect_id: &str) -> Option<Effect<S, D>> {
+        self.effects
+            .read()
+            .iter()
+            .find(|effect| effect.id == effect_id)
+            .cloned()
+    }
+
+    /// Find queue codec by event type name.
+    pub(crate) fn find_codec_by_event_type(&self, event_type: &str) -> Option<Arc<EventCodec>> {
+        for effect in self.effects.read().iter() {
+            for codec in effect.codecs() {
+                if codec.event_type == event_type {
+                    return Some(codec.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Find queue codec by Rust TypeId.
+    pub(crate) fn find_codec_by_type_id(
+        &self,
+        type_id: std::any::TypeId,
+    ) -> Option<Arc<EventCodec>> {
+        for effect in self.effects.read().iter() {
+            for codec in effect.codecs() {
+                if codec.type_id == type_id {
+                    return Some(codec.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Start all registered effects.
@@ -128,7 +172,9 @@ where
                                     let event_for_error = event.clone();
 
                                     // Run effect handler
-                                    let result = (effect.handler)(event, event_type, handler_ctx.clone()).await;
+                                    let result =
+                                        (effect.handler)(event, event_type, handler_ctx.clone())
+                                            .await;
 
                                     match result {
                                         Ok(Some(output)) => {
@@ -139,6 +185,8 @@ where
                                             // Observer effect, no event to dispatch
                                         }
                                         Err(e) => {
+                                            let error_message = e.to_string();
+
                                             // Effect error - isolate it so chain continues
                                             // Capture error for settled() to return (backwards compatibility)
                                             handler_ctx.capture_error_for_settled(&e);
@@ -151,15 +199,26 @@ where
                                             );
 
                                             // Dispatch EffectError using same path as Ok(Some(output))
-                                            let effect_error_output = crate::effect::EventOutput::new(effect_error);
-                                            handler_ctx.emit_any(effect_error_output.value, effect_error_output.type_id);
+                                            let effect_error_output =
+                                                crate::effect::EventOutput::new(effect_error);
+                                            handler_ctx.emit_any(
+                                                effect_error_output.value,
+                                                effect_error_output.type_id,
+                                            );
 
                                             // Note: on_error callback is now deprecated
                                             // Error is emitted as EffectError event instead
                                             if let Some(ref handler) = err_handler {
-                                                // Create a reference error for the callback
-                                                let callback_error = anyhow::anyhow!("Effect error (see EffectError event for details)");
-                                                handler(callback_error, event_type, handler_ctx).await;
+                                                let callback_error = anyhow::anyhow!(error_message);
+                                                // on_error is best-effort; callback panics must not break the chain.
+                                                let callback = handler(
+                                                    callback_error,
+                                                    event_type,
+                                                    handler_ctx,
+                                                );
+                                                let _ = std::panic::AssertUnwindSafe(callback)
+                                                    .catch_unwind()
+                                                    .await;
                                             }
                                         }
                                     }

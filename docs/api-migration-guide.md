@@ -21,11 +21,11 @@ Complete example showing API changes for a multi-day order processing workflow.
 use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
-// Events carry saga_id (boilerplate!)
+// Events carry correlation_id (boilerplate!)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
-    saga_id: Uuid,           // ← Manual saga tracking
+    correlation_id: Uuid,           // ← Manual saga tracking
     customer_email: String,
     amount_cents: i64,
 }
@@ -33,40 +33,40 @@ struct OrderPlaced {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PaymentCharged {
     order_id: Uuid,
-    saga_id: Uuid,           // ← Must pass through
+    correlation_id: Uuid,           // ← Must pass through
     charge_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConfirmationSent {
     order_id: Uuid,
-    saga_id: Uuid,           // ← Repeated in every event
+    correlation_id: Uuid,           // ← Repeated in every event
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ApprovalRequested {
     order_id: Uuid,
-    saga_id: Uuid,
+    correlation_id: Uuid,
     requested_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReminderSent {
     order_id: Uuid,
-    saga_id: Uuid,
+    correlation_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ApprovalReceived {
     order_id: Uuid,
-    saga_id: Uuid,
+    correlation_id: Uuid,
     approver_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCompleted {
     order_id: Uuid,
-    saga_id: Uuid,
+    correlation_id: Uuid,
 }
 ```
 
@@ -76,52 +76,52 @@ struct OrderCompleted {
 use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
-// Events are pure business data (no saga_id!)
+// Events are pure business data (no correlation_id!)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
     customer_email: String,
     amount_cents: i64,
-    // saga_id removed! Framework manages it ✅
+    // correlation_id removed! Framework manages it ✅
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PaymentCharged {
     order_id: Uuid,
     charge_id: String,
-    // No saga_id ✅
+    // No correlation_id ✅
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConfirmationSent {
     order_id: Uuid,
-    // No saga_id ✅
+    // No correlation_id ✅
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ApprovalRequested {
     order_id: Uuid,
     requested_at: DateTime<Utc>,
-    // No saga_id ✅
+    // No correlation_id ✅
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReminderSent {
     order_id: Uuid,
-    // No saga_id ✅
+    // No correlation_id ✅
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ApprovalReceived {
     order_id: Uuid,
     approver_id: Uuid,
-    // No saga_id ✅
+    // No correlation_id ✅
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCompleted {
     order_id: Uuid,
-    // No saga_id ✅
+    // No correlation_id ✅
 }
 ```
 
@@ -239,10 +239,10 @@ let charge_effect = effect::on::<OrderPlaced>()
         // Manual idempotency mark
         ctx.deps().db.mark_charged(event.order_id).await?;
 
-        // Have to pass saga_id through
+        // Have to pass correlation_id through
         ctx.emit(PaymentCharged {
             order_id: event.order_id,
-            saga_id: event.saga_id,  // ← Manual pass-through
+            correlation_id: event.correlation_id,  // ← Manual pass-through
             charge_id: charge.id,
         })?;
 
@@ -256,7 +256,7 @@ let confirm_effect = effect::on::<OrderPlaced>()
 
         ctx.emit(ConfirmationSent {
             order_id: event.order_id,
-            saga_id: event.saga_id,  // ← Manual pass-through
+            correlation_id: event.correlation_id,  // ← Manual pass-through
         })?;
 
         Ok(())
@@ -270,7 +270,7 @@ let approval_effect = effect::on::<OrderPlaced>()
 
         ctx.emit(ApprovalRequested {
             order_id: event.order_id,
-            saga_id: event.saga_id,
+            correlation_id: event.correlation_id,
             requested_at: Utc::now(),
         })?;
 
@@ -285,7 +285,7 @@ let reminder_effect = effect::on::<ApprovalRequested>()
 
         ctx.emit(ReminderSent {
             order_id: event.order_id,
-            saga_id: event.saga_id,
+            correlation_id: event.correlation_id,
         })?;
 
         Ok(())
@@ -298,7 +298,7 @@ let complete_effect = effect::on::<ApprovalReceived>()
 
         ctx.emit(OrderCompleted {
             order_id: event.order_id,
-            saga_id: event.saga_id,
+            correlation_id: event.correlation_id,
         })?;
 
         Ok(())
@@ -323,11 +323,11 @@ let charge_effect = effect::on::<OrderPlaced>()
             idempotency_key: &ctx.idempotency_key  // ← Framework provides UUID v5
         ).await?;
 
-        // saga_id automatically attached by framework!
+        // correlation_id automatically attached by framework!
         Ok(PaymentCharged {
             order_id: event.order_id,
             charge_id: charge.id,
-            // No saga_id needed! ✅
+            // No correlation_id needed! ✅
         })
     });
 
@@ -611,7 +611,7 @@ async fn main() -> Result<()> {
     handle.run(|_ctx| {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
-            saga_id: Uuid::new_v4(),  // ← Manual saga_id
+            correlation_id: Uuid::new_v4(),  // ← Manual correlation_id
             customer_email: "user@example.com".to_string(),
             amount_cents: 9999,
         })
@@ -630,7 +630,7 @@ async fn main() -> Result<()> {
 // Webhook handler (Day 3)
 async fn handle_approval_webhook(order_id: Uuid) -> Result<()> {
     // ❌ How do we continue the saga from 2 days ago?
-    // ❌ No saga_id lookup mechanism
+    // ❌ No correlation_id lookup mechanism
     // ❌ State is lost after handle.settled() completed
 
     panic!("Can't handle multi-day workflows in stateless mode!")
@@ -680,21 +680,21 @@ async fn main() -> Result<()> {
     let engine = engine.with_queue(queue);
 
     // Process initial event (starts new saga)
-    let saga_id = engine.process(|| async {
+    let correlation_id = engine.process(|| async {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
             customer_email: "user@example.com".to_string(),
             amount_cents: 9999,
-            // No saga_id! Framework generates it ✅
+            // No correlation_id! Framework generates it ✅
         })
     }).await?;
 
-    info!("Started order saga: {}", saga_id);
+    info!("Started order saga: {}", correlation_id);
 
-    // Store saga_id for later (webhook callbacks)
+    // Store correlation_id for later (webhook callbacks)
     sqlx::query!(
-        "UPDATE orders SET saga_id = $1 WHERE order_id = $2",
-        saga_id,
+        "UPDATE orders SET correlation_id = $1 WHERE order_id = $2",
+        correlation_id,
         order_id
     )
     .execute(&pool)
@@ -719,21 +719,21 @@ async fn handle_approval_webhook(
     engine: Arc<Engine<OrderState, Deps>>,
     pool: &PgPool,
 ) -> Result<()> {
-    // ✅ Lookup saga_id from database
-    let saga_id = sqlx::query!(
-        "SELECT saga_id FROM orders WHERE order_id = $1",
+    // ✅ Lookup correlation_id from database
+    let correlation_id = sqlx::query!(
+        "SELECT correlation_id FROM orders WHERE order_id = $1",
         order_id
     )
     .fetch_one(pool)
     .await?
-    .saga_id;
+    .correlation_id;
 
     // ✅ Continue existing saga (state preserved from Day 1!)
-    engine.process_saga(saga_id, || async move {
+    engine.process_saga(correlation_id, || async move {
         Ok(ApprovalReceived {
             order_id,
             approver_id,
-            // No saga_id! ✅
+            // No correlation_id! ✅
         })
     }).await?;
 
@@ -784,7 +784,7 @@ async fn test_order_flow() {
     let engine = engine.with_queue(queue);
 
     // Day 1: Place order
-    let saga_id = engine.process(|| async {
+    let correlation_id = engine.process(|| async {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
             customer_email: "test@example.com".to_string(),
@@ -796,7 +796,7 @@ async fn test_order_flow() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check state
-    let state = get_saga_state(&pool, saga_id).await.unwrap();
+    let state = get_saga_state(&pool, correlation_id).await.unwrap();
     assert_eq!(state.status, OrderStatus::Pending);
     assert!(state.payment_charged);
     assert!(state.confirmation_sent);
@@ -807,9 +807,9 @@ async fn test_order_flow() {
         "UPDATE seesaw_effect_executions
          SET execute_at = NOW()
          WHERE event_id IN (
-             SELECT event_id FROM seesaw_events WHERE saga_id = $1
+             SELECT event_id FROM seesaw_events WHERE correlation_id = $1
          )",
-        saga_id
+        correlation_id
     )
     .execute(&pool)
     .await
@@ -819,7 +819,7 @@ async fn test_order_flow() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check approval requested
-    let state = get_saga_state(&pool, saga_id).await.unwrap();
+    let state = get_saga_state(&pool, correlation_id).await.unwrap();
     assert_eq!(state.status, OrderStatus::AwaitingApproval);
 
     engine.shutdown().await.unwrap();
@@ -832,7 +832,7 @@ async fn test_order_flow() {
 
 | Aspect | v0.7 Stateless | Queue-Backed | Benefit |
 |--------|---------------|--------------|---------|
-| **Event saga_id** | Manual in every event | Envelope carries it | -50 LOC, cleaner events |
+| **Event correlation_id** | Manual in every event | Envelope carries it | -50 LOC, cleaner events |
 | **Effect ID** | Optional | **Required** (`.id()`) | Compile-time idempotency |
 | **Idempotency** | Manual (15 lines per effect) | Framework-guaranteed | -300 LOC, no footguns |
 | **Delayed effects** | ❌ Not possible | `.delayed(2days)` | Multi-day workflows |
@@ -849,14 +849,14 @@ async fn test_order_flow() {
 
 ## Migration Checklist
 
-- [ ] Remove `saga_id` from all event structs
+- [ ] Remove `correlation_id` from all event structs
 - [ ] Add `.id("name")` to all effects (compile enforces)
 - [ ] Remove manual idempotency checks (framework handles it)
 - [ ] Add `.delayed()` for time-based effects
 - [ ] Add `.timeout()` and `.retry()` per effect
 - [ ] Change `engine.activate()` → `queue.start_workers()`
 - [ ] Change `handle.run()` → `engine.process()`
-- [ ] Store saga_id for webhook continuations
+- [ ] Store correlation_id for webhook continuations
 - [ ] Use `engine.process_saga()` for continuing sagas
 - [ ] Add graceful shutdown handler
 - [ ] Run database migrations (`001_queue_tables.sql`)
@@ -866,7 +866,7 @@ async fn test_order_flow() {
 
 ## Key Takeaways
 
-1. **Events are cleaner** - No saga_id boilerplate
+1. **Events are cleaner** - No correlation_id boilerplate
 2. **Idempotency is guaranteed** - Compile-time enforced via `.id()`
 3. **Delays are built-in** - `.delayed(7days)` just works
 4. **Per-effect config** - Payment: 60s timeout, Email: 10s
