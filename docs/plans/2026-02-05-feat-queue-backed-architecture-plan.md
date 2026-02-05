@@ -456,42 +456,126 @@ effect::on::<OrderPlaced>()
 
 ### Key Design Decisions
 
-#### 1. Concrete Types (No Trait Abstractions in v1)
+#### 1. Trait Abstractions (Pluggable Backends)
 
-**Locked Decision**: Use concrete `PostgresQueue` and `StateStore` types in v1.
+**Decision**: Use traits for `Queue` and `StateStore` to enable pluggable backends.
 
 **Rationale**:
-- Traits create false flexibility (Postgres IS the control plane)
-- Redis/NATS/Kafka are orthogonal (data plane, not queue replacement)
-- Generic `Q: Queue` breaks type inference for `publish(envelope: EventEnvelope)`
-- Adding abstractions prematurely creates maintenance burden
-- Can refactor to traits later if truly needed (breaking change)
+- ✅ **Use existing infrastructure** - Swap in NATS, Redis, custom queue implementations
+- ✅ **Testability** - In-memory implementations for fast tests without Postgres
+- ✅ **Flexibility** - SQLite for embedded, Postgres for production, custom for special cases
+- ✅ **Separation of concerns** - Engine doesn't know about storage implementation
+- Standard Rust pattern - abstractions via traits
 
-**Concrete API**:
+**Queue Trait**:
+```rust
+#[async_trait]
+pub trait Queue: Send + Sync + 'static {
+    async fn publish(&self, envelope: EventEnvelope) -> Result<()>;
+    async fn poll_event(&self) -> Result<Option<EventEnvelope>>;
+    async fn poll_effect(&self) -> Result<Option<EffectIntent>>;
+    async fn ack_event(&self, event_id: Uuid) -> Result<()>;
+    async fn ack_effect(&self, event_id: Uuid, effect_id: &str) -> Result<()>;
+}
+
+#[async_trait]
+pub trait StateStore: Send + Sync + 'static {
+    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>>;
+    async fn save<S: Serialize + Send>(&self, saga_id: Uuid, state: &S, version: i32) -> Result<()>;
+}
+```
+
+**Postgres Implementation** (ships with seesaw):
 ```rust
 pub struct PostgresQueue {
     pool: PgPool,
 }
 
-impl PostgresQueue {
-    pub fn new(pool: PgPool) -> Self;
-    async fn poll_event(&self) -> Result<Option<EventEnvelope>>;
-    async fn poll_effect(&self) -> Result<Option<EffectIntent>>;
-    async fn publish(&self, envelope: EventEnvelope) -> Result<()>;
+#[async_trait]
+impl Queue for PostgresQueue {
+    async fn publish(&self, envelope: EventEnvelope) -> Result<()> {
+        sqlx::query!("INSERT INTO seesaw_events ...").execute(&self.pool).await?;
+        Ok(())
+    }
+    // ... other methods
+}
+
+pub struct PostgresStateStore {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl StateStore for PostgresStateStore {
+    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>> {
+        let row = sqlx::query!("SELECT state FROM seesaw_state WHERE saga_id = $1", saga_id)
+            .fetch_optional(&self.pool).await?;
+        match row {
+            Some(r) => Ok(Some(serde_json::from_value(r.state)?)),
+            None => Ok(None),
+        }
+    }
+    // ...
 }
 ```
 
-#### 2. Postgres Only (Production-Grade)
+**Engine is Generic**:
+```rust
+pub struct Engine<S, D, Q: Queue, St: StateStore> {
+    queue: Arc<Q>,
+    state_store: Arc<St>,
+    deps: Arc<D>,
+    // ...
+}
 
-**Don't build**: NATS, Kafka, SQS, Redis implementations
+impl<S, D, Q: Queue, St: StateStore> Engine<S, D, Q, St> {
+    pub fn new(deps: D) -> Self;
+    pub fn with_queue(self, queue: Arc<Q>) -> Self;
+    pub fn with_state(self, state: Arc<St>) -> Self;
+    // ...
+}
+```
 
-**Just build**: Postgres-based queue using SQL transactions
+**User Code** (type inference works):
+```rust
+// Production: Postgres
+let queue = Arc::new(PostgresQueue::new(pool));
+let state = Arc::new(PostgresStateStore::new(pool));
+let engine = Engine::with_deps(deps)
+    .with_queue(queue)
+    .with_state(state);
+
+// Tests: In-memory
+let queue = Arc::new(InMemoryQueue::new());
+let state = Arc::new(InMemoryStateStore::new());
+let engine = Engine::with_deps(deps)
+    .with_queue(queue)
+    .with_state(state);
+
+// Custom: NATS + Redis
+let queue = Arc::new(NatsQueue::new(nc));
+let state = Arc::new(RedisStateStore::new(client));
+let engine = Engine::with_deps(deps)
+    .with_queue(queue)
+    .with_state(state);
+```
+
+#### 2. Ship Postgres + In-Memory Implementations
+
+**v1 includes**:
+- `PostgresQueue` + `PostgresStateStore` (production)
+- `InMemoryQueue` + `InMemoryStateStore` (testing)
+
+**Users can implement**:
+- `NatsQueue` (use your existing NATS infrastructure)
+- `RedisStateStore` (use your existing Redis cluster)
+- `SqliteQueue` (embedded deployments)
+- Custom implementations (enterprise requirements)
 
 **Rationale**:
-- One dependency (sqlx)
-- Simple operations (one database)
-- Fast enough for your use case
-- Can add other backends later if needed
+- Postgres is production-ready and well-tested (ships by default)
+- In-memory enables fast tests without external dependencies
+- Trait abstraction allows users to leverage existing infrastructure
+- No vendor lock-in
 
 #### 2. No Backward Compatibility
 
@@ -1863,10 +1947,10 @@ LIMIT 10;
 
 ## Usage Examples
 
-### Basic Setup
+### Basic Setup (Postgres)
 
 ```rust
-use seesaw::{Engine, PostgresQueue};
+use seesaw::{Engine, PostgresQueue, PostgresStateStore};
 use sqlx::PgPool;
 
 #[tokio::main]
@@ -1882,7 +1966,6 @@ async fn main() -> Result<()> {
                     process_order(event, ctx).await?;
                     Ok(ApprovalRequested {
                         order_id: event.order_id,
-                        saga_id: event.saga_id,
                     })
                 })
         )
@@ -1903,9 +1986,13 @@ async fn main() -> Result<()> {
             })
         );
 
-    // Create queue and runtime (Runtime owns workers)
-    let queue = Arc::new(PostgresQueue::new(pool));
-    let engine = engine.with_queue(queue.clone());
+    // Create queue, state store, and runtime
+    let queue = Arc::new(PostgresQueue::new(pool.clone()));
+    let state = Arc::new(PostgresStateStore::new(pool));
+    let engine = engine
+        .with_queue(queue.clone())
+        .with_state(state);
+
     let mut runtime = Runtime::new(engine.clone(), queue);
     runtime.spawn_workers(
         2,   // Event workers (fast - state updates)
@@ -1913,16 +2000,49 @@ async fn main() -> Result<()> {
     );
 
     // Process initial event - framework generates saga_id
-    let saga_id = engine.process(OrderPlaced {
+    engine.process(OrderPlaced {
         order_id: 123,
         // No saga_id! Envelope carries it ✅
-    }).await?;
+    });
 
-    info!("Started saga: {}", saga_id);
+    info!("Started saga");
 
     // Keep running until shutdown signal
     tokio::signal::ctrl_c().await?;
-    engine.shutdown().await?;
+    runtime.shutdown().await?;
+    Ok(())
+}
+```
+
+### Custom Backend Setup (NATS + Redis)
+
+```rust
+use seesaw::{Engine, Queue, StateStore};
+use my_adapters::{NatsQueue, RedisStateStore};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Use your existing NATS infrastructure
+    let nc = async_nats::connect("nats://localhost:4222").await?;
+    let queue = Arc::new(NatsQueue::new(nc));
+
+    // Use your existing Redis cluster
+    let redis = redis::Client::open("redis://localhost:6379")?;
+    let state = Arc::new(RedisStateStore::new(redis));
+
+    // Same engine code - backend swapped
+    let engine = Engine::new(deps)
+        .with_queue(queue.clone())
+        .with_state(state);
+
+    let mut runtime = Runtime::new(engine.clone(), queue);
+    runtime.spawn_workers(2, 20);
+
+    // Same API surface
+    engine.process(OrderPlaced { order_id: 123 });
+
+    tokio::signal::ctrl_c().await?;
+    runtime.shutdown().await?;
     Ok(())
 }
 ```
@@ -2234,45 +2354,94 @@ engine.resolve_dlq(event_id, "charge_payment").await?;
 ### Runtime Methods (Owns Workers)
 
 ```rust
-pub struct Runtime<S, D> {
-    engine: Arc<Engine<S, D>>,
-    queue: Arc<PostgresQueue>,
+pub struct Runtime<S, D, Q: Queue, St: StateStore> {
+    engine: Arc<Engine<S, D, Q, St>>,
+    queue: Arc<Q>,
     event_workers: JoinSet<()>,
     effect_workers: JoinSet<()>,
 }
 
-impl<S, D> Runtime<S, D> {
-    pub fn new(engine: Arc<Engine<S, D>>, queue: Arc<PostgresQueue>) -> Self;
+impl<S, D, Q: Queue, St: StateStore> Runtime<S, D, Q, St> {
+    pub fn new(engine: Arc<Engine<S, D, Q, St>>, queue: Arc<Q>) -> Self;
 
     pub fn spawn_workers(&mut self, event_count: usize, effect_count: usize);
 
-    pub fn engine(&self) -> &Arc<Engine<S, D>>;
+    pub fn engine(&self) -> &Arc<Engine<S, D, Q, St>>;
 
     pub async fn shutdown(self) -> Result<()>;
 }
 ```
 
-### PostgresQueue Methods (Passive Storage)
+### Queue Trait (Implement Your Own)
 
 ```rust
-impl PostgresQueue {
-    pub fn new(pool: PgPool) -> Self;
-
-    // Internal: Called by workers
+#[async_trait]
+pub trait Queue: Send + Sync + 'static {
+    async fn publish(&self, envelope: EventEnvelope) -> Result<()>;
     async fn poll_event(&self) -> Result<Option<EventEnvelope>>;
     async fn poll_effect(&self) -> Result<Option<EffectIntent>>;
+    async fn ack_event(&self, event_id: Uuid) -> Result<()>;
+    async fn ack_effect(&self, event_id: Uuid, effect_id: &str) -> Result<()>;
+}
+
+#[async_trait]
+pub trait StateStore: Send + Sync + 'static {
+    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>>;
+    async fn save<S: Serialize + Send>(&self, saga_id: Uuid, state: &S, version: i32) -> Result<()>;
+}
+```
+
+### PostgresQueue Implementation (Ships with Seesaw)
+
+```rust
+pub struct PostgresQueue {
+    pool: PgPool,
+}
+
+impl PostgresQueue {
+    pub fn new(pool: PgPool) -> Self;
+}
+
+#[async_trait]
+impl Queue for PostgresQueue {
     async fn publish(&self, envelope: EventEnvelope) -> Result<()>;
+    async fn poll_event(&self) -> Result<Option<EventEnvelope>>;
+    async fn poll_effect(&self) -> Result<Option<EffectIntent>>;
+    async fn ack_event(&self, event_id: Uuid) -> Result<()>;
+    async fn ack_effect(&self, event_id: Uuid, effect_id: &str) -> Result<()>;
+}
+
+pub struct PostgresStateStore {
+    pool: PgPool,
+}
+
+impl PostgresStateStore {
+    pub fn new(pool: PgPool) -> Self;
+}
+
+#[async_trait]
+impl StateStore for PostgresStateStore {
+    async fn load<S: DeserializeOwned + Send>(&self, saga_id: Uuid) -> Result<Option<S>>;
+    async fn save<S: Serialize + Send>(&self, saga_id: Uuid, state: &S, version: i32) -> Result<()>;
 }
 ```
 
 ### Engine Methods
 
 ```rust
-impl Engine<S, D> {
+pub struct Engine<S, D, Q: Queue, St: StateStore> {
+    queue: Arc<Q>,
+    state_store: Arc<St>,
+    deps: Arc<D>,
+    // ...
+}
+
+impl<S, D, Q: Queue, St: StateStore> Engine<S, D, Q, St> {
     // Setup
     pub fn new(deps: D) -> Self;
     pub fn with_deps(deps: D) -> Self;  // Alias for clarity
-    pub fn with_queue(self, queue: Arc<PostgresQueue>) -> Self;  // Concrete type
+    pub fn with_queue(self, queue: Arc<Q>) -> Self;
+    pub fn with_state(self, state: Arc<St>) -> Self;
 
     // Process external events (entry points)
     pub fn process(&self, event: impl Event) -> ProcessHandle;  // Returns handle for wait/fire-and-forget
