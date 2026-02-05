@@ -48,7 +48,7 @@ impl Store for PostgresStore {
                 event_id, parent_id, saga_id, event_type, payload, hops, created_at
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (event_id) DO NOTHING",
+             ON CONFLICT (event_id, created_at) DO NOTHING",
             event.event_id,
             event.parent_id,
             event.saga_id,
@@ -231,7 +231,7 @@ impl Store for PostgresStore {
             FROM seesaw_effect_executions
             WHERE status = 'pending'
               AND execute_at <= NOW()
-            ORDER BY priority DESC, execute_at ASC
+            ORDER BY priority ASC, execute_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED
             "#

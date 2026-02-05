@@ -4,6 +4,7 @@ use std::any::{Any, TypeId};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Error, Result};
 
@@ -85,6 +86,10 @@ where
     S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
+    /// Human-readable identifier for this effect.
+    /// Used for debugging, tracing, and the `produced_by` field in event envelopes.
+    pub id: String,
+
     /// Determines if this effect handles the given event type.
     /// Returns true if this effect should receive events of the given TypeId.
     pub(crate) can_handle: Arc<dyn Fn(TypeId) -> bool + Send + Sync>,
@@ -103,6 +108,18 @@ where
             + Send
             + Sync,
     >,
+
+    // Execution configuration (determines inline vs queued)
+    /// Force queued execution (default: false = inline)
+    pub(crate) queued: bool,
+    /// Delay before execution (triggers queued)
+    pub(crate) delay: Option<Duration>,
+    /// Execution timeout (triggers queued)
+    pub(crate) timeout: Option<Duration>,
+    /// Maximum retry attempts (default: 1 = no retry = inline)
+    pub(crate) max_attempts: u32,
+    /// Execution priority (lower = higher priority, triggers queued)
+    pub(crate) priority: Option<i32>,
 }
 
 impl<S, D> Clone for Effect<S, D>
@@ -112,9 +129,15 @@ where
 {
     fn clone(&self) -> Self {
         Self {
+            id: self.id.clone(),
             can_handle: self.can_handle.clone(),
             started: self.started.clone(),
             handler: self.handler.clone(),
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
         }
     }
 }
@@ -147,6 +170,22 @@ where
         ctx: EffectContext<S, D>,
     ) -> Result<Option<EventOutput>> {
         (self.handler)(value, type_id, ctx).await
+    }
+
+    /// Check if this effect should execute inline (in same transaction as event processing)
+    ///
+    /// Effects are inline by default. They become queued if:
+    /// - `.queued()` was explicitly set
+    /// - `.delayed()` was set
+    /// - `.timeout()` was set
+    /// - `.retry()` was set with attempts > 1
+    /// - `.priority()` was set
+    pub fn is_inline(&self) -> bool {
+        !self.queued
+            && self.delay.is_none()
+            && self.timeout.is_none()
+            && self.max_attempts == 1
+            && self.priority.is_none()
     }
 }
 

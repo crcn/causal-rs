@@ -173,6 +173,61 @@ let effects = on! {
 let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
 ```
 
+#### Effect Execution Configuration (v0.7.6+)
+
+Effects can be configured for retry, timeout, delay, priority, and queued execution:
+
+```rust
+// Queued effect with retry and timeout
+effect::on::<PaymentRequested>()
+    .id("charge_payment")          // Custom ID for tracing/debugging
+    .retry(5)                       // Retry up to 5 times on failure
+    .timeout(Duration::from_secs(30))  // 30 second timeout
+    .priority(1)                    // Higher priority (lower number = higher priority)
+    .then(|event, ctx| async move {
+        ctx.deps().stripe.charge(&event).await?;
+        Ok(PaymentCharged { order_id: event.order_id })
+    });
+
+// Delayed execution
+effect::on::<OrderPlaced>()
+    .delayed(Duration::from_secs(3600))  // Run 1 hour later
+    .then(|event, ctx| async move {
+        ctx.deps().send_followup_email(&event).await?;
+        Ok(FollowupSent { order_id: event.order_id })
+    });
+
+// Force queued execution (even without retry/delay/timeout)
+effect::on::<AnalyticsEvent>()
+    .queued()                       // Execute in background worker
+    .then(|event, ctx| async move {
+        ctx.deps().analytics.track(&event).await?;
+        Ok(())
+    });
+
+// Chaining works in any order
+effect::on::<OrderPlaced>()
+    .filter(|e| e.total > 100.0)    // Filter first
+    .retry(3)                        // Then config
+    .id("large_orders")
+    .priority(1)
+    .then(|event, ctx| async move {
+        Ok(LargeOrderProcessed { id: event.id })
+    });
+```
+
+**Execution Modes:**
+- **Inline** (default): Runs immediately in same transaction, no retry
+- **Queued**: Triggered by `.queued()`, `.delayed()`, `.timeout()`, `.retry() > 1`, or `.priority()`
+
+**Configuration Methods:**
+- `.id(String)` - Custom identifier for tracing/debugging
+- `.retry(u32)` - Max retry attempts (default: 1 = no retry)
+- `.timeout(Duration)` - Execution timeout
+- `.delayed(Duration)` - Delay before execution
+- `.priority(i32)` - Priority (lower = higher priority)
+- `.queued()` - Force queued execution
+
 Each arm generates an effect equivalent to:
 ```rust
 effect::on::<CrawlEvent>()

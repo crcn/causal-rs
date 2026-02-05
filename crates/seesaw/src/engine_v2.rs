@@ -81,6 +81,29 @@ where
         self.process_saga_with_id(Uuid::new_v4(), saga_id, event)
     }
 
+    /// Process event with external event ID (webhook idempotency)
+    ///
+    /// Uses provided event_id for idempotency (e.g., Stripe webhook ID).
+    /// Generates a new saga_id.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Webhook handler
+    /// async fn handle_stripe_webhook(payload: StripeWebhook) -> Result<()> {
+    ///     engine.process_with_id(
+    ///         Uuid::parse_str(&payload.id)?,  // Stripe's idempotency key
+    ///         OrderPlaced { ... }
+    ///     ).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn process_with_id<E>(&self, event_id: Uuid, event: E) -> ProcessFuture<St>
+    where
+        E: Clone + Send + Sync + serde::Serialize + 'static,
+    {
+        self.process_saga_with_id(event_id, Uuid::new_v4(), event)
+    }
+
     /// Process event with event ID and saga ID (for idempotency)
     pub fn process_saga_with_id<E>(
         &self,

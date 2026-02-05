@@ -42,14 +42,21 @@ where
     S: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
+    /// Human-readable identifier of the effect being executed
+    pub effect_id: String,
+    /// Deterministic idempotency key for external API calls
+    /// Generated from event_id + effect_id, stable across retries
+    pub idempotency_key: String,
+    /// Saga ID from event envelope - groups related events together
+    pub saga_id: Uuid,
+    /// Current event's unique ID from envelope
+    pub event_id: Uuid,
     pub(crate) prev_state: Arc<S>,
     pub(crate) state: Arc<S>,
     pub(crate) live_state: Arc<parking_lot::RwLock<S>>,
     pub(crate) deps: Arc<D>,
     pub(crate) emitter: BoxedEmitter<S, D>,
     pub(crate) tasks: Arc<TaskGroup>,
-    /// Current event ID for causation tracking in flow visualization
-    pub(crate) current_event_id: Option<Uuid>,
     /// Chain of relay IDs visited (inherited by emitted events for echo prevention)
     pub(crate) visited: Arc<HashSet<u64>>,
 }
@@ -61,13 +68,16 @@ where
 {
     fn clone(&self) -> Self {
         Self {
+            effect_id: self.effect_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            saga_id: self.saga_id,
+            event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),
             live_state: self.live_state.clone(),
             deps: self.deps.clone(),
             emitter: self.emitter.clone(),
             tasks: self.tasks.clone(),
-            current_event_id: self.current_event_id,
             visited: self.visited.clone(),
         }
     }
@@ -79,6 +89,10 @@ where
     D: Send + Sync + 'static,
 {
     pub(crate) fn new(
+        effect_id: String,
+        idempotency_key: String,
+        saga_id: Uuid,
+        event_id: Uuid,
         prev_state: Arc<S>,
         state: Arc<S>,
         live_state: Arc<parking_lot::RwLock<S>>,
@@ -87,13 +101,16 @@ where
         tasks: Arc<TaskGroup>,
     ) -> Self {
         Self {
+            effect_id,
+            idempotency_key,
+            saga_id,
+            event_id,
             prev_state,
             state,
             live_state,
             deps,
             emitter,
             tasks,
-            current_event_id: None,
             visited: Arc::new(HashSet::new()),
         }
     }
@@ -117,6 +134,32 @@ where
         self.live_state.read().clone()
     }
 
+    /// Get the effect ID (human-readable identifier).
+    /// Used for debugging, tracing, and the `produced_by` field in event envelopes.
+    pub fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+
+    /// Get the idempotency key for external API calls.
+    /// Deterministic key generated from event_id + effect_id, stable across retries.
+    ///
+    /// # Example
+    /// ```ignore
+    /// effect::on::<OrderPlaced>()
+    ///     .id("charge_payment")
+    ///     .then(|event, ctx| async move {
+    ///         // Use with Stripe API for idempotency
+    ///         ctx.deps().stripe.charge(
+    ///             event.amount,
+    ///             ctx.idempotency_key()  // Same key on retry
+    ///         ).await?;
+    ///         Ok(PaymentCharged { order_id: event.id })
+    ///     })
+    /// ```
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
     /// Get shared dependencies.
     pub fn deps(&self) -> &D {
         &self.deps
@@ -130,13 +173,16 @@ where
         event_id: Uuid,
     ) -> Self {
         Self {
+            effect_id: self.effect_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            saga_id: self.saga_id,
+            event_id,
             prev_state,
             state,
             live_state: self.live_state.clone(),
             deps: self.deps.clone(),
             emitter: self.emitter.clone(),
             tasks: self.tasks.clone(),
-            current_event_id: Some(event_id),
             visited: self.visited.clone(),
         }
     }
@@ -144,20 +190,23 @@ where
     /// Create a new context with an updated visited set.
     pub(crate) fn with_visited(&self, visited: Arc<HashSet<u64>>) -> Self {
         Self {
+            effect_id: self.effect_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            saga_id: self.saga_id,
+            event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),
             live_state: self.live_state.clone(),
             deps: self.deps.clone(),
             emitter: self.emitter.clone(),
             tasks: self.tasks.clone(),
-            current_event_id: self.current_event_id,
             visited,
         }
     }
 
     /// Get the current event ID for causation tracking.
-    pub fn current_event_id(&self) -> Option<Uuid> {
-        self.current_event_id
+    pub fn current_event_id(&self) -> Uuid {
+        self.event_id
     }
 
     /// Emit a new event to the store.
@@ -188,13 +237,16 @@ where
     /// Create a context that spawns on the head (foreground) task group.
     fn with_head_task(&self) -> Self {
         Self {
+            effect_id: self.effect_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            saga_id: self.saga_id,
+            event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),
             live_state: self.live_state.clone(),
             deps: self.deps.clone(),
             emitter: self.emitter.clone(),
             tasks: self.tasks.head_or_self(),
-            current_event_id: self.current_event_id,
             visited: self.visited.clone(),
         }
     }
@@ -227,13 +279,16 @@ where
     /// when the session settles or is dropped.
     pub fn transient(&self) -> Self {
         Self {
+            effect_id: self.effect_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            saga_id: self.saga_id,
+            event_id: self.event_id,
             prev_state: self.prev_state.clone(),
             state: self.state.clone(),
             live_state: self.live_state.clone(),
             deps: self.deps.clone(),
             emitter: self.emitter.clone(),
             tasks: self.tasks.transient(),
-            current_event_id: self.current_event_id,
             visited: self.visited.clone(),
         }
     }
@@ -295,6 +350,10 @@ mod tests {
         let emitter: BoxedEmitter<TestState, TestDeps> = Arc::new(NoopEmitter);
         let tasks = TaskGroup::new();
         let context = EffectContext::new(
+            "test_effect".to_string(),
+            "test_idempotency_key".to_string(),
+            Uuid::nil(),
+            Uuid::nil(),
             state.clone(),
             state,
             live_state,

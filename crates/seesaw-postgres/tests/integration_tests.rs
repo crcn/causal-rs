@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use seesaw_core::{QueuedEffectExecution, QueuedEvent, Store};
+use seesaw_core::{EmittedEvent, QueuedEffectExecution, QueuedEvent, Store, NAMESPACE_SEESAW};
 use seesaw_postgres::PostgresStore;
 use sqlx::PgPool;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
@@ -107,9 +107,12 @@ async fn test_idempotent_publish() -> Result<()> {
 
     // Should only have one event
     let first = db.store.poll_next().await?.expect("Should have event");
-    let second = db.store.poll_next().await?;
-
     assert_eq!(first.event_id, event_id);
+
+    // Mark as processed so it won't be polled again
+    db.store.ack(first.id).await?;
+
+    let second = db.store.poll_next().await?;
     assert!(second.is_none(), "Should not have duplicate event");
 
     Ok(())
@@ -599,6 +602,154 @@ async fn test_concurrent_saga_processing() -> Result<()> {
     }
 
     assert_eq!(processed, 9, "All events should be processed");
+
+    Ok(())
+}
+
+/// Test deterministic event ID generation on effect completion
+/// Verifies crash+retry safety: same effect execution generates same event IDs
+#[tokio::test]
+async fn test_deterministic_event_emission() -> Result<()> {
+    let db = TestDb::new().await?;
+    let saga_id = Uuid::new_v4();
+    let event_id = Uuid::new_v4();
+
+    // Publish initial event
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id,
+            parent_id: None,
+            saga_id,
+            event_type: "OrderPlaced".to_string(),
+            payload: serde_json::json!({ "order_id": 123 }),
+            hops: 0,
+            created_at: Utc::now(),
+        })
+        .await?;
+
+    // Insert effect execution
+    db.store
+        .insert_effect_intent(
+            event_id,
+            "charge_payment".to_string(),
+            saga_id,
+            "OrderPlaced".to_string(),
+            serde_json::json!({ "order_id": 123 }),
+            None,
+            Utc::now(),
+            30,
+            3,
+            10,
+        )
+        .await?;
+
+    // Complete effect with emitted events
+    let emitted_events = vec![
+        EmittedEvent {
+            event_type: "PaymentCharged".to_string(),
+            payload: serde_json::json!({ "order_id": 123, "amount": 99.99 }),
+        },
+        EmittedEvent {
+            event_type: "EmailQueued".to_string(),
+            payload: serde_json::json!({ "order_id": 123, "template": "receipt" }),
+        },
+    ];
+
+    db.store
+        .complete_effect_with_events(
+            event_id,
+            "charge_payment".to_string(),
+            serde_json::json!({ "status": "success" }),
+            emitted_events.clone(),
+        )
+        .await?;
+
+    // Ack the initial OrderPlaced event before polling emitted events
+    let initial_event = db.store.poll_next().await?.expect("Initial event should exist");
+    assert_eq!(initial_event.event_id, event_id);
+    db.store.ack(initial_event.id).await?;
+
+    // Compute expected deterministic IDs (same logic as PostgresStore)
+    let expected_payment_id = Uuid::new_v5(
+        &NAMESPACE_SEESAW,
+        format!("{}-{}-{}", event_id, "charge_payment", "PaymentCharged").as_bytes(),
+    );
+    let expected_email_id = Uuid::new_v5(
+        &NAMESPACE_SEESAW,
+        format!("{}-{}-{}", event_id, "charge_payment", "EmailQueued").as_bytes(),
+    );
+
+    // Compute expected timestamp (midnight UTC today)
+    let _expected_timestamp = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+
+    // Poll emitted events (order may vary, so collect both)
+    let event1 = db
+        .store
+        .poll_next()
+        .await?
+        .expect("First emitted event should exist");
+    db.store.ack(event1.id).await?;
+
+    let event2 = db
+        .store
+        .poll_next()
+        .await?
+        .expect("Second emitted event should exist");
+    db.store.ack(event2.id).await?;
+
+    // Debug: Show polled events
+    println!("Event 1: {} ({})", event1.event_id, event1.event_type);
+    println!("Event 2: {} ({})", event2.event_id, event2.event_type);
+    println!("Expected PaymentCharged ID: {}", expected_payment_id);
+    println!("Expected EmailQueued ID: {}", expected_email_id);
+
+    // Collect events by type (order-independent verification)
+    let events_by_type: std::collections::HashMap<String, _> = [
+        (event1.event_type.clone(), event1),
+        (event2.event_type.clone(), event2),
+    ]
+    .into_iter()
+    .collect();
+
+    let payment_event = events_by_type
+        .get("PaymentCharged")
+        .expect("PaymentCharged event should exist");
+
+    assert_eq!(payment_event.event_id, expected_payment_id,
+        "Deterministic ID mismatch for PaymentCharged");
+    assert_eq!(payment_event.parent_id, Some(event_id));
+    assert_eq!(payment_event.hops, 1);
+
+    let email_event = events_by_type
+        .get("EmailQueued")
+        .expect("EmailQueued event should exist");
+    assert_eq!(email_event.event_id, expected_email_id);
+    assert_eq!(email_event.parent_id, Some(event_id));
+    assert_eq!(email_event.hops, 1);
+
+    // Verify effect is marked complete
+    let execution_status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM seesaw_effect_executions
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(event_id)
+    .bind("charge_payment")
+    .fetch_optional(&db.pool)
+    .await?;
+
+    assert_eq!(
+        execution_status,
+        Some("completed".to_string()),
+        "Effect should be marked as completed"
+    );
+
+    // Verify no additional events in queue
+    let remaining_events = db.store.poll_next().await?;
+    assert!(
+        remaining_events.is_none(),
+        "All events should have been processed"
+    );
 
     Ok(())
 }

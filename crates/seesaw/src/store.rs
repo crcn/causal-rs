@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+/// UUID v5 namespace for deterministic event ID generation
+/// Used to prevent duplicate events on crash+retry
+/// This is a custom namespace UUID (derived from URL namespace)
+pub const NAMESPACE_SEESAW: Uuid = Uuid::from_u128(0x6ba7b8109dad11d180b400c04fd430c8);
+
 /// Queued event from store
 #[derive(Debug, Clone)]
 pub struct QueuedEvent {
@@ -26,8 +31,26 @@ pub struct QueuedEvent {
     pub created_at: DateTime<Utc>,
 }
 
+/// Event emitted by an effect (for atomic insertion)
+#[derive(Debug, Clone)]
+pub struct EmittedEvent {
+    /// Event type name (for deterministic ID generation)
+    pub event_type: String,
+    /// Event payload (JSON)
+    pub payload: serde_json::Value,
+}
+
 /// Store trait - combines queue and state operations
 ///
+/// Event notification from LISTEN/NOTIFY for .wait() pattern
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SagaEvent {
+    pub event_id: Uuid,
+    pub saga_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+}
+
 /// Single trait because they share same database/pool/transactions.
 /// This enables:
 /// - Transactional state updates + event publishing
@@ -109,11 +132,36 @@ pub trait Store: Send + Sync + 'static {
     /// Mark effect execution as completed
     async fn complete_effect(&self, event_id: Uuid, effect_id: String, result: serde_json::Value) -> Result<()>;
 
+    /// Complete effect and atomically publish emitted events (crash-safe)
+    ///
+    /// Generates deterministic event IDs from hash(parent_event_id, effect_id, event_type).
+    /// Uses single transaction so both succeed or both fail (idempotent on retry).
+    async fn complete_effect_with_events(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        result: serde_json::Value,
+        emitted_events: Vec<EmittedEvent>,
+    ) -> Result<()>;
+
     /// Mark effect execution as failed
     async fn fail_effect(&self, event_id: Uuid, effect_id: String, error: String, attempts: i32) -> Result<()>;
 
     /// Move effect to DLQ (permanently failed)
     async fn dlq_effect(&self, event_id: Uuid, effect_id: String, error: String, reason: String, attempts: i32) -> Result<()>;
+
+    // =========================================================================
+    // LISTEN/NOTIFY Operations (for .wait() pattern)
+    // =========================================================================
+
+    /// Subscribe to events for a specific saga via LISTEN/NOTIFY.
+    ///
+    /// Returns a stream that yields events as they are emitted in the saga.
+    /// Used by the .wait() pattern to efficiently wait for terminal events.
+    async fn subscribe_saga_events(
+        &self,
+        saga_id: Uuid,
+    ) -> Result<Box<dyn futures::Stream<Item = SagaEvent> + Send + Unpin>>;
 }
 
 /// Queued effect execution from store

@@ -4,8 +4,10 @@ use std::any::{Any, TypeId};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
+use uuid::Uuid;
 
 use super::context::EffectContext;
 use super::types::{AnyEvent, BoxFuture, Effect, EventOutput};
@@ -50,6 +52,12 @@ pub struct EffectBuilder<EventType, Filter, Trans, Started> {
     filter: Filter,
     transition: Trans,
     started: Started,
+    id: Option<String>,
+    queued: bool,
+    delay: Option<Duration>,
+    timeout: Option<Duration>,
+    max_attempts: u32,
+    priority: Option<i32>,
     _marker: PhantomData<EventType>,
 }
 
@@ -72,6 +80,12 @@ pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoTra
         filter: NoFilter,
         transition: NoTransition,
         started: NoStarted,
+        id: None,
+        queued: false,
+        delay: None,
+        timeout: None,
+        max_attempts: 1,
+        priority: None,
         _marker: PhantomData,
     }
 }
@@ -91,6 +105,12 @@ pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
         filter: NoFilter,
         transition: NoTransition,
         started: NoStarted,
+        id: None,
+        queued: false,
+        delay: None,
+        timeout: None,
+        max_attempts: 1,
+        priority: None,
         _marker: PhantomData,
     }
 }
@@ -112,6 +132,12 @@ where
             filter: WithFilter(predicate),
             transition: self.transition,
             started: self.started,
+            id: self.id,
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
             _marker: PhantomData,
         }
     }
@@ -142,6 +168,12 @@ where
             filter: WithFilterMap(extractor, PhantomData),
             transition: self.transition,
             started: self.started,
+            id: self.id,
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
             _marker: PhantomData,
         }
     }
@@ -165,6 +197,12 @@ impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, NoTransition, 
             filter: self.filter,
             transition: WithTransition(predicate, PhantomData),
             started: self.started,
+            id: self.id,
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
             _marker: PhantomData,
         }
     }
@@ -190,8 +228,57 @@ impl<EventType, Filter, Trans> EffectBuilder<EventType, Filter, Trans, NoStarted
             filter: self.filter,
             transition: self.transition,
             started: WithStarted(started, PhantomData),
+            id: self.id,
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
             _marker: PhantomData,
         }
+    }
+}
+
+// =============================================================================
+// Builder Methods - Execution Configuration (All Builders)
+// =============================================================================
+
+impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, Started> {
+    /// Set a custom ID for this effect (default: auto-generated).
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Force queued execution (default: inline).
+    pub fn queued(mut self) -> Self {
+        self.queued = true;
+        self
+    }
+
+    /// Add a delay before execution (triggers queued execution).
+    pub fn delayed(mut self, duration: Duration) -> Self {
+        self.delay = Some(duration);
+        self
+    }
+
+    /// Set execution timeout (triggers queued execution).
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = Some(duration);
+        self
+    }
+
+    /// Set maximum retry attempts (default: 1 = no retry).
+    /// Values > 1 trigger queued execution.
+    pub fn retry(mut self, attempts: u32) -> Self {
+        self.max_attempts = attempts;
+        self
+    }
+
+    /// Set execution priority (lower = higher priority, triggers queued execution).
+    pub fn priority(mut self, level: i32) -> Self {
+        self.priority = Some(level);
+        self
     }
 }
 
@@ -342,7 +429,10 @@ where
         let filter = self.filter;
         let transition = self.transition;
 
+        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
+
         Effect {
+            id,
             can_handle: Arc::new(move |t| t == target),
             started: self.started.into_started(),
             handler: Arc::new(move |value, _, ctx| {
@@ -370,6 +460,11 @@ where
                     None => Box::pin(async { Ok(None) }),
                 }
             }),
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
         }
     }
 }
@@ -388,7 +483,10 @@ impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
         H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
+        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
+
         Effect {
+            id,
             can_handle: Arc::new(|_| true),
             started: None,
             handler: Arc::new(move |value, type_id, ctx| {
@@ -399,6 +497,11 @@ impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
                     Ok(None)
                 })
             }),
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
         }
     }
 }
@@ -416,8 +519,11 @@ where
         H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
+        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
         let transition = self.transition.0;
+
         Effect {
+            id,
             can_handle: Arc::new(|_| true),
             started: None,
             handler: Arc::new(move |_, _, ctx| {
@@ -430,6 +536,11 @@ where
                     Ok(None)
                 })
             }),
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
         }
     }
 }
@@ -447,8 +558,11 @@ where
         H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
+        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
         let started = self.started.0;
+
         Effect {
+            id,
             can_handle: Arc::new(|_| true),
             started: Some(Arc::new(move |ctx| Box::pin(started(ctx)))),
             handler: Arc::new(move |value, type_id, ctx| {
@@ -459,6 +573,11 @@ where
                     Ok(None)
                 })
             }),
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
         }
     }
 }
@@ -477,9 +596,12 @@ where
         H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
+        let id = self.id.unwrap_or_else(|| format!("effect_{}", Uuid::new_v4()));
         let started = self.started.0;
         let transition = self.transition.0;
+
         Effect {
+            id,
             can_handle: Arc::new(|_| true),
             started: Some(Arc::new(move |ctx| Box::pin(started(ctx)))),
             handler: Arc::new(move |_, _, ctx| {
@@ -492,6 +614,11 @@ where
                     Ok(None)
                 })
             }),
+            queued: self.queued,
+            delay: self.delay,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            priority: self.priority,
         }
     }
 }
@@ -519,6 +646,7 @@ where
     let effects: Arc<Vec<Effect<S, D>>> = Arc::new(effects.into_iter().collect());
 
     Effect {
+        id: format!("effect_group_{}", Uuid::new_v4()),
         can_handle: {
             let effects = effects.clone();
             Arc::new(move |type_id| effects.iter().any(|e| (e.can_handle)(type_id)))
@@ -572,6 +700,11 @@ where
                 },
             )
         },
+        queued: false,
+        delay: None,
+        timeout: None,
+        max_attempts: 1,
+        priority: None,
     }
 }
 
@@ -601,9 +734,15 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     Effect {
+        id: format!("effect_task_{}", Uuid::new_v4()),
         can_handle: Arc::new(|_| false),
         started: Some(Arc::new(move |ctx| Box::pin(f(ctx)))),
         handler: Arc::new(|_, _, _| Box::pin(async { Ok(None) })),
+        queued: false,
+        delay: None,
+        timeout: None,
+        max_attempts: 1,
+        priority: None,
     }
 }
 
@@ -629,6 +768,7 @@ where
     let rx = Arc::new(rx);
 
     Effect {
+        id: format!("effect_bridge_{}", Uuid::new_v4()),
         can_handle: Arc::new(|_| true),
         started: {
             let rx = rx.clone();
@@ -662,6 +802,11 @@ where
                 })
             })
         },
+        queued: false,
+        delay: None,
+        timeout: None,
+        max_attempts: 1,
+        priority: None,
     }
 }
 
@@ -709,6 +854,10 @@ mod tests {
         let state = Arc::new(TestState { count: 0 });
         let live_state = Arc::new(RwLock::new(TestState { count: 0 }));
         EffectContext::new(
+            "test_effect".to_string(),
+            "test_idempotency_key".to_string(),
+            Uuid::nil(),
+            Uuid::nil(),
             state.clone(),
             state,
             live_state,

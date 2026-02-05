@@ -27,7 +27,9 @@ CREATE TABLE seesaw_events (
 ) PARTITION BY RANGE (created_at);
 
 -- Idempotency: Prevent duplicate event_ids (webhooks, crash+retry)
-CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
+-- Must include partitioning column (created_at) for partitioned table
+-- For deterministic events, framework uses fixed timestamp to ensure idempotency
+CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id, created_at);
 
 -- Per-saga FIFO with advisory locks (workers use this to poll)
 CREATE INDEX idx_events_pending ON seesaw_events(created_at ASC)
@@ -143,9 +145,11 @@ CREATE TABLE seesaw_effect_executions (
 );
 
 -- Worker polling: Find next ready effect (respects priority and schedule)
+-- Note: execute_at <= NOW() check is done in query, not index (NOW() is STABLE not IMMUTABLE)
+-- Lower priority number = higher priority, so ASC order
 CREATE INDEX idx_effect_executions_pending
-ON seesaw_effect_executions(priority DESC, execute_at ASC)
-WHERE status = 'pending' AND execute_at <= NOW();
+ON seesaw_effect_executions(priority ASC, execute_at ASC)
+WHERE status = 'pending';
 
 -- Lookup effects by event (for debugging)
 CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);

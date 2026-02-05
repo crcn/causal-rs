@@ -178,6 +178,12 @@ where
         self.tasks.cancel();
     }
 
+    /// Gracefully shutdown by waiting for all in-flight tasks to complete.
+    /// Returns when all tasks have finished.
+    pub async fn shutdown(self) -> Result<()> {
+        self.tasks.settled().await
+    }
+
     /// Get an owned future that resolves when all tasks complete.
     /// Useful for spawning into a separate task.
     pub fn settled_owned(&self) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
@@ -334,6 +340,10 @@ where
         let state_snapshot = Arc::new(state.read().clone());
 
         let context = EffectContext::new(
+            "engine".to_string(),  // Engine-level context, not from a specific effect
+            "engine".to_string(),  // Engine-level idempotency key
+            Uuid::nil(),           // No saga for engine-level context
+            Uuid::nil(),           // No event for engine-level context
             state_snapshot.clone(),
             state_snapshot,
             state.clone(),

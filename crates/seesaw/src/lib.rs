@@ -83,7 +83,7 @@ pub use reducer::Reducer;
 pub use engine::{Handle, Engine};
 pub use engine_v2::Engine as QueueEngine; // New queue-backed engine
 pub use task_group::TaskGroup;
-pub use store::{Store, QueuedEvent, QueuedEffectExecution};
+pub use store::{EmittedEvent, QueuedEffectExecution, QueuedEvent, SagaEvent, Store, NAMESPACE_SEESAW};
 pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
 pub use runtime::{Runtime, RuntimeConfig};
 

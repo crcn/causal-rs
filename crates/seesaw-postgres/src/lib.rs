@@ -4,7 +4,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use seesaw_core::{QueuedEffectExecution, QueuedEvent, Store};
+use seesaw_core::{EmittedEvent, QueuedEffectExecution, QueuedEvent, Store, NAMESPACE_SEESAW};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -73,7 +73,7 @@ impl Store for PostgresStore {
                 event_id, parent_id, saga_id, event_type, payload, hops, created_at
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (event_id) DO NOTHING"
+             ON CONFLICT (event_id, created_at) DO NOTHING"
         )
         .bind(event.event_id)
         .bind(event.parent_id)
@@ -233,7 +233,7 @@ impl Store for PostgresStore {
             FROM seesaw_effect_executions
             WHERE status = 'pending'
               AND execute_at <= NOW()
-            ORDER BY priority DESC, execute_at ASC
+            ORDER BY priority ASC, execute_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED"
         )
@@ -291,6 +291,88 @@ impl Store for PostgresStore {
         .bind(result)
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    async fn complete_effect_with_events(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        result: serde_json::Value,
+        emitted_events: Vec<EmittedEvent>,
+    ) -> Result<()> {
+        // Get saga_id and hops for emitted events
+        let effect: EffectRow = sqlx::query_as(
+            "SELECT event_id, effect_id, saga_id, event_type, event_payload, parent_event_id,
+                    execute_at, timeout_seconds, max_attempts, priority, attempts
+             FROM seesaw_effect_executions
+             WHERE event_id = $1 AND effect_id = $2"
+        )
+        .bind(event_id)
+        .bind(&effect_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Get hops from parent event
+        let parent_hops: i32 = sqlx::query_scalar(
+            "SELECT hops FROM seesaw_events WHERE event_id = $1"
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Start transaction for atomicity
+        let mut tx = self.pool.begin().await?;
+
+        // Insert emitted events with deterministic IDs
+        for emitted in emitted_events {
+            // Generate deterministic event_id from hash(parent_event_id, effect_id, event_type)
+            let deterministic_id = Uuid::new_v5(
+                &NAMESPACE_SEESAW,
+                format!("{}-{}-{}", event_id, effect_id, emitted.event_type).as_bytes(),
+            );
+
+            // Use fixed timestamp for idempotency
+            // This ensures (event_id, created_at) pair is deterministic across crash+retry
+            // Fixed to start of 2026 to stay in current partition
+            let deterministic_timestamp = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+            // Insert event (idempotent via ON CONFLICT on (event_id, created_at))
+            sqlx::query(
+                "INSERT INTO seesaw_events (
+                    event_id, parent_id, saga_id, event_type, payload, hops, created_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (event_id, created_at) DO NOTHING"
+            )
+            .bind(deterministic_id)
+            .bind(Some(event_id))
+            .bind(effect.saga_id)
+            .bind(&emitted.event_type)
+            .bind(emitted.payload)
+            .bind(parent_hops + 1)
+            .bind(deterministic_timestamp)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Mark effect as completed (same transaction)
+        sqlx::query(
+            "UPDATE seesaw_effect_executions
+             SET status = 'completed',
+                 result = $3,
+                 completed_at = NOW()
+             WHERE event_id = $1 AND effect_id = $2"
+        )
+        .bind(event_id)
+        .bind(effect_id)
+        .bind(result)
+        .execute(&mut *tx)
+        .await?;
+
+        // Commit transaction - both succeed or both fail
+        tx.commit().await?;
 
         Ok(())
     }
@@ -366,5 +448,38 @@ impl Store for PostgresStore {
         .await?;
 
         Ok(())
+    }
+
+    async fn subscribe_saga_events(
+        &self,
+        saga_id: Uuid,
+    ) -> Result<Box<dyn futures::Stream<Item = seesaw_core::SagaEvent> + Send + Unpin>> {
+        use futures::stream::StreamExt;
+        use sqlx::postgres::PgListener;
+
+        let channel = format!("seesaw_saga_{}", saga_id);
+
+        // Create a new listener connection
+        let mut listener = PgListener::connect_with(&self.pool).await?;
+        listener.listen(&channel).await?;
+
+        // Convert listener into a stream of SagaEvent
+        let stream = listener.into_stream().filter_map(|result| {
+            Box::pin(async move {
+                match result {
+                    Ok(notification) => {
+                        // Parse the JSON payload from the notification
+                        if let Ok(event) = serde_json::from_str::<seesaw_core::SagaEvent>(notification.payload()) {
+                            Some(event)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            })
+        });
+
+        Ok(Box::new(stream))
     }
 }

@@ -395,6 +395,7 @@ mod tests {
     use crate::EffectContext;
     use std::any::{Any, TypeId};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     #[derive(Clone, Default)]
     struct TestState;
@@ -429,6 +430,10 @@ mod tests {
         let state = Arc::new(TestState);
         let live_state = Arc::new(RwLock::new(TestState));
         EffectContext::new(
+            "test_effect".to_string(),
+            "test_idempotency_key".to_string(),
+            Uuid::nil(),
+            Uuid::nil(),
             state.clone(),
             state,
             live_state,

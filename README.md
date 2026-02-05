@@ -247,6 +247,47 @@ let effects = on! {
 let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
 ```
 
+#### Effect Execution Configuration (v0.7.6+)
+
+Configure effects for retry, timeout, delay, priority, and queued execution:
+
+```rust
+// Queued effect with retry and timeout
+effect::on::<PaymentRequested>()
+    .id("charge_payment")               // Custom ID for tracing
+    .retry(5)                            // Retry up to 5 times
+    .timeout(Duration::from_secs(30))   // 30 second timeout
+    .priority(1)                         // Higher priority (lower = higher)
+    .then(|event, ctx| async move {
+        ctx.deps().stripe.charge(&event).await?;
+        Ok(PaymentCharged { order_id: event.order_id })
+    });
+
+// Delayed execution
+effect::on::<OrderPlaced>()
+    .delayed(Duration::from_secs(3600))  // Run 1 hour later
+    .then(|event, ctx| async move {
+        Ok(FollowupSent { order_id: event.order_id })
+    });
+
+// Force queued execution
+effect::on::<AnalyticsEvent>()
+    .queued()  // Execute in background worker
+    .then(|event, ctx| async move { Ok(()) });
+```
+
+**Configuration methods:**
+- `.id(String)` - Custom identifier
+- `.retry(u32)` - Max retry attempts (default: 1)
+- `.timeout(Duration)` - Execution timeout
+- `.delayed(Duration)` - Delay before execution
+- `.priority(i32)` - Priority (lower = higher)
+- `.queued()` - Force queued execution
+
+**Execution modes:**
+- **Inline** (default): Immediate, no retry
+- **Queued**: Triggered by `.queued()`, `.delayed()`, `.timeout()`, `.retry() > 1`, or `.priority()`
+
 Key properties:
 
 - **Closure-based**: No trait implementations required
@@ -377,6 +418,60 @@ Handle methods:
 - `.process(async_closure).await` — Async version of `run()`, waits for completion
 - `.settled().await` — Wait for all effects to complete
 - `.cancel()` — Cancel all tasks
+- `.shutdown().await` — Graceful shutdown (waits for in-flight tasks)
+
+## Queue-Backed Engine (v0.7.6+)
+
+For durable, queue-backed execution with `.wait()` pattern:
+
+```rust
+use seesaw_core::{QueueEngine, effect};
+use seesaw_postgres::PostgresStore;
+
+// Create queue-backed engine
+let store = PostgresStore::new(pool);
+let engine = QueueEngine::new(deps, store)
+    .with_effect(
+        effect::on::<OrderPlaced>()
+            .id("send_email")
+            .retry(3)
+            .then(|event, ctx| async move {
+                ctx.deps().mailer.send(&event).await?;
+                Ok(EmailSent { order_id: event.order_id })
+            })
+    )
+    .with_reducer(reducer);
+
+// Wait for terminal event using LISTEN/NOTIFY
+let result = engine
+    .process(CreateOrder { user_id: 123 })
+    .wait(|event| {
+        // Pattern match on terminal events
+        if let Some(created) = event.downcast_ref::<OrderCreated>() {
+            Some(Ok(created.clone()))
+        } else if let Some(failed) = event.downcast_ref::<OrderFailed>() {
+            Some(Err(anyhow!("Failed: {}", failed.reason)))
+        } else {
+            None  // Keep waiting
+        }
+    })
+    .timeout(Duration::from_secs(30))
+    .await?;
+```
+
+**Benefits:**
+- **Push-based**: Uses PostgreSQL LISTEN/NOTIFY (no polling)
+- **Durable**: Events survive crashes
+- **Distributed**: Multiple workers process from queue
+- **Wait for completion**: `.wait()` blocks until terminal event
+
+**EffectContext in queue-backed mode:**
+```rust
+ctx.saga_id        // Saga ID from event envelope
+ctx.event_id       // Current event's unique ID
+ctx.effect_id      // Effect's identifier
+ctx.idempotency_key  // UUID v5(event_id + effect_id) for idempotent API calls
+```
 
 ## Request/Response Pattern
 
