@@ -599,6 +599,67 @@ impl PostgresQueue {
     ) -> Result<()>;
 
     // ============================================================
+    // Saga Introspection (Progress Tracking)
+    // ============================================================
+
+    /// Get current state for a saga
+    ///
+    /// # Example
+    /// ```rust
+    /// let state: CrawlState = queue.get_saga_state(saga_id).await?
+    ///     .ok_or_else(|| anyhow!("Saga not found"))?;
+    /// println!("Pages crawled: {}/{}", state.pages_crawled, state.pages_total);
+    /// ```
+    pub async fn get_saga_state<S>(&self, saga_id: Uuid) -> Result<Option<S>>
+    where
+        S: serde::de::DeserializeOwned;
+
+    /// Get all effect executions for a saga
+    ///
+    /// Returns detailed information about each effect (status, attempts, errors).
+    ///
+    /// # Example
+    /// ```rust
+    /// let effects = queue.list_saga_effects(saga_id).await?;
+    /// for effect in effects {
+    ///     println!("{}: {} (attempts: {})",
+    ///         effect.effect_id,
+    ///         effect.status,
+    ///         effect.attempts
+    ///     );
+    /// }
+    /// ```
+    pub async fn list_saga_effects(&self, saga_id: Uuid) -> Result<Vec<EffectExecution>>;
+
+    /// Get saga summary (effect counts by status)
+    ///
+    /// Efficient single query that returns counts for pending, executing,
+    /// completed, and failed effects.
+    ///
+    /// # Example
+    /// ```rust
+    /// let summary = queue.get_saga_summary(saga_id).await?;
+    /// let progress = summary.completed as f64 /
+    ///     (summary.completed + summary.pending + summary.executing) as f64;
+    /// println!("Progress: {:.0}%", progress * 100.0);
+    /// ```
+    pub async fn get_saga_summary(&self, saga_id: Uuid) -> Result<SagaSummary>;
+
+    /// List all active sagas (have pending/executing effects)
+    ///
+    /// Useful for admin dashboards and monitoring.
+    ///
+    /// # Example
+    /// ```rust
+    /// let sagas = queue.list_active_sagas().await?;
+    /// println!("Active sagas: {}", sagas.len());
+    /// for saga in sagas {
+    ///     println!("  {} - {} effects", saga.saga_id, saga.total_effects);
+    /// }
+    /// ```
+    pub async fn list_active_sagas(&self) -> Result<Vec<SagaInfo>>;
+
+    // ============================================================
     // Health Monitoring
     // ============================================================
 

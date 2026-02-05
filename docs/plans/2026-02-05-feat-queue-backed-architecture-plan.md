@@ -2262,6 +2262,203 @@ queue.retry_from_dlq(event_id, "send_email").await?;
 
 ---
 
+### Saga Introspection APIs (Progress Tracking)
+
+**Use Case**: Frontend progress indicators, admin dashboards, debugging
+
+**Decision**: All data access belongs on **PostgresQueue** (store layer), not Engine.
+
+```rust
+impl PostgresQueue {
+    // ============ Saga Progress Tracking ============
+
+    /// Get current state for a saga
+    pub async fn get_saga_state<S>(&self, saga_id: Uuid) -> Result<Option<S>>
+    where
+        S: serde::de::DeserializeOwned,
+    {
+        let row = sqlx::query!(
+            "SELECT state FROM seesaw_state WHERE saga_id = $1",
+            saga_id
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(serde_json::from_value(r.state)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get all effect executions for a saga (detailed view)
+    pub async fn list_saga_effects(&self, saga_id: Uuid) -> Result<Vec<EffectExecution>> {
+        sqlx::query_as!(
+            EffectExecution,
+            "SELECT event_id, effect_id, status, execute_at,
+                    completed_at, attempts, error, event_type
+             FROM seesaw_effect_executions
+             WHERE saga_id = $1
+             ORDER BY execute_at",
+            saga_id
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Get saga summary (effect counts by status)
+    pub async fn get_saga_summary(&self, saga_id: Uuid) -> Result<SagaSummary> {
+        let row = sqlx::query!(
+            "SELECT
+                COUNT(*) FILTER (WHERE status = 'pending') as pending,
+                COUNT(*) FILTER (WHERE status = 'executing') as executing,
+                COUNT(*) FILTER (WHERE status = 'completed') as completed,
+                COUNT(*) FILTER (WHERE status = 'failed') as failed
+             FROM seesaw_effect_executions
+             WHERE saga_id = $1",
+            saga_id
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(SagaSummary {
+            saga_id,
+            pending: row.pending.unwrap_or(0) as u32,
+            executing: row.executing.unwrap_or(0) as u32,
+            completed: row.completed.unwrap_or(0) as u32,
+            failed: row.failed.unwrap_or(0) as u32,
+        })
+    }
+
+    /// List all active sagas (have pending/executing effects)
+    pub async fn list_active_sagas(&self) -> Result<Vec<SagaInfo>> {
+        sqlx::query_as!(
+            SagaInfo,
+            "SELECT DISTINCT saga_id,
+                    MIN(execute_at) as started_at,
+                    COUNT(*) as total_effects
+             FROM seesaw_effect_executions
+             WHERE status IN ('pending', 'executing')
+             GROUP BY saga_id
+             ORDER BY started_at DESC"
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
+// Supporting types
+pub struct EffectExecution {
+    pub event_id: Uuid,
+    pub effect_id: String,
+    pub status: String,  // 'pending', 'executing', 'completed', 'failed'
+    pub execute_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub attempts: i32,
+    pub error: Option<String>,
+    pub event_type: String,
+}
+
+pub struct SagaSummary {
+    pub saga_id: Uuid,
+    pub pending: u32,
+    pub executing: u32,
+    pub completed: u32,
+    pub failed: u32,
+}
+
+pub struct SagaInfo {
+    pub saga_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub total_effects: i64,
+}
+```
+
+**Usage Example: Crawl Progress API**
+
+```rust
+#[get("/crawl/{saga_id}/progress")]
+async fn crawl_progress(
+    saga_id: web::Path<Uuid>,
+    queue: web::Data<Arc<PostgresQueue>>
+) -> Result<Json<CrawlProgress>> {
+    // Get effect summary (one efficient query)
+    let summary = queue.get_saga_summary(*saga_id).await?;
+
+    // Get domain state
+    let state: CrawlState = queue.get_saga_state(*saga_id).await?
+        .ok_or_else(|| anyhow!("Saga not found"))?;
+
+    // Get detailed effects if needed
+    let effects = queue.list_saga_effects(*saga_id).await?;
+
+    Ok(Json(CrawlProgress {
+        saga_id: *saga_id,
+        status: state.status,
+        pages_crawled: state.pages_crawled,
+        pages_total: state.pages_total,
+        current_phase: state.current_phase,
+        effects_pending: summary.pending,
+        effects_executing: summary.executing,
+        effects_completed: summary.completed,
+        effects_failed: summary.failed,
+        effects: effects.iter().map(|e| EffectInfo {
+            name: e.effect_id.clone(),
+            status: e.status.clone(),
+            error: e.error.clone(),
+        }).collect(),
+    }))
+}
+
+// Frontend polls this endpoint every 2s
+// GET /crawl/550e8400-e29b-41d4-a716-446655440000/progress
+// {
+//   "saga_id": "550e8400-e29b-41d4-a716-446655440000",
+//   "status": "Crawling",
+//   "pages_crawled": 42,
+//   "pages_total": 100,
+//   "current_phase": "Extracting",
+//   "effects_pending": 58,
+//   "effects_executing": 3,
+//   "effects_completed": 42,
+//   "effects_failed": 0
+// }
+```
+
+**Usage Example: Admin Dashboard**
+
+```rust
+#[get("/admin/sagas")]
+async fn list_sagas(
+    queue: web::Data<Arc<PostgresQueue>>
+) -> Result<Json<Vec<SagaListItem>>> {
+    let sagas = queue.list_active_sagas().await?;
+
+    let mut items = vec![];
+    for saga in sagas {
+        if let Some(state) = queue.get_saga_state::<CrawlState>(saga.saga_id).await? {
+            items.push(SagaListItem {
+                saga_id: saga.saga_id,
+                website_url: state.website_url,
+                status: state.status,
+                started_at: saga.started_at,
+                total_effects: saga.total_effects,
+            });
+        }
+    }
+
+    Ok(Json(items))
+}
+```
+
+**Rationale**:
+- ✅ Common use case (every app needs progress tracking)
+- ✅ Read-only (no state mutations)
+- ✅ Efficient queries (uses indexes, aggregates)
+- ✅ Type-safe (returns structs)
+- ✅ Store concern (PostgresQueue owns DB access)
+
+---
+
 ### Migration Checklist
 
 - [ ] **Remove `saga_id` from all event structs** - now in envelope
