@@ -1717,23 +1717,52 @@ effect::on::<OrderPlaced>()
     });
 ```
 
-### Priority Events
+### Priority Handling
+
+**Decision**: Priority is set on **effects**, not on external events.
+
+**Rationale**:
+- External events (webhooks, user actions) don't have inherent priority
+- Priority matters for **side effects** (e.g., urgent emails vs. background cleanup)
+- Queue workers poll effects by priority, not events
 
 ```rust
-// Jump critical events to front of queue (new saga):
-let saga_id = engine.process_with_priority(1, || async {  // Lower = higher priority
-    Ok(SystemReset { reason: "emergency" })
-}).await?;
+// High priority effect (jump to front of effect queue)
+effect::on::<SystemAlert>()
+    .id("send_urgent_alert")
+    .priority(1)  // ← Priority set on effect, not engine.process()
+    .then(|event, ctx| async move {
+        ctx.deps().pagerduty.alert(&event).await?;
+        Ok(())
+    });
 
-// High priority, continue existing saga:
-engine.process_saga_with_priority(saga_id, 5, || async {
-    Ok(AdminAction { action: "cancel_all" })
-}).await?;
+// Normal priority effect
+effect::on::<UserSignedUp>()
+    .id("send_welcome_email")
+    .priority(10)  // ← Default priority
+    .then(|event, ctx| async move {
+        ctx.deps().mailer.send_welcome(&event).await?;
+        Ok(())
+    });
 
-// Normal priority (10), new saga:
-engine.process(|| async {
-    Ok(UserSignedUp { user_id })
-}).await?;
+// Low priority effect (background work)
+effect::on::<DataExport>()
+    .id("export_csv")
+    .priority(20)
+    .then(|event, ctx| async move {
+        ctx.deps().exporter.generate_csv(&event).await?;
+        Ok(())
+    });
+```
+
+**Worker Behavior**:
+```sql
+-- Effect worker polls by priority DESC
+SELECT * FROM seesaw_effect_executions
+WHERE status = 'pending' AND execute_at <= NOW()
+ORDER BY priority DESC, execute_at ASC  -- ← High priority first
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
 ```
 
 ### Graceful Shutdown
@@ -1826,40 +1855,15 @@ impl Engine<S, D> {
     pub fn new(deps: D) -> Self;
     pub fn with_queue<Q: Queue>(self, queue: Q) -> Self;
 
-    // Process external events - NEW saga (generates saga_id)
-    pub async fn process<F>(&self, f: F) -> Result<Uuid>  // Returns saga_id
-    where
-        F: FnOnce() -> BoxFuture<Result<impl Event>>;
-
-    // Process external events - EXISTING saga (explicit saga_id)
-    pub async fn process_saga<F>(&self, saga_id: Uuid, f: F) -> Result<()>
-    where
-        F: FnOnce() -> BoxFuture<Result<impl Event>>;
-
-    // With priority
-    pub async fn process_with_priority<F>(&self, priority: i32, f: F) -> Result<Uuid>
-    where
-        F: FnOnce() -> BoxFuture<Result<impl Event>>;
-
-    pub async fn process_saga_with_priority<F>(
-        &self,
-        saga_id: Uuid,
-        priority: i32,
-        f: F
-    ) -> Result<()>
-    where
-        F: FnOnce() -> BoxFuture<Result<impl Event>>;
+    // Process external events (entry points)
+    pub async fn process(&self, event: impl Event) -> Result<Uuid>;  // Returns saga_id
+    pub async fn process_with_id(&self, event_id: Uuid, event: impl Event) -> Result<Uuid>;
 
     // Lifecycle
     pub async fn shutdown(&self) -> Result<()>;
 
-    // Internal: called by workers
+    // Internal: called by workers (not public API)
     async fn process_event(&self, envelope: EventEnvelope) -> Result<Vec<Event>>;
-
-    // Dead letter queue
-    pub async fn list_dlq(&self) -> Result<Vec<DlqEntry>>;
-    pub async fn retry_from_dlq(&self, event_id: Uuid, effect_id: &str) -> Result<()>;
-    pub async fn resolve_dlq(&self, event_id: Uuid, effect_id: &str) -> Result<()>;
 }
 ```
 
@@ -1968,34 +1972,128 @@ effect::on::<CrawlEvent>()
 
 ```rust
 pub struct EffectContext<S, D> {
-    pub prev_state: S,            // Existing
-    pub next_state: S,            // Existing
-    pub deps: Arc<D>,             // Existing
+    // State access (loads latest from DB)
+    state: Arc<RwLock<S>>,        // ← Latest state, loaded fresh
 
-    // NEW: Envelope metadata
+    // Dependencies
+    pub deps: Arc<D>,
+
+    // Envelope metadata (NEW)
     pub saga_id: Uuid,            // ← From envelope, not user event
     pub event_id: Uuid,           // ← Current event's unique ID
     pub idempotency_key: String,  // ← UUID v5(event_id + effect_id)
 }
 
-// Events returned from effects automatically inherit saga_id:
+impl<S, D> EffectContext<S, D> {
+    /// Get current state (read-only reference)
+    pub fn state(&self) -> RwLockReadGuard<S> {
+        self.state.read().unwrap()
+    }
+
+    /// Get dependencies
+    pub fn deps(&self) -> &Arc<D> {
+        &self.deps
+    }
+}
+
+// Effects see latest state (not snapshot):
 effect::on::<OrderPlaced>()
     .id("send_email")
     .then(|event, ctx| async move {
-        send_email(&event).await?;
+        let state = ctx.state();  // ← Fresh from DB
+        ctx.deps().mailer.send(state.user_email).await?;
 
-        // This event will have ctx.saga_id attached automatically ✅
+        // Event inherits ctx.saga_id automatically ✅
         Ok(EmailSent { order_id: event.order_id })
     });
 ```
+
+**Removed**: `ctx.prev_state()` and `ctx.next_state()` - effects only see latest state.
+
+### DLQ Management (Queue Responsibility, Not Engine)
+
+**Decision**: DLQ is a **queue/worker concern**, not engine business logic.
+
+```rust
+// PostgresQueue handles DLQ, not Engine
+impl PostgresQueue {
+    /// List failed effects in DLQ
+    pub async fn list_dlq(&self) -> Result<Vec<DlqEntry>> {
+        sqlx::query_as!(
+            DlqEntry,
+            "SELECT event_id, effect_id, error, created_at, payload
+             FROM seesaw_dlq
+             ORDER BY created_at DESC
+             LIMIT 100"
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Retry a failed effect from DLQ
+    pub async fn retry_from_dlq(&self, event_id: Uuid, effect_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Move from DLQ back to effect_executions
+        sqlx::query!(
+            "INSERT INTO seesaw_effect_executions (event_id, effect_id, saga_id, status, attempts)
+             SELECT event_id, effect_id, saga_id, 'pending', 0
+             FROM seesaw_dlq
+             WHERE event_id = $1 AND effect_id = $2",
+            event_id,
+            effect_id
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query!(
+            "DELETE FROM seesaw_dlq WHERE event_id = $1 AND effect_id = $2",
+            event_id,
+            effect_id
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mark DLQ entry as resolved (delete without retry)
+    pub async fn resolve_dlq(&self, event_id: Uuid, effect_id: &str) -> Result<()> {
+        sqlx::query!(
+            "DELETE FROM seesaw_dlq WHERE event_id = $1 AND effect_id = $2",
+            event_id,
+            effect_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+// Usage (ops/admin code, not application code)
+let queue = PostgresQueue::new(pool);
+
+// List failed effects
+let failed = queue.list_dlq().await?;
+for entry in failed {
+    println!("Failed: {:?} - {}", entry.effect_id, entry.error);
+}
+
+// Retry specific failure
+queue.retry_from_dlq(event_id, "send_email").await?;
+```
+
+**Invariant**: Engine never touches DLQ. Workers move effects to DLQ on permanent failure (timeout, max retries).
+
+---
 
 ### Migration Checklist
 
 - [ ] **Remove `saga_id` from all event structs** - now in envelope
 - [ ] Create `PostgresQueue` and start workers: `queue.start_workers(N, engine)`
-- [ ] Replace `handle.run(|_| Ok(Event))` with `engine.process(|| async { Ok(Event) })`
-- [ ] Store returned `saga_id` from `process()` for later continuation
-- [ ] Use `engine.process_saga(saga_id, ...)` for continuing existing sagas
+- [ ] Replace `handle.run(|_| Ok(Event))` with `engine.process(event)`
+- [ ] For webhooks, use `engine.process_with_id(webhook_id, event)` for idempotency
 - [ ] Replace `handle.settled()` with `engine.shutdown()`
 - [ ] Add `.id("name")` to all effects (compile will enforce)
 - [ ] Use `ctx.saga_id` instead of `event.saga_id`
