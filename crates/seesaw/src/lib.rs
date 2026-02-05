@@ -61,10 +61,12 @@
 pub mod effect;
 pub mod reducer;
 pub mod store;
+pub mod runtime;
 
 mod effect_registry;
 mod reducer_registry;
 mod engine;
+mod engine_v2;
 mod task_group;
 mod process;
 
@@ -79,9 +81,11 @@ pub mod otel;
 pub use effect::{AnyEvent, Effect, EffectContext, EffectError};
 pub use reducer::Reducer;
 pub use engine::{Handle, Engine};
+pub use engine_v2::Engine as QueueEngine; // New queue-backed engine
 pub use task_group::TaskGroup;
 pub use store::{Store, QueuedEvent, QueuedEffectExecution};
 pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
+pub use runtime::{Runtime, RuntimeConfig};
 
 // Top-level builder functions
 pub use effect::on;
