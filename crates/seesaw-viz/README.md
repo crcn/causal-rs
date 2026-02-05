@@ -9,7 +9,7 @@ Workflow visualization and observability for Seesaw event-driven runtime.
 - ✅ **Component grouping** using `module_path!()` for Mermaid subgraphs (P2)
 - ✅ **State diffing** with customizable formatters
 - ✅ **Sampling strategies** for overhead reduction
-- 🚧 **Live HTML viewer** (coming soon - P3)
+- ✅ **Live HTML viewer** with real-time Mermaid rendering (P3)
 
 ## Quick Start
 
@@ -103,16 +103,23 @@ graph TD
 
 Prevents "spaghetti" diagrams at scale.
 
-### Priority 3: Live HTML Viewer (Coming Soon)
+### Priority 3: Live HTML Viewer
 
-Axum-based live viewer with real-time updates:
+Production-ready Axum-based viewer with real-time Mermaid rendering:
 
 ```rust
 use seesaw_viz::web::start_viewer;
 
 start_viewer(collector, "127.0.0.1:3000").await?;
-// Open http://localhost:3000
+// Open http://localhost:3000 for live visualization
 ```
+
+Features:
+- Real-time Mermaid diagram updates
+- Stats dashboard (total spans, roots, completed, failed)
+- Auto-refresh mode (2-second intervals)
+- Manual refresh and clear controls
+- Responsive dark theme UI
 
 ## Sampling Strategies
 
