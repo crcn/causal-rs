@@ -324,15 +324,21 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 ```
 External Event → engine.process() → Queue.publish()
                                          ↓
-                                    Worker Pool (owned by Runtime)
+                                 Event Worker (owned by Runtime)
                                          ↓
                               Poll → Engine.process_event()
                                          ↓
-                          Load State → Reducers → Effects → Save State
+                    Load State → Reducers → Save State
                                          ↓
-                                  Returns next events
-                                         ↓
-                                  Queue.publish()
+                                   Run Effects:
+                                    ├─ Inline effects (execute immediately)
+                                    │  └─ Emit events → Queue.publish()
+                                    └─ Queued effects (persist to DB)
+                                       └─ INSERT seesaw_effect_executions
+                                              ↓
+                                    Effect Worker (owned by Runtime)
+                                              ↓
+                                    Poll → Execute → Emit events
 ```
 
 ### Components
@@ -349,22 +355,104 @@ External Event → engine.process() → Queue.publish()
 4. **PostgresStateStore** - Per-saga state isolation with versioning (embedded in PostgresQueue)
 5. **Idempotency Layer** - seesaw_events.event_id + seesaw_effect_executions tables
 
+### Effect Execution Model: Inline vs Queued
+
+**Critical Design Decision**: Effects are **inline by default** (zero overhead), automatically queued only when needed.
+
+#### Inline Effects (Default)
+
+Run immediately during event processing, no Postgres overhead:
+
+```rust
+// ✅ Inline - runs in event worker, no DB write
+effect::on::<OrderPlaced>()
+    .id("log_order")
+    .then(|event, ctx| async move {
+        tracing::info!("Order placed: {}", event.order_id);
+        Ok(())  // Fast, synchronous-style logic
+    });
+
+// ✅ Inline - emit next event immediately
+effect::on::<OrderPlaced>()
+    .id("request_approval")
+    .then(|event, ctx| async move {
+        Ok(ApprovalRequested { order_id: event.order_id })
+    });
+```
+
+**When inline**:
+- No `.delayed()`, `.retry()`, `.timeout()`, `.priority()`, or `.queued()` modifiers
+- Executes during event processing (same transaction as state update)
+- Emitted events published immediately
+- Zero Postgres overhead (no `seesaw_effect_executions` write)
+
+#### Queued Effects (Opt-In)
+
+Persisted to `seesaw_effect_executions`, polled by effect workers:
+
+```rust
+// ✅ Queued - has .delayed() → requires persistence
+effect::on::<OrderPlaced>()
+    .id("send_reminder")
+    .delayed(Duration::from_days(7))
+    .then(|event, ctx| async move {
+        ctx.deps().mailer.send_reminder(&event).await?;
+        Ok(ReminderSent { order_id: event.order_id })
+    });
+
+// ✅ Queued - has .retry() → needs durability for crash recovery
+effect::on::<OrderPlaced>()
+    .id("charge_payment")
+    .retry(5)
+    .timeout(Duration::from_secs(60))
+    .then(|event, ctx| async move {
+        ctx.deps().stripe.charge(&event).await?;
+        Ok(PaymentCharged { order_id: event.order_id })
+    });
+
+// ✅ Queued - explicit .queued() for long-running IO
+effect::on::<OrderPlaced>()
+    .id("generate_report")
+    .queued()  // Force queued execution
+    .timeout(Duration::from_secs(120))
+    .then(|event, ctx| async move {
+        let report = ctx.deps().reporter.generate(&event).await?;
+        Ok(ReportGenerated { order_id: event.order_id })
+    });
+```
+
+**When queued** (any of these triggers persistence):
+- Has `.delayed(duration)` - schedule for future execution
+- Has `.retry(n)` where n > 1 - needs crash recovery
+- Has `.timeout(duration)` - implies potentially slow IO
+- Has `.priority(n)` - needs priority queue scheduling
+- Has `.queued()` - explicit opt-in for long-running work
+
 ### Two-Phase Worker Architecture
 
-**Phase 1: Event Workers** (Fast - Pure State Transitions)
+**Phase 1: Event Workers** (Fast - State + Inline Effects)
 ```
-Poll seesaw_events → Run Reducers → Save State → Insert effect_executions (pending)
+1. Poll seesaw_events (SKIP LOCKED + advisory lock for FIFO)
+2. Load state → Run reducers → Save state
+3. For each effect:
+   - If inline: Execute immediately, emit events
+   - If queued: Insert into seesaw_effect_executions
+4. Mark event processed
 ```
 
-**Phase 2: Effect Workers** (Slow - IO-Bound Side Effects)
+**Phase 2: Effect Workers** (Slow - Queued Effects Only)
 ```
-Poll seesaw_effect_executions (where pending AND execute_at <= NOW) → Run Effects → Mark completed
+1. Poll seesaw_effect_executions (where pending AND execute_at <= NOW)
+2. Execute effect (retry on failure, respect timeout)
+3. Mark completed, emit next events
 ```
 
 **Why Split?**
+- ✅ **Zero overhead for simple effects** - Inline execution, no DB write
 - ✅ **Isolation** - Slow third-party APIs don't block state updates
-- ✅ **Scalability** - Run 2 event workers, 20 effect workers (effects are usually the bottleneck)
-- ✅ **Throughput** - Events process at pure DB speed, effects run in parallel
+- ✅ **Scalability** - Run 2 event workers, 20 effect workers (queued effects are the bottleneck)
+- ✅ **Durability** - Queued effects survive crashes, support retries and delays
+- ✅ **Pay-per-use** - Only persist effects that need durability
 
 ### Key Design Decisions
 
@@ -2010,6 +2098,29 @@ let result = engine
 
 **Performance**: Push-based (LISTEN/NOTIFY), not polling. Zero overhead when not using `.wait()`.
 
+**Works with Both Inline and Queued Effects**:
+- **Inline effects**: Terminal event emitted immediately during event processing
+- **Queued effects**: Terminal event emitted when effect worker completes execution
+- `.wait()` doesn't care - it just waits for ANY matching event on the saga
+
+```rust
+// Example: Wait for queued effect terminal event
+effect::on::<OrderPlaced>()
+    .id("charge_payment")
+    .retry(5)  // ← Queued (might take time, retries)
+    .then(|event, ctx| async move {
+        ctx.deps().stripe.charge(&event).await?;
+        Ok(PaymentCharged { order_id: event.order_id })
+    });
+
+// Wait for PaymentCharged (even though it's from queued effect)
+let payment = engine
+    .process(OrderPlaced { ... })
+    .wait::<PaymentCharged>()  // ← Works! Waits for queued effect to complete
+    .timeout(Duration::from_secs(60))
+    .await?;
+```
+
 ### Priority Handling
 
 **Decision**: Priority is set on **effects**, not on external events.
@@ -2296,29 +2407,49 @@ impl<E> EffectBuilder<E, NoId> {
 }
 
 impl<E> EffectBuilder<E, HasIdTag> {
-    // Execution timing
-    pub fn delayed(self, duration: Duration) -> Self;
-    pub fn scheduled_at(self, time: DateTime<Utc>) -> Self;
+    // Execution mode (determines inline vs queued)
+    pub fn queued(self) -> Self;                               // Force queued execution
 
-    // Execution constraints
-    pub fn timeout(self, duration: Duration) -> Self;          // Default: 30s
-    pub fn retry(self, attempts: u32) -> Self;                 // Default: 3
-    pub fn retry_policy(self, policy: RetryPolicy) -> Self;    // Advanced
+    // Execution timing (automatically triggers queued)
+    pub fn delayed(self, duration: Duration) -> Self;          // → Queued
+    pub fn scheduled_at(self, time: DateTime<Utc>) -> Self;    // → Queued
 
-    // Priority
-    pub fn priority(self, priority: i32) -> Self;              // Default: 10
+    // Execution constraints (automatically triggers queued)
+    pub fn timeout(self, duration: Duration) -> Self;          // → Queued (default: 30s)
+    pub fn retry(self, attempts: u32) -> Self;                 // → Queued (default: 1 = inline)
+    pub fn retry_policy(self, policy: RetryPolicy) -> Self;    // → Queued
+
+    // Priority (automatically triggers queued)
+    pub fn priority(self, priority: i32) -> Self;              // → Queued (default: 10)
 
     pub fn then<F>(self, handler: F) -> Effect<E>;  // ← Only available after .id()
 }
 
-// Examples of chaining:
+// Examples:
+
+// Inline (default) - zero overhead
 effect::on::<Event>()
-    .id("name")
-    .delayed(Duration::from_days(2))
+    .id("log_event")
+    .then(|event, ctx| async move { Ok(()) });
+
+// Queued (explicit) - persisted to seesaw_effect_executions
+effect::on::<Event>()
+    .id("long_running")
+    .queued()
+    .then(|event, ctx| async move { /* slow work */ Ok(()) });
+
+// Queued (implicit via .delayed()) - scheduled execution
+effect::on::<Event>()
+    .id("send_reminder")
+    .delayed(Duration::from_days(7))
+    .then(|event, ctx| async move { Ok(()) });
+
+// Queued (implicit via .retry()) - crash recovery
+effect::on::<Event>()
+    .id("charge_payment")
     .retry(5)
     .timeout(Duration::from_secs(60))
-    .priority(1)
-    .then(|event, ctx| async move { ... });
+    .then(|event, ctx| async move { Ok(()) });
 ```
 
 ### `on!` Macro with Attributes
