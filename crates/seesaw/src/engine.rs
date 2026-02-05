@@ -157,35 +157,40 @@ where
         Ok(())
     }
 
-    /// Process an event to completion.
+    /// Process to completion and return a value.
     ///
-    /// This is a convenience method that combines `run()` and `settled()`.
-    /// The returned event will be dispatched and all cascading effects
-    /// will complete before this method returns.
+    /// If the returned value is an event type (not `()`), it will be dispatched
+    /// to trigger effects. Waits for all cascading effects to complete.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let handle = engine.activate(State::default());
-    /// handle.process(|ctx| async move {
-    ///     let data = fetch_data().await?;
-    ///     Ok(OrderPlaced { id: 123, data })
+    ///
+    /// // Return an event - dispatched and returned
+    /// let order = handle.process(|_| async {
+    ///     Ok(OrderPlaced { id: 123, total: 99.99 })
     /// }).await?;
-    /// println!("All effects completed");
+    /// println!("Placed: {:?}", order);
+    ///
+    /// // Return a plain value - just returned, not dispatched
+    /// let count = handle.process(|ctx| async {
+    ///     Ok(ctx.curr_state().order_count)
+    /// }).await?;
     /// ```
-    pub async fn process<'a, F, Fut, E>(&'a self, f: F) -> Result<()>
+    pub async fn process<'a, F, Fut, E>(&'a self, f: F) -> Result<E>
     where
         F: FnOnce(&'a EffectContext<S, D>) -> Fut,
         Fut: std::future::Future<Output = Result<E>> + Send + 'a,
-        E: Send + Sync + 'static,
+        E: Clone + Send + Sync + 'static,
     {
-        let event = f(&self.context).await?;
-        // Dispatch the event if it's not ()
+        let value = f(&self.context).await?;
+        // Dispatch if it's an event (not ())
         if std::any::TypeId::of::<E>() != std::any::TypeId::of::<()>() {
-            self.context.emit(event);
+            self.context.emit(value.clone());
         }
         self.tasks.settled().await?;
-        Ok(())
+        Ok(value)
     }
 
     /// Wait for all tasks to complete.
