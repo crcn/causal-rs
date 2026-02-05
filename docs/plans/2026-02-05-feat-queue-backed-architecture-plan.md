@@ -898,20 +898,6 @@ CREATE TABLE seesaw_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Event processing ledger (separate from queue)
--- Purpose: Atomic claim + processing phase tracking + historical record
--- Why not just use seesaw_events.processed_at?
---   1. Atomic claim: Worker inserts here at transaction start (ON CONFLICT = already claimed)
---   2. Phase tracking: Tracks state commit vs full completion separately
---   3. Audit trail: Persists even after event deleted from queue (30-day retention)
-CREATE TABLE seesaw_processed (
-    event_id UUID PRIMARY KEY,
-    saga_id UUID NOT NULL,
-    state_committed_at TIMESTAMPTZ,  -- When Phase 1 (reducers) completed
-    completed_at TIMESTAMPTZ,        -- When Phase 2 (all effects) completed
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 -- Effect idempotency (framework-guaranteed)
 CREATE TABLE seesaw_effect_executions (
     event_id UUID NOT NULL,
@@ -991,21 +977,21 @@ async fn event_worker_loop(&self) -> Result<()> {
             continue;
         }
 
-        // 3. Atomic event idempotency claim
+        // 3. Atomic event idempotency check (use seesaw_events.processed_at)
         let mut tx = self.pool.begin().await?;
 
-        let claimed = sqlx::query!(
-            "INSERT INTO seesaw_processed (event_id, saga_id)
-             VALUES ($1, $2)
-             ON CONFLICT (event_id) DO NOTHING
-             RETURNING event_id",
-            event.event_id,
-            event.saga_id
+        // Check if already processed
+        let already_processed = sqlx::query_scalar!(
+            "SELECT processed_at FROM seesaw_events
+             WHERE event_id = $1
+             FOR UPDATE",
+            event.event_id
         )
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
-        if claimed.is_none() {
+        if already_processed.is_some() {
+            // Event already processed (crash recovery)
             tx.rollback().await?;
             self.queue.ack(event.id).await?;
             continue;
@@ -1046,35 +1032,113 @@ async fn event_worker_loop(&self) -> Result<()> {
         .execute(&mut *tx)
         .await?;
 
-        // 7. Insert effect execution intents (with event payload for retention safety)
+        // 7. Process effects: inline (execute now) vs queued (insert intent)
+        let ctx = EffectContext {
+            saga_id: event.saga_id,
+            event_id: event.event_id,
+            state: Arc::new(next_state.clone()),
+            deps: self.deps.clone(),
+            idempotency_key: Uuid::new_v5(&NAMESPACE, format!("{}-{}", event.event_id, "...").as_bytes()),
+        };
+
         for effect in self.effects.handlers_for(&event.event_type) {
-            sqlx::query!(
-                "INSERT INTO seesaw_effect_executions (
-                    event_id, effect_id, saga_id, status,
-                    event_type, event_payload, parent_event_id,
-                    execute_at, timeout_seconds, max_attempts, priority
-                 )
-                 VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10)
-                 ON CONFLICT DO NOTHING",
-                event.event_id,
-                effect.id,
-                event.saga_id,
-                event.event_type,
-                Json(&event.payload),  // ← Copy payload (survives 30-day deletion)
-                event.parent_id,
-                Utc::now() + effect.config.delay,
-                effect.config.timeout.as_secs(),
-                effect.config.max_attempts,
-                effect.config.priority
-            )
-            .execute(&mut *tx)
-            .await?;
+            if effect.is_inline() {
+                // INLINE: Execute immediately in this transaction
+
+                // Check idempotency (already executed?)
+                let executed = sqlx::query_scalar!(
+                    "SELECT status FROM seesaw_effect_executions
+                     WHERE event_id = $1 AND effect_id = $2",
+                    event.event_id,
+                    effect.id
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                if executed.is_some() {
+                    continue;  // Already executed (event redelivery)
+                }
+
+                // Execute effect NOW
+                let result = effect.handler.execute(&event, &ctx).await?;
+
+                // Record execution (idempotency)
+                sqlx::query!(
+                    "INSERT INTO seesaw_effect_executions (
+                        event_id, effect_id, saga_id, status, result, completed_at
+                     )
+                     VALUES ($1, $2, $3, 'completed', $4, NOW())",
+                    event.event_id,
+                    effect.id,
+                    event.saga_id,
+                    Json(&result)
+                )
+                .execute(&mut *tx)
+                .await?;
+
+                // Emit next event (same transaction - atomicity!)
+                if let Some(next_event) = result {
+                    let next_event_id = Uuid::new_v5(
+                        &NAMESPACE,
+                        format!("{}-{}-{}", event.event_id, effect.id, std::any::type_name_of_val(&next_event)).as_bytes()
+                    );
+
+                    sqlx::query!(
+                        "INSERT INTO seesaw_events (
+                            event_id, saga_id, parent_id, event_type, payload, hops
+                         )
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         ON CONFLICT DO NOTHING",
+                        next_event_id,
+                        event.saga_id,
+                        event.event_id,
+                        std::any::type_name_of_val(&next_event),
+                        Json(&next_event),
+                        event.hops + 1
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            } else {
+                // QUEUED: Insert intent for effect worker
+                sqlx::query!(
+                    "INSERT INTO seesaw_effect_executions (
+                        event_id, effect_id, saga_id, status,
+                        event_type, event_payload, parent_event_id,
+                        execute_at, timeout_seconds, max_attempts, priority
+                     )
+                     VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10)
+                     ON CONFLICT DO NOTHING",
+                    event.event_id,
+                    effect.id,
+                    event.saga_id,
+                    event.event_type,
+                    Json(&event.payload),  // Copy payload (survives 30-day deletion)
+                    event.parent_id,
+                    Utc::now() + effect.config.delay,
+                    effect.config.timeout.as_secs(),
+                    effect.config.max_attempts,
+                    effect.config.priority
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
-        // 8. Commit (state + effect intents atomic)
+        // 8. Mark event as processed
+        sqlx::query!(
+            "UPDATE seesaw_events
+             SET processed_at = NOW()
+             WHERE event_id = $1",
+            event.event_id
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // 9. Commit (state + effect intents + inline effects + emitted events all atomic)
         tx.commit().await?;
 
-        // 9. Ack event
+        // 10. Ack event
         self.queue.ack(event.id).await?;
     }
 }
@@ -1226,184 +1290,6 @@ async fn effect_worker_loop(&self) -> Result<()> {
 ```
 
 **Deliverable**: Two-phase event processing with durability, isolation, and scalability
-
-### Phase 3 (Old - Single Worker)
-```rust
-async fn process_next_event(&self) -> Result<()> {
-    // 1. Poll next event (SKIP LOCKED)
-    let Some(queued) = self.queue.poll_next().await? else {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        return Ok(());
-    };
-
-    // 2. Atomic event idempotency claim
-    let mut tx = self.pool.begin().await?;
-
-    let claimed = sqlx::query!(
-        "INSERT INTO seesaw_processed (event_id, saga_id)
-         VALUES ($1, $2)
-         ON CONFLICT (event_id) DO NOTHING
-         RETURNING event_id",
-        queued.event_id,
-        queued.saga_id
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if claimed.is_none() {
-        // Another worker claimed this event
-        tx.rollback().await?;
-        self.queue.ack(queued.id).await?;
-        return Ok(());
-    }
-
-    // 3. Load state with FOR UPDATE lock
-    let (prev_state, version) = sqlx::query!(
-        "SELECT state, version FROM seesaw_state
-         WHERE saga_id = $1 FOR UPDATE",
-        queued.saga_id
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-
-    // 4. Run reducer (pure, fast)
-    let next_state = self.reducers.apply(prev_state.clone(), &queued.event);
-
-    // 5. Save state with version check
-    sqlx::query!(
-        "UPDATE seesaw_state
-         SET state = $1, version = $2, updated_at = NOW()
-         WHERE saga_id = $3 AND version = $4",
-        Json(&next_state),
-        version + 1,
-        queued.saga_id,
-        version
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    // 6. Mark state committed
-    sqlx::query!(
-        "UPDATE seesaw_processed SET state_committed_at = NOW()
-         WHERE event_id = $1",
-        queued.event_id
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    // 7. Commit transaction (state is now durable)
-    tx.commit().await?;
-
-    // 8. Run effects with framework-guaranteed idempotency
-    let ctx = EffectContext {
-        prev_state,
-        next_state: next_state.clone(),
-        deps: self.deps.clone(),
-        saga_id: queued.saga_id,
-        idempotency_key: format!("{}-{}", queued.event_id, "..."),  // Per-effect
-    };
-
-    for effect in self.effects.handlers_for(&queued.event_type) {
-        // run_effect_idempotent checks cache and skips if already executed
-        match self.run_effect_idempotent(queued.event_id, effect, &queued.event, &ctx).await {
-            Ok(Some(next_event)) => {
-                self.queue.publish(next_event).await?;
-            }
-            Ok(None) => {
-                // Observer effect or cached result was None
-            }
-            Err(e) => {
-                // Effect failed - logged but don't fail entire event
-                tracing::error!("Effect {} failed: {}", effect.id, e);
-            }
-        }
-    }
-
-    // 9. Mark fully processed
-    sqlx::query!(
-        "UPDATE seesaw_processed SET completed_at = NOW()
-         WHERE event_id = $1",
-        queued.event_id
-    )
-    .execute(&self.pool)
-    .await?;
-
-    // 10. Ack queue
-    self.queue.ack(queued.id).await?;
-
-    Ok(())
-}
-
-// Helper: Run effect with idempotency guarantee
-async fn run_effect_idempotent(
-    &self,
-    event_id: Uuid,
-    effect: &Effect,
-    event: &Event,
-    ctx: &Context
-) -> Result<Option<Event>> {
-    let mut tx = self.pool.begin().await?;
-
-    // Atomic check-and-claim
-    let cached = sqlx::query!(
-        "INSERT INTO seesaw_effect_executions (event_id, effect_id, status)
-         VALUES ($1, $2, 'executing')
-         ON CONFLICT (event_id, effect_id)
-         DO UPDATE SET last_attempted_at = NOW()
-         RETURNING status, result, error, attempts",
-        event_id,
-        effect.id
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    // Already completed - return cached!
-    if cached.status == "completed" {
-        return Ok(cached.result.map(|r| deserialize(&r)?));
-    }
-
-    // Failed too many times
-    if cached.status == "failed" && cached.attempts >= 3 {
-        return Err(anyhow!("Permanently failed"));
-    }
-
-    // Execute effect
-    match effect.handler.handle(event, ctx).await {
-        Ok(result) => {
-            sqlx::query!(
-                "UPDATE seesaw_effect_executions
-                 SET status = 'completed', result = $1, completed_at = NOW()
-                 WHERE event_id = $2 AND effect_id = $3",
-                Json(&result),
-                event_id,
-                effect.id
-            )
-            .execute(&self.pool)
-            .await?;
-
-            Ok(result)
-        }
-        Err(e) => {
-            sqlx::query!(
-                "UPDATE seesaw_effect_executions
-                 SET status = 'failed', error = $1, attempts = attempts + 1
-                 WHERE event_id = $2 AND effect_id = $3",
-                e.to_string(),
-                event_id,
-                effect.id
-            )
-            .execute(&self.pool)
-            .await?;
-
-            Err(e)
-        }
-    }
-}
-```
-
-**Deliverable**: End-to-end event processing with durability
 
 ### Phase 3.5: Production Hardening (Critical!)
 
@@ -3640,6 +3526,138 @@ Postgres:
 - **0-100k users**: Single Postgres, 2+20 workers
 - **100k-1M users**: Read replicas, partitioning, 5+50 workers
 - **1M+ users**: Sharding by saga_id, split control/data plane
+
+---
+
+### 6. Known Limitations
+
+#### Priority Inversion
+
+**Events are FIFO, Effects are Prioritized**
+
+The architecture enforces per-saga FIFO ordering for events to maintain causal consistency. Effects can be prioritized via the `priority` column in `seesaw_effect_executions`, but events always process in chronological order.
+
+**Scenario**: 1000 events queued → SystemAlert arrives → SystemAlert waits behind 1000 events
+
+**Why this design**:
+- Per-saga FIFO prevents causality violations (can't process OrderShipped before OrderPlaced)
+- Breaking FIFO requires complex dependency tracking and potential deadlocks
+- Most systems don't need event-level prioritization
+
+**If you hit this limitation**:
+
+Adding priority to events table is a 2-line change:
+
+```sql
+-- Add priority column
+ALTER TABLE seesaw_events ADD COLUMN priority INT NOT NULL DEFAULT 10;
+
+-- Update polling query
+CREATE INDEX idx_events_priority ON seesaw_events(priority DESC, created_at ASC)
+WHERE processed_at IS NULL;
+```
+
+Then modify the event worker polling query:
+```rust
+ORDER BY priority DESC, created_at ASC  -- Higher priority first, then FIFO
+```
+
+**Trade-off**: Priority breaks per-saga FIFO guarantees. Only add if you understand the consequences.
+
+**Recommendation**: Don't add priority until you actually hit the problem (zero users = no problem yet).
+
+---
+
+### 7. Process API Variants
+
+The Engine provides multiple entry points for processing events, each serving different use cases:
+
+#### `process(event)` - Standard Entry Point
+
+```rust
+engine.process(OrderPlaced { id: 123, total: 99.99 }).await?;
+```
+
+**Use when**:
+- Processing external events (webhooks, HTTP handlers, cron jobs)
+- You don't need to wait for a specific response event
+- Standard fire-and-forget semantics
+
+**Behavior**:
+- Generates random UUID v4 for event_id
+- Generates random UUID v4 for saga_id
+- Returns after event is queued (doesn't wait for effects)
+
+---
+
+#### `process_saga(saga_id, event)` - Saga Continuation
+
+```rust
+let saga_id = Uuid::new_v4();
+engine.process_saga(saga_id, OrderPlaced { ... }).await?;
+engine.process_saga(saga_id, PaymentReceived { ... }).await?;
+```
+
+**Use when**:
+- Continuing an existing saga/workflow
+- Multiple events belong to the same logical workflow
+- You need per-saga state isolation
+
+**Behavior**:
+- Uses provided saga_id (caller must generate or track it)
+- Generates random UUID v4 for event_id
+- All events with same saga_id share state and process FIFO
+
+---
+
+#### Idempotency Keys
+
+For idempotent event submission (webhooks, retries), derive deterministic UUIDs:
+
+```rust
+// Webhook with idempotency key
+let event_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, webhook_id.as_bytes());
+engine.process_with_id(event_id, saga_id, OrderPlaced { ... }).await?;
+```
+
+**Use when**:
+- External systems may retry (Stripe webhooks, GitHub webhooks)
+- You need exactly-once semantics
+- Event IDs must be deterministic
+
+**Behavior**:
+- Uses provided event_id (must be deterministic for idempotency)
+- Uses provided saga_id
+- Duplicate event_id fails silently (UNIQUE constraint on seesaw_events.event_id)
+
+---
+
+#### Request/Response Pattern
+
+For synchronous request/response (HTTP handlers that need a result):
+
+```rust
+use seesaw::{dispatch_request, EnvelopeMatch};
+
+let result = dispatch_request(
+    CreateOrder { customer_id: 123 },
+    &engine,
+    |m| m.try_match(|e: &OrderCreated| Some(Ok(e.order_id)))
+         .or_try(|e: &OrderFailed| Some(Err(anyhow!("failed: {}", e.reason))))
+         .result()
+).await?;
+```
+
+**Use when**:
+- HTTP handlers need to return results to clients
+- Waiting for specific terminal events (success or failure)
+- CQRS-style read-after-write
+
+**Behavior**:
+- Processes event with `process()`
+- Subscribes to saga events via LISTEN/NOTIFY
+- Returns when matching terminal event arrives
+- Timeout after configured duration
 
 ---
 
