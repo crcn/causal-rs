@@ -56,7 +56,8 @@ Closure → Event → Reducer → Effect → Event → Effect → ... (until set
 ## Quick Start
 
 ```rust
-use seesaw_core::{effect, reducer, Emit, Engine};
+use seesaw_core::{effect, reducer, Engine};
+use seesaw_memory::MemoryStore;
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -82,18 +83,18 @@ struct Deps {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let store = MemoryStore::new();
     let deps = Deps { /* ... */ };
 
-    // Define stateless engine with closure-based effects
-    let engine = Engine::new()
-        .with_deps(deps)
-        .with_reducer(reducer::on::<OrderEvent>().run(|state, event| {
+    // Define engine with deps and store
+    let engine = Engine::new(deps, store)
+        .with_reducer(reducer::fold::<OrderEvent>().into(|state: State, event| {
             match event {
                 OrderEvent::Placed { total, .. } => State {
                     order_count: state.order_count + 1,
                     total_revenue: state.total_revenue + total,
                 },
-                _ => state.clone(),
+                _ => state,
             }
         }))
         // Effect that reacts to Placed and returns Shipped
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
                 })
                 .then(|order_id, ctx| async move {
                     ctx.deps().shipping_api.ship(order_id).await?;
-                    Ok(Emit::One(OrderEvent::Shipped { order_id }))
+                    Ok(OrderEvent::Shipped { order_id })
                 })
         )
         // Effect that reacts to Shipped and returns Delivered
@@ -117,19 +118,13 @@ async fn main() -> Result<()> {
                 })
                 .then(|order_id, ctx| async move {
                     ctx.deps().email_service.send(order_id, "Shipped!").await?;
-                    Ok(Emit::One(OrderEvent::Delivered { order_id }))
+                    Ok(OrderEvent::Delivered { order_id })
                 })
         );
 
-    // Activate with initial state
-    let handle = engine.activate(State::default());
-
-    // Run logic - return event to dispatch
+    // Process event directly - engine handles everything
     let order_id = Uuid::new_v4();
-    handle.run(|_ctx| Ok(Emit::One(OrderEvent::Placed { order_id, total: 99.99 })))?;
-
-    // Wait for all effects to complete
-    handle.settled().await?;
+    engine.process(OrderEvent::Placed { order_id, total: 99.99 }).await?;
 
     Ok(())
 }
@@ -347,10 +342,13 @@ effect::on::<ImportEvent>()
     });
 ```
 
-**Return types - use explicit Emit:**
-- `Ok(Emit::One(event))` - single event
+**Return types:**
+- `Ok(event)` - auto-converts to `Emit::One(event)` when consistently returning events
+- `Ok(Emit::One(event))` - explicit single event (use when mixing return types)
 - `Ok(Emit::Batch(vec![...]))` - multiple events atomically
-- `Ok(Emit::None)` - no events (observer pattern)
+- `Ok(Emit::None)` - no events (use when some paths emit, others don't)
+
+**Rule**: Auto-conversion works when all paths return the same type. Use explicit `Emit` when mixing return types to avoid compiler ambiguity.
 
 **Join semantics:**
 - Events emitted in same batch (via `Emit::Batch`) share a `batch_id`

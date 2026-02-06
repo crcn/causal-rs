@@ -298,14 +298,19 @@ effect::on::<FileUploaded>().then(|event, ctx| async move {
 - Events have sequential `batch_index` (0, 1, 2, ...)
 - Atomic: rollback discards entire batch
 
-**Return types - use explicit Emit:**
+**Return types:**
 ```rust
+// Auto-conversion works when return type is consistent:
+Ok(event)                     // → Emit::One(event) when always returning events
+Ok(vec![e1, e2])             // → Emit::Batch([e1, e2]) when always returning vecs
+
+// Use explicit Emit when mixing return types in same handler:
 Ok(Emit::One(event))         // Single event
 Ok(Emit::Batch(vec![...]))   // Multiple events atomically
 Ok(Emit::None)               // Observer pattern, no event
 ```
 
-**Note**: While `From` traits exist for ergonomic conversion (`event` → `Emit::One`, `vec![]` → `Emit::Batch`), **always use explicit `Emit` constructors** to avoid type inference ambiguity.
+**Rule**: If all code paths return the same type (`Event`, `Vec<Event>`, or `()`), auto-conversion works. If mixing types (some paths return events, others return nothing), use explicit `Emit` to avoid type inference ambiguity.
 
 #### Joining Batched Events
 
