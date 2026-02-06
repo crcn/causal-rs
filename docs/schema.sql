@@ -1,6 +1,6 @@
 -- Seesaw Queue-Backed Architecture - Production Schema
--- Version: 0.8.0
--- Last Updated: 2026-02-05
+-- Version: 0.9.1
+-- Last Updated: 2026-02-06
 --
 -- This schema is designed for millions of users at 1000+ events/sec
 -- Features: Per-workflow FIFO, idempotency, two-phase execution, table partitioning
@@ -48,6 +48,7 @@ COMMENT ON COLUMN seesaw_events.correlation_id IS 'Envelope metadata - groups re
 
 -- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
 -- Enables engine.process(event).wait::<TerminalEvent>().await
+-- Note: Payload omitted - pg_notify has 8000-byte limit, notification is just a wake-up signal
 CREATE OR REPLACE FUNCTION notify_workflow_event()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -56,8 +57,7 @@ BEGIN
         json_build_object(
             'event_id', NEW.event_id,
             'correlation_id', NEW.correlation_id,
-            'event_type', NEW.event_type,
-            'payload', NEW.payload
+            'event_type', NEW.event_type
         )::text
     );
     RETURN NEW;

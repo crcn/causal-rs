@@ -21,7 +21,7 @@ export function useWebSocket() {
 
   function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const url = `${protocol}//${window.location.host}/api/ws?cursor=0`
+    const url = `${protocol}//${window.location.host}/api/ws`
 
     ws.current = new WebSocket(url)
 
@@ -34,6 +34,10 @@ export function useWebSocket() {
       const data = JSON.parse(event.data)
       if (data.type !== 'connected') {
         setEntries(prev => {
+          // Deduplicate by seq - don't add if we already have this seq
+          if (prev.some(e => e.seq === data.seq)) {
+            return prev
+          }
           const newEntries = [data, ...prev]
           return newEntries.slice(0, 100) // Keep last 100 entries
         })

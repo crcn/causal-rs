@@ -1,6 +1,5 @@
 //! WebSocket support for real-time stream updates
 
-use crate::stream::{StreamEntry, StreamReader};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -8,15 +7,12 @@ use axum::{
     },
     response::Response,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{stream::StreamExt as FuturesStreamExt, SinkExt};
+use seesaw_core::InsightStore;
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::broadcast;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 use uuid::Uuid;
-
-/// Broadcast channel for stream updates
-pub type StreamBroadcast = broadcast::Sender<StreamEntry>;
 
 /// Query params for WebSocket connection
 #[derive(Debug, Deserialize)]
@@ -27,57 +23,54 @@ pub struct WsQuery {
     correlation_id: Option<Uuid>,
 }
 
-/// WebSocket state
+/// WebSocket state using InsightStore
 #[derive(Clone)]
-pub struct WsState {
-    pub reader: Arc<StreamReader>,
-    pub broadcast: StreamBroadcast,
+pub struct WsState<I> {
+    pub insight_store: Arc<I>,
 }
 
 /// Handle WebSocket upgrade
-pub async fn ws_handler(
+pub async fn ws_handler<I>(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
-    State(state): State<WsState>,
-) -> Response {
+    State(state): State<WsState<I>>,
+) -> Response
+where
+    I: InsightStore + Clone + 'static,
+{
     ws.on_upgrade(move |socket| handle_socket(socket, query, state))
 }
 
 /// Handle WebSocket connection
-async fn handle_socket(socket: WebSocket, query: WsQuery, state: WsState) {
+async fn handle_socket<I>(socket: WebSocket, query: WsQuery, state: WsState<I>)
+where
+    I: InsightStore + Clone + 'static,
+{
     let (mut sender, mut receiver) = socket.split();
-    let mut rx = state.broadcast.subscribe();
 
-    info!(
+    debug!(
         "WebSocket connected - cursor: {:?}, correlation: {:?}",
         query.cursor, query.correlation_id
     );
 
-    // Send historical entries if cursor provided
-    if let Some(cursor) = query.cursor {
-        let limit = 100;
-        let result = if let Some(correlation_id) = query.correlation_id {
-            state
-                .reader
-                .fetch_workflow(correlation_id, Some(cursor), limit)
-                .await
-        } else {
-            state.reader.fetch(Some(cursor), limit).await
-        };
-
-        match result {
-            Ok((entries, _)) => {
-                for entry in entries {
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        if sender.send(Message::Text(json)).await.is_err() {
-                            return;
-                        }
+    // Send historical entries (always fetch recent events on connect)
+    let limit = 100;
+    match state
+        .insight_store
+        .get_recent_events(query.cursor, limit)
+        .await
+    {
+        Ok(entries) => {
+            for entry in entries {
+                if let Ok(json) = serde_json::to_string(&entry) {
+                    if sender.send(Message::Text(json)).await.is_err() {
+                        return;
                     }
                 }
             }
-            Err(e) => {
-                error!("Failed to fetch historical entries: {}", e);
-            }
+        }
+        Err(e) => {
+            error!("Failed to fetch historical entries: {}", e);
         }
     }
 
@@ -92,9 +85,18 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, state: WsState) {
         ))
         .await;
 
-    // Spawn task to receive broadcast updates
+    // Subscribe to live events
+    let mut event_stream = match state.insight_store.subscribe_events().await {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to subscribe to events: {}", e);
+            return;
+        }
+    };
+
+    // Spawn task to receive stream updates
     let mut send_task = tokio::spawn(async move {
-        while let Ok(entry) = rx.recv().await {
+        while let Some(entry) = event_stream.next().await {
             // Filter by correlation_id if specified
             if let Some(filter_id) = query.correlation_id {
                 if entry.correlation_id != filter_id {
@@ -143,34 +145,5 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, state: WsState) {
         }
     }
 
-    info!("WebSocket disconnected");
-}
-
-/// Background task to poll stream and broadcast updates
-pub async fn stream_broadcaster(reader: Arc<StreamReader>, tx: StreamBroadcast) {
-    let mut cursor: Option<i64> = None;
-    let limit = 100;
-
-    loop {
-        match reader.fetch(cursor, limit).await {
-            Ok((entries, next_cursor)) => {
-                if entries.is_empty() {
-                    // No new entries, sleep briefly
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                } else {
-                    // Broadcast each entry
-                    for entry in entries {
-                        debug!("Broadcasting entry seq={}", entry.seq);
-                        // Ignore send errors (no receivers)
-                        let _ = tx.send(entry);
-                    }
-                    cursor = next_cursor;
-                }
-            }
-            Err(e) => {
-                error!("Error fetching stream: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
+    debug!("WebSocket disconnected");
 }

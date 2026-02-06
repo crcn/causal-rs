@@ -535,19 +535,42 @@ impl Store for PostgresStore {
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen(&channel).await?;
 
+        let pool = self.pool.clone();
+
         // Convert listener into a stream of WorkflowEvent
-        let stream = listener.into_stream().filter_map(|result| {
+        let stream = listener.into_stream().filter_map(move |result| {
+            let pool = pool.clone();
             Box::pin(async move {
                 match result {
                     Ok(notification) => {
-                        // Parse the JSON payload from the notification
-                        if let Ok(event) =
-                            serde_json::from_str::<seesaw_core::WorkflowEvent>(notification.payload())
-                        {
-                            Some(event)
-                        } else {
-                            None
+                        // Parse notification metadata (no payload due to 8000-byte pg_notify limit)
+                        #[derive(serde::Deserialize)]
+                        struct NotificationMeta {
+                            event_id: Uuid,
+                            correlation_id: Uuid,
+                            event_type: String,
                         }
+
+                        let meta = serde_json::from_str::<NotificationMeta>(notification.payload()).ok()?;
+
+                        // Fetch full event from database
+                        sqlx::query_as::<_, (Uuid, Uuid, String, serde_json::Value)>(
+                            "SELECT event_id, correlation_id, event_type, payload
+                             FROM seesaw_events
+                             WHERE event_id = $1"
+                        )
+                        .bind(meta.event_id)
+                        .fetch_optional(&pool)
+                        .await
+                        .ok()?
+                        .map(|(event_id, correlation_id, event_type, payload)| {
+                            seesaw_core::WorkflowEvent {
+                                event_id,
+                                correlation_id,
+                                event_type,
+                                payload,
+                            }
+                        })
                     }
                     Err(_) => None,
                 }

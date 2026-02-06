@@ -55,7 +55,17 @@ where
         .route("/stream", get(sse_stream::<I>))
         .route("/tree/:correlation_id", get(get_tree::<I>))
         .route("/stats", get(get_stats::<I>))
-        .with_state(state);
+        .with_state(state.clone());
+
+    // WebSocket route with its own state
+    let ws_state = crate::websocket::WsState {
+        insight_store: state.insight_store.clone(),
+    };
+    let ws_route = Router::new()
+        .route("/ws", get(crate::websocket::ws_handler::<I>))
+        .with_state(ws_state);
+
+    let api_routes = api_routes.merge(ws_route);
 
     let mut insight_app = Router::new().nest("/api", api_routes);
 

@@ -46,6 +46,7 @@ pub struct MemoryStore {
 /// Stored event for history/tree reconstruction
 #[derive(Debug, Clone)]
 struct StoredEvent {
+    seq: i64,
     event_id: Uuid,
     parent_id: Option<Uuid>,
     correlation_id: Uuid,
@@ -99,10 +100,14 @@ impl Default for MemoryStore {
 #[async_trait]
 impl Store for MemoryStore {
     async fn publish(&self, event: QueuedEvent) -> Result<()> {
-        // Store in event history
+        // Generate sequence number
+        let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
+
+        // Store in event history with seq
         self.event_history.insert(
             event.event_id,
             StoredEvent {
+                seq,
                 event_id: event.event_id,
                 parent_id: event.parent_id,
                 correlation_id: event.correlation_id,
@@ -113,7 +118,6 @@ impl Store for MemoryStore {
         );
 
         // Publish insight event
-        let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
         self.publish_insight(InsightEvent {
             seq,
             stream_type: StreamType::EventDispatched,
@@ -471,18 +475,23 @@ impl InsightStore for MemoryStore {
 
     async fn get_recent_events(
         &self,
-        _cursor: Option<i64>,
+        cursor: Option<i64>,
         limit: usize,
     ) -> Result<Vec<InsightEvent>> {
-        // For in-memory, we don't have a persistent stream table
-        // Just return recent events from history
+        // Get events from history with proper seq
         let mut events: Vec<_> = self
             .event_history
             .iter()
-            .map(|e| {
+            .filter_map(|e| {
                 let stored = e.value();
-                InsightEvent {
-                    seq: 0, // No persistent seq in memory
+                // Filter by cursor if provided
+                if let Some(cursor_seq) = cursor {
+                    if stored.seq <= cursor_seq {
+                        return None;
+                    }
+                }
+                Some(InsightEvent {
+                    seq: stored.seq,
                     stream_type: StreamType::EventDispatched,
                     correlation_id: stored.correlation_id,
                     event_id: Some(stored.event_id),
@@ -493,11 +502,12 @@ impl InsightStore for MemoryStore {
                     error: None,
                     payload: Some(stored.payload.clone()),
                     created_at: stored.created_at,
-                }
+                })
             })
             .collect();
 
-        events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        // Sort by seq (oldest first for consistent cursor pagination)
+        events.sort_by_key(|e| e.seq);
         events.truncate(limit);
 
         Ok(events)
@@ -543,5 +553,102 @@ impl MemoryStore {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seesaw_core::store::Store;
+
+    #[tokio::test]
+    async fn test_insight_events_have_unique_seq() {
+        let store = MemoryStore::new();
+
+        // Publish 3 events
+        for i in 1..=3 {
+            let event = QueuedEvent {
+                id: i as i64,
+                event_id: Uuid::new_v4(),
+                parent_id: None,
+                correlation_id: Uuid::new_v4(),
+                event_type: format!("Event{}", i),
+                payload: serde_json::json!({"n": i}),
+                created_at: Utc::now(),
+                hops: 0,
+            };
+            store.publish(event).await.unwrap();
+        }
+
+        // Get recent events - should have seq 1, 2, 3
+        let events = store.get_recent_events(None, 10).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(events[2].seq, 3);
+    }
+
+    #[tokio::test]
+    async fn test_cursor_based_filtering() {
+        let store = MemoryStore::new();
+        let correlation_id = Uuid::new_v4();
+
+        // Publish 5 events
+        for i in 1..=5 {
+            let event = QueuedEvent {
+                id: i as i64,
+                event_id: Uuid::new_v4(),
+                parent_id: None,
+                correlation_id,
+                event_type: format!("Event{}", i),
+                payload: serde_json::json!({"n": i}),
+                created_at: Utc::now(),
+                hops: 0,
+            };
+            store.publish(event).await.unwrap();
+        }
+
+        // Get first 2 events (no cursor)
+        let events = store.get_recent_events(None, 2).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[1].seq, 2);
+
+        // Get next events after cursor=2
+        let next_events = store.get_recent_events(Some(2), 2).await.unwrap();
+        assert_eq!(next_events.len(), 2);
+        assert_eq!(next_events[0].seq, 3);
+        assert_eq!(next_events[1].seq, 4);
+
+        // Verify no duplicates between historical and cursor fetch
+        let all_seqs: Vec<i64> = events.iter()
+            .chain(next_events.iter())
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(all_seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_no_events_before_cursor() {
+        let store = MemoryStore::new();
+
+        // Publish 3 events
+        for i in 1..=3 {
+            let event = QueuedEvent {
+                id: i as i64,
+                event_id: Uuid::new_v4(),
+                parent_id: None,
+                correlation_id: Uuid::new_v4(),
+                event_type: format!("Event{}", i),
+                payload: serde_json::json!({"n": i}),
+                created_at: Utc::now(),
+                hops: 0,
+            };
+            store.publish(event).await.unwrap();
+        }
+
+        // Request events after cursor=10 (beyond all events)
+        let events = store.get_recent_events(Some(10), 10).await.unwrap();
+        assert_eq!(events.len(), 0, "Should return no events when cursor is beyond all seq values");
     }
 }
