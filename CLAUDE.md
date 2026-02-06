@@ -2,7 +2,7 @@
 
 **Mental Model**: Events are signals. Effects react and return new events. That's it.
 
-## Quick Start - v0.8.0 API
+## Quick Start - v0.9.0 API
 
 ### Stateless Engine Pattern
 
@@ -48,6 +48,14 @@ handle.process(|_ctx| async { Ok(process_webhook(payload)) }).await?;
 - **`handle.process()` for dispatch**: Async method that dispatches event and waits for effects
 - **`ctx.emit()` removed from public API**: Effects and edge functions return events
 - **Observer pattern**: Return `Ok(())` to dispatch nothing
+
+### What's New in v0.9
+
+- **`Emit<E>` type**: Effects return `Emit::One(e)`, `Emit::Batch(vec![...])`, or `Emit::None`
+- **Event batching**: Emit multiple events atomically with `Ok(Emit::Batch(events))`
+- **Join pattern**: Accumulate batched events with `.join()` for bulk operations
+- **Batch metadata**: Events track `batch_id`, `batch_index`, `batch_size`
+- **Backward compatible**: `Ok(event)` and `Ok(Some(event))` auto-convert to `Emit`
 
 ---
 
@@ -253,6 +261,236 @@ EffectContext provides:
 - `prev_state()` — state before reducer ran
 - `next_state()` — state after reducer ran
 - `curr_state()` — current live state
+
+### Event Batching
+
+**v0.9+** Effects can emit multiple events atomically using `Emit<E>`:
+
+```rust
+pub enum Emit<E> {
+    None,           // Observer pattern, no events dispatched
+    One(E),         // Single event (most common)
+    Batch(Vec<E>),  // Multiple events atomically
+}
+```
+
+#### Emitting Batches
+
+Use `Emit::Batch` when processing collections that need to emit one event per item:
+
+```rust
+// Parse CSV and emit batch of row events
+effect::on::<FileUploaded>().then(|event, ctx| async move {
+    let rows = ctx.deps().parse_csv(&event.path).await?;
+
+    // Emit all row events atomically with same batch_id
+    let events: Vec<_> = rows.into_iter()
+        .map(|row| RowParsed { row })
+        .collect();
+
+    Ok(Emit::Batch(events))  // All events get same batch_id
+})
+```
+
+**Key properties:**
+- All events in batch inserted in single transaction
+- All events share same `batch_id` (auto-generated)
+- Events have sequential `batch_index` (0, 1, 2, ...)
+- Atomic: rollback discards entire batch
+
+**Ergonomic conversions:**
+```rust
+Ok(event)                    // → Emit::One(event)
+Ok(Some(event))              // → Emit::One(event)
+Ok(None)                     // → Emit::None
+Ok(vec![e1, e2, e3])         // → Emit::Batch(vec![e1, e2, e3])
+Ok(vec![])                   // → Emit::None (empty batch)
+```
+
+#### Joining Batched Events
+
+Use `.join()` to accumulate events from the same batch before processing:
+
+```rust
+// Accumulate all RowParsed events from same batch
+effect::on::<RowParsed>()
+    .join()  // Enable batch accumulation
+    .then(|batch: Vec<RowParsed>, ctx| async move {
+        // Handler receives Vec<Event> instead of single Event
+
+        // Bulk insert all rows at once
+        ctx.deps().db.bulk_insert(&batch).await?;
+
+        Ok(Emit::One(BatchInserted { count: batch.len() }))
+    })
+```
+
+**How join works:**
+1. Events with same `batch_id` are accumulated in `seesaw_join_entries` table
+2. Per-event handler is skipped (no-op)
+3. When all events in batch arrive (based on `batch_size`), join handler fires
+4. Join handler receives `Vec<Event>` with all accumulated events
+5. Window marked complete in `seesaw_join_windows` table
+
+**Join properties:**
+- **Durable**: Join state persisted in database, survives restarts
+- **Deterministic**: Window closes when `batch_size` events received
+- **Ordered**: Events in `Vec` maintain `batch_index` order
+- **Always queued**: Join effects execute in background workers
+
+#### Batch Flow Example
+
+Complete flow showing batch emission → join accumulation → bulk operation:
+
+```rust
+// Event types
+enum ImportEvent {
+    FileUploaded { path: String },
+    RowParsed { row: String },
+    RowValidated { row: String },
+    BatchInserted { count: usize },
+}
+
+// Effect 1: Parse file, emit batch
+effect::on::<ImportEvent>()
+    .extract(|e| match e {
+        ImportEvent::FileUploaded { path } => Some(path.clone()),
+        _ => None,
+    })
+    .then(|path, ctx| async move {
+        let rows = ctx.deps().parse_csv(&path).await?;
+        let events = rows.into_iter()
+            .map(|row| ImportEvent::RowParsed { row })
+            .collect();
+        Ok(Emit::Batch(events))  // 1000 events with same batch_id
+    })
+
+// Effect 2: Validate each row (runs 1000 times)
+effect::on::<ImportEvent>()
+    .extract(|e| match e {
+        ImportEvent::RowParsed { row } => Some(row.clone()),
+        _ => None,
+    })
+    .then(|row, ctx| async move {
+        ctx.deps().validate_row(&row).await?;
+        Ok(Emit::One(ImportEvent::RowValidated { row }))
+    })
+
+// Effect 3: Join validated rows, bulk insert (runs once per batch)
+effect::on::<ImportEvent>()
+    .extract(|e| match e {
+        ImportEvent::RowValidated { row } => Some(row.clone()),
+        _ => None,
+    })
+    .join()
+    .then(|batch, ctx| async move {
+        // batch contains all 1000 validated rows
+        ctx.deps().db.bulk_insert(&batch).await?;
+        Ok(Emit::One(ImportEvent::BatchInserted { count: batch.len() }))
+    })
+```
+
+**Execution trace:**
+```
+1. FileUploaded dispatched
+2. Parse effect runs → Emit::Batch([Row1, Row2, ..., Row1000])
+3. All 1000 RowParsed events inserted (same batch_id, sequential batch_index)
+4. Validate effect runs 1000 times (once per RowParsed)
+5. Each validation emits RowValidated (new batch_id per event)
+6. Join effect accumulates all RowValidated in seesaw_join_entries
+7. When all events arrived, join handler fires with Vec[Row1...Row1000]
+8. Bulk insert runs once
+```
+
+#### Error Handling in Batches
+
+**Pattern 1: Per-item error events** (recommended)
+```rust
+effect::on::<RowParsed>().then(|event, ctx| async move {
+    match ctx.deps().validate_row(&event.row).await {
+        Ok(_) => Ok(Emit::One(RowValidated { row: event.row })),
+        Err(e) => Ok(Emit::One(RowRejected { row: event.row, reason: e.to_string() })),
+    }
+})
+```
+
+**Pattern 2: Collect successes and failures**
+```rust
+effect::on::<RowParsed>()
+    .join()
+    .then(|batch, ctx| async move {
+        let mut results = Vec::new();
+        for row in batch {
+            match ctx.deps().process(&row).await {
+                Ok(_) => results.push(RowSucceeded { row }),
+                Err(e) => results.push(RowFailed { row, error: e.to_string() }),
+            }
+        }
+        Ok(Emit::Batch(results))  // Emit both successes and failures
+    })
+```
+
+**Pattern 3: Retry entire batch** (for idempotent operations)
+```rust
+effect::on::<RowValidated>()
+    .join()
+    .retry(3)  // Retry whole batch on failure
+    .then(|batch, ctx| async move {
+        // Must be idempotent - may run multiple times
+        ctx.deps().bulk_insert(&batch).await?;
+        Ok(Emit::One(BatchInserted { count: batch.len() }))
+    })
+```
+
+#### When to Use Batching
+
+**Use `Emit::Batch` when:**
+- ✅ Processing collections with hundreds/thousands of items
+- ✅ Need atomic emission of related events
+- ✅ Avoiding N separate effect executions
+- ✅ Fan-out: dispatch notification to many users
+
+**Use `.join()` when:**
+- ✅ Bulk database operations (inserts, updates)
+- ✅ Rate limiting: accumulate, send in bursts
+- ✅ Aggregation: combine multiple events into summary
+- ✅ Performance: reduce transaction overhead
+
+**Don't use batching when:**
+- ❌ <10 events (overhead not worth it)
+- ❌ Events are unrelated (prefer sequential)
+- ❌ Need per-event traceability immediately
+- ❌ Partial results should emit incrementally
+
+#### Batch Limitations
+
+**pg_notify 8KB limit:**
+- Notifications send metadata only (event_id, type), not payload
+- Listeners fetch full events from database
+- No size limit on event payloads themselves
+
+**Max batch size:**
+- Recommend batches <10,000 events
+- For larger datasets, use pagination:
+  ```rust
+  for chunk in rows.chunks(1000) {
+      Ok(Emit::Batch(chunk.to_vec()))  // Emit 1000-item batches
+  }
+  ```
+
+**Join completion:**
+- Window closes when all `batch_size` events received
+- If some events fail to emit, window stays open indefinitely
+- Ensure batch emission is atomic (all-or-nothing)
+
+#### Complete Example
+
+See `examples/batch-processor/` for full working example demonstrating:
+- CSV parsing with `Emit::Batch`
+- Per-row validation
+- Batch accumulation with `.join()`
+- Bulk database insert
+- Error handling patterns
 
 ### Reducer
 

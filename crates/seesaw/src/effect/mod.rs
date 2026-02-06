@@ -62,7 +62,7 @@ mod types;
 pub use builders::{bridge, group, on, on_any, task};
 pub use context::EffectContext;
 pub use error_event::EffectError;
-pub use types::{AnyEvent, Effect, ErrorHandler, EventOutput};
+pub use types::{AnyEvent, Effect, Emit, ErrorHandler, EventOutput, JoinMode};
 
 // Re-export for internal use
-pub(crate) use context::{BoxedEmitter, EventEmitter, EventEnvelope};
+pub(crate) use context::EventEmitter;

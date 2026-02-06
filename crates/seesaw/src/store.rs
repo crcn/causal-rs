@@ -27,6 +27,12 @@ pub struct QueuedEvent {
     pub payload: serde_json::Value,
     /// Hop count (for infinite loop detection)
     pub hops: i32,
+    /// Batch identifier for same-batch fan-in semantics.
+    pub batch_id: Option<Uuid>,
+    /// Position inside a batch (0-based).
+    pub batch_index: Option<i32>,
+    /// Total number of items in the batch.
+    pub batch_size: Option<i32>,
     /// When event was created
     pub created_at: DateTime<Utc>,
 }
@@ -38,6 +44,24 @@ pub struct EmittedEvent {
     pub event_type: String,
     /// Event payload (JSON)
     pub payload: serde_json::Value,
+    /// Batch identifier for same-batch fan-in semantics.
+    pub batch_id: Option<Uuid>,
+    /// Position inside a batch (0-based).
+    pub batch_index: Option<i32>,
+    /// Total number of items in the batch.
+    pub batch_size: Option<i32>,
+}
+
+/// Persisted join entry used for durable same-batch fan-in.
+#[derive(Debug, Clone)]
+pub struct JoinEntry {
+    pub source_event_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub batch_id: Uuid,
+    pub batch_index: i32,
+    pub batch_size: i32,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Store trait - combines queue and state operations
@@ -122,6 +146,9 @@ pub trait Store: Send + Sync + 'static {
         event_type: String,
         event_payload: serde_json::Value,
         parent_event_id: Option<Uuid>,
+        batch_id: Option<Uuid>,
+        batch_index: Option<i32>,
+        batch_size: Option<i32>,
         execute_at: DateTime<Utc>,
         timeout_seconds: i32,
         max_attempts: i32,
@@ -196,6 +223,65 @@ pub trait Store: Send + Sync + 'static {
     /// A workflow is "settled" when no effects are pending/executing, but can start
     /// up again if new events arrive. Use terminal events for true completion.
     async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<WorkflowStatus>;
+
+    // =========================================================================
+    // Join Operations (durable same-batch fan-in)
+    // =========================================================================
+
+    /// Append a terminal item into a same-batch join window and attempt to claim
+    /// the window for processing when complete.
+    ///
+    /// Returns `Ok(Some(entries))` for exactly one caller when the batch is ready.
+    /// Returns `Ok(None)` when still waiting for more terminal items.
+    async fn join_same_batch_append_and_maybe_claim(
+        &self,
+        join_effect_id: String,
+        correlation_id: Uuid,
+        source_event_id: Uuid,
+        source_event_type: String,
+        source_payload: serde_json::Value,
+        source_created_at: DateTime<Utc>,
+        batch_id: Uuid,
+        batch_index: i32,
+        batch_size: i32,
+    ) -> Result<Option<Vec<JoinEntry>>> {
+        let _ = (
+            join_effect_id,
+            correlation_id,
+            source_event_id,
+            source_event_type,
+            source_payload,
+            source_created_at,
+            batch_id,
+            batch_index,
+            batch_size,
+        );
+        anyhow::bail!("join_same_batch is not implemented for this store")
+    }
+
+    /// Mark a claimed same-batch window as completed and clear durable join rows.
+    async fn join_same_batch_complete(
+        &self,
+        join_effect_id: String,
+        correlation_id: Uuid,
+        batch_id: Uuid,
+    ) -> Result<()> {
+        let _ = (join_effect_id, correlation_id, batch_id);
+        anyhow::bail!("join_same_batch is not implemented for this store")
+    }
+
+    /// Release a claimed same-batch window back to `open` state after a handler
+    /// error so retries can claim it again.
+    async fn join_same_batch_release(
+        &self,
+        join_effect_id: String,
+        correlation_id: Uuid,
+        batch_id: Uuid,
+        _error: String,
+    ) -> Result<()> {
+        let _ = (join_effect_id, correlation_id, batch_id);
+        anyhow::bail!("join_same_batch is not implemented for this store")
+    }
 }
 
 /// Workflow status for a correlation ID
@@ -222,6 +308,9 @@ pub struct QueuedEffectExecution {
     pub event_type: String,
     pub event_payload: serde_json::Value,
     pub parent_event_id: Option<Uuid>,
+    pub batch_id: Option<Uuid>,
+    pub batch_index: Option<i32>,
+    pub batch_size: Option<i32>,
     pub execute_at: DateTime<Utc>,
     pub timeout_seconds: i32,
     pub max_attempts: i32,

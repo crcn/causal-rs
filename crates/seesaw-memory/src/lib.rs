@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use seesaw_core::insight::*;
 use seesaw_core::store::*;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::broadcast;
 
 use std::sync::Arc;
@@ -41,6 +41,10 @@ pub struct MemoryStore {
     event_history: Arc<DashMap<Uuid, StoredEvent>>,
     /// Effect history
     effect_history: Arc<DashMap<(Uuid, String), StoredEffect>>,
+    /// Dead letter history
+    dead_letter_history: Arc<DashMap<(Uuid, String), StoredDeadLetter>>,
+    /// Durable-ish join windows for same-batch fan-in (in-memory only).
+    join_windows: Arc<Mutex<HashMap<(String, Uuid, Uuid), MemoryJoinWindow>>>,
 }
 
 /// Stored event for history/tree reconstruction
@@ -52,6 +56,10 @@ struct StoredEvent {
     correlation_id: Uuid,
     event_type: String,
     payload: serde_json::Value,
+    hops: i32,
+    batch_id: Option<Uuid>,
+    batch_index: Option<i32>,
+    batch_size: Option<i32>,
     created_at: DateTime<Utc>,
 }
 
@@ -61,11 +69,50 @@ struct StoredEffect {
     effect_id: String,
     event_id: Uuid,
     correlation_id: Uuid,
+    event_type: String,
+    event_payload: serde_json::Value,
+    batch_id: Option<Uuid>,
+    batch_index: Option<i32>,
+    batch_size: Option<i32>,
     status: String,
     result: Option<serde_json::Value>,
     error: Option<String>,
     attempts: i32,
     created_at: DateTime<Utc>,
+    execute_at: DateTime<Utc>,
+    claimed_at: Option<DateTime<Utc>>,
+    last_attempted_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryJoinStatus {
+    Open,
+    Processing,
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryJoinWindow {
+    target_count: i32,
+    status: MemoryJoinStatus,
+    source_event_ids: HashSet<Uuid>,
+    entries_by_index: HashMap<i32, JoinEntry>,
+}
+
+/// Stored dead letter entry for insight diagnostics.
+#[derive(Debug, Clone)]
+struct StoredDeadLetter {
+    event_id: Uuid,
+    effect_id: String,
+    correlation_id: Uuid,
+    event_type: String,
+    event_payload: serde_json::Value,
+    error: String,
+    reason: String,
+    attempts: i32,
+    failed_at: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
 }
 
 impl MemoryStore {
@@ -81,6 +128,8 @@ impl MemoryStore {
             insight_seq: Arc::new(AtomicI64::new(1)),
             event_history: Arc::new(DashMap::new()),
             effect_history: Arc::new(DashMap::new()),
+            dead_letter_history: Arc::new(DashMap::new()),
+            join_windows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -100,6 +149,10 @@ impl Default for MemoryStore {
 #[async_trait]
 impl Store for MemoryStore {
     async fn publish(&self, event: QueuedEvent) -> Result<()> {
+        if self.event_history.contains_key(&event.event_id) {
+            return Ok(());
+        }
+
         // Generate sequence number
         let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
 
@@ -113,6 +166,10 @@ impl Store for MemoryStore {
                 correlation_id: event.correlation_id,
                 event_type: event.event_type.clone(),
                 payload: event.payload.clone(),
+                hops: event.hops,
+                batch_id: event.batch_id,
+                batch_index: event.batch_index,
+                batch_size: event.batch_size,
                 created_at: event.created_at,
             },
         );
@@ -205,6 +262,9 @@ impl Store for MemoryStore {
         event_type: String,
         event_payload: serde_json::Value,
         parent_event_id: Option<Uuid>,
+        batch_id: Option<Uuid>,
+        batch_index: Option<i32>,
+        batch_size: Option<i32>,
         execute_at: DateTime<Utc>,
         timeout_seconds: i32,
         max_attempts: i32,
@@ -217,6 +277,9 @@ impl Store for MemoryStore {
             event_type,
             event_payload,
             parent_event_id,
+            batch_id,
+            batch_index,
+            batch_size,
             execute_at,
             timeout_seconds,
             max_attempts,
@@ -232,11 +295,20 @@ impl Store for MemoryStore {
                 effect_id: effect_id.clone(),
                 event_id,
                 correlation_id,
+                event_type: execution.event_type.clone(),
+                event_payload: execution.event_payload.clone(),
+                batch_id: execution.batch_id,
+                batch_index: execution.batch_index,
+                batch_size: execution.batch_size,
                 status: "pending".to_string(),
                 result: None,
                 error: None,
                 attempts: 0,
                 created_at: now,
+                execute_at,
+                claimed_at: None,
+                last_attempted_at: None,
+                completed_at: None,
             },
         );
 
@@ -263,11 +335,24 @@ impl Store for MemoryStore {
 
     async fn poll_next_effect(&self) -> Result<Option<QueuedEffectExecution>> {
         let mut queue = self.effects.lock();
-        
+
         // Find first effect that's ready to execute
         let now = Utc::now();
         if let Some(pos) = queue.iter().position(|e| e.execute_at <= now) {
-            Ok(queue.remove(pos))
+            if let Some(next) = queue.remove(pos) {
+                if let Some(mut effect) = self
+                    .effect_history
+                    .get_mut(&(next.event_id, next.effect_id.clone()))
+                {
+                    effect.status = "executing".to_string();
+                    effect.claimed_at = Some(now);
+                    effect.last_attempted_at = Some(now);
+                    effect.attempts = next.attempts + 1;
+                }
+                Ok(Some(next))
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
@@ -285,6 +370,9 @@ impl Store for MemoryStore {
         if let Some(mut entry) = self.effect_history.get_mut(&(event_id, effect_id.clone())) {
             entry.status = "completed".to_string();
             entry.result = Some(result.clone());
+            let completed_at = Utc::now();
+            entry.completed_at = Some(completed_at);
+            entry.last_attempted_at = Some(completed_at);
 
             // Publish insight event
             let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
@@ -299,7 +387,7 @@ impl Store for MemoryStore {
                 status: Some("completed".to_string()),
                 error: None,
                 payload: Some(result),
-                created_at: Utc::now(),
+                created_at: completed_at,
             });
         }
 
@@ -316,18 +404,40 @@ impl Store for MemoryStore {
         // Mark effect complete
         self.complete_effect(event_id, effect_id.clone(), result).await?;
 
+        let correlation_id = self
+            .effect_history
+            .get(&(event_id, effect_id.clone()))
+            .map(|entry| entry.correlation_id)
+            .or_else(|| self.event_history.get(&event_id).map(|entry| entry.correlation_id))
+            .unwrap_or(event_id);
+        let parent_hops = self
+            .event_history
+            .get(&event_id)
+            .map(|entry| entry.hops)
+            .unwrap_or(0);
+
         // Publish emitted events
-        for emitted in emitted_events {
-            let new_event_id = Uuid::new_v5(&NAMESPACE_SEESAW, format!("{}-{}-{}", event_id, effect_id, emitted.event_type).as_bytes());
+        for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
+            let new_event_id = Uuid::new_v5(
+                &NAMESPACE_SEESAW,
+                format!(
+                    "{}-{}-{}-{}",
+                    event_id, effect_id, emitted.event_type, emitted_index
+                )
+                .as_bytes(),
+            );
 
             let queued = QueuedEvent {
                 id: self.event_seq.fetch_add(1, Ordering::SeqCst),
                 event_id: new_event_id,
                 parent_id: Some(event_id),
-                correlation_id: event_id, // Simplified: use event_id as correlation for now
+                correlation_id,
                 event_type: emitted.event_type,
                 payload: emitted.payload,
-                hops: 0,
+                hops: parent_hops + 1,
+                batch_id: emitted.batch_id,
+                batch_index: emitted.batch_index,
+                batch_size: emitted.batch_size,
                 created_at: Utc::now(),
             };
 
@@ -346,9 +456,11 @@ impl Store for MemoryStore {
     ) -> Result<()> {
         // Update effect history
         if let Some(mut entry) = self.effect_history.get_mut(&(event_id, effect_id.clone())) {
+            let failed_at = Utc::now();
             entry.status = "failed".to_string();
             entry.error = Some(error.clone());
             entry.attempts += 1;
+            entry.last_attempted_at = Some(failed_at);
 
             // Publish insight event
             let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
@@ -363,7 +475,7 @@ impl Store for MemoryStore {
                 status: Some("failed".to_string()),
                 error: Some(error.clone()),
                 payload: None,
-                created_at: Utc::now(),
+                created_at: failed_at,
             });
         }
 
@@ -376,10 +488,188 @@ impl Store for MemoryStore {
         event_id: Uuid,
         effect_id: String,
         error: String,
-        _error_type: String,
+        error_type: String,
         attempts: i32,
     ) -> Result<()> {
+        let effect_snapshot = self
+            .effect_history
+            .get(&(event_id, effect_id.clone()))
+            .map(|entry| {
+                (
+                    entry.correlation_id,
+                    entry.event_type.clone(),
+                    entry.event_payload.clone(),
+                    entry.batch_id,
+                    entry.batch_index,
+                    entry.batch_size,
+                )
+            });
+        let event_snapshot = self.event_history.get(&event_id).map(|event| {
+            (
+                event.correlation_id,
+                event.event_type.clone(),
+                event.payload.clone(),
+                event.batch_id,
+                event.batch_index,
+                event.batch_size,
+                event.hops,
+            )
+        });
+
+        let (correlation_id, event_type, event_payload, batch_id, batch_index, batch_size) =
+            if let Some(snapshot) = effect_snapshot.clone() {
+                (
+                    snapshot.0, snapshot.1, snapshot.2, snapshot.3, snapshot.4, snapshot.5,
+                )
+            } else if let Some(snapshot) = event_snapshot.clone() {
+                (
+                    snapshot.0, snapshot.1, snapshot.2, snapshot.3, snapshot.4, snapshot.5,
+                )
+            } else {
+                (
+                    event_id,
+                    "unknown".to_string(),
+                    serde_json::Value::Null,
+                    None,
+                    None,
+                    None,
+                )
+            };
+
+        if let Some(mut effect) = self.effect_history.get_mut(&(event_id, effect_id.clone())) {
+            effect.status = "failed".to_string();
+            effect.error = Some(error.clone());
+            effect.attempts = attempts;
+            effect.last_attempted_at = Some(Utc::now());
+        }
+
+        self.dead_letter_history.insert(
+            (event_id, effect_id.clone()),
+            StoredDeadLetter {
+                event_id,
+                effect_id: effect_id.clone(),
+                correlation_id,
+                event_type: event_type.clone(),
+                event_payload: event_payload.clone(),
+                error: error.clone(),
+                reason: error_type,
+                attempts,
+                failed_at: Utc::now(),
+                resolved_at: None,
+            },
+        );
+
+        if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
+            (batch_id, batch_index, batch_size)
+        {
+            let parent_hops = event_snapshot.map(|snapshot| snapshot.6).unwrap_or(0);
+            let synthetic_event_id = Uuid::new_v5(
+                &NAMESPACE_SEESAW,
+                format!("{}-{}-dlq-terminal", event_id, effect_id).as_bytes(),
+            );
+            self.publish(QueuedEvent {
+                id: self.event_seq.fetch_add(1, Ordering::SeqCst),
+                event_id: synthetic_event_id,
+                parent_id: Some(event_id),
+                correlation_id,
+                event_type: event_type.clone(),
+                payload: event_payload.clone(),
+                hops: parent_hops + 1,
+                batch_id: Some(batch_id),
+                batch_index: Some(batch_index),
+                batch_size: Some(batch_size),
+                created_at: Utc::now(),
+            })
+            .await?;
+        }
+
         eprintln!("Effect sent to DLQ: {}:{} - {} (attempts: {})", event_id, effect_id, error, attempts);
+        Ok(())
+    }
+
+    async fn join_same_batch_append_and_maybe_claim(
+        &self,
+        join_effect_id: String,
+        correlation_id: Uuid,
+        source_event_id: Uuid,
+        source_event_type: String,
+        source_payload: serde_json::Value,
+        source_created_at: DateTime<Utc>,
+        batch_id: Uuid,
+        batch_index: i32,
+        batch_size: i32,
+    ) -> Result<Option<Vec<JoinEntry>>> {
+        let key = (join_effect_id.clone(), correlation_id, batch_id);
+        let mut windows = self.join_windows.lock();
+        let window = windows.entry(key).or_insert_with(|| MemoryJoinWindow {
+            target_count: batch_size,
+            status: MemoryJoinStatus::Open,
+            source_event_ids: HashSet::new(),
+            entries_by_index: HashMap::new(),
+        });
+
+        if window.status == MemoryJoinStatus::Completed {
+            return Ok(None);
+        }
+
+        if window.target_count != batch_size {
+            window.target_count = batch_size;
+        }
+
+        let already_seen_source = !window.source_event_ids.insert(source_event_id);
+        if !already_seen_source {
+            window
+                .entries_by_index
+                .entry(batch_index)
+                .or_insert_with(|| JoinEntry {
+                    source_event_id,
+                    event_type: source_event_type,
+                    payload: source_payload,
+                    batch_id,
+                    batch_index,
+                    batch_size,
+                    created_at: source_created_at,
+                });
+        }
+
+        let ready = window.entries_by_index.len() as i32 >= window.target_count;
+        if ready && window.status == MemoryJoinStatus::Open {
+            window.status = MemoryJoinStatus::Processing;
+            let mut ordered = window.entries_by_index.values().cloned().collect::<Vec<_>>();
+            ordered.sort_by_key(|entry| entry.batch_index);
+            return Ok(Some(ordered));
+        }
+
+        Ok(None)
+    }
+
+    async fn join_same_batch_complete(
+        &self,
+        join_effect_id: String,
+        correlation_id: Uuid,
+        batch_id: Uuid,
+    ) -> Result<()> {
+        let key = (join_effect_id, correlation_id, batch_id);
+        if let Some(window) = self.join_windows.lock().get_mut(&key) {
+            window.status = MemoryJoinStatus::Completed;
+        }
+        self.join_windows.lock().remove(&key);
+        Ok(())
+    }
+
+    async fn join_same_batch_release(
+        &self,
+        join_effect_id: String,
+        correlation_id: Uuid,
+        batch_id: Uuid,
+        _error: String,
+    ) -> Result<()> {
+        let key = (join_effect_id, correlation_id, batch_id);
+        if let Some(window) = self.join_windows.lock().get_mut(&key) {
+            if window.status == MemoryJoinStatus::Processing {
+                window.status = MemoryJoinStatus::Open;
+            }
+        }
         Ok(())
     }
 
@@ -430,8 +720,10 @@ impl InsightStore for MemoryStore {
 
         events.sort_by_key(|e| e.created_at);
 
-        // Build tree (find root events and recursively build children)
-        let roots = self.build_event_nodes(&events, None);
+        // Build tree. Treat events with missing parents as roots so partially
+        // captured workflows still render.
+        let event_ids: HashSet<Uuid> = events.iter().map(|e| e.event_id).collect();
+        let roots = self.build_event_nodes(&events, None, &event_ids, true);
 
         // Get state
         let state = self.states.get(&correlation_id).map(|entry| entry.value().0.clone());
@@ -512,14 +804,192 @@ impl InsightStore for MemoryStore {
 
         Ok(events)
     }
+
+    async fn get_effect_logs(
+        &self,
+        correlation_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<EffectExecutionLog>> {
+        let mut logs: Vec<_> = self
+            .effect_history
+            .iter()
+            .filter_map(|entry| {
+                let effect = entry.value();
+                if let Some(filter) = correlation_id {
+                    if effect.correlation_id != filter {
+                        return None;
+                    }
+                }
+
+                let started_at = effect.claimed_at.or(effect.last_attempted_at);
+                let duration_ms = match (started_at, effect.completed_at) {
+                    (Some(start), Some(end)) => Some((end - start).num_milliseconds().max(0)),
+                    _ => None,
+                };
+
+                Some(EffectExecutionLog {
+                    correlation_id: effect.correlation_id,
+                    event_id: effect.event_id,
+                    effect_id: effect.effect_id.clone(),
+                    status: effect.status.clone(),
+                    attempts: effect.attempts,
+                    event_type: Some(effect.event_type.clone()),
+                    result: effect.result.clone(),
+                    error: effect.error.clone(),
+                    created_at: effect.created_at,
+                    execute_at: Some(effect.execute_at),
+                    claimed_at: effect.claimed_at,
+                    last_attempted_at: effect.last_attempted_at,
+                    completed_at: effect.completed_at,
+                    duration_ms,
+                })
+            })
+            .collect();
+
+        logs.sort_by(|a, b| {
+            let a_time = a
+                .last_attempted_at
+                .or(a.completed_at)
+                .or(a.claimed_at)
+                .unwrap_or(a.created_at);
+            let b_time = b
+                .last_attempted_at
+                .or(b.completed_at)
+                .or(b.claimed_at)
+                .unwrap_or(b.created_at);
+            b_time.cmp(&a_time)
+        });
+        logs.truncate(limit);
+        Ok(logs)
+    }
+
+    async fn get_dead_letters(
+        &self,
+        unresolved_only: bool,
+        limit: usize,
+    ) -> Result<Vec<DeadLetterEntry>> {
+        let mut rows: Vec<_> = self
+            .dead_letter_history
+            .iter()
+            .filter_map(|entry| {
+                let dead = entry.value();
+                if unresolved_only && dead.resolved_at.is_some() {
+                    return None;
+                }
+
+                Some(DeadLetterEntry {
+                    correlation_id: dead.correlation_id,
+                    event_id: dead.event_id,
+                    effect_id: dead.effect_id.clone(),
+                    event_type: dead.event_type.clone(),
+                    event_payload: dead.event_payload.clone(),
+                    error: dead.error.clone(),
+                    reason: dead.reason.clone(),
+                    attempts: dead.attempts,
+                    failed_at: dead.failed_at,
+                    resolved_at: dead.resolved_at,
+                })
+            })
+            .collect();
+
+        rows.sort_by(|a, b| b.failed_at.cmp(&a.failed_at));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn get_failed_workflows(&self, limit: usize) -> Result<Vec<FailedWorkflow>> {
+        let mut workflows: HashMap<Uuid, FailedWorkflow> = HashMap::new();
+
+        for entry in self.effect_history.iter() {
+            let effect = entry.value();
+            let workflow = workflows
+                .entry(effect.correlation_id)
+                .or_insert(FailedWorkflow {
+                    correlation_id: effect.correlation_id,
+                    failed_effects: 0,
+                    active_effects: 0,
+                    dead_letters: 0,
+                    last_failed_at: None,
+                    last_error: None,
+                });
+
+            match effect.status.as_str() {
+                "failed" => {
+                    workflow.failed_effects += 1;
+                    let at = effect.last_attempted_at.unwrap_or(effect.created_at);
+                    if workflow.last_failed_at.map(|current| at > current).unwrap_or(true) {
+                        workflow.last_failed_at = Some(at);
+                        workflow.last_error = effect.error.clone();
+                    }
+                }
+                "pending" | "executing" => {
+                    workflow.active_effects += 1;
+                }
+                _ => {}
+            }
+        }
+
+        for entry in self.dead_letter_history.iter() {
+            let dead = entry.value();
+            if dead.resolved_at.is_some() {
+                continue;
+            }
+
+            let workflow = workflows
+                .entry(dead.correlation_id)
+                .or_insert(FailedWorkflow {
+                    correlation_id: dead.correlation_id,
+                    failed_effects: 0,
+                    active_effects: 0,
+                    dead_letters: 0,
+                    last_failed_at: None,
+                    last_error: None,
+                });
+
+            workflow.dead_letters += 1;
+            if workflow
+                .last_failed_at
+                .map(|current| dead.failed_at > current)
+                .unwrap_or(true)
+            {
+                workflow.last_failed_at = Some(dead.failed_at);
+                workflow.last_error = Some(dead.error.clone());
+            }
+        }
+
+        let mut rows: Vec<_> = workflows
+            .into_values()
+            .filter(|workflow| workflow.failed_effects > 0 || workflow.dead_letters > 0)
+            .collect();
+
+        rows.sort_by(|a, b| b.last_failed_at.cmp(&a.last_failed_at));
+        rows.truncate(limit);
+        Ok(rows)
+    }
 }
 
 impl MemoryStore {
     /// Build event nodes recursively
-    fn build_event_nodes(&self, events: &[StoredEvent], parent_id: Option<Uuid>) -> Vec<EventNode> {
+    fn build_event_nodes(
+        &self,
+        events: &[StoredEvent],
+        parent_id: Option<Uuid>,
+        event_ids: &HashSet<Uuid>,
+        is_root_pass: bool,
+    ) -> Vec<EventNode> {
         events
             .iter()
-            .filter(|e| e.parent_id == parent_id)
+            .filter(|event| {
+                if is_root_pass {
+                    event.parent_id.is_none()
+                        || event
+                            .parent_id
+                            .map(|parent| !event_ids.contains(&parent))
+                            .unwrap_or(false)
+                } else {
+                    event.parent_id == parent_id
+                }
+            })
             .map(|event| {
                 // Get effects for this event
                 let effects = self
@@ -541,7 +1011,8 @@ impl MemoryStore {
                     .collect();
 
                 // Recursively build children
-                let children = self.build_event_nodes(events, Some(event.event_id));
+                let children =
+                    self.build_event_nodes(events, Some(event.event_id), event_ids, false);
 
                 EventNode {
                     event_id: event.event_id,
@@ -576,6 +1047,9 @@ mod tests {
                 payload: serde_json::json!({"n": i}),
                 created_at: Utc::now(),
                 hops: 0,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
             };
             store.publish(event).await.unwrap();
         }
@@ -604,6 +1078,9 @@ mod tests {
                 payload: serde_json::json!({"n": i}),
                 created_at: Utc::now(),
                 hops: 0,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
             };
             store.publish(event).await.unwrap();
         }
@@ -643,6 +1120,9 @@ mod tests {
                 payload: serde_json::json!({"n": i}),
                 created_at: Utc::now(),
                 hops: 0,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
             };
             store.publish(event).await.unwrap();
         }
@@ -650,5 +1130,122 @@ mod tests {
         // Request events after cursor=10 (beyond all events)
         let events = store.get_recent_events(Some(10), 10).await.unwrap();
         assert_eq!(events.len(), 0, "Should return no events when cursor is beyond all seq values");
+    }
+
+    #[tokio::test]
+    async fn test_workflow_tree_treats_orphan_parent_as_root() {
+        let store = MemoryStore::new();
+        let correlation_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        let missing_parent = Uuid::new_v4();
+
+        store
+            .publish(QueuedEvent {
+                id: 1,
+                event_id,
+                parent_id: Some(missing_parent),
+                correlation_id,
+                event_type: "OrphanEvent".to_string(),
+                payload: serde_json::json!({"ok": true}),
+                created_at: Utc::now(),
+                hops: 1,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+            })
+            .await
+            .unwrap();
+
+        let tree = store.get_workflow_tree(correlation_id).await.unwrap();
+        assert_eq!(tree.event_count, 1);
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].event_id, event_id);
+    }
+
+    #[tokio::test]
+    async fn test_dlq_with_batch_metadata_publishes_synthetic_terminal_event() {
+        let store = MemoryStore::new();
+        let event_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+
+        store
+            .insert_effect_intent(
+                event_id,
+                "join_effect".to_string(),
+                correlation_id,
+                "BatchItemResult".to_string(),
+                serde_json::json!({ "index": 2, "ok": false }),
+                None,
+                Some(batch_id),
+                Some(2),
+                Some(5),
+                Utc::now(),
+                30,
+                1,
+                10,
+            )
+            .await
+            .expect("insert should succeed");
+
+        store
+            .dlq_effect(
+                event_id,
+                "join_effect".to_string(),
+                "forced failure".to_string(),
+                "failed".to_string(),
+                1,
+            )
+            .await
+            .expect("dlq should succeed");
+
+        let synthetic = store.poll_next().await.expect("poll should succeed");
+        assert!(synthetic.is_some(), "synthetic terminal event should be published");
+        let synthetic = synthetic.unwrap();
+        assert_eq!(synthetic.correlation_id, correlation_id);
+        assert_eq!(synthetic.event_type, "BatchItemResult");
+        assert_eq!(synthetic.batch_id, Some(batch_id));
+        assert_eq!(synthetic.batch_index, Some(2));
+        assert_eq!(synthetic.batch_size, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_dlq_without_batch_metadata_does_not_publish_synthetic_terminal_event() {
+        let store = MemoryStore::new();
+        let event_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
+
+        store
+            .insert_effect_intent(
+                event_id,
+                "normal_effect".to_string(),
+                correlation_id,
+                "NormalEvent".to_string(),
+                serde_json::json!({ "ok": true }),
+                None,
+                None,
+                None,
+                None,
+                Utc::now(),
+                30,
+                1,
+                10,
+            )
+            .await
+            .expect("insert should succeed");
+
+        store
+            .dlq_effect(
+                event_id,
+                "normal_effect".to_string(),
+                "forced failure".to_string(),
+                "failed".to_string(),
+                1,
+            )
+            .await
+            .expect("dlq should succeed");
+
+        let next = store.poll_next().await.expect("poll should succeed");
+        assert!(next.is_none(), "no synthetic terminal event expected");
     }
 }

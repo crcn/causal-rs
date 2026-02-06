@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{Html, Json},
     routing::{get, post},
@@ -20,6 +20,23 @@ use std::{sync::Arc, time::Duration};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DemoMode {
+    Normal,
+    Slow,
+    FailPayment,
+    FailInventory,
+    FailShipping,
+    FailEmail,
+}
+
+impl Default for DemoMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 // Domain events
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum OrderEvent {
@@ -27,31 +44,41 @@ enum OrderEvent {
         order_id: Uuid,
         customer_id: Uuid,
         total: f64,
+        mode: DemoMode,
     },
     OrderValidated {
         order_id: Uuid,
+        total: f64,
+        mode: DemoMode,
     },
     PaymentProcessed {
         order_id: Uuid,
         amount: f64,
+        mode: DemoMode,
     },
     InventoryReserved {
         order_id: Uuid,
+        amount: f64,
+        mode: DemoMode,
     },
     OrderShipped {
         order_id: Uuid,
         tracking_number: String,
+        mode: DemoMode,
     },
     EmailSent {
         order_id: Uuid,
         email_type: String,
+        mode: DemoMode,
     },
     OrderCompleted {
         order_id: Uuid,
+        mode: DemoMode,
     },
     OrderFailed {
         order_id: Uuid,
         reason: String,
+        mode: DemoMode,
     },
 }
 
@@ -68,29 +95,114 @@ struct OrderState {
 #[derive(Clone)]
 struct Deps;
 
-// API handler to create new orders
-async fn create_order(
-    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
-) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+#[derive(Debug, serde::Deserialize)]
+struct CreateOrderQuery {
+    mode: Option<DemoMode>,
+    total: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SeedFailuresQuery {
+    count: Option<usize>,
+}
+
+async fn enqueue_order(
+    engine: &Engine<OrderState, Deps, MemoryStore>,
+    mode: DemoMode,
+    total: f64,
+) -> Result<serde_json::Value, StatusCode> {
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
-    let total = 99.99 + (rand::random::<f64>() * 200.0);
 
     engine
         .process(OrderEvent::OrderPlaced {
             order_id,
             customer_id,
             total,
+            mode,
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    Ok(serde_json::json!({
+        "order_id": order_id,
+        "customer_id": customer_id,
+        "total": total,
+        "mode": mode,
+    }))
+}
+
+// API handler to create new orders
+async fn create_order(
+    Query(query): Query<CreateOrderQuery>,
+    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let mode = query.mode.unwrap_or_default();
+    let total = query
+        .total
+        .filter(|total| *total > 0.0)
+        .unwrap_or_else(|| 99.99 + (rand::random::<f64>() * 200.0));
+    let data = enqueue_order(&engine, mode, total).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(data),
+    ))
+}
+
+async fn seed_scenarios(
+    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let scenarios = [
+        DemoMode::Normal,
+        DemoMode::Slow,
+        DemoMode::FailPayment,
+        DemoMode::FailInventory,
+        DemoMode::FailShipping,
+        DemoMode::FailEmail,
+    ];
+
+    let mut created = Vec::with_capacity(scenarios.len());
+    for mode in scenarios {
+        let total = match mode {
+            DemoMode::Slow => 199.0,
+            DemoMode::FailPayment => 149.0,
+            DemoMode::FailInventory => 179.0,
+            DemoMode::FailShipping => 249.0,
+            DemoMode::FailEmail => 129.0,
+            DemoMode::Normal => 99.0,
+        };
+        created.push(enqueue_order(&engine, mode, total).await?);
+    }
+
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "created": created }))))
+}
+
+async fn seed_failures(
+    Query(query): Query<SeedFailuresQuery>,
+    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let count = query.count.unwrap_or(8).clamp(1, 40);
+    let failure_modes = [
+        DemoMode::FailPayment,
+        DemoMode::FailInventory,
+        DemoMode::FailShipping,
+        DemoMode::FailEmail,
+    ];
+
+    let mut created = Vec::with_capacity(count);
+    for i in 0..count {
+        let mode = failure_modes[i % failure_modes.len()];
+        let total = 120.0 + (i as f64 * 17.5);
+        created.push(enqueue_order(&engine, mode, total).await?);
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "order_id": order_id,
-            "customer_id": customer_id,
-            "total": total,
+            "created": created,
+            "count": count,
+            "modes": failure_modes,
         })),
     ))
 }
@@ -116,15 +228,23 @@ async fn toy_app() -> Html<&'static str> {
             background: #3b82f6;
             color: white;
             border: none;
-            padding: 16px 32px;
-            font-size: 18px;
+            padding: 12px 18px;
+            font-size: 16px;
             border-radius: 8px;
             cursor: pointer;
             font-weight: 600;
             transition: all 0.2s;
+            margin-right: 8px;
+            margin-bottom: 8px;
         }
         .button:hover { background: #2563eb; transform: translateY(-2px); }
         .button:active { transform: translateY(0); }
+        .button.slow { background: #a855f7; }
+        .button.slow:hover { background: #9333ea; }
+        .button.fail { background: #dc2626; }
+        .button.fail:hover { background: #b91c1c; }
+        .button.seed { background: #0891b2; }
+        .button.seed:hover { background: #0e7490; }
         .status {
             margin-top: 20px;
             padding: 16px;
@@ -148,22 +268,25 @@ async fn toy_app() -> Html<&'static str> {
     <h1>🚀 Seesaw Demo</h1>
     <div class="info">
         <p>This is a live demo of the Seesaw event-driven runtime with in-memory store.</p>
-        <p>Click the button to create a new order workflow and watch it in the <a href="/">Insights Dashboard →</a></p>
+        <p>Create normal/slow/failing workflows and watch them in the <a href="/">Insights Dashboard →</a></p>
     </div>
 
-    <button class="button" onclick="createOrder()">Create Order</button>
+    <button class="button" onclick="createOrder('normal')">Create Normal</button>
+    <button class="button slow" onclick="createOrder('slow')">Create Slow</button>
+    <button class="button fail" onclick="createOrder('fail_payment')">Fail Payment (DLQ)</button>
+    <button class="button fail" onclick="createOrder('fail_inventory')">Fail Inventory (DLQ)</button>
+    <button class="button fail" onclick="createOrder('fail_shipping')">Fail Shipping (DLQ)</button>
+    <button class="button fail" onclick="createOrder('fail_email')">Fail Email (DLQ)</button>
+    <button class="button seed" onclick="seedScenarios()">Seed All Scenarios</button>
+    <button class="button seed" onclick="seedFailures()">Seed Failures Burst</button>
     <div id="status"></div>
 
     <script>
-        async function createOrder() {
-            const btn = document.querySelector('.button');
+        async function createOrder(mode) {
             const status = document.getElementById('status');
 
-            btn.disabled = true;
-            btn.textContent = 'Creating...';
-
             try {
-                const response = await fetch('/api/create-order', {
+                const response = await fetch(`/api/create-order?mode=${mode}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -173,14 +296,45 @@ async fn toy_app() -> Html<&'static str> {
                 status.className = 'status success';
                 status.innerHTML = `✅ Order created!<br>
                     Order ID: <code>${data.order_id}</code><br>
+                    Mode: <code>${data.mode}</code><br>
                     Total: $${data.total.toFixed(2)}<br>
                     <a href="/">View in Insights Dashboard →</a>`;
             } catch (error) {
                 status.className = 'status error';
                 status.textContent = '❌ Failed to create order: ' + error.message;
-            } finally {
-                btn.disabled = false;
-                btn.textContent = 'Create Order';
+            }
+        }
+
+        async function seedScenarios() {
+            const status = document.getElementById('status');
+
+            try {
+                const response = await fetch('/api/seed-scenarios', { method: 'POST' });
+                const data = await response.json();
+
+                status.className = 'status success';
+                status.innerHTML = `✅ Seeded ${data.created.length} workflows<br>
+                    <a href="/">Open dashboard and inspect failures/bottlenecks →</a>`;
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = '❌ Failed to seed scenarios: ' + error.message;
+            }
+        }
+
+        async function seedFailures() {
+            const status = document.getElementById('status');
+
+            try {
+                const response = await fetch('/api/seed-failures?count=8', { method: 'POST' });
+                const data = await response.json();
+
+                status.className = 'status success';
+                status.innerHTML = `✅ Seeded ${data.count} failing workflows<br>
+                    Modes: <code>${data.modes.join(', ')}</code><br>
+                    <a href="/">Open dashboard and toggle Failed / Dead filters →</a>`;
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = '❌ Failed to seed failures: ' + error.message;
             }
         }
     </script>
@@ -230,30 +384,49 @@ async fn main() -> Result<()> {
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::OrderPlaced { order_id, .. } => Some(*order_id),
+                    OrderEvent::OrderPlaced {
+                        order_id,
+                        total,
+                        mode,
+                        ..
+                    } => Some((*order_id, *total, *mode)),
                     _ => None,
                 })
                 .id("validate_order")
-                .then_queue(|order_id, _ctx| async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    Ok(OrderEvent::OrderValidated { order_id })
+                .then_queue(|(order_id, total, mode), _ctx| async move {
+                    let wait = if mode == DemoMode::Slow { 900 } else { 350 };
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                    Ok(OrderEvent::OrderValidated {
+                        order_id,
+                        total,
+                        mode,
+                    })
                 }),
         )
         // Effect: Process payment
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::OrderValidated { order_id } => Some(*order_id),
+                    OrderEvent::OrderValidated {
+                        order_id,
+                        total,
+                        mode,
+                    } => Some((*order_id, *total, *mode)),
                     _ => None,
                 })
                 .id("process_payment")
-                .retry(3)
+                .retry(2)
                 .timeout(Duration::from_secs(5))
-                .then_queue(|order_id, _ctx| async move {
-                    tokio::time::sleep(Duration::from_millis(800)).await;
+                .then_queue(|(order_id, total, mode), _ctx| async move {
+                    if mode == DemoMode::FailPayment {
+                        anyhow::bail!("Payment gateway timeout - simulated permanent failure");
+                    }
+                    let wait = if mode == DemoMode::Slow { 2600 } else { 750 };
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
                     Ok(OrderEvent::PaymentProcessed {
                         order_id,
-                        amount: 99.99,
+                        amount: total,
+                        mode,
                     })
                 }),
         )
@@ -261,32 +434,54 @@ async fn main() -> Result<()> {
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::PaymentProcessed { order_id, .. } => Some(*order_id),
+                    OrderEvent::PaymentProcessed {
+                        order_id,
+                        amount,
+                        mode,
+                    } => Some((*order_id, *amount, *mode)),
                     _ => None,
                 })
                 .id("reserve_inventory")
                 .priority(1)
-                .then_queue(|order_id, _ctx| async move {
-                    tokio::time::sleep(Duration::from_millis(600)).await;
-                    Ok(OrderEvent::InventoryReserved { order_id })
+                .then_queue(|(order_id, amount, mode), _ctx| async move {
+                    if mode == DemoMode::FailInventory {
+                        anyhow::bail!("Inventory reservation conflict - simulated stock failure");
+                    }
+                    let wait = if mode == DemoMode::Slow { 2100 } else { 520 };
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                    Ok(OrderEvent::InventoryReserved {
+                        order_id,
+                        amount,
+                        mode,
+                    })
                 }),
         )
         // Effect: Ship order
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::InventoryReserved { order_id } => Some(*order_id),
+                    OrderEvent::InventoryReserved {
+                        order_id,
+                        mode,
+                        ..
+                    } => Some((*order_id, *mode)),
                     _ => None,
                 })
                 .id("ship_order")
-                .then_queue(|order_id, _ctx| async move {
-                    tokio::time::sleep(Duration::from_millis(700)).await;
+                .retry(2)
+                .then_queue(|(order_id, mode), _ctx| async move {
+                    if mode == DemoMode::FailShipping {
+                        anyhow::bail!("Carrier API unavailable - simulated shipping failure");
+                    }
+                    let wait = if mode == DemoMode::Slow { 2800 } else { 680 };
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
                     Ok(OrderEvent::OrderShipped {
                         order_id,
                         tracking_number: format!(
                             "TRACK-{}",
                             order_id.to_string()[..8].to_uppercase()
                         ),
+                        mode,
                     })
                 }),
         )
@@ -294,15 +489,24 @@ async fn main() -> Result<()> {
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::OrderShipped { order_id, .. } => Some(*order_id),
+                    OrderEvent::OrderShipped {
+                        order_id,
+                        mode,
+                        ..
+                    } => Some((*order_id, *mode)),
                     _ => None,
                 })
                 .id("send_confirmation_email")
-                .then_queue(|order_id, _ctx| async move {
+                .retry(2)
+                .then_queue(|(order_id, mode), _ctx| async move {
+                    if mode == DemoMode::FailEmail {
+                        anyhow::bail!("Email provider throttled - simulated notification failure");
+                    }
                     tokio::time::sleep(Duration::from_millis(400)).await;
                     Ok(OrderEvent::EmailSent {
                         order_id,
                         email_type: "shipping_confirmation".to_string(),
+                        mode,
                     })
                 }),
         )
@@ -310,13 +514,17 @@ async fn main() -> Result<()> {
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::EmailSent { order_id, .. } => Some(*order_id),
+                    OrderEvent::EmailSent {
+                        order_id,
+                        mode,
+                        ..
+                    } => Some((*order_id, *mode)),
                     _ => None,
                 })
                 .id("complete_order")
-                .then_queue(|order_id, _ctx| async move {
+                .then_queue(|(order_id, mode), _ctx| async move {
                     tokio::time::sleep(Duration::from_millis(300)).await;
-                    Ok(OrderEvent::OrderCompleted { order_id })
+                    Ok(OrderEvent::OrderCompleted { order_id, mode })
                 }),
         );
 
@@ -339,14 +547,23 @@ async fn main() -> Result<()> {
     println!("🎬 Generating demo workflows...\n");
 
     // Generate demo workflows
-    for i in 1..=3 {
+    let startup_scenarios = [
+        (1usize, DemoMode::Normal),
+        (2usize, DemoMode::Slow),
+        (3usize, DemoMode::FailPayment),
+        (4usize, DemoMode::FailInventory),
+        (5usize, DemoMode::FailShipping),
+        (6usize, DemoMode::FailEmail),
+    ];
+    for (i, mode) in startup_scenarios {
         let order_id = Uuid::new_v4();
         let customer_id = Uuid::new_v4();
 
         println!(
-            "📦 Workflow {}: Order {} starting",
+            "📦 Workflow {}: Order {} starting ({:?})",
             i,
-            &order_id.to_string()[..8]
+            &order_id.to_string()[..8],
+            mode
         );
 
         engine
@@ -354,11 +571,12 @@ async fn main() -> Result<()> {
                 order_id,
                 customer_id,
                 total: 99.99 * i as f64,
+                mode,
             })
             .await?;
 
         // Stagger workflow starts
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
     }
 
     println!("\n✨ Demo workflows initiated!");
@@ -373,6 +591,8 @@ async fn main() -> Result<()> {
     let demo_routes = Router::new()
         .route("/demo", get(toy_app))
         .route("/api/create-order", post(create_order))
+        .route("/api/seed-scenarios", post(seed_scenarios))
+        .route("/api/seed-failures", post(seed_failures))
         .with_state(engine.clone());
 
     // Merge both apps (they have different state types, but that's ok with merge)
@@ -390,9 +610,11 @@ async fn main() -> Result<()> {
     println!("   Toy App:   http://localhost:3000/demo");
     println!("   API:       POST http://localhost:3000/api/create-order\n");
     println!("Features to try:");
-    println!("  • Click 'Create Order' on the toy app");
-    println!("  • Watch workflows in real-time at / (main dashboard)");
-    println!("  • See event chains and effect execution\n");
+    println!("  • Create normal, slow, and failing orders from /demo");
+    println!("  • Use /api/seed-failures for burst DLQ/failed-flow simulation");
+    println!("  • Watch pinned events, effect logs, and payloads at /");
+    println!("  • Inspect dead letters and failed flows in left rail");
+    println!("  • Open bottlenecks panel to spot slow effects\n");
     println!("Press Ctrl+C to stop...\n");
 
     tokio::spawn(async move {

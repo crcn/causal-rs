@@ -36,8 +36,34 @@ pub struct StreamQuery {
     limit: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EffectLogsQuery {
+    #[serde(default)]
+    correlation_id: Option<Uuid>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeadLettersQuery {
+    #[serde(default)]
+    unresolved_only: Option<bool>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FailedWorkflowsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 fn default_limit() -> i64 {
     100
+}
+
+fn clamp_limit(limit: Option<usize>, default: usize, max: usize) -> usize {
+    limit.unwrap_or(default).max(1).min(max)
 }
 
 /// Create web server router
@@ -55,6 +81,9 @@ where
         .route("/stream", get(sse_stream::<I>))
         .route("/tree/:correlation_id", get(get_tree::<I>))
         .route("/stats", get(get_stats::<I>))
+        .route("/effects", get(get_effect_logs::<I>))
+        .route("/dead-letters", get(get_dead_letters::<I>))
+        .route("/failures", get(get_failed_workflows::<I>))
         .with_state(state.clone());
 
     // WebSocket route with its own state
@@ -172,6 +201,78 @@ where
     }
 }
 
+async fn get_effect_logs<I>(
+    Query(query): Query<EffectLogsQuery>,
+    State(state): State<AppState<I>>,
+) -> Response
+where
+    I: InsightStore + Clone + 'static,
+{
+    let limit = clamp_limit(query.limit, 200, 1000);
+    match state
+        .insight_store
+        .get_effect_logs(query.correlation_id, limit)
+        .await
+    {
+        Ok(logs) => Json(logs).into_response(),
+        Err(e) => {
+            tracing::error!("Error fetching effect logs: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to fetch effect logs: {}", e),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_dead_letters<I>(
+    Query(query): Query<DeadLettersQuery>,
+    State(state): State<AppState<I>>,
+) -> Response
+where
+    I: InsightStore + Clone + 'static,
+{
+    let unresolved_only = query.unresolved_only.unwrap_or(true);
+    let limit = clamp_limit(query.limit, 200, 1000);
+    match state
+        .insight_store
+        .get_dead_letters(unresolved_only, limit)
+        .await
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => {
+            tracing::error!("Error fetching dead letters: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to fetch dead letters: {}", e),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_failed_workflows<I>(
+    Query(query): Query<FailedWorkflowsQuery>,
+    State(state): State<AppState<I>>,
+) -> Response
+where
+    I: InsightStore + Clone + 'static,
+{
+    let limit = clamp_limit(query.limit, 100, 500);
+    match state.insight_store.get_failed_workflows(limit).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => {
+            tracing::error!("Error fetching failed workflows: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to fetch failed workflows: {}", e),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Start the web server
 pub async fn serve<I>(
     insight_store: I,
@@ -187,6 +288,9 @@ where
     info!("  SSE endpoint: http://{}/api/stream", addr);
     info!("  Tree API: http://{}/api/tree/:correlation_id", addr);
     info!("  Stats API: http://{}/api/stats", addr);
+    info!("  Effects API: http://{}/api/effects", addr);
+    info!("  Dead Letters API: http://{}/api/dead-letters", addr);
+    info!("  Failed Workflows API: http://{}/api/failures", addr);
     info!("  Dashboard: http://{}/", addr);
     axum::serve(listener, app).await?;
     Ok(())

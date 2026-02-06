@@ -1,15 +1,11 @@
 //! Effect registry for storing and starting effects.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use futures::FutureExt;
 use parking_lot::RwLock;
-use tracing::{info_span, Instrument};
 
-use crate::effect::{Effect, EffectContext, ErrorHandler, EventEnvelope};
+use crate::effect::Effect;
 use crate::event_codec::EventCodec;
-use pipedream::RelayReceiver;
 
 /// Registry for storing effects.
 pub struct EffectRegistry<S, D>
@@ -86,161 +82,6 @@ where
             }
         }
         None
-    }
-
-    /// Start all registered effects.
-    ///
-    /// This subscribes each effect to the event relay and spawns background
-    /// tasks to handle events.
-    ///
-    /// If `error_handler` is provided, it's called when effects error.
-    /// The chain continues regardless of errors.
-    pub(crate) fn start_effects(
-        &self,
-        relay: &RelayReceiver,
-        ctx: &EffectContext<S, D>,
-        error_handler: Option<ErrorHandler<S, D>>,
-    ) {
-        // Collect ready signals from effect background loops
-        let mut ready_signals = Vec::new();
-
-        for effect in self.effects.read().iter() {
-            let effect = effect.clone();
-
-            // Use tracked subscription so send() waits for handler to be spawned.
-            // This prevents race where settled() returns before handlers are spawned.
-            let (mut rx, handler_count) = relay.subscribe_tracked::<EventEnvelope<S, D>>();
-            let ctx = ctx.clone();
-
-            // Call started on the foreground context BEFORE spawning the background loop.
-            if effect.started.is_some() {
-                let effect_clone = effect.clone();
-                let ctx_clone = ctx.clone();
-                tokio::spawn(async move {
-                    if let Some(ref started) = effect_clone.started {
-                        let _ = started(ctx_clone).await;
-                    }
-                });
-            }
-
-            // Create a ready signal channel
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            ready_signals.push(ready_rx);
-
-            // Clone error handler for this effect's loop
-            let err_handler_for_loop = error_handler.clone();
-
-            // Spawn background task to listen for events
-            tokio::spawn(async move {
-                    // Signal ready before entering the receive loop
-                    let _ = ready_tx.send(());
-
-                    // Listen for events until channel closes
-                    while let Some(envelope) = rx.recv().await {
-                        // Get tracker before handling; complete only after handler work is accounted.
-                        let tracker = rx.current_tracker();
-
-                        // Only handle if this effect cares about this event type
-                        if effect.can_handle(envelope.event_type) {
-                            // Use envelope's ctx so handler is tracked on foreground
-                            let effect = effect.clone();
-                            let event = envelope.event.clone();
-                            let event_type = envelope.event_type;
-                            let event_id = envelope.ctx.current_event_id();
-                            let err_handler = err_handler_for_loop.clone();
-
-                            // Create tracing span for effect handling
-                            let span = info_span!(
-                                "seesaw.effect",
-                                event_id = ?event_id,
-                            );
-
-                            let handler_ctx = envelope.ctx.clone();
-                            let run_result = {
-                                // Clone event for error handling (before it's moved into handler)
-                                let event_for_error = event.clone();
-
-                                // Run effect handler
-                                let result =
-                                    (effect.handler)(event, event_type, handler_ctx.clone())
-                                        .instrument(span)
-                                        .await;
-
-                                match result {
-                                    Ok(Some(output)) => {
-                                        // Effect returned an event, dispatch it
-                                        handler_ctx.emit_any(output.value, output.type_id);
-                                    }
-                                    Ok(None) => {
-                                        // Observer effect, no event to dispatch
-                                    }
-                                    Err(e) => {
-                                        let error_message = e.to_string();
-
-                                        // Effect error - isolate it so chain continues
-                                        // Convert error to EffectError event (preserves error for downcast)
-                                        let effect_error = crate::effect::EffectError::new(
-                                            event_for_error,
-                                            event_type,
-                                            e,
-                                        );
-
-                                        // Dispatch EffectError using same path as Ok(Some(output))
-                                        let effect_error_output =
-                                            crate::effect::EventOutput::new(effect_error);
-                                        handler_ctx.emit_any(
-                                            effect_error_output.value,
-                                            effect_error_output.type_id,
-                                        );
-
-                                        // Note: on_error callback is now deprecated
-                                        // Error is emitted as EffectError event instead
-                                        if let Some(ref handler) = err_handler {
-                                            let callback_error =
-                                                anyhow::anyhow!(error_message);
-                                            // on_error is best-effort; callback panics must not break the chain.
-                                            let callback = handler(
-                                                callback_error,
-                                                event_type,
-                                                handler_ctx,
-                                            );
-                                            let _ = std::panic::AssertUnwindSafe(callback)
-                                                .catch_unwind()
-                                                .await;
-                                        }
-                                    }
-                                }
-
-                                Ok::<(), anyhow::Error>(())
-                            };
-
-                            if let Err(e) = run_result {
-                                tracing::warn!("effect handler task failed: {}", e);
-                            }
-                        }
-
-                        // Complete tracker after handler execution has been accounted for.
-                        // This provides natural backpressure under heavy load.
-                        if let Some(t) = tracker {
-                            t.complete_one();
-                        }
-                        rx.clear_tracker();
-                    }
-
-                    // Decrement handler count when effect loop exits
-                    handler_count.fetch_sub(1, Ordering::SeqCst);
-            });
-        }
-
-        // Spawn a task that waits for all effect loops to be ready
-        // This ensures effects are receiving before any events can be emitted
-        if !ready_signals.is_empty() {
-            tokio::spawn(async move {
-                for signal in ready_signals {
-                    let _ = signal.await;
-                }
-            });
-        }
     }
 }
 

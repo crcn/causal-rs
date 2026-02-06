@@ -118,6 +118,81 @@ pub struct InsightStats {
     pub failed_effects: i64,
 }
 
+/// Effect execution log entry for troubleshooting and timing analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectExecutionLog {
+    /// Workflow identifier.
+    pub correlation_id: Uuid,
+    /// Triggering event ID.
+    pub event_id: Uuid,
+    /// Effect identifier.
+    pub effect_id: String,
+    /// Current status (pending, executing, completed, failed).
+    pub status: String,
+    /// Attempt count.
+    pub attempts: i32,
+    /// Event type that triggered the effect.
+    pub event_type: Option<String>,
+    /// Effect result payload.
+    pub result: Option<serde_json::Value>,
+    /// Error text (if failed).
+    pub error: Option<String>,
+    /// Intent creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Scheduled execution time.
+    pub execute_at: Option<DateTime<Utc>>,
+    /// Last claim timestamp.
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// Last attempted timestamp.
+    pub last_attempted_at: Option<DateTime<Utc>>,
+    /// Completion timestamp.
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Derived execution duration when available.
+    pub duration_ms: Option<i64>,
+}
+
+/// Dead letter queue row for permanently failed effects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterEntry {
+    /// Workflow identifier.
+    pub correlation_id: Uuid,
+    /// Triggering event ID.
+    pub event_id: Uuid,
+    /// Effect identifier.
+    pub effect_id: String,
+    /// Triggering event type.
+    pub event_type: String,
+    /// Triggering event payload snapshot.
+    pub event_payload: serde_json::Value,
+    /// Failure reason text.
+    pub error: String,
+    /// DLQ classification.
+    pub reason: String,
+    /// Retry attempts before DLQ.
+    pub attempts: i32,
+    /// Timestamp when moved to DLQ.
+    pub failed_at: DateTime<Utc>,
+    /// Timestamp when manually resolved.
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+/// Aggregated failure summary per workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedWorkflow {
+    /// Workflow identifier.
+    pub correlation_id: Uuid,
+    /// Number of failed effects in executions table.
+    pub failed_effects: i64,
+    /// Number of pending/executing effects.
+    pub active_effects: i64,
+    /// Number of unresolved dead letters.
+    pub dead_letters: i64,
+    /// Most recent failure timestamp.
+    pub last_failed_at: Option<DateTime<Utc>>,
+    /// Most recent failure message.
+    pub last_error: Option<String>,
+}
+
 /// Trait for insight/observability queries
 ///
 /// This is separate from the Store trait because:
@@ -151,4 +226,36 @@ pub trait InsightStore: Send + Sync + 'static {
     /// If cursor is None, returns most recent events.
     async fn get_recent_events(&self, cursor: Option<i64>, limit: usize)
         -> Result<Vec<InsightEvent>>;
+
+    /// Get effect execution logs for operational debugging.
+    ///
+    /// Default implementation returns no rows for stores that do not expose this.
+    async fn get_effect_logs(
+        &self,
+        correlation_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<EffectExecutionLog>> {
+        let _ = (correlation_id, limit);
+        Ok(Vec::new())
+    }
+
+    /// Get dead letter queue entries.
+    ///
+    /// Default implementation returns no rows for stores that do not expose DLQ state.
+    async fn get_dead_letters(
+        &self,
+        unresolved_only: bool,
+        limit: usize,
+    ) -> Result<Vec<DeadLetterEntry>> {
+        let _ = (unresolved_only, limit);
+        Ok(Vec::new())
+    }
+
+    /// Get workflows that currently have failures or dead letters.
+    ///
+    /// Default implementation returns no rows for stores without failure aggregation.
+    async fn get_failed_workflows(&self, limit: usize) -> Result<Vec<FailedWorkflow>> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
 }

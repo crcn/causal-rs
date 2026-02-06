@@ -11,7 +11,7 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use super::context::EffectContext;
-use super::types::{AnyEvent, BoxFuture, Effect, EventOutput};
+use super::types::{AnyEvent, BoxFuture, Effect, Emit, EventOutput, JoinMode};
 use crate::event_codec::EventCodec;
 
 #[track_caller]
@@ -23,6 +23,18 @@ fn default_effect_id(prefix: &str) -> String {
         location.line(),
         location.column()
     )
+}
+
+fn emit_to_outputs<E: Send + Sync + 'static>(emit: Emit<E>) -> Vec<EventOutput> {
+    // `Ok(())` is supported as observer semantics for typed handlers.
+    if TypeId::of::<E>() == TypeId::of::<()>() {
+        return Vec::new();
+    }
+
+    emit.into_vec()
+        .into_iter()
+        .map(EventOutput::new)
+        .collect::<Vec<_>>()
 }
 
 // =============================================================================
@@ -309,6 +321,7 @@ impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, 
     }
 }
 
+#[allow(private_bounds)]
 impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, Started>
 where
     EventType: QueueCodecProvider,
@@ -349,6 +362,98 @@ where
         self.priority = Some(level);
         self.codec = EventType::queue_codec();
         self
+    }
+}
+
+// =============================================================================
+// Join Builder (typed, queued-only)
+// =============================================================================
+
+/// Builder for durable same-batch join effects.
+pub struct JoinEffectBuilder<E, Started> {
+    inner: EffectBuilder<Typed<E>, NoFilter, NoTransition, Started>,
+    mode: JoinMode,
+}
+
+impl<E, Started> EffectBuilder<Typed<E>, NoFilter, NoTransition, Started>
+where
+    E: Clone + Send + Sync + 'static,
+{
+    /// Configure this effect as a durable join effect.
+    ///
+    /// Join effects are always queued and never execute inline.
+    pub fn join(self) -> JoinEffectBuilder<E, Started> {
+        JoinEffectBuilder {
+            inner: self,
+            mode: JoinMode::SameBatch,
+        }
+    }
+}
+
+impl<E, Started> JoinEffectBuilder<E, Started>
+where
+    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+{
+    /// Join terminal events that share the same `(correlation_id, batch_id)`.
+    pub fn same_batch(mut self) -> Self {
+        self.mode = JoinMode::SameBatch;
+        self
+    }
+
+    /// Set the handler for joined batch execution.
+    #[track_caller]
+    #[allow(private_bounds)]
+    pub fn then<S, D, H, Fut, R, O>(mut self, handler: H) -> Effect<S, D>
+    where
+        S: Clone + Send + Sync + 'static,
+        D: Send + Sync + 'static,
+        Started: StartedHandler<S, D>,
+        H: Fn(Vec<E>, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
+        R: Into<Emit<O>> + Send + 'static,
+        O: Send + Sync + 'static,
+    {
+        let target = TypeId::of::<E>();
+        let id = self
+            .inner
+            .id
+            .take()
+            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
+        let join_mode = self.mode;
+        let typed_codec = self.inner.codec.take().unwrap_or_else(typed_event_codec::<E>);
+
+        Effect {
+            id,
+            codecs: vec![typed_codec],
+            can_handle: Arc::new(move |t| t == target),
+            started: self.inner.started.into_started(),
+            // append phase is handled by runtime; this per-item handler is a no-op
+            handler: Arc::new(move |_, _, _| Box::pin(async { Ok(Vec::new()) })),
+            join_mode: Some(join_mode),
+            join_batch_handler: Some(Arc::new(move |values, ctx| {
+                let mut typed = Vec::with_capacity(values.len());
+                for value in values {
+                    let Ok(downcasted) = value.downcast::<E>() else {
+                        return Box::pin(async {
+                            Err(anyhow::anyhow!("join batch item downcast failed"))
+                        });
+                    };
+                    typed.push((*downcasted).clone());
+                }
+
+                let fut = handler(typed, ctx);
+                Box::pin(async move {
+                    let output: R = fut.await?;
+                    let emit: Emit<O> = output.into();
+                    Ok(emit_to_outputs(emit))
+                })
+            })),
+            queued: true,
+            delay: self.inner.delay,
+            timeout: self.inner.timeout,
+            max_attempts: self.inner.max_attempts.max(1),
+            priority: self.inner.priority,
+        }
     }
 }
 
@@ -489,7 +594,8 @@ where
     /// })
     /// ```
     #[track_caller]
-    pub fn then<S, D, T, H, Fut, O>(self, handler: H) -> Effect<S, D>
+    #[allow(private_bounds)]
+    pub fn then<S, D, T, H, Fut, R, O>(self, handler: H) -> Effect<S, D>
     where
         S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
@@ -498,11 +604,11 @@ where
         Trans: TransitionChecker<S>,
         Started: StartedHandler<S, D>,
         H: Fn(T, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O>> + Send + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
+        R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
     {
         let target = TypeId::of::<E>();
-        let output_is_unit = TypeId::of::<O>() == TypeId::of::<()>();
         let filter = self.filter;
         let transition = self.transition;
         let codec = self.codec;
@@ -521,7 +627,7 @@ where
 
                 // Check transition
                 if !transition.should_run(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(None) });
+                    return Box::pin(async { Ok(Vec::new()) });
                 }
 
                 // Extract/filter
@@ -529,18 +635,16 @@ where
                     Some(extracted) => {
                         let fut = handler(extracted, ctx);
                         Box::pin(async move {
-                            let output = fut.await?;
-                            // Special case: () means no event to dispatch (observer pattern)
-                            if output_is_unit {
-                                Ok(None)
-                            } else {
-                                Ok(Some(EventOutput::new(output)))
-                            }
+                            let output: R = fut.await?;
+                            let emit: Emit<O> = output.into();
+                            Ok(emit_to_outputs(emit))
                         })
                     }
-                    None => Box::pin(async { Ok(None) }),
+                    None => Box::pin(async { Ok(Vec::new()) }),
                 }
             }),
+            join_mode: None,
+            join_batch_handler: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -554,7 +658,8 @@ where
     /// Adds serde-based codec metadata so queue-backed workers can decode and
     /// execute this typed effect from persisted JSON events.
     #[track_caller]
-    pub fn then_queue<S, D, T, H, Fut, O>(self, handler: H) -> Effect<S, D>
+    #[allow(private_bounds)]
+    pub fn then_queue<S, D, T, H, Fut, R, O>(self, handler: H) -> Effect<S, D>
     where
         S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
@@ -564,11 +669,11 @@ where
         Trans: TransitionChecker<S>,
         Started: StartedHandler<S, D>,
         H: Fn(T, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O>> + Send + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
+        R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
     {
         let target = TypeId::of::<E>();
-        let output_is_unit = TypeId::of::<O>() == TypeId::of::<()>();
         let filter = self.filter;
         let transition = self.transition;
         let codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
@@ -587,7 +692,7 @@ where
 
                 // Check transition
                 if !transition.should_run(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(None) });
+                    return Box::pin(async { Ok(Vec::new()) });
                 }
 
                 // Extract/filter
@@ -595,18 +700,16 @@ where
                     Some(extracted) => {
                         let fut = handler(extracted, ctx);
                         Box::pin(async move {
-                            let output = fut.await?;
-                            // Special case: () means no event to dispatch (observer pattern)
-                            if output_is_unit {
-                                Ok(None)
-                            } else {
-                                Ok(Some(EventOutput::new(output)))
-                            }
+                            let output: R = fut.await?;
+                            let emit: Emit<O> = output.into();
+                            Ok(emit_to_outputs(emit))
                         })
                     }
-                    None => Box::pin(async { Ok(None) }),
+                    None => Box::pin(async { Ok(Vec::new()) }),
                 }
             }),
+            join_mode: None,
+            join_batch_handler: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -643,9 +746,11 @@ impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
                 let fut = handler(event, ctx);
                 Box::pin(async move {
                     fut.await?;
-                    Ok(None)
+                    Ok(Vec::new())
                 })
             }),
+            join_mode: None,
+            join_batch_handler: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -681,14 +786,16 @@ where
             started: None,
             handler: Arc::new(move |_, _, ctx| {
                 if !transition(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(None) });
+                    return Box::pin(async { Ok(Vec::new()) });
                 }
                 let fut = handler(ctx);
                 Box::pin(async move {
                     fut.await?;
-                    Ok(None)
+                    Ok(Vec::new())
                 })
             }),
+            join_mode: None,
+            join_batch_handler: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -727,9 +834,11 @@ where
                 let fut = handler(event, ctx);
                 Box::pin(async move {
                     fut.await?;
-                    Ok(None)
+                    Ok(Vec::new())
                 })
             }),
+            join_mode: None,
+            join_batch_handler: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -768,14 +877,16 @@ where
             started: Some(Arc::new(move |ctx| Box::pin(started(ctx)))),
             handler: Arc::new(move |_, _, ctx| {
                 if !transition(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(None) });
+                    return Box::pin(async { Ok(Vec::new()) });
                 }
                 let fut = handler(ctx);
                 Box::pin(async move {
                     fut.await?;
-                    Ok(None)
+                    Ok(Vec::new())
                 })
             }),
+            join_mode: None,
+            join_batch_handler: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -841,15 +952,12 @@ where
                       ctx: EffectContext<S, D>| {
                     let effects = effects.clone();
                     Box::pin(async move {
-                        let mut last_output = None;
+                        let mut outputs = Vec::new();
                         let mut first_error: Option<anyhow::Error> = None;
                         for effect in effects.iter() {
                             if (effect.can_handle)(type_id) {
                                 match (effect.handler)(value.clone(), type_id, ctx.clone()).await {
-                                    Ok(Some(output)) => {
-                                        last_output = Some(output);
-                                    }
-                                    Ok(None) => {}
+                                    Ok(mut emitted) => outputs.append(&mut emitted),
                                     Err(e) => {
                                         // Capture first error but continue processing
                                         if first_error.is_none() {
@@ -863,11 +971,13 @@ where
                         if let Some(err) = first_error {
                             return Err(err);
                         }
-                        Ok(last_output)
+                        Ok(outputs)
                     })
                 },
             )
         },
+        join_mode: None,
+        join_batch_handler: None,
         queued: false,
         delay: None,
         timeout: None,
@@ -907,7 +1017,9 @@ where
         codecs: Vec::new(),
         can_handle: Arc::new(|_| false),
         started: Some(Arc::new(move |ctx| Box::pin(f(ctx)))),
-        handler: Arc::new(|_, _, _| Box::pin(async { Ok(None) })),
+        handler: Arc::new(|_, _, _| Box::pin(async { Ok(Vec::new()) })),
+        join_mode: None,
+        join_batch_handler: None,
         queued: false,
         delay: None,
         timeout: None,
@@ -970,10 +1082,12 @@ where
                     tx.send_any_with_origin(value, type_id, bridge_origin_id)
                         .await
                         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                    Ok(None)
+                    Ok(Vec::new())
                 })
             })
         },
+        join_mode: None,
+        join_batch_handler: None,
         queued: false,
         delay: None,
         timeout: None,
@@ -988,9 +1102,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Default)]
-    struct TestState {
-        count: i32,
-    }
+    struct TestState;
 
     #[derive(Clone, Default)]
     struct TestDeps;
@@ -1022,8 +1134,8 @@ mod tests {
             }
         }
 
-        let state = Arc::new(TestState { count: 0 });
-        let live_state = Arc::new(RwLock::new(TestState { count: 0 }));
+        let state = Arc::new(TestState);
+        let live_state = Arc::new(RwLock::new(TestState));
         EffectContext::new(
             "test_effect".to_string(),
             "test_idempotency_key".to_string(),
@@ -1082,10 +1194,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_some());
-        let output = result.unwrap();
+        assert_eq!(result.len(), 1);
+        let output = &result[0];
         assert_eq!(output.type_id, TypeId::of::<OutputEvent>());
-        let downcasted = output.value.downcast::<OutputEvent>().unwrap();
+        let downcasted = output.value.clone().downcast::<OutputEvent>().unwrap();
         assert_eq!(downcasted.result, 42);
     }
 
@@ -1115,7 +1227,7 @@ mod tests {
             .call_handler(event1, TypeId::of::<TestEvent>(), ctx.clone())
             .await
             .unwrap();
-        assert!(result1.is_none());
+        assert!(result1.is_empty());
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         // Should run - value > 10
@@ -1124,7 +1236,7 @@ mod tests {
             .call_handler(event2, TypeId::of::<TestEvent>(), ctx)
             .await
             .unwrap();
-        assert!(result2.is_some());
+        assert_eq!(result2.len(), 1);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
@@ -1152,7 +1264,7 @@ mod tests {
             .call_handler(event1, TypeId::of::<TestEvent>(), ctx.clone())
             .await
             .unwrap();
-        assert!(result1.is_none());
+        assert!(result1.is_empty());
 
         // Should run with transformed value - value > 10
         let event2: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 15 });
@@ -1161,8 +1273,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result2.is_some());
-        let output = result2.unwrap().value.downcast::<OutputEvent>().unwrap();
+        assert_eq!(result2.len(), 1);
+        let output = result2[0]
+            .value
+            .clone()
+            .downcast::<OutputEvent>()
+            .unwrap();
         assert_eq!(output.result, 15 + 30); // original + doubled
     }
 

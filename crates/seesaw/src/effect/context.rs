@@ -18,21 +18,6 @@ where
 /// A boxed event emitter.
 pub type BoxedEmitter<S, D> = Arc<dyn EventEmitter<S, D>>;
 
-/// Envelope wrapping an event with its type and context.
-pub struct EventEnvelope<S, D>
-where
-    S: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    pub event: Arc<dyn Any + Send + Sync>,
-    pub event_type: TypeId,
-    pub ctx: EffectContext<S, D>,
-    /// Origin stream ID for echo prevention (0 = internal, will be stamped by stream)
-    pub origin: u64,
-    /// Chain of relay IDs this event has visited (for multi-hop echo prevention)
-    pub visited: HashSet<u64>,
-}
-
 /// Context passed to effect handlers.
 pub struct EffectContext<S, D>
 where
@@ -158,53 +143,9 @@ where
         &self.deps
     }
 
-    /// Create a new context with updated state snapshots and a new event ID for causation tracking.
-    pub(crate) fn with_states_and_event_id(
-        &self,
-        prev_state: Arc<S>,
-        state: Arc<S>,
-        event_id: Uuid,
-    ) -> Self {
-        Self {
-            effect_id: self.effect_id.clone(),
-            idempotency_key: self.idempotency_key.clone(),
-            correlation_id: self.correlation_id,
-            event_id,
-            prev_state,
-            state,
-            live_state: self.live_state.clone(),
-            deps: self.deps.clone(),
-            emitter: self.emitter.clone(),
-            visited: self.visited.clone(),
-        }
-    }
-
-    /// Create a new context with an updated visited set.
-    pub(crate) fn with_visited(&self, visited: Arc<HashSet<u64>>) -> Self {
-        Self {
-            effect_id: self.effect_id.clone(),
-            idempotency_key: self.idempotency_key.clone(),
-            correlation_id: self.correlation_id,
-            event_id: self.event_id,
-            prev_state: self.prev_state.clone(),
-            state: self.state.clone(),
-            live_state: self.live_state.clone(),
-            deps: self.deps.clone(),
-            emitter: self.emitter.clone(),
-            visited,
-        }
-    }
-
     /// Get the current event ID for causation tracking.
     pub fn current_event_id(&self) -> Uuid {
         self.event_id
-    }
-
-    /// Emit a new event to the store.
-    pub(crate) fn emit<E: Send + Sync + 'static>(&self, event: E) {
-        let type_id = TypeId::of::<E>();
-        let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event);
-        self.emitter.emit(type_id, event_arc, self.clone());
     }
 
     /// Emit a type-erased event to the store.

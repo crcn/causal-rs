@@ -1,6 +1,7 @@
 //! Effect Worker - polls and executes queued effects
 
 use anyhow::Result;
+use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 use std::any::{Any, TypeId};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::effect::{EffectContext, EventEmitter};
+use crate::effect::{EffectContext, EventEmitter, JoinMode};
 use crate::effect_registry::EffectRegistry;
 use crate::reducer_registry::ReducerRegistry;
 use crate::{EmittedEvent, Store, NAMESPACE_SEESAW};
@@ -41,6 +42,8 @@ pub struct EffectWorkerConfig {
     pub poll_interval: Duration,
     /// Default timeout for effect execution
     pub default_timeout: Duration,
+    /// Maximum number of events an effect may emit in one batch
+    pub max_batch_size: usize,
 }
 
 impl Default for EffectWorkerConfig {
@@ -48,6 +51,7 @@ impl Default for EffectWorkerConfig {
         Self {
             poll_interval: Duration::from_millis(100),
             default_timeout: Duration::from_secs(30),
+            max_batch_size: 10_000,
         }
     }
 }
@@ -197,6 +201,97 @@ where
             emitter,
         );
 
+        let join_claim = match effect.join_mode {
+            Some(JoinMode::SameBatch) => {
+                let join_claim_result = async {
+                    let (Some(batch_id), Some(batch_index), Some(batch_size)) =
+                        (execution.batch_id, execution.batch_index, execution.batch_size)
+                    else {
+                        anyhow::bail!(
+                            "join().same_batch() requires batch_id, batch_index, and batch_size metadata"
+                        );
+                    };
+                    if batch_size <= 0 || batch_index < 0 || batch_index >= batch_size {
+                        anyhow::bail!(
+                            "join().same_batch() received invalid batch metadata: index={} size={}",
+                            batch_index,
+                            batch_size
+                        );
+                    }
+                    if batch_size as usize > self.config.max_batch_size {
+                        anyhow::bail!(
+                            "join().same_batch() batch_size {} exceeds max_batch_size {}",
+                            batch_size,
+                            self.config.max_batch_size
+                        );
+                    }
+
+                    self.store
+                        .join_same_batch_append_and_maybe_claim(
+                            execution.effect_id.clone(),
+                            execution.correlation_id,
+                            execution.event_id,
+                            execution.event_type.clone(),
+                            execution.event_payload.clone(),
+                            Utc::now(),
+                            batch_id,
+                            batch_index,
+                            batch_size,
+                        )
+                        .await
+                }
+                .await;
+
+                match join_claim_result {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        let message = error.to_string();
+                        warn!(
+                            "Join append failed: {} (attempt {}/{}): {}",
+                            execution.effect_id, execution.attempts, execution.max_attempts, message
+                        );
+                        if execution.attempts >= execution.max_attempts {
+                            self.store
+                                .dlq_effect(
+                                    execution.event_id,
+                                    execution.effect_id.clone(),
+                                    message,
+                                    "failed".to_string(),
+                                    execution.attempts,
+                                )
+                                .await?;
+                        } else {
+                            self.store
+                                .fail_effect(
+                                    execution.event_id,
+                                    execution.effect_id.clone(),
+                                    message,
+                                    execution.attempts,
+                                )
+                                .await?;
+                        }
+                        return Ok(true);
+                    }
+                }
+            }
+            None => None,
+        };
+
+        if effect.join_mode.is_some() && join_claim.is_none() {
+            self.store
+                .complete_effect(
+                    execution.event_id,
+                    execution.effect_id.clone(),
+                    serde_json::json!({ "status": "join_waiting" }),
+                )
+                .await?;
+            return Ok(true);
+        }
+
+        let claimed_batch_id = join_claim
+            .as_ref()
+            .and_then(|entries| entries.first().map(|entry| entry.batch_id));
+
         // Execute effect with timeout
         let timeout_duration = if execution.timeout_seconds > 0 {
             Duration::from_secs(execution.timeout_seconds as u64)
@@ -206,11 +301,24 @@ where
 
         let result = timeout(timeout_duration, async {
             let mut emitted = Vec::new();
-            if let Some(output) = effect
-                .call_handler(typed_event, type_id, ctx.clone())
-                .await?
-            {
-                emitted.push((output.type_id, output.value));
+            if let Some(entries) = join_claim.as_ref() {
+                let mut values = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let (typed, _value_type_id) =
+                        self.decode_event(&entry.event_type, &entry.payload)?;
+                    values.push(typed);
+                }
+
+                for output in effect.call_join_batch_handler(values, ctx.clone()).await? {
+                    emitted.push((output.type_id, output.value));
+                }
+            } else {
+                for output in effect
+                    .call_handler(typed_event, type_id, ctx.clone())
+                    .await?
+                {
+                    emitted.push((output.type_id, output.value));
+                }
             }
 
             // tasks.wait_pending().await; // TODO: Re-enable when tasks tracking is implemented
@@ -221,10 +329,61 @@ where
 
         match result {
             Ok(Ok(emitted_raw)) => {
+                let emitted_events = match self.serialize_emitted_events(emitted_raw, &execution) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        warn!(
+                            "Effect output serialization failed: {} (attempt {}/{}): {}",
+                            execution.effect_id,
+                            execution.attempts,
+                            execution.max_attempts,
+                            error
+                        );
+
+                        if let Some(batch_id) = claimed_batch_id {
+                            if let Err(release_error) = self
+                                .store
+                                .join_same_batch_release(
+                                    execution.effect_id.clone(),
+                                    execution.correlation_id,
+                                    batch_id,
+                                    error.to_string(),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to release join claim for {}: {}",
+                                    execution.effect_id, release_error
+                                );
+                            }
+                        }
+
+                        if execution.attempts >= execution.max_attempts {
+                            self.store
+                                .dlq_effect(
+                                    execution.event_id,
+                                    execution.effect_id.clone(),
+                                    error.to_string(),
+                                    "failed".to_string(),
+                                    execution.attempts,
+                                )
+                                .await?;
+                        } else {
+                            self.store
+                                .fail_effect(
+                                    execution.event_id,
+                                    execution.effect_id.clone(),
+                                    error.to_string(),
+                                    execution.attempts,
+                                )
+                                .await?;
+                        }
+                        return Ok(true);
+                    }
+                };
+
                 // Success - mark as completed
                 info!("Effect completed successfully: {}", execution.effect_id);
-
-                let emitted_events = self.serialize_emitted_events(emitted_raw)?;
                 let result_value = serde_json::json!({ "status": "ok" });
 
                 if emitted_events.is_empty() {
@@ -245,6 +404,16 @@ where
                         )
                         .await?;
                 }
+
+                if let Some(batch_id) = claimed_batch_id {
+                    self.store
+                        .join_same_batch_complete(
+                            execution.effect_id.clone(),
+                            execution.correlation_id,
+                            batch_id,
+                        )
+                        .await?;
+                }
             }
             Ok(Err(e)) => {
                 // Effect failed
@@ -252,6 +421,24 @@ where
                     "Effect failed: {} (attempt {}/{}): {}",
                     execution.effect_id, execution.attempts, execution.max_attempts, e
                 );
+
+                if let Some(batch_id) = claimed_batch_id {
+                    if let Err(release_error) = self
+                        .store
+                        .join_same_batch_release(
+                            execution.effect_id.clone(),
+                            execution.correlation_id,
+                            batch_id,
+                            e.to_string(),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to release join claim for {}: {}",
+                            execution.effect_id, release_error
+                        );
+                    }
+                }
 
                 if execution.attempts >= execution.max_attempts {
                     // Permanently failed - move to DLQ
@@ -284,6 +471,24 @@ where
             Err(_) => {
                 // Timeout
                 warn!("Effect timed out: {}", execution.effect_id);
+
+                if let Some(batch_id) = claimed_batch_id {
+                    if let Err(release_error) = self
+                        .store
+                        .join_same_batch_release(
+                            execution.effect_id.clone(),
+                            execution.correlation_id,
+                            batch_id,
+                            "Effect execution timed out".to_string(),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to release join claim for {} after timeout: {}",
+                            execution.effect_id, release_error
+                        );
+                    }
+                }
 
                 if execution.attempts >= execution.max_attempts {
                     // Permanently failed - move to DLQ
@@ -334,9 +539,62 @@ where
     fn serialize_emitted_events(
         &self,
         emitted: Vec<(TypeId, Arc<dyn Any + Send + Sync>)>,
+        execution: &crate::QueuedEffectExecution,
     ) -> Result<Vec<EmittedEvent>> {
-        let mut result = Vec::with_capacity(emitted.len());
-        for (type_id, event_any) in emitted {
+        let emitted_count = emitted.len();
+        if emitted_count > self.config.max_batch_size {
+            anyhow::bail!(
+                "effect '{}' emitted {} events, exceeding max_batch_size {}",
+                execution.effect_id,
+                emitted_count,
+                self.config.max_batch_size
+            );
+        }
+        if emitted_count > i32::MAX as usize {
+            anyhow::bail!(
+                "effect '{}' emitted {} events, exceeding i32 batch metadata capacity",
+                execution.effect_id,
+                emitted_count
+            );
+        }
+        let inherited_batch = if emitted_count == 1 {
+            match (
+                execution.batch_id,
+                execution.batch_index,
+                execution.batch_size,
+            ) {
+                (Some(batch_id), Some(batch_index), Some(batch_size)) => {
+                    if batch_size <= 0
+                        || batch_index < 0
+                        || batch_index >= batch_size
+                        || batch_size as usize > self.config.max_batch_size
+                    {
+                        anyhow::bail!(
+                            "invalid inherited batch metadata: id={} index={} size={} max_batch_size={}",
+                            batch_id,
+                            batch_index,
+                            batch_size,
+                            self.config.max_batch_size
+                        );
+                    }
+                    Some((batch_id, batch_index, batch_size))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let emitted_batch_id = if emitted_count > 1 {
+            Some(Uuid::new_v5(
+                &NAMESPACE_SEESAW,
+                format!("{}-{}-batch", execution.event_id, execution.effect_id).as_bytes(),
+            ))
+        } else {
+            None
+        };
+
+        let mut result = Vec::with_capacity(emitted_count);
+        for (emitted_index, (type_id, event_any)) in emitted.into_iter().enumerate() {
             let codec = self
                 .effects
                 .find_codec_by_type_id(type_id)
@@ -350,9 +608,23 @@ where
             let payload = (codec.encode)(event_any.as_ref()).ok_or_else(|| {
                 anyhow::anyhow!("Failed to serialize emitted event {}", codec.event_type)
             })?;
+            let (batch_id, batch_index, batch_size) = if let Some(inherited) = inherited_batch {
+                (Some(inherited.0), Some(inherited.1), Some(inherited.2))
+            } else if emitted_count > 1 {
+                (
+                    emitted_batch_id,
+                    Some(emitted_index as i32),
+                    Some(emitted_count as i32),
+                )
+            } else {
+                (None, None, None)
+            };
             result.push(EmittedEvent {
                 event_type: codec.event_type.clone(),
                 payload,
+                batch_id,
+                batch_index,
+                batch_size,
             });
         }
         Ok(result)
@@ -363,9 +635,11 @@ where
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
     use futures::Stream;
     use parking_lot::Mutex;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -384,12 +658,42 @@ mod tests {
         amount: i32,
     }
 
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct BatchItemResult {
+        index: i32,
+        ok: bool,
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct BatchJoinSummary {
+        total: usize,
+        failed: usize,
+    }
+
+    #[derive(Clone)]
+    struct JoinWindow {
+        target_count: i32,
+        status: JoinStatus,
+        source_ids: HashSet<Uuid>,
+        entries_by_index: HashMap<i32, crate::JoinEntry>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum JoinStatus {
+        Open,
+        Processing,
+        Completed,
+    }
+
     struct TestStore {
         queued_effects: Mutex<VecDeque<crate::QueuedEffectExecution>>,
         completed: Mutex<Vec<(Uuid, String)>>,
         completed_with_events: Mutex<Vec<(Uuid, String, Vec<crate::EmittedEvent>)>>,
         failed: Mutex<Vec<(Uuid, String)>>,
         dlqed: Mutex<Vec<(Uuid, String)>>,
+        join_windows: Mutex<HashMap<(String, Uuid, Uuid), JoinWindow>>,
+        join_complete_calls: Mutex<Vec<(String, Uuid, Uuid)>>,
+        join_release_calls: Mutex<Vec<(String, Uuid, Uuid, String)>>,
     }
 
     impl TestStore {
@@ -400,6 +704,9 @@ mod tests {
                 completed_with_events: Mutex::new(Vec::new()),
                 failed: Mutex::new(Vec::new()),
                 dlqed: Mutex::new(Vec::new()),
+                join_windows: Mutex::new(HashMap::new()),
+                join_complete_calls: Mutex::new(Vec::new()),
+                join_release_calls: Mutex::new(Vec::new()),
             }
         }
     }
@@ -449,6 +756,9 @@ mod tests {
             _event_type: String,
             _event_payload: serde_json::Value,
             _parent_event_id: Option<Uuid>,
+            _batch_id: Option<Uuid>,
+            _batch_index: Option<i32>,
+            _batch_size: Option<i32>,
             _execute_at: chrono::DateTime<chrono::Utc>,
             _timeout_seconds: i32,
             _max_attempts: i32,
@@ -526,6 +836,103 @@ mod tests {
         ) -> Result<Box<dyn Stream<Item = crate::WorkflowEvent> + Send + Unpin>> {
             Ok(Box::new(futures::stream::empty::<crate::WorkflowEvent>()))
         }
+
+        async fn join_same_batch_append_and_maybe_claim(
+            &self,
+            join_effect_id: String,
+            correlation_id: Uuid,
+            source_event_id: Uuid,
+            source_event_type: String,
+            source_payload: serde_json::Value,
+            source_created_at: DateTime<Utc>,
+            batch_id: Uuid,
+            batch_index: i32,
+            batch_size: i32,
+        ) -> Result<Option<Vec<crate::JoinEntry>>> {
+            let key = (join_effect_id.clone(), correlation_id, batch_id);
+            let mut windows = self.join_windows.lock();
+            let window = windows.entry(key).or_insert_with(|| JoinWindow {
+                target_count: batch_size,
+                status: JoinStatus::Open,
+                source_ids: HashSet::new(),
+                entries_by_index: HashMap::new(),
+            });
+
+            if window.status == JoinStatus::Completed {
+                return Ok(None);
+            }
+            window.target_count = batch_size;
+
+            if window.source_ids.insert(source_event_id) {
+                window
+                    .entries_by_index
+                    .entry(batch_index)
+                    .or_insert_with(|| crate::JoinEntry {
+                        source_event_id,
+                        event_type: source_event_type,
+                        payload: source_payload,
+                        batch_id,
+                        batch_index,
+                        batch_size,
+                        created_at: source_created_at,
+                    });
+            }
+
+            let ready = window.entries_by_index.len() as i32 >= window.target_count;
+            if ready && window.status == JoinStatus::Open {
+                window.status = JoinStatus::Processing;
+                let mut entries = window
+                    .entries_by_index
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                entries.sort_by_key(|entry| entry.batch_index);
+                return Ok(Some(entries));
+            }
+
+            Ok(None)
+        }
+
+        async fn join_same_batch_complete(
+            &self,
+            join_effect_id: String,
+            correlation_id: Uuid,
+            batch_id: Uuid,
+        ) -> Result<()> {
+            self.join_complete_calls
+                .lock()
+                .push((join_effect_id.clone(), correlation_id, batch_id));
+            if let Some(window) = self
+                .join_windows
+                .lock()
+                .get_mut(&(join_effect_id, correlation_id, batch_id))
+            {
+                window.status = JoinStatus::Completed;
+            }
+            Ok(())
+        }
+
+        async fn join_same_batch_release(
+            &self,
+            join_effect_id: String,
+            correlation_id: Uuid,
+            batch_id: Uuid,
+            error: String,
+        ) -> Result<()> {
+            self.join_release_calls
+                .lock()
+                .push((join_effect_id.clone(), correlation_id, batch_id, error));
+            if let Some(window) = self
+                .join_windows
+                .lock()
+                .get_mut(&(join_effect_id, correlation_id, batch_id))
+            {
+                if window.status == JoinStatus::Processing {
+                    window.status = JoinStatus::Open;
+                }
+            }
+            Ok(())
+        }
     }
 
     fn queued_execution(effect_id: String) -> crate::QueuedEffectExecution {
@@ -536,11 +943,42 @@ mod tests {
             event_type: std::any::type_name::<Increment>().to_string(),
             event_payload: serde_json::json!({ "amount": 2 }),
             parent_event_id: None,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             execute_at: chrono::Utc::now(),
             timeout_seconds: 1,
             max_attempts: 3,
             priority: 10,
             attempts: 1,
+        }
+    }
+
+    fn queued_batch_execution(
+        effect_id: String,
+        correlation_id: Uuid,
+        batch_id: Uuid,
+        index: i32,
+        batch_size: i32,
+        attempts: i32,
+        max_attempts: i32,
+        ok: bool,
+    ) -> crate::QueuedEffectExecution {
+        crate::QueuedEffectExecution {
+            event_id: Uuid::new_v4(),
+            effect_id,
+            correlation_id,
+            event_type: std::any::type_name::<BatchItemResult>().to_string(),
+            event_payload: serde_json::json!(BatchItemResult { index, ok }),
+            parent_event_id: None,
+            batch_id: Some(batch_id),
+            batch_index: Some(index),
+            batch_size: Some(batch_size),
+            execute_at: chrono::Utc::now(),
+            timeout_seconds: 5,
+            max_attempts,
+            priority: 10,
+            attempts,
         }
     }
 
@@ -631,5 +1069,378 @@ mod tests {
         assert!(processed);
         assert_eq!(store.failed.lock().len(), 1);
         assert!(store.dlqed.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn effect_worker_join_same_batch_executes_once_on_closure() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<BatchJoinSummary>().into_queue(|state: TestState, _| state),
+        );
+
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls_clone = handler_calls.clone();
+        let effect = crate::effect::on::<BatchItemResult>()
+            .join()
+            .same_batch()
+            .then(
+                move |items: Vec<BatchItemResult>, _ctx: EffectContext<TestState, TestDeps>| {
+                    let handler_calls = handler_calls_clone.clone();
+                    async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        let failed = items.iter().filter(|item| !item.ok).count();
+                        Ok(BatchJoinSummary {
+                            total: items.len(),
+                            failed,
+                        })
+                    }
+                },
+            );
+        let effect_id = effect.id.clone();
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let correlation_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let executions = vec![
+            queued_batch_execution(
+                effect_id.clone(),
+                correlation_id,
+                batch_id,
+                0,
+                3,
+                1,
+                3,
+                true,
+            ),
+            queued_batch_execution(
+                effect_id.clone(),
+                correlation_id,
+                batch_id,
+                1,
+                3,
+                1,
+                3,
+                false,
+            ),
+            queued_batch_execution(
+                effect_id.clone(),
+                correlation_id,
+                batch_id,
+                2,
+                3,
+                1,
+                3,
+                true,
+            ),
+        ];
+
+        let store = Arc::new(TestStore::new(executions));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        );
+
+        while worker.process_next_effect().await.expect("process should succeed") {}
+
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.completed.lock().len(), 2);
+        assert_eq!(store.completed_with_events.lock().len(), 1);
+        assert_eq!(store.failed.lock().len(), 0);
+        assert_eq!(store.dlqed.lock().len(), 0);
+        assert_eq!(store.join_complete_calls.lock().len(), 1);
+        assert_eq!(store.join_release_calls.lock().len(), 0);
+
+        let emitted = &store.completed_with_events.lock()[0].2;
+        assert_eq!(emitted.len(), 1);
+        let payload = &emitted[0].payload;
+        assert_eq!(payload["total"], serde_json::json!(3));
+        assert_eq!(payload["failed"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn effect_worker_join_same_batch_releases_and_retries_after_handler_error() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<BatchJoinSummary>().into_queue(|state: TestState, _| state),
+        );
+
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls_clone = handler_calls.clone();
+        let effect = crate::effect::on::<BatchItemResult>()
+            .join()
+            .same_batch()
+            .then(
+                move |items: Vec<BatchItemResult>, _ctx: EffectContext<TestState, TestDeps>| {
+                    let handler_calls = handler_calls_clone.clone();
+                    async move {
+                        let call = handler_calls.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            anyhow::bail!("synthetic join failure");
+                        }
+                        Ok(BatchJoinSummary {
+                            total: items.len(),
+                            failed: items.iter().filter(|item| !item.ok).count(),
+                        })
+                    }
+                },
+            );
+        let effect_id = effect.id.clone();
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let correlation_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let first_item =
+            queued_batch_execution(effect_id.clone(), correlation_id, batch_id, 0, 2, 1, 2, true);
+        let retrying_item =
+            queued_batch_execution(effect_id.clone(), correlation_id, batch_id, 1, 2, 1, 2, false);
+        let mut retry_attempt = retrying_item.clone();
+        retry_attempt.attempts = 2;
+        retry_attempt.max_attempts = 2;
+
+        let store = Arc::new(TestStore::new(vec![first_item, retrying_item, retry_attempt]));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        );
+
+        while worker.process_next_effect().await.expect("process should succeed") {}
+
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.failed.lock().len(), 1);
+        assert_eq!(store.dlqed.lock().len(), 0);
+        assert_eq!(store.join_release_calls.lock().len(), 1);
+        assert_eq!(store.join_complete_calls.lock().len(), 1);
+        assert_eq!(store.completed_with_events.lock().len(), 1);
+
+        let payload = &store.completed_with_events.lock()[0].2[0].payload;
+        assert_eq!(payload["total"], serde_json::json!(2));
+        assert_eq!(payload["failed"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn effect_worker_join_same_batch_invalid_metadata_is_failed() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        let effect = crate::effect::on::<BatchItemResult>()
+            .join()
+            .same_batch()
+            .then(
+                |_items: Vec<BatchItemResult>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                    Ok(BatchJoinSummary {
+                        total: 0,
+                        failed: 0,
+                    })
+                },
+            );
+        let effect_id = effect.id.clone();
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let mut execution = queued_execution(effect_id);
+        execution.event_type = std::any::type_name::<BatchItemResult>().to_string();
+        execution.event_payload = serde_json::json!(BatchItemResult {
+            index: 0,
+            ok: true,
+        });
+        execution.attempts = 1;
+        execution.max_attempts = 3;
+        execution.batch_id = None;
+        execution.batch_index = Some(0);
+        execution.batch_size = Some(1);
+
+        let store = Arc::new(TestStore::new(vec![execution]));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        );
+
+        let processed = worker.process_next_effect().await.expect("process should succeed");
+        assert!(processed);
+        assert_eq!(store.failed.lock().len(), 1);
+        assert_eq!(store.dlqed.lock().len(), 0);
+        assert_eq!(store.join_release_calls.lock().len(), 0);
+        assert_eq!(store.join_complete_calls.lock().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn effect_worker_join_same_batch_stress_large_batch_closes_once() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<BatchJoinSummary>().into_queue(|state: TestState, _| state),
+        );
+
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls_clone = handler_calls.clone();
+        let effect = crate::effect::on::<BatchItemResult>()
+            .join()
+            .same_batch()
+            .then(
+                move |items: Vec<BatchItemResult>, _ctx: EffectContext<TestState, TestDeps>| {
+                    let handler_calls = handler_calls_clone.clone();
+                    async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(BatchJoinSummary {
+                            total: items.len(),
+                            failed: items.iter().filter(|item| !item.ok).count(),
+                        })
+                    }
+                },
+            );
+        let effect_id = effect.id.clone();
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let correlation_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let batch_size = 256i32;
+        let mut executions = Vec::with_capacity(batch_size as usize);
+        for index in 0..batch_size {
+            executions.push(queued_batch_execution(
+                effect_id.clone(),
+                correlation_id,
+                batch_id,
+                index,
+                batch_size,
+                1,
+                3,
+                index % 4 != 0,
+            ));
+        }
+
+        let store = Arc::new(TestStore::new(executions));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        );
+
+        let mut iterations = 0usize;
+        while worker.process_next_effect().await.expect("process should succeed") {
+            iterations += 1;
+        }
+        assert_eq!(iterations, batch_size as usize);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.completed.lock().len(), (batch_size - 1) as usize);
+        assert_eq!(store.completed_with_events.lock().len(), 1);
+        assert_eq!(store.join_complete_calls.lock().len(), 1);
+
+        let payload = &store.completed_with_events.lock()[0].2[0].payload;
+        assert_eq!(payload["total"], serde_json::json!(batch_size));
+        assert_eq!(payload["failed"], serde_json::json!(batch_size / 4));
+    }
+
+    #[tokio::test]
+    async fn effect_worker_emitted_batch_over_limit_is_failed() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effect = crate::effect::on::<Increment>().then_queue::<
+            TestState,
+            TestDeps,
+            Arc<Increment>,
+            _,
+            _,
+            Vec<Incremented>,
+            Incremented,
+        >(
+            |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                Ok((0..256)
+                    .map(|idx| Incremented { amount: idx })
+                    .collect::<Vec<_>>())
+            },
+        );
+        let effect_id = effect.id.clone();
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let execution = queued_execution(effect_id.clone());
+        let store = Arc::new(TestStore::new(vec![execution]));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig {
+                max_batch_size: 32,
+                ..EffectWorkerConfig::default()
+            },
+        );
+
+        let processed = worker
+            .process_next_effect()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+        assert_eq!(store.failed.lock().len(), 1);
+        assert!(store.dlqed.lock().is_empty());
+        assert!(store.completed.lock().is_empty());
+        assert!(store.completed_with_events.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn effect_worker_join_same_batch_over_limit_is_failed() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        let effect = crate::effect::on::<BatchItemResult>()
+            .join()
+            .same_batch()
+            .then(
+                |_items: Vec<BatchItemResult>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                    Ok(BatchJoinSummary {
+                        total: 0,
+                        failed: 0,
+                    })
+                },
+            );
+        let effect_id = effect.id.clone();
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let execution = queued_batch_execution(
+            effect_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            0,
+            256,
+            1,
+            3,
+            true,
+        );
+        let store = Arc::new(TestStore::new(vec![execution]));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig {
+                max_batch_size: 64,
+                ..EffectWorkerConfig::default()
+            },
+        );
+
+        let processed = worker
+            .process_next_effect()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+        assert_eq!(store.failed.lock().len(), 1);
+        assert!(store.dlqed.lock().is_empty());
+        assert!(store.join_complete_calls.lock().is_empty());
+        assert!(store.join_release_calls.lock().is_empty());
     }
 }

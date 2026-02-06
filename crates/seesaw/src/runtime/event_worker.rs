@@ -41,6 +41,8 @@ pub struct EventWorkerConfig {
     pub poll_interval: Duration,
     /// Maximum hop count before DLQ (infinite loop detection)
     pub max_hops: i32,
+    /// Maximum number of events an effect may emit in one batch
+    pub max_batch_size: usize,
 }
 
 impl Default for EventWorkerConfig {
@@ -48,6 +50,7 @@ impl Default for EventWorkerConfig {
         Self {
             poll_interval: Duration::from_millis(100),
             max_hops: 50,
+            max_batch_size: 10_000,
         }
     }
 }
@@ -238,6 +241,9 @@ where
                         event.event_type.clone(),
                         event.payload.clone(),
                         Some(event.event_id),
+                        event.batch_id,
+                        event.batch_index,
+                        event.batch_size,
                         execute_at,
                         timeout_seconds,
                         max_attempts,
@@ -307,7 +313,7 @@ where
             emitter,
         );
 
-        if let Some(output) = effect
+        for output in effect
             .call_handler(typed_event, event_type_id, ctx.clone())
             .await?
         {
@@ -316,7 +322,59 @@ where
 
         // tasks.wait_pending().await; // TODO: Re-enable when tasks tracking is implemented
         let drained = emissions.lock().drain(..).collect::<Vec<_>>();
-        for (type_id, event_any) in drained {
+        let emitted_count = drained.len();
+        if emitted_count > self.config.max_batch_size {
+            anyhow::bail!(
+                "inline effect '{}' emitted {} events, exceeding max_batch_size {}",
+                effect.id,
+                emitted_count,
+                self.config.max_batch_size
+            );
+        }
+        if emitted_count > i32::MAX as usize {
+            anyhow::bail!(
+                "inline effect '{}' emitted {} events, exceeding i32 batch metadata capacity",
+                effect.id,
+                emitted_count
+            );
+        }
+        let inherited_batch = if emitted_count == 1 {
+            match (
+                source_event.batch_id,
+                source_event.batch_index,
+                source_event.batch_size,
+            ) {
+                (Some(batch_id), Some(batch_index), Some(batch_size)) => {
+                    if batch_size <= 0
+                        || batch_index < 0
+                        || batch_index >= batch_size
+                        || batch_size as usize > self.config.max_batch_size
+                    {
+                        anyhow::bail!(
+                            "invalid inherited batch metadata: id={} index={} size={} max_batch_size={}",
+                            batch_id,
+                            batch_index,
+                            batch_size,
+                            self.config.max_batch_size
+                        );
+                    }
+                    Some((batch_id, batch_index, batch_size))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let emitted_batch_id = if emitted_count > 1 {
+            Some(Uuid::new_v5(
+                &NAMESPACE_SEESAW,
+                format!("{}-{}-batch", source_event.event_id, effect.id).as_bytes(),
+            ))
+        } else {
+            None
+        };
+
+        for (emitted_index, (type_id, event_any)) in drained.into_iter().enumerate() {
             let codec = self
                 .reducers
                 .find_codec_by_type_id(type_id)
@@ -333,8 +391,8 @@ where
             let event_id = Uuid::new_v5(
                 &NAMESPACE_SEESAW,
                 format!(
-                    "{}-{}-{}",
-                    source_event.event_id, effect.id, codec.event_type
+                    "{}-{}-{}-{}",
+                    source_event.event_id, effect.id, codec.event_type, emitted_index
                 )
                 .as_bytes(),
             );
@@ -344,6 +402,17 @@ where
                 .and_hms_opt(0, 0, 0)
                 .expect("midnight UTC should always be valid")
                 .and_utc();
+            let (batch_id, batch_index, batch_size) = if let Some(inherited) = inherited_batch {
+                (Some(inherited.0), Some(inherited.1), Some(inherited.2))
+            } else if emitted_count > 1 {
+                (
+                    emitted_batch_id,
+                    Some(emitted_index as i32),
+                    Some(emitted_count as i32),
+                )
+            } else {
+                (None, None, None)
+            };
 
             self.store
                 .publish(QueuedEvent {
@@ -354,6 +423,9 @@ where
                     event_type: codec.event_type.clone(),
                     payload,
                     hops: source_event.hops + 1,
+                    batch_id,
+                    batch_index,
+                    batch_size,
                     created_at,
                 })
                 .await?;
@@ -369,7 +441,7 @@ mod tests {
     use async_trait::async_trait;
     use futures::Stream;
     use parking_lot::Mutex;
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
 
     #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
     struct TestState {
@@ -394,12 +466,27 @@ mod tests {
         id: i32,
     }
 
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct FanOut {
+        count: usize,
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct FanOutItem {
+        index: i32,
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct BatchCarry {
+        marker: String,
+    }
+
     struct TestStore {
         queued_events: Mutex<VecDeque<QueuedEvent>>,
         acked_ids: Mutex<Vec<i64>>,
         nacked_ids: Mutex<Vec<i64>>,
         saved_states: Mutex<Vec<serde_json::Value>>,
-        effect_intents: Mutex<Vec<String>>,
+        effect_intents: Mutex<Vec<(String, Option<Uuid>, Option<i32>, Option<i32>)>>,
         published_events: Mutex<Vec<QueuedEvent>>,
     }
 
@@ -465,12 +552,17 @@ mod tests {
             _event_type: String,
             _event_payload: serde_json::Value,
             _parent_event_id: Option<Uuid>,
+            batch_id: Option<Uuid>,
+            batch_index: Option<i32>,
+            batch_size: Option<i32>,
             _execute_at: chrono::DateTime<chrono::Utc>,
             _timeout_seconds: i32,
             _max_attempts: i32,
             _priority: i32,
         ) -> Result<()> {
-            self.effect_intents.lock().push(effect_id);
+            self.effect_intents
+                .lock()
+                .push((effect_id, batch_id, batch_index, batch_size));
             Ok(())
         }
 
@@ -548,6 +640,9 @@ mod tests {
             event_type: std::any::type_name::<Increment>().to_string(),
             payload: serde_json::json!({ "amount": 2 }),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -561,6 +656,9 @@ mod tests {
             event_type: std::any::type_name::<EffectOnlyEvent>().to_string(),
             payload: serde_json::json!({ "id": 42 }),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -689,5 +787,258 @@ mod tests {
         assert!(processed);
         assert_eq!(store.effect_intents.lock().len(), 1);
         assert_eq!(*store.acked_ids.lock(), vec![event.id]);
+    }
+
+    #[tokio::test]
+    async fn event_worker_inline_batch_emit_stress_generates_unique_ids_and_batch_metadata() {
+        let source = QueuedEvent {
+            id: 99,
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: std::any::type_name::<FanOut>().to_string(),
+            payload: serde_json::json!(FanOut { count: 256 }),
+            hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: chrono::Utc::now(),
+        };
+        let store = Arc::new(TestStore::new(vec![source.clone()]));
+
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<FanOut>().into_queue(|state: TestState, _event| state),
+        );
+        reducers.register(
+            crate::reducer::fold::<FanOutItem>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(
+            crate::effect::on::<FanOut>().then_queue::<
+                TestState,
+                TestDeps,
+                Arc<FanOut>,
+                _,
+                _,
+                Vec<FanOutItem>,
+                FanOutItem,
+            >(
+                |event: Arc<FanOut>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                    Ok((0..event.count)
+                        .map(|index| FanOutItem {
+                            index: index as i32,
+                        })
+                        .collect::<Vec<_>>())
+                },
+            ),
+        );
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+
+        let published = store.published_events.lock();
+        assert_eq!(published.len(), 256);
+        let batch_id = published[0].batch_id.expect("batch_id should be set");
+        let mut ids = HashSet::new();
+        let mut indexes = HashSet::new();
+        for event in published.iter() {
+            assert!(ids.insert(event.event_id), "event IDs should be unique");
+            assert_eq!(event.batch_id, Some(batch_id));
+            assert_eq!(event.batch_size, Some(256));
+            let index = event.batch_index.expect("batch_index should be present");
+            assert!(indexes.insert(index), "batch indexes should be unique");
+            assert!(index >= 0 && index < 256);
+        }
+        assert_eq!(indexes.len(), 256);
+        assert_eq!(*store.acked_ids.lock(), vec![source.id]);
+    }
+
+    #[tokio::test]
+    async fn event_worker_inline_batch_emit_over_limit_is_nacked() {
+        let source = QueuedEvent {
+            id: 102,
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: std::any::type_name::<FanOut>().to_string(),
+            payload: serde_json::json!(FanOut { count: 256 }),
+            hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: chrono::Utc::now(),
+        };
+        let store = Arc::new(TestStore::new(vec![source.clone()]));
+
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<FanOut>().into_queue(|state: TestState, _event| state),
+        );
+        reducers.register(
+            crate::reducer::fold::<FanOutItem>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(
+            crate::effect::on::<FanOut>().then_queue::<
+                TestState,
+                TestDeps,
+                Arc<FanOut>,
+                _,
+                _,
+                Vec<FanOutItem>,
+                FanOutItem,
+            >(
+                |event: Arc<FanOut>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                    Ok((0..event.count)
+                        .map(|index| FanOutItem {
+                            index: index as i32,
+                        })
+                        .collect::<Vec<_>>())
+                },
+            ),
+        );
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig {
+                max_batch_size: 32,
+                ..EventWorkerConfig::default()
+            },
+        );
+
+        let result = worker.process_next_event().await;
+        assert!(result.is_err(), "oversized inline batch should fail");
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("max_batch_size"),
+            "error should mention max_batch_size, got: {}",
+            error
+        );
+        assert_eq!(*store.nacked_ids.lock(), vec![source.id]);
+        assert!(store.acked_ids.lock().is_empty());
+        assert!(store.published_events.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_worker_inline_single_emit_inherits_incoming_batch_metadata() {
+        let incoming_batch_id = Uuid::new_v4();
+        let source = QueuedEvent {
+            id: 100,
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: std::any::type_name::<BatchCarry>().to_string(),
+            payload: serde_json::json!(BatchCarry {
+                marker: "in".to_string(),
+            }),
+            hops: 0,
+            batch_id: Some(incoming_batch_id),
+            batch_index: Some(7),
+            batch_size: Some(42),
+            created_at: chrono::Utc::now(),
+        };
+        let store = Arc::new(TestStore::new(vec![source.clone()]));
+
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<BatchCarry>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(crate::effect::on::<BatchCarry>().then_queue(
+            |_event: Arc<BatchCarry>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                Ok(BatchCarry {
+                    marker: "out".to_string(),
+                })
+            },
+        ));
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+
+        let published = store.published_events.lock();
+        assert_eq!(published.len(), 1);
+        let emitted = &published[0];
+        assert_eq!(emitted.batch_id, Some(incoming_batch_id));
+        assert_eq!(emitted.batch_index, Some(7));
+        assert_eq!(emitted.batch_size, Some(42));
+    }
+
+    #[tokio::test]
+    async fn event_worker_passes_batch_metadata_to_queued_effect_intent() {
+        let event = QueuedEvent {
+            id: 101,
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: std::any::type_name::<Increment>().to_string(),
+            payload: serde_json::json!({ "amount": 1 }),
+            hops: 0,
+            batch_id: Some(Uuid::new_v4()),
+            batch_index: Some(3),
+            batch_size: Some(10),
+            created_at: chrono::Utc::now(),
+        };
+        let store = Arc::new(TestStore::new(vec![event.clone()]));
+
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(crate::reducer::fold::<Increment>().into_queue(
+            |state: TestState, event| TestState {
+                count: state.count + event.amount,
+            },
+        ));
+
+        let effects = Arc::new(EffectRegistry::new());
+        let queued_effect = crate::effect::on::<Increment>().queued().then_queue(
+            |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async { Ok(()) },
+        );
+        effects.register(queued_effect);
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+
+        let intents = store.effect_intents.lock();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].1, event.batch_id);
+        assert_eq!(intents[0].2, event.batch_index);
+        assert_eq!(intents[0].3, event.batch_size);
     }
 }

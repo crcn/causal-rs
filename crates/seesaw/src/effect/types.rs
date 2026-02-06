@@ -21,6 +21,55 @@ pub type ErrorHandler<S, D> =
 /// A boxed future for async effect handlers.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
+/// Event emission result from effect handlers.
+#[derive(Debug, Clone)]
+pub enum Emit<E> {
+    None,
+    One(E),
+    Batch(Vec<E>),
+}
+
+impl<E> Emit<E> {
+    pub fn into_vec(self) -> Vec<E> {
+        match self {
+            Emit::None => Vec::new(),
+            Emit::One(event) => vec![event],
+            Emit::Batch(events) => events,
+        }
+    }
+}
+
+impl<E> From<E> for Emit<E> {
+    fn from(value: E) -> Self {
+        Emit::One(value)
+    }
+}
+
+impl<E> From<Option<E>> for Emit<E> {
+    fn from(value: Option<E>) -> Self {
+        match value {
+            Some(event) => Emit::One(event),
+            None => Emit::None,
+        }
+    }
+}
+
+impl<E> From<Vec<E>> for Emit<E> {
+    fn from(value: Vec<E>) -> Self {
+        match value.len() {
+            0 => Emit::None,
+            1 => Emit::One(value.into_iter().next().expect("len checked above")),
+            _ => Emit::Batch(value),
+        }
+    }
+}
+
+/// Join mode for queued batch fan-in effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinMode {
+    SameBatch,
+}
+
 /// Output from an effect handler that returns an event.
 ///
 /// Used by `.then()` effects to return events for dispatch by the engine.
@@ -108,17 +157,31 @@ where
 
     /// Called for each event that passes `can_handle`.
     /// Receives the type-erased event, its TypeId, and the effect context.
-    /// Returns `Option<EventOutput>`:
-    /// - `None`: Effect completed, no event to dispatch (observer pattern)
-    /// - `Some(EventOutput)`: Effect completed, dispatch this event
+    /// Returns a list of events to dispatch (possibly empty).
     pub(crate) handler: Arc<
         dyn Fn(
                 Arc<dyn Any + Send + Sync>,
                 TypeId,
                 EffectContext<S, D>,
-            ) -> BoxFuture<Result<Option<EventOutput>>>
+            ) -> BoxFuture<Result<Vec<EventOutput>>>
             + Send
             + Sync,
+    >,
+
+    /// Optional join mode - when set, effect executions are accumulated and
+    /// flushed in durable windows before invoking `join_batch_handler`.
+    pub(crate) join_mode: Option<JoinMode>,
+
+    /// Optional batch handler for join modes.
+    pub(crate) join_batch_handler: Option<
+        Arc<
+            dyn Fn(
+                    Vec<Arc<dyn Any + Send + Sync>>,
+                    EffectContext<S, D>,
+                ) -> BoxFuture<Result<Vec<EventOutput>>>
+                + Send
+                + Sync,
+        >,
     >,
 
     // Execution configuration (determines inline vs queued)
@@ -146,6 +209,8 @@ where
             can_handle: self.can_handle.clone(),
             started: self.started.clone(),
             handler: self.handler.clone(),
+            join_mode: self.join_mode,
+            join_batch_handler: self.join_batch_handler.clone(),
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -175,14 +240,27 @@ where
     }
 
     /// Call the event handler.
-    /// Returns `Option<EventOutput>` - if `Some`, the engine should dispatch the returned event.
+    /// Returns the emitted events (possibly empty).
     pub async fn call_handler(
         &self,
         value: Arc<dyn Any + Send + Sync>,
         type_id: TypeId,
         ctx: EffectContext<S, D>,
-    ) -> Result<Option<EventOutput>> {
+    ) -> Result<Vec<EventOutput>> {
         (self.handler)(value, type_id, ctx).await
+    }
+
+    /// Call the join batch handler if configured.
+    pub async fn call_join_batch_handler(
+        &self,
+        values: Vec<Arc<dyn Any + Send + Sync>>,
+        ctx: EffectContext<S, D>,
+    ) -> Result<Vec<EventOutput>> {
+        if let Some(handler) = &self.join_batch_handler {
+            handler(values, ctx).await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Internal queue codec metadata.

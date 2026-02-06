@@ -1,8 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
+use futures::StreamExt;
 use seesaw_core::{EmittedEvent, QueuedEvent, Store, NAMESPACE_SEESAW};
 use seesaw_postgres::PostgresStore;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
@@ -63,6 +65,9 @@ async fn test_publish_and_poll() -> Result<()> {
         event_type: "TestEvent".to_string(),
         payload: serde_json::json!({"data": "test"}),
         hops: 0,
+        batch_id: None,
+        batch_index: None,
+        batch_size: None,
         created_at: Utc::now(),
     };
 
@@ -99,6 +104,9 @@ async fn test_idempotent_publish() -> Result<()> {
         event_type: "TestEvent".to_string(),
         payload: serde_json::json!({"data": "test"}),
         hops: 0,
+        batch_id: None,
+        batch_index: None,
+        batch_size: None,
         created_at: Utc::now(),
     };
 
@@ -135,6 +143,9 @@ async fn test_per_workflow_fifo_ordering() -> Result<()> {
             event_type: format!("Event{}", i),
             payload: serde_json::json!({"order": i}),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: Utc::now(),
         };
         db.store.publish(event).await?;
@@ -167,6 +178,9 @@ async fn test_skip_locked_concurrent_workers() -> Result<()> {
                 event_type: format!("Event{}", i),
                 payload: serde_json::json!({}),
                 hops: 0,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
                 created_at: Utc::now(),
             })
             .await?;
@@ -221,6 +235,9 @@ async fn test_ack_and_nack() -> Result<()> {
         event_type: "TestEvent".to_string(),
         payload: serde_json::json!({}),
         hops: 0,
+        batch_id: None,
+        batch_index: None,
+        batch_size: None,
         created_at: Utc::now(),
     };
 
@@ -263,6 +280,9 @@ async fn test_poll_next_claims_event_until_ack_or_nack() -> Result<()> {
         event_type: "ClaimedEvent".to_string(),
         payload: serde_json::json!({}),
         hops: 0,
+        batch_id: None,
+        batch_index: None,
+        batch_size: None,
         created_at: Utc::now(),
     };
 
@@ -310,6 +330,9 @@ async fn test_publish_deduplicates_event_id_even_with_different_timestamps() -> 
             event_type: "WebhookReceived".to_string(),
             payload: serde_json::json!({ "attempt": 1 }),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: base_time,
         })
         .await?;
@@ -323,6 +346,9 @@ async fn test_publish_deduplicates_event_id_even_with_different_timestamps() -> 
             event_type: "WebhookReceived".to_string(),
             payload: serde_json::json!({ "attempt": 2 }),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: base_time + chrono::Duration::seconds(1),
         })
         .await?;
@@ -441,6 +467,9 @@ async fn test_insert_and_poll_effect() -> Result<()> {
             "TestEvent".to_string(),
             serde_json::json!({"data": "test"}),
             None,
+            None,
+            None,
+            None,
             Utc::now(),
             30,
             3,
@@ -475,6 +504,9 @@ async fn test_effect_priority_ordering() -> Result<()> {
                 "TestEvent".to_string(),
                 serde_json::json!({}),
                 None,
+                None,
+                None,
+                None,
                 Utc::now(),
                 30,
                 3,
@@ -505,6 +537,9 @@ async fn test_complete_effect() -> Result<()> {
             Uuid::new_v4(),
             "TestEvent".to_string(),
             serde_json::json!({}),
+            None,
+            None,
+            None,
             None,
             Utc::now(),
             30,
@@ -543,6 +578,9 @@ async fn test_fail_effect_schedules_retry() -> Result<()> {
             correlation_id,
             "TestEvent".to_string(),
             serde_json::json!({}),
+            None,
+            None,
+            None,
             None,
             Utc::now(),
             30,
@@ -603,6 +641,9 @@ async fn test_fail_and_dlq_effect() -> Result<()> {
             "TestEvent".to_string(),
             serde_json::json!({}),
             None,
+            None,
+            None,
+            None,
             Utc::now(),
             30,
             1, // max_attempts
@@ -653,6 +694,9 @@ async fn test_get_workflow_status_uses_correlation_id_columns() -> Result<()> {
             event_type: "StatusEvent".to_string(),
             payload: serde_json::json!({}),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: Utc::now(),
         })
         .await?;
@@ -686,6 +730,9 @@ async fn test_complete_event_workflow() -> Result<()> {
             event_type: "OrderPlaced".to_string(),
             payload: serde_json::json!({"order_id": 123}),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: Utc::now(),
         })
         .await?;
@@ -709,6 +756,9 @@ async fn test_complete_event_workflow() -> Result<()> {
             correlation_id,
             "OrderPlaced".to_string(),
             event.payload.clone(),
+            None,
+            None,
+            None,
             None,
             Utc::now(),
             30,
@@ -760,6 +810,9 @@ async fn test_concurrent_workflow_processing() -> Result<()> {
                     event_type: format!("Event{}", i),
                     payload: serde_json::json!({}),
                     hops: 0,
+                    batch_id: None,
+                    batch_index: None,
+                    batch_size: None,
                     created_at: Utc::now(),
                 })
                 .await?;
@@ -797,6 +850,9 @@ async fn test_deterministic_event_emission() -> Result<()> {
             event_type: "OrderPlaced".to_string(),
             payload: serde_json::json!({ "order_id": 123 }),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             created_at: parent_created_at,
         })
         .await?;
@@ -810,6 +866,9 @@ async fn test_deterministic_event_emission() -> Result<()> {
             "OrderPlaced".to_string(),
             serde_json::json!({ "order_id": 123 }),
             None,
+            None,
+            None,
+            None,
             Utc::now(),
             30,
             3,
@@ -822,10 +881,16 @@ async fn test_deterministic_event_emission() -> Result<()> {
         EmittedEvent {
             event_type: "PaymentCharged".to_string(),
             payload: serde_json::json!({ "order_id": 123, "amount": 99.99 }),
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
         },
         EmittedEvent {
             event_type: "EmailQueued".to_string(),
             payload: serde_json::json!({ "order_id": 123, "template": "receipt" }),
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
         },
     ];
 
@@ -946,5 +1011,104 @@ async fn test_deterministic_event_emission() -> Result<()> {
         "All events should have been processed"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_workflow_subscription_coalesced_notify_stress_drains_all_events() -> Result<()> {
+    let db = TestDb::new().await?;
+    let correlation_id = Uuid::new_v4();
+    let parent_event_id = Uuid::new_v4();
+    let effect_id = "notify_stress_effect".to_string();
+
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id: parent_event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: "FanOutRoot".to_string(),
+            payload: serde_json::json!({ "root": true }),
+            hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: Utc::now(),
+        })
+        .await?;
+
+    db.store
+        .insert_effect_intent(
+            parent_event_id,
+            effect_id.clone(),
+            correlation_id,
+            "FanOutRoot".to_string(),
+            serde_json::json!({ "root": true }),
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+            30,
+            3,
+            10,
+        )
+        .await?;
+
+    // Start subscription after existing rows are present. The stream should
+    // emit only events created after this subscribe call.
+    let mut stream = db.store.subscribe_workflow_events(correlation_id).await?;
+
+    // Ack the root event so the queue remains focused on emitted stress events.
+    let root_event = db.store.poll_next().await?.expect("root event should exist");
+    assert_eq!(root_event.event_id, parent_event_id);
+    db.store.ack(root_event.id).await?;
+
+    const FAN_OUT_SIZE: usize = 700; // > paging size to exercise cursor paging.
+    let emitted_events = (0..FAN_OUT_SIZE)
+        .map(|index| EmittedEvent {
+            event_type: "StressItem".to_string(),
+            payload: serde_json::json!({ "index": index }),
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+        })
+        .collect::<Vec<_>>();
+
+    db.store
+        .complete_effect_with_events(
+            parent_event_id,
+            effect_id,
+            serde_json::json!({ "status": "ok" }),
+            emitted_events,
+        )
+        .await?;
+
+    let mut received_indexes = HashSet::with_capacity(FAN_OUT_SIZE);
+    while received_indexes.len() < FAN_OUT_SIZE {
+        let maybe_event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            stream.next(),
+        )
+        .await
+        .expect("timed out waiting for stress workflow event");
+        let event = maybe_event.expect("workflow stream ended unexpectedly");
+
+        if event.event_type != "StressItem" {
+            continue;
+        }
+
+        let index = event.payload["index"]
+            .as_u64()
+            .expect("StressItem payload should contain numeric index")
+            as usize;
+        assert!(
+            received_indexes.insert(index),
+            "duplicate StressItem index received: {}",
+            index
+        );
+    }
+
+    assert_eq!(received_indexes.len(), FAN_OUT_SIZE);
     Ok(())
 }

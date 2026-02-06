@@ -92,6 +92,9 @@ impl<St: Store> ProcessFuture<St> {
                         event_type,
                         payload,
                         hops,
+                        batch_id: None,
+                        batch_index: None,
+                        batch_size: None,
                         created_at: chrono::Utc::now(),
                     };
                     store.publish(queued_event).await?;
@@ -152,6 +155,9 @@ impl<St: Store> Future for ProcessFuture<St> {
                         event_type: this.event_type.clone(),
                         payload: this.payload.clone(),
                         hops: this.hops,
+                        batch_id: None,
+                        batch_index: None,
+                        batch_size: None,
                         created_at: chrono::Utc::now(),
                     };
 
@@ -373,6 +379,9 @@ mod tests {
             _event_type: String,
             _event_payload: serde_json::Value,
             _parent_event_id: Option<Uuid>,
+            _batch_id: Option<Uuid>,
+            _batch_index: Option<i32>,
+            _batch_size: Option<i32>,
             _execute_at: chrono::DateTime<chrono::Utc>,
             _timeout_seconds: i32,
             _max_attempts: i32,

@@ -19,6 +19,9 @@ CREATE TABLE seesaw_events (
     event_type VARCHAR(255) NOT NULL,
     payload JSONB NOT NULL,
     hops INT NOT NULL DEFAULT 0,     -- Infinite loop protection (DLQ after 50)
+    batch_id UUID,                   -- Same-batch fan-in token
+    batch_index INT,                 -- 0-based position in emitted batch
+    batch_size INT,                  -- total items in emitted batch
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed_at TIMESTAMPTZ,        -- NULL = pending, set when complete
     locked_until TIMESTAMPTZ,        -- For retry backoff
@@ -48,17 +51,13 @@ COMMENT ON COLUMN seesaw_events.correlation_id IS 'Envelope metadata - groups re
 
 -- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
 -- Enables engine.process(event).wait::<TerminalEvent>().await
--- Note: Payload omitted - pg_notify has 8000-byte limit, notification is just a wake-up signal
+-- Uses a constant payload so notifications can be coalesced per transaction.
 CREATE OR REPLACE FUNCTION notify_workflow_event()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify(
         'seesaw_workflow_' || NEW.correlation_id::text,
-        json_build_object(
-            'event_id', NEW.event_id,
-            'correlation_id', NEW.correlation_id,
-            'event_type', NEW.event_type
-        )::text
+        'wake'
     );
     RETURN NEW;
 END;
@@ -69,7 +68,7 @@ CREATE TRIGGER seesaw_events_notify
     FOR EACH ROW
     EXECUTE FUNCTION notify_workflow_event();
 
-COMMENT ON FUNCTION notify_workflow_event IS 'Push notification for wait() pattern - enables CQRS without polling';
+COMMENT ON FUNCTION notify_workflow_event IS 'Push wake-up notification for wait() pattern; consumers fetch new rows by cursor';
 
 -- Create initial partitions (daily partitions - must create before inserts)
 -- In production, automate partition creation (cron job or pg_partman)
@@ -132,6 +131,9 @@ CREATE TABLE seesaw_effect_executions (
     event_type VARCHAR(255) NOT NULL,
     event_payload JSONB NOT NULL,    -- Copied from seesaw_events for delayed effects
     parent_event_id UUID,
+    batch_id UUID,
+    batch_index INT,
+    batch_size INT,
 
     -- Execution properties (from effect builder)
     execute_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- When to execute (.delayed())
@@ -171,6 +173,47 @@ WHERE status = 'failed';
 COMMENT ON TABLE seesaw_effect_executions IS 'Effect intents - created by event workers, executed by effect workers';
 COMMENT ON COLUMN seesaw_effect_executions.event_payload IS 'Event data copied here - survives parent event deletion after 30 days';
 COMMENT ON COLUMN seesaw_effect_executions.priority IS 'Worker polling priority - lower number = higher priority';
+
+-- ============================================================
+-- Join Tables (same-batch durable fan-in)
+-- ============================================================
+
+CREATE TABLE seesaw_join_entries (
+    join_effect_id VARCHAR(255) NOT NULL,
+    correlation_id UUID NOT NULL,
+    source_event_id UUID NOT NULL,
+    source_event_type VARCHAR(255) NOT NULL,
+    source_payload JSONB NOT NULL,
+    source_created_at TIMESTAMPTZ NOT NULL,
+    batch_id UUID NOT NULL,
+    batch_index INT NOT NULL,
+    batch_size INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (join_effect_id, correlation_id, source_event_id),
+    UNIQUE (join_effect_id, correlation_id, batch_id, batch_index)
+);
+
+CREATE INDEX idx_join_entries_window
+ON seesaw_join_entries(join_effect_id, correlation_id, batch_id, batch_index);
+
+CREATE TABLE seesaw_join_windows (
+    join_effect_id VARCHAR(255) NOT NULL,
+    correlation_id UUID NOT NULL,
+    mode VARCHAR(50) NOT NULL DEFAULT 'same_batch',
+    batch_id UUID NOT NULL,
+    target_count INT NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'open', -- open, processing, completed
+    sealed_at TIMESTAMPTZ,
+    processing_started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (join_effect_id, correlation_id, batch_id)
+);
+
+CREATE INDEX idx_join_windows_status
+ON seesaw_join_windows(status, updated_at DESC);
 
 -- ============================================================
 -- Dead Letter Queue

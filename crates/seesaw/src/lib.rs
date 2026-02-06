@@ -71,12 +71,8 @@ mod process;
 mod reducer_registry;
 mod task_group;
 
-// OpenTelemetry integration
-#[cfg(feature = "otel")]
-pub mod otel;
-
 // Re-export main types
-pub use effect::{AnyEvent, Effect, EffectContext, EffectError};
+pub use effect::{AnyEvent, Effect, EffectContext, EffectError, Emit, JoinMode};
 pub use engine_v2::Engine;
 pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
 pub use reducer::Reducer;
@@ -85,8 +81,8 @@ pub use insight::{
     EffectNode, EventNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,
 };
 pub use store::{
-    EmittedEvent, QueuedEffectExecution, QueuedEvent, WorkflowEvent, Store, WorkflowStatus,
-    NAMESPACE_SEESAW,
+    EmittedEvent, JoinEntry, QueuedEffectExecution, QueuedEvent, Store, WorkflowEvent,
+    WorkflowStatus, NAMESPACE_SEESAW,
 };
 pub use task_group::TaskGroup;
 

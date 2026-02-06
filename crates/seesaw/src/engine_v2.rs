@@ -129,22 +129,22 @@ where
     }
 
     /// Get store reference (for workers)
-    pub fn store(&self) -> &Arc<St> {
+    pub(crate) fn store(&self) -> &Arc<St> {
         &self.store
     }
 
     /// Get deps reference (for workers)
-    pub fn deps(&self) -> &Arc<D> {
+    pub(crate) fn deps(&self) -> &Arc<D> {
         &self.deps
     }
 
     /// Get reducers (for event workers)
-    pub fn reducers(&self) -> &Arc<ReducerRegistry<S>> {
+    pub(crate) fn reducers(&self) -> &Arc<ReducerRegistry<S>> {
         &self.reducers
     }
 
     /// Get effects (for event workers)
-    pub fn effects(&self) -> &Arc<EffectRegistry<S, D>> {
+    pub(crate) fn effects(&self) -> &Arc<EffectRegistry<S, D>> {
         &self.effects
     }
 }

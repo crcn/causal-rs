@@ -50,9 +50,7 @@ mod tests {
     use super::*;
 
     #[derive(Clone, Debug)]
-    struct TestEvent {
-        id: u32,
-    }
+    struct TestEvent;
 
     #[derive(Debug, thiserror::Error)]
     #[error("custom error: {message}")]
@@ -62,7 +60,7 @@ mod tests {
 
     #[test]
     fn test_effect_error_creation() {
-        let event = TestEvent { id: 42 };
+        let event = TestEvent;
         let error = anyhow::anyhow!("test error");
 
         let effect_error =
@@ -74,7 +72,7 @@ mod tests {
 
     #[test]
     fn test_downcast_success() {
-        let event = TestEvent { id: 42 };
+        let event = TestEvent;
         let custom_error = CustomError {
             message: "specific error".to_string(),
         };
@@ -90,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_downcast_failure() {
-        let event = TestEvent { id: 42 };
+        let event = TestEvent;
         let error = anyhow::anyhow!("generic error");
 
         let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
@@ -102,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_debug_formatting() {
-        let event = TestEvent { id: 42 };
+        let event = TestEvent;
         let error = anyhow::anyhow!("formatting test");
 
         let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
@@ -114,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_clone() {
-        let event = TestEvent { id: 42 };
+        let event = TestEvent;
         let error = anyhow::anyhow!("clone test");
 
         let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);

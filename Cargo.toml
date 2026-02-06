@@ -6,6 +6,7 @@ members = [
     "examples/ai-summarizer",
     "examples/workflow-status",
     "examples/insight-demo",
+    "examples/batch-processor",
     "crates/seesaw-postgres",
     "crates/seesaw-insight",
     "crates/seesaw-memory",
@@ -13,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 authors = ["Crispin Read <crispin@crispinread.com>"]

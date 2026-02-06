@@ -441,6 +441,19 @@ mod tests {
         )
     }
 
+    fn assert_result_event_id(output: &crate::effect::EventOutput, expected_id: u64) {
+        let event = output
+            .value
+            .downcast_ref::<TestEvent>()
+            .expect("output should contain TestEvent");
+        match event {
+            TestEvent::ResultA { id } | TestEvent::ResultC { id } => {
+                assert_eq!(*id, expected_id);
+            }
+            other => panic!("expected ResultA/ResultC output, got {other:?}"),
+        }
+    }
+
     // ============================================================
     // New syntax tests: Event::Variant { ... } => ...
     // ============================================================
@@ -508,9 +521,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_some());
-        let output = result.unwrap();
+        assert_eq!(result.len(), 1);
+        let output = &result[0];
         assert_eq!(output.type_id, TypeId::of::<TestEvent>());
+        assert_result_event_id(output, 42);
     }
 
     #[tokio::test]
@@ -539,7 +553,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_some());
+        assert_eq!(result.len(), 1);
+        assert_result_event_id(&result[0], 99);
     }
 
     #[tokio::test]
@@ -568,7 +583,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_some());
+        assert_eq!(result.len(), 1);
+        assert_result_event_id(&result[0], 123);
     }
 
     #[test]
@@ -669,9 +685,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_some());
-        let output = result.unwrap();
+        assert_eq!(result.len(), 1);
+        let output = &result[0];
         assert_eq!(output.type_id, TypeId::of::<TestEvent>());
+        assert_result_event_id(output, 42);
     }
 
     #[tokio::test]
@@ -700,7 +717,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_some());
+        assert_eq!(result.len(), 1);
+        assert_result_event_id(&result[0], 99);
     }
 
     #[tokio::test]
@@ -729,7 +747,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_some());
+        assert_eq!(result.len(), 1);
+        assert_result_event_id(&result[0], 123);
     }
 
     #[test]
