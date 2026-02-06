@@ -15,8 +15,8 @@ use crate::event_codec::EventCodec;
 ///
 /// The handler receives the error, event type that caused it, and context.
 /// It can emit failure events or log the error. The chain continues regardless.
-pub type ErrorHandler<S, D> =
-    Arc<dyn Fn(Error, TypeId, EffectContext<S, D>) -> BoxFuture<()> + Send + Sync>;
+pub type ErrorHandler<D> =
+    Arc<dyn Fn(Error, TypeId, EffectContext<D>) -> BoxFuture<()> + Send + Sync>;
 
 /// Metadata passed to DLQ terminal mappers when an effect exhausts retries.
 #[derive(Debug, Clone)]
@@ -90,9 +90,6 @@ pub enum JoinMode {
 }
 
 /// Output from an effect handler that returns an event.
-///
-/// Used by `.then()` effects to return events for dispatch by the engine.
-/// The event is type-erased but includes its TypeId for proper routing.
 #[derive(Clone)]
 pub struct EventOutput {
     /// The TypeId of the event type.
@@ -150,38 +147,29 @@ impl AnyEvent {
 }
 
 /// An effect handler - no traits, just data with closures.
-///
-/// Effects react to events and can perform side effects like I/O,
-/// and optionally return new events for dispatch.
-pub struct Effect<S, D>
+pub struct Effect<D>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     /// Human-readable identifier for this effect.
-    /// Used for debugging, tracing, and the `produced_by` field in event envelopes.
     pub id: String,
 
     /// Queue codec metadata for typed event handling/serialization.
     pub(crate) codecs: Vec<std::sync::Arc<EventCodec>>,
 
     /// Determines if this effect handles the given event type.
-    /// Returns true if this effect should receive events of the given TypeId.
     pub(crate) can_handle: Arc<dyn Fn(TypeId) -> bool + Send + Sync>,
 
     /// Called once when the store is activated.
-    /// Used for setup, spawning background tasks, etc.
     pub(crate) started:
-        Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>>,
+        Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>,
 
     /// Called for each event that passes `can_handle`.
-    /// Receives the type-erased event, its TypeId, and the effect context.
-    /// Returns a list of events to dispatch (possibly empty).
     pub(crate) handler: Arc<
         dyn Fn(
                 Arc<dyn Any + Send + Sync>,
                 TypeId,
-                EffectContext<S, D>,
+                EffectContext<D>,
             ) -> BoxFuture<Result<Vec<EventOutput>>>
             + Send
             + Sync,
@@ -196,7 +184,7 @@ where
         Arc<
             dyn Fn(
                     Vec<Arc<dyn Any + Send + Sync>>,
-                    EffectContext<S, D>,
+                    EffectContext<D>,
                 ) -> BoxFuture<Result<Vec<EventOutput>>>
                 + Send
                 + Sync,
@@ -219,9 +207,8 @@ where
     pub(crate) priority: Option<i32>,
 }
 
-impl<S, D> Clone for Effect<S, D>
+impl<D> Clone for Effect<D>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
@@ -243,9 +230,8 @@ where
     }
 }
 
-impl<S, D> Effect<S, D>
+impl<D> Effect<D>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     /// Check if this effect handles the given event type.
@@ -254,7 +240,7 @@ where
     }
 
     /// Call the started handler if present.
-    pub async fn call_started(&self, ctx: EffectContext<S, D>) -> Result<()> {
+    pub async fn call_started(&self, ctx: EffectContext<D>) -> Result<()> {
         if let Some(ref started) = self.started {
             started(ctx).await
         } else {
@@ -263,12 +249,11 @@ where
     }
 
     /// Call the event handler.
-    /// Returns the emitted events (possibly empty).
     pub async fn call_handler(
         &self,
         value: Arc<dyn Any + Send + Sync>,
         type_id: TypeId,
-        ctx: EffectContext<S, D>,
+        ctx: EffectContext<D>,
     ) -> Result<Vec<EventOutput>> {
         (self.handler)(value, type_id, ctx).await
     }
@@ -277,7 +262,7 @@ where
     pub async fn call_join_batch_handler(
         &self,
         values: Vec<Arc<dyn Any + Send + Sync>>,
-        ctx: EffectContext<S, D>,
+        ctx: EffectContext<D>,
     ) -> Result<Vec<EventOutput>> {
         if let Some(handler) = &self.join_batch_handler {
             handler(values, ctx).await
@@ -291,14 +276,7 @@ where
         &self.codecs
     }
 
-    /// Check if this effect should execute inline (in same transaction as event processing)
-    ///
-    /// Effects are inline by default. They become queued if:
-    /// - `.queued()` was explicitly set
-    /// - `.delayed()` was set
-    /// - `.timeout()` was set
-    /// - `.retry()` was set with attempts > 1
-    /// - `.priority()` was set
+    /// Check if this effect should execute inline.
     pub fn is_inline(&self) -> bool {
         !self.queued
             && self.delay.is_none()
@@ -320,27 +298,36 @@ mod tests {
             type_id: TypeId::of::<i32>(),
         };
 
-        assert!(event.is::<i32>());
-        assert!(!event.is::<String>());
-
         let downcasted = event.downcast::<i32>();
         assert!(downcasted.is_some());
         assert_eq!(*downcasted.unwrap(), 42);
-
-        let wrong_type = event.downcast::<String>();
-        assert!(wrong_type.is_none());
+        assert!(event.is::<i32>());
+        assert!(!event.is::<String>());
     }
 
     #[test]
-    fn test_any_event_downcast_ref() {
-        let value: Arc<dyn Any + Send + Sync> = Arc::new("hello".to_string());
-        let event = AnyEvent {
-            value,
-            type_id: TypeId::of::<String>(),
-        };
+    fn test_emit_conversions() {
+        let none: Emit<i32> = Emit::None;
+        assert_eq!(none.into_vec().len(), 0);
 
-        let downcasted = event.downcast_ref::<String>();
-        assert!(downcasted.is_some());
-        assert_eq!(downcasted.unwrap(), "hello");
+        let one: Emit<i32> = 42.into();
+        assert_eq!(one.into_vec(), vec![42]);
+
+        let opt_some: Emit<i32> = Some(42).into();
+        assert_eq!(opt_some.into_vec(), vec![42]);
+
+        let opt_none: Emit<i32> = Option::<i32>::None.into();
+        assert_eq!(opt_none.into_vec().len(), 0);
+
+        let vec_emit: Emit<i32> = vec![1, 2, 3].into();
+        assert_eq!(vec_emit.into_vec(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_event_output_debug() {
+        let output = EventOutput::new(42i32);
+        let debug_str = format!("{:?}", output);
+        assert!(debug_str.contains("EventOutput"));
+        assert!(debug_str.contains("event_type"));
     }
 }

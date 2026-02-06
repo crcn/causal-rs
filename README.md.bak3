@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
 For a more concise syntax, use the `#[handler]` procedural macro (enabled by default via the `macros` feature):
 
 ```rust
-use seesaw_core::{handler, HandlerContext, DlqTerminalInfo};
+use seesaw_core::{effect, reducer, HandlerContext, DlqTerminalInfo};
 use anyhow::Result;
 
 #[derive(Clone)]
@@ -319,7 +319,7 @@ enum UserEvent {
 Effects are event handlers that react to events, perform IO, and return new events. Use the closure-based builder API with `.then()`:
 
 ```rust
-use seesaw_core::handler;
+use seesaw_core::effect;
 
 // Basic effect - returns event to dispatch
 handler::on::<UserEvent>()
@@ -515,7 +515,7 @@ Key properties:
 Effects can emit multiple events at once using the `Emit` enum:
 
 ```rust
-use seesaw_core::handler;
+use seesaw_core::effect;
 
 // Emit multiple events in a batch
 handler::on::<ImportEvent>()

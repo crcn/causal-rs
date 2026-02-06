@@ -223,7 +223,7 @@ struct Deps {
 use seesaw::{effect, Engine};
 
 // Effect 1: Charge payment (no timeout/retry config)
-let charge_effect = handler::on::<OrderPlaced>()
+let charge_effect = effect::on::<OrderPlaced>()
     .then(|event, ctx| async move {
         // Manual idempotency check (easy to forget!)
         if ctx.deps().db.already_charged(event.order_id).await? {
@@ -250,7 +250,7 @@ let charge_effect = handler::on::<OrderPlaced>()
     });
 
 // Effect 2: Send confirmation
-let confirm_effect = handler::on::<OrderPlaced>()
+let confirm_effect = effect::on::<OrderPlaced>()
     .then(|event, ctx| async move {
         ctx.deps().mailer.send_confirmation(&event.customer_email).await?;
 
@@ -263,7 +263,7 @@ let confirm_effect = handler::on::<OrderPlaced>()
     });
 
 // Effect 3: Request approval (no way to delay!)
-let approval_effect = handler::on::<OrderPlaced>()
+let approval_effect = effect::on::<OrderPlaced>()
     .then(|event, ctx| async move {
         // Can't delay 2 days - would need manual scheduling
         ctx.deps().mailer.send_approval_request(&event).await?;
@@ -278,7 +278,7 @@ let approval_effect = handler::on::<OrderPlaced>()
     });
 
 // Effect 4: Send reminder (no way to delay!)
-let reminder_effect = handler::on::<ApprovalRequested>()
+let reminder_effect = effect::on::<ApprovalRequested>()
     .then(|event, ctx| async move {
         // Can't delay 7 days automatically
         ctx.deps().mailer.send_reminder(event.order_id).await?;
@@ -292,7 +292,7 @@ let reminder_effect = handler::on::<ApprovalRequested>()
     });
 
 // Effect 5: Complete order
-let complete_effect = handler::on::<ApprovalReceived>()
+let complete_effect = effect::on::<ApprovalReceived>()
     .then(|event, ctx| async move {
         ctx.deps().db.finalize_order(event.order_id).await?;
 
@@ -311,8 +311,8 @@ let complete_effect = handler::on::<ApprovalReceived>()
 use seesaw::{effect, Engine};
 
 // Effect 1: Charge payment (with timeout, retry, priority)
-let charge_effect = handler::on::<OrderPlaced>()
-    .name("charge_payment")                    // ← Required (compile-time enforced)
+let charge_effect = effect::on::<OrderPlaced>()
+    .id("charge_payment")                    // ← Required (compile-time enforced)
     .timeout(Duration::from_secs(60))        // ← Stripe can be slow
     .retry(5)                                // ← Critical - retry more
     .priority(1)                             // ← High priority
@@ -332,8 +332,8 @@ let charge_effect = handler::on::<OrderPlaced>()
     });
 
 // Effect 2: Send confirmation (immediate)
-let confirm_effect = handler::on::<OrderPlaced>()
-    .name("send_confirmation")
+let confirm_effect = effect::on::<OrderPlaced>()
+    .id("send_confirmation")
     .timeout(Duration::from_secs(10))
     .retry(3)
     .then(|event, ctx| async move {
@@ -345,9 +345,9 @@ let confirm_effect = handler::on::<OrderPlaced>()
     });
 
 // Effect 3: Request approval (delayed 2 days!)
-let approval_effect = handler::on::<OrderPlaced>()
-    .name("request_approval")
-    .delay(Duration::from_days(2))         // ← Execute in 2 days!
+let approval_effect = effect::on::<OrderPlaced>()
+    .id("request_approval")
+    .delayed(Duration::from_days(2))         // ← Execute in 2 days!
     .timeout(Duration::from_secs(30))
     .retry(5)
     .then(|event, ctx| async move {
@@ -360,9 +360,9 @@ let approval_effect = handler::on::<OrderPlaced>()
     });
 
 // Effect 4: Send reminder (delayed 7 days from approval request!)
-let reminder_effect = handler::on::<ApprovalRequested>()
-    .name("send_reminder")
-    .delay(Duration::from_days(7))         // ← Execute in 7 days!
+let reminder_effect = effect::on::<ApprovalRequested>()
+    .id("send_reminder")
+    .delayed(Duration::from_days(7))         // ← Execute in 7 days!
     .retry(3)
     .then(|event, ctx| async move {
         // Only send if not approved yet
@@ -375,8 +375,8 @@ let reminder_effect = handler::on::<ApprovalRequested>()
     });
 
 // Effect 5: Complete order
-let complete_effect = handler::on::<ApprovalReceived>()
-    .name("complete_order")
+let complete_effect = effect::on::<ApprovalReceived>()
+    .id("complete_order")
     .timeout(Duration::from_secs(30))
     .then(|event, ctx| async move {
         ctx.deps().db.finalize_order(event.order_id).await?;
@@ -400,16 +400,16 @@ let complete_effect = handler::on::<ApprovalReceived>()
 ### Queue-Backed ✅
 
 ```rust
-use seesaw::{effect, effects, HandlerContext};
+use seesaw::{effect, effects, EffectContext};
 
-#[handlers]
+#[effects]
 mod order_effects {
     use super::*;
 
-    #[handler(on = OrderPlaced, id = "charge_payment", priority = 1, timeout_secs = 60, retry = 5)]
+    #[effect(on = OrderPlaced, id = "charge_payment", priority = 1, timeout_secs = 60, retry = 5)]
     async fn charge_payment(
         event: OrderPlaced,
-        ctx: HandlerContext<Deps>,
+        ctx: EffectContext<Deps>,
     ) -> anyhow::Result<PaymentCharged> {
         let charge = ctx
             .deps()
@@ -422,14 +422,14 @@ mod order_effects {
         })
     }
 
-    #[handler(on = [OrderEvent::Placed, OrderEvent::Updated], extract(order_id), id = "sync_order")]
-    async fn sync_order(order_id: Uuid, ctx: HandlerContext<Deps>) -> anyhow::Result<()> {
+    #[effect(on = [OrderEvent::Placed, OrderEvent::Updated], extract(order_id), id = "sync_order")]
+    async fn sync_order(order_id: Uuid, ctx: EffectContext<Deps>) -> anyhow::Result<()> {
         ctx.deps().db.sync(order_id).await?;
         Ok(())
     }
 }
 
-let engine = Engine::new(deps, store).with_handlers(order_effects::effects());
+let engine = Engine::new(deps, store).with_effects(order_effects::effects());
 ```
 
 ---
@@ -576,11 +576,11 @@ async fn main() -> Result<()> {
 
     // Build engine
     let engine = Engine::with_deps(deps)
-        .with_handler(charge_effect)
-        .with_handler(confirm_effect)
-        .with_handler(approval_effect)
-        .with_handler(reminder_effect)
-        .with_handler(complete_effect)
+        .with_effect(charge_effect)
+        .with_effect(confirm_effect)
+        .with_effect(approval_effect)
+        .with_effect(reminder_effect)
+        .with_effect(complete_effect)
         .with_reducer(order_placed_reducer)
         .with_reducer(payment_charged_reducer)
         .with_reducer(confirmation_sent_reducer)
@@ -640,11 +640,11 @@ async fn main() -> Result<()> {
 
     // Build engine (same as v0.7)
     let engine = Engine::new(deps)
-        .with_handler(charge_effect)
-        .with_handler(confirm_effect)
-        .with_handler(approval_effect)
-        .with_handler(reminder_effect)
-        .with_handler(complete_effect)
+        .with_effect(charge_effect)
+        .with_effect(confirm_effect)
+        .with_effect(approval_effect)
+        .with_effect(reminder_effect)
+        .with_effect(complete_effect)
         .with_reducer(order_placed_reducer)
         .with_reducer(payment_charged_reducer)
         .with_reducer(confirmation_sent_reducer)
@@ -665,7 +665,7 @@ async fn main() -> Result<()> {
     let engine = engine.with_queue(queue);
 
     // Process initial event (starts new workflow)
-    let correlation_id = engine.dispatch(|| async {
+    let correlation_id = engine.process(|| async {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
             customer_email: "user@example.com".to_string(),
@@ -769,7 +769,7 @@ async fn test_order_flow() {
     let engine = engine.with_queue(queue);
 
     // Day 1: Place order
-    let correlation_id = engine.dispatch(|| async {
+    let correlation_id = engine.process(|| async {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
             customer_email: "test@example.com".to_string(),
@@ -820,7 +820,7 @@ async fn test_order_flow() {
 | **Event correlation_id** | Manual in every event | Envelope carries it | -50 LOC, cleaner events |
 | **Effect ID** | Optional | **Required** (`.id()`) | Compile-time idempotency |
 | **Idempotency** | Manual (15 lines per effect) | Framework-guaranteed | -300 LOC, no footguns |
-| **Delayed effects** | ❌ Not possible | `.delay(2days)` | Multi-day workflows |
+| **Delayed effects** | ❌ Not possible | `.delayed(2days)` | Multi-day workflows |
 | **Timeout config** | ❌ Global only | Per-effect (`.timeout(60)`) | Payment: 60s, Email: 10s |
 | **Retry config** | ❌ Global only | Per-effect (`.retry(5)`) | Critical: 5x, Logs: 1x |
 | **Priority** | ❌ No priority | `.priority(1)` | Critical first |
@@ -835,12 +835,12 @@ async fn test_order_flow() {
 ## Migration Checklist
 
 - [ ] Remove `correlation_id` from all event structs
-- [ ] Add `.name("name")` to all effects (compile enforces)
+- [ ] Add `.id("name")` to all effects (compile enforces)
 - [ ] Remove manual idempotency checks (framework handles it)
-- [ ] Add `.delay()` for time-based effects
+- [ ] Add `.delayed()` for time-based effects
 - [ ] Add `.timeout()` and `.retry()` per effect
 - [ ] Change `engine.activate()` → `queue.start_workers()`
-- [ ] Change `handle.run()` → `engine.dispatch()`
+- [ ] Change `handle.run()` → `engine.process()`
 - [ ] Store correlation_id for webhook continuations
 - [ ] Use `engine.process_workflow()` for continuing workflows
 - [ ] Add graceful shutdown handler
@@ -853,7 +853,7 @@ async fn test_order_flow() {
 
 1. **Events are cleaner** - No correlation_id boilerplate
 2. **Idempotency is guaranteed** - Compile-time enforced via `.id()`
-3. **Delays are built-in** - `.delay(7days)` just works
+3. **Delays are built-in** - `.delayed(7days)` just works
 4. **Per-effect config** - Payment: 60s timeout, Email: 10s
 5. **Multi-day workflows** - State persists between days 1-9
 6. **Two-phase workers** - Fast state updates, slow effects scale independently

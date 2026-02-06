@@ -1,6 +1,6 @@
 # Seesaw
 
-An event-driven runtime for building reactive systems with a simple **Event → Handler → Event** flow.
+An event-driven runtime for building reactive systems with a simple **Event → Effect → Event** flow.
 
 Named after the playground equipment that balances back and forth — representing the continuous flow of events through the system.
 
@@ -19,14 +19,14 @@ This repository is organized as a Cargo workspace:
 
 ## Core Principle
 
-**Event → Handler → Event.** Simple, direct flow with flexible state management.
+**Event → Effect → Event.** Simple, direct flow with clean state management.
 
 ## What Seesaw Is / Is Not
 
 Seesaw **is**:
 
-> An event-driven runtime where events flow through handlers, which return new events.
-> State lives in events or shared dependencies. Clean entry points via closures.
+> An event-driven runtime where events flow through effects, which return new events.
+> State flows through reducers. Clean entry points via closures.
 
 Seesaw is **not**:
 
@@ -36,29 +36,30 @@ Seesaw is **not**:
 
 ## Features
 
-- **Stateless Engine**: Reusable runtime, dependencies and store provided at creation
+- **Stateless Engine**: Reusable runtime, state passed per-execution
 - **Event-Driven**: Events are the only signals - facts about what happened
 - **Closure-Based API**: Simple builder pattern with closures (no trait implementations)
-- **Procedural Macros**: Optional `#[handler]` attributes for concise syntax (v0.10+)
-- **Event Handlers**: React to events, perform IO, return new events
-- **Flexible State**: Event-threaded, shared dependencies, or implicit state patterns
+- **Procedural Macros**: Optional `#[effect]` and `#[reducer]` attributes for concise syntax (v0.10.2+)
+- **Effect Handlers**: React to events, perform IO, return new events
+- **Reducers**: Pure state transformations before effects
 - **DLQ Terminal Mapping**: Map exhausted retries to terminal events for explicit failure handling (v0.10.2+)
-- **Event Batching**: Emit and accumulate multiple events for bulk operations (v0.10.0+)
+- **Event Batching**: Emit and join multiple events for bulk operations (v0.10.0+)
 - **Pipedream Integration**: Stream composition and bidirectional piping
-- **Direct Dispatch**: `engine.dispatch(event)` for clean execution
+- **State Flow**: Per-execution state flows through reducers and effects
+- **Handle Pattern**: `activate(state).run(|_| Ok(event)).settled()` for clean execution
 
 ## Architecture
 
 ```
-Event → Handler → Event → Handler → ... (until settled)
-          ↓
-      returns Event
+Closure → Event → Reducer → Effect → Event → Effect → ... (until settled)
+                     ↓         ↓
+                 State'    returns Event
 ```
 
 ## Quick Start
 
 ```rust
-use seesaw_core::{handler, Engine};
+use seesaw_core::{effect, reducer, Engine};
 use seesaw_memory::MemoryStore;
 use anyhow::Result;
 use uuid::Uuid;
@@ -69,6 +70,12 @@ enum OrderEvent {
     Placed { order_id: Uuid, total: f64 },
     Shipped { order_id: Uuid },
     Delivered { order_id: Uuid },
+}
+
+#[derive(Clone, Default)]
+struct State {
+    order_count: usize,
+    total_revenue: f64,
 }
 
 #[derive(Clone)]
@@ -84,9 +91,18 @@ async fn main() -> Result<()> {
 
     // Define engine with deps and store
     let engine = Engine::new(deps, store)
-        // Handler that reacts to Placed and returns Shipped
-        .with_handler(
-            handler::on::<OrderEvent>()
+        .with_reducer(reducer::fold::<OrderEvent>().into(|state: State, event| {
+            match event {
+                OrderEvent::Placed { total, .. } => State {
+                    order_count: state.order_count + 1,
+                    total_revenue: state.total_revenue + total,
+                },
+                _ => state,
+            }
+        }))
+        // Effect that reacts to Placed and returns Shipped
+        .with_effect(
+            effect::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::Placed { order_id, .. } => Some(*order_id),
                     _ => None,
@@ -96,9 +112,9 @@ async fn main() -> Result<()> {
                     Ok(OrderEvent::Shipped { order_id })
                 })
         )
-        // Handler that reacts to Shipped and returns Delivered
-        .with_handler(
-            handler::on::<OrderEvent>()
+        // Effect that reacts to Shipped and returns Delivered
+        .with_effect(
+            effect::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::Shipped { order_id } => Some(*order_id),
                     _ => None,
@@ -109,9 +125,9 @@ async fn main() -> Result<()> {
                 })
         );
 
-    // Dispatch event directly - engine handles everything
+    // Process event directly - engine handles everything
     let order_id = Uuid::new_v4();
-    engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
+    engine.process(OrderEvent::Placed { order_id, total: 99.99 }).await?;
 
     Ok(())
 }
@@ -119,10 +135,10 @@ async fn main() -> Result<()> {
 
 ## Procedural Macro API (Recommended)
 
-For a more concise syntax, use the `#[handler]` procedural macro (enabled by default via the `macros` feature):
+For a more concise syntax, use the `#[effect]` and `#[reducer]` procedural macros (enabled by default via the `macros` feature):
 
 ```rust
-use seesaw_core::{handler, HandlerContext, DlqTerminalInfo};
+use seesaw_core::{effect, reducer, EffectContext, DlqTerminalInfo};
 use anyhow::Result;
 
 #[derive(Clone)]
@@ -146,7 +162,7 @@ struct Deps {
 }
 
 // Effect with attribute macro
-#[handler(
+#[effect(
     on = OrderEvent,
     extract(order_id, total),
     retry = 3,
@@ -157,7 +173,7 @@ struct Deps {
 async fn charge_payment(
     order_id: Uuid,
     total: f64,
-    ctx: HandlerContext<OrderState, Deps>
+    ctx: EffectContext<OrderState, Deps>
 ) -> Result<OrderEvent> {
     ctx.deps().payment.charge(order_id, total).await?;
     Ok(OrderEvent::PaymentCharged { order_id })
@@ -184,23 +200,23 @@ fn track_revenue(state: OrderState, total: f64) -> OrderState {
 }
 
 // Multi-variant matching with macro
-#[handler(
+#[effect(
     on = [OrderEvent::PaymentCharged, OrderEvent::OrderFailed],
     extract(order_id)
 )]
 async fn ship_order(
     order_id: Uuid,
-    ctx: HandlerContext<OrderState, Deps>
+    ctx: EffectContext<OrderState, Deps>
 ) -> Result<OrderEvent> {
     ctx.deps().shipping.ship(order_id).await?;
     Ok(OrderEvent::OrderShipped { order_id })
 }
 
 // Join handler with macro
-#[handler(on = OrderEvent, join)]
+#[effect(on = OrderEvent, join)]
 async fn process_batch(
     batch: Vec<OrderEvent>,
-    ctx: HandlerContext<OrderState, Deps>
+    ctx: EffectContext<OrderState, Deps>
 ) -> Result<()> {
     // Process entire batch together
     let order_ids: Vec<_> = batch.iter()
@@ -216,25 +232,25 @@ async fn process_batch(
 
 ### Module-level registration
 
-Use `#[handlers]` and `#[reducers]` to automatically generate registration functions:
+Use `#[effects]` and `#[reducers]` to automatically generate registration functions:
 
 ```rust
-#[handlers]
+#[effects]
 mod order_effects {
     use super::*;
 
-    #[handler(on = OrderEvent, extract(order_id))]
+    #[effect(on = OrderEvent, extract(order_id))]
     async fn charge_payment(
         order_id: Uuid,
-        ctx: HandlerContext<OrderState, Deps>
+        ctx: EffectContext<OrderState, Deps>
     ) -> Result<OrderEvent> {
         // ... implementation
     }
 
-    #[handler(on = OrderEvent, extract(order_id))]
+    #[effect(on = OrderEvent, extract(order_id))]
     async fn ship_order(
         order_id: Uuid,
-        ctx: HandlerContext<OrderState, Deps>
+        ctx: EffectContext<OrderState, Deps>
     ) -> Result<OrderEvent> {
         // ... implementation
     }
@@ -257,7 +273,7 @@ mod order_reducers {
 
 // Register all at once
 let engine = Engine::new(deps, store)
-    .with_handlers(order_effects::effects())
+    .with_effects(order_effects::effects())
     .with_reducers(order_reducers::reducers());
 ```
 
@@ -284,7 +300,7 @@ let engine = Engine::new(deps, store)
 **Requirements:**
 - Effect functions must be `async` and return `Result<T>` where `T` is an event or `()`
 - Reducer functions must be synchronous and return the state type
-- All functions must include exactly one `HandlerContext<S, D>` parameter (for effects)
+- All functions must include exactly one `EffectContext<S, D>` parameter (for effects)
 - Parameter names must match extracted field names when using `extract(...)`
 - For `join`, first parameter must be `Vec<EventType>`
 
@@ -319,10 +335,10 @@ enum UserEvent {
 Effects are event handlers that react to events, perform IO, and return new events. Use the closure-based builder API with `.then()`:
 
 ```rust
-use seesaw_core::handler;
+use seesaw_core::effect;
 
 // Basic effect - returns event to dispatch
-handler::on::<UserEvent>()
+effect::on::<UserEvent>()
     .extract(|e| match e {
         UserEvent::SignupRequested { email, name } => Some((email.clone(), name.clone())),
         _ => None,
@@ -341,7 +357,7 @@ handler::on::<UserEvent>()
     })
 
 // Effect with filter_map (combines filter + destructure)
-handler::on::<CrawlEvent>()
+effect::on::<CrawlEvent>()
     .extract(|e| match e {
         CrawlEvent::PagesReady { website_id, job_id, page_ids } => {
             Some((*website_id, *job_id, page_ids.clone()))
@@ -355,7 +371,7 @@ handler::on::<CrawlEvent>()
     })
 
 // Effect with state transition guard
-handler::on::<StatusEvent>()
+effect::on::<StatusEvent>()
     .transition(|prev, next| prev.status != next.status)
     .then(|event, ctx| async move {
         // Only runs when status actually changed
@@ -364,13 +380,13 @@ handler::on::<StatusEvent>()
     })
 
 // Observer effect - returns Emit::None to dispatch nothing
-handler::on::<OrderEvent>().then(|event, ctx| async move {
+effect::on::<OrderEvent>().then(|event, ctx| async move {
     ctx.deps().logger.log(&event);
     Ok(Emit::None)  // No event dispatched
 })
 
 // Observe ALL events
-handler::on_any().then(|event, ctx| async move {
+effect::on_any().then(|event, ctx| async move {
     ctx.deps().metrics.track(event.type_id);
     Ok(Emit::None)
 })
@@ -382,8 +398,8 @@ Configure effects for retry, timeout, delay, priority, and queued execution:
 
 ```rust
 // Queued effect with retry and timeout
-handler::on::<PaymentRequested>()
-    .name("charge_payment")               // Custom ID for tracing
+effect::on::<PaymentRequested>()
+    .id("charge_payment")               // Custom ID for tracing
     .retry(5)                            // Retry up to 5 times
     .timeout(Duration::from_secs(30))   // 30 second timeout
     .priority(1)                         // Higher priority (lower = higher)
@@ -393,15 +409,15 @@ handler::on::<PaymentRequested>()
     });
 
 // Delayed execution
-handler::on::<OrderPlaced>()
-    .delay(Duration::from_secs(3600))  // Run 1 hour later
+effect::on::<OrderPlaced>()
+    .delayed(Duration::from_secs(3600))  // Run 1 hour later
     .then(|event, ctx| async move {
         Ok(Emit::One(FollowupSent { order_id: event.order_id }))
     });
 
 // Force queued execution
-handler::on::<AnalyticsEvent>()
-    .background()  // Execute in background worker
+effect::on::<AnalyticsEvent>()
+    .queued()  // Execute in background worker
     .then(|event, ctx| async move { Ok(Emit::None) });
 ```
 
@@ -409,14 +425,14 @@ handler::on::<AnalyticsEvent>()
 - `.id(String)` - Custom identifier
 - `.retry(u32)` - Max retry attempts (default: 1)
 - `.timeout(Duration)` - Execution timeout
-- `.delay(Duration)` - Delay before execution
+- `.delayed(Duration)` - Delay before execution
 - `.priority(i32)` - Priority (lower = higher)
-- `.background()` - Force queued execution
+- `.queued()` - Force queued execution
 - `.dlq_terminal(mapper)` - Map exhausted retries to terminal events (v0.10.2+)
 
 **Execution modes:**
 - **Inline** (default): Immediate, no retry
-- **Queued**: Triggered by `.background()`, `.delay()`, `.timeout()`, `.retry() > 1`, or `.priority()`
+- **Queued**: Triggered by `.queued()`, `.delayed()`, `.timeout()`, `.retry() > 1`, or `.priority()`
 
 #### DLQ Terminal Mapping (v0.10.2+)
 
@@ -434,7 +450,7 @@ enum OrderEvent {
 }
 
 // Map exhausted retries to terminal event
-handler::on::<OrderEvent>()
+effect::on::<OrderEvent>()
     .extract(|e| match e {
         OrderEvent::OrderPlaced { order_id } => Some(*order_id),
         _ => None,
@@ -465,19 +481,19 @@ handler::on::<OrderEvent>()
 - Workflows that need compensation or rollback events
 - Situations where silent failures are unacceptable
 
-**Alternative: `HandlerError` events**
+**Alternative: `EffectError` events**
 
-For convenience, use `?` in effects and handle `HandlerError` events:
+For convenience, use `?` in effects and handle `EffectError` events:
 
 ```rust
 // Use ? for ergonomics
-handler::on::<OrderPlaced>().then(|order, ctx| async move {
+effect::on::<OrderPlaced>().then(|order, ctx| async move {
     ctx.deps().payment.charge(order.total).await?;  // Propagates error
     Ok(PaymentCharged { order_id: order.id })
 });
 
-// Handle HandlerError events
-handler::on::<HandlerError>()
+// Handle EffectError events
+effect::on::<EffectError>()
     .extract(|err| {
         // Filter by source event + error type
         if err.source_event_type == TypeId::of::<OrderPlaced>() {
@@ -515,10 +531,10 @@ Key properties:
 Effects can emit multiple events at once using the `Emit` enum:
 
 ```rust
-use seesaw_core::handler;
+use seesaw_core::effect;
 
 // Emit multiple events in a batch
-handler::on::<ImportEvent>()
+effect::on::<ImportEvent>()
     .extract(|e| match e {
         ImportEvent::FileUploaded { path } => Some(path.clone()),
         _ => None,
@@ -537,8 +553,8 @@ handler::on::<ImportEvent>()
     });
 
 // Join pattern - accumulate batch and process together
-handler::on::<ImportEvent>()
-    .accumulate()  // Accumulates events with same batch_id
+effect::on::<ImportEvent>()
+    .join()  // Accumulates events with same batch_id
     .then(|batch: Vec<ImportEvent>, ctx| async move {
         let items: Vec<_> = batch.into_iter()
             .filter_map(|e| match e {
@@ -563,7 +579,7 @@ handler::on::<ImportEvent>()
 
 **Join semantics:**
 - Events emitted in same batch (via `Emit::Batch`) share a `batch_id`
-- `.accumulate()` accumulates all events with matching `batch_id`
+- `.join()` accumulates all events with matching `batch_id`
 - Once all events in batch arrive, handler receives the full batch
 - Provides 10-50x performance for bulk operations
 
@@ -610,9 +626,9 @@ Key properties:
 - **Transform state**: Take current state and event, return new state
 - **Run before effects**: Updated state is passed to effects via `ctx.next_state()`
 
-### HandlerContext
+### EffectContext
 
-`HandlerContext` provides a narrow API to effects:
+`EffectContext` provides a narrow API to effects:
 
 ```rust
 // Access shared dependencies (database, APIs, config)
@@ -648,22 +664,22 @@ let engine = Engine::new()
         // Pure state transformation
         State { count: state.count + 1, ..state }
     }))
-    .with_handler(
-        handler::on::<OrderEvent>()
+    .with_effect(
+        effect::on::<OrderEvent>()
             .extract(|e| match e {
                 OrderEvent::Placed { order_id, .. } => Some(*order_id),
                 _ => None,
             })
             .then(|order_id, ctx| async move {
                 // Side effects - return event to dispatch
-                ctx.deps().dispatch(order_id).await?;
+                ctx.deps().process(order_id).await?;
                 Ok(OrderEvent::Processed { order_id })
             })
     );
 
 // Option 1: Process to completion (common pattern)
 let handle = engine.activate(State::default());
-handle.dispatch(|_ctx| async {
+handle.process(|_ctx| async {
     Ok(OrderEvent::Placed { order_id, total: 99.99 })
 }).await?;
 
@@ -680,13 +696,13 @@ Builder methods:
 
 - `.with_deps(deps)` — Set shared dependencies
 - `.with_reducer(reducer)` — Register pure state transformations
-- `.with_handler(effect)` — Register event handlers (use `.then()` to return events)
+- `.with_effect(effect)` — Register event handlers (use `.then()` to return events)
 - `.with_effect_registry(registry)` — Use existing effect registry
 
 Handle methods:
 
 - `.run(closure)` — Execute logic, return event to dispatch (or `()` for none)
-- `.dispatch(async_closure).await` — Async version of `run()`, waits for completion
+- `.process(async_closure).await` — Async version of `run()`, waits for completion
 - `.settled().await` — Wait for all effects to complete
 - `.cancel()` — Cancel all tasks
 - `.shutdown().await` — Graceful shutdown (waits for in-flight tasks)
@@ -702,9 +718,9 @@ use seesaw_postgres::PostgresStore;
 // Create queue-backed engine
 let store = PostgresStore::new(pool);
 let engine = QueueEngine::new(deps, store)
-    .with_handler(
-        handler::on::<OrderPlaced>()
-            .name("send_email")
+    .with_effect(
+        effect::on::<OrderPlaced>()
+            .id("send_email")
             .retry(3)
             .then(|event, ctx| async move {
                 ctx.deps().mailer.send(&event).await?;
@@ -714,12 +730,12 @@ let engine = QueueEngine::new(deps, store)
     .with_reducer(reducer);
 
 // Pattern 1: Fire and forget - get correlation_id
-let handle = engine.dispatch(CreateOrder { user_id: 123 }).await?;
+let handle = engine.process(CreateOrder { user_id: 123 }).await?;
 let correlation_id = handle.correlation_id;  // Return to client
 
 // Pattern 2: Wait for terminal event using LISTEN/NOTIFY
 let result = engine
-    .dispatch(CreateOrder { user_id: 123 })
+    .process(CreateOrder { user_id: 123 })
     .wait(|event| {
         // Match on WorkflowEvent (contains event_type and JSON payload)
         if let Some(workflow_event) = event.downcast_ref::<seesaw_core::WorkflowEvent>() {
@@ -809,7 +825,7 @@ Triggers populate this table automatically - no code changes needed!
 - `GET /api/tree/:correlation_id` - Causality tree
 - `GET /api/stats` - Current metrics
 
-**HandlerContext in queue-backed mode:**
+**EffectContext in queue-backed mode:**
 ```rust
 ctx.correlation_id   // Workflow identifier
 ctx.event_id         // Current event's unique ID
@@ -857,7 +873,7 @@ impl OutboxEvent for OrderPlaced {
 }
 
 // 2. Write to outbox in same transaction as business data
-handler::on::<OrderEvent>()
+effect::on::<OrderEvent>()
     .extract(|e| match e {
         OrderEvent::PlaceRequested { customer_id, items } => {
             Some((*customer_id, items.clone()))
@@ -922,8 +938,8 @@ Test effects using the Engine:
 async fn test_effect_returns_event() {
     let engine = Engine::new()
         .with_deps(MockDeps::new())
-        .with_handler(
-            handler::on::<OrderEvent>()
+        .with_effect(
+            effect::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::Placed { order_id, .. } => Some(*order_id),
                     _ => None,

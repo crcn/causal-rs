@@ -4,9 +4,6 @@ use futures::Stream;
 use seesaw_core::{Engine, QueueBackend, QueuedEffectExecution, QueuedEvent, Store, WorkflowEvent};
 use uuid::Uuid;
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-struct TestState;
-
 #[derive(Clone, Default)]
 struct TestDeps;
 
@@ -29,25 +26,6 @@ impl Store for TestStore {
 
     async fn nack(&self, _id: i64, _retry_after_secs: u64) -> Result<()> {
         Ok(())
-    }
-
-    async fn load_state<S>(&self, _correlation_id: Uuid) -> Result<Option<(S, i32)>>
-    where
-        S: for<'de> serde::Deserialize<'de> + Send,
-    {
-        Ok(None)
-    }
-
-    async fn save_state<S>(
-        &self,
-        _correlation_id: Uuid,
-        _state: &S,
-        _expected_version: i32,
-    ) -> Result<i32>
-    where
-        S: serde::Serialize + Send + Sync,
-    {
-        Ok(1)
     }
 
     async fn insert_effect_intent(
@@ -126,7 +104,6 @@ impl Store for TestStore {
     ) -> Result<seesaw_core::WorkflowStatus> {
         Ok(seesaw_core::WorkflowStatus {
             correlation_id,
-            state: None,
             pending_effects: 0,
             is_settled: true,
             last_event: None,
@@ -146,13 +123,13 @@ impl QueueBackend<TestStore> for CustomQueueBackend {
 
 #[test]
 fn engine_new_defaults_to_store_queue_backend() {
-    let engine = Engine::<TestState, TestDeps, TestStore>::new(TestDeps, TestStore);
+    let engine = Engine::<TestDeps, TestStore>::new(TestDeps, TestStore);
     assert_eq!(engine.queue_backend_name(), "store");
 }
 
 #[test]
 fn engine_builder_allows_custom_queue_backend() {
-    let engine = Engine::<TestState, TestDeps, TestStore>::builder(TestDeps, TestStore)
+    let engine = Engine::<TestDeps, TestStore>::builder(TestDeps, TestStore)
         .queue_backend(CustomQueueBackend)
         .build();
     assert_eq!(engine.queue_backend_name(), "custom-test-backend");

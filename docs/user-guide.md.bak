@@ -67,16 +67,16 @@ enum OrderStatus {
 ## 3. Write Your Effects
 
 ```rust
-use seesaw::{effect, effects, HandlerContext};
+use seesaw::{effect, effects, EffectContext};
 
-#[handlers]
+#[effects]
 mod order_effects {
     use super::*;
 
-    #[handler(on = OrderPlaced, id = "charge_payment", retry = 5, timeout_secs = 60, priority = 1)]
+    #[effect(on = OrderPlaced, id = "charge_payment", retry = 5, timeout_secs = 60, priority = 1)]
     async fn charge_payment(
         event: OrderPlaced,
-        ctx: HandlerContext<Deps>,
+        ctx: EffectContext<Deps>,
     ) -> anyhow::Result<PaymentCharged> {
         let _charge = ctx
             .deps()
@@ -88,17 +88,17 @@ mod order_effects {
         })
     }
 
-    #[handler(on = OrderPlaced, id = "send_confirmation")]
+    #[effect(on = OrderPlaced, id = "send_confirmation")]
     async fn send_confirmation(
         event: OrderPlaced,
-        ctx: HandlerContext<Deps>,
+        ctx: EffectContext<Deps>,
     ) -> anyhow::Result<()> {
         ctx.deps().mailer.send_confirmation(&event.customer_email).await?;
         Ok(())
     }
 }
 
-let engine = seesaw::Engine::new(deps, store).with_handlers(order_effects::effects());
+let engine = seesaw::Engine::new(deps, store).with_effects(order_effects::effects());
 ```
 
 ---
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
 
     // Build engine
     let engine = Engine::new(deps);
-    for effect in effects { engine = engine.with_handler(effect); }
+    for effect in effects { engine = engine.with_effect(effect); }
     for reducer in reducers { engine = engine.with_reducer(reducer); }
 
     // Start workers (2 for events, 20 for effects)
@@ -179,7 +179,7 @@ async fn create_order(
     db: &PgPool,
 ) -> Result<Json<OrderResponse>> {
     // Start new workflow
-    let correlation_id = engine.dispatch(|| async move {
+    let correlation_id = engine.process(|| async move {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
             customer_email: payload.email,
@@ -246,7 +246,7 @@ async fn handle_approval(
 ### 1. Framework-Guaranteed Idempotency
 
 ```rust
-#[handler(id = "charge_payment")]  // ← ID required at compile-time
+#[effect(id = "charge_payment")]  // ← ID required at compile-time
 OrderPlaced { .. } => |ctx| async move {
     // If effect runs twice (crash/retry), framework skips duplicate
     ctx.deps().stripe.charge(...).await?;  // Only charges once!
@@ -257,7 +257,7 @@ OrderPlaced { .. } => |ctx| async move {
 ### 2. Delayed Execution
 
 ```rust
-#[handler(id = "send_reminder", delayed = 7days)]
+#[effect(id = "send_reminder", delayed = 7days)]
 ApprovalRequested { .. } => |ctx| async move {
     // Runs 7 days later, survives restarts/deploys
     ctx.deps().mailer.send_reminder(...).await?;
@@ -269,13 +269,13 @@ ApprovalRequested { .. } => |ctx| async move {
 
 ```rust
 // Payment: critical, long timeout, many retries
-#[handler(id = "charge_payment", timeout = 60, retry = 5, priority = 1)]
+#[effect(id = "charge_payment", timeout = 60, retry = 5, priority = 1)]
 
 // Email: fast, few retries
-#[handler(id = "send_email", timeout = 10, retry = 3)]
+#[effect(id = "send_email", timeout = 10, retry = 3)]
 
 // Logs: no retries needed
-#[handler(id = "log", timeout = 5, retry = 1)]
+#[effect(id = "log", timeout = 5, retry = 1)]
 ```
 
 ### 4. State Persistence
@@ -308,7 +308,7 @@ engine.shutdown().await?;  // Drains workers, completes in-flight events
 ### Pattern 1: Conditional Effects
 
 ```rust
-#[handler(id = "send_reminder", delayed = 7days)]
+#[effect(id = "send_reminder", delayed = 7days)]
 ApprovalRequested { order_id, .. } => |ctx| async move {
     // Only send if still pending
     if ctx.next_state().status == OrderStatus::AwaitingApproval {
@@ -322,18 +322,18 @@ ApprovalRequested { order_id, .. } => |ctx| async move {
 
 ```rust
 // Emergency events jump to front
-#[handler(id = "system_alert", priority = 1)]  // Higher priority
+#[effect(id = "system_alert", priority = 1)]  // Higher priority
 SystemAlert { .. } => |ctx| async move { ... }
 
 // Normal events
-#[handler(id = "user_signup", priority = 10)]  // Default priority
+#[effect(id = "user_signup", priority = 10)]  // Default priority
 UserSignup { .. } => |ctx| async move { ... }
 ```
 
 ### Pattern 3: External API Idempotency
 
 ```rust
-#[handler(id = "charge_payment")]
+#[effect(id = "charge_payment")]
 OrderPlaced { amount, .. } => |ctx| async move {
     // ctx.idempotency_key is deterministic UUID v5
     // Same event_id + effect_id → same key
@@ -350,9 +350,9 @@ OrderPlaced { amount, .. } => |ctx| async move {
 ```rust
 // One event triggers multiple effects
 OrderPlaced { .. } => {
-    #[handler(id = "charge")] => charge_payment,
-    #[handler(id = "confirm")] => send_confirmation,
-    #[handler(id = "notify_ops")] => notify_ops_team,
+    #[effect(id = "charge")] => charge_payment,
+    #[effect(id = "confirm")] => send_confirmation,
+    #[effect(id = "notify_ops")] => notify_ops_team,
 }
 
 // All run in parallel automatically
@@ -376,7 +376,7 @@ async fn test_order_workflow() {
     let engine = engine.with_queue(queue);
 
     // Place order
-    let correlation_id = engine.dispatch(|| async {
+    let correlation_id = engine.process(|| async {
         Ok(OrderPlaced { order_id, email, amount })
     }).await?;
 
@@ -407,9 +407,9 @@ If you're coming from v0.7 (stateless):
 
 1. **Remove correlation_id from events** - Framework manages it now
 2. **Add `.id()` to effects** - Compile enforces idempotency
-3. **Add delays** - Use `.delay(7days)` for time-based execution
+3. **Add delays** - Use `.delayed(7days)` for time-based execution
 4. **Start workers** - Replace `activate()` with `start_workers()`
-5. **Use `process()`** - Replace `run()` with `engine.dispatch()`
+5. **Use `process()`** - Replace `run()` with `engine.process()`
 6. **Store correlation_id** - For webhook continuations
 
 See [API Migration Guide](./api-migration-guide.md) for detailed before/after examples.
@@ -421,7 +421,7 @@ See [API Migration Guide](./api-migration-guide.md) for detailed before/after ex
 1. Run migrations: `sqlx migrate run`
 2. Update your events (remove correlation_id)
 3. Add `.id()` to all effects
-4. Add `.delay()` for time-based logic
+4. Add `.delayed()` for time-based logic
 5. Deploy with workers
 6. Monitor DLQ for failures
 

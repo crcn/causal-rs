@@ -10,7 +10,6 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use seesaw_core::insight::*;
 use seesaw_core::store::*;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::broadcast;
 
@@ -25,8 +24,6 @@ pub struct MemoryStore {
     events: Arc<DashMap<Uuid, VecDeque<QueuedEvent>>>,
     /// Global event sequence for IDs
     event_seq: Arc<AtomicI64>,
-    /// Workflow states
-    states: Arc<DashMap<Uuid, (serde_json::Value, i32)>>,
     /// Effect executions queue
     effects: Arc<Mutex<VecDeque<QueuedEffectExecution>>>,
     /// Completed effects (for idempotency)
@@ -122,7 +119,6 @@ impl MemoryStore {
         Self {
             events: Arc::new(DashMap::new()),
             event_seq: Arc::new(AtomicI64::new(1)),
-            states: Arc::new(DashMap::new()),
             effects: Arc::new(Mutex::new(VecDeque::new())),
             completed_effects: Arc::new(DashMap::new()),
             insight_tx: Arc::new(insight_tx),
@@ -225,49 +221,6 @@ impl Store for MemoryStore {
     async fn nack(&self, _id: i64, _retry_after_secs: u64) -> Result<()> {
         // For simplicity, just drop failed events in memory store
         Ok(())
-    }
-
-    async fn load_state<S>(&self, correlation_id: Uuid) -> Result<Option<(S, i32)>>
-    where
-        S: for<'de> Deserialize<'de> + Send,
-    {
-        if let Some(entry) = self.states.get(&correlation_id) {
-            let (json, version) = entry.value();
-            let state: S = serde_json::from_value(json.clone())?;
-            Ok(Some((state, *version)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn save_state<S>(
-        &self,
-        correlation_id: Uuid,
-        state: &S,
-        expected_version: i32,
-    ) -> Result<i32>
-    where
-        S: Serialize + Send + Sync,
-    {
-        let json = serde_json::to_value(state)?;
-        let new_version = expected_version + 1;
-
-        // Simple optimistic locking check
-        if let Some(mut entry) = self.states.get_mut(&correlation_id) {
-            let (_, current_version) = entry.value();
-            if *current_version != expected_version {
-                return Err(anyhow!(
-                    "Version mismatch: expected {} but was {}",
-                    expected_version,
-                    current_version
-                ));
-            }
-            *entry.value_mut() = (json, new_version);
-        } else {
-            self.states.insert(correlation_id, (json, new_version));
-        }
-
-        Ok(new_version)
     }
 
     async fn insert_effect_intent(
@@ -760,15 +713,10 @@ impl Store for MemoryStore {
             .get(&correlation_id)
             .map(|q| !q.is_empty())
             .unwrap_or(false);
-        let state = self
-            .states
-            .get(&correlation_id)
-            .map(|entry| entry.value().0.clone());
         let pending_effects = 0i64; // Simplified
 
         Ok(WorkflowStatus {
             correlation_id,
-            state,
             pending_effects,
             is_settled: !has_events && pending_effects == 0,
             last_event: None, // Could track this if needed
@@ -807,16 +755,9 @@ impl InsightStore for MemoryStore {
         let event_ids: HashSet<Uuid> = events.iter().map(|e| e.event_id).collect();
         let roots = self.build_event_nodes(&events, None, &event_ids, true);
 
-        // Get state
-        let state = self
-            .states
-            .get(&correlation_id)
-            .map(|entry| entry.value().0.clone());
-
         Ok(WorkflowTree {
             correlation_id,
             roots,
-            state,
             event_count: events.len(),
             effect_count: self
                 .effect_history

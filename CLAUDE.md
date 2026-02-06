@@ -1,61 +1,61 @@
 # Seesaw Architecture Guidelines
 
-**Mental Model**: Events are signals. Effects react and return new events. That's it.
+**Mental Model**: Events are signals. Handlers react and return new events. That's it.
 
 ## Quick Start - v0.9.0 API
 
-### Stateless Engine Pattern
+### Simple Pattern - Handlers Only
 
 ```rust
-// 1. Define engine once (stateless, reusable)
-let engine = Engine::new()
-    .with_effect(effect::on::<OrderPlaced>().then(|event, ctx| async move {
+// Define engine once with dependencies and store
+let engine = Engine::new(deps, store)
+    .with_handler(handler::on::<OrderPlaced>().then(|event, ctx| async move {
         ctx.deps().mailer.send_confirmation(&event).await?;
         Ok(EmailSent { order_id: event.id })  // Return event to dispatch
-    }))
-    .with_reducer(reducer::on::<OrderPlaced>().run(|state, event| {
-        State { order_count: state.order_count + 1, ..state }
     }));
 
-// 2. Activate with initial state (per-execution)
-let handle = engine.activate(State::default());
-
-// 3. Process your logic - return event to dispatch, waits for effects
-handle.process(|_ctx| async { Ok(OrderPlaced { id: 123, total: 99.99 }) }).await?;
+// Dispatch events directly
+engine.dispatch(OrderPlaced { id: 123, total: 99.99 }).await?;
 ```
 
 ### Edge Function Pattern
 
 ```rust
 // Engine is stateless - define once, use many times
-let engine = Engine::new()
-    .with_effect(...)
-    .with_reducer(...);
+let engine = Engine::new(deps, store)
+    .with_handler(handler::on::<OrderPlaced>().then(|event, ctx| async move {
+        ctx.deps().ship(event.order_id).await?;
+        Ok(OrderShipped { order_id: event.order_id })
+    }));
 
 // Edge function returns event to dispatch
 fn process_webhook(payload: Webhook) -> OrderPlaced {
     OrderPlaced::from(payload)
 }
 
-// Execute per-request
-let handle = engine.activate(State::default());
-handle.process(|_ctx| async { Ok(process_webhook(payload)) }).await?;
+// Dispatch per-request
+engine.dispatch(process_webhook(payload)).await?;
 ```
 
 ### Key Differences from v0.6
 
-- **Effects return events**: Use `.then()` and return `Ok(Event)` instead of `ctx.emit()`
-- **`handle.process()` for dispatch**: Async method that dispatches event and waits for effects
-- **`ctx.emit()` removed from public API**: Effects and edge functions return events
+- **Handlers return events**: Use `.then()` and return `Ok(Event)` instead of `ctx.emit()`
+- **`engine.dispatch()` for dispatch**: Async method that dispatches event and waits for handlers
+- **`ctx.emit()` removed from public API**: Handlers and edge functions return events
 - **Observer pattern**: Return `Ok(())` to dispatch nothing
+- **Reducers removed**: No more `.with_reducer()`, state lives in events or dependencies
 
-### What's New in v0.9
+### What's New in v0.10
 
-- **`Emit<E>` type**: Effects return `Emit::One(e)`, `Emit::Batch(vec![...])`, or `Emit::None`
+- **Renamed `effect` → `handler`**: Clearer terminology, no confusion with React/FP effects
+- **Renamed methods**: `.process()` → `.dispatch()`, `.id()` → `.name()`, `.delayed()` → `.delay()`, `.queued()` → `.background()`, `.join()` → `.accumulate()`
+- **`Emit<E>` type**: Handlers return `Emit::One(e)`, `Emit::Batch(vec![...])`, or `Emit::None`
 - **Event batching**: Emit multiple events atomically with `Ok(Emit::Batch(events))`
-- **Join pattern**: Accumulate batched events with `.join()` for bulk operations
+- **Accumulate pattern**: Accumulate batched events with `.accumulate()` for bulk operations
 - **Batch metadata**: Events track `batch_id`, `batch_index`, `batch_size`
 - **Backward compatible**: `Ok(event)` and `Ok(Some(event))` auto-convert to `Emit`
+- **Reducers removed**: Handlers-only architecture, state lives in events or dependencies
+- **Simplified HandlerContext**: Only `deps()` method, removed state accessors
 
 ---
 
@@ -63,11 +63,11 @@ handle.process(|_ctx| async { Ok(process_webhook(payload)) }).await?;
 
 Seesaw is an **event-driven runtime** for building reactive systems.
 
-**Core flow**: Event → Reducer → Effect → Event
+**Core flow**: Event → Handler → Event
 
 - **Events** are signals (facts that already happened)
-- **Reducers** transform state before effects (pure functions)
-- **Effects** react to events, perform IO, return new events
+- **Handlers** react to events, perform IO, return new events
+- **State** lives in events or shared dependencies
 
 Simple, direct, no ceremony.
 
@@ -103,13 +103,13 @@ Events may come from:
 
 Events are the only signals in the system.
 
-### Effect
+### Handler
 
-Handlers that react to events and return new events.
+Handlers react to events and return new events.
 
 ```rust
-// Simple effect - reacts to one event type, returns new event
-let scrape_effect = effect::on::<SourceRequested>().then(|event, ctx| async move {
+// Simple handler - reacts to one event type, returns new event
+let scrape_handler = handler::on::<SourceRequested>().then(|event, ctx| async move {
     let data = ctx.deps().scraper.scrape(event.source_id).await?;
     Ok(SourceScraped {
         source_id: event.source_id,
@@ -117,9 +117,9 @@ let scrape_effect = effect::on::<SourceRequested>().then(|event, ctx| async move
     })
 });
 
-// Effect with filter_map - extract data and return event
-let priority_effect = effect::on::<OrderPlaced>()
-    .filter_map(|event| {
+// Handler with extract - extract data and return event
+let priority_handler = handler::on::<OrderPlaced>()
+    .extract(|event| {
         if event.priority > 5 { Some(event.clone()) } else { None }
     })
     .then(|event, ctx| async move {
@@ -127,22 +127,22 @@ let priority_effect = effect::on::<OrderPlaced>()
         Ok(UrgentNotified { order_id: event.id })
     });
 
-// Effect with state transition
-let status_effect = effect::on::<StatusChanged>()
+// Handler with state transition
+let status_handler = handler::on::<StatusChanged>()
     .transition(|prev, next| prev.status != next.status)
     .then(|event, ctx| async move {
         ctx.deps().notify_status_change(&event).await?;
         Ok(StatusNotified { id: event.id })
     });
 
-// Observer effect - returns () to dispatch nothing
-let logger_effect = effect::on::<OrderPlaced>().then(|event, ctx| async move {
+// Observer handler - returns () to dispatch nothing
+let logger_handler = handler::on::<OrderPlaced>().then(|event, ctx| async move {
     ctx.deps().logger.log(&event);
     Ok(())  // No event dispatched
 });
 
 // Observe ALL events (for logging, metrics, debugging)
-let observer_effect = effect::on_any().then(|event, ctx| async move {
+let observer_handler = handler::on_any().then(|event, ctx| async move {
     ctx.deps().logger.log(event.type_id);
     if let Some(order) = event.downcast::<OrderPlaced>() {
         ctx.deps().analytics.track("order_placed", order);
@@ -159,7 +159,7 @@ When handling enum events with multiple variants, the `on!` macro provides conci
 use seesaw::on;
 
 // Match-like syntax with Event::Variant patterns
-let effects = on! {
+let handlers = on! {
     // Multiple variants with | - same fields required
     CrawlEvent::WebsiteIngested { website_id, job_id, .. } |
     CrawlEvent::WebsitePostsRegenerated { website_id, job_id, .. } => |ctx| async move {
@@ -177,47 +177,47 @@ let effects = on! {
     },
 };
 
-// Returns Vec<Effect<S, D>> - add to engine
-let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
+// Returns Vec<Handler<D>> - add to engine
+let engine = handlers.into_iter().fold(Engine::new(deps, store), |e, h| e.with_handler(h));
 ```
 
-#### Effect Execution Configuration (v0.8.0+)
+#### Handler Execution Configuration (v0.8.0+)
 
-Effects can be configured for retry, timeout, delay, priority, and queued execution:
+Handlers can be configured for retry, timeout, delay, priority, and background execution:
 
 ```rust
-// Queued effect with retry and timeout
-effect::on::<PaymentRequested>()
-    .id("charge_payment")          // Custom ID for tracing/debugging
-    .retry(5)                       // Retry up to 5 times on failure
+// Background handler with retry and timeout
+handler::on::<PaymentRequested>()
+    .name("charge_payment")          // Custom name for tracing/debugging
+    .retry(5)                        // Retry up to 5 times on failure
     .timeout(Duration::from_secs(30))  // 30 second timeout
-    .priority(1)                    // Higher priority (lower number = higher priority)
+    .priority(1)                     // Higher priority (lower number = higher priority)
     .then(|event, ctx| async move {
         ctx.deps().stripe.charge(&event).await?;
         Ok(PaymentCharged { order_id: event.order_id })
     });
 
 // Delayed execution
-effect::on::<OrderPlaced>()
-    .delayed(Duration::from_secs(3600))  // Run 1 hour later
+handler::on::<OrderPlaced>()
+    .delay(Duration::from_secs(3600))  // Run 1 hour later
     .then(|event, ctx| async move {
         ctx.deps().send_followup_email(&event).await?;
         Ok(FollowupSent { order_id: event.order_id })
     });
 
-// Force queued execution (even without retry/delay/timeout)
-effect::on::<AnalyticsEvent>()
-    .queued()                       // Execute in background worker
+// Force background execution (even without retry/delay/timeout)
+handler::on::<AnalyticsEvent>()
+    .background()                    // Execute in background worker
     .then(|event, ctx| async move {
         ctx.deps().analytics.track(&event).await?;
         Ok(())
     });
 
 // Chaining works in any order
-effect::on::<OrderPlaced>()
-    .filter(|e| e.total > 100.0)    // Filter first
+handler::on::<OrderPlaced>()
+    .filter(|e| e.total > 100.0)     // Filter first
     .retry(3)                        // Then config
-    .id("large_orders")
+    .name("large_orders")
     .priority(1)
     .then(|event, ctx| async move {
         Ok(LargeOrderProcessed { id: event.id })
@@ -226,19 +226,19 @@ effect::on::<OrderPlaced>()
 
 **Execution Modes:**
 - **Inline** (default): Runs immediately in same transaction, no retry
-- **Queued**: Triggered by `.queued()`, `.delayed()`, `.timeout()`, `.retry() > 1`, or `.priority()`
+- **Background**: Triggered by `.background()`, `.delay()`, `.timeout()`, `.retry() > 1`, or `.priority()`
 
 **Configuration Methods:**
-- `.id(String)` - Custom identifier for tracing/debugging
+- `.name(String)` - Custom name for tracing/debugging
 - `.retry(u32)` - Max retry attempts (default: 1 = no retry)
 - `.timeout(Duration)` - Execution timeout
-- `.delayed(Duration)` - Delay before execution
+- `.delay(Duration)` - Delay before execution
 - `.priority(i32)` - Priority (lower = higher priority)
-- `.queued()` - Force queued execution
+- `.background()` - Force background execution
 
-Each arm generates an effect equivalent to:
+Each arm generates a handler equivalent to:
 ```rust
-effect::on::<CrawlEvent>()
+handler::on::<CrawlEvent>()
     .extract(|e| match e {
         CrawlEvent::WebsiteIngested { website_id, job_id, .. } => Some((website_id.clone(), job_id.clone())),
         _ => None,
@@ -246,25 +246,26 @@ effect::on::<CrawlEvent>()
     .then(|(website_id, job_id), ctx| async move { ... })
 ```
 
-Effects can:
+Handlers can:
 - Do IO (DB queries, API calls, etc.)
 - Make decisions
 - Branch on conditions
 - Be pure or impure (your choice)
 - Return events to dispatch, or `Ok(())` to dispatch nothing
-- Filter events with `.extract()` (formerly `.filter_map()`)
+- Filter events with `.extract()` (formerly `.extract()`)
 - React to state transitions with `.transition()`
 - Use `on!` macro for ergonomic multi-variant matching
 
-EffectContext provides:
+HandlerContext provides:
 - `deps()` — shared dependencies
-- `prev_state()` — state before reducer ran
-- `next_state()` — state after reducer ran
-- `curr_state()` — current live state
+- `handler_id()` — handler identifier for tracing
+- `idempotency_key()` — deterministic key for external APIs
+- `correlation_id` — groups related events in workflow
+- `event_id` — current event's unique identifier
 
 ### Event Batching
 
-**v0.9+** Effects can emit multiple events atomically using `Emit<E>`:
+**v0.9+** Handlers can emit multiple events atomically using `Emit<E>`:
 
 ```rust
 pub enum Emit<E> {
@@ -280,7 +281,7 @@ Use `Emit::Batch` when processing collections that need to emit one event per it
 
 ```rust
 // Parse CSV and emit batch of row events
-effect::on::<FileUploaded>().then(|event, ctx| async move {
+handler::on::<FileUploaded>().then(|event, ctx| async move {
     let rows = ctx.deps().parse_csv(&event.path).await?;
 
     // Emit all row events atomically with same batch_id
@@ -312,14 +313,14 @@ Ok(Emit::None)               // Observer pattern, no event
 
 **Rule**: If all code paths return the same type (`Event`, `Vec<Event>`, or `()`), auto-conversion works. If mixing types (some paths return events, others return nothing), use explicit `Emit` to avoid type inference ambiguity.
 
-#### Joining Batched Events
+#### Accumulating Batched Events
 
-Use `.join()` to accumulate events from the same batch before processing:
+Use `.accumulate()` to accumulate events from the same batch before processing:
 
 ```rust
 // Accumulate all RowParsed events from same batch
-effect::on::<RowParsed>()
-    .join()  // Enable batch accumulation
+handler::on::<RowParsed>()
+    .accumulate()  // Enable batch accumulation
     .then(|batch: Vec<RowParsed>, ctx| async move {
         // Handler receives Vec<Event> instead of single Event
 
@@ -330,18 +331,18 @@ effect::on::<RowParsed>()
     })
 ```
 
-**How join works:**
+**How accumulate works:**
 1. Events with same `batch_id` are accumulated in `seesaw_join_entries` table
 2. Per-event handler is skipped (no-op)
-3. When all events in batch arrive (based on `batch_size`), join handler fires
-4. Join handler receives `Vec<Event>` with all accumulated events
+3. When all events in batch arrive (based on `batch_size`), accumulate handler fires
+4. Accumulate handler receives `Vec<Event>` with all accumulated events
 5. Window marked complete in `seesaw_join_windows` table
 
-**Join properties:**
-- **Durable**: Join state persisted in database, survives restarts
+**Accumulate properties:**
+- **Durable**: Accumulate state persisted in database, survives restarts
 - **Deterministic**: Window closes when `batch_size` events received
 - **Ordered**: Events in `Vec` maintain `batch_index` order
-- **Always queued**: Join effects execute in background workers
+- **Always background**: Accumulate handlers execute in background workers
 
 #### Batch Flow Example
 
@@ -356,8 +357,8 @@ enum ImportEvent {
     BatchInserted { count: usize },
 }
 
-// Effect 1: Parse file, emit batch
-effect::on::<ImportEvent>()
+// Handler 1: Parse file, emit batch
+handler::on::<ImportEvent>()
     .extract(|e| match e {
         ImportEvent::FileUploaded { path } => Some(path.clone()),
         _ => None,
@@ -370,8 +371,8 @@ effect::on::<ImportEvent>()
         Ok(Emit::Batch(events))  // 1000 events with same batch_id
     })
 
-// Effect 2: Validate each row (runs 1000 times)
-effect::on::<ImportEvent>()
+// Handler 2: Validate each row (runs 1000 times)
+handler::on::<ImportEvent>()
     .extract(|e| match e {
         ImportEvent::RowParsed { row } => Some(row.clone()),
         _ => None,
@@ -381,13 +382,13 @@ effect::on::<ImportEvent>()
         Ok(Emit::One(ImportEvent::RowValidated { row }))
     })
 
-// Effect 3: Join validated rows, bulk insert (runs once per batch)
-effect::on::<ImportEvent>()
+// Handler 3: Accumulate validated rows, bulk insert (runs once per batch)
+handler::on::<ImportEvent>()
     .extract(|e| match e {
         ImportEvent::RowValidated { row } => Some(row.clone()),
         _ => None,
     })
-    .join()
+    .accumulate()
     .then(|batch, ctx| async move {
         // batch contains all 1000 validated rows
         ctx.deps().db.bulk_insert(&batch).await?;
@@ -398,12 +399,12 @@ effect::on::<ImportEvent>()
 **Execution trace:**
 ```
 1. FileUploaded dispatched
-2. Parse effect runs → Emit::Batch([Row1, Row2, ..., Row1000])
+2. Parse handler runs → Emit::Batch([Row1, Row2, ..., Row1000])
 3. All 1000 RowParsed events inserted (same batch_id, sequential batch_index)
-4. Validate effect runs 1000 times (once per RowParsed)
+4. Validate handler runs 1000 times (once per RowParsed)
 5. Each validation emits RowValidated (new batch_id per event)
-6. Join effect accumulates all RowValidated in seesaw_join_entries
-7. When all events arrived, join handler fires with Vec[Row1...Row1000]
+6. Accumulate handler accumulates all RowValidated in seesaw_join_entries
+7. When all events arrived, accumulate handler fires with Vec[Row1...Row1000]
 8. Bulk insert runs once
 ```
 
@@ -411,7 +412,7 @@ effect::on::<ImportEvent>()
 
 **Pattern 1: Per-item error events** (recommended)
 ```rust
-effect::on::<RowParsed>().then(|event, ctx| async move {
+handler::on::<RowParsed>().then(|event, ctx| async move {
     match ctx.deps().validate_row(&event.row).await {
         Ok(_) => Ok(Emit::One(RowValidated { row: event.row })),
         Err(e) => Ok(Emit::One(RowRejected { row: event.row, reason: e.to_string() })),
@@ -421,8 +422,8 @@ effect::on::<RowParsed>().then(|event, ctx| async move {
 
 **Pattern 2: Collect successes and failures**
 ```rust
-effect::on::<RowParsed>()
-    .join()
+handler::on::<RowParsed>()
+    .accumulate()
     .then(|batch, ctx| async move {
         let mut results = Vec::new();
         for row in batch {
@@ -437,8 +438,8 @@ effect::on::<RowParsed>()
 
 **Pattern 3: Retry entire batch** (for idempotent operations)
 ```rust
-effect::on::<RowValidated>()
-    .join()
+handler::on::<RowValidated>()
+    .accumulate()
     .retry(3)  // Retry whole batch on failure
     .then(|batch, ctx| async move {
         // Must be idempotent - may run multiple times
@@ -455,7 +456,7 @@ effect::on::<RowValidated>()
 - ✅ Avoiding N separate effect executions
 - ✅ Fan-out: dispatch notification to many users
 
-**Use `.join()` when:**
+**Use `.accumulate()` when:**
 - ✅ Bulk database operations (inserts, updates)
 - ✅ Rate limiting: accumulate, send in bursts
 - ✅ Aggregation: combine multiple events into summary
@@ -493,45 +494,105 @@ effect::on::<RowValidated>()
 See `examples/batch-processor/` for full working example demonstrating:
 - CSV parsing with `Emit::Batch`
 - Per-row validation
-- Batch accumulation with `.join()`
+- Batch accumulation with `.accumulate()`
 - Bulk database insert
 - Error handling patterns
 
-### Reducer
+### State Management Without Reducers
 
-Pure state transformations that run before effects.
+Seesaw uses **handlers-only** architecture. State is managed through three patterns:
+
+#### Pattern 1: Event-Threaded State (Pure, Auditable)
+State flows as event fields. Each event carries accumulated state forward.
 
 ```rust
-// Simple reducer
-let scrape_reducer = reducer::on::<SourceScraped>().run(|state, event| {
-    State {
-        last_scrape: Some(event.data.clone()),
-        scrape_count: state.scrape_count + 1,
-        ..state
-    }
-});
+#[derive(Clone, Serialize, Deserialize)]
+enum OrderEvent {
+    Processing {
+        order_id: Uuid,
+        items_processed: usize,  // Accumulated state
+        items_remaining: Vec<Item>,
+    },
+    Complete {
+        order_id: Uuid,
+        total_items: usize,  // Final state
+    },
+}
 
-// Multiple reducers for different events
-let order_reducer = reducer::on::<OrderPlaced>().run(|state, event| {
-    State {
-        order_count: state.order_count + 1,
-        total_revenue: state.total_revenue + event.amount,
-        ..state
-    }
-});
-
-// Reducer that resets state
-let reset_reducer = reducer::on::<Reset>().run(|_state, _event| {
-    State::default()
-});
+handler::on::<OrderEvent>()
+    .extract(|e| match e {
+        OrderEvent::Processing { order_id, items_processed, items_remaining } =>
+            Some((*order_id, *items_processed, items_remaining.clone())),
+        _ => None,
+    })
+    .then(|(order_id, processed, remaining), ctx| async move {
+        if let Some((item, rest)) = remaining.split_first() {
+            ctx.deps().process_item(item).await?;
+            Ok(OrderEvent::Processing {
+                order_id,
+                items_processed: processed + 1,
+                items_remaining: rest.to_vec(),
+            })
+        } else {
+            Ok(OrderEvent::Complete {
+                order_id,
+                total_items: processed,
+            })
+        }
+    })
 ```
 
-Reducers:
-- Are pure functions (no side effects)
-- Transform state based on events
-- Run before effects see the event
-- Multiple reducers chain together
-- Provide updated state to effects via `ctx.state()`
+**When to use:** Deterministic workflows, auditability requirements, replay scenarios
+
+#### Pattern 2: Shared Dependency State (Mutable, Shared)
+State stored in dependencies using `Arc<Mutex<T>>`.
+
+```rust
+#[derive(Clone)]
+struct Deps {
+    order_status: Arc<Mutex<HashMap<Uuid, OrderStatus>>>,
+}
+
+handler::on::<OrderEvent>()
+    .then(|event, ctx| async move {
+        let mut status = ctx.deps().order_status.lock().unwrap();
+        status.insert(event.order_id, OrderStatus::Shipped);
+        Ok(OrderShipped { order_id: event.order_id })
+    })
+```
+
+**When to use:** Complex mutable state, shared across effects, need to query arbitrary state
+
+#### Pattern 3: Implicit State (Event Sequence)
+State is implicit in "which events have fired".
+
+```rust
+// State is: OrderPlaced → state "placed"
+//          OrderShipped → state "shipped"
+//          OrderDelivered → state "delivered"
+
+handler::on::<OrderPlaced>().then(|event, ctx| async move {
+    ctx.deps().ship(event.order_id).await?;
+    Ok(OrderShipped { order_id: event.order_id })
+})
+```
+
+**When to use:** Simple workflows where event types represent state transitions
+
+#### Choosing a Pattern
+
+| Pattern | Deterministic | Auditable | Mutable | Complexity |
+|---------|---------------|-----------|---------|------------|
+| Event-Threaded | ✅ | ✅ | ❌ | Low-Medium |
+| Shared Deps | ❌ | ❌ | ✅ | Medium-High |
+| Implicit | ✅ | ✅ | ❌ | Low |
+
+### Reducer (Removed in v0.9)
+
+**Reducers have been removed** from Seesaw. State is now managed by handlers through:
+- Event-threaded state (state flows through event fields)
+- Shared dependency state (Arc<Mutex<T>> in deps)
+- Implicit state (event sequences represent state)
 
 ## Execution Model
 
@@ -540,13 +601,14 @@ Simple and direct:
 ```
 Event dispatched
   ↓
-Reducers transform state
+All Handlers listening to this event execute
   ↓
-All Effects listening to this event
+Handlers perform IO, make decisions, query state from:
+  - Event payload (state-in-events pattern)
+  - Shared dependencies (Arc<Mutex<T>> pattern)
+  - Event history (implicit state pattern)
   ↓
-Execute (IO, decisions, state checks)
-  ↓
-Return new Event (or () for none)
+Handlers return new Event (or () for observer pattern)
   ↓
 Repeat
 ```
@@ -555,24 +617,24 @@ Repeat
 
 ```rust
 ScrapeEvent::SourceRequested
-  → ScrapeEffect → scrapes URL → returns SourceScraped { data }
-  → ExtractEffect → extracts items → returns DataExtracted { items }
-  → SyncEffect → syncs to DB → returns SyncComplete
+  → ScrapeHandler → scrapes URL → returns SourceScraped { data }
+  → ExtractHandler → extracts items → returns DataExtracted { items }
+  → SyncHandler → syncs to DB → returns SyncComplete
 ```
 
-Multiple effects can listen to the same event and run in parallel.
+Multiple handlers can listen to the same event and run in parallel.
 
 **Example**: Parallel notifications
 
 ```rust
 UserEvent::SignedUp
   ↓
-  ├─→ EmailEffect → sends welcome email → returns EmailSent
-  ├─→ SlackEffect → posts to Slack → returns SlackPosted
-  └─→ AnalyticsEffect → tracks event → returns ()
+  ├─→ EmailHandler → sends welcome email → returns EmailSent
+  ├─→ SlackHandler → posts to Slack → returns SlackPosted
+  └─→ AnalyticsHandler → tracks event → returns ()
 ```
 
-All three effects run concurrently when `SignedUp` is dispatched.
+All three handlers run concurrently when `SignedUp` is dispatched.
 
 ## Examples
 
@@ -586,11 +648,11 @@ enum ScrapeEvent {
     DataExtracted { source_id: Uuid, items: Vec<Item> },
 }
 
-let engine = Engine::with_deps(deps)
-    // Effect 1: Scrape on request
-    .with_effect(
-        effect::on::<ScrapeEvent>()
-            .filter_map(|e| match e {
+let engine = Engine::new(deps, store)
+    // Handler 1: Scrape on request
+    .with_handler(
+        handler::on::<ScrapeEvent>()
+            .extract(|e| match e {
                 ScrapeEvent::SourceRequested { source_id } => Some(*source_id),
                 _ => None,
             })
@@ -599,10 +661,10 @@ let engine = Engine::with_deps(deps)
                 Ok(ScrapeEvent::SourceScraped { source_id, data })
             })
     )
-    // Effect 2: Extract on scrape
-    .with_effect(
-        effect::on::<ScrapeEvent>()
-            .filter_map(|e| match e {
+    // Handler 2: Extract on scrape
+    .with_handler(
+        handler::on::<ScrapeEvent>()
+            .extract(|e| match e {
                 ScrapeEvent::SourceScraped { source_id, data } => Some((*source_id, data.clone())),
                 _ => None,
             })
@@ -623,11 +685,11 @@ enum NotificationEvent {
     SlackPosted { user_id: Uuid, message_id: String },
 }
 
-let engine = Engine::with_deps(deps)
-    // Email effect
-    .with_effect(
-        effect::on::<NotificationEvent>()
-            .filter_map(|e| match e {
+let engine = Engine::new(deps, store)
+    // Email handler
+    .with_handler(
+        handler::on::<NotificationEvent>()
+            .extract(|e| match e {
                 NotificationEvent::UserSignedUp { user_id, email } => Some((*user_id, email.clone())),
                 _ => None,
             })
@@ -636,10 +698,10 @@ let engine = Engine::with_deps(deps)
                 Ok(NotificationEvent::EmailSent { user_id, email_id })
             })
     )
-    // Slack effect
-    .with_effect(
-        effect::on::<NotificationEvent>()
-            .filter_map(|e| match e {
+    // Slack handler
+    .with_handler(
+        handler::on::<NotificationEvent>()
+            .extract(|e| match e {
                 NotificationEvent::UserSignedUp { user_id, .. } => Some(*user_id),
                 _ => None,
             })
@@ -650,14 +712,14 @@ let engine = Engine::with_deps(deps)
     );
 ```
 
-Both effects run in parallel when `UserSignedUp` is dispatched. No coordination needed.
+Both handlers run in parallel when `UserSignedUp` is dispatched. No coordination needed.
 
 ### Example 3: Conditional event dispatch
 
 ```rust
-// Effect that conditionally returns different events
-effect::on::<ScrapeEvent>()
-    .filter_map(|e| match e {
+// Handler that conditionally returns different events
+handler::on::<ScrapeEvent>()
+    .extract(|e| match e {
         ScrapeEvent::SourceRequested { source_id } => Some(*source_id),
         _ => None,
     })
@@ -675,7 +737,7 @@ effect::on::<ScrapeEvent>()
     })
 ```
 
-Effects return events based on outcomes - success, failure, or rate-limited all flow as events.
+Handlers return events based on outcomes - success, failure, or rate-limited all flow as events.
 
 ## Design Guidelines
 
@@ -690,9 +752,9 @@ Otherwise you get:
 - Silent deadlocks
 - Ghost workflows
 
-### Effects can do anything
+### Handlers can do anything
 
-Effects are unconstrained. They can:
+Handlers are unconstrained. They can:
 - Do IO or be pure
 - Hold state or be stateless
 - Make complex decisions or be simple transforms
@@ -702,12 +764,12 @@ You decide based on your needs.
 
 ### Cross-domain listening
 
-Effects can listen to events from any domain and return events from another.
+Handlers can listen to events from any domain and return events from another.
 
 ```rust
-// Effect listening to WebsiteEvent, returning CrawlEvent
-effect::on::<WebsiteEvent>()
-    .filter_map(|e| match e {
+// Handler listening to WebsiteEvent, returning CrawlEvent
+handler::on::<WebsiteEvent>()
+    .extract(|e| match e {
         WebsiteEvent::WebsiteApproved { website_id } => Some(*website_id),
         _ => None,
     })
@@ -721,7 +783,7 @@ This is normal and correct. Cross-domain coordination happens via events.
 
 ## Error Handling Pattern
 
-Effects can handle errors in two ways:
+Handlers can handle errors in two ways:
 
 ### Preferred: Explicit Failure Events
 
@@ -736,7 +798,7 @@ enum OrderEvent {
 }
 
 // Handle failures explicitly
-effect::on::<OrderEvent>()
+handler::on::<OrderEvent>()
     .extract(|e| match e {
         OrderEvent::OrderPlaced { order_id, total, .. } => Some((*order_id, *total)),
         _ => None,
@@ -752,7 +814,7 @@ effect::on::<OrderEvent>()
     });
 
 // Compensation
-effect::on::<OrderEvent>()
+handler::on::<OrderEvent>()
     .extract(|e| match e {
         OrderEvent::PaymentChargeFailed { order_id, reason, .. } => Some((*order_id, reason.clone())),
         _ => None,
@@ -768,17 +830,17 @@ effect::on::<OrderEvent>()
     });
 ```
 
-### Fallback: EffectError for Ergonomic `?` Usage
+### Fallback: HandlerError for Ergonomic `?` Usage
 
 ```rust
 // Use ? for ergonomics
-effect::on::<OrderPlaced>().then(|order, ctx| async move {
+handler::on::<OrderPlaced>().then(|order, ctx| async move {
     ctx.deps().payment.charge(order.total).await?;  // Propagates error
     Ok(PaymentCharged { order_id: order.id })
 })
 
-// Generic EffectError handler
-effect::on::<EffectError>()
+// Generic HandlerError handler
+handler::on::<HandlerError>()
     .filter(|err| {
         // Explicit retry logic
         err.source_event_type == TypeId::of::<OrderPlaced>() &&
@@ -792,7 +854,7 @@ effect::on::<EffectError>()
     });
 
 // Typed error handling
-effect::on::<EffectError>()
+handler::on::<HandlerError>()
     .extract(|err| {
         // Filter by source event + error type
         if err.source_event_type == TypeId::of::<OrderPlaced>() {
@@ -818,18 +880,26 @@ effect::on::<EffectError>()
 ### Guidelines
 
 1. **Use explicit failure events** for critical flows where you need fine-grained control
-2. **Use EffectError** for convenience when you just want to use `?`
+2. **Use HandlerError** for convenience when you just want to use `?`
 3. **Write explicit logic** - no magic helpers for "transient" or "should_retry"
-4. **Compensation effects should be infallible** - catch errors internally, don't propagate
+4. **Compensation handlers should be infallible** - catch errors internally, don't propagate
 
-## Role Matrix
+## Handler Responsibilities
 
-| Role    | React? | Mutate? | Returns | Listen To | Pure? |
-| ------- | ------ | ------- | ------- | --------- | ----- |
-| Reducer | No     | No      | State   | Events    | Yes   |
-| Effect  | Yes    | Yes     | Event   | Events    | No    |
+Handlers are the **only** reactive primitive in Seesaw. They handle:
 
-Reducers transform state. Effects do the work and return events.
+- ✅ Reacting to events
+- ✅ Performing side effects (IO, API calls)
+- ✅ Querying state (from events or dependencies)
+- ✅ Updating state (by emitting new events or mutating deps)
+- ✅ Making decisions and branching logic
+- ✅ Returning new events to dispatch
+
+Handlers can be:
+- Pure or impure (your choice)
+- Stateless or stateful (your choice)
+- Synchronous or asynchronous
+- Inline or queued
 
 ## What Seesaw Is Not
 
@@ -885,14 +955,14 @@ Event::UserRequested { user_id: Uuid }  // Immutable reference
 
 Events should reference facts, not embed data that might change.
 
-### 2. Effects that know too much
+### 2. Handlers that know too much
 
-If your effect:
+If your handler:
 - Has dozens of fields
 - Mirrors database rows
 - Holds authoritative data
 
-You're putting the source of truth in the wrong place. Effects should query deps, not store domain data.
+You're putting the source of truth in the wrong place. Handlers should query deps, not store domain data.
 
 ### 3. Missing terminal events
 
@@ -912,39 +982,36 @@ Every long-running flow needs success and failure terminal events.
 ## Engine Usage
 
 ```rust
-// Define engine once (stateless, reusable)
-let engine = Engine::new()
-    .with_reducer(reducer::on::<MyEvent>().run(|state, event| {
-        // Pure state transformation
-        State { count: state.count + 1, ..state }
-    }))
-    .with_effect(effect::on::<MyEvent>().then(|event, ctx| async move {
-        // Side effects - return event to dispatch
+// Define engine with dependencies and store
+let engine = Engine::new(deps, store)
+    .with_handler(handler::on::<MyEvent>().then(|event, ctx| async move {
+        // Query state from deps or event
+        let count = ctx.deps().get_count().await?;
+        ctx.deps().set_count(count + 1).await?;
+
+        // Or thread state through events
         ctx.deps().notify(&event).await?;
-        Ok(NextEvent { id: event.id })
+        Ok(NextEvent { id: event.id, count: count + 1 })
     }));
 
-// Execute per-request - return event to dispatch
-let handle = engine.activate(State::default());
-handle.process(|_ctx| async { Ok(MyEvent::Started { data }) }).await?;
+// Dispatch events directly
+engine.dispatch(MyEvent::Started { count: 0 }).await?;
 ```
 
 Builder methods:
-- `.with_reducer(reducer)` — Register pure state transformations
-- `.with_effect(effect)` — Register event handlers (use `.then()` to return events)
-- `.with_deps(deps)` — Create engine with dependencies
-- `.with_effect_registry(registry)` — Use existing effect registry
+- `.with_handler(handler)` — Register event handlers (use `.then()` to return events)
+- `Engine::new(deps, store)` — Create engine with dependencies and event store
 
-Handle methods:
-- `.process(async_closure).await` — Execute logic, dispatch event, wait for effects to complete
-- `.settled().await` — Wait for all effects to complete
+Engine methods:
+- `.dispatch(event).await` — Dispatch event and wait for handlers to complete
+- `.settled().await` — Wait for all handlers to complete
 - `.cancel()` — Cancel all tasks
 
 ## Cross-Domain Reactions
 
-Effects can listen to events from other domains. This is normal and correct.
+Handlers can listen to events from other domains. This is normal and correct.
 
-**Pattern**: Domain A dispatches event → Domain B's effect reacts → Domain B returns its own events
+**Pattern**: Domain A dispatches event → Domain B's handler reacts → Domain B returns its own events
 
 ### Example: Website approval triggers crawling
 
@@ -954,9 +1021,9 @@ pub enum WebsiteEvent {
     WebsiteApproved { website_id: Uuid },
 }
 
-// Crawl effect listens to WebsiteEvent, returns CrawlEvent
-effect::on::<WebsiteEvent>()
-    .filter_map(|e| match e {
+// Crawl handler listens to WebsiteEvent, returns CrawlEvent
+handler::on::<WebsiteEvent>()
+    .extract(|e| match e {
         WebsiteEvent::WebsiteApproved { website_id } => Some(*website_id),
         _ => None,
     })
@@ -972,7 +1039,7 @@ effect::on::<WebsiteEvent>()
 - Trivially testable
 - Explicit and localized
 
-The runtime broadcasts events. Effects that care, react and return new events. That's it.
+The engine dispatches events. Handlers that care, react and return new events. That's it.
 
 ## Request/Response Pattern
 
@@ -1007,7 +1074,7 @@ tx.commit().await?;
 ## Architecture Flow
 
 ```
-EventBus → Effect.then(event) → returns Event → EventBus
+Engine → Handler.then(event) → returns Event → Engine
 ```
 
 Simple and direct.
@@ -1015,10 +1082,10 @@ Simple and direct.
 ## Design Principles Summary
 
 1. **Events are the only signals** — Everything flows through events
-2. **Reducers transform state** — Pure functions that run before effects
-3. **Effects react to events** — Do IO, return new events
-4. **Effects are unconstrained** — Can do anything, pure or impure, stateful or stateless
+2. **Handlers are the only reactive primitive** — Handle both state queries/updates AND side effects
+3. **State lives in events or dependencies** — Choose pattern based on needs
+4. **Handlers are unconstrained** — Can do anything, pure or impure, stateful or stateless
 5. **Events are facts, past-tense** — `UserCreated`, not `CreateUser`
-6. **Effects can listen to any domain** — Cross-domain coordination via events
-7. **One Effect execution = One transaction** — Multiple atomic writes belong together
+6. **Handlers can listen to any domain** — Cross-domain coordination via events
+7. **One Handler execution = One transaction** — Multiple atomic writes belong together
 8. **Terminal events close loops** — Every workflow needs success/failure events

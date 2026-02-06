@@ -29,26 +29,6 @@ pub fn effects(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-#[proc_macro_attribute]
-pub fn reducer(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let metas = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
-    let input_fn = parse_macro_input!(item as ItemFn);
-
-    match expand_reducer(parse_reducer_args(&metas), input_fn) {
-        Ok(tokens) => tokens.into(),
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
-#[proc_macro_attribute]
-pub fn reducers(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut module = parse_macro_input!(item as ItemMod);
-    match expand_reducers_module(&mut module) {
-        Ok(tokens) => tokens.into(),
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
 #[derive(Clone)]
 enum OnSpec {
     EventType(Path),
@@ -103,12 +83,6 @@ struct EffectArgs {
     group: Option<String>,
 }
 
-#[derive(Default)]
-struct ReducerArgs {
-    on: Option<OnSpec>,
-    extract: Vec<Ident>,
-}
-
 struct ParamInfo {
     ident: Ident,
     ty: Type,
@@ -160,7 +134,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
     })?;
     let on_event_type = on.event_type()?;
 
-    let (ctx_idx, state_ty, deps_ty) = find_effect_context(&input_fn.sig)?;
+    let (ctx_idx, deps_ty) = find_effect_context(&input_fn.sig)?;
     let params = collect_params(&input_fn.sig)?;
     let non_ctx_params: Vec<ParamInfo> = params
         .into_iter()
@@ -211,7 +185,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             #builder
                 .join()
                 .same_batch()
-                .then::<#state_ty, #deps_ty, _, _, _, #output_event_ty>(|#batch_ident, __seesaw_ctx| #fn_ident(#batch_ident, __seesaw_ctx))
+                .then::<#deps_ty, _, _, _, #output_event_ty>(|#batch_ident, __seesaw_ctx| #fn_ident(#batch_ident, __seesaw_ctx))
         }
     } else if !args.extract.is_empty() {
         if non_ctx_params.len() != args.extract.len() {
@@ -277,14 +251,14 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             quote! {
                 #builder
                     #extract_call
-                    .then::<#state_ty, #deps_ty, #extracted_ty, _, _, _, #output_event_ty>(|#field, __seesaw_ctx| #fn_ident(#field, __seesaw_ctx))
+                    .then::<#deps_ty, #extracted_ty, _, _, _, #output_event_ty>(|#field, __seesaw_ctx| #fn_ident(#field, __seesaw_ctx))
             }
         } else {
             let extracted_tys: Vec<&Type> = non_ctx_params.iter().map(|param| &param.ty).collect();
             quote! {
                 #builder
                     #extract_call
-                    .then::<#state_ty, #deps_ty, (#(#extracted_tys),*), _, _, _, #output_event_ty>(|(#(#fields),*), __seesaw_ctx| #fn_ident(#(#fields),*, __seesaw_ctx))
+                    .then::<#deps_ty, (#(#extracted_tys),*), _, _, _, #output_event_ty>(|(#(#fields),*), __seesaw_ctx| #fn_ident(#(#fields),*, __seesaw_ctx))
             }
         }
     } else {
@@ -312,7 +286,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         let event_ident = &event_param.ident;
         quote! {
             #builder
-                .then::<#state_ty, #deps_ty, ::std::sync::Arc<#on_event_type>, _, _, _, #output_event_ty>(|#event_ident, __seesaw_ctx| #fn_ident((#event_ident).as_ref().clone(), __seesaw_ctx))
+                .then::<#deps_ty, ::std::sync::Arc<#on_event_type>, _, _, _, #output_event_ty>(|#event_ident, __seesaw_ctx| #fn_ident((#event_ident).as_ref().clone(), __seesaw_ctx))
         }
     };
 
@@ -320,157 +294,8 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         #input_fn
 
         #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::seesaw_core::Effect<#state_ty, #deps_ty> {
+        pub fn #wrapper_ident() -> ::seesaw_core::Effect<#deps_ty> {
             #chain
-        }
-    })
-}
-
-fn expand_reducer(args: syn::Result<ReducerArgs>, input_fn: ItemFn) -> syn::Result<TokenStream2> {
-    let args = args?;
-    let fn_ident = input_fn.sig.ident.clone();
-    let wrapper_ident = format_ident!("__seesaw_reducer_{}", fn_ident);
-
-    if input_fn.sig.asyncness.is_some() {
-        return Err(syn::Error::new_spanned(
-            &input_fn.sig.fn_token,
-            "#[reducer] requires a synchronous function",
-        ));
-    }
-    if !input_fn.sig.generics.params.is_empty() {
-        return Err(syn::Error::new_spanned(
-            &input_fn.sig.generics,
-            "#[reducer] does not support generic functions",
-        ));
-    }
-
-    let params = collect_params(&input_fn.sig)?;
-    if params.is_empty() {
-        return Err(syn::Error::new_spanned(
-            &input_fn.sig.inputs,
-            "#[reducer] requires a state parameter",
-        ));
-    }
-
-    let state_param = &params[0];
-    let state_ty = state_param.ty.clone();
-
-    match &input_fn.sig.output {
-        ReturnType::Default => {
-            return Err(syn::Error::new_spanned(
-                &input_fn.sig.output,
-                "#[reducer] must return the state type",
-            ));
-        }
-        ReturnType::Type(_, output_ty) => {
-            if type_key(output_ty) != type_key(&state_ty) {
-                return Err(syn::Error::new_spanned(
-                    output_ty,
-                    "reducer return type must match state parameter type",
-                ));
-            }
-        }
-    }
-
-    let body = if args.extract.is_empty() {
-        if params.len() != 2 {
-            return Err(syn::Error::new_spanned(
-                &input_fn.sig.inputs,
-                "#[reducer] without extract(...) requires exactly two parameters: (state, event)",
-            ));
-        }
-
-        let event_ty = match args.on {
-            Some(ref on) => on.event_type()?,
-            None => type_to_path(&params[1].ty)?,
-        };
-
-        if let Some(ref on) = args.on {
-            if matches!(on, OnSpec::EventType(_)) && type_key(&params[1].ty) != path_key(&event_ty)
-            {
-                return Err(syn::Error::new_spanned(
-                    &params[1].ty,
-                    "event parameter type must match on = EventType",
-                ));
-            }
-        }
-
-        quote! {
-            ::seesaw_core::reducer::fold::<#event_ty>()
-                .into(|state, __seesaw_event| #fn_ident(state, __seesaw_event.clone()))
-        }
-    } else {
-        let on = args.on.ok_or_else(|| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "extract(...) requires on = EventType or on = [Enum::Variant, ...]",
-            )
-        })?;
-
-        if params.len() != args.extract.len() + 1 {
-            return Err(syn::Error::new_spanned(
-                &input_fn.sig.inputs,
-                "reducer parameters after state must match extract(...) fields",
-            ));
-        }
-
-        let extracted_params = &params[1..];
-        for (param, extracted) in extracted_params.iter().zip(args.extract.iter()) {
-            if param.ident != *extracted {
-                return Err(syn::Error::new_spanned(
-                    &param.ident,
-                    format!(
-                        "parameter `{}` must match extracted field `{}`",
-                        param.ident, extracted
-                    ),
-                ));
-            }
-        }
-
-        let fields = &args.extract;
-        let event_ty = on.event_type()?;
-        match on {
-            OnSpec::EventType(_) => {
-                if fields.len() == 1 {
-                    let field = &fields[0];
-                    quote! {
-                        ::seesaw_core::reducer::fold::<#event_ty>()
-                            .into(|state, __seesaw_event| #fn_ident(state, __seesaw_event.#field.clone()))
-                    }
-                } else {
-                    quote! {
-                        ::seesaw_core::reducer::fold::<#event_ty>()
-                            .into(|state, __seesaw_event| {
-                                #fn_ident(state, #(__seesaw_event.#fields.clone()),*)
-                            })
-                    }
-                }
-            }
-            OnSpec::Variants(variants) => {
-                let match_arms = variants.iter().map(|variant| {
-                    quote! {
-                        #variant { #(#fields),*, .. } => #fn_ident(state, #(#fields.clone()),*),
-                    }
-                });
-
-                quote! {
-                    ::seesaw_core::reducer::fold::<#event_ty>()
-                        .into(|state, __seesaw_event| match __seesaw_event {
-                            #(#match_arms)*
-                            #[allow(unreachable_patterns)]
-                            _ => state,
-                        })
-                }
-            }
-        }
-    };
-
-    Ok(quote! {
-        #input_fn
-
-        #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::seesaw_core::Reducer<#state_ty> {
-            #body
         }
     })
 }
@@ -484,7 +309,6 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     };
 
     let mut wrappers = Vec::new();
-    let mut state_ty: Option<Type> = None;
     let mut deps_ty: Option<Type> = None;
 
     for item in items.iter() {
@@ -498,23 +322,17 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         let wrapper_ident = format_ident!("__seesaw_effect_{}", item_fn.sig.ident);
         wrappers.push(wrapper_ident);
 
-        let (_, state, deps) = find_effect_context(&item_fn.sig)?;
-        match (&state_ty, &deps_ty) {
-            (None, None) => {
-                state_ty = Some(state);
-                deps_ty = Some(deps);
-            }
-            (Some(existing_state), Some(existing_deps)) => {
-                if type_key(existing_state) != type_key(&state)
-                    || type_key(existing_deps) != type_key(&deps)
-                {
+        let (_, deps) = find_effect_context(&item_fn.sig)?;
+        match &deps_ty {
+            None => deps_ty = Some(deps),
+            Some(existing_deps) => {
+                if type_key(existing_deps) != type_key(&deps) {
                     return Err(syn::Error::new_spanned(
                         &item_fn.sig,
-                        "all #[effect] handlers in an #[effects] module must use the same EffectContext<State, Deps>",
+                        "all #[effect] handlers in an #[effects] module must use the same EffectContext<Deps>",
                     ));
                 }
             }
-            _ => unreachable!(),
         }
     }
 
@@ -525,72 +343,9 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         ));
     }
 
-    let state_ty = state_ty.expect("checked above");
     let deps_ty = deps_ty.expect("checked above");
     let registration_fn: ItemFn = parse_quote! {
-        pub fn effects() -> ::std::vec::Vec<::seesaw_core::Effect<#state_ty, #deps_ty>> {
-            ::std::vec![#(#wrappers()),*]
-        }
-    };
-    items.push(Item::Fn(registration_fn));
-
-    Ok(quote! { #module })
-}
-
-fn expand_reducers_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
-    let Some((_, items)) = &mut module.content else {
-        return Err(syn::Error::new_spanned(
-            module,
-            "#[reducers] requires an inline module",
-        ));
-    };
-
-    let mut wrappers = Vec::new();
-    let mut state_ty: Option<Type> = None;
-
-    for item in items.iter() {
-        let Item::Fn(item_fn) = item else {
-            continue;
-        };
-        if !has_attr(&item_fn.attrs, "reducer") {
-            continue;
-        }
-
-        let wrapper_ident = format_ident!("__seesaw_reducer_{}", item_fn.sig.ident);
-        wrappers.push(wrapper_ident);
-
-        let params = collect_params(&item_fn.sig)?;
-        let Some(first) = params.first() else {
-            return Err(syn::Error::new_spanned(
-                &item_fn.sig.inputs,
-                "#[reducer] requires a state parameter",
-            ));
-        };
-        let current_state = first.ty.clone();
-
-        match &state_ty {
-            None => state_ty = Some(current_state),
-            Some(existing_state) => {
-                if type_key(existing_state) != type_key(&current_state) {
-                    return Err(syn::Error::new_spanned(
-                        &item_fn.sig,
-                        "all #[reducer] handlers in a #[reducers] module must use the same state type",
-                    ));
-                }
-            }
-        }
-    }
-
-    if wrappers.is_empty() {
-        return Err(syn::Error::new_spanned(
-            module,
-            "#[reducers] module must contain at least one #[reducer] function",
-        ));
-    }
-
-    let state_ty = state_ty.expect("checked above");
-    let registration_fn: ItemFn = parse_quote! {
-        pub fn reducers() -> ::std::vec::Vec<::seesaw_core::Reducer<#state_ty>> {
+        pub fn effects() -> ::std::vec::Vec<::seesaw_core::Effect<#deps_ty>> {
             ::std::vec![#(#wrappers()),*]
         }
     };
@@ -675,36 +430,6 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 return Err(syn::Error::new_spanned(
                     meta,
                     "unsupported #[effect] option",
-                ));
-            }
-        }
-    }
-
-    Ok(args)
-}
-
-fn parse_reducer_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<ReducerArgs> {
-    let mut args = ReducerArgs::default();
-
-    for meta in metas {
-        match meta {
-            Meta::NameValue(nv) if nv.path.is_ident("on") => {
-                ensure_unset(&args.on, nv, "on")?;
-                args.on = Some(parse_on_expr(&nv.value)?);
-            }
-            Meta::List(list) if list.path.is_ident("extract") => {
-                if !args.extract.is_empty() {
-                    return Err(syn::Error::new_spanned(
-                        list,
-                        "extract(...) specified more than once",
-                    ));
-                }
-                args.extract = parse_extract_fields(list)?;
-            }
-            _ => {
-                return Err(syn::Error::new_spanned(
-                    meta,
-                    "unsupported #[reducer] option",
                 ));
             }
         }
@@ -814,34 +539,34 @@ fn parse_path_expr(expr: &Expr, label: &str) -> syn::Result<Path> {
     }
 }
 
-fn find_effect_context(sig: &Signature) -> syn::Result<(usize, Type, Type)> {
-    let mut found: Option<(usize, Type, Type)> = None;
+fn find_effect_context(sig: &Signature) -> syn::Result<(usize, Type)> {
+    let mut found: Option<(usize, Type)> = None;
 
     for (index, input) in sig.inputs.iter().enumerate() {
         let FnArg::Typed(typed) = input else {
             continue;
         };
 
-        if let Some((state, deps)) = parse_effect_context_type(&typed.ty) {
+        if let Some(deps) = parse_effect_context_type(&typed.ty) {
             if found.is_some() {
                 return Err(syn::Error::new_spanned(
                     &typed.ty,
                     "multiple EffectContext parameters are not supported",
                 ));
             }
-            found = Some((index, state, deps));
+            found = Some((index, deps));
         }
     }
 
     found.ok_or_else(|| {
         syn::Error::new_spanned(
             &sig.inputs,
-            "effect handler must include ctx: EffectContext<State, Deps>",
+            "effect handler must include ctx: EffectContext<Deps>",
         )
     })
 }
 
-fn parse_effect_context_type(ty: &Type) -> Option<(Type, Type)> {
+fn parse_effect_context_type(ty: &Type) -> Option<Type> {
     let Type::Path(TypePath { path, .. }) = ty else {
         return None;
     };
@@ -859,10 +584,10 @@ fn parse_effect_context_type(ty: &Type) -> Option<(Type, Type)> {
             types.push(ty.clone());
         }
     }
-    if types.len() != 2 {
+    if types.len() != 1 {
         return None;
     }
-    Some((types[0].clone(), types[1].clone()))
+    Some(types[0].clone())
 }
 
 fn collect_params(sig: &Signature) -> syn::Result<Vec<ParamInfo>> {
@@ -925,16 +650,6 @@ fn variant_base_path(path: &Path) -> syn::Result<Path> {
     }
     base.segments = segments;
     Ok(base)
-}
-
-fn type_to_path(ty: &Type) -> syn::Result<Path> {
-    let Type::Path(type_path) = ty else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected a concrete event type path",
-        ));
-    };
-    Ok(type_path.path.clone())
 }
 
 fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) -> TokenStream2 {
@@ -1042,6 +757,63 @@ fn effect_output_event_type(sig: &Signature) -> syn::Result<Type> {
     }
 }
 
+fn result_ok_type(ty: &Type) -> syn::Result<Type> {
+    let Type::Path(type_path) = ty else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "expected return type Result<T>",
+        ));
+    };
+    let Some(last) = type_path.path.segments.last() else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "expected return type Result<T>",
+        ));
+    };
+    if last.ident != "Result" {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "expected return type Result<T>",
+        ));
+    }
+
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "expected return type Result<T>",
+        ));
+    };
+    for arg in &args.args {
+        if let GenericArgument::Type(inner) = arg {
+            return Ok(inner.clone());
+        }
+    }
+
+    Err(syn::Error::new_spanned(
+        ty,
+        "expected return type Result<T>",
+    ))
+}
+
+fn emit_inner_type(ty: &Type) -> Option<Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let last = type_path.path.segments.last()?;
+    if last.ident != "Emit" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    for arg in &args.args {
+        if let GenericArgument::Type(inner) = arg {
+            return Some(inner.clone());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1112,19 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_reducer_args_rejects_queued_option() {
-        let metas = parse_effect_meta_list(quote!(on = MyEvent, queued));
-        let error = parse_reducer_args(&metas)
-            .err()
-            .expect("queued should be unsupported for reducers");
-        assert!(
-            error.to_string().contains("unsupported #[reducer] option"),
-            "unexpected error: {}",
-            error
-        );
-    }
-
-    #[test]
     fn stable_id_is_required_for_durable_effect_configs() {
         let durable = EffectArgs {
             retry: Some(3),
@@ -1132,61 +891,4 @@ mod tests {
         };
         assert!(effect_requires_stable_id(&durable));
     }
-}
-
-fn result_ok_type(ty: &Type) -> syn::Result<Type> {
-    let Type::Path(type_path) = ty else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
-    };
-    let Some(last) = type_path.path.segments.last() else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
-    };
-    if last.ident != "Result" {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
-    }
-
-    let PathArguments::AngleBracketed(args) = &last.arguments else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
-    };
-    for arg in &args.args {
-        if let GenericArgument::Type(inner) = arg {
-            return Ok(inner.clone());
-        }
-    }
-
-    Err(syn::Error::new_spanned(
-        ty,
-        "expected return type Result<T>",
-    ))
-}
-
-fn emit_inner_type(ty: &Type) -> Option<Type> {
-    let Type::Path(type_path) = ty else {
-        return None;
-    };
-    let last = type_path.path.segments.last()?;
-    if last.ident != "Emit" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &last.arguments else {
-        return None;
-    };
-    for arg in &args.args {
-        if let GenericArgument::Type(inner) = arg {
-            return Some(inner.clone());
-        }
-    }
-    None
 }

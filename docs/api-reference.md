@@ -936,37 +936,34 @@ async fn handle_webhook(
 
 ---
 
-## 8. Macro Syntax (Coming Soon)
+## 8. Procedural Macros
 
-For cleaner multi-variant event matching:
+Use `#[effect]` and `#[effects]` for concise registration:
 
 ```rust
-use seesaw::on;
+use seesaw::{effect, effects, EffectContext};
 
-let effects = on! {
-    // Match multiple variants
-    OrderEvent::Placed { order_id, .. } |
-    OrderEvent::Updated { order_id, .. } => {
-        #[effect(id = "sync", priority = 10)]
-        |order_id, ctx| async move {
-            ctx.deps().db.sync(order_id).await?;
-            Ok(())
-        }
-    },
+#[effects]
+mod order_effects {
+    use super::*;
 
-    // Single variant with config
-    OrderEvent::PaymentCharged { order_id } => {
-        #[effect(id = "fulfill", delayed = 1hour, retry = 5)]
-        |order_id, ctx| async move {
-            ctx.deps().fulfillment.ship(order_id).await?;
-            Ok(OrderEvent::Fulfilled { order_id })
-        }
-    },
-};
+    #[effect(on = [OrderEvent::Placed, OrderEvent::Updated], extract(order_id), id = "sync", priority = 10)]
+    async fn sync(order_id: uuid::Uuid, ctx: EffectContext<Deps>) -> anyhow::Result<()> {
+        ctx.deps().db.sync(order_id).await?;
+        Ok(())
+    }
 
-// Add to engine
-let engine = effects.into_iter()
-    .fold(Engine::new(deps), |e, eff| e.with_effect(eff));
+    #[effect(on = [OrderEvent::PaymentCharged], extract(order_id), id = "fulfill", delay_secs = 3600, retry = 5)]
+    async fn fulfill(
+        order_id: uuid::Uuid,
+        ctx: EffectContext<Deps>,
+    ) -> anyhow::Result<OrderEvent> {
+        ctx.deps().fulfillment.ship(order_id).await?;
+        Ok(OrderEvent::Fulfilled { order_id })
+    }
+}
+
+let engine = Engine::new(deps, store).with_effects(order_effects::effects());
 ```
 
 ---

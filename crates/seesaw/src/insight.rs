@@ -61,8 +61,6 @@ pub struct WorkflowTree {
     pub correlation_id: Uuid,
     /// Root events (events with no parent)
     pub roots: Vec<EventNode>,
-    /// Workflow state (if exists)
-    pub state: Option<serde_json::Value>,
     /// Total event count
     pub event_count: usize,
     /// Total effect count
@@ -214,7 +212,7 @@ pub struct FailedWorkflow {
 /// Trait for insight/observability queries
 ///
 /// This is separate from the Store trait because:
-/// - Store is for runtime execution (queue, state, effects)
+/// - Store is for runtime execution (queue/effect orchestration)
 /// - InsightStore is for visualization and observability
 /// - Different backends may implement them differently
 /// - Keeps core runtime decoupled from observability concerns
@@ -262,7 +260,7 @@ pub trait InsightStore: Send + Sync + 'static {
 
     /// Get dead letter queue entries.
     ///
-    /// Default implementation returns no rows for stores that do not expose DLQ state.
+    /// Default implementation returns no rows for stores that do not expose DLQ data.
     async fn get_dead_letters(
         &self,
         unresolved_only: bool,

@@ -8,7 +8,6 @@ use seesaw_core::{
     insight::*, EmittedEvent, EventProcessingCommit, JoinEntry, QueuedEffectExecution, QueuedEvent,
     Store, NAMESPACE_SEESAW,
 };
-use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -65,12 +64,6 @@ struct EventRow {
     batch_index: Option<i32>,
     batch_size: Option<i32>,
     created_at: DateTime<Utc>,
-}
-
-#[derive(FromRow)]
-struct StateRow {
-    state: serde_json::Value,
-    version: i32,
 }
 
 #[derive(FromRow)]
@@ -242,101 +235,19 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn load_state<S>(&self, correlation_id: Uuid) -> Result<Option<(S, i32)>>
-    where
-        S: for<'de> Deserialize<'de> + Send,
-    {
-        let row: Option<StateRow> =
-            sqlx::query_as("SELECT state, version FROM seesaw_state WHERE correlation_id = $1")
-                .bind(correlation_id)
-                .fetch_optional(&self.pool)
-                .await?;
-
-        match row {
-            Some(r) => {
-                let state: S = serde_json::from_value(r.state)?;
-                Ok(Some((state, r.version)))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn save_state<S>(
-        &self,
-        correlation_id: Uuid,
-        state: &S,
-        expected_version: i32,
-    ) -> Result<i32>
-    where
-        S: Serialize + Send + Sync,
-    {
-        let state_json = serde_json::to_value(state)?;
-        let new_version = expected_version + 1;
-
-        let result = sqlx::query(
-            "INSERT INTO seesaw_state (correlation_id, state, version, updated_at)
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (correlation_id) DO UPDATE
-             SET state = $2,
-                 version = $3,
-                 updated_at = NOW()
-             WHERE seesaw_state.version = $4",
-        )
-        .bind(correlation_id)
-        .bind(&state_json)
-        .bind(new_version)
-        .bind(expected_version)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            anyhow::bail!("Version conflict: state was modified concurrently");
-        }
-
-        Ok(new_version)
-    }
-
-    async fn commit_event_processing<S>(&self, commit: EventProcessingCommit<S>) -> Result<i32>
-    where
-        S: Serialize + Send + Sync,
-    {
+    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
         let EventProcessingCommit {
             event_row_id,
             event_id,
             correlation_id,
             event_type,
             event_payload,
-            state,
-            expected_state_version,
             queued_effect_intents,
             inline_effect_failures,
             emitted_events,
         } = commit;
 
         let mut tx = self.pool.begin().await?;
-
-        let state_json = serde_json::to_value(&state)?;
-        let new_version = expected_state_version + 1;
-
-        let state_result = sqlx::query(
-            "INSERT INTO seesaw_state (correlation_id, state, version, updated_at)
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (correlation_id) DO UPDATE
-             SET state = $2,
-                 version = $3,
-                 updated_at = NOW()
-             WHERE seesaw_state.version = $4",
-        )
-        .bind(correlation_id)
-        .bind(&state_json)
-        .bind(new_version)
-        .bind(expected_state_version)
-        .execute(&mut *tx)
-        .await?;
-
-        if state_result.rows_affected() == 0 {
-            anyhow::bail!("Version conflict: state was modified concurrently");
-        }
 
         for intent in queued_effect_intents {
             sqlx::query(
@@ -486,7 +397,7 @@ impl Store for PostgresStore {
         }
 
         tx.commit().await?;
-        Ok(new_version)
+        Ok(())
     }
 
     async fn insert_effect_intent(
@@ -1037,14 +948,6 @@ impl Store for PostgresStore {
         &self,
         correlation_id: Uuid,
     ) -> Result<seesaw_core::WorkflowStatus> {
-        let state = sqlx::query_as::<_, (serde_json::Value,)>(
-            "SELECT state FROM seesaw_state WHERE correlation_id = $1",
-        )
-        .bind(correlation_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(|r| r.0);
-
         let pending_effects = sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM seesaw_effect_executions
              WHERE correlation_id = $1 AND status IN ('pending', 'executing', 'failed')",
@@ -1067,7 +970,6 @@ impl Store for PostgresStore {
 
         Ok(seesaw_core::WorkflowStatus {
             correlation_id,
-            state,
             pending_effects,
             is_settled: pending_effects == 0,
             last_event,
@@ -1418,19 +1320,9 @@ impl InsightStore for PostgresStore {
         let event_ids: HashSet<Uuid> = events.iter().map(|event| event.event_id).collect();
         let roots = build_event_tree(&events, &effects, None, &event_ids, true);
 
-        // Get state
-        let state = sqlx::query_as::<_, (serde_json::Value,)>(
-            "SELECT state FROM seesaw_state WHERE correlation_id = $1",
-        )
-        .bind(correlation_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(|r| r.0);
-
         Ok(WorkflowTree {
             correlation_id,
             roots,
-            state,
             event_count: events.len(),
             effect_count: effects.len(),
         })

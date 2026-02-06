@@ -354,25 +354,6 @@ mod tests {
             Ok(())
         }
 
-        async fn load_state<S>(&self, _correlation_id: Uuid) -> Result<Option<(S, i32)>>
-        where
-            S: for<'de> serde::Deserialize<'de> + Send,
-        {
-            Ok(None)
-        }
-
-        async fn save_state<S>(
-            &self,
-            _correlation_id: Uuid,
-            _state: &S,
-            _expected_version: i32,
-        ) -> Result<i32>
-        where
-            S: serde::Serialize + Send + Sync,
-        {
-            Ok(1)
-        }
-
         async fn insert_effect_intent(
             &self,
             _event_id: Uuid,
@@ -442,7 +423,6 @@ mod tests {
         ) -> Result<crate::WorkflowStatus> {
             Ok(crate::WorkflowStatus {
                 correlation_id: _correlation_id,
-                state: None,
                 pending_effects: 0,
                 is_settled: true,
                 last_event: None,

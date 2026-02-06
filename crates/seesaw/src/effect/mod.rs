@@ -29,7 +29,6 @@
 //! // on_any() observer pattern
 //! store.with_effect(
 //!     effect::on_any()
-//!         .transition(|prev, next| prev.status != next.status)
 //!         .then(|event, ctx| async move { Ok(()) })
 //! );
 //!
@@ -39,32 +38,16 @@
 //!     effect::on::<EventB>().then(handle_b),
 //! ]));
 //!
-//! // on! macro for multi-variant matching
-//! use seesaw::on;
-//!
-//! let effects = on!(MyEvent {
-//!     VariantA { id, data, .. } |
-//!     VariantB { id, data, .. } => |ctx| async move {
-//!         Ok(MyEvent::Processed { id })
-//!     },
-//!     VariantC { id, .. } => |ctx| async move {
-//!         Ok(MyEvent::Handled { id })
-//!     },
-//! });
 //! ```
 
 mod builders;
 pub(crate) mod context;
 mod error_event;
-mod macros;
 mod types;
 
-pub use builders::{bridge, group, on, on_any, task};
+pub use builders::{group, on, on_any};
 pub use context::EffectContext;
 pub use error_event::EffectError;
 pub use types::{
     AnyEvent, DlqTerminalInfo, Effect, Emit, ErrorContext, ErrorHandler, EventOutput, JoinMode,
 };
-
-// Re-export for internal use
-pub(crate) use context::EventEmitter;

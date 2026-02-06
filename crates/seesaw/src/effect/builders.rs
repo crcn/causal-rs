@@ -7,8 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-#[cfg(test)]
-use uuid::Uuid;
 
 use super::context::EffectContext;
 use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Effect, Emit, EventOutput, JoinMode};
@@ -26,7 +24,6 @@ fn default_effect_id(prefix: &str) -> String {
 }
 
 fn emit_to_outputs<E: Send + Sync + 'static>(emit: Emit<E>) -> Vec<EventOutput> {
-    // `Ok(())` is supported as observer semantics for typed handlers.
     if TypeId::of::<E>() == TypeId::of::<()>() {
         return Vec::new();
     }
@@ -37,14 +34,10 @@ fn emit_to_outputs<E: Send + Sync + 'static>(emit: Emit<E>) -> Vec<EventOutput> 
         .collect::<Vec<_>>()
 }
 
-// =============================================================================
-// Type-State Markers
-// =============================================================================
-
-/// Marker for typed event effects (on::<E>()).
+/// Marker for typed event effects (`on::<E>()`).
 pub struct Typed<E>(PhantomData<E>);
 
-/// Marker for any event effects (on_any()).
+/// Marker for any event effects (`on_any()`).
 pub struct Untyped;
 
 /// Marker for no filter.
@@ -56,17 +49,11 @@ pub struct WithFilter<F>(F);
 /// Marker for having a filter_map predicate.
 pub struct WithFilterMap<F, T>(F, PhantomData<T>);
 
-/// Marker for no transition predicate.
-pub struct NoTransition;
-
-/// Marker for having a transition predicate.
-pub struct WithTransition<S, P>(P, PhantomData<S>);
-
 /// Marker for no started handler.
 pub struct NoStarted;
 
 /// Marker for having a started handler.
-pub struct WithStarted<S, D, St>(St, PhantomData<(S, D)>);
+pub struct WithStarted<D, St>(St, PhantomData<D>);
 
 fn typed_event_codec<E>() -> Arc<EventCodec>
 where
@@ -106,14 +93,9 @@ where
     }
 }
 
-// =============================================================================
-// Unified EffectBuilder
-// =============================================================================
-
-/// A unified builder for effects using the type-state pattern.
-pub struct EffectBuilder<EventType, Filter, Trans, Started> {
+/// A unified builder for effects using a compile-time type-phase pattern.
+pub struct EffectBuilder<EventType, Filter, Started> {
     filter: Filter,
-    transition: Trans,
     started: Started,
     id: Option<String>,
     queued: bool,
@@ -126,24 +108,10 @@ pub struct EffectBuilder<EventType, Filter, Trans, Started> {
     _marker: PhantomData<EventType>,
 }
 
-// =============================================================================
-// Entry Points
-// =============================================================================
-
 /// Create an effect that handles a specific event type.
-///
-/// # Example
-///
-/// ```ignore
-/// effect::on::<MyEvent>().then(|event, ctx| async move {
-///     Ok(NextEvent { data: event.data })
-/// })
-/// ```
-pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoTransition, NoStarted>
-{
+pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoStarted> {
     EffectBuilder {
         filter: NoFilter,
-        transition: NoTransition,
         started: NoStarted,
         id: None,
         queued: false,
@@ -158,19 +126,9 @@ pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoTra
 }
 
 /// Create an effect that handles all events (observer pattern).
-///
-/// # Example
-///
-/// ```ignore
-/// effect::on_any().then(|event, ctx| async move {
-///     ctx.deps().metrics.increment("events");
-///     Ok(())
-/// })
-/// ```
-pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
+pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoStarted> {
     EffectBuilder {
         filter: NoFilter,
-        transition: NoTransition,
         started: NoStarted,
         id: None,
         queued: false,
@@ -184,25 +142,20 @@ pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
     }
 }
 
-// =============================================================================
-// Builder Methods - Filter/FilterMap (Typed only)
-// =============================================================================
-
-impl<E, Trans, Started> EffectBuilder<Typed<E>, NoFilter, Trans, Started>
+impl<E, Started> EffectBuilder<Typed<E>, NoFilter, Started>
 where
     E: Send + Sync + 'static,
 {
     /// Add a filter predicate that must pass for the handler to run.
-    pub fn filter<F>(self, predicate: F) -> EffectBuilder<Typed<E>, WithFilter<F>, Trans, Started>
+    pub fn filter<F>(self, predicate: F) -> EffectBuilder<Typed<E>, WithFilter<F>, Started>
     where
         F: Fn(&E) -> bool + Send + Sync + 'static,
     {
         EffectBuilder {
             filter: WithFilter(predicate),
-            transition: self.transition,
             started: self.started,
             id: self.id,
-            queued: self.queued,
+            queued: true,
             delay: self.delay,
             timeout: self.timeout,
             max_attempts: self.max_attempts,
@@ -214,30 +167,16 @@ where
     }
 
     /// Extract data from events. Handler receives the extracted value.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// on::<MyEvent>()
-    ///     .extract(|e| match e {
-    ///         MyEvent::Variant { id, data } => Some((*id, data.clone())),
-    ///         _ => None
-    ///     })
-    ///     .then(|(id, data), ctx| async move {
-    ///         Ok(MyEvent::Processed { id, data })
-    ///     })
-    /// ```
     pub fn extract<F, T>(
         self,
         extractor: F,
-    ) -> EffectBuilder<Typed<E>, WithFilterMap<F, T>, Trans, Started>
+    ) -> EffectBuilder<Typed<E>, WithFilterMap<F, T>, Started>
     where
         F: Fn(&E) -> Option<T> + Send + Sync + 'static,
         T: Clone + Send + Sync + 'static,
     {
         EffectBuilder {
             filter: WithFilterMap(extractor, PhantomData),
-            transition: self.transition,
             started: self.started,
             id: self.id,
             queued: self.queued,
@@ -252,56 +191,19 @@ where
     }
 }
 
-// =============================================================================
-// Builder Methods - Transition (Both Typed and Untyped)
-// =============================================================================
-
-impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, NoTransition, Started> {
-    /// Add a state transition predicate. Handler only runs when predicate returns true.
-    pub fn transition<S, P>(
-        self,
-        predicate: P,
-    ) -> EffectBuilder<EventType, Filter, WithTransition<S, P>, Started>
-    where
-        S: Clone + Send + Sync + 'static,
-        P: Fn(&S, &S) -> bool + Send + Sync + 'static,
-    {
-        EffectBuilder {
-            filter: self.filter,
-            transition: WithTransition(predicate, PhantomData),
-            started: self.started,
-            id: self.id,
-            queued: self.queued,
-            delay: self.delay,
-            timeout: self.timeout,
-            max_attempts: self.max_attempts,
-            priority: self.priority,
-            codec: self.codec,
-            dlq_terminal_mapper: self.dlq_terminal_mapper,
-            _marker: PhantomData,
-        }
-    }
-}
-
-// =============================================================================
-// Builder Methods - Started (Both Typed and Untyped)
-// =============================================================================
-
-impl<EventType, Filter, Trans> EffectBuilder<EventType, Filter, Trans, NoStarted> {
+impl<EventType, Filter> EffectBuilder<EventType, Filter, NoStarted> {
     /// Add a started handler that runs when the store is activated.
-    pub fn started<S, D, St, StFut>(
+    pub fn started<D, St, StFut>(
         self,
         started: St,
-    ) -> EffectBuilder<EventType, Filter, Trans, WithStarted<S, D, St>>
+    ) -> EffectBuilder<EventType, Filter, WithStarted<D, St>>
     where
-        S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
-        St: Fn(EffectContext<S, D>) -> StFut + Send + Sync + 'static,
+        St: Fn(EffectContext<D>) -> StFut + Send + Sync + 'static,
         StFut: Future<Output = Result<()>> + Send + 'static,
     {
         EffectBuilder {
             filter: self.filter,
-            transition: self.transition,
             started: WithStarted(started, PhantomData),
             id: self.id,
             queued: self.queued,
@@ -316,11 +218,7 @@ impl<EventType, Filter, Trans> EffectBuilder<EventType, Filter, Trans, NoStarted
     }
 }
 
-// =============================================================================
-// Builder Methods - Execution Configuration (All Builders)
-// =============================================================================
-
-impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, Started> {
+impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, Started> {
     /// Set a custom ID for this effect (default: auto-generated).
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
@@ -328,13 +226,11 @@ impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, 
     }
 }
 
-impl<E, Filter, Trans, Started> EffectBuilder<Typed<E>, Filter, Trans, Started>
+impl<E, Filter, Started> EffectBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
     /// Map exhausted retries/timeouts to a terminal event before DLQ completion.
-    ///
-    /// This mapper only runs when execution is moving to DLQ, not on intermediate retries.
     pub fn dlq_terminal<O, M>(mut self, mapper: M) -> Self
     where
         O: serde::Serialize + Send + Sync + 'static,
@@ -369,7 +265,7 @@ where
 }
 
 #[allow(private_bounds)]
-impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, Started>
+impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, Started>
 where
     EventType: QueueCodecProvider,
 {
@@ -395,7 +291,6 @@ where
     }
 
     /// Set maximum retry attempts (default: 1 = no retry).
-    /// Values > 1 trigger queued execution.
     pub fn retry(mut self, attempts: u32) -> Self {
         self.max_attempts = attempts;
         if attempts > 1 {
@@ -412,23 +307,17 @@ where
     }
 }
 
-// =============================================================================
-// Join Builder (typed, queued-only)
-// =============================================================================
-
 /// Builder for durable same-batch join effects.
 pub struct JoinEffectBuilder<E, Started> {
-    inner: EffectBuilder<Typed<E>, NoFilter, NoTransition, Started>,
+    inner: EffectBuilder<Typed<E>, NoFilter, Started>,
     mode: JoinMode,
 }
 
-impl<E, Started> EffectBuilder<Typed<E>, NoFilter, NoTransition, Started>
+impl<E, Started> EffectBuilder<Typed<E>, NoFilter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
     /// Configure this effect as a durable join effect.
-    ///
-    /// Join effects are always queued and never execute inline.
     pub fn join(self) -> JoinEffectBuilder<E, Started> {
         JoinEffectBuilder {
             inner: self,
@@ -450,12 +339,11 @@ where
     /// Set the handler for joined batch execution.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<S, D, H, Fut, R, O>(mut self, handler: H) -> Effect<S, D>
+    pub fn then<D, H, Fut, R, O>(mut self, handler: H) -> Effect<D>
     where
-        S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
-        Started: StartedHandler<S, D>,
-        H: Fn(Vec<E>, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Started: StartedHandler<D>,
+        H: Fn(Vec<E>, EffectContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
@@ -478,7 +366,6 @@ where
             codecs: vec![typed_codec],
             can_handle: Arc::new(move |t| t == target),
             started: self.inner.started.into_started(),
-            // append phase is handled by runtime; this per-item handler is a no-op
             handler: Arc::new(move |_, _, _| Box::pin(async { Ok(Vec::new()) })),
             join_mode: Some(join_mode),
             join_batch_handler: Some(Arc::new(move |values, ctx| {
@@ -508,10 +395,6 @@ where
         }
     }
 }
-
-// =============================================================================
-// Extraction Trait - Abstracts filter/filter_map logic
-// =============================================================================
 
 /// Trait for extracting a value from an event (handles filter/filter_map).
 trait Extractor<E, T>: Send + Sync + 'static {
@@ -549,120 +432,61 @@ where
     }
 }
 
-// =============================================================================
-// Transition Trait - Abstracts transition checking
-// =============================================================================
-
-/// Trait for checking state transitions.
-trait TransitionChecker<S>: Send + Sync + 'static {
-    fn should_run(&self, prev: &S, next: &S) -> bool;
-}
-
-impl<S> TransitionChecker<S> for NoTransition {
-    fn should_run(&self, _prev: &S, _next: &S) -> bool {
-        true
-    }
-}
-
-impl<S, P> TransitionChecker<S> for WithTransition<S, P>
-where
-    S: Clone + Send + Sync + 'static,
-    P: Fn(&S, &S) -> bool + Send + Sync + 'static,
-{
-    fn should_run(&self, prev: &S, next: &S) -> bool {
-        (self.0)(prev, next)
-    }
-}
-
-// =============================================================================
-// Started Trait - Abstracts started handler
-// =============================================================================
-
 /// Trait for optional started handlers.
-trait StartedHandler<S, D>: Send + Sync + 'static
+trait StartedHandler<D>: Send + Sync + 'static
 where
-    S: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>>;
+    ) -> Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>;
 }
 
-impl<S, D> StartedHandler<S, D> for NoStarted
+impl<D> StartedHandler<D> for NoStarted
 where
-    S: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    ) -> Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         None
     }
 }
 
-impl<S, D, St, StFut> StartedHandler<S, D> for WithStarted<S, D, St>
+impl<D, St, StFut> StartedHandler<D> for WithStarted<D, St>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
-    St: Fn(EffectContext<S, D>) -> StFut + Send + Sync + 'static,
+    St: Fn(EffectContext<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(EffectContext<S, D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    ) -> Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         let started = self.0;
         Some(Arc::new(move |ctx| Box::pin(started(ctx))))
     }
 }
 
-// =============================================================================
-// then() - Unified Implementation for Typed Events
-// =============================================================================
-
-impl<E, Filter, Trans, Started> EffectBuilder<Typed<E>, Filter, Trans, Started>
+impl<E, Filter, Started> EffectBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
     /// Set the handler that returns the next event (terminal operation).
-    ///
-    /// The output type is inferred from the closure return type.
-    /// - Return `Ok(SomeEvent)` to dispatch that event
-    /// - Return `Ok(())` to dispatch nothing (observer pattern for typed events)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Chain effect - returns next event
-    /// effect::on::<OrderPlaced>().then(|event, ctx| async move {
-    ///     ctx.deps().mailer.send(&event).await?;
-    ///     Ok(EmailSent { order_id: event.id })
-    /// })
-    ///
-    /// // Observer effect - returns () to dispatch nothing
-    /// effect::on::<OrderPlaced>().then(|event, ctx| async move {
-    ///     println!("Order placed: {:?}", event);
-    ///     Ok(())
-    /// })
-    /// ```
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<S, D, T, H, Fut, R, O>(self, handler: H) -> Effect<S, D>
+    pub fn then<D, T, H, Fut, R, O>(self, handler: H) -> Effect<D>
     where
-        S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
         T: Clone + Send + 'static,
         Filter: Extractor<E, T>,
-        Trans: TransitionChecker<S>,
-        Started: StartedHandler<S, D>,
-        H: Fn(T, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Started: StartedHandler<D>,
+        H: Fn(T, EffectContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
     {
         let target = TypeId::of::<E>();
         let filter = self.filter;
-        let transition = self.transition;
         let codec = self.codec;
         let dlq_terminal_mapper = self.dlq_terminal_mapper;
 
@@ -678,12 +502,6 @@ where
             handler: Arc::new(move |value, _, ctx| {
                 let typed = value.downcast::<E>().expect("type checked by can_handle");
 
-                // Check transition
-                if !transition.should_run(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(Vec::new()) });
-                }
-
-                // Extract/filter
                 match filter.extract(&typed) {
                     Some(extracted) => {
                         let fut = handler(extracted, ctx);
@@ -708,28 +526,22 @@ where
     }
 
     /// Queue-capable variant of [`then`].
-    ///
-    /// Adds serde-based codec metadata so queue-backed workers can decode and
-    /// execute this typed effect from persisted JSON events.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then_queue<S, D, T, H, Fut, R, O>(self, handler: H) -> Effect<S, D>
+    pub fn then_queue<D, T, H, Fut, R, O>(self, handler: H) -> Effect<D>
     where
-        S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
         E: Clone + serde::Serialize + serde::de::DeserializeOwned,
         T: Clone + Send + 'static,
         Filter: Extractor<E, T>,
-        Trans: TransitionChecker<S>,
-        Started: StartedHandler<S, D>,
-        H: Fn(T, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        Started: StartedHandler<D>,
+        H: Fn(T, EffectContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
     {
         let target = TypeId::of::<E>();
         let filter = self.filter;
-        let transition = self.transition;
         let codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
         let dlq_terminal_mapper = self.dlq_terminal_mapper;
 
@@ -745,12 +557,6 @@ where
             handler: Arc::new(move |value, _, ctx| {
                 let typed = value.downcast::<E>().expect("type checked by can_handle");
 
-                // Check transition
-                if !transition.should_run(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(Vec::new()) });
-                }
-
-                // Extract/filter
                 match filter.extract(&typed) {
                     Some(extracted) => {
                         let fut = handler(extracted, ctx);
@@ -766,7 +572,7 @@ where
             join_mode: None,
             join_batch_handler: None,
             dlq_terminal_mapper,
-            queued: self.queued,
+            queued: true,
             delay: self.delay,
             timeout: self.timeout,
             max_attempts: self.max_attempts,
@@ -775,19 +581,13 @@ where
     }
 }
 
-// =============================================================================
-// then() - Untyped Events (on_any) - Observer Pattern
-// =============================================================================
-
-impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
-    /// Set the handler for observing all events (terminal operation).
-    /// Returns `Result<()>` - observers don't produce events.
+impl EffectBuilder<Untyped, NoFilter, NoStarted> {
+    /// Set the handler for observing all events.
     #[track_caller]
-    pub fn then<S, D, H, Fut>(self, handler: H) -> Effect<S, D>
+    pub fn then<D, H, Fut>(self, handler: H) -> Effect<D>
     where
-        S: Clone + Send + Sync + 'static,
         D: Send + Sync + 'static,
-        H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        H: Fn(AnyEvent, EffectContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let id = self.id.unwrap_or_else(|| default_effect_id("effect_any"));
@@ -817,64 +617,17 @@ impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
     }
 }
 
-impl<S, P> EffectBuilder<Untyped, NoFilter, WithTransition<S, P>, NoStarted>
+impl<D, St, StFut> EffectBuilder<Untyped, NoFilter, WithStarted<D, St>>
 where
-    S: Clone + Send + Sync + 'static,
-    P: Fn(&S, &S) -> bool + Send + Sync + 'static,
-{
-    /// Set the handler for state transitions (terminal operation).
-    /// Handler receives only context since transitions are about state changes.
-    #[track_caller]
-    pub fn then<D, H, Fut>(self, handler: H) -> Effect<S, D>
-    where
-        D: Send + Sync + 'static,
-        H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        let id = self
-            .id
-            .unwrap_or_else(|| default_effect_id("effect_transition"));
-        let transition = self.transition.0;
-
-        Effect {
-            id,
-            codecs: Vec::new(),
-            can_handle: Arc::new(|_| true),
-            started: None,
-            handler: Arc::new(move |_, _, ctx| {
-                if !transition(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(Vec::new()) });
-                }
-                let fut = handler(ctx);
-                Box::pin(async move {
-                    fut.await?;
-                    Ok(Vec::new())
-                })
-            }),
-            join_mode: None,
-            join_batch_handler: None,
-            dlq_terminal_mapper: None,
-            queued: self.queued,
-            delay: self.delay,
-            timeout: self.timeout,
-            max_attempts: self.max_attempts,
-            priority: self.priority,
-        }
-    }
-}
-
-impl<S, D, St, StFut> EffectBuilder<Untyped, NoFilter, NoTransition, WithStarted<S, D, St>>
-where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
-    St: Fn(EffectContext<S, D>) -> StFut + Send + Sync + 'static,
+    St: Fn(EffectContext<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
-    /// Set the handler for observing all events with started (terminal operation).
+    /// Set the handler for observing all events with started hook.
     #[track_caller]
-    pub fn then<H, Fut>(self, handler: H) -> Effect<S, D>
+    pub fn then<H, Fut>(self, handler: H) -> Effect<D>
     where
-        H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
+        H: Fn(AnyEvent, EffectContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let id = self
@@ -907,77 +660,13 @@ where
     }
 }
 
-impl<S, D, St, StFut, P>
-    EffectBuilder<Untyped, NoFilter, WithTransition<S, P>, WithStarted<S, D, St>>
-where
-    S: Clone + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-    St: Fn(EffectContext<S, D>) -> StFut + Send + Sync + 'static,
-    StFut: Future<Output = Result<()>> + Send + 'static,
-    P: Fn(&S, &S) -> bool + Send + Sync + 'static,
-{
-    /// Set the handler for state transitions with started (terminal operation).
-    #[track_caller]
-    pub fn then<H, Fut>(self, handler: H) -> Effect<S, D>
-    where
-        H: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        let id = self
-            .id
-            .unwrap_or_else(|| default_effect_id("effect_transition_started"));
-        let started = self.started.0;
-        let transition = self.transition.0;
-
-        Effect {
-            id,
-            codecs: Vec::new(),
-            can_handle: Arc::new(|_| true),
-            started: Some(Arc::new(move |ctx| Box::pin(started(ctx)))),
-            handler: Arc::new(move |_, _, ctx| {
-                if !transition(ctx.prev_state(), ctx.next_state()) {
-                    return Box::pin(async { Ok(Vec::new()) });
-                }
-                let fut = handler(ctx);
-                Box::pin(async move {
-                    fut.await?;
-                    Ok(Vec::new())
-                })
-            }),
-            join_mode: None,
-            join_batch_handler: None,
-            dlq_terminal_mapper: None,
-            queued: self.queued,
-            delay: self.delay,
-            timeout: self.timeout,
-            max_attempts: self.max_attempts,
-            priority: self.priority,
-        }
-    }
-}
-
-// =============================================================================
-// =============================================================================
-// group() - Compose multiple effects
-// =============================================================================
-
 /// Compose multiple effects into a single effect.
-///
-/// # Example
-///
-/// ```ignore
-/// effect::group([
-///     effect::on::<EventA>().then(handle_a),
-///     effect::on::<EventB>().then(handle_b),
-/// ])
-/// ```
 #[track_caller]
-pub fn group<S, D>(effects: impl IntoIterator<Item = Effect<S, D>>) -> Effect<S, D>
+pub fn group<D>(effects: impl IntoIterator<Item = Effect<D>>) -> Effect<D>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    let effects: Arc<Vec<Effect<S, D>>> = Arc::new(effects.into_iter().collect());
+    let effects: Arc<Vec<Effect<D>>> = Arc::new(effects.into_iter().collect());
     let mut codecs = Vec::new();
     for effect in effects.iter() {
         codecs.extend(effect.codecs().iter().cloned());
@@ -992,7 +681,7 @@ where
         },
         started: {
             let effects = effects.clone();
-            Some(Arc::new(move |ctx: EffectContext<S, D>| {
+            Some(Arc::new(move |ctx: EffectContext<D>| {
                 let effects = effects.clone();
                 Box::pin(async move {
                     for effect in effects.iter() {
@@ -1007,9 +696,7 @@ where
         handler: {
             let effects = effects.clone();
             Arc::new(
-                move |value: Arc<dyn Any + Send + Sync>,
-                      type_id: TypeId,
-                      ctx: EffectContext<S, D>| {
+                move |value: Arc<dyn Any + Send + Sync>, type_id: TypeId, ctx: EffectContext<D>| {
                     let effects = effects.clone();
                     Box::pin(async move {
                         let mut outputs = Vec::new();
@@ -1019,7 +706,6 @@ where
                                 match (effect.handler)(value.clone(), type_id, ctx.clone()).await {
                                     Ok(mut emitted) => outputs.append(&mut emitted),
                                     Err(e) => {
-                                        // Capture first error but continue processing
                                         if first_error.is_none() {
                                             first_error = Some(e);
                                         }
@@ -1027,7 +713,7 @@ where
                                 }
                             }
                         }
-                        // Return first error after all effects have run
+
                         if let Some(err) = first_error {
                             return Err(err);
                         }
@@ -1047,361 +733,28 @@ where
     }
 }
 
-// =============================================================================
-// task() - Long-running task without event handling
-// =============================================================================
-
-/// Create a long-running task that runs on store activation.
-///
-/// Use for background tasks that don't need to handle events.
-///
-/// # Example
-///
-/// ```ignore
-/// effect::task(|ctx| async move {
-///     while !ctx.is_cancelled() {
-///         // background work
-///     }
-///     Ok(())
-/// })
-/// ```
-#[track_caller]
-pub fn task<S, D, F, Fut>(f: F) -> Effect<S, D>
-where
-    S: Clone + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-    F: Fn(EffectContext<S, D>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<()>> + Send + 'static,
-{
-    Effect {
-        id: default_effect_id("effect_task"),
-        codecs: Vec::new(),
-        can_handle: Arc::new(|_| false),
-        started: Some(Arc::new(move |ctx| Box::pin(f(ctx)))),
-        handler: Arc::new(|_, _, _| Box::pin(async { Ok(Vec::new()) })),
-        join_mode: None,
-        join_batch_handler: None,
-        dlq_terminal_mapper: None,
-        queued: false,
-        delay: None,
-        timeout: None,
-        max_attempts: 1,
-        priority: None,
-    }
-}
-
-// =============================================================================
-// bridge() - Bidirectional relay connection
-// =============================================================================
-
-/// Create a bidirectional bridge to a relay channel.
-///
-/// Forwards store events to relay and relay events back to store.
-/// Prevents feedback loops using unique origin tracking.
-#[track_caller]
-pub fn bridge<S, D>(tx: pipedream::WeakSender, rx: pipedream::RelayReceiver) -> Effect<S, D>
-where
-    S: Clone + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-    static BRIDGE_ID_COUNTER: AtomicU64 = AtomicU64::new(1 << 32);
-    let bridge_origin_id = BRIDGE_ID_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-
-    let tx = Arc::new(tx);
-    let rx = Arc::new(rx);
-
-    Effect {
-        id: default_effect_id("effect_bridge"),
-        codecs: Vec::new(),
-        can_handle: Arc::new(|_| true),
-        started: {
-            let rx = rx.clone();
-            Some(Arc::new(move |ctx: EffectContext<S, D>| {
-                let rx = rx.clone();
-                let mut receiver = rx.subscribe_all();
-
-                // Spawn background task to forward events from bridge
-                tokio::spawn(async move {
-                    while let Some(envelope) = receiver.recv().await {
-                        if envelope.origin() == bridge_origin_id {
-                            continue;
-                        }
-                        let type_id = envelope.type_id();
-                        ctx.emit_any(envelope.value, type_id);
-                    }
-                });
-
-                Box::pin(async { Ok(()) })
-            }))
-        },
-        handler: {
-            let tx = tx.clone();
-            Arc::new(move |value, type_id, _ctx| {
-                let tx = tx.clone();
-                Box::pin(async move {
-                    tx.send_any_with_origin(value, type_id, bridge_origin_id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                    Ok(Vec::new())
-                })
-            })
-        },
-        join_mode: None,
-        join_batch_handler: None,
-        dlq_terminal_mapper: None,
-        queued: false,
-        delay: None,
-        timeout: None,
-        max_attempts: 1,
-        priority: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[derive(Clone, Default)]
-    struct TestState;
-
-    #[derive(Clone, Default)]
-    struct TestDeps;
+    use std::sync::Arc;
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
-    struct TestEvent {
+    struct QueueEvent {
         value: i32,
     }
 
-    #[derive(Clone, serde::Serialize)]
-    struct OutputEvent {
-        result: i32,
-    }
-
     #[derive(Clone)]
-    struct OtherEvent;
-
-    fn create_test_ctx() -> EffectContext<TestState, TestDeps> {
-        use parking_lot::RwLock;
-
-        struct NoopEmitter;
-        impl super::super::context::EventEmitter<TestState, TestDeps> for NoopEmitter {
-            fn emit(
-                &self,
-                _: TypeId,
-                _: Arc<dyn Any + Send + Sync>,
-                _: EffectContext<TestState, TestDeps>,
-            ) {
-            }
-        }
-
-        let state = Arc::new(TestState);
-        let live_state = Arc::new(RwLock::new(TestState));
-        EffectContext::new(
-            "test_effect".to_string(),
-            "test_idempotency_key".to_string(),
-            Uuid::nil(),
-            Uuid::nil(),
-            state.clone(),
-            state,
-            live_state,
-            Arc::new(TestDeps),
-            Arc::new(NoopEmitter),
-        )
-    }
+    struct Deps;
 
     #[test]
-    fn test_on_can_handle() {
-        let effect: Effect<TestState, TestDeps> =
-            on::<TestEvent>().then(|_, _| async { Ok(OutputEvent { result: 1 }) });
+    fn then_queue_forces_queued_execution() {
+        let effect = on::<QueueEvent>().id("queue_probe").then_queue(
+            |_event: Arc<QueueEvent>, _ctx: EffectContext<Deps>| async move { Ok(()) },
+        );
 
-        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
-        assert!(!effect.can_handle(TypeId::of::<OtherEvent>()));
-    }
-
-    #[test]
-    fn test_on_any_can_handle() {
-        let effect: Effect<TestState, TestDeps> = on_any().then(|_, _| async { Ok(()) });
-
-        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
-        assert!(effect.can_handle(TypeId::of::<OtherEvent>()));
-    }
-
-    #[test]
-    fn test_group_can_handle() {
-        let effect: Effect<TestState, TestDeps> = group([
-            on::<TestEvent>().then(|_, _| async { Ok(OutputEvent { result: 1 }) }),
-            on::<OtherEvent>().then(|_, _| async { Ok(OutputEvent { result: 2 }) }),
-        ]);
-
-        assert!(effect.can_handle(TypeId::of::<TestEvent>()));
-        assert!(effect.can_handle(TypeId::of::<OtherEvent>()));
-        assert!(!effect.can_handle(TypeId::of::<String>()));
-    }
-
-    #[tokio::test]
-    async fn test_then_returns_event() {
-        let effect: Effect<TestState, TestDeps> = on::<TestEvent>().then(|event, _| async move {
-            Ok(OutputEvent {
-                result: event.value * 2,
-            })
-        });
-
-        let ctx = create_test_ctx();
-        let event: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 21 });
-
-        let result = effect
-            .call_handler(event, TypeId::of::<TestEvent>(), ctx)
-            .await
-            .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let output = &result[0];
-        assert_eq!(output.type_id, TypeId::of::<OutputEvent>());
-        let downcasted = output.value.clone().downcast::<OutputEvent>().unwrap();
-        assert_eq!(downcasted.result, 42);
-    }
-
-    #[tokio::test]
-    async fn test_filter_skips_non_matching() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = counter.clone();
-
-        let effect: Effect<TestState, TestDeps> =
-            on::<TestEvent>()
-                .filter(|e| e.value > 10)
-                .then(move |event, _| {
-                    let counter = counter_clone.clone();
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        Ok(OutputEvent {
-                            result: event.value,
-                        })
-                    }
-                });
-
-        let ctx = create_test_ctx();
-
-        // Should skip - value <= 10
-        let event1: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 5 });
-        let result1 = effect
-            .call_handler(event1, TypeId::of::<TestEvent>(), ctx.clone())
-            .await
-            .unwrap();
-        assert!(result1.is_empty());
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-
-        // Should run - value > 10
-        let event2: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 15 });
-        let result2 = effect
-            .call_handler(event2, TypeId::of::<TestEvent>(), ctx)
-            .await
-            .unwrap();
-        assert_eq!(result2.len(), 1);
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_filter_map_transforms_and_filters() {
-        let effect: Effect<TestState, TestDeps> = on::<TestEvent>()
-            .extract(|e| {
-                if e.value > 10 {
-                    Some((e.value, e.value * 2))
-                } else {
-                    None
-                }
-            })
-            .then(|(original, doubled), _| async move {
-                Ok(OutputEvent {
-                    result: original + doubled,
-                })
-            });
-
-        let ctx = create_test_ctx();
-
-        // Should skip - value <= 10
-        let event1: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 5 });
-        let result1 = effect
-            .call_handler(event1, TypeId::of::<TestEvent>(), ctx.clone())
-            .await
-            .unwrap();
-        assert!(result1.is_empty());
-
-        // Should run with transformed value - value > 10
-        let event2: Arc<dyn Any + Send + Sync> = Arc::new(TestEvent { value: 15 });
-        let result2 = effect
-            .call_handler(event2, TypeId::of::<TestEvent>(), ctx)
-            .await
-            .unwrap();
-
-        assert_eq!(result2.len(), 1);
-        let output = result2[0].value.clone().downcast::<OutputEvent>().unwrap();
-        assert_eq!(output.result, 15 + 30); // original + doubled
-    }
-
-    #[test]
-    fn test_task_never_handles_events() {
-        let effect: Effect<TestState, TestDeps> = task(|_ctx| async { Ok(()) });
-
-        assert!(!effect.can_handle(TypeId::of::<TestEvent>()));
-        assert!(!effect.can_handle(TypeId::of::<OtherEvent>()));
-    }
-
-    #[tokio::test]
-    async fn test_task_started_called() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = counter.clone();
-
-        let effect: Effect<TestState, TestDeps> = task(move |_ctx| {
-            let counter = counter_clone.clone();
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        });
-
-        let ctx = create_test_ctx();
-        effect.call_started(ctx).await.unwrap();
-
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_dlq_terminal_mapper_for_typed_effect() {
-        let effect: Effect<TestState, TestDeps> = on::<TestEvent>()
-            .queued()
-            .retry(2)
-            .dlq_terminal(|event: Arc<TestEvent>, info| OutputEvent {
-                result: event.value + info.attempts,
-            })
-            .then(
-                |_event: Arc<TestEvent>, _ctx: EffectContext<TestState, TestDeps>| async move {
-                    anyhow::bail!("forced failure");
-                    #[allow(unreachable_code)]
-                    Ok::<(), anyhow::Error>(())
-                },
-            );
-
-        let mapper = effect
-            .dlq_terminal_mapper
-            .as_ref()
-            .expect("dlq_terminal mapper should be present");
-        let mapped = mapper(
-            Arc::new(TestEvent { value: 2 }),
-            TypeId::of::<TestEvent>(),
-            DlqTerminalInfo {
-                error: "boom".to_string(),
-                reason: "failed".to_string(),
-                attempts: 1,
-                max_attempts: 2,
-            },
-        )
-        .expect("mapper should succeed");
-
-        assert_eq!(mapped.event_type, std::any::type_name::<OutputEvent>());
-        assert_eq!(mapped.payload["result"], serde_json::json!(3));
-        assert!(mapped.batch_id.is_none());
+        assert!(
+            !effect.is_inline(),
+            "then_queue() should always create queued effects"
+        );
     }
 }

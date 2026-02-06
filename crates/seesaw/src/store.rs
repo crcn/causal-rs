@@ -86,10 +86,7 @@ pub struct InlineEffectFailure {
 
 /// Atomic event processing commit payload.
 #[derive(Debug)]
-pub struct EventProcessingCommit<S>
-where
-    S: Serialize + Send + Sync,
-{
+pub struct EventProcessingCommit {
     /// Source queue row to acknowledge.
     pub event_row_id: i64,
     /// Source event identifiers.
@@ -97,9 +94,6 @@ where
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
-    /// Reducer output and optimistic lock version.
-    pub state: S,
-    pub expected_state_version: i32,
     /// Queued effect intents to persist.
     pub queued_effect_intents: Vec<QueuedEffectIntent>,
     /// Inline effect failures to persist to DLQ.
@@ -120,7 +114,7 @@ pub struct JoinEntry {
     pub created_at: DateTime<Utc>,
 }
 
-/// Store trait - combines queue and state operations
+/// Store trait - combines queue and effect operations
 ///
 /// Event notification from LISTEN/NOTIFY for .wait() pattern
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -133,9 +127,9 @@ pub struct WorkflowEvent {
 
 /// Single trait because they share same database/pool/transactions.
 /// This enables:
-/// - Transactional state updates + event publishing
-/// - Inline effects in same transaction as state commit
-/// - Atomic event acknowledgement + state save
+/// - Transactional effect intent persistence + event publishing
+/// - Inline effects in same transaction as event acknowledgement
+/// - Atomic event acknowledgement + side-effect persistence
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
     // =========================================================================
@@ -163,46 +157,12 @@ pub trait Store: Send + Sync + 'static {
     /// Increments retry_count, sets locked_until for exponential backoff.
     async fn nack(&self, id: i64, retry_after_secs: u64) -> Result<()>;
 
-    // =========================================================================
-    // State Operations
-    // =========================================================================
-
-    /// Load state for workflow
-    ///
-    /// Returns None if workflow has no state yet.
-    async fn load_state<S>(&self, correlation_id: Uuid) -> Result<Option<(S, i32)>>
-    where
-        S: for<'de> Deserialize<'de> + Send;
-
-    /// Save state for workflow (optimistic locking)
-    ///
-    /// Returns error if version mismatch (concurrent modification detected).
-    async fn save_state<S>(
-        &self,
-        correlation_id: Uuid,
-        state: &S,
-        expected_version: i32,
-    ) -> Result<i32>
-    where
-        S: Serialize + Send + Sync;
-
     /// Atomically commit event processing side effects.
     ///
     /// Default implementation composes existing store methods sequentially.
     /// Stores can override this with a single transaction for stronger
     /// crash-consistency guarantees.
-    async fn commit_event_processing<S>(&self, commit: EventProcessingCommit<S>) -> Result<i32>
-    where
-        S: Serialize + Send + Sync,
-    {
-        let new_version = self
-            .save_state(
-                commit.correlation_id,
-                &commit.state,
-                commit.expected_state_version,
-            )
-            .await?;
-
+    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
         for intent in commit.queued_effect_intents {
             self.insert_effect_intent(
                 commit.event_id,
@@ -238,7 +198,7 @@ pub trait Store: Send + Sync + 'static {
         }
 
         self.ack(commit.event_row_id).await?;
-        Ok(new_version)
+        Ok(())
     }
 
     // =========================================================================
@@ -247,7 +207,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// Insert effect execution intent
     ///
-    /// Called by event worker after running reducers.
+    /// Called by event worker after effect routing/planning.
     /// Effect workers poll this table.
     async fn insert_effect_intent(
         &self,
@@ -403,7 +363,7 @@ pub trait Store: Send + Sync + 'static {
         anyhow::bail!("join_same_batch is not implemented for this store")
     }
 
-    /// Release a claimed same-batch window back to `open` state after a handler
+    /// Release a claimed same-batch window back to `open` status after a handler
     /// error so retries can claim it again.
     async fn join_same_batch_release(
         &self,
@@ -422,8 +382,6 @@ pub trait Store: Send + Sync + 'static {
 pub struct WorkflowStatus {
     /// Correlation ID (workflow identifier)
     pub correlation_id: Uuid,
-    /// Current state (if exists)
-    pub state: Option<serde_json::Value>,
     /// Number of effects pending/executing
     pub pending_effects: i64,
     /// True when no effects are pending/executing (workflow is idle)

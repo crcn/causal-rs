@@ -84,26 +84,11 @@ FOR VALUES FROM ('2026-02-07') TO ('2026-02-08');
 -- Note: Create partitions 7 days ahead, drop partitions older than 30 days
 -- See docs/partitioning.md for automation scripts
 
--- State per workflow (optimistic locking with version column)
-CREATE TABLE seesaw_state (
-    correlation_id UUID PRIMARY KEY,
-    state JSONB NOT NULL,             -- User's domain state (keep under 10KB!)
-    version INT NOT NULL DEFAULT 1,   -- Optimistic locking
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX idx_state_updated ON seesaw_state(updated_at DESC);
-
-COMMENT ON TABLE seesaw_state IS 'Per-workflow state - loaded/saved by event workers, read by effect workers';
-COMMENT ON COLUMN seesaw_state.state IS 'Keep under 10KB - store large blobs in S3, not here!';
-COMMENT ON COLUMN seesaw_state.version IS 'Incremented on each update - detects concurrent modifications';
-
 -- Event processing ledger (atomic claim + phase tracking + audit trail)
 -- Purpose: Separate from queue for atomic claiming and historical record
 CREATE TABLE seesaw_processed (
     event_id UUID PRIMARY KEY,
     correlation_id UUID NOT NULL,
-    state_committed_at TIMESTAMPTZ,  -- When Phase 1 (reducers) completed
     completed_at TIMESTAMPTZ,        -- When Phase 2 (all effects) completed
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -113,7 +98,6 @@ CREATE INDEX idx_processed_completed ON seesaw_processed(completed_at DESC)
 WHERE completed_at IS NOT NULL;
 
 COMMENT ON TABLE seesaw_processed IS 'Processing ledger - atomic claim via ON CONFLICT, persists after queue deletion';
-COMMENT ON COLUMN seesaw_processed.state_committed_at IS 'Phase 1 complete - state saved, effect intents inserted';
 COMMENT ON COLUMN seesaw_processed.completed_at IS 'Phase 2 complete - all effects finished';
 
 -- Effect execution intents (framework-guaranteed idempotency)
@@ -492,11 +476,11 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 -- FROM seesaw_events
 -- WHERE processed_at IS NULL;
 
--- Alert: State size > 10KB (performance risk)
--- SELECT correlation_id, LENGTH(state::text) as state_bytes
--- FROM seesaw_state
--- WHERE LENGTH(state::text) > 10240
--- ORDER BY state_bytes DESC;
+-- Alert: Pending effect payload size > 10KB (performance risk)
+-- SELECT event_id, LENGTH(event_payload::text) as payload_bytes
+-- FROM seesaw_effect_executions
+-- WHERE LENGTH(event_payload::text) > 10240
+-- ORDER BY payload_bytes DESC;
 
 -- Alert: High failure rate
 -- SELECT COUNT(*) FILTER (WHERE status = 'failed') as failed,
@@ -547,7 +531,7 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 
 -- Monthly:
 --   - VACUUM ANALYZE all tables
---   - Check state size distribution
+--   - Check effect payload size distribution
 --   - Review DLQ for patterns
 
 -- Schema complete! Ready for production at 1000+ events/sec.

@@ -11,7 +11,7 @@ use axum::{
     Router,
 };
 use seesaw_core::{
-    effect, reducer,
+    effect,
     runtime::{Runtime, RuntimeConfig},
     Engine,
 };
@@ -105,19 +105,6 @@ struct BatchJoinReady {
     failed: usize,
 }
 
-// Simple state tracking
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-struct OrderState {
-    validated: bool,
-    payment_processed: bool,
-    inventory_reserved: bool,
-    shipped: bool,
-    batch_items_total: usize,
-    batch_items_done: usize,
-    batch_failed: usize,
-    batch_joined: bool,
-}
-
 // Mock dependencies
 #[derive(Clone)]
 struct Deps;
@@ -134,7 +121,7 @@ struct SeedFailuresQuery {
 }
 
 async fn enqueue_order(
-    engine: &Engine<OrderState, Deps, MemoryStore>,
+    engine: &Engine<Deps, MemoryStore>,
     mode: DemoMode,
     total: f64,
 ) -> Result<serde_json::Value, StatusCode> {
@@ -162,7 +149,7 @@ async fn enqueue_order(
 // API handler to create new orders
 async fn create_order(
     Query(query): Query<CreateOrderQuery>,
-    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
+    State(engine): State<Arc<Engine<Deps, MemoryStore>>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let mode = query.mode.unwrap_or_default();
     let total = query
@@ -175,7 +162,7 @@ async fn create_order(
 }
 
 async fn seed_scenarios(
-    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
+    State(engine): State<Arc<Engine<Deps, MemoryStore>>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let scenarios = [
         DemoMode::Normal,
@@ -209,7 +196,7 @@ async fn seed_scenarios(
 
 async fn seed_failures(
     Query(query): Query<SeedFailuresQuery>,
-    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
+    State(engine): State<Arc<Engine<Deps, MemoryStore>>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let count = query.count.unwrap_or(8).clamp(1, 40);
     let failure_modes = [
@@ -391,46 +378,6 @@ async fn main() -> Result<()> {
     let deps = Deps;
 
     let engine = Engine::new(deps, store.clone())
-        .with_reducer(
-            reducer::fold::<OrderEvent>().into_queue(|state: OrderState, event| match event {
-                OrderEvent::OrderValidated { .. } => OrderState {
-                    validated: true,
-                    ..state
-                },
-                OrderEvent::PaymentProcessed { .. } => OrderState {
-                    payment_processed: true,
-                    ..state
-                },
-                OrderEvent::InventoryReserved { .. } => OrderState {
-                    inventory_reserved: true,
-                    ..state
-                },
-                OrderEvent::OrderShipped { .. } => OrderState {
-                    shipped: true,
-                    ..state
-                },
-                _ => state,
-            }),
-        )
-        .with_reducer(
-            reducer::fold::<BatchWorkItem>().into_queue(|state: OrderState, _event| OrderState {
-                batch_items_total: state.batch_items_total + 1,
-                ..state
-            }),
-        )
-        .with_reducer(
-            reducer::fold::<BatchWorkResult>().into_queue(|state: OrderState, event| OrderState {
-                batch_items_done: state.batch_items_done + 1,
-                batch_failed: state.batch_failed + usize::from(!event.success),
-                ..state
-            }),
-        )
-        .with_reducer(
-            reducer::fold::<BatchJoinReady>().into_queue(|state: OrderState, _event| OrderState {
-                batch_joined: true,
-                ..state
-            }),
-        )
         // Effect: Validate order
         .with_effect(
             effect::on::<OrderEvent>()
@@ -466,7 +413,7 @@ async fn main() -> Result<()> {
                     _ => None,
                 })
                 .id("fan_out_batch_items")
-                .then_queue::<OrderState, Deps, Uuid, _, _, _, BatchWorkItem>(
+                .then_queue::<Deps, Uuid, _, _, Vec<BatchWorkItem>, BatchWorkItem>(
                     |order_id, _ctx| async move {
                         tokio::time::sleep(Duration::from_millis(260)).await;
 
@@ -489,7 +436,7 @@ async fn main() -> Result<()> {
                 .retry(2)
                 .then_queue(
                     |item: Arc<BatchWorkItem>,
-                     _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                     _ctx: seesaw_core::EffectContext<Deps>| async move {
                         tokio::time::sleep(Duration::from_millis(
                             220 + (item.item_index as u64 * 70),
                         ))
@@ -517,7 +464,7 @@ async fn main() -> Result<()> {
                 .same_batch()
                 .then(
                     |items: Vec<BatchWorkResult>,
-                     _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                     _ctx: seesaw_core::EffectContext<Deps>| async move {
                         let Some(order_id) = items.first().map(|item| item.order_id) else {
                             anyhow::bail!("join_batch_items received empty batch");
                         };
@@ -541,7 +488,7 @@ async fn main() -> Result<()> {
                 .id("finalize_batch_join")
                 .then_queue(
                     |summary: Arc<BatchJoinReady>,
-                     _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                     _ctx: seesaw_core::EffectContext<Deps>| async move {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         if summary.failed > 0 {
                             Ok(OrderEvent::OrderFailed {

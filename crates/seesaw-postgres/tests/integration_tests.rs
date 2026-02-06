@@ -20,11 +20,6 @@ struct TestDb {
     store: PostgresStore,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
-struct CommitState {
-    count: i32,
-}
-
 impl TestDb {
     async fn new() -> Result<Self> {
         // Initialize tracing for tests
@@ -318,8 +313,6 @@ async fn test_commit_event_processing_persists_all_side_effects() -> Result<()> 
             correlation_id: claimed.correlation_id,
             event_type: claimed.event_type.clone(),
             event_payload: claimed.payload.clone(),
-            state: CommitState { count: 10 },
-            expected_state_version: 0,
             queued_effect_intents: vec![QueuedEffectIntent {
                 effect_id: "queued_commit_effect".to_string(),
                 parent_event_id: Some(claimed.event_id),
@@ -353,9 +346,6 @@ async fn test_commit_event_processing_persists_all_side_effects() -> Result<()> 
             }],
         })
         .await?;
-
-    let loaded_state: Option<(CommitState, i32)> = db.store.load_state(correlation_id).await?;
-    assert_eq!(loaded_state, Some((CommitState { count: 10 }, 1)));
 
     let effect_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
@@ -443,8 +433,6 @@ async fn test_commit_event_processing_rolls_back_on_mid_commit_failure() -> Resu
             correlation_id: claimed.correlation_id,
             event_type: claimed.event_type.clone(),
             event_payload: claimed.payload.clone(),
-            state: CommitState { count: 99 },
-            expected_state_version: 0,
             queued_effect_intents: vec![QueuedEffectIntent {
                 effect_id: "queued_commit_effect".to_string(),
                 parent_event_id: Some(claimed.event_id),
@@ -493,9 +481,6 @@ async fn test_commit_event_processing_rolls_back_on_mid_commit_failure() -> Resu
             .contains("duplicate key value violates unique constraint"),
         "unexpected error: {error}"
     );
-
-    let loaded_state: Option<(CommitState, i32)> = db.store.load_state(correlation_id).await?;
-    assert!(loaded_state.is_none(), "state update should roll back");
 
     let effect_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
@@ -565,7 +550,11 @@ async fn test_commit_event_processing_fails_when_source_ack_row_missing() -> Res
         })
         .await?;
 
-    let claimed = db.store.poll_next().await?.expect("source event should exist");
+    let claimed = db
+        .store
+        .poll_next()
+        .await?
+        .expect("source event should exist");
 
     let error = db
         .store
@@ -575,8 +564,6 @@ async fn test_commit_event_processing_fails_when_source_ack_row_missing() -> Res
             correlation_id: claimed.correlation_id,
             event_type: claimed.event_type.clone(),
             event_payload: claimed.payload.clone(),
-            state: CommitState { count: 7 },
-            expected_state_version: 0,
             queued_effect_intents: vec![QueuedEffectIntent {
                 effect_id: "queued_commit_effect".to_string(),
                 parent_event_id: Some(claimed.event_id),
@@ -599,9 +586,6 @@ async fn test_commit_event_processing_fails_when_source_ack_row_missing() -> Res
             .contains("atomic event commit failed to ack source event row"),
         "unexpected error: {error}"
     );
-
-    let loaded_state: Option<(CommitState, i32)> = db.store.load_state(correlation_id).await?;
-    assert!(loaded_state.is_none(), "state update should roll back");
 
     let effect_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
@@ -725,86 +709,6 @@ async fn test_publish_deduplicates_event_id_even_with_different_timestamps() -> 
         duplicate_count, 1,
         "event_id idempotency must hold even when created_at differs"
     );
-
-    Ok(())
-}
-
-// ============================================================================
-// State Operations Tests
-// ============================================================================
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-struct TestState {
-    count: i32,
-    name: String,
-}
-
-#[tokio::test]
-async fn test_save_and_load_state() -> Result<()> {
-    let db = TestDb::new().await?;
-
-    let correlation_id = Uuid::new_v4();
-    let state = TestState {
-        count: 42,
-        name: "test".to_string(),
-    };
-
-    // Save state
-    let version = db.store.save_state(correlation_id, &state, 0).await?;
-    assert_eq!(version, 1);
-
-    // Load state
-    let (loaded, loaded_version): (TestState, i32) =
-        db.store.load_state(correlation_id).await?.unwrap();
-
-    assert_eq!(loaded, state);
-    assert_eq!(loaded_version, 1);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_optimistic_locking() -> Result<()> {
-    let db = TestDb::new().await?;
-
-    let correlation_id = Uuid::new_v4();
-    let state = TestState {
-        count: 1,
-        name: "initial".to_string(),
-    };
-
-    // Initial save
-    db.store.save_state(correlation_id, &state, 0).await?;
-
-    // Update with correct version
-    let new_state = TestState {
-        count: 2,
-        name: "updated".to_string(),
-    };
-    let v2 = db.store.save_state(correlation_id, &new_state, 1).await?;
-    assert_eq!(v2, 2);
-
-    // Try to update with stale version (should fail)
-    let stale_state = TestState {
-        count: 3,
-        name: "stale".to_string(),
-    };
-    let result = db.store.save_state(correlation_id, &stale_state, 1).await;
-
-    assert!(result.is_err(), "Should fail with version conflict");
-    assert!(result.unwrap_err().to_string().contains("Version conflict"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_load_nonexistent_state() -> Result<()> {
-    let db = TestDb::new().await?;
-
-    let correlation_id = Uuid::new_v4();
-    let result: Option<(TestState, i32)> = db.store.load_state(correlation_id).await?;
-
-    assert!(result.is_none(), "Should return None for nonexistent state");
 
     Ok(())
 }
@@ -1251,14 +1155,7 @@ async fn test_complete_event_workflow() -> Result<()> {
     let event = db.store.poll_next().await?.unwrap();
     assert_eq!(event.event_id, event_id);
 
-    // 3. Save state (simulating reducer)
-    let state = TestState {
-        count: 1,
-        name: "order_placed".to_string(),
-    };
-    db.store.save_state(correlation_id, &state, 0).await?;
-
-    // 4. Insert effect intent
+    // 3. Insert effect intent
     db.store
         .insert_effect_intent(
             event_id,
@@ -1277,14 +1174,14 @@ async fn test_complete_event_workflow() -> Result<()> {
         )
         .await?;
 
-    // 5. Ack event
+    // 4. Ack event
     db.store.ack(event.id).await?;
 
-    // 6. Poll effect
+    // 5. Poll effect
     let effect = db.store.poll_next_effect().await?.unwrap();
     assert_eq!(effect.effect_id, "send_email");
 
-    // 7. Complete effect
+    // 6. Complete effect
     db.store
         .complete_effect(
             effect.event_id,
@@ -1292,12 +1189,6 @@ async fn test_complete_event_workflow() -> Result<()> {
             serde_json::json!({"sent": true}),
         )
         .await?;
-
-    // 8. Verify final state
-    let (final_state, version): (TestState, i32) =
-        db.store.load_state(correlation_id).await?.unwrap();
-    assert_eq!(final_state.count, 1);
-    assert_eq!(version, 1);
 
     Ok(())
 }

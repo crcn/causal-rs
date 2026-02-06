@@ -8,17 +8,15 @@ use crate::effect::Effect;
 use crate::event_codec::EventCodec;
 
 /// Registry for storing effects.
-pub struct EffectRegistry<S, D>
+pub struct EffectRegistry<D>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    effects: RwLock<Vec<Effect<S, D>>>,
+    effects: RwLock<Vec<Effect<D>>>,
 }
 
-impl<S, D> Default for EffectRegistry<S, D>
+impl<D> Default for EffectRegistry<D>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     fn default() -> Self {
@@ -26,9 +24,8 @@ where
     }
 }
 
-impl<S, D> EffectRegistry<S, D>
+impl<D> EffectRegistry<D>
 where
-    S: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     /// Create a new empty effect registry.
@@ -39,7 +36,7 @@ where
     }
 
     /// Register an effect.
-    pub fn register(&self, effect: Effect<S, D>) {
+    pub fn register(&self, effect: Effect<D>) {
         if effect.id.trim().is_empty() {
             panic!("Effect ID cannot be empty");
         }
@@ -59,12 +56,12 @@ where
     }
 
     /// Get all registered effects (cloned).
-    pub(crate) fn all(&self) -> Vec<Effect<S, D>> {
+    pub(crate) fn all(&self) -> Vec<Effect<D>> {
         self.effects.read().iter().cloned().collect()
     }
 
     /// Find effect by stable ID.
-    pub(crate) fn find_by_id(&self, effect_id: &str) -> Option<Effect<S, D>> {
+    pub(crate) fn find_by_id(&self, effect_id: &str) -> Option<Effect<D>> {
         self.effects
             .read()
             .iter()
@@ -128,12 +125,12 @@ mod tests {
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct EventB;
 
-    #[derive(Clone)]
-    struct TestState;
+    #[derive(Clone, Default)]
+    struct TestDeps;
 
     #[tokio::test]
     async fn test_effect_registry_registers_effects() {
-        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+        let registry: EffectRegistry<TestDeps> = EffectRegistry::new();
 
         registry.register(effect::on::<EventA>().then(|_, _| async { Ok(()) }));
 
@@ -142,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_effects() {
-        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+        let registry: EffectRegistry<TestDeps> = EffectRegistry::new();
 
         registry.register(effect::on::<EventA>().then(|_, _| async { Ok(()) }));
         registry.register(effect::on::<EventB>().then(|_, _| async { Ok(()) }));
@@ -152,7 +149,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_effect_can_handle() {
-        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+        let registry: EffectRegistry<TestDeps> = EffectRegistry::new();
 
         registry.register(effect::on::<EventA>().then(|_, _| async { Ok(()) }));
 
@@ -163,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_effect() {
-        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+        let registry: EffectRegistry<TestDeps> = EffectRegistry::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
         let counter_a = counter.clone();
@@ -198,7 +195,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "Duplicate effect id 'duplicate'")]
     async fn test_register_rejects_duplicate_effect_ids() {
-        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+        let registry: EffectRegistry<TestDeps> = EffectRegistry::new();
 
         registry.register(
             effect::on::<EventA>()
@@ -215,7 +212,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "must declare an explicit stable id")]
     async fn test_register_rejects_generated_id_for_queued_effect() {
-        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+        let registry: EffectRegistry<TestDeps> = EffectRegistry::new();
         registry.register(
             effect::on::<EventA>()
                 .retry(3)

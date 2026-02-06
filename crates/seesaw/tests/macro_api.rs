@@ -1,14 +1,9 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{effect, effects, reducer, reducers, EffectContext, Emit, ErrorContext};
+use seesaw_core::{effect, effects, EffectContext, Emit, ErrorContext};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-#[derive(Clone, Default)]
-struct TestState {
-    count: u32,
-}
 
 #[derive(Clone)]
 struct Deps;
@@ -65,10 +60,7 @@ mod order_effects {
     use super::*;
 
     #[effect(on = OrderPlaced, id = "ship_order")]
-    async fn ship_order(
-        event: OrderPlaced,
-        _ctx: EffectContext<TestState, Deps>,
-    ) -> Result<OrderShipped> {
+    async fn ship_order(event: OrderPlaced, _ctx: EffectContext<Deps>) -> Result<OrderShipped> {
         Ok(OrderShipped {
             order_id: event.order_id,
         })
@@ -83,7 +75,7 @@ mod order_effects {
     )]
     async fn charge_payment(
         event: PaymentRequested,
-        _ctx: EffectContext<TestState, Deps>,
+        _ctx: EffectContext<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -101,7 +93,7 @@ mod order_effects {
     )]
     async fn run_search(
         event: PaymentRequested,
-        _ctx: EffectContext<TestState, Deps>,
+        _ctx: EffectContext<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -123,7 +115,7 @@ mod order_effects {
     #[effect(on = OrderPlaced, queued, id = "queued_observer")]
     async fn queued_observer(
         _event: OrderPlaced,
-        _ctx: EffectContext<TestState, Deps>,
+        _ctx: EffectContext<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
     }
@@ -136,7 +128,7 @@ mod order_effects {
     )]
     async fn queued_retry_one(
         event: PaymentRequested,
-        _ctx: EffectContext<TestState, Deps>,
+        _ctx: EffectContext<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -149,7 +141,7 @@ mod order_effects {
     #[effect(on = RowValidated, join, id = "bulk_insert")]
     async fn bulk_insert(
         batch: Vec<RowValidated>,
-        _ctx: EffectContext<TestState, Deps>,
+        _ctx: EffectContext<Deps>,
     ) -> Result<BatchInserted> {
         Ok(BatchInserted { count: batch.len() })
     }
@@ -161,7 +153,7 @@ mod order_effects {
     async fn enqueue_extract(
         website_id: Uuid,
         job_id: Uuid,
-        _ctx: EffectContext<TestState, Deps>,
+        _ctx: EffectContext<Deps>,
     ) -> Result<ExtractEnqueued> {
         let _ = job_id;
         Ok(ExtractEnqueued { website_id })
@@ -170,32 +162,9 @@ mod order_effects {
     #[effect(on = OrderPlaced, group = "analytics")]
     async fn log_order(
         _event: OrderPlaced,
-        _ctx: EffectContext<TestState, Deps>,
+        _ctx: EffectContext<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
-    }
-}
-
-#[reducers]
-mod state_reducers {
-    use super::*;
-
-    #[reducer(on = OrderPlaced)]
-    fn order_placed(state: TestState, _event: OrderPlaced) -> TestState {
-        TestState {
-            count: state.count + 1,
-        }
-    }
-
-    #[reducer(
-        on = [CrawlEvent::Ingested, CrawlEvent::Regenerated],
-        extract(website_id, job_id)
-    )]
-    fn extraction_seen(state: TestState, website_id: Uuid, job_id: Uuid) -> TestState {
-        let _ = (website_id, job_id);
-        TestState {
-            count: state.count + 1,
-        }
     }
 }
 
@@ -239,10 +208,4 @@ fn effects_module_registration_works() {
         !queued_retry_one.is_inline(),
         "queued attribute should force queued execution even when retry = 1"
     );
-}
-
-#[test]
-fn reducers_module_registration_works() {
-    let reducers = state_reducers::reducers();
-    assert_eq!(reducers.len(), 2);
 }
