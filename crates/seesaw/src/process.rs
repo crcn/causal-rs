@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::Store;
 
-/// Future returned by Engine::process()
+/// Future returned by Engine::dispatch()
 ///
 /// Lazy: doesn't publish until polled
 pub struct ProcessFuture<St: Store> {
@@ -52,6 +52,24 @@ impl<St: Store> ProcessFuture<St> {
             hops,
             state: ProcessState::Init,
         }
+    }
+
+    /// Set custom event ID (for idempotency)
+    pub fn with_id(mut self, event_id: Uuid) -> Self {
+        self.event_id = event_id;
+        self
+    }
+
+    /// Set workflow/correlation ID
+    pub fn with_workflow_id(mut self, correlation_id: Uuid) -> Self {
+        self.correlation_id = correlation_id;
+        self
+    }
+
+    /// Set parent event ID (for causation tracking)
+    pub fn with_parent(mut self, parent_id: Uuid) -> Self {
+        self.parent_id = Some(parent_id);
+        self
     }
 
     /// Wait for terminal event matching closure

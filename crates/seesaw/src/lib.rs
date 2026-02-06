@@ -33,6 +33,7 @@
 extern crate self as seesaw_core;
 
 // New module structure
+pub mod dead_letter_queue;
 pub mod distributed_safe;
 pub mod handler;
 pub mod insight;
@@ -46,10 +47,11 @@ mod handler_registry;
 mod process;
 
 // Re-export main types
+pub use dead_letter_queue::{DeadLetter, DeadLetterQueue, DlqStats, DlqStatus, RetrySummary};
 pub use distributed_safe::DistributedSafe;
 pub use engine_v2::{Engine, EngineBackend};
 pub use handler::{
-    AnyEvent, DlqTerminalInfo, Emit, ErrorContext, Handler, HandlerContext, HandlerError, JoinMode,
+    AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Handler, HandlerError, JoinMode,
 };
 pub use insight::{
     EventNode, HandlerNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,

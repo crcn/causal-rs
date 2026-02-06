@@ -1,16 +1,17 @@
 //! Runtime - worker management for queue-backed engine.
 
 pub mod event_worker;
+pub mod graceful_shutdown;
 pub mod handler_worker;
 
-use anyhow::{Context, Result};
+use anyhow::{Context as AnyhowContext, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::handler::HandlerContext;
+use crate::handler::Context;
 use crate::Store;
 use event_worker::{EventWorker, EventWorkerConfig};
 use handler_worker::{HandlerWorker, HandlerWorkerConfig};
@@ -71,7 +72,7 @@ impl Runtime {
 
             let deps = engine.deps().clone();
             let effect_id = effect.id.clone();
-            let ctx = HandlerContext::new(
+            let ctx = Context::new(
                 effect_id.clone(),
                 format!("startup::{}", effect_id),
                 Uuid::nil(),
@@ -155,7 +156,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::{on_any, HandlerContext};
+    use crate::handler::{on_any, Context};
     use crate::{
         EmittedEvent, QueuedEvent, QueuedHandlerExecution, Store, WorkflowEvent, WorkflowStatus,
     };
@@ -286,7 +287,7 @@ mod tests {
         let engine = crate::Engine::new(TestDeps, NoopStore).with_handler(
             on_any()
                 .id("startup_probe")
-                .started(move |_ctx: HandlerContext<TestDeps>| {
+                .init(move |_ctx: Context<TestDeps>| {
                     let started_calls = started_calls_clone.clone();
                     async move {
                         started_calls.fetch_add(1, Ordering::SeqCst);
@@ -321,9 +322,9 @@ mod tests {
         let engine = crate::Engine::new(TestDeps, NoopStore).with_handler(
             on_any()
                 .id("startup_fail")
-                .started(|_ctx: HandlerContext<TestDeps>| async move {
-                    Err(anyhow::anyhow!("startup failed"))
-                })
+                .init(
+                    |_ctx: Context<TestDeps>| async move { Err(anyhow::anyhow!("startup failed")) },
+                )
                 .then(|_, _| async move { Ok(()) }),
         );
 

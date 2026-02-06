@@ -19,10 +19,10 @@
 //!     Ok(())
 //! }));
 //!
-//! // With setup
+//! // With init
 //! store.with_handler(
 //!     effect::on::<MyEvent>()
-//!         .started(setup_handler)
+//!         .init(setup_handler)
 //!         .then(handle_my_event)
 //! );
 //!
@@ -31,13 +31,6 @@
 //!     effect::on_any()
 //!         .then(|event, ctx| async move { Ok(()) })
 //! );
-//!
-//! // Group multiple effects
-//! store.with_handler(effect::group([
-//!     effect::on::<EventA>().then(handle_a),
-//!     effect::on::<EventB>().then(handle_b),
-//! ]));
-//!
 //! ```
 
 mod builders;
@@ -45,8 +38,8 @@ pub(crate) mod context;
 mod error_event;
 mod types;
 
-pub use builders::{group, on, on_any};
-pub use context::HandlerContext;
+pub use builders::{on, on_any};
+pub use context::Context;
 pub use error_event::HandlerError;
 pub use types::{
     AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Handler, JoinMode,

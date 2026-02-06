@@ -93,8 +93,8 @@ impl<A: DistributedSafe, B: DistributedSafe, C: DistributedSafe, D: DistributedS
     for (A, B, C, D)
 {
 }
-impl<A: DistributedSafe, B: DistributedSafe, C: DistributedSafe, D: DistributedSafe>
-    DistributedSafe for (A, B, C, D)
+impl<A: DistributedSafe, B: DistributedSafe, C: DistributedSafe, D: DistributedSafe> DistributedSafe
+    for (A, B, C, D)
 {
 }
 

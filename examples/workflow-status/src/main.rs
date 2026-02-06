@@ -1,7 +1,7 @@
 //! Workflow Status Tracking Example (stateless)
 
 use anyhow::Result;
-use seesaw_core::{effect, Engine, HandlerContext, Store, WorkflowStatus};
+use seesaw_core::{effect, Context, Engine, Store, WorkflowStatus};
 use seesaw_postgres::PostgresStore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
                 })
                 .queued()
                 .retry(3)
-                .then(|(order_id, total), ctx: HandlerContext<Deps>| async move {
+                .then(|(order_id, total), ctx: Context<Deps>| async move {
                     ctx.deps().payment_service.charge(total).await?;
                     Ok(OrderEvent::PaymentCharged { order_id })
                 }),
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
                     _ => None,
                 })
                 .queued()
-                .then(|order_id, ctx: HandlerContext<Deps>| async move {
+                .then(|order_id, ctx: Context<Deps>| async move {
                     ctx.deps().inventory_service.reserve(order_id).await?;
                     Ok(OrderEvent::InventoryReserved { order_id })
                 }),
@@ -90,14 +90,14 @@ async fn main() -> Result<()> {
                     OrderEvent::InventoryReserved { order_id } => Some(*order_id),
                     _ => None,
                 })
-                .then(|order_id, _ctx: HandlerContext<Deps>| async move {
+                .then(|order_id, _ctx: Context<Deps>| async move {
                     Ok(OrderEvent::OrderCompleted { order_id })
                 }),
         );
 
     let order_id = Uuid::new_v4();
     let handle = engine
-        .process(OrderEvent::OrderPlaced {
+        .dispatch(OrderEvent::OrderPlaced {
             order_id,
             total: 99.99,
         })
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
 
     let order_id_2 = Uuid::new_v4();
     let _result = engine
-        .process(OrderEvent::OrderPlaced {
+        .dispatch(OrderEvent::OrderPlaced {
             order_id: order_id_2,
             total: 149.99,
         })

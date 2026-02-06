@@ -129,7 +129,7 @@ async fn enqueue_order(
     let customer_id = Uuid::new_v4();
 
     engine
-        .process(OrderEvent::OrderPlaced {
+        .dispatch(OrderEvent::OrderPlaced {
             order_id,
             customer_id,
             total,
@@ -435,8 +435,7 @@ async fn main() -> Result<()> {
                 .id("process_batch_item")
                 .retry(2)
                 .then_queue(
-                    |item: Arc<BatchWorkItem>,
-                     _ctx: seesaw_core::HandlerContext<Deps>| async move {
+                    |item: Arc<BatchWorkItem>, _ctx: seesaw_core::Context<Deps>| async move {
                         tokio::time::sleep(Duration::from_millis(
                             220 + (item.item_index as u64 * 70),
                         ))
@@ -463,8 +462,7 @@ async fn main() -> Result<()> {
                 .join()
                 .same_batch()
                 .then(
-                    |items: Vec<BatchWorkResult>,
-                     _ctx: seesaw_core::HandlerContext<Deps>| async move {
+                    |items: Vec<BatchWorkResult>, _ctx: seesaw_core::Context<Deps>| async move {
                         let Some(order_id) = items.first().map(|item| item.order_id) else {
                             anyhow::bail!("join_batch_items received empty batch");
                         };
@@ -487,8 +485,7 @@ async fn main() -> Result<()> {
             handler::on::<BatchJoinReady>()
                 .id("finalize_batch_join")
                 .then_queue(
-                    |summary: Arc<BatchJoinReady>,
-                     _ctx: seesaw_core::HandlerContext<Deps>| async move {
+                    |summary: Arc<BatchJoinReady>, _ctx: seesaw_core::Context<Deps>| async move {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         if summary.failed > 0 {
                             Ok(OrderEvent::OrderFailed {
@@ -664,7 +661,7 @@ async fn main() -> Result<()> {
         );
 
         engine
-            .process(OrderEvent::OrderPlaced {
+            .dispatch(OrderEvent::OrderPlaced {
                 order_id,
                 customer_id,
                 total: 99.99 * i as f64,

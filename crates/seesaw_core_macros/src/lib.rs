@@ -296,7 +296,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         if non_ctx_params.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &input_fn.sig.inputs,
-                "#[handler] requires exactly one event parameter plus HandlerContext when extract(...) is not used",
+                "#[handler] requires exactly one event parameter plus Context when extract(...) is not used",
             ));
         }
         if !matches!(on, OnSpec::EventType(_)) {
@@ -360,7 +360,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
                 if type_key(existing_deps) != type_key(&deps) {
                     return Err(syn::Error::new_spanned(
                         &item_fn.sig,
-                        "all #[handler] handlers in an #[handlers] module must use the same HandlerContext<Deps>",
+                        "all #[handler] handlers in an #[handlers] module must use the same Context<Deps>",
                     ));
                 }
             }
@@ -607,7 +607,7 @@ fn find_effect_context(sig: &Signature) -> syn::Result<(usize, Type)> {
             if found.is_some() {
                 return Err(syn::Error::new_spanned(
                     &typed.ty,
-                    "multiple HandlerContext parameters are not supported",
+                    "multiple Context parameters are not supported",
                 ));
             }
             found = Some((index, deps));
@@ -617,7 +617,7 @@ fn find_effect_context(sig: &Signature) -> syn::Result<(usize, Type)> {
     found.ok_or_else(|| {
         syn::Error::new_spanned(
             &sig.inputs,
-            "effect handler must include ctx: HandlerContext<Deps>",
+            "effect handler must include ctx: Context<Deps>",
         )
     })
 }
@@ -627,7 +627,7 @@ fn parse_effect_context_type(ty: &Type) -> Option<Type> {
         return None;
     };
     let last = path.segments.last()?;
-    if last.ident != "HandlerContext" {
+    if last.ident != "Context" {
         return None;
     }
     let PathArguments::AngleBracketed(args) = &last.arguments else {

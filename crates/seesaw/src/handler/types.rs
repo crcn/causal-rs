@@ -8,15 +8,14 @@ use std::time::Duration;
 
 use anyhow::{Error, Result};
 
-use super::context::HandlerContext;
+use super::context::Context;
 use crate::event_codec::EventCodec;
 
 /// Error handler called when an effect returns an error.
 ///
 /// The handler receives the error, event type that caused it, and context.
 /// It can emit failure events or log the error. The chain continues regardless.
-pub type ErrorHandler<D> =
-    Arc<dyn Fn(Error, TypeId, HandlerContext<D>) -> BoxFuture<()> + Send + Sync>;
+pub type ErrorHandler<D> = Arc<dyn Fn(Error, TypeId, Context<D>) -> BoxFuture<()> + Send + Sync>;
 
 /// Metadata passed to DLQ terminal mappers when an effect exhausts retries.
 #[derive(Debug, Clone)]
@@ -161,15 +160,14 @@ where
     pub(crate) can_handle: Arc<dyn Fn(TypeId) -> bool + Send + Sync>,
 
     /// Called once when the store is activated.
-    pub(crate) started:
-        Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>,
+    pub(crate) started: Option<Arc<dyn Fn(Context<D>) -> BoxFuture<Result<()>> + Send + Sync>>,
 
     /// Called for each event that passes `can_handle`.
     pub(crate) handler: Arc<
         dyn Fn(
                 Arc<dyn Any + Send + Sync>,
                 TypeId,
-                HandlerContext<D>,
+                Context<D>,
             ) -> BoxFuture<Result<Vec<EventOutput>>>
             + Send
             + Sync,
@@ -184,7 +182,7 @@ where
         Arc<
             dyn Fn(
                     Vec<Arc<dyn Any + Send + Sync>>,
-                    HandlerContext<D>,
+                    Context<D>,
                 ) -> BoxFuture<Result<Vec<EventOutput>>>
                 + Send
                 + Sync,
@@ -244,7 +242,7 @@ where
     }
 
     /// Call the started handler if present.
-    pub async fn call_started(&self, ctx: HandlerContext<D>) -> Result<()> {
+    pub async fn call_started(&self, ctx: Context<D>) -> Result<()> {
         if let Some(ref started) = self.started {
             started(ctx).await
         } else {
@@ -257,7 +255,7 @@ where
         &self,
         value: Arc<dyn Any + Send + Sync>,
         type_id: TypeId,
-        ctx: HandlerContext<D>,
+        ctx: Context<D>,
     ) -> Result<Vec<EventOutput>> {
         (self.handler)(value, type_id, ctx).await
     }
@@ -266,7 +264,7 @@ where
     pub async fn call_join_batch_handler(
         &self,
         values: Vec<Arc<dyn Any + Send + Sync>>,
-        ctx: HandlerContext<D>,
+        ctx: Context<D>,
     ) -> Result<Vec<EventOutput>> {
         if let Some(handler) = &self.join_batch_handler {
             handler(values, ctx).await

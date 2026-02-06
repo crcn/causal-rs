@@ -138,42 +138,15 @@ where
         self
     }
 
-    /// Process event (returns lazy future)
+    /// Dispatch event (returns lazy future)
     ///
     /// Event is serialized and published to store when future is polled.
-    pub fn process<E>(&self, event: E) -> ProcessFuture<St>
+    pub fn dispatch<E>(&self, event: E) -> ProcessFuture<St>
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
-        self.process_workflow(Uuid::new_v4(), event)
-    }
-
-    /// Process event with workflow ID
-    pub fn process_workflow<E>(&self, correlation_id: Uuid, event: E) -> ProcessFuture<St>
-    where
-        E: Clone + Send + Sync + serde::Serialize + 'static,
-    {
-        self.process_workflow_with_id(Uuid::new_v4(), correlation_id, event)
-    }
-
-    /// Process event with external event ID (webhook idempotency)
-    pub fn process_with_id<E>(&self, event_id: Uuid, event: E) -> ProcessFuture<St>
-    where
-        E: Clone + Send + Sync + serde::Serialize + 'static,
-    {
-        self.process_workflow_with_id(event_id, Uuid::new_v4(), event)
-    }
-
-    /// Process event with event ID and workflow ID (for idempotency)
-    pub fn process_workflow_with_id<E>(
-        &self,
-        event_id: Uuid,
-        correlation_id: Uuid,
-        event: E,
-    ) -> ProcessFuture<St>
-    where
-        E: Clone + Send + Sync + serde::Serialize + 'static,
-    {
+        let event_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
         let event_type = std::any::type_name::<E>().to_string();
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
 

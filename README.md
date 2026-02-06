@@ -14,10 +14,11 @@ This repository is organized as a Cargo workspace:
 
 ## Documentation
 
-- **[CLAUDE.md](./CLAUDE.md)** - Complete architecture guide and API reference
+- **[docs/CLAUDE.md](./docs/CLAUDE.md)** - Complete architecture guide and API reference
 - **[docs/DISTRIBUTED-SAFETY.md](./docs/DISTRIBUTED-SAFETY.md)** - ⚠️ Multi-worker deployment safety guide
-- **[IMPLEMENTATION_SUMMARY.md](./IMPLEMENTATION_SUMMARY.md)** - Tree visualization & WebSocket implementation details
-- **[INTEGRATION_MNDIGITALAID.md](./INTEGRATION_MNDIGITALAID.md)** - Upgrading from v0.7.8 to v0.8.1 guide
+- **[docs/WORK-DEDUPLICATION.md](./docs/WORK-DEDUPLICATION.md)** - 🔒 At-most-once processing and idempotency guarantees
+- **[docs/IMPLEMENTATION_SUMMARY.md](./docs/IMPLEMENTATION_SUMMARY.md)** - Tree visualization & WebSocket implementation details
+- **[docs/INTEGRATION_MNDIGITALAID.md](./docs/INTEGRATION_MNDIGITALAID.md)** - Upgrading from v0.7.8 to v0.8.1 guide
 
 ## Core Principle
 
@@ -124,7 +125,7 @@ async fn main() -> Result<()> {
 For a more concise syntax, use the `#[handler]` procedural macro (enabled by default via the `macros` feature):
 
 ```rust
-use seesaw_core::{handler, HandlerContext, DlqTerminalInfo};
+use seesaw_core::{handler, Context, DlqTerminalInfo};
 use anyhow::Result;
 
 #[derive(Clone)]
@@ -154,12 +155,12 @@ struct Deps {
     retry = 3,
     timeout_secs = 30,
     priority = 1,
-    dlq_terminal = order_payment_failed
+    on_failure = order_payment_failed
 )]
 async fn charge_payment(
     order_id: Uuid,
     total: f64,
-    ctx: HandlerContext<OrderState, Deps>
+    ctx: Context<OrderState, Deps>
 ) -> Result<OrderEvent> {
     ctx.deps().payment.charge(order_id, total).await?;
     Ok(OrderEvent::PaymentCharged { order_id })
@@ -192,7 +193,7 @@ fn track_revenue(state: OrderState, total: f64) -> OrderState {
 )]
 async fn ship_order(
     order_id: Uuid,
-    ctx: HandlerContext<OrderState, Deps>
+    ctx: Context<OrderState, Deps>
 ) -> Result<OrderEvent> {
     ctx.deps().shipping.ship(order_id).await?;
     Ok(OrderEvent::OrderShipped { order_id })
@@ -202,7 +203,7 @@ async fn ship_order(
 #[handler(on = OrderEvent, join)]
 async fn process_batch(
     batch: Vec<OrderEvent>,
-    ctx: HandlerContext<OrderState, Deps>
+    ctx: Context<OrderState, Deps>
 ) -> Result<()> {
     // Process entire batch together
     let order_ids: Vec<_> = batch.iter()
@@ -228,7 +229,7 @@ mod order_effects {
     #[handler(on = OrderEvent, extract(order_id))]
     async fn charge_payment(
         order_id: Uuid,
-        ctx: HandlerContext<OrderState, Deps>
+        ctx: Context<OrderState, Deps>
     ) -> Result<OrderEvent> {
         // ... implementation
     }
@@ -236,7 +237,7 @@ mod order_effects {
     #[handler(on = OrderEvent, extract(order_id))]
     async fn ship_order(
         order_id: Uuid,
-        ctx: HandlerContext<OrderState, Deps>
+        ctx: Context<OrderState, Deps>
     ) -> Result<OrderEvent> {
         // ... implementation
     }
@@ -276,7 +277,7 @@ let engine = Engine::new(deps, store)
 - `delay_secs = N` / `delay_ms = N` - Delayed execution
 - `priority = N` - Execution priority (lower = higher)
 - `group = "name"` - Effect group (used in ID if no explicit `id`)
-- `dlq_terminal = handler` - Terminal event mapper for exhausted retries
+- `on_failure = handler` - Terminal event mapper for exhausted retries
 
 **Reducer attributes:**
 - `on = EventType` - Single event type
@@ -286,7 +287,7 @@ let engine = Engine::new(deps, store)
 **Requirements:**
 - Effect functions must be `async` and return `Result<T>` where `T` is an event or `()`
 - Reducer functions must be synchronous and return the state type
-- All functions must include exactly one `HandlerContext<S, D>` parameter (for effects)
+- All functions must include exactly one `Context<S, D>` parameter (for effects)
 - Parameter names must match extracted field names when using `extract(...)`
 - For `join`, first parameter must be `Vec<EventType>`
 
@@ -414,7 +415,7 @@ handler::on::<AnalyticsEvent>()
 - `.delay(Duration)` - Delay before execution
 - `.priority(i32)` - Priority (lower = higher)
 - `.background()` - Force queued execution
-- `.dlq_terminal(mapper)` - Map exhausted retries to terminal events (v0.10.2+)
+- `.on_failure(mapper)` - Map exhausted retries to terminal events (v0.10.2+)
 
 **Execution modes:**
 - **Inline** (default): Immediate, no retry
@@ -422,7 +423,7 @@ handler::on::<AnalyticsEvent>()
 
 #### DLQ Terminal Mapping (v0.10.2+)
 
-When an effect exhausts its retry attempts, you can map the failure to a terminal event using `.dlq_terminal()`:
+When an effect exhausts its retry attempts, you can map the failure to a terminal event using `.on_failure()`:
 
 ```rust
 use seesaw_core::{effect, DlqTerminalInfo};
@@ -442,7 +443,7 @@ handler::on::<OrderEvent>()
         _ => None,
     })
     .retry(3)  // Try 3 times
-    .dlq_terminal(|event, info: DlqTerminalInfo| {
+    .on_failure(|event, info: DlqTerminalInfo| {
         // Called when effect fails after max attempts
         OrderEvent::OrderFailed {
             order_id: event.order_id,
@@ -612,9 +613,9 @@ Key properties:
 - **Transform state**: Take current state and event, return new state
 - **Run before effects**: Updated state is passed to effects via `ctx.next_state()`
 
-### HandlerContext
+### Context
 
-`HandlerContext` provides a narrow API to effects:
+`Context` provides a narrow API to effects:
 
 ```rust
 // Access shared dependencies (database, APIs, config)
@@ -811,7 +812,7 @@ Triggers populate this table automatically - no code changes needed!
 - `GET /api/tree/:correlation_id` - Causality tree
 - `GET /api/stats` - Current metrics
 
-**HandlerContext in queue-backed mode:**
+**Context in queue-backed mode:**
 ```rust
 ctx.correlation_id   // Workflow identifier
 ctx.event_id         // Current event's unique ID

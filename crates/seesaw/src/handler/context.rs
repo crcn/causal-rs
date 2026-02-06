@@ -5,7 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Context passed to effect handlers.
-pub struct HandlerContext<D>
+pub struct Context<D>
 where
     D: Send + Sync + 'static,
 {
@@ -20,7 +20,7 @@ where
     pub(crate) deps: Arc<D>,
 }
 
-impl<D> Clone for HandlerContext<D>
+impl<D> Clone for Context<D>
 where
     D: Send + Sync + 'static,
 {
@@ -35,7 +35,7 @@ where
     }
 }
 
-impl<D> HandlerContext<D>
+impl<D> Context<D>
 where
     D: Send + Sync + 'static,
 {
@@ -85,9 +85,9 @@ mod tests {
         multiplier: i32,
     }
 
-    fn create_test_context() -> HandlerContext<TestDeps> {
+    fn create_test_context() -> Context<TestDeps> {
         let deps = Arc::new(TestDeps { multiplier: 2 });
-        HandlerContext::new(
+        Context::new(
             "test_effect".to_string(),
             "test_idempotency_key".to_string(),
             Uuid::nil(),

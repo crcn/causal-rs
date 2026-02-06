@@ -9,7 +9,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::handler::HandlerContext;
+use crate::handler::Context;
 use crate::handler_registry::HandlerRegistry;
 use crate::queue_backend::{QueueBackend, StoreQueueBackend};
 use crate::{
@@ -318,7 +318,7 @@ where
             format!("{}-{}", source_event.event_id, effect.id).as_bytes(),
         )
         .to_string();
-        let ctx = HandlerContext::new(
+        let ctx = Context::new(
             effect.id.clone(),
             idempotency_key,
             source_event.correlation_id,
@@ -602,9 +602,7 @@ mod tests {
             handler::on::<TypedInput>()
                 .queued()
                 .id("decode_probe")
-                .then(
-                    |_event: Arc<TypedInput>, _ctx: HandlerContext<TestDeps>| async move { Ok(()) },
-                ),
+                .then(|_event: Arc<TypedInput>, _ctx: Context<TestDeps>| async move { Ok(()) }),
         );
 
         let bad_event = QueuedEvent {

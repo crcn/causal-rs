@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use super::context::HandlerContext;
+use super::context::Context;
 use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Emit, EventOutput, Handler, JoinMode};
 use crate::event_codec::EventCodec;
 
@@ -101,7 +101,7 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
     queued: bool,
     delay: Option<Duration>,
     timeout: Option<Duration>,
-    join_window_timeout: Option<Duration>,
+    join_window: Option<Duration>,
     max_attempts: u32,
     priority: Option<i32>,
     codec: Option<Arc<EventCodec>>,
@@ -118,7 +118,7 @@ pub fn on<E: Send + Sync + 'static>() -> HandlerBuilder<Typed<E>, NoFilter, NoSt
         queued: false,
         delay: None,
         timeout: None,
-        join_window_timeout: None,
+        join_window: None,
         max_attempts: 1,
         priority: None,
         codec: None,
@@ -136,7 +136,7 @@ pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
         queued: false,
         delay: None,
         timeout: None,
-        join_window_timeout: None,
+        join_window: None,
         max_attempts: 1,
         priority: None,
         codec: None,
@@ -161,7 +161,7 @@ where
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
-            join_window_timeout: self.join_window_timeout,
+            join_window: self.join_window,
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
@@ -186,7 +186,7 @@ where
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
-            join_window_timeout: self.join_window_timeout,
+            join_window: self.join_window,
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
@@ -197,14 +197,14 @@ where
 }
 
 impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
-    /// Add a started handler that runs when the store is activated.
-    pub fn started<D, St, StFut>(
+    /// Add an init handler that runs when the store is activated.
+    pub fn init<D, St, StFut>(
         self,
         started: St,
     ) -> HandlerBuilder<EventType, Filter, WithStarted<D, St>>
     where
         D: Send + Sync + 'static,
-        St: Fn(HandlerContext<D>) -> StFut + Send + Sync + 'static,
+        St: Fn(Context<D>) -> StFut + Send + Sync + 'static,
         StFut: Future<Output = Result<()>> + Send + 'static,
     {
         HandlerBuilder {
@@ -214,7 +214,7 @@ impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
-            join_window_timeout: self.join_window_timeout,
+            join_window: self.join_window,
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
@@ -236,8 +236,8 @@ impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
-    /// Map exhausted retries/timeouts to a terminal event before DLQ completion.
-    pub fn dlq_terminal<O, M>(mut self, mapper: M) -> Self
+    /// Map exhausted retries/timeouts to a failure event.
+    pub fn on_failure<O, M>(mut self, mapper: M) -> Self
     where
         O: serde::Serialize + Send + Sync + 'static,
         M: Fn(Arc<E>, DlqTerminalInfo) -> O + Send + Sync + 'static,
@@ -246,14 +246,14 @@ where
         self.dlq_terminal_mapper = Some(Arc::new(move |source_any, source_type, info| {
             if source_type != TypeId::of::<E>() {
                 anyhow::bail!(
-                    "dlq_terminal source type mismatch: expected {}",
+                    "on_failure source type mismatch: expected {}",
                     std::any::type_name::<E>()
                 );
             }
 
             let typed = source_any.downcast::<E>().map_err(|_| {
                 anyhow::anyhow!(
-                    "dlq_terminal source downcast failed for {}",
+                    "on_failure source downcast failed for {}",
                     std::any::type_name::<E>()
                 )
             })?;
@@ -276,8 +276,8 @@ where
     EventType: QueueCodecProvider,
 {
     /// Set a timeout for accumulation windows.
-    pub fn window_timeout(mut self, duration: Duration) -> Self {
-        self.join_window_timeout = Some(duration);
+    pub fn window(mut self, duration: Duration) -> Self {
+        self.join_window = Some(duration);
         self
     }
 
@@ -336,11 +336,6 @@ where
             mode: JoinMode::SameBatch,
         }
     }
-
-    /// Backward-compatible alias for `accumulate()`.
-    pub fn join(self) -> JoinHandlerBuilder<E, Started> {
-        self.accumulate()
-    }
 }
 
 impl<E, Started> JoinHandlerBuilder<E, Started>
@@ -354,8 +349,8 @@ where
     }
 
     /// Set a timeout for this accumulation window.
-    pub fn window_timeout(mut self, duration: Duration) -> Self {
-        self.inner.join_window_timeout = Some(duration);
+    pub fn window(mut self, duration: Duration) -> Self {
+        self.inner.join_window = Some(duration);
         self
     }
 
@@ -366,7 +361,7 @@ where
     where
         D: Send + Sync + 'static,
         Started: StartedHandler<D>,
-        H: Fn(Vec<E>, HandlerContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(Vec<E>, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
@@ -409,7 +404,7 @@ where
                     Ok(emit_to_outputs(emit))
                 })
             })),
-            join_window_timeout: self.inner.join_window_timeout,
+            join_window_timeout: self.inner.join_window,
             dlq_terminal_mapper: self.inner.dlq_terminal_mapper.take(),
             queued: true,
             delay: self.inner.delay,
@@ -461,9 +456,8 @@ trait StartedHandler<D>: Send + Sync + 'static
 where
     D: Send + Sync + 'static,
 {
-    fn into_started(
-        self,
-    ) -> Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>;
+    fn into_started(self)
+        -> Option<Arc<dyn Fn(Context<D>) -> BoxFuture<Result<()>> + Send + Sync>>;
 }
 
 impl<D> StartedHandler<D> for NoStarted
@@ -472,7 +466,7 @@ where
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    ) -> Option<Arc<dyn Fn(Context<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         None
     }
 }
@@ -480,12 +474,12 @@ where
 impl<D, St, StFut> StartedHandler<D> for WithStarted<D, St>
 where
     D: Send + Sync + 'static,
-    St: Fn(HandlerContext<D>) -> StFut + Send + Sync + 'static,
+    St: Fn(Context<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    ) -> Option<Arc<dyn Fn(Context<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         let started = self.0;
         Some(Arc::new(move |ctx| Box::pin(started(ctx))))
     }
@@ -504,7 +498,7 @@ where
         T: Clone + Send + 'static,
         Filter: Extractor<E, T>,
         Started: StartedHandler<D>,
-        H: Fn(T, HandlerContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(T, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
@@ -540,65 +534,9 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
-            join_window_timeout: self.join_window_timeout,
+            join_window_timeout: self.join_window,
             dlq_terminal_mapper,
             queued: self.queued,
-            delay: self.delay,
-            timeout: self.timeout,
-            max_attempts: self.max_attempts,
-            priority: self.priority,
-        }
-    }
-
-    /// Queue-capable variant of [`then`].
-    #[track_caller]
-    #[allow(private_bounds)]
-    pub fn then_queue<D, T, H, Fut, R, O>(self, handler: H) -> Handler<D>
-    where
-        D: Send + Sync + 'static,
-        E: Clone + serde::Serialize + serde::de::DeserializeOwned,
-        T: Clone + Send + 'static,
-        Filter: Extractor<E, T>,
-        Started: StartedHandler<D>,
-        H: Fn(T, HandlerContext<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
-        R: Into<Emit<O>> + Send + 'static,
-        O: Send + Sync + 'static,
-    {
-        let target = TypeId::of::<E>();
-        let filter = self.filter;
-        let codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
-        let dlq_terminal_mapper = self.dlq_terminal_mapper;
-
-        let id = self
-            .id
-            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
-
-        Handler {
-            id,
-            codecs: vec![codec],
-            can_handle: Arc::new(move |t| t == target),
-            started: self.started.into_started(),
-            handler: Arc::new(move |value, _, ctx| {
-                let typed = value.downcast::<E>().expect("type checked by can_handle");
-
-                match filter.extract(&typed) {
-                    Some(extracted) => {
-                        let fut = handler(extracted, ctx);
-                        Box::pin(async move {
-                            let output: R = fut.await?;
-                            let emit: Emit<O> = output.into();
-                            Ok(emit_to_outputs(emit))
-                        })
-                    }
-                    None => Box::pin(async { Ok(Vec::new()) }),
-                }
-            }),
-            join_mode: None,
-            join_batch_handler: None,
-            join_window_timeout: self.join_window_timeout,
-            dlq_terminal_mapper,
-            queued: true,
             delay: self.delay,
             timeout: self.timeout,
             max_attempts: self.max_attempts,
@@ -613,7 +551,7 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
     pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
-        H: Fn(AnyEvent, HandlerContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let id = self.id.unwrap_or_else(|| default_effect_id("effect_any"));
@@ -633,7 +571,7 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
             }),
             join_mode: None,
             join_batch_handler: None,
-            join_window_timeout: self.join_window_timeout,
+            join_window_timeout: self.join_window,
             dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
@@ -647,14 +585,14 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
 impl<D, St, StFut> HandlerBuilder<Untyped, NoFilter, WithStarted<D, St>>
 where
     D: Send + Sync + 'static,
-    St: Fn(HandlerContext<D>) -> StFut + Send + Sync + 'static,
+    St: Fn(Context<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
     /// Set the handler for observing all events with started hook.
     #[track_caller]
     pub fn then<H, Fut>(self, handler: H) -> Handler<D>
     where
-        H: Fn(AnyEvent, HandlerContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let id = self
@@ -677,7 +615,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
-            join_window_timeout: self.join_window_timeout,
+            join_window_timeout: self.join_window,
             dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
@@ -685,82 +623,6 @@ where
             max_attempts: self.max_attempts,
             priority: self.priority,
         }
-    }
-}
-
-/// Compose multiple effects into a single effect.
-#[track_caller]
-pub fn group<D>(effects: impl IntoIterator<Item = Handler<D>>) -> Handler<D>
-where
-    D: Send + Sync + 'static,
-{
-    let effects: Arc<Vec<Handler<D>>> = Arc::new(effects.into_iter().collect());
-    let mut codecs = Vec::new();
-    for effect in effects.iter() {
-        codecs.extend(effect.codecs().iter().cloned());
-    }
-
-    Handler {
-        id: default_effect_id("effect_group"),
-        codecs,
-        can_handle: {
-            let effects = effects.clone();
-            Arc::new(move |type_id| effects.iter().any(|e| (e.can_handle)(type_id)))
-        },
-        started: {
-            let effects = effects.clone();
-            Some(Arc::new(move |ctx: HandlerContext<D>| {
-                let effects = effects.clone();
-                Box::pin(async move {
-                    for effect in effects.iter() {
-                        if let Some(ref started) = effect.started {
-                            started(ctx.clone()).await?;
-                        }
-                    }
-                    Ok(())
-                })
-            }))
-        },
-        handler: {
-            let effects = effects.clone();
-            Arc::new(
-                move |value: Arc<dyn Any + Send + Sync>,
-                      type_id: TypeId,
-                      ctx: HandlerContext<D>| {
-                    let effects = effects.clone();
-                    Box::pin(async move {
-                        let mut outputs = Vec::new();
-                        let mut first_error: Option<anyhow::Error> = None;
-                        for effect in effects.iter() {
-                            if (effect.can_handle)(type_id) {
-                                match (effect.handler)(value.clone(), type_id, ctx.clone()).await {
-                                    Ok(mut emitted) => outputs.append(&mut emitted),
-                                    Err(e) => {
-                                        if first_error.is_none() {
-                                            first_error = Some(e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(err) = first_error {
-                            return Err(err);
-                        }
-                        Ok(outputs)
-                    })
-                },
-            )
-        },
-        join_mode: None,
-        join_batch_handler: None,
-        join_window_timeout: None,
-        dlq_terminal_mapper: None,
-        queued: false,
-        delay: None,
-        timeout: None,
-        max_attempts: 1,
-        priority: None,
     }
 }
 
@@ -778,23 +640,11 @@ mod tests {
     struct Deps;
 
     #[test]
-    fn then_queue_forces_queued_execution() {
-        let effect = on::<QueueEvent>().id("queue_probe").then_queue(
-            |_event: Arc<QueueEvent>, _ctx: HandlerContext<Deps>| async move { Ok(()) },
-        );
-
-        assert!(
-            !effect.is_inline(),
-            "then_queue() should always create queued effects"
-        );
-    }
-
-    #[test]
     fn filter_does_not_force_queued_execution() {
         let effect = on::<QueueEvent>()
             .id("filter_probe")
             .filter(|event| event.value > 0)
-            .then(|_event: Arc<QueueEvent>, _ctx: HandlerContext<Deps>| async move { Ok(()) });
+            .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move { Ok(()) });
 
         assert!(
             effect.is_inline(),

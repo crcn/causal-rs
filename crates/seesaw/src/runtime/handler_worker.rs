@@ -10,7 +10,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::handler::{DlqTerminalInfo, HandlerContext, JoinMode};
+use crate::handler::{Context, DlqTerminalInfo, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::queue_backend::{QueueBackend, StoreQueueBackend};
 use crate::{EmittedEvent, Store, NAMESPACE_SEESAW};
@@ -172,7 +172,7 @@ where
             format!("{}-{}", execution.event_id, execution.handler_id).as_bytes(),
         )
         .to_string();
-        let ctx = HandlerContext::new(
+        let ctx = Context::new(
             effect.id.clone(),
             idempotency_key,
             execution.correlation_id,

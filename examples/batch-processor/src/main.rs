@@ -1,7 +1,7 @@
 //! Batch Processing Example (stateless)
 
 use anyhow::Result;
-use seesaw_core::{effect, Engine, HandlerContext};
+use seesaw_core::{effect, Context, Engine};
 use seesaw_memory::MemoryStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -129,7 +129,7 @@ fn build_effects() -> Vec<seesaw_core::Handler<Deps>> {
                 _ => None,
             })
             .then::<Deps, (Uuid, String, usize), _, _, Vec<ImportEvent>, ImportEvent>(
-                |(file_id, file_path, expected_rows), ctx: HandlerContext<Deps>| async move {
+                |(file_id, file_path, expected_rows), ctx: Context<Deps>| async move {
                     ctx.deps().start_import(file_id, expected_rows);
                     let rows = ctx.deps().parse_csv(&file_path).await?;
 
@@ -154,27 +154,25 @@ fn build_effects() -> Vec<seesaw_core::Handler<Deps>> {
                 } => Some((*file_id, *row_id, data.clone())),
                 _ => None,
             })
-            .then(
-                |(file_id, row_id, data), ctx: HandlerContext<Deps>| async move {
-                    match ctx.deps().validate_row(&data).await {
-                        Ok(()) => Ok(ImportEvent::RowValidated {
-                            file_id,
-                            row_id,
-                            data,
-                        }),
-                        Err(error) => Ok(ImportEvent::RowRejected {
-                            file_id,
-                            row_id,
-                            reason: error.to_string(),
-                        }),
-                    }
-                },
-            ),
+            .then(|(file_id, row_id, data), ctx: Context<Deps>| async move {
+                match ctx.deps().validate_row(&data).await {
+                    Ok(()) => Ok(ImportEvent::RowValidated {
+                        file_id,
+                        row_id,
+                        data,
+                    }),
+                    Err(error) => Ok(ImportEvent::RowRejected {
+                        file_id,
+                        row_id,
+                        reason: error.to_string(),
+                    }),
+                }
+            }),
         handler::on::<ImportEvent>()
             .join()
             .same_batch()
             .then::<Deps, _, _, Vec<ImportEvent>, ImportEvent>(
-                |batch: Vec<ImportEvent>, ctx: HandlerContext<Deps>| async move {
+                |batch: Vec<ImportEvent>, ctx: Context<Deps>| async move {
                     let mut rows = Vec::new();
                     let mut file_id = None;
 
@@ -208,7 +206,7 @@ fn build_effects() -> Vec<seesaw_core::Handler<Deps>> {
                 _ => None,
             })
             .then::<Deps, (Uuid, bool), _, _, Vec<ImportEvent>, ImportEvent>(
-                |(file_id, validated), ctx: HandlerContext<Deps>| async move {
+                |(file_id, validated), ctx: Context<Deps>| async move {
                     if let Some((total, valid, rejected)) =
                         ctx.deps().mark_progress(file_id, validated)
                     {
@@ -239,7 +237,7 @@ async fn main() -> Result<()> {
 
     let file_id = Uuid::new_v4();
     engine
-        .process(ImportEvent::FileUploaded {
+        .dispatch(ImportEvent::FileUploaded {
             file_id,
             file_path: "/data/import.csv".to_string(),
             expected_rows: 1000,

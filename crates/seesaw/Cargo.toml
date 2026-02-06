@@ -21,8 +21,10 @@ pipedream.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 seesaw_core_macros = { version = "0.10.3", path = "../seesaw_core_macros", optional = true }
@@ -30,3 +32,5 @@ seesaw_core_macros = { version = "0.10.3", path = "../seesaw_core_macros", optio
 [dev-dependencies]
 fastrand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+sqlx.workspace = true
+seesaw-postgres = { version = "0.10.3", path = "../seesaw-postgres" }
