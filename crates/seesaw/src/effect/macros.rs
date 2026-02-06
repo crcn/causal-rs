@@ -2,6 +2,8 @@
 
 /// Create an effect group from pattern-matched event variants.
 ///
+/// **DEPRECATED**: Use the `#[effect]` procedural macro with `on = [Variant1, Variant2]` instead.
+///
 /// This macro provides a concise way to handle multiple event variants
 /// with separate effects, avoiding verbose `.extract()` boilerplate.
 /// Returns a single grouped `Effect` that can be added directly to the engine.
@@ -45,6 +47,10 @@
 ///     })
 ///     .then(|(field1, field2), ctx| async move { ... })
 /// ```
+#[deprecated(
+    since = "0.10.2",
+    note = "Use #[effect] procedural macro with on = [Variant1, Variant2] instead"
+)]
 #[macro_export]
 macro_rules! on {
     // Internal: Single variant arm (untyped)

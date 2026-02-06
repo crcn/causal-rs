@@ -133,6 +133,177 @@ async fn main() -> Result<()> {
 }
 ```
 
+## Procedural Macro API (Recommended)
+
+For a more concise syntax, use the `#[effect]` and `#[reducer]` procedural macros (enabled by default via the `macros` feature):
+
+```rust
+use seesaw_core::{effect, reducer, EffectContext, DlqTerminalInfo};
+use anyhow::Result;
+
+#[derive(Clone)]
+enum OrderEvent {
+    OrderPlaced { order_id: Uuid, total: f64 },
+    PaymentCharged { order_id: Uuid },
+    OrderShipped { order_id: Uuid },
+    OrderFailed { order_id: Uuid, reason: String },
+}
+
+#[derive(Clone)]
+struct OrderState {
+    order_count: usize,
+    total_revenue: f64,
+}
+
+#[derive(Clone)]
+struct Deps {
+    payment: PaymentService,
+    shipping: ShippingService,
+}
+
+// Effect with attribute macro
+#[effect(
+    on = OrderEvent,
+    extract(order_id, total),
+    retry = 3,
+    timeout_secs = 30,
+    priority = 1,
+    dlq_terminal = order_payment_failed
+)]
+async fn charge_payment(
+    order_id: Uuid,
+    total: f64,
+    ctx: EffectContext<OrderState, Deps>
+) -> Result<OrderEvent> {
+    ctx.deps().payment.charge(order_id, total).await?;
+    Ok(OrderEvent::PaymentCharged { order_id })
+}
+
+// DLQ terminal mapper
+fn order_payment_failed(event: OrderEvent, info: DlqTerminalInfo) -> OrderEvent {
+    OrderEvent::OrderFailed {
+        order_id: match event {
+            OrderEvent::OrderPlaced { order_id, .. } => order_id,
+            _ => panic!("unexpected event"),
+        },
+        reason: format!("Payment failed after {} attempts: {}", info.attempts, info.error),
+    }
+}
+
+// Reducer with attribute macro
+#[reducer(on = OrderEvent, extract(total))]
+fn track_revenue(state: OrderState, total: f64) -> OrderState {
+    OrderState {
+        order_count: state.order_count + 1,
+        total_revenue: state.total_revenue + total,
+    }
+}
+
+// Multi-variant matching with macro
+#[effect(
+    on = [OrderEvent::PaymentCharged, OrderEvent::OrderFailed],
+    extract(order_id)
+)]
+async fn ship_order(
+    order_id: Uuid,
+    ctx: EffectContext<OrderState, Deps>
+) -> Result<OrderEvent> {
+    ctx.deps().shipping.ship(order_id).await?;
+    Ok(OrderEvent::OrderShipped { order_id })
+}
+
+// Join handler with macro
+#[effect(on = OrderEvent, join)]
+async fn process_batch(
+    batch: Vec<OrderEvent>,
+    ctx: EffectContext<OrderState, Deps>
+) -> Result<()> {
+    // Process entire batch together
+    let order_ids: Vec<_> = batch.iter()
+        .filter_map(|e| match e {
+            OrderEvent::OrderPlaced { order_id, .. } => Some(*order_id),
+            _ => None,
+        })
+        .collect();
+    ctx.deps().bulk_process(&order_ids).await?;
+    Ok(())
+}
+```
+
+### Module-level registration
+
+Use `#[effects]` and `#[reducers]` to automatically generate registration functions:
+
+```rust
+#[effects]
+mod order_effects {
+    use super::*;
+
+    #[effect(on = OrderEvent, extract(order_id))]
+    async fn charge_payment(
+        order_id: Uuid,
+        ctx: EffectContext<OrderState, Deps>
+    ) -> Result<OrderEvent> {
+        // ... implementation
+    }
+
+    #[effect(on = OrderEvent, extract(order_id))]
+    async fn ship_order(
+        order_id: Uuid,
+        ctx: EffectContext<OrderState, Deps>
+    ) -> Result<OrderEvent> {
+        // ... implementation
+    }
+}
+
+#[reducers]
+mod order_reducers {
+    use super::*;
+
+    #[reducer(on = OrderEvent, extract(total))]
+    fn track_revenue(state: OrderState, total: f64) -> OrderState {
+        // ... implementation
+    }
+
+    #[reducer(on = OrderEvent, extract(order_id))]
+    fn track_orders(state: OrderState, order_id: Uuid) -> OrderState {
+        // ... implementation
+    }
+}
+
+// Register all at once
+let engine = Engine::new(deps, store)
+    .with_effects(order_effects::effects())
+    .with_reducers(order_reducers::reducers());
+```
+
+### Macro attributes
+
+**Effect attributes:**
+- `on = EventType` - Single event type
+- `on = [Enum::Variant1, Enum::Variant2]` - Multiple enum variants
+- `extract(field1, field2, ...)` - Extract fields from event
+- `join` - Accumulate batch for bulk processing
+- `id = "name"` - Custom effect identifier
+- `retry = N` - Max retry attempts
+- `timeout_secs = N` / `timeout_ms = N` - Execution timeout
+- `delay_secs = N` / `delay_ms = N` - Delayed execution
+- `priority = N` - Execution priority (lower = higher)
+- `group = "name"` - Effect group (used in ID if no explicit `id`)
+- `dlq_terminal = handler` - Terminal event mapper for exhausted retries
+
+**Reducer attributes:**
+- `on = EventType` - Single event type
+- `on = [Enum::Variant1, Enum::Variant2]` - Multiple enum variants
+- `extract(field1, field2, ...)` - Extract fields from event
+
+**Requirements:**
+- Effect functions must be `async` and return `Result<T>` where `T` is an event or `()`
+- Reducer functions must be synchronous and return the state type
+- All functions must include exactly one `EffectContext<S, D>` parameter (for effects)
+- Parameter names must match extracted field names when using `extract(...)`
+- For `join`, first parameter must be `Vec<EventType>`
+
 ## Core Concepts
 
 ### Events
@@ -219,36 +390,6 @@ effect::on_any().then(|event, ctx| async move {
     ctx.deps().metrics.track(event.type_id);
     Ok(Emit::None)
 })
-```
-
-#### `on!` Macro for Multi-Variant Matching
-
-When handling enum events with multiple variants, the `on!` macro provides concise syntax that mirrors Rust's `match`:
-
-```rust
-use seesaw_core::on;
-
-// Match-like syntax with Event::Variant patterns
-let effects = on! {
-    // Multiple variants with | - same fields required
-    CrawlEvent::WebsiteIngested { website_id, job_id, .. } |
-    CrawlEvent::WebsitePostsRegenerated { website_id, job_id, .. } => |ctx| async move {
-        ctx.deps().jobs.enqueue(ExtractPostsJob {
-            website_id,
-            parent_job_id: job_id,
-        }).await?;
-        Ok(Emit::One(CrawlEvent::ExtractJobEnqueued { website_id }))
-    },
-
-    // Single variant
-    CrawlEvent::PostsExtractedFromPages { website_id, posts, .. } => |ctx| async move {
-        ctx.deps().jobs.enqueue(SyncPostsJob { website_id, posts }).await?;
-        Ok(Emit::One(CrawlEvent::SyncJobEnqueued { website_id }))
-    },
-};
-
-// Returns Vec<Effect<S, D>> - add to engine
-let engine = effects.into_iter().fold(Engine::new(), |e, eff| e.with_effect(eff));
 ```
 
 #### Effect Execution Configuration (v0.8.0+)
@@ -443,177 +584,6 @@ effect::on::<ImportEvent>()
 - Provides 10-50x performance for bulk operations
 
 See [`examples/batch-processor`](./examples/batch-processor) for a complete CSV import example.
-
-### Procedural Macro API (v0.10.2+)
-
-For a more concise syntax, use the `#[effect]` and `#[reducer]` procedural macros (enabled by default via the `macros` feature):
-
-```rust
-use seesaw_core::{effect, reducer, EffectContext, DlqTerminalInfo};
-use anyhow::Result;
-
-#[derive(Clone)]
-enum OrderEvent {
-    OrderPlaced { order_id: Uuid, total: f64 },
-    PaymentCharged { order_id: Uuid },
-    OrderShipped { order_id: Uuid },
-    OrderFailed { order_id: Uuid, reason: String },
-}
-
-#[derive(Clone)]
-struct OrderState {
-    order_count: usize,
-    total_revenue: f64,
-}
-
-#[derive(Clone)]
-struct Deps {
-    payment: PaymentService,
-    shipping: ShippingService,
-}
-
-// Effect with attribute macro
-#[effect(
-    on = OrderEvent,
-    extract(order_id, total),
-    retry = 3,
-    timeout_secs = 30,
-    priority = 1,
-    dlq_terminal = order_payment_failed
-)]
-async fn charge_payment(
-    order_id: Uuid,
-    total: f64,
-    ctx: EffectContext<OrderState, Deps>
-) -> Result<OrderEvent> {
-    ctx.deps().payment.charge(order_id, total).await?;
-    Ok(OrderEvent::PaymentCharged { order_id })
-}
-
-// DLQ terminal mapper
-fn order_payment_failed(event: OrderEvent, info: DlqTerminalInfo) -> OrderEvent {
-    OrderEvent::OrderFailed {
-        order_id: match event {
-            OrderEvent::OrderPlaced { order_id, .. } => order_id,
-            _ => panic!("unexpected event"),
-        },
-        reason: format!("Payment failed after {} attempts: {}", info.attempts, info.error),
-    }
-}
-
-// Reducer with attribute macro
-#[reducer(on = OrderEvent, extract(total))]
-fn track_revenue(state: OrderState, total: f64) -> OrderState {
-    OrderState {
-        order_count: state.order_count + 1,
-        total_revenue: state.total_revenue + total,
-    }
-}
-
-// Multi-variant matching with macro
-#[effect(
-    on = [OrderEvent::PaymentCharged, OrderEvent::OrderFailed],
-    extract(order_id)
-)]
-async fn ship_order(
-    order_id: Uuid,
-    ctx: EffectContext<OrderState, Deps>
-) -> Result<OrderEvent> {
-    ctx.deps().shipping.ship(order_id).await?;
-    Ok(OrderEvent::OrderShipped { order_id })
-}
-
-// Join handler with macro
-#[effect(on = OrderEvent, join)]
-async fn process_batch(
-    batch: Vec<OrderEvent>,
-    ctx: EffectContext<OrderState, Deps>
-) -> Result<()> {
-    // Process entire batch together
-    let order_ids: Vec<_> = batch.iter()
-        .filter_map(|e| match e {
-            OrderEvent::OrderPlaced { order_id, .. } => Some(*order_id),
-            _ => None,
-        })
-        .collect();
-    ctx.deps().bulk_process(&order_ids).await?;
-    Ok(())
-}
-```
-
-**Module-level registration:**
-
-Use `#[effects]` and `#[reducers]` to automatically generate registration functions:
-
-```rust
-#[effects]
-mod order_effects {
-    use super::*;
-
-    #[effect(on = OrderEvent, extract(order_id))]
-    async fn charge_payment(
-        order_id: Uuid,
-        ctx: EffectContext<OrderState, Deps>
-    ) -> Result<OrderEvent> {
-        // ... implementation
-    }
-
-    #[effect(on = OrderEvent, extract(order_id))]
-    async fn ship_order(
-        order_id: Uuid,
-        ctx: EffectContext<OrderState, Deps>
-    ) -> Result<OrderEvent> {
-        // ... implementation
-    }
-}
-
-#[reducers]
-mod order_reducers {
-    use super::*;
-
-    #[reducer(on = OrderEvent, extract(total))]
-    fn track_revenue(state: OrderState, total: f64) -> OrderState {
-        // ... implementation
-    }
-
-    #[reducer(on = OrderEvent, extract(order_id))]
-    fn track_orders(state: OrderState, order_id: Uuid) -> OrderState {
-        // ... implementation
-    }
-}
-
-// Register all at once
-let engine = Engine::new(deps, store)
-    .with_effects(order_effects::effects())
-    .with_reducers(order_reducers::reducers());
-```
-
-**Macro attributes:**
-
-**Effect attributes:**
-- `on = EventType` - Single event type
-- `on = [Enum::Variant1, Enum::Variant2]` - Multiple enum variants
-- `extract(field1, field2, ...)` - Extract fields from event
-- `join` - Accumulate batch for bulk processing
-- `id = "name"` - Custom effect identifier
-- `retry = N` - Max retry attempts
-- `timeout_secs = N` / `timeout_ms = N` - Execution timeout
-- `delay_secs = N` / `delay_ms = N` - Delayed execution
-- `priority = N` - Execution priority (lower = higher)
-- `group = "name"` - Effect group (used in ID if no explicit `id`)
-- `dlq_terminal = handler` - Terminal event mapper for exhausted retries
-
-**Reducer attributes:**
-- `on = EventType` - Single event type
-- `on = [Enum::Variant1, Enum::Variant2]` - Multiple enum variants
-- `extract(field1, field2, ...)` - Extract fields from event
-
-**Requirements:**
-- Effect functions must be `async` and return `Result<T>` where `T` is an event or `()`
-- Reducer functions must be synchronous and return the state type
-- All functions must include exactly one `EffectContext<S, D>` parameter (for effects)
-- Parameter names must match extracted field names when using `extract(...)`
-- For `join`, first parameter must be `Vec<EventType>`
 
 ### Reducers
 
