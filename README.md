@@ -320,14 +320,14 @@ effect::on::<ImportEvent>()
     .then(|path, ctx| async move {
         let rows = ctx.deps().parse_csv(&path).await?;
 
-        // Return Vec<Event> - auto-converts to Emit::Batch
+        // Use Emit::Batch for multiple events
         let events: Vec<_> = rows.into_iter()
             .map(|data| ImportEvent::RowParsed {
                 row_id: Uuid::new_v4(),
                 data
             })
             .collect();
-        Ok(events)  // Emits 1000s of events efficiently
+        Ok(Emit::Batch(events))  // Emits 1000s of events efficiently
     });
 
 // Join pattern - accumulate batch and process together
@@ -343,14 +343,14 @@ effect::on::<ImportEvent>()
 
         // Bulk insert entire batch
         ctx.deps().bulk_insert(&items).await?;
-        Ok(ImportEvent::BatchInserted { count: items.len() })
+        Ok(Emit::One(ImportEvent::BatchInserted { count: items.len() }))
     });
 ```
 
-**Return types:**
-- `Ok(event)` → `Emit::One(event)` (single event)
-- `Ok(vec![e1, e2])` → `Emit::Batch(vec)` (multiple events)
-- `Ok(())` → `Emit::None` (no events)
+**Return types - use explicit Emit:**
+- `Ok(Emit::One(event))` - single event
+- `Ok(Emit::Batch(vec![...]))` - multiple events atomically
+- `Ok(Emit::None)` - no events (observer pattern)
 
 **Join semantics:**
 - Events emitted in same batch (via `Emit::Batch`) share a `batch_id`

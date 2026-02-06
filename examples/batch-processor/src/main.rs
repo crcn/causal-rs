@@ -136,7 +136,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
                 } => Some((file_id.clone(), file_path.clone())),
                 _ => None,
             })
-            .then(|(file_id, file_path), ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
+            .then::<ImportState, Deps, _, _, _, Emit<ImportEvent>, ImportEvent>(|(file_id, file_path), ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
                 println!("\n🚀 Effect 1: Parsing file {}", file_id);
 
                 // Parse CSV into rows
@@ -155,8 +155,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
                 println!("📤 Emitting batch of {} RowParsed events", events.len());
 
                 // This is the key: Emit::Batch emits all events atomically with same batch_id
-                // Vec<E> automatically converts to Emit::Batch via From impl
-                Ok(events)
+                Ok(Emit::Batch(events))
             }),
 
         // Effect 2: Validate each row (runs once per RowParsed event)
@@ -169,7 +168,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
                 } => Some((file_id.clone(), row_id.clone(), data.clone())),
                 _ => None,
             })
-            .then(|(file_id, row_id, data), ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
+            .then::<ImportState, Deps, _, _, _, ImportEvent, ImportEvent>(|(file_id, row_id, data), ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
                 // Validate row
                 match ctx.deps().validate_row(&data).await {
                     Ok(()) => {
@@ -196,7 +195,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
         // This is the key join pattern - accumulates all RowValidated events from same batch
         effect::on::<ImportEvent>()
             .join() // Enable batch accumulation
-            .then::<ImportState, Deps, _, _, ImportEvent, ImportEvent>(|batch: Vec<ImportEvent>, ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
+            .then::<ImportState, Deps, _, _, Emit<ImportEvent>, ImportEvent>(|batch: Vec<ImportEvent>, ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
                 println!("\n🔄 Effect 3: Join handler called with {} events", batch.len());
 
                 // Filter to only RowValidated events and extract data
@@ -212,8 +211,9 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
                     }
                 }
 
+                // If no validated rows, return Emit::None
                 if rows.is_empty() {
-                    return Ok(());
+                    return Ok(Emit::None);
                 }
 
                 let file_id = file_id.expect("file_id should be set");
@@ -221,11 +221,11 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
                 // Bulk insert to database
                 ctx.deps().bulk_insert(&rows).await?;
 
-                // Emit success event
-                Ok(ImportEvent::BatchInserted {
+                // Return single event
+                Ok(Emit::One(ImportEvent::BatchInserted {
                     file_id,
                     count: rows.len(),
-                })
+                }))
             }),
 
         // Effect 4: Check if import is complete (terminal event)
@@ -235,7 +235,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
                 | ImportEvent::RowRejected { file_id, .. } => Some(*file_id),
                 _ => None,
             })
-            .then(|file_id, ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
+            .then::<ImportState, Deps, _, _, _, Emit<ImportEvent>, ImportEvent>(|file_id, ctx: seesaw_core::EffectContext<ImportState, Deps>| async move {
                 let state = ctx.next_state();
 
                 // Check if all rows processed
@@ -248,15 +248,16 @@ fn build_effects() -> Vec<seesaw_core::Effect<ImportState, Deps>> {
                         state.expected_rows, state.validated_count, state.rejected_count
                     );
 
-                    Ok(ImportEvent::ImportCompleted {
+                    // Return single event
+                    Ok(Emit::One(ImportEvent::ImportCompleted {
                         file_id,
                         total_rows: state.expected_rows,
                         valid_rows: state.validated_count,
                         rejected_rows: state.rejected_count,
-                    })
+                    }))
                 } else {
-                    // Not complete yet
-                    Ok(())
+                    // Not complete yet - no events emitted
+                    Ok(Emit::None)
                 }
             }),
     ]

@@ -80,6 +80,15 @@ pub struct EventNode {
     pub payload: serde_json::Value,
     /// When created
     pub created_at: DateTime<Utc>,
+    /// Batch identifier for same-batch fan-in semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<Uuid>,
+    /// Position inside a batch (0-based).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<i32>,
+    /// Total number of items in the batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<i32>,
     /// Child events
     pub children: Vec<EventNode>,
     /// Effects triggered by this event
@@ -103,6 +112,15 @@ pub struct EffectNode {
     pub attempts: i32,
     /// When created
     pub created_at: DateTime<Utc>,
+    /// Batch identifier inherited from source event (when present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<Uuid>,
+    /// Position inside a batch (0-based).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<i32>,
+    /// Total number of items in the batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<i32>,
 }
 
 /// Aggregate statistics for insight dashboard

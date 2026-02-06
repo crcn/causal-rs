@@ -15,6 +15,12 @@ pub struct EventNode {
     pub payload: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub hops: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<i32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<EventNode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -27,6 +33,12 @@ pub struct EffectNode {
     pub effect_id: String,
     pub status: String,
     pub attempts: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +78,9 @@ impl TreeBuilder {
                 event_type,
                 payload,
                 hops,
+                batch_id,
+                batch_index,
+                batch_size,
                 created_at
             FROM seesaw_events
             WHERE correlation_id = $1
@@ -84,6 +99,9 @@ impl TreeBuilder {
                 event_type: row.get("event_type"),
                 payload: row.get("payload"),
                 hops: row.get("hops"),
+                batch_id: row.get("batch_id"),
+                batch_index: row.get("batch_index"),
+                batch_size: row.get("batch_size"),
                 created_at: row.get("created_at"),
             })
             .collect();
@@ -99,6 +117,9 @@ impl TreeBuilder {
                 effect_id,
                 status,
                 attempts,
+                batch_id,
+                batch_index,
+                batch_size,
                 error,
                 completed_at
             FROM seesaw_effect_executions
@@ -118,6 +139,9 @@ impl TreeBuilder {
                 effect_id: row.get("effect_id"),
                 status: row.get("status"),
                 attempts: row.get("attempts"),
+                batch_id: row.get("batch_id"),
+                batch_index: row.get("batch_index"),
+                batch_size: row.get("batch_size"),
                 error: row.get("error"),
                 completed_at: row.get("completed_at"),
             };
@@ -182,6 +206,9 @@ impl TreeBuilder {
             payload: event.payload,
             created_at: event.created_at,
             hops: event.hops,
+            batch_id: event.batch_id,
+            batch_index: event.batch_index,
+            batch_size: event.batch_size,
             children,
             effects: effects.get(&event_id).cloned().unwrap_or_default(),
         })
@@ -195,6 +222,9 @@ struct EventRow {
     event_type: String,
     payload: Option<serde_json::Value>,
     hops: i32,
+    batch_id: Option<Uuid>,
+    batch_index: Option<i32>,
+    batch_size: Option<i32>,
     created_at: DateTime<Utc>,
 }
 
@@ -210,11 +240,17 @@ mod tests {
             payload: Some(serde_json::json!({"order_id": 123})),
             created_at: Utc::now(),
             hops: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
             children: vec![],
             effects: vec![EffectNode {
                 effect_id: "validate_order".to_string(),
                 status: "completed".to_string(),
                 attempts: 1,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
                 error: None,
                 completed_at: Some(Utc::now()),
             }],

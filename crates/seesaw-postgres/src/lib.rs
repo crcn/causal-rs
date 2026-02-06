@@ -1104,7 +1104,8 @@ impl InsightStore for PostgresStore {
 
         // Get all effects for this correlation
         let effects = sqlx::query_as::<_, EffectTreeRow>(
-            "SELECT event_id, effect_id, status, result, error, attempts, created_at
+            "SELECT event_id, effect_id, status, result, error, attempts, created_at,
+                    batch_id, batch_index, batch_size
              FROM seesaw_effect_executions
              WHERE correlation_id = $1
              ORDER BY created_at ASC",
@@ -1369,6 +1370,9 @@ struct EffectTreeRow {
     error: Option<String>,
     attempts: i32,
     created_at: DateTime<Utc>,
+    batch_id: Option<Uuid>,
+    batch_index: Option<i32>,
+    batch_size: Option<i32>,
 }
 
 fn stream_row_to_insight_event(row: StreamRow) -> InsightEvent {
@@ -1439,6 +1443,9 @@ fn build_event_tree(
                     error: eff.error.clone(),
                     attempts: eff.attempts,
                     created_at: eff.created_at,
+                    batch_id: eff.batch_id,
+                    batch_index: eff.batch_index,
+                    batch_size: eff.batch_size,
                 })
                 .collect();
 
@@ -1451,6 +1458,9 @@ fn build_event_tree(
                 event_type: event.event_type.clone(),
                 payload: event.payload.clone(),
                 created_at: event.created_at,
+                batch_id: event.batch_id,
+                batch_index: event.batch_index,
+                batch_size: event.batch_size,
                 children,
                 effects: event_effects,
             }

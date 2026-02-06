@@ -298,14 +298,14 @@ effect::on::<FileUploaded>().then(|event, ctx| async move {
 - Events have sequential `batch_index` (0, 1, 2, ...)
 - Atomic: rollback discards entire batch
 
-**Ergonomic conversions:**
+**Return types - use explicit Emit:**
 ```rust
-Ok(event)                    // → Emit::One(event)
-Ok(Some(event))              // → Emit::One(event)
-Ok(None)                     // → Emit::None
-Ok(vec![e1, e2, e3])         // → Emit::Batch(vec![e1, e2, e3])
-Ok(vec![])                   // → Emit::None (empty batch)
+Ok(Emit::One(event))         // Single event
+Ok(Emit::Batch(vec![...]))   // Multiple events atomically
+Ok(Emit::None)               // Observer pattern, no event
 ```
+
+**Note**: While `From` traits exist for ergonomic conversion (`event` → `Emit::One`, `vec![]` → `Emit::Batch`), **always use explicit `Emit` constructors** to avoid type inference ambiguity.
 
 #### Joining Batched Events
 

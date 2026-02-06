@@ -185,7 +185,14 @@ impl Store for MemoryStore {
             event_type: Some(event.event_type.clone()),
             status: None,
             error: None,
-            payload: Some(event.payload.clone()),
+            payload: Some(serde_json::json!({
+                "event_type": event.event_type.clone(),
+                "hops": event.hops,
+                "batch_id": event.batch_id,
+                "batch_index": event.batch_index,
+                "batch_size": event.batch_size,
+                "payload": event.payload.clone(),
+            })),
             created_at: event.created_at,
         });
 
@@ -792,7 +799,14 @@ impl InsightStore for MemoryStore {
                     event_type: Some(stored.event_type.clone()),
                     status: None,
                     error: None,
-                    payload: Some(stored.payload.clone()),
+                    payload: Some(serde_json::json!({
+                        "event_type": stored.event_type.clone(),
+                        "hops": stored.hops,
+                        "batch_id": stored.batch_id,
+                        "batch_index": stored.batch_index,
+                        "batch_size": stored.batch_size,
+                        "payload": stored.payload.clone(),
+                    })),
                     created_at: stored.created_at,
                 })
             })
@@ -1006,6 +1020,9 @@ impl MemoryStore {
                             error: effect.error.clone(),
                             attempts: effect.attempts,
                             created_at: effect.created_at,
+                            batch_id: effect.batch_id,
+                            batch_index: effect.batch_index,
+                            batch_size: effect.batch_size,
                         }
                     })
                     .collect();
@@ -1019,6 +1036,9 @@ impl MemoryStore {
                     event_type: event.event_type.clone(),
                     payload: event.payload.clone(),
                     created_at: event.created_at,
+                    batch_id: event.batch_id,
+                    batch_index: event.batch_index,
+                    batch_size: event.batch_size,
                     children,
                     effects,
                 }

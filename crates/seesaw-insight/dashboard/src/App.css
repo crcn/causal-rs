@@ -244,6 +244,26 @@
   font-size: 0.66rem;
 }
 
+.workflow-metrics span.tone-ok {
+  color: var(--ok);
+  border-color: rgba(135, 222, 157, 0.52);
+}
+
+.workflow-metrics span.tone-warn {
+  color: var(--warn);
+  border-color: rgba(255, 201, 134, 0.52);
+}
+
+.workflow-metrics span.tone-fail {
+  color: var(--danger);
+  border-color: rgba(255, 141, 133, 0.58);
+}
+
+.workflow-metrics span.tone-neutral {
+  color: var(--muted);
+  border-color: rgba(158, 179, 209, 0.46);
+}
+
 .workflow-error {
   margin: 0.4rem 0 0;
   color: var(--danger);
@@ -354,7 +374,7 @@
 .canvas-node {
   position: absolute;
   width: 236px;
-  height: 108px;
+  height: 120px;
   border: 1px solid var(--border);
   border-radius: 0.74rem;
   background: linear-gradient(160deg, rgba(15, 27, 43, 0.95), rgba(12, 23, 36, 0.95));
@@ -407,6 +427,26 @@
   padding: 0.1rem 0.42rem;
   font-size: 0.65rem;
   color: var(--muted);
+}
+
+.node-badges span.tone-ok {
+  color: var(--ok);
+  border-color: rgba(135, 222, 157, 0.52);
+}
+
+.node-badges span.tone-warn {
+  color: var(--warn);
+  border-color: rgba(255, 201, 134, 0.52);
+}
+
+.node-badges span.tone-fail {
+  color: var(--danger);
+  border-color: rgba(255, 141, 133, 0.58);
+}
+
+.node-badges span.tone-neutral {
+  color: var(--muted);
+  border-color: rgba(158, 179, 209, 0.46);
 }
 
 .canvas-inspector {
@@ -507,6 +547,14 @@
   justify-content: space-between;
   align-items: center;
   gap: 0.4rem;
+}
+
+.row-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .row-head code {

@@ -297,6 +297,9 @@ BEGIN
         jsonb_build_object(
             'event_type', NEW.event_type,
             'hops', NEW.hops,
+            'batch_id', NEW.batch_id,
+            'batch_index', NEW.batch_index,
+            'batch_size', NEW.batch_size,
             'payload', NEW.payload
         ),
         NEW.created_at

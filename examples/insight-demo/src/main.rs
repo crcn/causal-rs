@@ -25,6 +25,7 @@ use uuid::Uuid;
 enum DemoMode {
     Normal,
     Slow,
+    BatchJoin,
     FailPayment,
     FailInventory,
     FailShipping,
@@ -82,6 +83,28 @@ enum OrderEvent {
     },
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BatchWorkItem {
+    order_id: Uuid,
+    item_index: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BatchWorkResult {
+    order_id: Uuid,
+    item_index: usize,
+    success: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BatchJoinReady {
+    order_id: Uuid,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
 // Simple state tracking
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct OrderState {
@@ -89,6 +112,10 @@ struct OrderState {
     payment_processed: bool,
     inventory_reserved: bool,
     shipped: bool,
+    batch_items_total: usize,
+    batch_items_done: usize,
+    batch_failed: usize,
+    batch_joined: bool,
 }
 
 // Mock dependencies
@@ -156,6 +183,7 @@ async fn seed_scenarios(
     let scenarios = [
         DemoMode::Normal,
         DemoMode::Slow,
+        DemoMode::BatchJoin,
         DemoMode::FailPayment,
         DemoMode::FailInventory,
         DemoMode::FailShipping,
@@ -166,6 +194,7 @@ async fn seed_scenarios(
     for mode in scenarios {
         let total = match mode {
             DemoMode::Slow => 199.0,
+            DemoMode::BatchJoin => 219.0,
             DemoMode::FailPayment => 149.0,
             DemoMode::FailInventory => 179.0,
             DemoMode::FailShipping => 249.0,
@@ -268,11 +297,12 @@ async fn toy_app() -> Html<&'static str> {
     <h1>🚀 Seesaw Demo</h1>
     <div class="info">
         <p>This is a live demo of the Seesaw event-driven runtime with in-memory store.</p>
-        <p>Create normal/slow/failing workflows and watch them in the <a href="/">Insights Dashboard →</a></p>
+        <p>Create normal/slow/batch+join/failing workflows and watch them in the <a href="/">Insights Dashboard →</a></p>
     </div>
 
     <button class="button" onclick="createOrder('normal')">Create Normal</button>
     <button class="button slow" onclick="createOrder('slow')">Create Slow</button>
+    <button class="button seed" onclick="createOrder('batch_join')">Create Batch + Join</button>
     <button class="button fail" onclick="createOrder('fail_payment')">Fail Payment (DLQ)</button>
     <button class="button fail" onclick="createOrder('fail_inventory')">Fail Inventory (DLQ)</button>
     <button class="button fail" onclick="createOrder('fail_shipping')">Fail Shipping (DLQ)</button>
@@ -380,6 +410,25 @@ async fn main() -> Result<()> {
                 _ => state,
             }),
         )
+        .with_reducer(
+            reducer::fold::<BatchWorkItem>().into_queue(|state: OrderState, _event| OrderState {
+                batch_items_total: state.batch_items_total + 1,
+                ..state
+            }),
+        )
+        .with_reducer(
+            reducer::fold::<BatchWorkResult>().into_queue(|state: OrderState, event| OrderState {
+                batch_items_done: state.batch_items_done + 1,
+                batch_failed: state.batch_failed + usize::from(!event.success),
+                ..state
+            }),
+        )
+        .with_reducer(
+            reducer::fold::<BatchJoinReady>().into_queue(|state: OrderState, _event| OrderState {
+                batch_joined: true,
+                ..state
+            }),
+        )
         // Effect: Validate order
         .with_effect(
             effect::on::<OrderEvent>()
@@ -403,6 +452,108 @@ async fn main() -> Result<()> {
                     })
                 }),
         )
+        // Effect: Fan out batch items for same-batch join demo
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::OrderValidated { order_id, mode, .. }
+                        if *mode == DemoMode::BatchJoin =>
+                    {
+                        Some(*order_id)
+                    }
+                    _ => None,
+                })
+                .id("fan_out_batch_items")
+                .then_queue::<OrderState, Deps, Uuid, _, _, _, BatchWorkItem>(
+                    |order_id, _ctx| async move {
+                    tokio::time::sleep(Duration::from_millis(260)).await;
+
+                    let item_count = 6usize;
+                    let items: Vec<_> = (0..item_count)
+                        .map(|item_index| BatchWorkItem {
+                            order_id,
+                            item_index,
+                        })
+                        .collect();
+
+                        Ok(items)
+                    },
+                ),
+        )
+        // Effect: Process each batch item independently
+        .with_effect(
+            effect::on::<BatchWorkItem>()
+                .id("process_batch_item")
+                .retry(2)
+                .then_queue(
+                    |item: Arc<BatchWorkItem>, _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                        tokio::time::sleep(Duration::from_millis(220 + (item.item_index as u64 * 70)))
+                            .await;
+
+                        let success = (item.item_index + 1) % 4 != 0;
+                        Ok(BatchWorkResult {
+                            order_id: item.order_id,
+                            item_index: item.item_index,
+                            success,
+                            message: if success {
+                                format!("item {} settled", item.item_index)
+                            } else {
+                                format!("item {} failed validation", item.item_index)
+                            },
+                        })
+                    },
+                ),
+        )
+        // Effect: Join all results for one emitted batch
+        .with_effect(
+            effect::on::<BatchWorkResult>()
+                .id("join_batch_items")
+                .join()
+                .same_batch()
+                .then(
+                    |items: Vec<BatchWorkResult>, _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                        let Some(order_id) = items.first().map(|item| item.order_id) else {
+                            anyhow::bail!("join_batch_items received empty batch");
+                        };
+
+                        let failed = items.iter().filter(|item| !item.success).count();
+                        let total = items.len();
+                        let succeeded = total.saturating_sub(failed);
+
+                        Ok(BatchJoinReady {
+                            order_id,
+                            total,
+                            succeeded,
+                            failed,
+                        })
+                    },
+                ),
+        )
+        // Effect: Convert joined summary back into domain completion/failure
+        .with_effect(
+            effect::on::<BatchJoinReady>()
+                .id("finalize_batch_join")
+                .then_queue(
+                    |summary: Arc<BatchJoinReady>, _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        if summary.failed > 0 {
+                            Ok(OrderEvent::OrderFailed {
+                                order_id: summary.order_id,
+                                reason: format!(
+                                    "batch join completed with {} failed items out of {}",
+                                    summary.failed, summary.total
+                                ),
+                                mode: DemoMode::BatchJoin,
+                            })
+                        } else {
+                            Ok(OrderEvent::OrderCompleted {
+                                order_id: summary.order_id,
+                                mode: DemoMode::BatchJoin,
+                            })
+                        }
+                    },
+                ),
+        )
         // Effect: Process payment
         .with_effect(
             effect::on::<OrderEvent>()
@@ -411,7 +562,7 @@ async fn main() -> Result<()> {
                         order_id,
                         total,
                         mode,
-                    } => Some((*order_id, *total, *mode)),
+                    } if *mode != DemoMode::BatchJoin => Some((*order_id, *total, *mode)),
                     _ => None,
                 })
                 .id("process_payment")
@@ -528,7 +679,7 @@ async fn main() -> Result<()> {
                 }),
         );
 
-    println!("✅ Engine configured with 6 effects");
+    println!("✅ Engine configured with 10 effects (includes batch + join flow)");
 
     // Wrap engine in Arc for sharing across threads
     let engine = Arc::new(engine);
@@ -550,10 +701,11 @@ async fn main() -> Result<()> {
     let startup_scenarios = [
         (1usize, DemoMode::Normal),
         (2usize, DemoMode::Slow),
-        (3usize, DemoMode::FailPayment),
-        (4usize, DemoMode::FailInventory),
-        (5usize, DemoMode::FailShipping),
-        (6usize, DemoMode::FailEmail),
+        (3usize, DemoMode::BatchJoin),
+        (4usize, DemoMode::FailPayment),
+        (5usize, DemoMode::FailInventory),
+        (6usize, DemoMode::FailShipping),
+        (7usize, DemoMode::FailEmail),
     ];
     for (i, mode) in startup_scenarios {
         let order_id = Uuid::new_v4();
@@ -610,8 +762,9 @@ async fn main() -> Result<()> {
     println!("   Toy App:   http://localhost:3000/demo");
     println!("   API:       POST http://localhost:3000/api/create-order\n");
     println!("Features to try:");
-    println!("  • Create normal, slow, and failing orders from /demo");
+    println!("  • Create normal, slow, batch+join, and failing orders from /demo");
     println!("  • Use /api/seed-failures for burst DLQ/failed-flow simulation");
+    println!("  • Watch batch chips + join waiting/completion in the flow canvas at /");
     println!("  • Watch pinned events, effect logs, and payloads at /");
     println!("  • Inspect dead letters and failed flows in left rail");
     println!("  • Open bottlenecks panel to spot slow effects\n");

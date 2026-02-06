@@ -7,7 +7,7 @@ const OPERATIONS_REFRESH_MS = 4000
 const PIN_STORAGE_KEY = 'seesaw-insight:pinned-workflows'
 
 const NODE_WIDTH = 236
-const NODE_HEIGHT = 108
+const NODE_HEIGHT = 120
 const LEVEL_GAP = 312
 const ROW_GAP = 146
 
@@ -64,6 +64,13 @@ function parseEnvelope(entry) {
           : entry.event_type ?? null,
       payload: entry.payload.payload ?? null,
       hops: Number.isFinite(entry.payload.hops) ? Number(entry.payload.hops) : null,
+      batchId: typeof entry.payload.batch_id === 'string' ? entry.payload.batch_id : null,
+      batchIndex: Number.isFinite(entry.payload.batch_index)
+        ? Number(entry.payload.batch_index)
+        : null,
+      batchSize: Number.isFinite(entry.payload.batch_size)
+        ? Number(entry.payload.batch_size)
+        : null,
     }
   }
 
@@ -71,7 +78,24 @@ function parseEnvelope(entry) {
     eventType: entry?.event_type ?? null,
     payload: entry?.payload ?? null,
     hops: null,
+    batchId: null,
+    batchIndex: null,
+    batchSize: null,
   }
+}
+
+function batchProgressLabel(batchIndex, batchSize) {
+  if (!Number.isFinite(batchIndex) || !Number.isFinite(batchSize) || batchSize <= 0) return null
+  return `batch ${batchIndex + 1}/${batchSize}`
+}
+
+function isJoinWaitingResult(result) {
+  return (
+    result &&
+    typeof result === 'object' &&
+    !Array.isArray(result) &&
+    result.status === 'join_waiting'
+  )
 }
 
 function previewPayload(value) {
@@ -397,6 +421,9 @@ function App() {
           type: simplifyType(envelope.eventType),
           payload: envelope.payload,
           hops: envelope.hops,
+          batchId: envelope.batchId,
+          batchIndex: envelope.batchIndex,
+          batchSize: envelope.batchSize,
           created_at: entry.created_at,
         }
 
@@ -597,6 +624,49 @@ function App() {
     return deadLetters.filter((entry) => entry.correlation_id === selectedWorkflowId)
   }, [deadLetters, selectedWorkflowId])
 
+  const selectedWorkflowBatchStats = useMemo(() => {
+    if (!tree || !Array.isArray(tree.roots) || tree.roots.length === 0) {
+      return {
+        batches: 0,
+        items: 0,
+        joinWaiting: 0,
+      }
+    }
+
+    const batchIds = new Set()
+    let itemCount = 0
+    let joinWaiting = 0
+
+    const stack = [...tree.roots]
+    while (stack.length > 0) {
+      const node = stack.pop()
+      if (!node || typeof node !== 'object') continue
+
+      if (typeof node.batch_id === 'string') {
+        batchIds.add(node.batch_id)
+        itemCount += 1
+      }
+
+      const effects = Array.isArray(node.effects) ? node.effects : []
+      for (const effect of effects) {
+        if (isJoinWaitingResult(effect?.result)) {
+          joinWaiting += 1
+        }
+      }
+
+      const children = Array.isArray(node.children) ? node.children : []
+      for (const child of children) {
+        stack.push(child)
+      }
+    }
+
+    return {
+      batches: batchIds.size,
+      items: itemCount,
+      joinWaiting,
+    }
+  }, [tree])
+
   const timingStats = useMemo(() => {
     const values = effectLogs
       .map((entry) => entry.duration_ms)
@@ -642,6 +712,10 @@ function App() {
   const selectedNodeChildren = Array.isArray(selectedNode?.raw?.children)
     ? selectedNode.raw.children.length
     : 0
+  const selectedNodeBatchLabel = batchProgressLabel(
+    selectedNode?.raw?.batch_index,
+    selectedNode?.raw?.batch_size,
+  )
 
   const togglePinned = (workflowId) => {
     setPinnedWorkflowIds((current) => {
@@ -847,6 +921,10 @@ function App() {
             {sortedWorkflows.map((workflow) => {
               const pinned = pinnedWorkflowIds.includes(workflow.correlation_id)
               const failedCount = workflowFailedCount(workflow)
+              const rootBatchLabel = batchProgressLabel(
+                workflow.root?.batchIndex,
+                workflow.root?.batchSize,
+              )
 
               return (
                 <article
@@ -877,6 +955,7 @@ function App() {
                       <span className={workflow.dead_letters > 0 ? 'tone-fail' : 'tone-neutral'}>
                         {workflow.dead_letters} dead
                       </span>
+                      {rootBatchLabel && <span className="tone-warn">{rootBatchLabel}</span>}
                     </div>
 
                     {workflow.failed?.last_error && (
@@ -1006,6 +1085,10 @@ function App() {
                     const event = node.raw
                     const effects = Array.isArray(event.effects) ? event.effects : []
                     const failedEffects = effects.filter((effect) => effect.status === 'failed').length
+                    const joinWaitingEffects = effects.filter((effect) =>
+                      isJoinWaitingResult(effect?.result),
+                    ).length
+                    const batchLabel = batchProgressLabel(event.batch_index, event.batch_size)
                     const active = selectedNodeId === node.id
 
                     return (
@@ -1032,6 +1115,10 @@ function App() {
                           <span className={failedEffects > 0 ? 'tone-fail' : 'tone-neutral'}>
                             {failedEffects} failed
                           </span>
+                          {batchLabel && <span className="tone-warn">{batchLabel}</span>}
+                          {joinWaitingEffects > 0 && (
+                            <span className="tone-warn">join waiting</span>
+                          )}
                         </div>
                       </button>
                     )
@@ -1055,6 +1142,12 @@ function App() {
                   <code title={selectedNode.raw.event_id}>{selectedNode.raw.event_id}</code>
                   <span>{selectedNodeChildren} children</span>
                   <span>{selectedNodeEffects.length} effects</span>
+                  {selectedNodeBatchLabel && <span>{selectedNodeBatchLabel}</span>}
+                  {selectedNode.raw.batch_id && (
+                    <code title={selectedNode.raw.batch_id}>
+                      batch {shortId(selectedNode.raw.batch_id)}
+                    </code>
+                  )}
                 </div>
 
                 <details open>
@@ -1072,10 +1165,18 @@ function App() {
                         <li key={`${effect.effect_id}-${effect.event_id}`}>
                           <div className="row-head">
                             <code>{effect.effect_id}</code>
-                            <span className={`pill ${effectTone(effect.status)}`}>{effect.status}</span>
+                            <div className="row-pills">
+                              <span className={`pill ${effectTone(effect.status)}`}>{effect.status}</span>
+                              {isJoinWaitingResult(effect.result) && (
+                                <span className="pill tone-warn">join waiting</span>
+                              )}
+                            </div>
                           </div>
                           <div className="row-meta">
                             <span>attempts {effect.attempts}</span>
+                            {batchProgressLabel(effect.batch_index, effect.batch_size) && (
+                              <span>{batchProgressLabel(effect.batch_index, effect.batch_size)}</span>
+                            )}
                             {effect.error && <span className="tone-fail">{effect.error}</span>}
                           </div>
                         </li>
@@ -1090,9 +1191,10 @@ function App() {
                     <span>avg {timingStats.avg ?? '—'}ms</span>
                     <span>p95 {timingStats.p95 ?? '—'}ms</span>
                     <span>max {timingStats.max ?? '—'}ms</span>
-                    <span>
-                      dead {selectedWorkflowDeadLetters.length}
-                    </span>
+                    <span>dead {selectedWorkflowDeadLetters.length}</span>
+                    <span>batches {selectedWorkflowBatchStats.batches}</span>
+                    <span>items {selectedWorkflowBatchStats.items}</span>
+                    <span>join waiting {selectedWorkflowBatchStats.joinWaiting}</span>
                   </div>
 
                   {effectLogs.length > 0 && (
@@ -1101,7 +1203,12 @@ function App() {
                         <li key={`${log.effect_id}-${log.event_id}`}>
                           <div className="row-head">
                             <code>{log.effect_id}</code>
-                            <span className={`pill ${effectTone(log.status)}`}>{log.status}</span>
+                            <div className="row-pills">
+                              <span className={`pill ${effectTone(log.status)}`}>{log.status}</span>
+                              {isJoinWaitingResult(log.result) && (
+                                <span className="pill tone-warn">join waiting</span>
+                              )}
+                            </div>
                           </div>
                           <div className="row-meta">
                             <span>{simplifyType(log.event_type)}</span>
