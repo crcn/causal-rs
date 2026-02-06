@@ -95,7 +95,7 @@ pub use effect::on;
 pub use reducer::fold;
 
 #[cfg(feature = "macros")]
-pub use seesaw_macros::{effect, effects, reducer, reducers};
+pub use seesaw_core_macros::{effect, effects, reducer, reducers};
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;

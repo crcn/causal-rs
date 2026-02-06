@@ -1,5 +1,5 @@
 [package]
-name = "seesaw-macros"
+name = "seesaw_core_macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
