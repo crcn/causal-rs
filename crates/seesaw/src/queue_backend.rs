@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{QueuedEffectExecution, Store};
+use crate::{QueuedHandlerExecution, Store};
 
 /// Queue backend abstraction for queued effect dispatch.
 ///
@@ -38,7 +38,7 @@ pub trait QueueBackend<St: Store>: Send + Sync + 'static {
     /// Fetch the next queued effect execution to process.
     ///
     /// Default implementation delegates to the store-backed queue.
-    async fn poll_next_effect(&self, store: &St) -> Result<Option<QueuedEffectExecution>> {
+    async fn poll_next_effect(&self, store: &St) -> Result<Option<QueuedHandlerExecution>> {
         store.poll_next_effect().await
     }
 }

@@ -9,11 +9,11 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::effect::EffectContext;
-use crate::effect_registry::EffectRegistry;
+use crate::handler::HandlerContext;
+use crate::handler_registry::HandlerRegistry;
 use crate::queue_backend::{QueueBackend, StoreQueueBackend};
 use crate::{
-    EventProcessingCommit, InlineEffectFailure, QueuedEffectIntent, QueuedEvent, Store,
+    EventProcessingCommit, InlineHandlerFailure, QueuedEvent, QueuedHandlerIntent, Store,
     NAMESPACE_SEESAW,
 };
 
@@ -49,7 +49,7 @@ where
 {
     store: Arc<St>,
     deps: Arc<D>,
-    effects: Arc<EffectRegistry<D>>,
+    effects: Arc<HandlerRegistry<D>>,
     queue_backend: Arc<dyn QueueBackend<St>>,
     config: EventWorkerConfig,
     shutdown: Arc<AtomicBool>,
@@ -63,7 +63,7 @@ where
     pub(crate) fn new(
         store: Arc<St>,
         deps: Arc<D>,
-        effects: Arc<EffectRegistry<D>>,
+        effects: Arc<HandlerRegistry<D>>,
         config: EventWorkerConfig,
     ) -> Self {
         Self {
@@ -200,8 +200,8 @@ where
                 .map(|d| d.as_secs() as i32)
                 .unwrap_or(30)
                 .max(1);
-            queued_effect_intents.push(QueuedEffectIntent {
-                effect_id: effect.id.clone(),
+            queued_effect_intents.push(QueuedHandlerIntent {
+                handler_id: effect.id.clone(),
                 parent_event_id: Some(event.event_id),
                 batch_id: event.batch_id,
                 batch_index: event.batch_index,
@@ -210,6 +210,10 @@ where
                 timeout_seconds,
                 max_attempts: effect.max_attempts as i32,
                 priority: effect.priority.unwrap_or(10),
+                join_window_timeout_seconds: effect
+                    .join_window_timeout
+                    .map(|d| d.as_secs() as i32)
+                    .map(|seconds| seconds.max(1)),
             });
         }
 
@@ -227,8 +231,8 @@ where
                         "Inline effect failed and will be persisted to DLQ: event_id={}, effect_id={}, error={}",
                         event.event_id, effect.id, error_string
                     );
-                    inline_effect_failures.push(InlineEffectFailure {
-                        effect_id: effect.id.clone(),
+                    inline_effect_failures.push(InlineHandlerFailure {
+                        handler_id: effect.id.clone(),
                         error: error_string,
                         reason: "inline_failed".to_string(),
                         attempts: event.retry_count.saturating_add(1),
@@ -241,7 +245,7 @@ where
 
         let queued_effect_ids = queued_effect_intents
             .iter()
-            .map(|intent| intent.effect_id.clone())
+            .map(|intent| intent.handler_id.clone())
             .collect::<Vec<_>>();
 
         self.store
@@ -304,7 +308,7 @@ where
 
     async fn run_inline_effect(
         &self,
-        effect: &crate::effect::Effect<D>,
+        effect: &crate::handler::Handler<D>,
         source_event: &QueuedEvent,
         typed_event: Arc<dyn Any + Send + Sync>,
         event_type_id: TypeId,
@@ -314,7 +318,7 @@ where
             format!("{}-{}", source_event.event_id, effect.id).as_bytes(),
         )
         .to_string();
-        let ctx = EffectContext::new(
+        let ctx = HandlerContext::new(
             effect.id.clone(),
             idempotency_key,
             source_event.correlation_id,
@@ -442,7 +446,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect;
+    use crate::handler;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use futures::stream;
@@ -502,6 +506,13 @@ mod tests {
             Ok(())
         }
 
+        async fn commit_event_processing(
+            &self,
+            _commit: crate::EventProcessingCommit,
+        ) -> Result<()> {
+            Ok(())
+        }
+
         async fn insert_effect_intent(
             &self,
             _event_id: Uuid,
@@ -517,11 +528,12 @@ mod tests {
             _timeout_seconds: i32,
             _max_attempts: i32,
             _priority: i32,
+            _join_window_timeout_seconds: Option<i32>,
         ) -> Result<()> {
             Ok(())
         }
 
-        async fn poll_next_effect(&self) -> Result<Option<crate::QueuedEffectExecution>> {
+        async fn poll_next_effect(&self) -> Result<Option<crate::QueuedHandlerExecution>> {
             Ok(None)
         }
 
@@ -585,14 +597,14 @@ mod tests {
 
     #[tokio::test]
     async fn decode_errors_respect_retry_cap_and_dlq() {
-        let effect_registry = Arc::new(EffectRegistry::new());
-        effect_registry.register(
-            effect::on::<TypedInput>()
+        let handler_registry = Arc::new(HandlerRegistry::new());
+        handler_registry.register(
+            handler::on::<TypedInput>()
                 .queued()
                 .id("decode_probe")
-                .then(|_event: Arc<TypedInput>, _ctx: EffectContext<TestDeps>| async move {
-                    Ok(())
-                }),
+                .then(
+                    |_event: Arc<TypedInput>, _ctx: HandlerContext<TestDeps>| async move { Ok(()) },
+                ),
         );
 
         let bad_event = QueuedEvent {
@@ -614,7 +626,7 @@ mod tests {
         let worker = EventWorker::new(
             store.clone(),
             Arc::new(TestDeps),
-            effect_registry,
+            handler_registry,
             EventWorkerConfig {
                 max_inline_retry_attempts: 2,
                 ..Default::default()

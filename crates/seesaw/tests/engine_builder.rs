@@ -1,7 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
-use seesaw_core::{Engine, QueueBackend, QueuedEffectExecution, QueuedEvent, Store, WorkflowEvent};
+use seesaw_core::{
+    Engine, QueueBackend, QueuedEvent, QueuedHandlerExecution, Store, WorkflowEvent,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Default)]
@@ -28,6 +30,13 @@ impl Store for TestStore {
         Ok(())
     }
 
+    async fn commit_event_processing(
+        &self,
+        _commit: seesaw_core::EventProcessingCommit,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn insert_effect_intent(
         &self,
         _event_id: Uuid,
@@ -43,11 +52,12 @@ impl Store for TestStore {
         _timeout_seconds: i32,
         _max_attempts: i32,
         _priority: i32,
+        _join_window_timeout_seconds: Option<i32>,
     ) -> Result<()> {
         Ok(())
     }
 
-    async fn poll_next_effect(&self) -> Result<Option<QueuedEffectExecution>> {
+    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
         Ok(None)
     }
 
@@ -128,9 +138,14 @@ fn engine_new_defaults_to_store_queue_backend() {
 }
 
 #[test]
-fn engine_builder_allows_custom_queue_backend() {
-    let engine = Engine::<TestDeps, TestStore>::builder(TestDeps, TestStore)
-        .queue_backend(CustomQueueBackend)
-        .build();
+fn engine_new_allows_custom_queue_backend_tuple() {
+    let engine =
+        Engine::<TestDeps, TestStore>::new(TestDeps, (TestStore, CustomQueueBackend));
     assert_eq!(engine.queue_backend_name(), "custom-test-backend");
+}
+
+#[test]
+fn engine_builder_defaults_to_store_queue_backend() {
+    let engine = Engine::<TestDeps, TestStore>::builder(TestDeps, TestStore).build();
+    assert_eq!(engine.queue_backend_name(), "store");
 }

@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{effect, effects, EffectContext, Emit, ErrorContext};
+use seesaw_core::{handle, handles, Emit, ErrorContext, HandlerContext};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -55,18 +55,18 @@ struct ExtractEnqueued {
 #[derive(Clone, Serialize, Deserialize)]
 struct AnalyticsEvent;
 
-#[effects]
+#[handles]
 mod order_effects {
     use super::*;
 
-    #[effect(on = OrderPlaced, id = "ship_order")]
-    async fn ship_order(event: OrderPlaced, _ctx: EffectContext<Deps>) -> Result<OrderShipped> {
+    #[handle(on = OrderPlaced, id = "ship_order")]
+    async fn ship_order(event: OrderPlaced, _ctx: HandlerContext<Deps>) -> Result<OrderShipped> {
         Ok(OrderShipped {
             order_id: event.order_id,
         })
     }
 
-    #[effect(
+    #[handle(
         on = PaymentRequested,
         id = "charge_payment",
         retry = 3,
@@ -75,7 +75,7 @@ mod order_effects {
     )]
     async fn charge_payment(
         event: PaymentRequested,
-        _ctx: EffectContext<Deps>,
+        _ctx: HandlerContext<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -85,7 +85,7 @@ mod order_effects {
         })
     }
 
-    #[effect(
+    #[handle(
         on = PaymentRequested,
         id = "run_search",
         retry = 3,
@@ -93,7 +93,7 @@ mod order_effects {
     )]
     async fn run_search(
         event: PaymentRequested,
-        _ctx: EffectContext<Deps>,
+        _ctx: HandlerContext<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -112,15 +112,15 @@ mod order_effects {
         }
     }
 
-    #[effect(on = OrderPlaced, queued, id = "queued_observer")]
+    #[handle(on = OrderPlaced, queued, id = "queued_observer")]
     async fn queued_observer(
         _event: OrderPlaced,
-        _ctx: EffectContext<Deps>,
+        _ctx: HandlerContext<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
     }
 
-    #[effect(
+    #[handle(
         on = PaymentRequested,
         queued,
         retry = 1,
@@ -128,7 +128,7 @@ mod order_effects {
     )]
     async fn queued_retry_one(
         event: PaymentRequested,
-        _ctx: EffectContext<Deps>,
+        _ctx: HandlerContext<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -138,31 +138,36 @@ mod order_effects {
         })
     }
 
-    #[effect(on = RowValidated, join, id = "bulk_insert")]
+    #[handle(
+        on = RowValidated,
+        accumulate,
+        window_timeout_secs = 60,
+        id = "bulk_insert"
+    )]
     async fn bulk_insert(
         batch: Vec<RowValidated>,
-        _ctx: EffectContext<Deps>,
+        _ctx: HandlerContext<Deps>,
     ) -> Result<BatchInserted> {
         Ok(BatchInserted { count: batch.len() })
     }
 
-    #[effect(
+    #[handle(
         on = [CrawlEvent::Ingested, CrawlEvent::Regenerated],
         extract(website_id, job_id)
     )]
     async fn enqueue_extract(
         website_id: Uuid,
         job_id: Uuid,
-        _ctx: EffectContext<Deps>,
+        _ctx: HandlerContext<Deps>,
     ) -> Result<ExtractEnqueued> {
         let _ = job_id;
         Ok(ExtractEnqueued { website_id })
     }
 
-    #[effect(on = OrderPlaced, group = "analytics")]
+    #[handle(on = OrderPlaced, group = "analytics")]
     async fn log_order(
         _event: OrderPlaced,
-        _ctx: EffectContext<Deps>,
+        _ctx: HandlerContext<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
     }
@@ -170,7 +175,7 @@ mod order_effects {
 
 #[test]
 fn effects_module_registration_works() {
-    let effects = order_effects::effects();
+    let effects = order_effects::handles();
     assert_eq!(effects.len(), 8);
     assert!(effects
         .iter()

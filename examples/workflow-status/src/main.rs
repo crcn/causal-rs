@@ -1,7 +1,7 @@
 //! Workflow Status Tracking Example (stateless)
 
 use anyhow::Result;
-use seesaw_core::{effect, EffectContext, Engine, Store, WorkflowStatus};
+use seesaw_core::{effect, Engine, HandlerContext, Store, WorkflowStatus};
 use seesaw_postgres::PostgresStore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -59,38 +59,38 @@ async fn main() -> Result<()> {
     };
 
     let engine = Engine::new(deps.clone(), store.clone())
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::OrderPlaced { order_id, total } => Some((*order_id, *total)),
                     _ => None,
                 })
                 .queued()
                 .retry(3)
-                .then(|(order_id, total), ctx: EffectContext<Deps>| async move {
+                .then(|(order_id, total), ctx: HandlerContext<Deps>| async move {
                     ctx.deps().payment_service.charge(total).await?;
                     Ok(OrderEvent::PaymentCharged { order_id })
                 }),
         )
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::PaymentCharged { order_id } => Some(*order_id),
                     _ => None,
                 })
                 .queued()
-                .then(|order_id, ctx: EffectContext<Deps>| async move {
+                .then(|order_id, ctx: HandlerContext<Deps>| async move {
                     ctx.deps().inventory_service.reserve(order_id).await?;
                     Ok(OrderEvent::InventoryReserved { order_id })
                 }),
         )
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::InventoryReserved { order_id } => Some(*order_id),
                     _ => None,
                 })
-                .then(|order_id, _ctx: EffectContext<Deps>| async move {
+                .then(|order_id, _ctx: HandlerContext<Deps>| async move {
                     Ok(OrderEvent::OrderCompleted { order_id })
                 }),
         );

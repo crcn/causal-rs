@@ -379,8 +379,8 @@ async fn main() -> Result<()> {
 
     let engine = Engine::new(deps, store.clone())
         // Effect: Validate order
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::OrderPlaced {
                         order_id,
@@ -402,8 +402,8 @@ async fn main() -> Result<()> {
                 }),
         )
         // Effect: Fan out batch items for same-batch join demo
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::OrderValidated { order_id, mode, .. }
                         if *mode == DemoMode::BatchJoin =>
@@ -430,13 +430,13 @@ async fn main() -> Result<()> {
                 ),
         )
         // Effect: Process each batch item independently
-        .with_effect(
-            effect::on::<BatchWorkItem>()
+        .with_handler(
+            handler::on::<BatchWorkItem>()
                 .id("process_batch_item")
                 .retry(2)
                 .then_queue(
                     |item: Arc<BatchWorkItem>,
-                     _ctx: seesaw_core::EffectContext<Deps>| async move {
+                     _ctx: seesaw_core::HandlerContext<Deps>| async move {
                         tokio::time::sleep(Duration::from_millis(
                             220 + (item.item_index as u64 * 70),
                         ))
@@ -457,14 +457,14 @@ async fn main() -> Result<()> {
                 ),
         )
         // Effect: Join all results for one emitted batch
-        .with_effect(
-            effect::on::<BatchWorkResult>()
+        .with_handler(
+            handler::on::<BatchWorkResult>()
                 .id("join_batch_items")
                 .join()
                 .same_batch()
                 .then(
                     |items: Vec<BatchWorkResult>,
-                     _ctx: seesaw_core::EffectContext<Deps>| async move {
+                     _ctx: seesaw_core::HandlerContext<Deps>| async move {
                         let Some(order_id) = items.first().map(|item| item.order_id) else {
                             anyhow::bail!("join_batch_items received empty batch");
                         };
@@ -483,12 +483,12 @@ async fn main() -> Result<()> {
                 ),
         )
         // Effect: Convert joined summary back into domain completion/failure
-        .with_effect(
-            effect::on::<BatchJoinReady>()
+        .with_handler(
+            handler::on::<BatchJoinReady>()
                 .id("finalize_batch_join")
                 .then_queue(
                     |summary: Arc<BatchJoinReady>,
-                     _ctx: seesaw_core::EffectContext<Deps>| async move {
+                     _ctx: seesaw_core::HandlerContext<Deps>| async move {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         if summary.failed > 0 {
                             Ok(OrderEvent::OrderFailed {
@@ -509,8 +509,8 @@ async fn main() -> Result<()> {
                 ),
         )
         // Effect: Process payment
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::OrderValidated {
                         order_id,
@@ -536,8 +536,8 @@ async fn main() -> Result<()> {
                 }),
         )
         // Effect: Reserve inventory
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::PaymentProcessed {
                         order_id,
@@ -562,8 +562,8 @@ async fn main() -> Result<()> {
                 }),
         )
         // Effect: Ship order
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::InventoryReserved { order_id, mode, .. } => {
                         Some((*order_id, *mode))
@@ -589,8 +589,8 @@ async fn main() -> Result<()> {
                 }),
         )
         // Effect: Send confirmation email
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::OrderShipped { order_id, mode, .. } => Some((*order_id, *mode)),
                     _ => None,
@@ -610,8 +610,8 @@ async fn main() -> Result<()> {
                 }),
         )
         // Effect: Complete order
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::EmailSent { order_id, mode, .. } => Some((*order_id, *mode)),
                     _ => None,
@@ -633,10 +633,11 @@ async fn main() -> Result<()> {
         &engine,
         RuntimeConfig {
             event_workers: 2,
-            effect_workers: 4,
+            handler_workers: 4,
             ..Default::default()
         },
-    );
+    )
+    .await?;
 
     println!("✅ Runtime started (2 event workers, 4 effect workers)\n");
     println!("🎬 Generating demo workflows...\n");

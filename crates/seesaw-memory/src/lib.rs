@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use seesaw_core::insight::*;
@@ -25,7 +25,7 @@ pub struct MemoryStore {
     /// Global event sequence for IDs
     event_seq: Arc<AtomicI64>,
     /// Effect executions queue
-    effects: Arc<Mutex<VecDeque<QueuedEffectExecution>>>,
+    effects: Arc<Mutex<VecDeque<QueuedHandlerExecution>>>,
     /// Completed effects (for idempotency)
     completed_effects: Arc<DashMap<(Uuid, String), serde_json::Value>>,
 
@@ -64,7 +64,7 @@ struct StoredEvent {
 /// Stored effect for history/tree reconstruction
 #[derive(Debug, Clone)]
 struct StoredEffect {
-    effect_id: String,
+    handler_id: String,
     event_id: Uuid,
     correlation_id: Uuid,
     event_type: String,
@@ -96,13 +96,14 @@ struct MemoryJoinWindow {
     status: MemoryJoinStatus,
     source_event_ids: HashSet<Uuid>,
     entries_by_index: HashMap<i32, JoinEntry>,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 /// Stored dead letter entry for insight diagnostics.
 #[derive(Debug, Clone)]
 struct StoredDeadLetter {
     event_id: Uuid,
-    effect_id: String,
+    handler_id: String,
     correlation_id: Uuid,
     event_type: String,
     event_payload: serde_json::Value,
@@ -179,7 +180,7 @@ impl Store for MemoryStore {
             correlation_id: event.correlation_id,
             event_id: Some(event.event_id),
             effect_event_id: None,
-            effect_id: None,
+            handler_id: None,
             event_type: Some(event.event_type.clone()),
             status: None,
             error: None,
@@ -223,10 +224,50 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
+        for intent in commit.queued_effect_intents {
+            self.insert_effect_intent(
+                commit.event_id,
+                intent.handler_id,
+                commit.correlation_id,
+                commit.event_type.clone(),
+                commit.event_payload.clone(),
+                intent.parent_event_id,
+                intent.batch_id,
+                intent.batch_index,
+                intent.batch_size,
+                intent.execute_at,
+                intent.timeout_seconds,
+                intent.max_attempts,
+                intent.priority,
+                intent.join_window_timeout_seconds,
+            )
+            .await?;
+        }
+
+        for event in commit.emitted_events {
+            self.publish(event).await?;
+        }
+
+        for failure in commit.inline_effect_failures {
+            self.dlq_effect(
+                commit.event_id,
+                failure.handler_id,
+                failure.error,
+                failure.reason,
+                failure.attempts,
+            )
+            .await?;
+        }
+
+        self.ack(commit.event_row_id).await?;
+        Ok(())
+    }
+
     async fn insert_effect_intent(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         correlation_id: Uuid,
         event_type: String,
         event_payload: serde_json::Value,
@@ -238,10 +279,11 @@ impl Store for MemoryStore {
         timeout_seconds: i32,
         max_attempts: i32,
         priority: i32,
+        join_window_timeout_seconds: Option<i32>,
     ) -> Result<()> {
-        let execution = QueuedEffectExecution {
+        let execution = QueuedHandlerExecution {
             event_id,
-            effect_id: effect_id.clone(),
+            handler_id: handler_id.clone(),
             correlation_id,
             event_type,
             event_payload,
@@ -254,14 +296,15 @@ impl Store for MemoryStore {
             max_attempts,
             priority,
             attempts: 0,
+            join_window_timeout_seconds,
         };
 
         // Store in effect history
         let now = Utc::now();
         self.effect_history.insert(
-            (event_id, effect_id.clone()),
+            (event_id, handler_id.clone()),
             StoredEffect {
-                effect_id: effect_id.clone(),
+                handler_id: handler_id.clone(),
                 event_id,
                 correlation_id,
                 event_type: execution.event_type.clone(),
@@ -289,7 +332,7 @@ impl Store for MemoryStore {
             correlation_id,
             event_id: None,
             effect_event_id: Some(event_id),
-            effect_id: Some(effect_id),
+            handler_id: Some(handler_id),
             event_type: None,
             status: Some("pending".to_string()),
             error: None,
@@ -302,7 +345,7 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn poll_next_effect(&self) -> Result<Option<QueuedEffectExecution>> {
+    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
         let mut queue = self.effects.lock();
 
         // Find first effect that's ready to execute
@@ -311,7 +354,7 @@ impl Store for MemoryStore {
             if let Some(next) = queue.remove(pos) {
                 if let Some(mut effect) = self
                     .effect_history
-                    .get_mut(&(next.event_id, next.effect_id.clone()))
+                    .get_mut(&(next.event_id, next.handler_id.clone()))
                 {
                     effect.status = "executing".to_string();
                     effect.claimed_at = Some(now);
@@ -330,14 +373,14 @@ impl Store for MemoryStore {
     async fn complete_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         result: serde_json::Value,
     ) -> Result<()> {
         self.completed_effects
-            .insert((event_id, effect_id.clone()), result.clone());
+            .insert((event_id, handler_id.clone()), result.clone());
 
         // Update effect history
-        if let Some(mut entry) = self.effect_history.get_mut(&(event_id, effect_id.clone())) {
+        if let Some(mut entry) = self.effect_history.get_mut(&(event_id, handler_id.clone())) {
             entry.status = "completed".to_string();
             entry.result = Some(result.clone());
             let completed_at = Utc::now();
@@ -352,7 +395,7 @@ impl Store for MemoryStore {
                 correlation_id: entry.correlation_id,
                 event_id: None,
                 effect_event_id: Some(event_id),
-                effect_id: Some(effect_id),
+                handler_id: Some(handler_id),
                 event_type: None,
                 status: Some("completed".to_string()),
                 error: None,
@@ -367,17 +410,17 @@ impl Store for MemoryStore {
     async fn complete_effect_with_events(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         result: serde_json::Value,
         emitted_events: Vec<EmittedEvent>,
     ) -> Result<()> {
         // Mark effect complete
-        self.complete_effect(event_id, effect_id.clone(), result)
+        self.complete_effect(event_id, handler_id.clone(), result)
             .await?;
 
         let correlation_id = self
             .effect_history
-            .get(&(event_id, effect_id.clone()))
+            .get(&(event_id, handler_id.clone()))
             .map(|entry| entry.correlation_id)
             .or_else(|| {
                 self.event_history
@@ -397,7 +440,7 @@ impl Store for MemoryStore {
                 &NAMESPACE_SEESAW,
                 format!(
                     "{}-{}-{}-{}",
-                    event_id, effect_id, emitted.event_type, emitted_index
+                    event_id, handler_id, emitted.event_type, emitted_index
                 )
                 .as_bytes(),
             );
@@ -426,12 +469,12 @@ impl Store for MemoryStore {
     async fn fail_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         _retry_after_secs: i32,
     ) -> Result<()> {
         // Update effect history
-        if let Some(mut entry) = self.effect_history.get_mut(&(event_id, effect_id.clone())) {
+        if let Some(mut entry) = self.effect_history.get_mut(&(event_id, handler_id.clone())) {
             let failed_at = Utc::now();
             entry.status = "failed".to_string();
             entry.error = Some(error.clone());
@@ -446,7 +489,7 @@ impl Store for MemoryStore {
                 correlation_id: entry.correlation_id,
                 event_id: None,
                 effect_event_id: Some(event_id),
-                effect_id: Some(effect_id),
+                handler_id: Some(handler_id),
                 event_type: None,
                 status: Some("failed".to_string()),
                 error: Some(error.clone()),
@@ -455,44 +498,51 @@ impl Store for MemoryStore {
             });
         }
 
-        eprintln!("Effect failed: {}", error);
+        eprintln!("Handler failed: {}", error);
         Ok(())
     }
 
     async fn dlq_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         error_type: String,
         attempts: i32,
     ) -> Result<()> {
-        self.dlq_effect_with_events(event_id, effect_id, error, error_type, attempts, Vec::new())
-            .await
+        self.dlq_effect_with_events(
+            event_id,
+            handler_id,
+            error,
+            error_type,
+            attempts,
+            Vec::new(),
+        )
+        .await
     }
 
     async fn dlq_effect_with_events(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         error_type: String,
         attempts: i32,
         emitted_events: Vec<EmittedEvent>,
     ) -> Result<()> {
-        let effect_snapshot =
-            self.effect_history
-                .get(&(event_id, effect_id.clone()))
-                .map(|entry| {
-                    (
-                        entry.correlation_id,
-                        entry.event_type.clone(),
-                        entry.event_payload.clone(),
-                        entry.batch_id,
-                        entry.batch_index,
-                        entry.batch_size,
-                    )
-                });
+        let effect_snapshot = self
+            .effect_history
+            .get(&(event_id, handler_id.clone()))
+            .map(|entry| {
+                (
+                    entry.correlation_id,
+                    entry.event_type.clone(),
+                    entry.event_payload.clone(),
+                    entry.batch_id,
+                    entry.batch_index,
+                    entry.batch_size,
+                )
+            });
         let event_snapshot = self.event_history.get(&event_id).map(|event| {
             (
                 event.correlation_id,
@@ -525,23 +575,24 @@ impl Store for MemoryStore {
                 )
             };
 
-        if let Some(mut effect) = self.effect_history.get_mut(&(event_id, effect_id.clone())) {
+        if let Some(mut effect) = self.effect_history.get_mut(&(event_id, handler_id.clone())) {
             effect.status = "failed".to_string();
             effect.error = Some(error.clone());
             effect.attempts = attempts;
             effect.last_attempted_at = Some(Utc::now());
         }
+        let preserve_batch_terminal = error_type != "accumulate_timeout";
 
         self.dead_letter_history.insert(
-            (event_id, effect_id.clone()),
+            (event_id, handler_id.clone()),
             StoredDeadLetter {
                 event_id,
-                effect_id: effect_id.clone(),
+                handler_id: handler_id.clone(),
                 correlation_id,
                 event_type: event_type.clone(),
                 event_payload: event_payload.clone(),
                 error: error.clone(),
-                reason: error_type,
+                reason: error_type.clone(),
                 attempts,
                 failed_at: Utc::now(),
                 resolved_at: None,
@@ -550,12 +601,19 @@ impl Store for MemoryStore {
 
         let parent_hops = event_snapshot.map(|snapshot| snapshot.6).unwrap_or(0);
         if emitted_events.is_empty() {
+            if !preserve_batch_terminal {
+                eprintln!(
+                    "Handler sent to DLQ without synthetic terminal event: {}:{} - {} (attempts: {})",
+                    event_id, handler_id, error, attempts
+                );
+                return Ok(());
+            }
             if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
                 (batch_id, batch_index, batch_size)
             {
                 let synthetic_event_id = Uuid::new_v5(
                     &NAMESPACE_SEESAW,
-                    format!("{}-{}-dlq-terminal", event_id, effect_id).as_bytes(),
+                    format!("{}-{}-dlq-terminal", event_id, handler_id).as_bytes(),
                 );
                 self.publish(QueuedEvent {
                     id: self.event_seq.fetch_add(1, Ordering::SeqCst),
@@ -579,7 +637,7 @@ impl Store for MemoryStore {
                     &NAMESPACE_SEESAW,
                     format!(
                         "{}-{}-dlq-terminal-{}-{}",
-                        event_id, effect_id, emitted.event_type, emitted_index
+                        event_id, handler_id, emitted.event_type, emitted_index
                     )
                     .as_bytes(),
                 );
@@ -592,9 +650,21 @@ impl Store for MemoryStore {
                     payload: emitted.payload,
                     hops: parent_hops + 1,
                     retry_count: 0,
-                    batch_id: emitted.batch_id.or(batch_id),
-                    batch_index: emitted.batch_index.or(batch_index),
-                    batch_size: emitted.batch_size.or(batch_size),
+                    batch_id: emitted.batch_id.or(if preserve_batch_terminal {
+                        batch_id
+                    } else {
+                        None
+                    }),
+                    batch_index: emitted.batch_index.or(if preserve_batch_terminal {
+                        batch_index
+                    } else {
+                        None
+                    }),
+                    batch_size: emitted.batch_size.or(if preserve_batch_terminal {
+                        batch_size
+                    } else {
+                        None
+                    }),
                     created_at: Utc::now(),
                 })
                 .await?;
@@ -602,15 +672,15 @@ impl Store for MemoryStore {
         }
 
         eprintln!(
-            "Effect sent to DLQ: {}:{} - {} (attempts: {})",
-            event_id, effect_id, error, attempts
+            "Handler sent to DLQ: {}:{} - {} (attempts: {})",
+            event_id, handler_id, error, attempts
         );
         Ok(())
     }
 
     async fn join_same_batch_append_and_maybe_claim(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         source_event_id: Uuid,
         source_event_type: String,
@@ -619,14 +689,17 @@ impl Store for MemoryStore {
         batch_id: Uuid,
         batch_index: i32,
         batch_size: i32,
+        join_window_timeout_seconds: Option<i32>,
     ) -> Result<Option<Vec<JoinEntry>>> {
-        let key = (join_effect_id.clone(), correlation_id, batch_id);
+        let key = (join_handler_id.clone(), correlation_id, batch_id);
         let mut windows = self.join_windows.lock();
         let window = windows.entry(key).or_insert_with(|| MemoryJoinWindow {
             target_count: batch_size,
             status: MemoryJoinStatus::Open,
             source_event_ids: HashSet::new(),
             entries_by_index: HashMap::new(),
+            expires_at: join_window_timeout_seconds
+                .map(|seconds| Utc::now() + Duration::seconds(seconds as i64)),
         });
 
         if window.status == MemoryJoinStatus::Completed {
@@ -635,6 +708,10 @@ impl Store for MemoryStore {
 
         if window.target_count != batch_size {
             window.target_count = batch_size;
+        }
+        if window.expires_at.is_none() {
+            window.expires_at = join_window_timeout_seconds
+                .map(|seconds| Utc::now() + Duration::seconds(seconds as i64));
         }
 
         let already_seen_source = !window.source_event_ids.insert(source_event_id);
@@ -670,11 +747,11 @@ impl Store for MemoryStore {
 
     async fn join_same_batch_complete(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         batch_id: Uuid,
     ) -> Result<()> {
-        let key = (join_effect_id, correlation_id, batch_id);
+        let key = (join_handler_id, correlation_id, batch_id);
         if let Some(window) = self.join_windows.lock().get_mut(&key) {
             window.status = MemoryJoinStatus::Completed;
         }
@@ -684,18 +761,55 @@ impl Store for MemoryStore {
 
     async fn join_same_batch_release(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         batch_id: Uuid,
         _error: String,
     ) -> Result<()> {
-        let key = (join_effect_id, correlation_id, batch_id);
+        let key = (join_handler_id, correlation_id, batch_id);
         if let Some(window) = self.join_windows.lock().get_mut(&key) {
             if window.status == MemoryJoinStatus::Processing {
                 window.status = MemoryJoinStatus::Open;
             }
         }
         Ok(())
+    }
+
+    async fn expire_same_batch_windows(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ExpiredJoinWindow>> {
+        let mut windows = self.join_windows.lock();
+        let mut expired = Vec::new();
+        let mut expired_keys = Vec::new();
+
+        for (key, window) in windows.iter() {
+            if window.status != MemoryJoinStatus::Open {
+                continue;
+            }
+            let Some(expires_at) = window.expires_at else {
+                continue;
+            };
+            if expires_at > now {
+                continue;
+            }
+
+            let mut source_event_ids = window.source_event_ids.iter().copied().collect::<Vec<_>>();
+            source_event_ids.sort();
+            expired.push(ExpiredJoinWindow {
+                join_handler_id: key.0.clone(),
+                correlation_id: key.1,
+                batch_id: key.2,
+                source_event_ids,
+            });
+            expired_keys.push(key.clone());
+        }
+
+        for key in expired_keys {
+            windows.remove(&key);
+        }
+
+        Ok(expired)
     }
 
     async fn subscribe_workflow_events(
@@ -814,7 +928,7 @@ impl InsightStore for MemoryStore {
                     correlation_id: stored.correlation_id,
                     event_id: Some(stored.event_id),
                     effect_event_id: None,
-                    effect_id: None,
+                    handler_id: None,
                     event_type: Some(stored.event_type.clone()),
                     status: None,
                     error: None,
@@ -863,7 +977,7 @@ impl InsightStore for MemoryStore {
                 Some(EffectExecutionLog {
                     correlation_id: effect.correlation_id,
                     event_id: effect.event_id,
-                    effect_id: effect.effect_id.clone(),
+                    handler_id: effect.handler_id.clone(),
                     status: effect.status.clone(),
                     attempts: effect.attempts,
                     event_type: Some(effect.event_type.clone()),
@@ -913,7 +1027,7 @@ impl InsightStore for MemoryStore {
                 Some(DeadLetterEntry {
                     correlation_id: dead.correlation_id,
                     event_id: dead.event_id,
-                    effect_id: dead.effect_id.clone(),
+                    handler_id: dead.handler_id.clone(),
                     event_type: dead.event_type.clone(),
                     event_payload: dead.event_payload.clone(),
                     error: dead.error.clone(),
@@ -1035,8 +1149,8 @@ impl MemoryStore {
                     .filter(|e| e.value().event_id == event.event_id)
                     .map(|e| {
                         let effect = e.value();
-                        EffectNode {
-                            effect_id: effect.effect_id.clone(),
+                        HandlerNode {
+                            handler_id: effect.handler_id.clone(),
                             event_id: effect.event_id,
                             status: effect.status.clone(),
                             result: effect.result.clone(),
@@ -1236,6 +1350,7 @@ mod tests {
                 30,
                 1,
                 10,
+                None,
             )
             .await
             .expect("insert should succeed");
@@ -1285,6 +1400,7 @@ mod tests {
                 30,
                 1,
                 10,
+                None,
             )
             .await
             .expect("insert should succeed");
@@ -1302,5 +1418,85 @@ mod tests {
 
         let next = store.poll_next().await.expect("poll should succeed");
         assert!(next.is_none(), "no synthetic terminal event expected");
+    }
+
+    #[tokio::test]
+    async fn test_accumulate_timeout_reason_does_not_publish_synthetic_terminal_event() {
+        let store = MemoryStore::new();
+        let event_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+
+        store
+            .insert_effect_intent(
+                event_id,
+                "join_effect".to_string(),
+                correlation_id,
+                "BatchItemResult".to_string(),
+                serde_json::json!({ "index": 2, "ok": false }),
+                None,
+                Some(batch_id),
+                Some(2),
+                Some(5),
+                Utc::now(),
+                30,
+                1,
+                10,
+                Some(1),
+            )
+            .await
+            .expect("insert should succeed");
+
+        store
+            .dlq_effect(
+                event_id,
+                "join_effect".to_string(),
+                "window timed out".to_string(),
+                "accumulate_timeout".to_string(),
+                1,
+            )
+            .await
+            .expect("dlq should succeed");
+
+        let next = store.poll_next().await.expect("poll should succeed");
+        assert!(
+            next.is_none(),
+            "accumulate_timeout should not publish synthetic terminal events"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expire_same_batch_windows_removes_stale_window() {
+        let store = MemoryStore::new();
+        let correlation_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let source_event_id = Uuid::new_v4();
+
+        let claimed = store
+            .join_same_batch_append_and_maybe_claim(
+                "bulk_insert".to_string(),
+                correlation_id,
+                source_event_id,
+                "RowValidated".to_string(),
+                serde_json::json!({ "row_id": source_event_id }),
+                Utc::now(),
+                batch_id,
+                0,
+                2,
+                Some(1),
+            )
+            .await
+            .expect("append should succeed");
+        assert!(claimed.is_none(), "window should remain open");
+
+        let expired = store
+            .expire_same_batch_windows(Utc::now() + Duration::seconds(2))
+            .await
+            .expect("expiry should succeed");
+        assert_eq!(expired.len(), 1, "one stale window should expire");
+        assert_eq!(expired[0].join_handler_id, "bulk_insert");
+        assert_eq!(expired[0].correlation_id, correlation_id);
+        assert_eq!(expired[0].batch_id, batch_id);
+        assert_eq!(expired[0].source_event_ids, vec![source_event_id]);
     }
 }

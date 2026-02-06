@@ -6,11 +6,48 @@
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::effect::Effect;
-use crate::effect_registry::EffectRegistry;
+use crate::handler::Handler;
+use crate::handler_registry::HandlerRegistry;
 use crate::process::ProcessFuture;
 use crate::queue_backend::{QueueBackend, StoreQueueBackend};
 use crate::Store;
+
+/// Adapter trait for Engine backend construction.
+///
+/// This allows `Engine::new` to accept either:
+/// - A plain store (`St`) which uses [`StoreQueueBackend`] by default.
+/// - A tuple (`(St, Q)`) for explicit store + queue backend pairing.
+pub trait EngineBackend {
+    type Store: Store;
+    type Queue: QueueBackend<Self::Store>;
+
+    fn into_engine_parts(self) -> (Self::Store, Self::Queue);
+}
+
+impl<St> EngineBackend for St
+where
+    St: Store,
+{
+    type Store = St;
+    type Queue = StoreQueueBackend;
+
+    fn into_engine_parts(self) -> (Self::Store, Self::Queue) {
+        (self, StoreQueueBackend)
+    }
+}
+
+impl<St, Q> EngineBackend for (St, Q)
+where
+    St: Store,
+    Q: QueueBackend<St>,
+{
+    type Store = St;
+    type Queue = Q;
+
+    fn into_engine_parts(self) -> (Self::Store, Self::Queue) {
+        self
+    }
+}
 
 /// Queue-backed Engine
 ///
@@ -23,7 +60,7 @@ where
     store: Arc<St>,
     queue_backend: Arc<dyn QueueBackend<St>>,
     deps: Arc<D>,
-    effects: Arc<EffectRegistry<D>>,
+    effects: Arc<HandlerRegistry<D>>,
 }
 
 impl<D, St> Engine<D, St>
@@ -31,9 +68,17 @@ where
     D: Send + Sync + 'static,
     St: Store,
 {
-    /// Create new engine with dependencies and store
-    pub fn new(deps: D, store: St) -> Self {
-        Self::builder(deps, store).build()
+    /// Create new engine with dependencies and backend.
+    ///
+    /// Accepts either:
+    /// - `store` (defaults to store-backed queue dispatch)
+    /// - `(store, queue_backend)` for explicit queue backend wiring
+    pub fn new<B>(deps: D, backend: B) -> Self
+    where
+        B: EngineBackend<Store = St>,
+    {
+        let (store, queue_backend) = backend.into_engine_parts();
+        Self::from_parts(deps, store, Vec::new(), Arc::new(queue_backend))
     }
 
     /// Create a builder for engine configuration.
@@ -42,17 +87,7 @@ where
             store,
             deps,
             effects: Vec::new(),
-            queue_backend: Arc::new(StoreQueueBackend),
         }
-    }
-
-    /// Override queue backend used for queued effect dispatch.
-    pub fn with_queue_backend<B>(mut self, queue_backend: B) -> Self
-    where
-        B: QueueBackend<St>,
-    {
-        self.queue_backend = Arc::new(queue_backend);
-        self
     }
 
     /// Queue backend name for diagnostics.
@@ -63,13 +98,13 @@ where
     fn from_parts(
         deps: D,
         store: St,
-        effects: Vec<Effect<D>>,
+        effects: Vec<Handler<D>>,
         queue_backend: Arc<dyn QueueBackend<St>>,
     ) -> Self {
-        let mut effect_registry = Arc::new(EffectRegistry::new());
+        let mut handler_registry = Arc::new(HandlerRegistry::new());
 
         // Safe because registry was just created and is uniquely owned.
-        let effects_target = Arc::get_mut(&mut effect_registry)
+        let effects_target = Arc::get_mut(&mut handler_registry)
             .expect("new effect registry should be uniquely owned");
         for effect in effects {
             effects_target.register(effect);
@@ -79,26 +114,26 @@ where
             store: Arc::new(store),
             queue_backend,
             deps: Arc::new(deps),
-            effects: effect_registry,
+            effects: handler_registry,
         }
     }
 
-    /// Register an effect.
-    pub fn with_effect(mut self, effect: Effect<D>) -> Self {
+    /// Register a handler.
+    pub fn with_handler(mut self, handler: Handler<D>) -> Self {
         Arc::get_mut(&mut self.effects)
-            .expect("Cannot add effect after cloning")
-            .register(effect);
+            .expect("Cannot add handler after cloning")
+            .register(handler);
         self
     }
 
-    /// Register multiple effects.
-    pub fn with_effects<I>(mut self, effects: I) -> Self
+    /// Register multiple handlers.
+    pub fn with_handlers<I>(mut self, handlers: I) -> Self
     where
-        I: IntoIterator<Item = Effect<D>>,
+        I: IntoIterator<Item = Handler<D>>,
     {
-        let registry = Arc::get_mut(&mut self.effects).expect("Cannot add effects after cloning");
-        for effect in effects {
-            registry.register(effect);
+        let registry = Arc::get_mut(&mut self.effects).expect("Cannot add handlers after cloning");
+        for handler in handlers {
+            registry.register(handler);
         }
         self
     }
@@ -169,7 +204,7 @@ where
     }
 
     /// Get effects (for event/effect workers)
-    pub(crate) fn effects(&self) -> &Arc<EffectRegistry<D>> {
+    pub(crate) fn effects(&self) -> &Arc<HandlerRegistry<D>> {
         &self.effects
     }
 }
@@ -197,8 +232,7 @@ where
 {
     store: St,
     deps: D,
-    effects: Vec<Effect<D>>,
-    queue_backend: Arc<dyn QueueBackend<St>>,
+    effects: Vec<Handler<D>>,
 }
 
 impl<D, St> EngineBuilder<D, St>
@@ -206,32 +240,28 @@ where
     D: Send + Sync + 'static,
     St: Store,
 {
-    /// Register an effect.
-    pub fn with_effect(mut self, effect: Effect<D>) -> Self {
-        self.effects.push(effect);
+    /// Register a handler.
+    pub fn with_handler(mut self, handler: Handler<D>) -> Self {
+        self.effects.push(handler);
         self
     }
 
-    /// Register multiple effects.
-    pub fn with_effects<I>(mut self, effects: I) -> Self
+    /// Register multiple handlers.
+    pub fn with_handlers<I>(mut self, handlers: I) -> Self
     where
-        I: IntoIterator<Item = Effect<D>>,
+        I: IntoIterator<Item = Handler<D>>,
     {
-        self.effects.extend(effects);
-        self
-    }
-
-    /// Override queue backend used for queued effect dispatch.
-    pub fn queue_backend<B>(mut self, queue_backend: B) -> Self
-    where
-        B: QueueBackend<St>,
-    {
-        self.queue_backend = Arc::new(queue_backend);
+        self.effects.extend(handlers);
         self
     }
 
     /// Build engine.
     pub fn build(self) -> Engine<D, St> {
-        Engine::from_parts(self.deps, self.store, self.effects, self.queue_backend)
+        Engine::from_parts(
+            self.deps,
+            self.store,
+            self.effects,
+            Arc::new(StoreQueueBackend),
+        )
     }
 }

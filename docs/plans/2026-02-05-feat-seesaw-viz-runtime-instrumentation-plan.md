@@ -585,8 +585,8 @@ json-patch = "2.0"  # Structured state diffs (optional, for serde formatter)
 let collector = SpanCollector::new();
 
 let engine = Engine::new()
-    .with_effect(collector.effect())  // Register observer
-    .with_effect(/* user's effects */);
+    .with_handler(collector.effect())  // Register observer
+    .with_handler(/* user's effects */);
 
 let handle = engine.activate(State::default());
 handle.run(|_| Ok(OrderPlaced { id: 123 })).unwrap();

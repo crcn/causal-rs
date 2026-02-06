@@ -1,7 +1,7 @@
 //! HTTP Fetcher Example (stateless)
 
 use anyhow::Result;
-use seesaw_core::{effect, EffectContext, Engine};
+use seesaw_core::{effect, Engine, HandlerContext};
 use seesaw_memory::MemoryStore;
 use serde::{Deserialize, Serialize};
 
@@ -41,8 +41,8 @@ async fn main() -> Result<()> {
     };
 
     let engine = Engine::new(deps, store)
-        .with_effect(
-            effect::on::<FetchEvent>()
+        .with_handler(
+            handler::on::<FetchEvent>()
                 .extract(|e| match e {
                     FetchEvent::FetchRequested {
                         urls,
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
                     _ => None,
                 })
                 .then::<Deps, (Vec<String>, usize, usize), _, _, Vec<FetchEvent>, FetchEvent>(
-                    |(urls, success_count, failure_count), ctx: EffectContext<Deps>| async move {
+                    |(urls, success_count, failure_count), ctx: HandlerContext<Deps>| async move {
                         if let Some((url, rest)) = urls.split_first() {
                             let url = url.clone();
                             let rest = rest.to_vec();
@@ -102,8 +102,8 @@ async fn main() -> Result<()> {
                     },
                 ),
         )
-        .with_effect(
-            effect::on::<FetchEvent>()
+        .with_handler(
+            handler::on::<FetchEvent>()
                 .extract(|e| match e {
                     FetchEvent::AllComplete {
                         success_count,
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
                     _ => None,
                 })
                 .then::<Deps, (usize, usize), _, _, Vec<FetchEvent>, FetchEvent>(
-                    |(ok, fail), _ctx: EffectContext<Deps>| async move {
+                    |(ok, fail), _ctx: HandlerContext<Deps>| async move {
                         println!("all fetches complete: ok={}, fail={}", ok, fail);
                         Ok(Vec::<FetchEvent>::new())
                     },

@@ -56,9 +56,9 @@ pub struct EmittedEvent {
 
 /// Persisted intent for a queued effect execution.
 #[derive(Debug, Clone)]
-pub struct QueuedEffectIntent {
+pub struct QueuedHandlerIntent {
     /// Stable effect identifier.
-    pub effect_id: String,
+    pub handler_id: String,
     /// Parent event for causality tracking.
     pub parent_event_id: Option<Uuid>,
     /// Batch metadata inherited from source event.
@@ -73,12 +73,14 @@ pub struct QueuedEffectIntent {
     pub max_attempts: i32,
     /// Queue priority (lower = higher priority).
     pub priority: i32,
+    /// Optional timeout for same-batch accumulation windows.
+    pub join_window_timeout_seconds: Option<i32>,
 }
 
 /// Captured inline effect failure to persist in DLQ at commit time.
 #[derive(Debug, Clone)]
-pub struct InlineEffectFailure {
-    pub effect_id: String,
+pub struct InlineHandlerFailure {
+    pub handler_id: String,
     pub error: String,
     pub reason: String,
     pub attempts: i32,
@@ -95,9 +97,9 @@ pub struct EventProcessingCommit {
     pub event_type: String,
     pub event_payload: serde_json::Value,
     /// Queued effect intents to persist.
-    pub queued_effect_intents: Vec<QueuedEffectIntent>,
+    pub queued_effect_intents: Vec<QueuedHandlerIntent>,
     /// Inline effect failures to persist to DLQ.
-    pub inline_effect_failures: Vec<InlineEffectFailure>,
+    pub inline_effect_failures: Vec<InlineHandlerFailure>,
     /// Inline emitted events to publish.
     pub emitted_events: Vec<QueuedEvent>,
 }
@@ -112,6 +114,15 @@ pub struct JoinEntry {
     pub batch_index: i32,
     pub batch_size: i32,
     pub created_at: DateTime<Utc>,
+}
+
+/// Expired same-batch accumulation window metadata.
+#[derive(Debug, Clone)]
+pub struct ExpiredJoinWindow {
+    pub join_handler_id: String,
+    pub correlation_id: Uuid,
+    pub batch_id: Uuid,
+    pub source_event_ids: Vec<Uuid>,
 }
 
 /// Store trait - combines queue and effect operations
@@ -159,47 +170,8 @@ pub trait Store: Send + Sync + 'static {
 
     /// Atomically commit event processing side effects.
     ///
-    /// Default implementation composes existing store methods sequentially.
-    /// Stores can override this with a single transaction for stronger
-    /// crash-consistency guarantees.
-    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
-        for intent in commit.queued_effect_intents {
-            self.insert_effect_intent(
-                commit.event_id,
-                intent.effect_id,
-                commit.correlation_id,
-                commit.event_type.clone(),
-                commit.event_payload.clone(),
-                intent.parent_event_id,
-                intent.batch_id,
-                intent.batch_index,
-                intent.batch_size,
-                intent.execute_at,
-                intent.timeout_seconds,
-                intent.max_attempts,
-                intent.priority,
-            )
-            .await?;
-        }
-
-        for event in commit.emitted_events {
-            self.publish(event).await?;
-        }
-
-        for failure in commit.inline_effect_failures {
-            self.dlq_effect(
-                commit.event_id,
-                failure.effect_id,
-                failure.error,
-                failure.reason,
-                failure.attempts,
-            )
-            .await?;
-        }
-
-        self.ack(commit.event_row_id).await?;
-        Ok(())
-    }
+    /// Implementations must guarantee atomicity across all persisted side effects.
+    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()>;
 
     // =========================================================================
     // Effect Execution Operations
@@ -212,7 +184,7 @@ pub trait Store: Send + Sync + 'static {
     async fn insert_effect_intent(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         correlation_id: Uuid,
         event_type: String,
         event_payload: serde_json::Value,
@@ -224,19 +196,20 @@ pub trait Store: Send + Sync + 'static {
         timeout_seconds: i32,
         max_attempts: i32,
         priority: i32,
+        join_window_timeout_seconds: Option<i32>,
     ) -> Result<()>;
 
     /// Poll next ready effect (priority-based)
     ///
     /// Returns None if no effects ready.
     /// Uses SKIP LOCKED for concurrent workers.
-    async fn poll_next_effect(&self) -> Result<Option<QueuedEffectExecution>>;
+    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>>;
 
     /// Mark effect execution as completed
     async fn complete_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         result: serde_json::Value,
     ) -> Result<()>;
 
@@ -248,7 +221,7 @@ pub trait Store: Send + Sync + 'static {
     async fn complete_effect_with_events(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         result: serde_json::Value,
         emitted_events: Vec<EmittedEvent>,
     ) -> Result<()>;
@@ -257,7 +230,7 @@ pub trait Store: Send + Sync + 'static {
     async fn fail_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         attempts: i32,
     ) -> Result<()>;
@@ -266,7 +239,7 @@ pub trait Store: Send + Sync + 'static {
     async fn dlq_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         reason: String,
         attempts: i32,
@@ -279,7 +252,7 @@ pub trait Store: Send + Sync + 'static {
     async fn dlq_effect_with_events(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         reason: String,
         attempts: i32,
@@ -287,7 +260,7 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<()> {
         if emitted_events.is_empty() {
             return self
-                .dlq_effect(event_id, effect_id, error, reason, attempts)
+                .dlq_effect(event_id, handler_id, error, reason, attempts)
                 .await;
         }
         anyhow::bail!("dlq_effect_with_events is not implemented for this store")
@@ -328,7 +301,7 @@ pub trait Store: Send + Sync + 'static {
     /// Returns `Ok(None)` when still waiting for more terminal items.
     async fn join_same_batch_append_and_maybe_claim(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         source_event_id: Uuid,
         source_event_type: String,
@@ -337,9 +310,10 @@ pub trait Store: Send + Sync + 'static {
         batch_id: Uuid,
         batch_index: i32,
         batch_size: i32,
+        join_window_timeout_seconds: Option<i32>,
     ) -> Result<Option<Vec<JoinEntry>>> {
         let _ = (
-            join_effect_id,
+            join_handler_id,
             correlation_id,
             source_event_id,
             source_event_type,
@@ -348,6 +322,7 @@ pub trait Store: Send + Sync + 'static {
             batch_id,
             batch_index,
             batch_size,
+            join_window_timeout_seconds,
         );
         anyhow::bail!("join_same_batch is not implemented for this store")
     }
@@ -355,11 +330,11 @@ pub trait Store: Send + Sync + 'static {
     /// Mark a claimed same-batch window as completed and clear durable join rows.
     async fn join_same_batch_complete(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         batch_id: Uuid,
     ) -> Result<()> {
-        let _ = (join_effect_id, correlation_id, batch_id);
+        let _ = (join_handler_id, correlation_id, batch_id);
         anyhow::bail!("join_same_batch is not implemented for this store")
     }
 
@@ -367,13 +342,21 @@ pub trait Store: Send + Sync + 'static {
     /// error so retries can claim it again.
     async fn join_same_batch_release(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         batch_id: Uuid,
         _error: String,
     ) -> Result<()> {
-        let _ = (join_effect_id, correlation_id, batch_id);
+        let _ = (join_handler_id, correlation_id, batch_id);
         anyhow::bail!("join_same_batch is not implemented for this store")
+    }
+
+    /// Expire same-batch windows that have exceeded their configured timeout.
+    async fn expire_same_batch_windows(
+        &self,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<ExpiredJoinWindow>> {
+        Ok(Vec::new())
     }
 }
 
@@ -392,9 +375,9 @@ pub struct WorkflowStatus {
 
 /// Queued effect execution from store
 #[derive(Debug, Clone)]
-pub struct QueuedEffectExecution {
+pub struct QueuedHandlerExecution {
     pub event_id: Uuid,
-    pub effect_id: String,
+    pub handler_id: String,
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
@@ -407,6 +390,7 @@ pub struct QueuedEffectExecution {
     pub max_attempts: i32,
     pub priority: i32,
     pub attempts: i32,
+    pub join_window_timeout_seconds: Option<i32>,
 }
 
 // Helper to format event for logging
@@ -420,13 +404,13 @@ impl fmt::Display for QueuedEvent {
     }
 }
 
-impl fmt::Display for QueuedEffectExecution {
+impl fmt::Display for QueuedHandlerExecution {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Effect(event_id={}, effect_id={}, correlation_id={}, priority={}, attempts={}/{})",
+            "Handler(event_id={}, effect_id={}, correlation_id={}, priority={}, attempts={}/{})",
             self.event_id,
-            self.effect_id,
+            self.handler_id,
             self.correlation_id,
             self.priority,
             self.attempts,

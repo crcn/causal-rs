@@ -5,8 +5,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use seesaw_core::{
-    insight::*, EmittedEvent, EventProcessingCommit, JoinEntry, QueuedEffectExecution, QueuedEvent,
-    Store, NAMESPACE_SEESAW,
+    insight::*, EmittedEvent, EventProcessingCommit, ExpiredJoinWindow, JoinEntry, QueuedEvent,
+    QueuedHandlerExecution, Store, NAMESPACE_SEESAW,
 };
 use sqlx::{FromRow, PgPool};
 use std::collections::HashSet;
@@ -22,7 +22,7 @@ fn emitted_event_created_at(parent_created_at: DateTime<Utc>) -> DateTime<Utc> {
         .and_utc()
 }
 
-fn effect_retry_delay_seconds(attempts: i32) -> i64 {
+fn handler_retry_delay_seconds(attempts: i32) -> i64 {
     let exponent = attempts.saturating_sub(1).clamp(0, 8) as u32;
     1_i64 << exponent
 }
@@ -67,9 +67,9 @@ struct EventRow {
 }
 
 #[derive(FromRow)]
-struct EffectRow {
+struct HandlerRow {
     event_id: Uuid,
-    effect_id: String,
+    handler_id: String,
     correlation_id: Uuid,
     event_type: String,
     event_payload: serde_json::Value,
@@ -82,6 +82,7 @@ struct EffectRow {
     max_attempts: i32,
     priority: i32,
     attempts: i32,
+    join_window_timeout_seconds: Option<i32>,
 }
 
 #[derive(FromRow)]
@@ -251,17 +252,18 @@ impl Store for PostgresStore {
 
         for intent in queued_effect_intents {
             sqlx::query(
-                "INSERT INTO seesaw_effect_executions (
-                    event_id, effect_id, correlation_id, status,
+                "INSERT INTO seesaw_handler_executions (
+                    event_id, handler_id, correlation_id, status,
                     event_type, event_payload, parent_event_id,
                     batch_id, batch_index, batch_size,
-                    execute_at, timeout_seconds, max_attempts, priority
+                    execute_at, timeout_seconds, max_attempts, priority,
+                    join_window_timeout_seconds
                  )
-                 VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                 ON CONFLICT (event_id, effect_id) DO NOTHING",
+                 VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 ON CONFLICT (event_id, handler_id) DO NOTHING",
             )
             .bind(event_id)
-            .bind(intent.effect_id)
+            .bind(intent.handler_id)
             .bind(correlation_id)
             .bind(&event_type)
             .bind(&event_payload)
@@ -273,6 +275,7 @@ impl Store for PostgresStore {
             .bind(intent.timeout_seconds)
             .bind(intent.max_attempts)
             .bind(intent.priority)
+            .bind(intent.join_window_timeout_seconds)
             .execute(&mut *tx)
             .await?;
         }
@@ -334,12 +337,12 @@ impl Store for PostgresStore {
         for failure in inline_effect_failures {
             sqlx::query(
                 "INSERT INTO seesaw_dlq (
-                    event_id, effect_id, correlation_id, error, event_type, event_payload, reason, attempts
+                    event_id, handler_id, correlation_id, error, event_type, event_payload, reason, attempts
                  )
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(event_id)
-            .bind(&failure.effect_id)
+            .bind(&failure.handler_id)
             .bind(correlation_id)
             .bind(&failure.error)
             .bind(&event_type)
@@ -355,7 +358,7 @@ impl Store for PostgresStore {
                 {
                     let synthetic_event_id = Uuid::new_v5(
                         &NAMESPACE_SEESAW,
-                        format!("{}-{}-dlq-terminal", event_id, failure.effect_id).as_bytes(),
+                        format!("{}-{}-dlq-terminal", event_id, failure.handler_id).as_bytes(),
                     );
                     let synthetic_created_at = emitted_event_created_at(source.created_at);
 
@@ -403,7 +406,7 @@ impl Store for PostgresStore {
     async fn insert_effect_intent(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         correlation_id: Uuid,
         event_type: String,
         event_payload: serde_json::Value,
@@ -415,19 +418,21 @@ impl Store for PostgresStore {
         timeout_seconds: i32,
         max_attempts: i32,
         priority: i32,
+        join_window_timeout_seconds: Option<i32>,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO seesaw_effect_executions (
-                event_id, effect_id, correlation_id, status,
+            "INSERT INTO seesaw_handler_executions (
+                event_id, handler_id, correlation_id, status,
                 event_type, event_payload, parent_event_id,
                 batch_id, batch_index, batch_size,
-                execute_at, timeout_seconds, max_attempts, priority
+                execute_at, timeout_seconds, max_attempts, priority,
+                join_window_timeout_seconds
              )
-             VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-             ON CONFLICT (event_id, effect_id) DO NOTHING",
+             VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             ON CONFLICT (event_id, handler_id) DO NOTHING",
         )
         .bind(event_id)
-        .bind(effect_id)
+        .bind(handler_id)
         .bind(correlation_id)
         .bind(event_type)
         .bind(event_payload)
@@ -439,46 +444,48 @@ impl Store for PostgresStore {
         .bind(timeout_seconds)
         .bind(max_attempts)
         .bind(priority)
+        .bind(join_window_timeout_seconds)
         .execute(&self.pool)
         .await?;
 
         Ok(())
     }
 
-    async fn poll_next_effect(&self) -> Result<Option<QueuedEffectExecution>> {
-        let row: Option<EffectRow> = sqlx::query_as(
+    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
+        let row: Option<HandlerRow> = sqlx::query_as(
             "WITH next_effect AS (
-                SELECT event_id, effect_id
-                FROM seesaw_effect_executions
+                SELECT event_id, handler_id
+                FROM seesaw_handler_executions
                 WHERE (
                     status = 'pending'
                     OR (status = 'failed' AND attempts < max_attempts)
                 )
                   AND execute_at <= NOW()
-                ORDER BY priority ASC, execute_at ASC, event_id ASC, effect_id ASC
+                ORDER BY priority ASC, execute_at ASC, event_id ASC, handler_id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE seesaw_effect_executions e
+            UPDATE seesaw_handler_executions e
             SET status = 'executing',
                 claimed_at = NOW(),
                 last_attempted_at = NOW(),
                 attempts = e.attempts + 1
             FROM next_effect
             WHERE e.event_id = next_effect.event_id
-              AND e.effect_id = next_effect.effect_id
+              AND e.handler_id = next_effect.handler_id
             RETURNING
-                e.event_id, e.effect_id, e.correlation_id, e.event_type, e.event_payload, e.parent_event_id,
+                e.event_id, e.handler_id, e.correlation_id, e.event_type, e.event_payload, e.parent_event_id,
                 e.batch_id, e.batch_index, e.batch_size,
-                e.execute_at, e.timeout_seconds, e.max_attempts, e.priority, e.attempts",
+                e.execute_at, e.timeout_seconds, e.max_attempts, e.priority, e.attempts,
+                e.join_window_timeout_seconds",
         )
         .fetch_optional(&self.pool)
         .await?;
 
         if let Some(r) = row {
-            Ok(Some(QueuedEffectExecution {
+            Ok(Some(QueuedHandlerExecution {
                 event_id: r.event_id,
-                effect_id: r.effect_id,
+                handler_id: r.handler_id,
                 correlation_id: r.correlation_id,
                 event_type: r.event_type,
                 event_payload: r.event_payload,
@@ -491,6 +498,7 @@ impl Store for PostgresStore {
                 max_attempts: r.max_attempts,
                 priority: r.priority,
                 attempts: r.attempts,
+                join_window_timeout_seconds: r.join_window_timeout_seconds,
             }))
         } else {
             Ok(None)
@@ -500,18 +508,18 @@ impl Store for PostgresStore {
     async fn complete_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         result: serde_json::Value,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE seesaw_effect_executions
+            "UPDATE seesaw_handler_executions
              SET status = 'completed',
                  result = $3,
                  completed_at = NOW()
-             WHERE event_id = $1 AND effect_id = $2",
+             WHERE event_id = $1 AND handler_id = $2",
         )
         .bind(event_id)
-        .bind(effect_id)
+        .bind(handler_id)
         .bind(result)
         .execute(&self.pool)
         .await?;
@@ -522,20 +530,20 @@ impl Store for PostgresStore {
     async fn complete_effect_with_events(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         result: serde_json::Value,
         emitted_events: Vec<EmittedEvent>,
     ) -> Result<()> {
         // Get correlation_id and hops for emitted events
-        let effect: EffectRow = sqlx::query_as(
-            "SELECT event_id, effect_id, correlation_id, event_type, event_payload, parent_event_id,
+        let effect: HandlerRow = sqlx::query_as(
+            "SELECT event_id, handler_id, correlation_id, event_type, event_payload, parent_event_id,
                     batch_id, batch_index, batch_size,
-                    execute_at, timeout_seconds, max_attempts, priority, attempts
-             FROM seesaw_effect_executions
-             WHERE event_id = $1 AND effect_id = $2",
+                    execute_at, timeout_seconds, max_attempts, priority, attempts, join_window_timeout_seconds
+             FROM seesaw_handler_executions
+             WHERE event_id = $1 AND handler_id = $2",
         )
         .bind(event_id)
-        .bind(&effect_id)
+        .bind(&handler_id)
         .fetch_one(&self.pool)
         .await?;
 
@@ -557,12 +565,12 @@ impl Store for PostgresStore {
         // Insert emitted events with deterministic IDs
         for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
             // Generate deterministic event_id from
-            // hash(parent_event_id, effect_id, event_type, emitted_index)
+            // hash(parent_event_id, handler_id, event_type, emitted_index)
             let deterministic_id = Uuid::new_v5(
                 &NAMESPACE_SEESAW,
                 format!(
                     "{}-{}-{}-{}",
-                    event_id, effect_id, emitted.event_type, emitted_index
+                    event_id, handler_id, emitted.event_type, emitted_index
                 )
                 .as_bytes(),
             );
@@ -596,14 +604,14 @@ impl Store for PostgresStore {
 
         // Mark effect as completed (same transaction)
         sqlx::query(
-            "UPDATE seesaw_effect_executions
+            "UPDATE seesaw_handler_executions
              SET status = 'completed',
                  result = $3,
                  completed_at = NOW()
-             WHERE event_id = $1 AND effect_id = $2",
+             WHERE event_id = $1 AND handler_id = $2",
         )
         .bind(event_id)
-        .bind(effect_id)
+        .bind(handler_id)
         .bind(result)
         .execute(&mut *tx)
         .await?;
@@ -617,21 +625,21 @@ impl Store for PostgresStore {
     async fn fail_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         attempts: i32,
     ) -> Result<()> {
-        let retry_at = Utc::now() + Duration::seconds(effect_retry_delay_seconds(attempts));
+        let retry_at = Utc::now() + Duration::seconds(handler_retry_delay_seconds(attempts));
         sqlx::query(
-            "UPDATE seesaw_effect_executions
+            "UPDATE seesaw_handler_executions
              SET status = 'failed',
                  error = $3,
                  execute_at = $5,
                  claimed_at = NULL
-             WHERE event_id = $1 AND effect_id = $2 AND attempts >= $4",
+             WHERE event_id = $1 AND handler_id = $2 AND attempts >= $4",
         )
         .bind(event_id)
-        .bind(effect_id)
+        .bind(handler_id)
         .bind(error)
         .bind(attempts)
         .bind(retry_at)
@@ -644,19 +652,19 @@ impl Store for PostgresStore {
     async fn dlq_effect(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         reason: String,
         attempts: i32,
     ) -> Result<()> {
-        self.dlq_effect_with_events(event_id, effect_id, error, reason, attempts, Vec::new())
+        self.dlq_effect_with_events(event_id, handler_id, error, reason, attempts, Vec::new())
             .await
     }
 
     async fn dlq_effect_with_events(
         &self,
         event_id: Uuid,
-        effect_id: String,
+        handler_id: String,
         error: String,
         reason: String,
         attempts: i32,
@@ -664,15 +672,15 @@ impl Store for PostgresStore {
     ) -> Result<()> {
         // Effect details may be missing for inline/synthetic failures. Fall back to
         // parent event data so DLQ writes still succeed.
-        let effect = sqlx::query_as::<_, EffectRow>(
-            "SELECT event_id, effect_id, correlation_id, event_type, event_payload, parent_event_id,
+        let effect = sqlx::query_as::<_, HandlerRow>(
+            "SELECT event_id, handler_id, correlation_id, event_type, event_payload, parent_event_id,
                     batch_id, batch_index, batch_size,
-                    execute_at, timeout_seconds, max_attempts, priority, attempts
-             FROM seesaw_effect_executions
-             WHERE event_id = $1 AND effect_id = $2",
+                    execute_at, timeout_seconds, max_attempts, priority, attempts, join_window_timeout_seconds
+             FROM seesaw_handler_executions
+             WHERE event_id = $1 AND handler_id = $2",
         )
         .bind(event_id)
-        .bind(&effect_id)
+        .bind(&handler_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -715,7 +723,7 @@ impl Store for PostgresStore {
         } else {
             anyhow::bail!(
                 "cannot DLQ unknown effect {} for missing event {}",
-                effect_id,
+                handler_id,
                 event_id
             );
         };
@@ -725,12 +733,12 @@ impl Store for PostgresStore {
         // Insert into DLQ
         sqlx::query(
             "INSERT INTO seesaw_dlq (
-                event_id, effect_id, correlation_id, error, event_type, event_payload, reason, attempts
+                event_id, handler_id, correlation_id, error, event_type, event_payload, reason, attempts
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(event_id)
-        .bind(&effect_id)
+        .bind(&handler_id)
         .bind(source_correlation_id)
         .bind(&error)
         .bind(&source_event_type)
@@ -739,6 +747,7 @@ impl Store for PostgresStore {
         .bind(attempts)
         .execute(&mut *tx)
         .await?;
+        let preserve_batch_terminal = reason != "accumulate_timeout";
 
         let synthetic_created_at = source_event
             .as_ref()
@@ -747,12 +756,23 @@ impl Store for PostgresStore {
         let synthetic_hops = source_event.as_ref().map(|row| row.hops + 1).unwrap_or(0);
 
         if emitted_events.is_empty() {
+            if !preserve_batch_terminal {
+                sqlx::query(
+                    "DELETE FROM seesaw_handler_executions WHERE event_id = $1 AND handler_id = $2",
+                )
+                .bind(event_id)
+                .bind(&handler_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(());
+            }
             if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
                 (source_batch_id, source_batch_index, source_batch_size)
             {
                 let synthetic_event_id = Uuid::new_v5(
                     &NAMESPACE_SEESAW,
-                    format!("{}-{}-dlq-terminal", event_id, effect_id).as_bytes(),
+                    format!("{}-{}-dlq-terminal", event_id, handler_id).as_bytes(),
                 );
 
                 sqlx::query(
@@ -782,7 +802,7 @@ impl Store for PostgresStore {
                     &NAMESPACE_SEESAW,
                     format!(
                         "{}-{}-dlq-terminal-{}-{}",
-                        event_id, effect_id, emitted.event_type, emitted_index
+                        event_id, handler_id, emitted.event_type, emitted_index
                     )
                     .as_bytes(),
                 );
@@ -801,9 +821,21 @@ impl Store for PostgresStore {
                 .bind(&emitted.event_type)
                 .bind(emitted.payload)
                 .bind(synthetic_hops)
-                .bind(emitted.batch_id.or(source_batch_id))
-                .bind(emitted.batch_index.or(source_batch_index))
-                .bind(emitted.batch_size.or(source_batch_size))
+                .bind(emitted.batch_id.or(if preserve_batch_terminal {
+                    source_batch_id
+                } else {
+                    None
+                }))
+                .bind(emitted.batch_index.or(if preserve_batch_terminal {
+                    source_batch_index
+                } else {
+                    None
+                }))
+                .bind(emitted.batch_size.or(if preserve_batch_terminal {
+                    source_batch_size
+                } else {
+                    None
+                }))
                 .bind(synthetic_created_at)
                 .execute(&mut *tx)
                 .await?;
@@ -811,11 +843,13 @@ impl Store for PostgresStore {
         }
 
         // Delete from executions table
-        sqlx::query("DELETE FROM seesaw_effect_executions WHERE event_id = $1 AND effect_id = $2")
-            .bind(event_id)
-            .bind(&effect_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM seesaw_handler_executions WHERE event_id = $1 AND handler_id = $2",
+        )
+        .bind(event_id)
+        .bind(&handler_id)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
 
@@ -949,7 +983,7 @@ impl Store for PostgresStore {
         correlation_id: Uuid,
     ) -> Result<seesaw_core::WorkflowStatus> {
         let pending_effects = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM seesaw_effect_executions
+            "SELECT COUNT(*) FROM seesaw_handler_executions
              WHERE correlation_id = $1 AND status IN ('pending', 'executing', 'failed')",
         )
         .bind(correlation_id)
@@ -978,7 +1012,7 @@ impl Store for PostgresStore {
 
     async fn join_same_batch_append_and_maybe_claim(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         source_event_id: Uuid,
         source_event_type: String,
@@ -987,18 +1021,19 @@ impl Store for PostgresStore {
         batch_id: Uuid,
         batch_index: i32,
         batch_size: i32,
+        join_window_timeout_seconds: Option<i32>,
     ) -> Result<Option<Vec<JoinEntry>>> {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO seesaw_join_entries (
-                join_effect_id, correlation_id, source_event_id, source_event_type, source_payload,
+                join_handler_id, correlation_id, source_event_id, source_event_type, source_payload,
                 source_created_at, batch_id, batch_index, batch_size
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (join_effect_id, correlation_id, source_event_id) DO NOTHING",
+             ON CONFLICT (join_handler_id, correlation_id, source_event_id) DO NOTHING",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(source_event_id)
         .bind(&source_event_type)
@@ -1012,15 +1047,29 @@ impl Store for PostgresStore {
 
         sqlx::query(
             "INSERT INTO seesaw_join_windows (
-                join_effect_id, correlation_id, mode, batch_id, target_count, status
+                join_handler_id, correlation_id, mode, batch_id, target_count, status,
+                window_timeout_seconds, expires_at
              )
-             VALUES ($1, $2, 'same_batch', $3, $4, 'open')
-             ON CONFLICT (join_effect_id, correlation_id, batch_id) DO NOTHING",
+             VALUES (
+                $1,
+                $2,
+                'same_batch',
+                $3,
+                $4,
+                'open',
+                $5,
+                CASE
+                    WHEN $5 IS NULL THEN NULL
+                    ELSE NOW() + ($5::int * INTERVAL '1 second')
+                END
+             )
+             ON CONFLICT (join_handler_id, correlation_id, batch_id) DO NOTHING",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .bind(batch_size)
+        .bind(join_window_timeout_seconds)
         .execute(&mut *tx)
         .await?;
 
@@ -1028,12 +1077,12 @@ impl Store for PostgresStore {
             "UPDATE seesaw_join_windows
              SET target_count = $4,
                  updated_at = NOW()
-             WHERE join_effect_id = $1
+             WHERE join_handler_id = $1
                AND correlation_id = $2
                AND batch_id = $3
                AND target_count <> $4",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .bind(batch_size)
@@ -1047,20 +1096,21 @@ impl Store for PostgresStore {
                  processing_started_at = NOW(),
                  updated_at = NOW(),
                  last_error = NULL
-             WHERE w.join_effect_id = $1
+             WHERE w.join_handler_id = $1
                AND w.correlation_id = $2
                AND w.batch_id = $3
                AND w.status = 'open'
+               AND (w.expires_at IS NULL OR w.expires_at > NOW())
                AND (
                     SELECT COUNT(*)::int
                     FROM seesaw_join_entries e
-                    WHERE e.join_effect_id = w.join_effect_id
+                    WHERE e.join_handler_id = w.join_handler_id
                       AND e.correlation_id = w.correlation_id
                       AND e.batch_id = w.batch_id
                ) >= w.target_count
-             RETURNING w.join_effect_id",
+             RETURNING w.join_handler_id",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .fetch_optional(&mut *tx)
@@ -1074,12 +1124,12 @@ impl Store for PostgresStore {
         let rows = sqlx::query_as::<_, (Uuid, String, serde_json::Value, Uuid, i32, i32, DateTime<Utc>)>(
             "SELECT source_event_id, source_event_type, source_payload, batch_id, batch_index, batch_size, source_created_at
              FROM seesaw_join_entries
-             WHERE join_effect_id = $1
+             WHERE join_handler_id = $1
                AND correlation_id = $2
                AND batch_id = $3
              ORDER BY batch_index ASC, source_created_at ASC, source_event_id ASC",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .fetch_all(&mut *tx)
@@ -1114,7 +1164,7 @@ impl Store for PostgresStore {
 
     async fn join_same_batch_complete(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         batch_id: Uuid,
     ) -> Result<()> {
@@ -1125,11 +1175,11 @@ impl Store for PostgresStore {
              SET status = 'completed',
                  completed_at = NOW(),
                  updated_at = NOW()
-             WHERE join_effect_id = $1
+             WHERE join_handler_id = $1
                AND correlation_id = $2
                AND batch_id = $3",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .execute(&mut *tx)
@@ -1137,11 +1187,11 @@ impl Store for PostgresStore {
 
         sqlx::query(
             "DELETE FROM seesaw_join_entries
-             WHERE join_effect_id = $1
+             WHERE join_handler_id = $1
                AND correlation_id = $2
                AND batch_id = $3",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .execute(&mut *tx)
@@ -1149,11 +1199,11 @@ impl Store for PostgresStore {
 
         sqlx::query(
             "DELETE FROM seesaw_join_windows
-             WHERE join_effect_id = $1
+             WHERE join_handler_id = $1
                AND correlation_id = $2
                AND batch_id = $3",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .execute(&mut *tx)
@@ -1165,7 +1215,7 @@ impl Store for PostgresStore {
 
     async fn join_same_batch_release(
         &self,
-        join_effect_id: String,
+        join_handler_id: String,
         correlation_id: Uuid,
         batch_id: Uuid,
         error: String,
@@ -1176,12 +1226,12 @@ impl Store for PostgresStore {
                  processing_started_at = NULL,
                  last_error = $4,
                  updated_at = NOW()
-             WHERE join_effect_id = $1
+             WHERE join_handler_id = $1
                AND correlation_id = $2
                AND batch_id = $3
                AND status = 'processing'",
         )
-        .bind(&join_effect_id)
+        .bind(&join_handler_id)
         .bind(correlation_id)
         .bind(batch_id)
         .bind(error)
@@ -1189,6 +1239,79 @@ impl Store for PostgresStore {
         .await?;
 
         Ok(())
+    }
+
+    async fn expire_same_batch_windows(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ExpiredJoinWindow>> {
+        let mut tx = self.pool.begin().await?;
+
+        let windows = sqlx::query_as::<_, (String, Uuid, Uuid)>(
+            "SELECT join_handler_id, correlation_id, batch_id
+             FROM seesaw_join_windows
+             WHERE status = 'open'
+               AND expires_at IS NOT NULL
+               AND expires_at <= $1
+             FOR UPDATE SKIP LOCKED",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut expired = Vec::with_capacity(windows.len());
+        for (join_handler_id, correlation_id, batch_id) in windows {
+            let source_event_ids = sqlx::query_as::<_, (Uuid,)>(
+                "SELECT source_event_id
+                 FROM seesaw_join_entries
+                 WHERE join_handler_id = $1
+                   AND correlation_id = $2
+                   AND batch_id = $3
+                 ORDER BY batch_index ASC, source_created_at ASC, source_event_id ASC",
+            )
+            .bind(&join_handler_id)
+            .bind(correlation_id)
+            .bind(batch_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>();
+
+            sqlx::query(
+                "DELETE FROM seesaw_join_entries
+                 WHERE join_handler_id = $1
+                   AND correlation_id = $2
+                   AND batch_id = $3",
+            )
+            .bind(&join_handler_id)
+            .bind(correlation_id)
+            .bind(batch_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "DELETE FROM seesaw_join_windows
+                 WHERE join_handler_id = $1
+                   AND correlation_id = $2
+                   AND batch_id = $3",
+            )
+            .bind(&join_handler_id)
+            .bind(correlation_id)
+            .bind(batch_id)
+            .execute(&mut *tx)
+            .await?;
+
+            expired.push(ExpiredJoinWindow {
+                join_handler_id,
+                correlation_id,
+                batch_id,
+                source_event_ids,
+            });
+        }
+
+        tx.commit().await?;
+        Ok(expired)
     }
 }
 
@@ -1199,7 +1322,7 @@ struct StreamRow {
     correlation_id: Uuid,
     event_id: Option<Uuid>,
     effect_event_id: Option<Uuid>,
-    effect_id: Option<String>,
+    handler_id: Option<String>,
     status: Option<String>,
     error: Option<String>,
     payload: Option<serde_json::Value>,
@@ -1210,7 +1333,7 @@ struct StreamRow {
 struct EffectLogRow {
     correlation_id: Uuid,
     event_id: Uuid,
-    effect_id: String,
+    handler_id: String,
     status: String,
     attempts: i32,
     event_type: String,
@@ -1227,7 +1350,7 @@ struct EffectLogRow {
 struct DeadLetterRow {
     correlation_id: Uuid,
     event_id: Uuid,
-    effect_id: String,
+    handler_id: String,
     event_type: String,
     event_payload: serde_json::Value,
     error: String,
@@ -1270,7 +1393,7 @@ impl InsightStore for PostgresStore {
                         // (notification payload is just correlation_id for wake-up)
                         if let Ok(row) = sqlx::query_as::<_, StreamRow>(
                             "SELECT seq, stream_type, correlation_id, event_id, effect_event_id,
-                                    effect_id, status, error, payload, created_at
+                                    handler_id, status, error, payload, created_at
                              FROM seesaw_stream
                              ORDER BY seq DESC
                              LIMIT 1",
@@ -1306,9 +1429,9 @@ impl InsightStore for PostgresStore {
 
         // Get all effects for this correlation
         let effects = sqlx::query_as::<_, EffectTreeRow>(
-            "SELECT event_id, effect_id, status, result, error, attempts, created_at,
+            "SELECT event_id, handler_id, status, result, error, attempts, created_at,
                     batch_id, batch_index, batch_size
-             FROM seesaw_effect_executions
+             FROM seesaw_handler_executions
              WHERE correlation_id = $1
              ORDER BY created_at ASC",
         )
@@ -1335,7 +1458,7 @@ impl InsightStore for PostgresStore {
             .0;
 
         let active_effects = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM seesaw_effect_executions
+            "SELECT COUNT(*) FROM seesaw_handler_executions
              WHERE status IN ('pending', 'executing')",
         )
         .fetch_one(&self.pool)
@@ -1343,14 +1466,14 @@ impl InsightStore for PostgresStore {
         .0;
 
         let completed_effects = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM seesaw_effect_executions WHERE status = 'completed'",
+            "SELECT COUNT(*) FROM seesaw_handler_executions WHERE status = 'completed'",
         )
         .fetch_one(&self.pool)
         .await?
         .0;
 
         let failed_effects = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM seesaw_effect_executions WHERE status = 'failed'",
+            "SELECT COUNT(*) FROM seesaw_handler_executions WHERE status = 'failed'",
         )
         .fetch_one(&self.pool)
         .await?
@@ -1372,7 +1495,7 @@ impl InsightStore for PostgresStore {
         let rows = if let Some(cursor_seq) = cursor {
             sqlx::query_as::<_, StreamRow>(
                 "SELECT seq, stream_type, correlation_id, event_id, effect_event_id,
-                        effect_id, status, error, payload, created_at
+                        handler_id, status, error, payload, created_at
                  FROM seesaw_stream
                  WHERE seq > $1
                  ORDER BY seq ASC
@@ -1385,7 +1508,7 @@ impl InsightStore for PostgresStore {
         } else {
             sqlx::query_as::<_, StreamRow>(
                 "SELECT seq, stream_type, correlation_id, event_id, effect_event_id,
-                        effect_id, status, error, payload, created_at
+                        handler_id, status, error, payload, created_at
                  FROM seesaw_stream
                  ORDER BY seq DESC
                  LIMIT $1",
@@ -1407,7 +1530,7 @@ impl InsightStore for PostgresStore {
             "SELECT
                 correlation_id,
                 event_id,
-                effect_id,
+                handler_id,
                 status,
                 attempts,
                 event_type,
@@ -1418,7 +1541,7 @@ impl InsightStore for PostgresStore {
                 claimed_at,
                 last_attempted_at,
                 completed_at
-             FROM seesaw_effect_executions
+             FROM seesaw_handler_executions
              WHERE ($1::uuid IS NULL OR correlation_id = $1)
              ORDER BY COALESCE(last_attempted_at, created_at) DESC, event_id DESC
              LIMIT $2",
@@ -1440,7 +1563,7 @@ impl InsightStore for PostgresStore {
                 EffectExecutionLog {
                     correlation_id: row.correlation_id,
                     event_id: row.event_id,
-                    effect_id: row.effect_id,
+                    handler_id: row.handler_id,
                     status: row.status,
                     attempts: row.attempts,
                     event_type: Some(row.event_type),
@@ -1466,7 +1589,7 @@ impl InsightStore for PostgresStore {
             "SELECT
                 correlation_id,
                 event_id,
-                effect_id,
+                handler_id,
                 event_type,
                 event_payload,
                 error,
@@ -1489,7 +1612,7 @@ impl InsightStore for PostgresStore {
             .map(|row| DeadLetterEntry {
                 correlation_id: row.correlation_id,
                 event_id: row.event_id,
-                effect_id: row.effect_id,
+                handler_id: row.handler_id,
                 event_type: row.event_type,
                 event_payload: row.event_payload,
                 error: row.error,
@@ -1510,7 +1633,7 @@ impl InsightStore for PostgresStore {
                     COUNT(*) FILTER (WHERE status IN ('pending', 'executing'))::BIGINT AS active_effects,
                     MAX(last_attempted_at) FILTER (WHERE status = 'failed') AS last_failed_at,
                     MAX(error) FILTER (WHERE status = 'failed') AS last_error
-                FROM seesaw_effect_executions
+                FROM seesaw_handler_executions
                 GROUP BY correlation_id
              ),
              dlq_agg AS (
@@ -1556,7 +1679,7 @@ impl InsightStore for PostgresStore {
 #[derive(FromRow)]
 struct EffectTreeRow {
     event_id: Uuid,
-    effect_id: String,
+    handler_id: String,
     status: String,
     result: Option<serde_json::Value>,
     error: Option<String>,
@@ -1593,7 +1716,7 @@ fn stream_row_to_insight_event(row: StreamRow) -> InsightEvent {
         correlation_id: row.correlation_id,
         event_id: row.event_id,
         effect_event_id: row.effect_event_id,
-        effect_id: row.effect_id,
+        handler_id: row.handler_id,
         event_type,
         status: row.status,
         error: row.error,
@@ -1624,11 +1747,11 @@ fn build_event_tree(
         })
         .map(|event| {
             // Get effects for this event
-            let event_effects: Vec<EffectNode> = effects
+            let event_effects: Vec<HandlerNode> = effects
                 .iter()
                 .filter(|eff| eff.event_id == event.event_id)
-                .map(|eff| EffectNode {
-                    effect_id: eff.effect_id.clone(),
+                .map(|eff| HandlerNode {
+                    handler_id: eff.handler_id.clone(),
                     event_id: eff.event_id,
                     status: eff.status.clone(),
                     result: eff.result.clone(),
@@ -1698,17 +1821,17 @@ mod tests {
     }
 
     #[test]
-    fn effect_retry_delay_seconds_uses_exponential_backoff() {
-        assert_eq!(effect_retry_delay_seconds(1), 1);
-        assert_eq!(effect_retry_delay_seconds(2), 2);
-        assert_eq!(effect_retry_delay_seconds(3), 4);
-        assert_eq!(effect_retry_delay_seconds(4), 8);
+    fn handler_retry_delay_seconds_uses_exponential_backoff() {
+        assert_eq!(handler_retry_delay_seconds(1), 1);
+        assert_eq!(handler_retry_delay_seconds(2), 2);
+        assert_eq!(handler_retry_delay_seconds(3), 4);
+        assert_eq!(handler_retry_delay_seconds(4), 8);
     }
 
     #[test]
-    fn effect_retry_delay_seconds_is_capped() {
-        assert_eq!(effect_retry_delay_seconds(9), 256);
-        assert_eq!(effect_retry_delay_seconds(50), 256);
+    fn handler_retry_delay_seconds_is_capped() {
+        assert_eq!(handler_retry_delay_seconds(9), 256);
+        assert_eq!(handler_retry_delay_seconds(50), 256);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Batch Processing Example (stateless)
 
 use anyhow::Result;
-use seesaw_core::{effect, EffectContext, Engine};
+use seesaw_core::{effect, Engine, HandlerContext};
 use seesaw_memory::MemoryStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,11 @@ struct ImportProgress {
     rejected_rows: usize,
 }
 
+// ⚠️ WARNING: Arc<Mutex> is ONLY safe for single-worker deployments!
+// For distributed/multi-worker setups, use:
+// - External storage (Postgres, Redis) for progress tracking
+// - Event-threaded state (store progress in event fields)
+// See docs/DISTRIBUTED-SAFETY.md for details
 #[derive(Clone, Default)]
 struct Deps {
     progress: Arc<Mutex<HashMap<Uuid, ImportProgress>>>,
@@ -112,9 +117,9 @@ impl Deps {
     }
 }
 
-fn build_effects() -> Vec<seesaw_core::Effect<Deps>> {
+fn build_effects() -> Vec<seesaw_core::Handler<Deps>> {
     vec![
-        effect::on::<ImportEvent>()
+        handler::on::<ImportEvent>()
             .extract(|e| match e {
                 ImportEvent::FileUploaded {
                     file_id,
@@ -124,7 +129,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<Deps>> {
                 _ => None,
             })
             .then::<Deps, (Uuid, String, usize), _, _, Vec<ImportEvent>, ImportEvent>(
-                |(file_id, file_path, expected_rows), ctx: EffectContext<Deps>| async move {
+                |(file_id, file_path, expected_rows), ctx: HandlerContext<Deps>| async move {
                     ctx.deps().start_import(file_id, expected_rows);
                     let rows = ctx.deps().parse_csv(&file_path).await?;
 
@@ -140,7 +145,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<Deps>> {
                     Ok(events)
                 },
             ),
-        effect::on::<ImportEvent>()
+        handler::on::<ImportEvent>()
             .extract(|e| match e {
                 ImportEvent::RowParsed {
                     file_id,
@@ -150,7 +155,7 @@ fn build_effects() -> Vec<seesaw_core::Effect<Deps>> {
                 _ => None,
             })
             .then(
-                |(file_id, row_id, data), ctx: EffectContext<Deps>| async move {
+                |(file_id, row_id, data), ctx: HandlerContext<Deps>| async move {
                     match ctx.deps().validate_row(&data).await {
                         Ok(()) => Ok(ImportEvent::RowValidated {
                             file_id,
@@ -165,11 +170,11 @@ fn build_effects() -> Vec<seesaw_core::Effect<Deps>> {
                     }
                 },
             ),
-        effect::on::<ImportEvent>()
+        handler::on::<ImportEvent>()
             .join()
             .same_batch()
             .then::<Deps, _, _, Vec<ImportEvent>, ImportEvent>(
-                |batch: Vec<ImportEvent>, ctx: EffectContext<Deps>| async move {
+                |batch: Vec<ImportEvent>, ctx: HandlerContext<Deps>| async move {
                     let mut rows = Vec::new();
                     let mut file_id = None;
 
@@ -196,14 +201,14 @@ fn build_effects() -> Vec<seesaw_core::Effect<Deps>> {
                     Ok(vec![ImportEvent::BatchInserted { file_id, count }])
                 },
             ),
-        effect::on::<ImportEvent>()
+        handler::on::<ImportEvent>()
             .extract(|e| match e {
                 ImportEvent::RowValidated { file_id, .. } => Some((*file_id, true)),
                 ImportEvent::RowRejected { file_id, .. } => Some((*file_id, false)),
                 _ => None,
             })
             .then::<Deps, (Uuid, bool), _, _, Vec<ImportEvent>, ImportEvent>(
-                |(file_id, validated), ctx: EffectContext<Deps>| async move {
+                |(file_id, validated), ctx: HandlerContext<Deps>| async move {
                     if let Some((total, valid, rejected)) =
                         ctx.deps().mark_progress(file_id, validated)
                     {
@@ -230,7 +235,7 @@ async fn main() -> Result<()> {
     let store = MemoryStore::new();
     let deps = Deps::default();
 
-    let engine = Engine::new(deps, store).with_effects(build_effects());
+    let engine = Engine::new(deps, store).with_handlers(build_effects());
 
     let file_id = Uuid::new_v4();
     engine

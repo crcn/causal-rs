@@ -429,7 +429,7 @@ mod order_effects {
     }
 }
 
-let engine = Engine::new(deps, store).with_effects(order_effects::effects());
+let engine = Engine::new(deps, store).with_handlers(order_effects::effects());
 ```
 
 ---
@@ -576,11 +576,11 @@ async fn main() -> Result<()> {
 
     // Build engine
     let engine = Engine::with_deps(deps)
-        .with_effect(charge_effect)
-        .with_effect(confirm_effect)
-        .with_effect(approval_effect)
-        .with_effect(reminder_effect)
-        .with_effect(complete_effect)
+        .with_handler(charge_effect)
+        .with_handler(confirm_effect)
+        .with_handler(approval_effect)
+        .with_handler(reminder_effect)
+        .with_handler(complete_effect)
         .with_reducer(order_placed_reducer)
         .with_reducer(payment_charged_reducer)
         .with_reducer(confirmation_sent_reducer)
@@ -640,11 +640,11 @@ async fn main() -> Result<()> {
 
     // Build engine (same as v0.7)
     let engine = Engine::new(deps)
-        .with_effect(charge_effect)
-        .with_effect(confirm_effect)
-        .with_effect(approval_effect)
-        .with_effect(reminder_effect)
-        .with_effect(complete_effect)
+        .with_handler(charge_effect)
+        .with_handler(confirm_effect)
+        .with_handler(approval_effect)
+        .with_handler(reminder_effect)
+        .with_handler(complete_effect)
         .with_reducer(order_placed_reducer)
         .with_reducer(payment_charged_reducer)
         .with_reducer(confirmation_sent_reducer)

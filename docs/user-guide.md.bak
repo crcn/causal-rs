@@ -98,7 +98,7 @@ mod order_effects {
     }
 }
 
-let engine = seesaw::Engine::new(deps, store).with_effects(order_effects::effects());
+let engine = seesaw::Engine::new(deps, store).with_handlers(order_effects::effects());
 ```
 
 ---
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
 
     // Build engine
     let engine = Engine::new(deps);
-    for effect in effects { engine = engine.with_effect(effect); }
+    for effect in effects { engine = engine.with_handler(effect); }
     for reducer in reducers { engine = engine.with_reducer(reducer); }
 
     // Start workers (2 for events, 20 for effects)

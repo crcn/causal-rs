@@ -617,7 +617,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 
 **API Design**:
 ```rust
-engine.with_effect(
+engine.with_handler(
     effect::on::<OrderPlaced>()
         .id("send_welcome_email")  // ← Required! Compile error if missing
         .then(|event, ctx| async move {
@@ -1845,7 +1845,7 @@ async fn main() -> Result<()> {
 
     // Create engine with effects and reducers
     let engine = Engine::new(deps)
-        .with_effect(
+        .with_handler(
             effect::on::<OrderPlaced>()
                 .id("process_order")  // ← REQUIRED for idempotency
                 .then(|event, ctx| async move {
@@ -1855,7 +1855,7 @@ async fn main() -> Result<()> {
                     })
                 })
         )
-        .with_effect(
+        .with_handler(
             effect::on::<ApprovalRequested>()
                 .id("send_approval_email")  // ← REQUIRED
                 .then(|event, ctx| async move {
@@ -2183,7 +2183,7 @@ async fn main() -> Result<()> {
     let pool = PgPool::connect(&env::var("DATABASE_URL")?).await?;
 
     let engine = Engine::new(deps)
-        .with_effect(/* ... */)
+        .with_handler(/* ... */)
         .with_reducer(/* ... */);
 
     let queue = PostgresQueue::new(pool)
@@ -2539,7 +2539,7 @@ let effects = on! {
 };
 
 // Returns Vec<Effect<S, D>> - add to engine
-let engine = effects.into_iter().fold(Engine::new(deps), |e, eff| e.with_effect(eff));
+let engine = effects.into_iter().fold(Engine::new(deps), |e, eff| e.with_handler(eff));
 ```
 
 #### Attribute Syntax

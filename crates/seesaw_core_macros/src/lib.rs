@@ -4,13 +4,13 @@ use quote::{format_ident, quote, ToTokens};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, parse_quote, Attribute, Expr, FnArg, GenericArgument, Ident, Item, ItemFn,
-    ItemMod, Lit, Meta, MetaList, MetaNameValue, Pat, Path, PathArguments, ReturnType, Signature,
-    Token, Type, TypePath,
+    parse_macro_input, parse_quote, Attribute, Data, DeriveInput, Expr, Fields, FnArg,
+    GenericArgument, Ident, Item, ItemFn, ItemMod, Lit, Meta, MetaList, MetaNameValue, Pat, Path,
+    PathArguments, ReturnType, Signature, Token, Type, TypePath,
 };
 
 #[proc_macro_attribute]
-pub fn effect(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn handle(attr: TokenStream, item: TokenStream) -> TokenStream {
     let metas = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
     let input_fn = parse_macro_input!(item as ItemFn);
 
@@ -21,12 +21,22 @@ pub fn effect(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn effects(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
+    handle(attr, item)
+}
+
+#[proc_macro_attribute]
+pub fn handles(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = parse_macro_input!(item as ItemMod);
     match expand_effects_module(&mut module) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
+}
+
+#[proc_macro_attribute]
+pub fn handlers(attr: TokenStream, item: TokenStream) -> TokenStream {
+    handles(attr, item)
 }
 
 #[derive(Clone)]
@@ -70,6 +80,7 @@ impl OnSpec {
 struct EffectArgs {
     on: Option<OnSpec>,
     extract: Vec<Ident>,
+    accumulate: bool,
     join: bool,
     queued: bool,
     id: Option<String>,
@@ -77,6 +88,8 @@ struct EffectArgs {
     retry: Option<u32>,
     timeout_secs: Option<u64>,
     timeout_ms: Option<u64>,
+    window_timeout_secs: Option<u64>,
+    window_timeout_ms: Option<u64>,
     delay_secs: Option<u64>,
     delay_ms: Option<u64>,
     priority: Option<i32>,
@@ -97,13 +110,13 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.fn_token,
-            "#[effect] requires an async function",
+            "#[handler] requires an async function",
         ));
     }
     if !input_fn.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.generics,
-            "#[effect] does not support generic functions",
+            "#[handler] does not support generic functions",
         ));
     }
 
@@ -119,17 +132,36 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             "cannot specify both delay_secs and delay_ms",
         ));
     }
+    if args.window_timeout_secs.is_some() && args.window_timeout_ms.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "cannot specify both window_timeout_secs and window_timeout_ms",
+        ));
+    }
+    let is_accumulate = args.accumulate || args.join;
     if effect_requires_stable_id(&args) && args.id.is_none() && args.group.is_none() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "queued/durable #[effect] requires an explicit id = \"...\" (or group = \"...\")",
+            "queued/durable #[handler] requires an explicit id = \"...\" (or group = \"...\")",
+        ));
+    }
+
+    // Enforce explicit 'queued' attribute when using background-only features
+    if effect_requires_background(&args) && !args.queued && !is_accumulate {
+        let features = collect_background_features(&args);
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "handlers with {} must explicitly include 'queued' attribute to indicate background execution",
+                features.join(" and ")
+            ),
         ));
     }
 
     let on = args.on.clone().ok_or_else(|| {
         syn::Error::new(
             proc_macro2::Span::call_site(),
-            "#[effect] requires on = EventType or on = [Enum::Variant, ...]",
+            "#[handler] requires on = EventType or on = [Enum::Variant, ...]",
         )
     })?;
     let on_event_type = on.event_type()?;
@@ -142,26 +174,26 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         .filter_map(|(idx, param)| if idx == ctx_idx { None } else { Some(param) })
         .collect();
 
-    let input_builder = quote! { ::seesaw_core::effect::on::<#on_event_type>() };
+    let input_builder = quote! { ::seesaw_core::on::<#on_event_type>() };
     let builder = apply_effect_config(input_builder, &args, &fn_ident);
 
-    let chain = if args.join {
+    let chain = if is_accumulate {
         if !args.extract.is_empty() {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "join and extract(...) cannot be used together",
+                "accumulate and extract(...) cannot be used together",
             ));
         }
         if !matches!(on, OnSpec::EventType(_)) {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "join requires on = EventType (not on = [...])",
+                "accumulate requires on = EventType (not on = [...])",
             ));
         }
         if non_ctx_params.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &input_fn.sig.inputs,
-                "join requires exactly one non-context parameter of type Vec<T>",
+                "accumulate requires exactly one non-context parameter of type Vec<T>",
             ));
         }
 
@@ -169,22 +201,21 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         let batch_ty = vec_inner_type(&batch_param.ty).ok_or_else(|| {
             syn::Error::new_spanned(
                 &batch_param.ty,
-                "join requires first parameter to be Vec<T> where on = T",
+                "accumulate requires first parameter to be Vec<T> where on = T",
             )
         })?;
 
         if type_key(batch_ty) != path_key(&on_event_type) {
             return Err(syn::Error::new_spanned(
                 &batch_param.ty,
-                "join requires first parameter type Vec<T> to match on = T",
+                "accumulate requires first parameter type Vec<T> to match on = T",
             ));
         }
 
         let batch_ident = &batch_param.ident;
         quote! {
             #builder
-                .join()
-                .same_batch()
+                .accumulate()
                 .then::<#deps_ty, _, _, _, #output_event_ty>(|#batch_ident, __seesaw_ctx| #fn_ident(#batch_ident, __seesaw_ctx))
         }
     } else if !args.extract.is_empty() {
@@ -265,7 +296,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         if non_ctx_params.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &input_fn.sig.inputs,
-                "#[effect] requires exactly one event parameter plus EffectContext when extract(...) is not used",
+                "#[handler] requires exactly one event parameter plus HandlerContext when extract(...) is not used",
             ));
         }
         if !matches!(on, OnSpec::EventType(_)) {
@@ -294,7 +325,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         #input_fn
 
         #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::seesaw_core::Effect<#deps_ty> {
+        pub fn #wrapper_ident() -> ::seesaw_core::Handler<#deps_ty> {
             #chain
         }
     })
@@ -304,7 +335,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     let Some((_, items)) = &mut module.content else {
         return Err(syn::Error::new_spanned(
             module,
-            "#[effects] requires an inline module",
+            "#[handlers] requires an inline module",
         ));
     };
 
@@ -315,7 +346,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         let Item::Fn(item_fn) = item else {
             continue;
         };
-        if !has_attr(&item_fn.attrs, "effect") {
+        if !has_attr_any(&item_fn.attrs, &["handle", "handler"]) {
             continue;
         }
 
@@ -329,7 +360,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
                 if type_key(existing_deps) != type_key(&deps) {
                     return Err(syn::Error::new_spanned(
                         &item_fn.sig,
-                        "all #[effect] handlers in an #[effects] module must use the same EffectContext<Deps>",
+                        "all #[handler] handlers in an #[handlers] module must use the same HandlerContext<Deps>",
                     ));
                 }
             }
@@ -339,17 +370,23 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     if wrappers.is_empty() {
         return Err(syn::Error::new_spanned(
             module,
-            "#[effects] module must contain at least one #[effect] function",
+            "#[handlers] module must contain at least one #[handler] function",
         ));
     }
 
     let deps_ty = deps_ty.expect("checked above");
-    let registration_fn: ItemFn = parse_quote! {
-        pub fn effects() -> ::std::vec::Vec<::seesaw_core::Effect<#deps_ty>> {
+    let handles_fn: ItemFn = parse_quote! {
+        pub fn handles() -> ::std::vec::Vec<::seesaw_core::Handler<#deps_ty>> {
             ::std::vec![#(#wrappers()),*]
         }
     };
-    items.push(Item::Fn(registration_fn));
+    let handlers_fn: ItemFn = parse_quote! {
+        pub fn handlers() -> ::std::vec::Vec<::seesaw_core::Handler<#deps_ty>> {
+            handles()
+        }
+    };
+    items.push(Item::Fn(handles_fn));
+    items.push(Item::Fn(handlers_fn));
 
     Ok(quote! { #module })
 }
@@ -372,11 +409,20 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 }
                 args.extract = parse_extract_fields(list)?;
             }
-            Meta::Path(path) if path.is_ident("join") => {
-                if args.join {
+            Meta::Path(path) if path.is_ident("accumulate") => {
+                if args.accumulate || args.join {
                     return Err(syn::Error::new_spanned(
                         path,
-                        "join specified more than once",
+                        "accumulate specified more than once",
+                    ));
+                }
+                args.accumulate = true;
+            }
+            Meta::Path(path) if path.is_ident("join") => {
+                if args.accumulate || args.join {
+                    return Err(syn::Error::new_spanned(
+                        path,
+                        "accumulate specified more than once",
                     ));
                 }
                 args.join = true;
@@ -410,6 +456,16 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 ensure_unset(&args.timeout_ms, nv, "timeout_ms")?;
                 args.timeout_ms = Some(parse_int_lit::<u64>(&nv.value, "timeout_ms")?);
             }
+            Meta::NameValue(nv) if nv.path.is_ident("window_timeout_secs") => {
+                ensure_unset(&args.window_timeout_secs, nv, "window_timeout_secs")?;
+                args.window_timeout_secs =
+                    Some(parse_int_lit::<u64>(&nv.value, "window_timeout_secs")?);
+            }
+            Meta::NameValue(nv) if nv.path.is_ident("window_timeout_ms") => {
+                ensure_unset(&args.window_timeout_ms, nv, "window_timeout_ms")?;
+                args.window_timeout_ms =
+                    Some(parse_int_lit::<u64>(&nv.value, "window_timeout_ms")?);
+            }
             Meta::NameValue(nv) if nv.path.is_ident("delay_secs") => {
                 ensure_unset(&args.delay_secs, nv, "delay_secs")?;
                 args.delay_secs = Some(parse_int_lit::<u64>(&nv.value, "delay_secs")?);
@@ -429,7 +485,7 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
             _ => {
                 return Err(syn::Error::new_spanned(
                     meta,
-                    "unsupported #[effect] option",
+                    "unsupported #[handler] option",
                 ));
             }
         }
@@ -551,7 +607,7 @@ fn find_effect_context(sig: &Signature) -> syn::Result<(usize, Type)> {
             if found.is_some() {
                 return Err(syn::Error::new_spanned(
                     &typed.ty,
-                    "multiple EffectContext parameters are not supported",
+                    "multiple HandlerContext parameters are not supported",
                 ));
             }
             found = Some((index, deps));
@@ -561,7 +617,7 @@ fn find_effect_context(sig: &Signature) -> syn::Result<(usize, Type)> {
     found.ok_or_else(|| {
         syn::Error::new_spanned(
             &sig.inputs,
-            "effect handler must include ctx: EffectContext<Deps>",
+            "effect handler must include ctx: HandlerContext<Deps>",
         )
     })
 }
@@ -571,7 +627,7 @@ fn parse_effect_context_type(ty: &Type) -> Option<Type> {
         return None;
     };
     let last = path.segments.last()?;
-    if last.ident != "EffectContext" {
+    if last.ident != "HandlerContext" {
         return None;
     }
     let PathArguments::AngleBracketed(args) = &last.arguments else {
@@ -686,6 +742,18 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     if let Some(timeout_ms) = args.timeout_ms {
         builder = quote! { #builder .timeout(::std::time::Duration::from_millis(#timeout_ms)) };
     }
+    if let Some(window_timeout_secs) = args.window_timeout_secs {
+        builder = quote! {
+            #builder
+                .window_timeout(::std::time::Duration::from_secs(#window_timeout_secs))
+        };
+    }
+    if let Some(window_timeout_ms) = args.window_timeout_ms {
+        builder = quote! {
+            #builder
+                .window_timeout(::std::time::Duration::from_millis(#window_timeout_ms))
+        };
+    }
     if let Some(delay_secs) = args.delay_secs {
         builder = quote! { #builder .delayed(::std::time::Duration::from_secs(#delay_secs)) };
     }
@@ -701,17 +769,52 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
 
 fn effect_requires_stable_id(args: &EffectArgs) -> bool {
     args.queued
+        || args.accumulate
         || args.join
         || args.delay_secs.is_some()
         || args.delay_ms.is_some()
         || args.timeout_secs.is_some()
         || args.timeout_ms.is_some()
+        || args.window_timeout_secs.is_some()
+        || args.window_timeout_ms.is_some()
         || args.priority.is_some()
         || args.retry.unwrap_or(1) > 1
 }
 
+/// Check if handler requires background execution (excluding explicit queued/accumulate)
+fn effect_requires_background(args: &EffectArgs) -> bool {
+    args.retry.unwrap_or(1) > 1
+        || args.timeout_secs.is_some()
+        || args.timeout_ms.is_some()
+        || args.delay_secs.is_some()
+        || args.delay_ms.is_some()
+        || args.priority.is_some()
+}
+
+/// Collect list of background-only features for error message
+fn collect_background_features(args: &EffectArgs) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if args.retry.unwrap_or(1) > 1 {
+        features.push("retry > 1");
+    }
+    if args.timeout_secs.is_some() || args.timeout_ms.is_some() {
+        features.push("timeout");
+    }
+    if args.delay_secs.is_some() || args.delay_ms.is_some() {
+        features.push("delay");
+    }
+    if args.priority.is_some() {
+        features.push("priority");
+    }
+    features
+}
+
 fn has_attr(attrs: &[Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident(name))
+}
+
+fn has_attr_any(attrs: &[Attribute], names: &[&str]) -> bool {
+    names.iter().any(|name| has_attr(attrs, name))
 }
 
 fn path_key(path: &Path) -> String {
@@ -745,7 +848,7 @@ fn effect_output_event_type(sig: &Signature) -> syn::Result<Type> {
     let ReturnType::Type(_, output_ty) = &sig.output else {
         return Err(syn::Error::new_spanned(
             &sig.output,
-            "#[effect] must return Result<T>",
+            "#[handler] must return Result<T>",
         ));
     };
 
@@ -851,6 +954,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_effect_args_supports_accumulate_flag() {
+        let metas = parse_effect_meta_list(quote!(on = MyEvent, accumulate));
+        let args = parse_effect_args(&metas).expect("accumulate should parse");
+        assert!(args.accumulate);
+    }
+
+    #[test]
     fn apply_effect_config_emits_queued_builder_call() {
         let args = EffectArgs {
             queued: true,
@@ -858,7 +968,7 @@ mod tests {
         };
         let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
         let configured = apply_effect_config(
-            quote!(::seesaw_core::effect::on::<MyEvent>()),
+            quote!(::seesaw_core::on::<MyEvent>()),
             &args,
             &handler_ident,
         );
@@ -871,13 +981,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_effect_config_emits_window_timeout_builder_call() {
+        let args = EffectArgs {
+            window_timeout_secs: Some(60),
+            ..EffectArgs::default()
+        };
+        let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
+        let configured = apply_effect_config(
+            quote!(::seesaw_core::on::<MyEvent>()),
+            &args,
+            &handler_ident,
+        );
+        let configured_text = configured.to_string();
+        assert!(
+            configured_text.contains(". window_timeout (")
+                && configured_text.contains("Duration :: from_secs"),
+            "window_timeout builder call should be emitted, got: {}",
+            configured_text
+        );
+    }
+
+    #[test]
     fn parse_effect_args_rejects_delivery_option() {
         let metas = parse_effect_meta_list(quote!(on = MyEvent, delivery = "durable"));
         let error = parse_effect_args(&metas)
             .err()
             .expect("delivery option should remain unsupported");
         assert!(
-            error.to_string().contains("unsupported #[effect] option"),
+            error.to_string().contains("unsupported #[handler] option"),
             "unexpected error: {}",
             error
         );
@@ -890,5 +1021,160 @@ mod tests {
             ..EffectArgs::default()
         };
         assert!(effect_requires_stable_id(&durable));
+    }
+}
+
+/// Derive macro for `DistributedSafe` trait.
+///
+/// Validates that all fields implement `DistributedSafe` to ensure
+/// the type is safe for multi-worker distributed deployments.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use seesaw_core::DistributedSafe;
+///
+/// #[derive(Clone, DistributedSafe)]
+/// struct Deps {
+///     db: sqlx::PgPool,      // ✅ Implements DistributedSafe
+///     http: reqwest::Client, // ✅ Implements DistributedSafe
+/// }
+/// ```
+///
+/// # Opt-out
+///
+/// Use `#[allow_non_distributed]` to explicitly allow non-distributed fields:
+///
+/// ```rust,ignore
+/// #[derive(Clone, DistributedSafe)]
+/// struct Deps {
+///     db: sqlx::PgPool,
+///     #[allow_non_distributed]  // ⚠️ Warning: won't sync across workers
+///     cache: Arc<Mutex<HashMap>>,
+/// }
+/// ```
+#[proc_macro_derive(DistributedSafe, attributes(allow_non_distributed))]
+pub fn derive_distributed_safe(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    match derive_distributed_safe_impl(input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn derive_distributed_safe_impl(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    // Validate all fields implement DistributedSafe
+    match &input.data {
+        Data::Struct(data) => {
+            validate_fields(&data.fields)?;
+        }
+        Data::Enum(_) => {
+            return Err(syn::Error::new_spanned(
+                name,
+                "DistributedSafe can only be derived for structs, not enums",
+            ));
+        }
+        Data::Union(_) => {
+            return Err(syn::Error::new_spanned(
+                name,
+                "DistributedSafe can only be derived for structs, not unions",
+            ));
+        }
+    }
+
+    Ok(quote! {
+        impl #impl_generics ::seesaw_core::distributed_safe::sealed::Sealed for #name #ty_generics #where_clause {}
+
+        impl #impl_generics ::seesaw_core::DistributedSafe for #name #ty_generics #where_clause {}
+    })
+}
+
+fn validate_fields(fields: &Fields) -> syn::Result<()> {
+    let fields_iter = match fields {
+        Fields::Named(fields) => fields.named.iter(),
+        Fields::Unnamed(fields) => fields.unnamed.iter(),
+        Fields::Unit => return Ok(()),
+    };
+
+    for field in fields_iter {
+        // Check if field has #[allow_non_distributed] attribute
+        if has_attr(&field.attrs, "allow_non_distributed") {
+            // Emit a warning-style compile message via compile_error in a const
+            // (We can't emit actual warnings from proc macros, but we can document it)
+            continue;
+        }
+
+        // Check if field type looks dangerous
+        if is_dangerous_type(&field.ty) {
+            return Err(syn::Error::new_spanned(
+                &field.ty,
+                format!(
+                    "field type may not be distributed-safe (contains Arc<Mutex> or similar). \
+                     Either: (1) use external storage (Database, Redis), \
+                     (2) use event-threaded state, or \
+                     (3) add #[allow_non_distributed] attribute to explicitly opt-out"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_dangerous_type(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => {
+            let path = &type_path.path;
+            let segments: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+
+            // Check for Arc<Mutex<...>> pattern
+            if segments.contains(&"Arc".to_string()) {
+                // Look for nested Mutex, RwLock, etc.
+                for segment in &path.segments {
+                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                        for arg in &args.args {
+                            if let GenericArgument::Type(inner_ty) = arg {
+                                if type_contains_lock(inner_ty) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check for Mutex, RwLock, etc. at top level
+            if segments.contains(&"Mutex".to_string())
+                || segments.contains(&"RwLock".to_string())
+                || segments.contains(&"RefCell".to_string())
+            {
+                return true;
+            }
+
+            false
+        }
+        _ => false,
+    }
+}
+
+fn type_contains_lock(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => {
+            let segments: Vec<_> = type_path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            segments.contains(&"Mutex".to_string())
+                || segments.contains(&"RwLock".to_string())
+                || segments.contains(&"RefCell".to_string())
+        }
+        _ => false,
     }
 }

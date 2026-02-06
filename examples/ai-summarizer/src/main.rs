@@ -1,7 +1,7 @@
 //! AI Summarizer Example (stateless)
 
 use anyhow::{bail, Result};
-use seesaw_core::{effect, EffectContext, Engine};
+use seesaw_core::{effect, Engine, HandlerContext};
 use seesaw_memory::MemoryStore;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -94,15 +94,15 @@ async fn main() -> Result<()> {
         api_key,
     };
 
-    let engine = Engine::new(deps, store).with_effect(
-        effect::on::<SummaryEvent>()
+    let engine = Engine::new(deps, store).with_handler(
+        handler::on::<SummaryEvent>()
             .extract(|e| match e {
                 SummaryEvent::SummarizeRequested { task_id, text } => {
                     Some((*task_id, text.clone()))
                 }
                 _ => None,
             })
-            .then(|(task_id, text), ctx: EffectContext<Deps>| async move {
+            .then(|(task_id, text), ctx: HandlerContext<Deps>| async move {
                 let request = AnthropicRequest {
                     model: "claude-3-5-sonnet-20241022".to_string(),
                     max_tokens: 1024,

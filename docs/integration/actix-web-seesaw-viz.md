@@ -113,7 +113,7 @@ let engine = Engine::with_deps(deps)
     // ... your existing effects ...
 
     // Add visualization observer (P1: non-blocking async channel)
-    .with_effect(
+    .with_handler(
         effect::on_any().then(move |event, ctx| {
             let observer = viz_observer.clone();
             async move {

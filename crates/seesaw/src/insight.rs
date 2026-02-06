@@ -27,7 +27,7 @@ pub struct InsightEvent {
     /// Effect event ID (if effect-related)
     pub effect_event_id: Option<Uuid>,
     /// Effect ID (if effect-related)
-    pub effect_id: Option<String>,
+    pub handler_id: Option<String>,
     /// Event type name
     pub event_type: Option<String>,
     /// Status (for effect lifecycle)
@@ -90,14 +90,14 @@ pub struct EventNode {
     /// Child events
     pub children: Vec<EventNode>,
     /// Effects triggered by this event
-    pub effects: Vec<EffectNode>,
+    pub effects: Vec<HandlerNode>,
 }
 
 /// Effect node in the tree
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EffectNode {
+pub struct HandlerNode {
     /// Effect ID
-    pub effect_id: String,
+    pub handler_id: String,
     /// Event ID that triggered this effect
     pub event_id: Uuid,
     /// Status (pending, executing, completed, failed)
@@ -142,7 +142,7 @@ pub struct EffectExecutionLog {
     /// Triggering event ID.
     pub event_id: Uuid,
     /// Effect identifier.
-    pub effect_id: String,
+    pub handler_id: String,
     /// Current status (pending, executing, completed, failed).
     pub status: String,
     /// Attempt count.
@@ -175,7 +175,7 @@ pub struct DeadLetterEntry {
     /// Triggering event ID.
     pub event_id: Uuid,
     /// Effect identifier.
-    pub effect_id: String,
+    pub handler_id: String,
     /// Triggering event type.
     pub event_type: String,
     /// Triggering event payload snapshot.

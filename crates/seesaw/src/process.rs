@@ -354,6 +354,13 @@ mod tests {
             Ok(())
         }
 
+        async fn commit_event_processing(
+            &self,
+            _commit: crate::EventProcessingCommit,
+        ) -> Result<()> {
+            Ok(())
+        }
+
         async fn insert_effect_intent(
             &self,
             _event_id: Uuid,
@@ -369,11 +376,12 @@ mod tests {
             _timeout_seconds: i32,
             _max_attempts: i32,
             _priority: i32,
+            _join_window_timeout_seconds: Option<i32>,
         ) -> Result<()> {
             Ok(())
         }
 
-        async fn poll_next_effect(&self) -> Result<Option<crate::QueuedEffectExecution>> {
+        async fn poll_next_effect(&self) -> Result<Option<crate::QueuedHandlerExecution>> {
             Ok(None)
         }
 

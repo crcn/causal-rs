@@ -5,12 +5,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Context passed to effect handlers.
-pub struct EffectContext<D>
+pub struct HandlerContext<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Human-readable identifier of the effect being executed.
-    pub effect_id: String,
+    /// Human-readable identifier of the handler being executed.
+    pub handler_id: String,
     /// Deterministic idempotency key for external API calls.
     pub idempotency_key: String,
     /// Correlation ID from event envelope - groups related events together.
@@ -20,13 +20,13 @@ where
     pub(crate) deps: Arc<D>,
 }
 
-impl<D> Clone for EffectContext<D>
+impl<D> Clone for HandlerContext<D>
 where
     D: Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
-            effect_id: self.effect_id.clone(),
+            handler_id: self.handler_id.clone(),
             idempotency_key: self.idempotency_key.clone(),
             correlation_id: self.correlation_id,
             event_id: self.event_id,
@@ -35,19 +35,19 @@ where
     }
 }
 
-impl<D> EffectContext<D>
+impl<D> HandlerContext<D>
 where
     D: Send + Sync + 'static,
 {
     pub(crate) fn new(
-        effect_id: String,
+        handler_id: String,
         idempotency_key: String,
         correlation_id: Uuid,
         event_id: Uuid,
         deps: Arc<D>,
     ) -> Self {
         Self {
-            effect_id,
+            handler_id,
             idempotency_key,
             correlation_id,
             event_id,
@@ -55,9 +55,9 @@ where
         }
     }
 
-    /// Get the effect ID (human-readable identifier).
-    pub fn effect_id(&self) -> &str {
-        &self.effect_id
+    /// Get the handler ID (human-readable identifier).
+    pub fn handler_id(&self) -> &str {
+        &self.handler_id
     }
 
     /// Get the idempotency key for external API calls.
@@ -85,9 +85,9 @@ mod tests {
         multiplier: i32,
     }
 
-    fn create_test_context() -> EffectContext<TestDeps> {
+    fn create_test_context() -> HandlerContext<TestDeps> {
         let deps = Arc::new(TestDeps { multiplier: 2 });
-        EffectContext::new(
+        HandlerContext::new(
             "test_effect".to_string(),
             "test_idempotency_key".to_string(),
             Uuid::nil(),
@@ -100,7 +100,7 @@ mod tests {
     async fn test_effect_context_accessors() {
         let context = create_test_context();
 
-        assert_eq!(context.effect_id(), "test_effect");
+        assert_eq!(context.handler_id(), "test_effect");
         assert_eq!(context.idempotency_key(), "test_idempotency_key");
         assert_eq!(context.deps().multiplier, 2);
     }
@@ -110,7 +110,7 @@ mod tests {
         let context = create_test_context();
         let cloned = context.clone();
 
-        assert_eq!(cloned.effect_id(), "test_effect");
+        assert_eq!(cloned.handler_id(), "test_effect");
         assert_eq!(cloned.deps().multiplier, 2);
     }
 }

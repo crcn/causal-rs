@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Error, Result};
 
-use super::context::EffectContext;
+use super::context::HandlerContext;
 use crate::event_codec::EventCodec;
 
 /// Error handler called when an effect returns an error.
@@ -16,7 +16,7 @@ use crate::event_codec::EventCodec;
 /// The handler receives the error, event type that caused it, and context.
 /// It can emit failure events or log the error. The chain continues regardless.
 pub type ErrorHandler<D> =
-    Arc<dyn Fn(Error, TypeId, EffectContext<D>) -> BoxFuture<()> + Send + Sync>;
+    Arc<dyn Fn(Error, TypeId, HandlerContext<D>) -> BoxFuture<()> + Send + Sync>;
 
 /// Metadata passed to DLQ terminal mappers when an effect exhausts retries.
 #[derive(Debug, Clone)]
@@ -147,7 +147,7 @@ impl AnyEvent {
 }
 
 /// An effect handler - no traits, just data with closures.
-pub struct Effect<D>
+pub struct Handler<D>
 where
     D: Send + Sync + 'static,
 {
@@ -162,14 +162,14 @@ where
 
     /// Called once when the store is activated.
     pub(crate) started:
-        Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>,
+        Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>,
 
     /// Called for each event that passes `can_handle`.
     pub(crate) handler: Arc<
         dyn Fn(
                 Arc<dyn Any + Send + Sync>,
                 TypeId,
-                EffectContext<D>,
+                HandlerContext<D>,
             ) -> BoxFuture<Result<Vec<EventOutput>>>
             + Send
             + Sync,
@@ -184,12 +184,15 @@ where
         Arc<
             dyn Fn(
                     Vec<Arc<dyn Any + Send + Sync>>,
-                    EffectContext<D>,
+                    HandlerContext<D>,
                 ) -> BoxFuture<Result<Vec<EventOutput>>>
                 + Send
                 + Sync,
         >,
     >,
+
+    /// Optional timeout for same-batch accumulation windows.
+    pub(crate) join_window_timeout: Option<Duration>,
 
     /// Optional mapper for creating terminal events when an execution moves to DLQ.
     pub(crate) dlq_terminal_mapper: Option<DlqTerminalMapper>,
@@ -207,7 +210,7 @@ where
     pub(crate) priority: Option<i32>,
 }
 
-impl<D> Clone for Effect<D>
+impl<D> Clone for Handler<D>
 where
     D: Send + Sync + 'static,
 {
@@ -220,6 +223,7 @@ where
             handler: self.handler.clone(),
             join_mode: self.join_mode,
             join_batch_handler: self.join_batch_handler.clone(),
+            join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper: self.dlq_terminal_mapper.clone(),
             queued: self.queued,
             delay: self.delay,
@@ -230,7 +234,7 @@ where
     }
 }
 
-impl<D> Effect<D>
+impl<D> Handler<D>
 where
     D: Send + Sync + 'static,
 {
@@ -240,7 +244,7 @@ where
     }
 
     /// Call the started handler if present.
-    pub async fn call_started(&self, ctx: EffectContext<D>) -> Result<()> {
+    pub async fn call_started(&self, ctx: HandlerContext<D>) -> Result<()> {
         if let Some(ref started) = self.started {
             started(ctx).await
         } else {
@@ -253,7 +257,7 @@ where
         &self,
         value: Arc<dyn Any + Send + Sync>,
         type_id: TypeId,
-        ctx: EffectContext<D>,
+        ctx: HandlerContext<D>,
     ) -> Result<Vec<EventOutput>> {
         (self.handler)(value, type_id, ctx).await
     }
@@ -262,7 +266,7 @@ where
     pub async fn call_join_batch_handler(
         &self,
         values: Vec<Arc<dyn Any + Send + Sync>>,
-        ctx: EffectContext<D>,
+        ctx: HandlerContext<D>,
     ) -> Result<Vec<EventOutput>> {
         if let Some(handler) = &self.join_batch_handler {
             handler(values, ctx).await

@@ -1,428 +1,168 @@
-# Seesaw User Guide: Building Multi-Day Workflows
+# Seesaw User Guide (Stateless Runtime)
 
-Real-world example: Order processing system with payment, approvals, and reminders.
+Seesaw is a durable event/effect runtime.
+Workflows are modeled as events; effects react to events and emit more events.
 
----
+## Mental Model
 
-## The Workflow
+- No reducers
+- No workflow state object
+- No `ctx.prev_state()` / `ctx.next_state()`
+- Determinism comes from event payload + idempotent deps calls
 
-**Day 1**: Customer places order
-- Charge payment immediately (critical)
-- Send confirmation email
-
-**Day 3**: Request manager approval (automated)
-
-**Day 10**: Send reminder if still pending
-
-**Later**: Manager approves → complete order
-
----
-
-## 1. Define Your Events
+## 1. Define Events (Event-Carried Context)
 
 ```rust
-// Just business data - no framework metadata needed
-#[derive(Clone, Serialize, Deserialize)]
-struct OrderPlaced {
-    order_id: Uuid,
-    customer_email: String,
-    amount_cents: i64,
-}
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize)]
-struct PaymentCharged { order_id: Uuid }
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ApprovalRequested { order_id: Uuid }
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ApprovalReceived { order_id: Uuid }
-
-#[derive(Clone, Serialize, Deserialize)]
-struct OrderCompleted { order_id: Uuid }
-```
-
----
-
-## 2. Define Your State
-
-```rust
-#[derive(Clone, Serialize, Deserialize, Default)]
-struct OrderState {
-    status: OrderStatus,
-    payment_charged: bool,
-    approval_requested: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-enum OrderStatus {
-    Pending,
-    AwaitingApproval,
-    Completed,
+enum OrderEvent {
+    OrderPlaced {
+        order_id: Uuid,
+        customer_email: String,
+        amount_cents: i64,
+    },
+    PaymentCharged {
+        order_id: Uuid,
+        customer_email: String,
+        amount_cents: i64,
+    },
+    ApprovalRequested {
+        order_id: Uuid,
+        customer_email: String,
+    },
+    ApprovalReceived {
+        order_id: Uuid,
+        customer_email: String,
+    },
+    OrderCompleted {
+        order_id: Uuid,
+    },
 }
 ```
 
----
-
-## 3. Write Your Effects
+## 2. Define Dependencies
 
 ```rust
-use seesaw::{effect, effects, HandlerContext};
-
-#[handlers]
-mod order_effects {
-    use super::*;
-
-    #[handler(on = OrderPlaced, id = "charge_payment", retry = 5, timeout_secs = 60, priority = 1)]
-    async fn charge_payment(
-        event: OrderPlaced,
-        ctx: HandlerContext<Deps>,
-    ) -> anyhow::Result<PaymentCharged> {
-        let _charge = ctx
-            .deps()
-            .stripe
-            .charge(event.amount_cents, ctx.idempotency_key())
-            .await?;
-        Ok(PaymentCharged {
-            order_id: event.order_id,
-        })
-    }
-
-    #[handler(on = OrderPlaced, id = "send_confirmation")]
-    async fn send_confirmation(
-        event: OrderPlaced,
-        ctx: HandlerContext<Deps>,
-    ) -> anyhow::Result<()> {
-        ctx.deps().mailer.send_confirmation(&event.customer_email).await?;
-        Ok(())
-    }
-}
-
-let engine = seesaw::Engine::new(deps, store).with_handlers(order_effects::effects());
-```
-
----
-
-## 4. Write Your Reducers
-
-```rust
-use seesaw::reducer;
-
-let reducers = vec![
-    reducer::on::<OrderPlaced>().run(|state, _| OrderState {
-        status: OrderStatus::Pending,
-        payment_charged: false,
-        approval_requested: false,
-    }),
-
-    reducer::on::<PaymentCharged>().run(|state, _| OrderState {
-        payment_charged: true,
-        ..state
-    }),
-
-    reducer::on::<ApprovalRequested>().run(|state, _| OrderState {
-        status: OrderStatus::AwaitingApproval,
-        approval_requested: true,
-        ..state
-    }),
-
-    reducer::on::<ApprovalReceived>().run(|state, _| OrderState {
-        status: OrderStatus::Completed,
-        ..state
-    }),
-];
-```
-
----
-
-## 5. Set Up Your Engine
-
-```rust
-use seesaw::{Engine, PostgresQueue};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let pool = PgPool::connect(&env::var("DATABASE_URL")?).await?;
-    let deps = Deps { stripe, mailer, db: pool.clone() };
-
-    // Build engine
-    let engine = Engine::new(deps);
-    for effect in effects { engine = engine.with_handler(effect); }
-    for reducer in reducers { engine = engine.with_reducer(reducer); }
-
-    // Start workers (2 for events, 20 for effects)
-    let queue = PostgresQueue::new(pool)
-        .start_workers(2, 20, engine.clone())
-        .await?;
-
-    let engine = engine.with_queue(queue);
-
-    // Keep running
-    tokio::signal::ctrl_c().await?;
-    engine.shutdown().await?;
-
-    Ok(())
+#[derive(Clone)]
+struct Deps {
+    stripe: StripeClient,
+    mailer: MailerClient,
 }
 ```
 
----
-
-## 6. Process Events from Your API
-
-### Initial Order (Day 1)
+## 3. Register Effects
 
 ```rust
-// HTTP handler
-async fn create_order(
-    payload: OrderPayload,
-    engine: Arc<Engine<OrderState, Deps>>,
-    db: &PgPool,
-) -> Result<Json<OrderResponse>> {
-    // Start new workflow
-    let correlation_id = engine.dispatch(|| async move {
-        Ok(OrderPlaced {
-            order_id: Uuid::new_v4(),
-            customer_email: payload.email,
-            amount_cents: payload.amount,
-        })
-    }).await?;
+use seesaw::{effect, EffectContext, Engine};
+use std::time::Duration;
 
-    // Store correlation_id for later
-    sqlx::query!(
-        "UPDATE orders SET correlation_id = $1 WHERE order_id = $2",
-        correlation_id,
-        order_id
-    )
-    .execute(db)
+fn build_engine<St: seesaw::Store>(deps: Deps, store: St) -> Engine<Deps, St> {
+    Engine::new(deps, store)
+        .with_handler(
+            effect::on::<OrderEvent>()
+                .extract(|event| match event {
+                    OrderEvent::OrderPlaced {
+                        order_id,
+                        customer_email,
+                        amount_cents,
+                    } => Some((*order_id, customer_email.clone(), *amount_cents)),
+                    _ => None,
+                })
+                .id("charge_payment")
+                .retry(5)
+                .timeout(Duration::from_secs(60))
+                .then(|(order_id, customer_email, amount_cents), ctx: EffectContext<Deps>| async move {
+                    ctx.deps()
+                        .stripe
+                        .charge(amount_cents, ctx.idempotency_key())
+                        .await?;
+
+                    Ok(OrderEvent::PaymentCharged {
+                        order_id,
+                        customer_email,
+                        amount_cents,
+                    })
+                }),
+        )
+        .with_handler(
+            effect::on::<OrderEvent>()
+                .extract(|event| match event {
+                    OrderEvent::PaymentCharged {
+                        order_id,
+                        customer_email,
+                        ..
+                    } => Some((*order_id, customer_email.clone())),
+                    _ => None,
+                })
+                .id("request_approval")
+                .delayed(Duration::from_secs(60 * 60 * 24 * 2))
+                .then(|(order_id, customer_email), _ctx: EffectContext<Deps>| async move {
+                    Ok(OrderEvent::ApprovalRequested {
+                        order_id,
+                        customer_email,
+                    })
+                }),
+        )
+}
+```
+
+## 4. Start Runtime
+
+```rust
+use seesaw::{Runtime, RuntimeConfig};
+
+let engine = build_engine(deps, store);
+let runtime = Runtime::start(
+    &engine,
+    RuntimeConfig {
+        event_workers: 2,
+        effect_workers: 8,
+        ..Default::default()
+    },
+)
+.await?;
+```
+
+`Runtime::start(...)` is fail-fast: started-hook errors are returned immediately.
+
+## 5. Process Events
+
+```rust
+use uuid::Uuid;
+
+// New workflow
+engine
+    .process(OrderEvent::OrderPlaced {
+        order_id: Uuid::new_v4(),
+        customer_email: "user@example.com".to_string(),
+        amount_cents: 9999,
+    })
     .await?;
 
-    Ok(Json(OrderResponse { order_id, correlation_id }))
-}
-```
-
-**What happens next (automatic)**:
-- ✅ Payment charged immediately (60s timeout, 5 retries)
-- ✅ Confirmation email sent immediately
-- ⏰ Approval request scheduled for 2 days
-- ⏰ Reminder scheduled for 9 days
-
-### Approval Webhook (Day 5)
-
-```rust
-// Webhook handler
-async fn handle_approval(
-    payload: ApprovalWebhook,
-    engine: Arc<Engine<OrderState, Deps>>,
-    db: &PgPool,
-) -> Result<Json<()>> {
-    // Lookup correlation_id
-    let correlation_id = sqlx::query!(
-        "SELECT correlation_id FROM orders WHERE order_id = $1",
-        payload.order_id
+// Continue existing workflow
+let correlation_id = Uuid::parse_str("...")?;
+engine
+    .process_workflow(
+        correlation_id,
+        OrderEvent::ApprovalReceived {
+            order_id: Uuid::parse_str("...")?,
+            customer_email: "user@example.com".to_string(),
+        },
     )
-    .fetch_one(db)
-    .await?
-    .correlation_id;
-
-    // Continue existing workflow (state from Day 1 is still there!)
-    engine.process_workflow(correlation_id, || async move {
-        Ok(ApprovalReceived {
-            order_id: payload.order_id,
-        })
-    }).await?;
-
-    Ok(Json(()))
-}
+    .await?;
 ```
 
-**What happens next (automatic)**:
-- ✅ Order completed
-- ✅ Reminder cancelled (state shows approved)
-
----
-
-## Key Features
-
-### 1. Framework-Guaranteed Idempotency
+## 6. Shutdown
 
 ```rust
-#[handler(id = "charge_payment")]  // ← ID required at compile-time
-OrderPlaced { .. } => |ctx| async move {
-    // If effect runs twice (crash/retry), framework skips duplicate
-    ctx.deps().stripe.charge(...).await?;  // Only charges once!
-    Ok(PaymentCharged { .. })
-}
+runtime.shutdown().await?;
 ```
 
-### 2. Delayed Execution
+## Migration Notes
 
-```rust
-#[handler(id = "send_reminder", delayed = 7days)]
-ApprovalRequested { .. } => |ctx| async move {
-    // Runs 7 days later, survives restarts/deploys
-    ctx.deps().mailer.send_reminder(...).await?;
-    Ok(())
-}
-```
-
-### 3. Per-Effect Configuration
-
-```rust
-// Payment: critical, long timeout, many retries
-#[handler(id = "charge_payment", timeout = 60, retry = 5, priority = 1)]
-
-// Email: fast, few retries
-#[handler(id = "send_email", timeout = 10, retry = 3)]
-
-// Logs: no retries needed
-#[handler(id = "log", timeout = 5, retry = 1)]
-```
-
-### 4. State Persistence
-
-```rust
-// Day 1: State = { status: Pending, payment_charged: true }
-// Workers restart, deploys happen...
-// Day 5: State still = { status: Pending, payment_charged: true }
-
-ApprovalReceived { .. } => |ctx| async move {
-    // ctx.next_state() has accumulated state from Day 1!
-    if ctx.next_state().payment_charged {
-        finalize_order(...).await?;
-    }
-    Ok(OrderCompleted { .. })
-}
-```
-
-### 5. Graceful Shutdown
-
-```rust
-tokio::signal::ctrl_c().await?;
-engine.shutdown().await?;  // Drains workers, completes in-flight events
-```
-
----
-
-## Common Patterns
-
-### Pattern 1: Conditional Effects
-
-```rust
-#[handler(id = "send_reminder", delayed = 7days)]
-ApprovalRequested { order_id, .. } => |ctx| async move {
-    // Only send if still pending
-    if ctx.next_state().status == OrderStatus::AwaitingApproval {
-        ctx.deps().mailer.send_reminder(order_id).await?;
-    }
-    Ok(())  // No event if cancelled
-}
-```
-
-### Pattern 2: Priority Queue
-
-```rust
-// Emergency events jump to front
-#[handler(id = "system_alert", priority = 1)]  // Higher priority
-SystemAlert { .. } => |ctx| async move { ... }
-
-// Normal events
-#[handler(id = "user_signup", priority = 10)]  // Default priority
-UserSignup { .. } => |ctx| async move { ... }
-```
-
-### Pattern 3: External API Idempotency
-
-```rust
-#[handler(id = "charge_payment")]
-OrderPlaced { amount, .. } => |ctx| async move {
-    // ctx.idempotency_key is deterministic UUID v5
-    // Same event_id + effect_id → same key
-    ctx.deps().stripe.charge(
-        amount,
-        idempotency_key: &ctx.idempotency_key
-    ).await?;
-    Ok(PaymentCharged { .. })
-}
-```
-
-### Pattern 4: Fan-Out
-
-```rust
-// One event triggers multiple effects
-OrderPlaced { .. } => {
-    #[handler(id = "charge")] => charge_payment,
-    #[handler(id = "confirm")] => send_confirmation,
-    #[handler(id = "notify_ops")] => notify_ops_team,
-}
-
-// All run in parallel automatically
-```
-
----
-
-## Testing
-
-```rust
-#[tokio::test]
-async fn test_order_workflow() {
-    let pool = create_test_db().await;
-    let deps = create_test_deps();
-    let engine = create_engine(deps);
-
-    let queue = PostgresQueue::new(pool.clone())
-        .start_workers(1, 5, engine.clone())
-        .await?;
-
-    let engine = engine.with_queue(queue);
-
-    // Place order
-    let correlation_id = engine.dispatch(|| async {
-        Ok(OrderPlaced { order_id, email, amount })
-    }).await?;
-
-    // Wait for immediate effects
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Check state
-    let state = get_state(&pool, correlation_id).await?;
-    assert!(state.payment_charged);
-
-    // Simulate time passing (for delayed effects)
-    fast_forward_time(&pool, correlation_id, Duration::from_days(2)).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Check approval requested
-    let state = get_state(&pool, correlation_id).await?;
-    assert!(state.approval_requested);
-
-    engine.shutdown().await?;
-}
-```
-
----
-
-## Migration from v0.7
-
-If you're coming from v0.7 (stateless):
-
-1. **Remove correlation_id from events** - Framework manages it now
-2. **Add `.id()` to effects** - Compile enforces idempotency
-3. **Add delays** - Use `.delay(7days)` for time-based execution
-4. **Start workers** - Replace `activate()` with `start_workers()`
-5. **Use `process()`** - Replace `run()` with `engine.dispatch()`
-6. **Store correlation_id** - For webhook continuations
-
-See [API Migration Guide](./api-migration-guide.md) for detailed before/after examples.
-
----
-
-## Next Steps
-
-1. Run migrations: `sqlx migrate run`
-2. Update your events (remove correlation_id)
-3. Add `.id()` to all effects
-4. Add `.delay()` for time-based logic
-5. Deploy with workers
-6. Monitor DLQ for failures
-
-**You now have a production-grade event-driven system with multi-day workflows, automatic idempotency, and graceful scaling.**
+- Replace reducer logic with event-carried fields.
+- Remove all state access from effects.
+- Prefer explicit `.id("...")` for queued/retry/delayed effects.
+- If an effect needs current external data, query via `ctx.deps()`.

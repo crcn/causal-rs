@@ -43,10 +43,10 @@ where
     pub fn new(deps: D) -> Self;
 
     /// Register an effect handler
-    pub fn with_effect(self, effect: Effect<S, D>) -> Self;
+    pub fn with_handler(self, effect: Effect<S, D>) -> Self;
 
-    /// Register a reducer (pure state transformation)
-    pub fn with_reducer(self, reducer: Reducer<S>) -> Self;
+    /// Reducers are removed from core API.
+    /// Model workflow progress with event-carried context instead.
 
     /// Attach a queue (for durable execution)
     pub fn with_queue(self, queue: Arc<PostgresQueue>) -> Self;
@@ -467,64 +467,21 @@ where
 
 ---
 
-## 4. Reducer API (Pure State Transitions)
+## 4. State Model
 
-Reducers transform state before effects run. They are pure functions.
+Reducers are removed from the core runtime.
+
+Use event-carried context:
 
 ```rust
-pub struct Reducer<S> {
-    // Internal fields private
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PaymentCharged {
+    order_id: String,
+    customer_email: String,
+    approval_requested: bool,
 }
 
-impl<S> Reducer<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    /// Create a reducer for a specific event type
-    ///
-    /// # Example
-    /// ```rust
-    /// use seesaw::reducer;
-    ///
-    /// let reducer = reducer::on::<OrderPlaced>()
-    ///     .run(|state, event| {
-    ///         State {
-    ///             order_count: state.order_count + 1,
-    ///             total_revenue: state.total_revenue + event.amount,
-    ///             ..state
-    ///         }
-    ///     });
-    /// ```
-    pub fn on<E>() -> ReducerBuilder<S, E>
-    where
-        E: Event;
-}
-
-pub struct ReducerBuilder<S, E> {
-    // Internal fields private
-}
-
-impl<S, E> ReducerBuilder<S, E>
-where
-    S: Clone + Send + Sync + 'static,
-    E: Event,
-{
-    /// Attach the reducer function (pure state transformation)
-    ///
-    /// # Example
-    /// ```rust
-    /// reducer::on::<OrderPlaced>()
-    ///     .run(|state, event| {
-    ///         State {
-    ///             order_count: state.order_count + 1,
-    ///             ..state
-    ///         }
-    ///     });
-    /// ```
-    pub fn run<F>(self, reducer: F) -> Reducer<S>
-    where
-        F: Fn(&S, &E) -> S + Send + Sync + 'static;
-}
+// Branch on event fields inside effects.
 ```
 
 ---
@@ -714,8 +671,7 @@ where
     /// # Example
     /// ```rust
     /// let engine = Engine::new(deps)
-    ///     .with_effect(send_email_effect)
-    ///     .with_reducer(order_reducer);
+    ///     .with_handler(send_email_effect);
     ///
     /// let queue = PostgresQueue::new(pool);
     ///
@@ -777,7 +733,7 @@ where
 ## 7. Complete Usage Example
 
 ```rust
-use seesaw::{Engine, Runtime, PostgresQueue, effect, reducer};
+use seesaw::{Engine, Runtime, PostgresQueue, effect};
 use sqlx::PgPool;
 use anyhow::Result;
 
@@ -793,17 +749,7 @@ enum OrderEvent {
 }
 
 // ============================================================
-// 2. Define State
-// ============================================================
-
-#[derive(Debug, Clone)]
-struct State {
-    order_count: u64,
-    total_revenue: f64,
-}
-
-// ============================================================
-// 3. Define Dependencies
+// 2. Define Dependencies
 // ============================================================
 
 struct Deps {
@@ -813,25 +759,13 @@ struct Deps {
 }
 
 // ============================================================
-// 4. Build Engine
+// 3. Build Engine
 // ============================================================
 
-fn build_engine(deps: Deps) -> Engine<State, Deps> {
-    Engine::new(deps)
-        // Reducer: pure state transformation
-        .with_reducer(
-            reducer::on::<OrderEvent>()
-                .run(|state, event| match event {
-                    OrderEvent::Placed { amount, .. } => State {
-                        order_count: state.order_count + 1,
-                        total_revenue: state.total_revenue + amount,
-                    },
-                    _ => state.clone(),
-                })
-        )
-
+fn build_engine<St: seesaw::Store>(deps: Deps, store: St) -> Engine<Deps, St> {
+    Engine::new(deps, store)
         // Effect: charge payment
-        .with_effect(
+        .with_handler(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::Placed { order_id, amount } => {
@@ -854,7 +788,7 @@ fn build_engine(deps: Deps) -> Engine<State, Deps> {
         )
 
         // Effect: send confirmation email
-        .with_effect(
+        .with_handler(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::PaymentCharged { order_id } => {
@@ -963,7 +897,7 @@ mod order_effects {
     }
 }
 
-let engine = Engine::new(deps, store).with_effects(order_effects::effects());
+let engine = Engine::new(deps, store).with_handlers(order_effects::effects());
 ```
 
 ---

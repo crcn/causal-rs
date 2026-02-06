@@ -10,14 +10,14 @@ use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::effect::{DlqTerminalInfo, EffectContext, JoinMode};
-use crate::effect_registry::EffectRegistry;
+use crate::handler::{DlqTerminalInfo, HandlerContext, JoinMode};
+use crate::handler_registry::HandlerRegistry;
 use crate::queue_backend::{QueueBackend, StoreQueueBackend};
 use crate::{EmittedEvent, Store, NAMESPACE_SEESAW};
 
-/// Effect worker configuration.
+/// Handler worker configuration.
 #[derive(Debug, Clone)]
-pub struct EffectWorkerConfig {
+pub struct HandlerWorkerConfig {
     /// Polling interval when no effects available.
     pub poll_interval: Duration,
     /// Default timeout for effect execution.
@@ -26,7 +26,7 @@ pub struct EffectWorkerConfig {
     pub max_batch_size: usize,
 }
 
-impl Default for EffectWorkerConfig {
+impl Default for HandlerWorkerConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_millis(100),
@@ -36,21 +36,21 @@ impl Default for EffectWorkerConfig {
     }
 }
 
-/// Effect worker - polls and executes queued effects.
-pub struct EffectWorker<D, St>
+/// Handler worker - polls and executes queued effects.
+pub struct HandlerWorker<D, St>
 where
     D: Send + Sync + 'static,
     St: Store,
 {
     store: Arc<St>,
     deps: Arc<D>,
-    effects: Arc<EffectRegistry<D>>,
+    effects: Arc<HandlerRegistry<D>>,
     queue_backend: Arc<dyn QueueBackend<St>>,
-    config: EffectWorkerConfig,
+    config: HandlerWorkerConfig,
     shutdown: Arc<AtomicBool>,
 }
 
-impl<D, St> EffectWorker<D, St>
+impl<D, St> HandlerWorker<D, St>
 where
     D: Send + Sync + 'static,
     St: Store,
@@ -58,8 +58,8 @@ where
     pub(crate) fn new(
         store: Arc<St>,
         deps: Arc<D>,
-        effects: Arc<EffectRegistry<D>>,
-        config: EffectWorkerConfig,
+        effects: Arc<HandlerRegistry<D>>,
+        config: HandlerWorkerConfig,
     ) -> Self {
         Self {
             store,
@@ -84,7 +84,7 @@ where
 
     /// Run worker loop.
     pub async fn run(self) -> Result<()> {
-        info!("Effect worker started");
+        info!("Handler worker started");
 
         while !self.shutdown.load(Ordering::SeqCst) {
             match self.process_next_effect().await {
@@ -100,7 +100,7 @@ where
             }
         }
 
-        info!("Effect worker stopped");
+        info!("Handler worker stopped");
         Ok(())
     }
 
@@ -108,6 +108,8 @@ where
     ///
     /// Returns true if effect was processed, false if no effects available.
     async fn process_next_effect(&self) -> Result<bool> {
+        self.expire_accumulation_windows().await?;
+
         let execution = match self.queue_backend.poll_next_effect(&*self.store).await {
             Ok(Some(execution)) => Some(execution),
             Ok(None) => self.store.poll_next_effect().await?,
@@ -126,24 +128,24 @@ where
 
         info!(
             "Processing effect: effect_id={}, workflow={}, priority={}, attempt={}/{}",
-            execution.effect_id,
+            execution.handler_id,
             execution.correlation_id,
             execution.priority,
             execution.attempts,
             execution.max_attempts
         );
 
-        let Some(effect) = self.effects.find_by_id(&execution.effect_id) else {
+        let Some(effect) = self.effects.find_by_id(&execution.handler_id) else {
             let error = format!(
                 "No effect handler registered for id '{}'",
-                execution.effect_id
+                execution.handler_id
             );
             warn!("{}", error);
             if execution.attempts >= execution.max_attempts {
                 self.store
                     .dlq_effect(
                         execution.event_id,
-                        execution.effect_id,
+                        execution.handler_id,
                         error,
                         "missing_handler".to_string(),
                         execution.attempts,
@@ -153,7 +155,7 @@ where
                 self.store
                     .fail_effect(
                         execution.event_id,
-                        execution.effect_id,
+                        execution.handler_id,
                         error,
                         execution.attempts,
                     )
@@ -167,10 +169,10 @@ where
         let source_event_for_dlq = typed_event.clone();
         let idempotency_key = Uuid::new_v5(
             &NAMESPACE_SEESAW,
-            format!("{}-{}", execution.event_id, execution.effect_id).as_bytes(),
+            format!("{}-{}", execution.event_id, execution.handler_id).as_bytes(),
         )
         .to_string();
-        let ctx = EffectContext::new(
+        let ctx = HandlerContext::new(
             effect.id.clone(),
             idempotency_key,
             execution.correlation_id,
@@ -205,7 +207,7 @@ where
 
                     self.store
                         .join_same_batch_append_and_maybe_claim(
-                            execution.effect_id.clone(),
+                            execution.handler_id.clone(),
                             execution.correlation_id,
                             execution.event_id,
                             execution.event_type.clone(),
@@ -214,6 +216,7 @@ where
                             batch_id,
                             batch_index,
                             batch_size,
+                            execution.join_window_timeout_seconds,
                         )
                         .await
                 }
@@ -225,7 +228,7 @@ where
                         let message = error.to_string();
                         warn!(
                             "Join append failed: {} (attempt {}/{}): {}",
-                            execution.effect_id,
+                            execution.handler_id,
                             execution.attempts,
                             execution.max_attempts,
                             message
@@ -250,7 +253,7 @@ where
             self.store
                 .complete_effect(
                     execution.event_id,
-                    execution.effect_id.clone(),
+                    execution.handler_id.clone(),
                     serde_json::json!({ "status": "join_waiting" }),
                 )
                 .await?;
@@ -299,15 +302,15 @@ where
                     Ok(events) => events,
                     Err(error) => {
                         warn!(
-                            "Effect output serialization failed: {} (attempt {}/{}): {}",
-                            execution.effect_id, execution.attempts, execution.max_attempts, error
+                            "Handler output serialization failed: {} (attempt {}/{}): {}",
+                            execution.handler_id, execution.attempts, execution.max_attempts, error
                         );
 
                         if let Some(batch_id) = claimed_batch_id {
                             if let Err(release_error) = self
                                 .store
                                 .join_same_batch_release(
-                                    execution.effect_id.clone(),
+                                    execution.handler_id.clone(),
                                     execution.correlation_id,
                                     batch_id,
                                     error.to_string(),
@@ -316,7 +319,7 @@ where
                             {
                                 error!(
                                     "Failed to release join claim for {}: {}",
-                                    execution.effect_id, release_error
+                                    execution.handler_id, release_error
                                 );
                             }
                         }
@@ -334,14 +337,14 @@ where
                     }
                 };
 
-                info!("Effect completed successfully: {}", execution.effect_id);
+                info!("Handler completed successfully: {}", execution.handler_id);
                 let result_value = serde_json::json!({ "status": "ok" });
 
                 if emitted_events.is_empty() {
                     self.store
                         .complete_effect(
                             execution.event_id,
-                            execution.effect_id.clone(),
+                            execution.handler_id.clone(),
                             result_value,
                         )
                         .await?;
@@ -349,7 +352,7 @@ where
                     self.store
                         .complete_effect_with_events(
                             execution.event_id,
-                            execution.effect_id.clone(),
+                            execution.handler_id.clone(),
                             result_value,
                             emitted_events,
                         )
@@ -359,7 +362,7 @@ where
                 if let Some(batch_id) = claimed_batch_id {
                     self.store
                         .join_same_batch_complete(
-                            execution.effect_id.clone(),
+                            execution.handler_id.clone(),
                             execution.correlation_id,
                             batch_id,
                         )
@@ -368,15 +371,15 @@ where
             }
             Ok(Err(e)) => {
                 warn!(
-                    "Effect failed: {} (attempt {}/{}): {}",
-                    execution.effect_id, execution.attempts, execution.max_attempts, e
+                    "Handler failed: {} (attempt {}/{}): {}",
+                    execution.handler_id, execution.attempts, execution.max_attempts, e
                 );
 
                 if let Some(batch_id) = claimed_batch_id {
                     if let Err(release_error) = self
                         .store
                         .join_same_batch_release(
-                            execution.effect_id.clone(),
+                            execution.handler_id.clone(),
                             execution.correlation_id,
                             batch_id,
                             e.to_string(),
@@ -385,7 +388,7 @@ where
                     {
                         error!(
                             "Failed to release join claim for {}: {}",
-                            execution.effect_id, release_error
+                            execution.handler_id, release_error
                         );
                     }
                 }
@@ -401,22 +404,22 @@ where
                 .await?;
             }
             Err(_) => {
-                warn!("Effect timed out: {}", execution.effect_id);
+                warn!("Handler timed out: {}", execution.handler_id);
 
                 if let Some(batch_id) = claimed_batch_id {
                     if let Err(release_error) = self
                         .store
                         .join_same_batch_release(
-                            execution.effect_id.clone(),
+                            execution.handler_id.clone(),
                             execution.correlation_id,
                             batch_id,
-                            "Effect execution timed out".to_string(),
+                            "Handler execution timed out".to_string(),
                         )
                         .await
                     {
                         error!(
                             "Failed to release join claim for {} after timeout: {}",
-                            execution.effect_id, release_error
+                            execution.handler_id, release_error
                         );
                     }
                 }
@@ -427,13 +430,35 @@ where
                     source_event_for_dlq.clone(),
                     type_id,
                     "timeout",
-                    "Effect execution timed out".to_string(),
+                    "Handler execution timed out".to_string(),
                 )
                 .await?;
             }
         }
 
         Ok(true)
+    }
+
+    async fn expire_accumulation_windows(&self) -> Result<()> {
+        let expired_windows = self.store.expire_same_batch_windows(Utc::now()).await?;
+        for expired in expired_windows {
+            let error = format!(
+                "accumulation window timed out: correlation_id={}, batch_id={}",
+                expired.correlation_id, expired.batch_id
+            );
+            for source_event_id in expired.source_event_ids {
+                self.store
+                    .dlq_effect(
+                        source_event_id,
+                        expired.join_handler_id.clone(),
+                        error.clone(),
+                        "accumulate_timeout".to_string(),
+                        0,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     fn decode_event(
@@ -454,13 +479,13 @@ where
     fn serialize_emitted_events(
         &self,
         emitted: Vec<(TypeId, Arc<dyn Any + Send + Sync>)>,
-        execution: &crate::QueuedEffectExecution,
+        execution: &crate::QueuedHandlerExecution,
     ) -> Result<Vec<EmittedEvent>> {
         let emitted_count = emitted.len();
         if emitted_count > self.config.max_batch_size {
             anyhow::bail!(
                 "effect '{}' emitted {} events, exceeding max_batch_size {}",
-                execution.effect_id,
+                execution.handler_id,
                 emitted_count,
                 self.config.max_batch_size
             );
@@ -468,7 +493,7 @@ where
         if emitted_count > i32::MAX as usize {
             anyhow::bail!(
                 "effect '{}' emitted {} events, exceeding i32 batch metadata capacity",
-                execution.effect_id,
+                execution.handler_id,
                 emitted_count
             );
         }
@@ -502,7 +527,7 @@ where
         let emitted_batch_id = if emitted_count > 1 {
             Some(Uuid::new_v5(
                 &NAMESPACE_SEESAW,
-                format!("{}-{}-batch", execution.event_id, execution.effect_id).as_bytes(),
+                format!("{}-{}-batch", execution.event_id, execution.handler_id).as_bytes(),
             ))
         } else {
             None
@@ -543,10 +568,10 @@ where
 
     fn build_dlq_terminal_event(
         &self,
-        effect: &crate::effect::Effect<D>,
+        effect: &crate::handler::Handler<D>,
         source_event: Arc<dyn Any + Send + Sync>,
         source_type_id: TypeId,
-        execution: &crate::QueuedEffectExecution,
+        execution: &crate::QueuedHandlerExecution,
         reason: &str,
         error: String,
     ) -> Result<Option<EmittedEvent>> {
@@ -582,8 +607,8 @@ where
 
     async fn fail_or_dlq_effect(
         &self,
-        execution: &crate::QueuedEffectExecution,
-        effect: Option<&crate::effect::Effect<D>>,
+        execution: &crate::QueuedHandlerExecution,
+        effect: Option<&crate::handler::Handler<D>>,
         source_event: Arc<dyn Any + Send + Sync>,
         source_type_id: TypeId,
         reason: &str,
@@ -593,7 +618,7 @@ where
             self.store
                 .fail_effect(
                     execution.event_id,
-                    execution.effect_id.clone(),
+                    execution.handler_id.clone(),
                     error,
                     execution.attempts,
                 )
@@ -615,7 +640,7 @@ where
                         .store
                         .dlq_effect_with_events(
                             execution.event_id,
-                            execution.effect_id.clone(),
+                            execution.handler_id.clone(),
                             error.clone(),
                             reason.to_string(),
                             execution.attempts,
@@ -629,7 +654,7 @@ where
                     if let Err(store_error) = dlq_result {
                         warn!(
                             "dlq_effect_with_events failed for {}: {}. Falling back to dlq_effect",
-                            execution.effect_id, store_error
+                            execution.handler_id, store_error
                         );
                     }
                 }
@@ -637,7 +662,7 @@ where
                 Err(mapper_error) => {
                     warn!(
                         "dlq_terminal mapper failed for {}: {}. Falling back to dlq_effect",
-                        execution.effect_id, mapper_error
+                        execution.handler_id, mapper_error
                     );
                 }
             }
@@ -646,7 +671,7 @@ where
         self.store
             .dlq_effect(
                 execution.event_id,
-                execution.effect_id.clone(),
+                execution.handler_id.clone(),
                 error,
                 reason.to_string(),
                 execution.attempts,

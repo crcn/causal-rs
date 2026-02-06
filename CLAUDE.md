@@ -500,9 +500,9 @@ See `examples/batch-processor/` for full working example demonstrating:
 
 ### State Management Without Reducers
 
-Seesaw uses **handlers-only** architecture. State is managed through three patterns:
+Seesaw uses **handlers-only** architecture. State is managed through four patterns:
 
-#### Pattern 1: Event-Threaded State (Pure, Auditable)
+#### Pattern 1: Event-Threaded State (Pure, Auditable) - ✅ Distributed-Safe
 State flows as event fields. Each event carries accumulated state forward.
 
 ```rust
@@ -542,28 +542,32 @@ handler::on::<OrderEvent>()
     })
 ```
 
-**When to use:** Deterministic workflows, auditability requirements, replay scenarios
+**When to use:** Deterministic workflows, auditability requirements, replay scenarios, multi-worker deployments
 
-#### Pattern 2: Shared Dependency State (Mutable, Shared)
-State stored in dependencies using `Arc<Mutex<T>>`.
+#### Pattern 2: External Persistence (DB/Redis) - ✅ Distributed-Safe
+State stored in external systems that are shared across all workers.
 
 ```rust
 #[derive(Clone)]
 struct Deps {
-    order_status: Arc<Mutex<HashMap<Uuid, OrderStatus>>>,
+    db: PgPool,           // ✅ Shared across workers
+    redis: RedisClient,   // ✅ Shared across workers
 }
 
 handler::on::<OrderEvent>()
     .then(|event, ctx| async move {
-        let mut status = ctx.deps().order_status.lock().unwrap();
-        status.insert(event.order_id, OrderStatus::Shipped);
+        // State lives in database - all workers see same data
+        sqlx::query("UPDATE orders SET status = 'shipped' WHERE id = $1")
+            .bind(event.order_id)
+            .execute(&ctx.deps().db)
+            .await?;
         Ok(OrderShipped { order_id: event.order_id })
     })
 ```
 
-**When to use:** Complex mutable state, shared across effects, need to query arbitrary state
+**When to use:** Complex queryable state, shared across workers, need strong consistency
 
-#### Pattern 3: Implicit State (Event Sequence)
+#### Pattern 3: Implicit State (Event Sequence) - ✅ Distributed-Safe
 State is implicit in "which events have fired".
 
 ```rust
@@ -579,13 +583,56 @@ handler::on::<OrderPlaced>().then(|event, ctx| async move {
 
 **When to use:** Simple workflows where event types represent state transitions
 
+#### Pattern 4: In-Memory State (`Arc<Mutex>`) - ⚠️ SINGLE-PROCESS ONLY
+
+**🚨 CRITICAL WARNING: This pattern BREAKS with multiple workers!**
+
+```rust
+// ❌ DO NOT USE IN PRODUCTION WITH MULTIPLE WORKERS
+#[derive(Clone)]
+struct Deps {
+    order_status: Arc<Mutex<HashMap<Uuid, OrderStatus>>>,
+}
+
+handler::on::<OrderEvent>()
+    .then(|event, ctx| async move {
+        let mut status = ctx.deps().order_status.lock().unwrap();
+        status.insert(event.order_id, OrderStatus::Shipped);
+        Ok(OrderShipped { order_id: event.order_id })
+    })
+```
+
+**Why this breaks:**
+```
+Worker 1 starts with:   cache = {}
+Worker 2 starts with:   cache = {}
+
+Worker 1: cache[order_123] = "Shipped"  → Worker 1 cache = { order_123: "Shipped" }
+Worker 2: cache[order_123] = "Pending"  → Worker 2 cache = { order_123: "Pending" }
+
+Workers have diverged! They'll never see each other's updates. ☠️
+```
+
+**When to use:**
+- ✅ Development/testing with single worker
+- ✅ Demos and prototypes
+- ❌ **NEVER in production with multiple workers**
+
+**If you need in-memory caching:**
+- Use Pattern 2 with Redis/Memcached (shared cache)
+- Use Pattern 1 with event-threaded state
+- Accept that cache is worker-local (eventual consistency)
+
 #### Choosing a Pattern
 
-| Pattern | Deterministic | Auditable | Mutable | Complexity |
-|---------|---------------|-----------|---------|------------|
-| Event-Threaded | ✅ | ✅ | ❌ | Low-Medium |
-| Shared Deps | ❌ | ❌ | ✅ | Medium-High |
-| Implicit | ✅ | ✅ | ❌ | Low |
+| Pattern | Deterministic | Auditable | Multi-Worker | Complexity |
+|---------|---------------|-----------|--------------|------------|
+| Event-Threaded | ✅ | ✅ | ✅ | Low-Medium |
+| External Storage | ⚠️ | ⚠️ | ✅ | Medium |
+| Implicit | ✅ | ✅ | ✅ | Low |
+| Arc<Mutex> | ❌ | ❌ | ❌ | Low |
+
+**For production systems:** Use Patterns 1, 2, or 3. Avoid Pattern 4 unless you have exactly one worker.
 
 ### Reducer (Removed in v0.9)
 
@@ -635,6 +682,182 @@ UserEvent::SignedUp
 ```
 
 All three handlers run concurrently when `SignedUp` is dispatched.
+
+## Transaction Boundaries and Execution Modes
+
+Understanding when handlers run in which transaction is critical for correctness.
+
+### Inline Handlers (Default)
+
+Handlers without `.retry() > 1`, `.delay()`, `.timeout()`, or `.priority()` run **inline**:
+
+```rust
+// Inline handler - runs immediately
+handler::on::<OrderPlaced>()
+    .then(|event, ctx| async move {
+        ctx.deps().db.insert_order(&event).await?;
+        Ok(OrderSaved { order_id: event.order_id })
+    })
+```
+
+**Execution flow:**
+```
+engine.process(OrderPlaced { id: 123 }).await?;
+  ↓ [Transaction begins in EventWorker]
+  ↓ Insert OrderPlaced into seesaw_events
+  ↓ Handler executes (same transaction)
+  ↓ Insert OrderSaved into seesaw_events
+  ↓ Mark OrderPlaced as processed
+  ↓ [Transaction commits - atomic]
+  ↓ pg_notify sends events to workers
+```
+
+**Guarantees:**
+- ⚡ **Fast** - no queue overhead, runs immediately
+- 🔒 **Atomic** - all-or-nothing with event dispatch
+- 🎯 **Synchronous** - `.await` waits for completion
+- ✅ **Same transaction** - event + handler + emitted events all atomic
+
+**Use when:**
+- Fast operations (<100ms)
+- Must be atomic with event dispatch
+- Need synchronous confirmation
+- Database updates that must commit together
+
+### Background Handlers (Queued)
+
+Handlers with `.retry() > 1`, `.delay()`, `.timeout()`, or `.priority()` run in **background workers**:
+
+```rust
+// Background handler - queued for workers
+handler::on::<PaymentRequested>()
+    .retry(3)
+    .timeout(Duration::from_secs(30))
+    .then(|event, ctx| async move {
+        ctx.deps().stripe.charge(&event).await?;
+        Ok(PaymentCharged { order_id: event.order_id })
+    })
+```
+
+**Execution flow:**
+```
+1. Event inserted into seesaw_events (Transaction A)
+2. Handler intent inserted into seesaw_handler_intents (Transaction A)
+3. [Transaction A commits]
+4. pg_notify alerts workers
+5. Worker picks up handler intent
+6. [Transaction B begins in HandlerWorker]
+7. Handler executes
+8. Insert PaymentCharged into seesaw_events
+9. Mark handler complete
+10. [Transaction B commits]
+11. pg_notify sends new events
+```
+
+**Guarantees:**
+- ⏱️ **Async** - `.await` only waits for queue insertion, not execution
+- 🔄 **Retryable** - survives failures and restarts
+- 📈 **Scalable** - distributes across multiple workers
+- ⚠️ **Separate transaction** - not atomic with event dispatch
+
+**Use when:**
+- Slow operations (API calls, external services)
+- Need retry on failure
+- Can be asynchronous (eventual consistency okay)
+- Want to distribute load across workers
+
+### Key Differences
+
+| Aspect | Inline | Background |
+|--------|--------|------------|
+| **Transaction** | Same as dispatch | Separate |
+| **Speed** | Immediate | Queued (eventually) |
+| **Atomicity** | With dispatch | No |
+| **Retry** | No (failure = rollback) | Yes (configurable) |
+| **Workers** | Any worker | Dedicated handler workers |
+| **Latency** | Low (~ms) | Higher (~100ms+) |
+| **Use case** | DB updates | External APIs |
+
+### Common Patterns
+
+**Pattern 1: Inline for DB, Background for External**
+```rust
+// Inline - update local database atomically
+handler::on::<OrderPlaced>()
+    .then(|event, ctx| async move {
+        sqlx::query("INSERT INTO orders ...").execute(&ctx.deps().db).await?;
+        Ok(OrderSaved { order_id: event.order_id })
+    })
+
+// Background - call external API with retry
+handler::on::<OrderSaved>()
+    .retry(3)
+    .then(|event, ctx| async move {
+        ctx.deps().stripe.charge(&event).await?;
+        Ok(PaymentCharged { order_id: event.order_id })
+    })
+```
+
+**Pattern 2: Chain via Events**
+```rust
+// Inline handler emits event for background processing
+handler::on::<WebhookReceived>()
+    .then(|event, ctx| async move {
+        // Fast validation and persistence
+        ctx.deps().db.insert_webhook(&event).await?;
+        // Emit event for slow processing
+        Ok(WebhookValidated { webhook_id: event.id })
+    })
+
+// Background handler does slow work
+handler::on::<WebhookValidated>()
+    .retry(5)
+    .timeout(Duration::from_secs(60))
+    .then(|event, ctx| async move {
+        // Slow processing with retry
+        ctx.deps().process_webhook(&event).await?;
+        Ok(WebhookProcessed { webhook_id: event.webhook_id })
+    })
+```
+
+### Transaction Safety Rules
+
+1. **Inline handlers must be idempotent** within their transaction - they may be called multiple times if transaction retries
+2. **Background handlers must be idempotent** across executions - they WILL be retried on failure
+3. **Never assume atomicity across inline → background** - they're separate transactions
+4. **Use idempotency_key()** for external API calls to prevent duplicate charges/notifications
+5. **Emit events for coordination** - don't rely on shared mutable state
+
+### Debugging Transaction Issues
+
+**Problem: Changes disappear**
+```rust
+// ❌ Inline handler that might rollback
+handler::on::<OrderPlaced>()
+    .then(|event, ctx| async move {
+        ctx.deps().db.insert_order(&event).await?;  // ✅ Inserted
+        external_api_call().await?;  // ❌ Fails, entire TX rolls back
+        Ok(OrderSaved { order_id: event.order_id })
+    })
+```
+
+**Solution: Split inline (DB) and background (external)**
+```rust
+// ✅ Inline - just DB (fast, atomic)
+handler::on::<OrderPlaced>()
+    .then(|event, ctx| async move {
+        ctx.deps().db.insert_order(&event).await?;
+        Ok(OrderSaved { order_id: event.order_id })  // Always succeeds
+    })
+
+// ✅ Background - external API (retryable)
+handler::on::<OrderSaved>()
+    .retry(3)
+    .then(|event, ctx| async move {
+        external_api_call().await?;  // Retries on failure
+        Ok(ApiCallComplete)
+    })
+```
 
 ## Examples
 

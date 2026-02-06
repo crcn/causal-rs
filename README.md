@@ -14,6 +14,8 @@ This repository is organized as a Cargo workspace:
 
 ## Documentation
 
+- **[CLAUDE.md](./CLAUDE.md)** - Complete architecture guide and API reference
+- **[docs/DISTRIBUTED-SAFETY.md](./docs/DISTRIBUTED-SAFETY.md)** - ⚠️ Multi-worker deployment safety guide
 - **[IMPLEMENTATION_SUMMARY.md](./IMPLEMENTATION_SUMMARY.md)** - Tree visualization & WebSocket implementation details
 - **[INTEGRATION_MNDIGITALAID.md](./INTEGRATION_MNDIGITALAID.md)** - Upgrading from v0.7.8 to v0.8.1 guide
 
@@ -680,8 +682,8 @@ Builder methods:
 
 - `.with_deps(deps)` — Set shared dependencies
 - `.with_reducer(reducer)` — Register pure state transformations
-- `.with_handler(effect)` — Register event handlers (use `.then()` to return events)
-- `.with_effect_registry(registry)` — Use existing effect registry
+- `.with_handler(handler)` — Register one handler (use `.then()` to return events)
+- `.with_handlers(handlers)` — Register multiple handlers
 
 Handle methods:
 

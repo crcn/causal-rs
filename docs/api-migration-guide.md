@@ -436,125 +436,30 @@ let engine = Engine::new(deps, store).with_handlers(order_effects::effects());
 
 ## 6. Reducers
 
-### v0.7 (Stateless)
+Reducers were removed from the core API.
+
+Use event-carried context instead:
 
 ```rust
-use seesaw::reducer;
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PaymentCharged {
+    order_id: Uuid,
+    customer_email: String,
+    approval_requested: bool,
+}
 
-let order_placed_reducer = reducer::on::<OrderPlaced>().run(|state, event| {
-    OrderState {
-        order_id: Some(event.order_id),
-        status: OrderStatus::Pending,
-        payment_charged: false,
-        confirmation_sent: false,
-        approval_requested: false,
-        reminder_sent: false,
-    }
-});
-
-let payment_charged_reducer = reducer::on::<PaymentCharged>().run(|state, _event| {
-    OrderState {
-        payment_charged: true,
-        ..state
-    }
-});
-
-let confirmation_sent_reducer = reducer::on::<ConfirmationSent>().run(|state, _event| {
-    OrderState {
-        confirmation_sent: true,
-        ..state
-    }
-});
-
-let approval_requested_reducer = reducer::on::<ApprovalRequested>().run(|state, _event| {
-    OrderState {
-        status: OrderStatus::AwaitingApproval,
-        approval_requested: true,
-        ..state
-    }
-});
-
-let reminder_sent_reducer = reducer::on::<ReminderSent>().run(|state, _event| {
-    OrderState {
-        reminder_sent: true,
-        ..state
-    }
-});
-
-let approval_received_reducer = reducer::on::<ApprovalReceived>().run(|state, _event| {
-    OrderState {
-        status: OrderStatus::Approved,
-        ..state
-    }
-});
-
-let order_completed_reducer = reducer::on::<OrderCompleted>().run(|state, _event| {
-    OrderState {
-        status: OrderStatus::Completed,
-        ..state
-    }
-});
-```
-
-### Queue-Backed ✅
-
-```rust
-use seesaw::reducer;
-
-// Same reducer definitions - no changes needed!
-let order_placed_reducer = reducer::on::<OrderPlaced>().run(|state, event| {
-    OrderState {
-        order_id: Some(event.order_id),
-        status: OrderStatus::Pending,
-        payment_charged: false,
-        confirmation_sent: false,
-        approval_requested: false,
-        reminder_sent: false,
-    }
-});
-
-let payment_charged_reducer = reducer::on::<PaymentCharged>().run(|state, _event| {
-    OrderState {
-        payment_charged: true,
-        ..state
-    }
-});
-
-let confirmation_sent_reducer = reducer::on::<ConfirmationSent>().run(|state, _event| {
-    OrderState {
-        confirmation_sent: true,
-        ..state
-    }
-});
-
-let approval_requested_reducer = reducer::on::<ApprovalRequested>().run(|state, _event| {
-    OrderState {
-        status: OrderStatus::AwaitingApproval,
-        approval_requested: true,
-        ..state
-    }
-});
-
-let reminder_sent_reducer = reducer::on::<ReminderSent>().run(|state, _event| {
-    OrderState {
-        reminder_sent: true,
-        ..state
-    }
-});
-
-let approval_received_reducer = reducer::on::<ApprovalReceived>().run(|state, _event| {
-    OrderState {
-        status: OrderStatus::Approved,
-        ..state
-    }
-});
-
-let order_completed_reducer = reducer::on::<OrderCompleted>().run(|state, _event| {
-    OrderState {
-        status: OrderStatus::Completed,
-        ..state
-    }
-});
+// Effect logic branches on event fields instead of reducer state.
+let effect = seesaw::effect::on::<PaymentCharged>()
+    .id("request_approval")
+    .then(|event, _ctx| async move {
+        if event.approval_requested {
+            return Ok(());
+        }
+        Ok(ApprovalRequested {
+            order_id: event.order_id,
+            customer_email: event.customer_email.clone(),
+        })
+    });
 ```
 
 ---
@@ -580,14 +485,7 @@ async fn main() -> Result<()> {
         .with_handler(confirm_effect)
         .with_handler(approval_effect)
         .with_handler(reminder_effect)
-        .with_handler(complete_effect)
-        .with_reducer(order_placed_reducer)
-        .with_reducer(payment_charged_reducer)
-        .with_reducer(confirmation_sent_reducer)
-        .with_reducer(approval_requested_reducer)
-        .with_reducer(reminder_sent_reducer)
-        .with_reducer(approval_received_reducer)
-        .with_reducer(order_completed_reducer);
+        .with_handler(complete_effect);
 
     // Stateless execution - no durability!
     let handle = engine.activate(OrderState::default());
@@ -644,14 +542,7 @@ async fn main() -> Result<()> {
         .with_handler(confirm_effect)
         .with_handler(approval_effect)
         .with_handler(reminder_effect)
-        .with_handler(complete_effect)
-        .with_reducer(order_placed_reducer)
-        .with_reducer(payment_charged_reducer)
-        .with_reducer(confirmation_sent_reducer)
-        .with_reducer(approval_requested_reducer)
-        .with_reducer(reminder_sent_reducer)
-        .with_reducer(approval_received_reducer)
-        .with_reducer(order_completed_reducer);
+        .with_handler(complete_effect);
 
     // Create queue and start two-phase workers
     let queue = PostgresQueue::new(pool)

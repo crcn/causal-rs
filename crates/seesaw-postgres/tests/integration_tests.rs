@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
 use seesaw_core::{
-    EmittedEvent, EventProcessingCommit, InlineEffectFailure, QueuedEffectIntent, QueuedEvent,
+    EmittedEvent, EventProcessingCommit, InlineHandlerFailure, QueuedEvent, QueuedHandlerIntent,
     Store, NAMESPACE_SEESAW,
 };
 use seesaw_postgres::PostgresStore;
@@ -313,8 +313,8 @@ async fn test_commit_event_processing_persists_all_side_effects() -> Result<()> 
             correlation_id: claimed.correlation_id,
             event_type: claimed.event_type.clone(),
             event_payload: claimed.payload.clone(),
-            queued_effect_intents: vec![QueuedEffectIntent {
-                effect_id: "queued_commit_effect".to_string(),
+            queued_effect_intents: vec![QueuedHandlerIntent {
+                handler_id: "queued_commit_effect".to_string(),
                 parent_event_id: Some(claimed.event_id),
                 batch_id: None,
                 batch_index: None,
@@ -323,9 +323,10 @@ async fn test_commit_event_processing_persists_all_side_effects() -> Result<()> 
                 timeout_seconds: 30,
                 max_attempts: 3,
                 priority: 10,
+                join_window_timeout_seconds: None,
             }],
-            inline_effect_failures: vec![InlineEffectFailure {
-                effect_id: "inline_failure".to_string(),
+            inline_effect_failures: vec![InlineHandlerFailure {
+                handler_id: "inline_failure".to_string(),
                 error: "boom".to_string(),
                 reason: "inline_failed".to_string(),
                 attempts: 1,
@@ -433,8 +434,8 @@ async fn test_commit_event_processing_rolls_back_on_mid_commit_failure() -> Resu
             correlation_id: claimed.correlation_id,
             event_type: claimed.event_type.clone(),
             event_payload: claimed.payload.clone(),
-            queued_effect_intents: vec![QueuedEffectIntent {
-                effect_id: "queued_commit_effect".to_string(),
+            queued_effect_intents: vec![QueuedHandlerIntent {
+                handler_id: "queued_commit_effect".to_string(),
                 parent_event_id: Some(claimed.event_id),
                 batch_id: None,
                 batch_index: None,
@@ -443,16 +444,17 @@ async fn test_commit_event_processing_rolls_back_on_mid_commit_failure() -> Resu
                 timeout_seconds: 30,
                 max_attempts: 3,
                 priority: 10,
+                join_window_timeout_seconds: None,
             }],
             inline_effect_failures: vec![
-                InlineEffectFailure {
-                    effect_id: "dup_inline_failure".to_string(),
+                InlineHandlerFailure {
+                    handler_id: "dup_inline_failure".to_string(),
                     error: "boom".to_string(),
                     reason: "inline_failed".to_string(),
                     attempts: 1,
                 },
-                InlineEffectFailure {
-                    effect_id: "dup_inline_failure".to_string(),
+                InlineHandlerFailure {
+                    handler_id: "dup_inline_failure".to_string(),
                     error: "boom again".to_string(),
                     reason: "inline_failed".to_string(),
                     attempts: 1,
@@ -564,8 +566,8 @@ async fn test_commit_event_processing_fails_when_source_ack_row_missing() -> Res
             correlation_id: claimed.correlation_id,
             event_type: claimed.event_type.clone(),
             event_payload: claimed.payload.clone(),
-            queued_effect_intents: vec![QueuedEffectIntent {
-                effect_id: "queued_commit_effect".to_string(),
+            queued_effect_intents: vec![QueuedHandlerIntent {
+                handler_id: "queued_commit_effect".to_string(),
                 parent_event_id: Some(claimed.event_id),
                 batch_id: None,
                 batch_index: None,
@@ -574,6 +576,7 @@ async fn test_commit_event_processing_fails_when_source_ack_row_missing() -> Res
                 timeout_seconds: 30,
                 max_attempts: 3,
                 priority: 10,
+                join_window_timeout_seconds: None,
             }],
             inline_effect_failures: vec![],
             emitted_events: vec![],
@@ -740,6 +743,7 @@ async fn test_insert_and_poll_effect() -> Result<()> {
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -747,7 +751,7 @@ async fn test_insert_and_poll_effect() -> Result<()> {
     let effect = db.store.poll_next_effect().await?.unwrap();
 
     assert_eq!(effect.event_id, event_id);
-    assert_eq!(effect.effect_id, "test_effect");
+    assert_eq!(effect.handler_id, "test_effect");
     assert_eq!(effect.correlation_id, correlation_id);
     assert_eq!(effect.attempts, 1); // Should increment on poll
 
@@ -777,13 +781,14 @@ async fn test_effect_priority_ordering() -> Result<()> {
                 30,
                 3,
                 *priority,
+                None,
             )
             .await?;
     }
 
     // Should poll highest priority first (lower number = higher priority)
     let first = db.store.poll_next_effect().await?.unwrap();
-    assert_eq!(first.effect_id, "effect_1"); // Priority 1
+    assert_eq!(first.handler_id, "effect_1"); // Priority 1
 
     Ok(())
 }
@@ -811,6 +816,7 @@ async fn test_insert_effect_intent_is_idempotent() -> Result<()> {
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -830,6 +836,7 @@ async fn test_insert_effect_intent_is_idempotent() -> Result<()> {
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -850,12 +857,12 @@ async fn test_insert_effect_intent_is_idempotent() -> Result<()> {
         .await?
         .expect("single effect should be available");
     assert_eq!(polled.event_id, event_id);
-    assert_eq!(polled.effect_id, effect_id);
+    assert_eq!(polled.handler_id, effect_id);
 
     db.store
         .complete_effect(
             polled.event_id,
-            polled.effect_id.clone(),
+            polled.handler_id.clone(),
             serde_json::json!({ "ok": true }),
         )
         .await?;
@@ -889,6 +896,7 @@ async fn test_complete_effect() -> Result<()> {
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -930,6 +938,7 @@ async fn test_fail_effect_schedules_retry() -> Result<()> {
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -943,7 +952,7 @@ async fn test_fail_effect_schedules_retry() -> Result<()> {
     db.store
         .fail_effect(
             first.event_id,
-            first.effect_id.clone(),
+            first.handler_id.clone(),
             "transient failure".to_string(),
             first.attempts,
         )
@@ -963,7 +972,7 @@ async fn test_fail_effect_schedules_retry() -> Result<()> {
         .await?
         .expect("failed effect should be retried");
     assert_eq!(retried.event_id, event_id);
-    assert_eq!(retried.effect_id, effect_id);
+    assert_eq!(retried.handler_id, effect_id);
     assert_eq!(retried.attempts, 2);
 
     Ok(())
@@ -992,6 +1001,7 @@ async fn test_fail_and_dlq_effect() -> Result<()> {
             30,
             1, // max_attempts
             10,
+            None,
         )
         .await?;
 
@@ -1019,7 +1029,7 @@ async fn test_fail_and_dlq_effect() -> Result<()> {
         .fetch_one(&db.pool)
         .await?;
 
-    assert_eq!(dlq_count, 1, "Effect should be in DLQ");
+    assert_eq!(dlq_count, 1, "Handler should be in DLQ");
 
     Ok(())
 }
@@ -1171,6 +1181,7 @@ async fn test_complete_event_workflow() -> Result<()> {
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -1179,13 +1190,13 @@ async fn test_complete_event_workflow() -> Result<()> {
 
     // 5. Poll effect
     let effect = db.store.poll_next_effect().await?.unwrap();
-    assert_eq!(effect.effect_id, "send_email");
+    assert_eq!(effect.handler_id, "send_email");
 
     // 6. Complete effect
     db.store
         .complete_effect(
             effect.event_id,
-            effect.effect_id,
+            effect.handler_id,
             serde_json::json!({"sent": true}),
         )
         .await?;
@@ -1276,6 +1287,7 @@ async fn test_deterministic_event_emission() -> Result<()> {
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -1404,7 +1416,7 @@ async fn test_deterministic_event_emission() -> Result<()> {
     assert_eq!(
         execution_status,
         Some("completed".to_string()),
-        "Effect should be marked as completed"
+        "Handler should be marked as completed"
     );
 
     // Verify no additional events in queue
@@ -1456,6 +1468,7 @@ async fn test_workflow_subscription_coalesced_notify_stress_drains_all_events() 
             30,
             3,
             10,
+            None,
         )
         .await?;
 
@@ -1514,5 +1527,56 @@ async fn test_workflow_subscription_coalesced_notify_stress_drains_all_events() 
     }
 
     assert_eq!(received_indexes.len(), FAN_OUT_SIZE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_accumulation_window_timeout_expires_without_new_events() -> Result<()> {
+    let db = TestDb::new().await?;
+    let correlation_id = Uuid::new_v4();
+    let batch_id = Uuid::new_v4();
+    let source_event_id = Uuid::new_v4();
+    let handler_id = "bulk_insert".to_string();
+
+    let claimed = db
+        .store
+        .join_same_batch_append_and_maybe_claim(
+            handler_id.clone(),
+            correlation_id,
+            source_event_id,
+            "RowValidated".to_string(),
+            serde_json::json!({ "row_id": source_event_id }),
+            Utc::now(),
+            batch_id,
+            0,
+            2,
+            Some(1),
+        )
+        .await?;
+    assert!(claimed.is_none(), "window should wait for second item");
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    let expired = db.store.expire_same_batch_windows(Utc::now()).await?;
+    assert_eq!(expired.len(), 1, "exactly one window should expire");
+    assert_eq!(expired[0].join_handler_id, handler_id);
+    assert_eq!(expired[0].source_event_ids, vec![source_event_id]);
+
+    let remaining_windows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM seesaw_join_windows")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        remaining_windows.0, 0,
+        "expired accumulation windows should be removed"
+    );
+
+    let remaining_entries: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM seesaw_join_entries")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        remaining_entries.0, 0,
+        "expired accumulation entries should be removed"
+    );
+
     Ok(())
 }

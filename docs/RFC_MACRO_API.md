@@ -96,7 +96,7 @@ mod order_effects {
 // }
 
 let engine = Engine::new(deps, store)
-    .with_effects(order_effects::effects())
+    .with_handlers(order_effects::effects())
     .with_reducers(order_reducers::reducers());
 ```
 
@@ -437,7 +437,7 @@ async fn main() -> Result<()> {
 
     let engine = Engine::new(deps, store)
         .with_reducers(state::reducers())
-        .with_effects(effects::effects());
+        .with_handlers(effects::effects());
 
     let order_id = Uuid::new_v4();
     engine.process(OrderPlaced { order_id, total: 99.99 }).await?;
@@ -552,7 +552,7 @@ async fn test_ship_order() {
 async fn test_order_flow() {
     let engine = Engine::new(mock_deps(), MemoryStore::new())
         .with_reducers(state::reducers())
-        .with_effects(effects::effects());
+        .with_handlers(effects::effects());
 
     let order_id = Uuid::new_v4();
     engine.process(OrderPlaced { order_id, total: 99.99 }).await?;
@@ -596,8 +596,8 @@ async fn test_order_flow() {
 ```rust
 // Mix and match as needed
 let engine = Engine::new(deps, store)
-    .with_effects(order_effects::effects())  // Macro
-    .with_effect(  // Closure (when you need complex composition)
+    .with_handlers(order_effects::effects())  // Macro
+    .with_handler(  // Closure (when you need complex composition)
         effect::on::<ComplexEvent>()
             .filter(|e| e.is_valid())
             .transition(|prev, next| prev.status != next.status)

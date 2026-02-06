@@ -100,11 +100,11 @@ WHERE completed_at IS NOT NULL;
 COMMENT ON TABLE seesaw_processed IS 'Processing ledger - atomic claim via ON CONFLICT, persists after queue deletion';
 COMMENT ON COLUMN seesaw_processed.completed_at IS 'Phase 2 complete - all effects finished';
 
--- Effect execution intents (framework-guaranteed idempotency)
+-- Handler execution intents (framework-guaranteed idempotency)
 -- Effect workers poll this table for ready effects
-CREATE TABLE seesaw_effect_executions (
+CREATE TABLE seesaw_handler_executions (
     event_id UUID NOT NULL,
-    effect_id VARCHAR(255) NOT NULL,
+    handler_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, executing, completed, failed (retryable)
     result JSONB,
@@ -119,51 +119,52 @@ CREATE TABLE seesaw_effect_executions (
     batch_index INT,
     batch_size INT,
 
-    -- Execution properties (from effect builder)
+    -- Execution properties (from handler builder)
     execute_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- When to execute (.delayed())
     timeout_seconds INT NOT NULL DEFAULT 30,
     max_attempts INT NOT NULL DEFAULT 3,
     priority INT NOT NULL DEFAULT 10,               -- Lower = higher priority
+    join_window_timeout_seconds INT,
 
     claimed_at TIMESTAMPTZ,          -- NULL until claimed by worker
     completed_at TIMESTAMPTZ,
     last_attempted_at TIMESTAMPTZ,
 
-    PRIMARY KEY (event_id, effect_id)
+    PRIMARY KEY (event_id, handler_id)
 );
 
--- Worker polling: Find next ready effect (respects priority and schedule)
+-- Worker polling: Find next ready handler (respects priority and schedule)
 -- Note: execute_at <= NOW() check is done in query, not index (NOW() is STABLE not IMMUTABLE)
 -- Lower priority number = higher priority, so ASC order
-CREATE INDEX idx_effect_executions_pending
-ON seesaw_effect_executions(priority ASC, execute_at ASC)
+CREATE INDEX idx_handler_executions_pending
+ON seesaw_handler_executions(priority ASC, execute_at ASC)
 WHERE status = 'pending';
 
 -- Retry polling for failed effects waiting for backoff expiry.
-CREATE INDEX idx_effect_executions_retry
-ON seesaw_effect_executions(priority ASC, execute_at ASC)
+CREATE INDEX idx_handler_executions_retry
+ON seesaw_handler_executions(priority ASC, execute_at ASC)
 WHERE status = 'failed';
 
 -- Lookup effects by event (for debugging)
-CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
+CREATE INDEX idx_handler_executions_event ON seesaw_handler_executions(event_id);
 
 -- Lookup effects by workflow (for progress tracking)
-CREATE INDEX idx_effect_executions_workflow ON seesaw_effect_executions(correlation_id);
+CREATE INDEX idx_handler_executions_workflow ON seesaw_handler_executions(correlation_id);
 
 -- Monitor failures
-CREATE INDEX idx_effect_executions_failed ON seesaw_effect_executions(status, attempts)
+CREATE INDEX idx_handler_executions_failed ON seesaw_handler_executions(status, attempts)
 WHERE status = 'failed';
 
-COMMENT ON TABLE seesaw_effect_executions IS 'Effect intents - created by event workers, executed by effect workers';
-COMMENT ON COLUMN seesaw_effect_executions.event_payload IS 'Event data copied here - survives parent event deletion after 30 days';
-COMMENT ON COLUMN seesaw_effect_executions.priority IS 'Worker polling priority - lower number = higher priority';
+COMMENT ON TABLE seesaw_handler_executions IS 'Handler intents - created by event workers, executed by handler workers';
+COMMENT ON COLUMN seesaw_handler_executions.event_payload IS 'Event data copied here - survives parent event deletion after 30 days';
+COMMENT ON COLUMN seesaw_handler_executions.priority IS 'Worker polling priority - lower number = higher priority';
 
 -- ============================================================
 -- Join Tables (same-batch durable fan-in)
 -- ============================================================
 
 CREATE TABLE seesaw_join_entries (
-    join_effect_id VARCHAR(255) NOT NULL,
+    join_handler_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     source_event_id UUID NOT NULL,
     source_event_type VARCHAR(255) NOT NULL,
@@ -173,27 +174,29 @@ CREATE TABLE seesaw_join_entries (
     batch_index INT NOT NULL,
     batch_size INT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (join_effect_id, correlation_id, source_event_id),
-    UNIQUE (join_effect_id, correlation_id, batch_id, batch_index)
+    PRIMARY KEY (join_handler_id, correlation_id, source_event_id),
+    UNIQUE (join_handler_id, correlation_id, batch_id, batch_index)
 );
 
 CREATE INDEX idx_join_entries_window
-ON seesaw_join_entries(join_effect_id, correlation_id, batch_id, batch_index);
+ON seesaw_join_entries(join_handler_id, correlation_id, batch_id, batch_index);
 
 CREATE TABLE seesaw_join_windows (
-    join_effect_id VARCHAR(255) NOT NULL,
+    join_handler_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     mode VARCHAR(50) NOT NULL DEFAULT 'same_batch',
     batch_id UUID NOT NULL,
     target_count INT NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'open', -- open, processing, completed
+    window_timeout_seconds INT,
+    expires_at TIMESTAMPTZ,
     sealed_at TIMESTAMPTZ,
     processing_started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (join_effect_id, correlation_id, batch_id)
+    PRIMARY KEY (join_handler_id, correlation_id, batch_id)
 );
 
 CREATE INDEX idx_join_windows_status
@@ -206,7 +209,7 @@ ON seesaw_join_windows(status, updated_at DESC);
 -- Failed effects that exceeded retry limits
 CREATE TABLE seesaw_dlq (
     event_id UUID NOT NULL,
-    effect_id VARCHAR(255) NOT NULL,
+    handler_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     error TEXT NOT NULL,
     event_type VARCHAR(255) NOT NULL,
@@ -215,7 +218,7 @@ CREATE TABLE seesaw_dlq (
     attempts INT NOT NULL DEFAULT 0,
     failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at TIMESTAMPTZ,         -- NULL = unresolved, set when manually fixed
-    PRIMARY KEY (event_id, effect_id)
+    PRIMARY KEY (event_id, handler_id)
 );
 
 -- Ops query: List unresolved failures
@@ -236,7 +239,7 @@ COMMENT ON COLUMN seesaw_dlq.reason IS 'Why it failed: failed (retry exhausted),
 -- Observability Stream (for real-time visualization)
 -- ============================================================
 
--- Stream of all workflow events and effect transitions
+-- Stream of all workflow events and handler transitions
 -- Append-only table for real-time monitoring and debugging
 CREATE TABLE seesaw_stream (
     seq BIGSERIAL PRIMARY KEY,
@@ -244,10 +247,10 @@ CREATE TABLE seesaw_stream (
     correlation_id UUID NOT NULL,
     event_id UUID,
     effect_event_id UUID,              -- For effects: the triggering event_id
-    effect_id VARCHAR(255),             -- For effects: the effect identifier
+    handler_id VARCHAR(255),             -- For handlers: the handler identifier
     status VARCHAR(50),                 -- For effects: 'executing', 'completed', 'failed'
     error TEXT,                         -- For failures: error message
-    payload JSONB,                      -- Event payload or effect result
+    payload JSONB,                      -- Event payload or handler result
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -301,8 +304,8 @@ CREATE TRIGGER seesaw_events_stream
     FOR EACH ROW
     EXECUTE FUNCTION stream_event_dispatched();
 
--- Trigger: Stream effect execution lifecycle
-CREATE OR REPLACE FUNCTION stream_effect_transition()
+-- Trigger: Stream handler execution lifecycle
+CREATE OR REPLACE FUNCTION stream_handler_transition()
 RETURNS TRIGGER AS $$
 DECLARE
     stream_type_val VARCHAR(50);
@@ -324,7 +327,7 @@ BEGIN
         correlation_id,
         event_id,
         effect_event_id,
-        effect_id,
+        handler_id,
         status,
         error,
         payload,
@@ -332,9 +335,9 @@ BEGIN
     ) VALUES (
         stream_type_val,
         NEW.correlation_id,
-        NULL,  -- No new event for effect lifecycle
+        NULL,  -- No new event for handler lifecycle
         NEW.event_id,
-        NEW.effect_id,
+        NEW.handler_id,
         NEW.status,
         NEW.error,
         NEW.result,
@@ -348,13 +351,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER seesaw_effect_executions_stream
-    AFTER INSERT OR UPDATE ON seesaw_effect_executions
+CREATE TRIGGER seesaw_handler_executions_stream
+    AFTER INSERT OR UPDATE ON seesaw_handler_executions
     FOR EACH ROW
-    EXECUTE FUNCTION stream_effect_transition();
+    EXECUTE FUNCTION stream_handler_transition();
 
 COMMENT ON FUNCTION stream_event_dispatched IS 'Trigger: Log event dispatches to observability stream';
-COMMENT ON FUNCTION stream_effect_transition IS 'Trigger: Log effect lifecycle transitions to observability stream';
+COMMENT ON FUNCTION stream_handler_transition IS 'Trigger: Log handler lifecycle transitions to observability stream';
 
 -- ============================================================
 -- Operational Tables
@@ -366,12 +369,12 @@ CREATE TABLE seesaw_reaper_heartbeat (
     id INT PRIMARY KEY DEFAULT 1,
     last_run TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     events_reaped INT NOT NULL DEFAULT 0,
-    effects_reaped INT NOT NULL DEFAULT 0,
+    handlers_reaped INT NOT NULL DEFAULT 0,
     CHECK (id = 1)  -- Enforce single row
 );
 
 -- Insert initial row
-INSERT INTO seesaw_reaper_heartbeat (id, last_run, events_reaped, effects_reaped)
+INSERT INTO seesaw_reaper_heartbeat (id, last_run, events_reaped, handlers_reaped)
 VALUES (1, NOW(), 0, 0);
 
 CREATE INDEX idx_reaper_last_run ON seesaw_reaper_heartbeat(last_run);
@@ -394,10 +397,10 @@ COMMENT ON TABLE seesaw_events_archive IS 'Long-term storage for events older th
 
 -- Function to clean up old completed events (run via cron)
 CREATE OR REPLACE FUNCTION seesaw_cleanup_old_events(retention_days INT DEFAULT 30)
-RETURNS TABLE(events_deleted BIGINT, effects_deleted BIGINT) AS $$
+RETURNS TABLE(events_deleted BIGINT, handlers_deleted BIGINT) AS $$
 DECLARE
     events_count BIGINT;
-    effects_count BIGINT;
+    handlers_count BIGINT;
 BEGIN
     -- Archive events to archive table (optional)
     INSERT INTO seesaw_events_archive
@@ -409,19 +412,19 @@ BEGIN
     WHERE processed_at < NOW() - (retention_days || ' days')::INTERVAL;
     GET DIAGNOSTICS events_count = ROW_COUNT;
 
-    -- Delete old completed effects
-    DELETE FROM seesaw_effect_executions
+    -- Delete old completed handlers
+    DELETE FROM seesaw_handler_executions
     WHERE completed_at < NOW() - (retention_days || ' days')::INTERVAL
     AND status = 'completed';
-    GET DIAGNOSTICS effects_count = ROW_COUNT;
+    GET DIAGNOSTICS handlers_count = ROW_COUNT;
 
     -- Update reaper heartbeat
     UPDATE seesaw_reaper_heartbeat
     SET last_run = NOW(),
         events_reaped = events_reaped + events_count,
-        effects_reaped = effects_reaped + effects_count;
+        handlers_reaped = handlers_reaped + handlers_count;
 
-    RETURN QUERY SELECT events_count, effects_count;
+    RETURN QUERY SELECT events_count, handlers_count;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -476,9 +479,9 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 -- FROM seesaw_events
 -- WHERE processed_at IS NULL;
 
--- Alert: Pending effect payload size > 10KB (performance risk)
+-- Alert: Pending handler payload size > 10KB (performance risk)
 -- SELECT event_id, LENGTH(event_payload::text) as payload_bytes
--- FROM seesaw_effect_executions
+-- FROM seesaw_handler_executions
 -- WHERE LENGTH(event_payload::text) > 10240
 -- ORDER BY payload_bytes DESC;
 
@@ -486,20 +489,20 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 -- SELECT COUNT(*) FILTER (WHERE status = 'failed') as failed,
 --        COUNT(*) as total,
 --        (COUNT(*) FILTER (WHERE status = 'failed')::float / COUNT(*)) as failure_rate
--- FROM seesaw_effect_executions
+-- FROM seesaw_handler_executions
 -- WHERE completed_at > NOW() - INTERVAL '5 minutes';
 
 -- Dashboard: Active workflows
 -- SELECT COUNT(DISTINCT correlation_id) as active_workflows
--- FROM seesaw_effect_executions
+-- FROM seesaw_handler_executions
 -- WHERE status IN ('pending', 'executing', 'failed');
 
--- Dashboard: Effect execution latency (p50, p95, p99)
+-- Dashboard: Handler execution latency (p50, p95, p99)
 -- SELECT
 --     PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - execute_at))) as p50,
 --     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - execute_at))) as p95,
 --     PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - execute_at))) as p99
--- FROM seesaw_effect_executions
+-- FROM seesaw_handler_executions
 -- WHERE completed_at > NOW() - INTERVAL '1 hour' AND status = 'completed';
 
 -- ============================================================
@@ -531,7 +534,7 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 
 -- Monthly:
 --   - VACUUM ANALYZE all tables
---   - Check effect payload size distribution
+--   - Check handler payload size distribution
 --   - Review DLQ for patterns
 
 -- Schema complete! Ready for production at 1000+ events/sec.

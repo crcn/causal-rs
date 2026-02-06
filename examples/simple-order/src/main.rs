@@ -1,7 +1,7 @@
 //! Simple Order Processing Example
 
 use anyhow::Result;
-use seesaw_core::{effect, EffectContext, Engine};
+use seesaw_core::{effect, Engine, HandlerContext};
 use seesaw_memory::MemoryStore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -46,24 +46,24 @@ async fn main() -> Result<()> {
     };
 
     let engine = Engine::new(deps, store)
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::Placed { order_id, .. } => Some(*order_id),
                     _ => None,
                 })
-                .then(|order_id, ctx: EffectContext<Deps>| async move {
+                .then(|order_id, ctx: HandlerContext<Deps>| async move {
                     ctx.deps().ship(order_id).await?;
                     Ok(OrderEvent::Shipped { order_id })
                 }),
         )
-        .with_effect(
-            effect::on::<OrderEvent>()
+        .with_handler(
+            handler::on::<OrderEvent>()
                 .extract(|e| match e {
                     OrderEvent::Shipped { order_id } => Some(*order_id),
                     _ => None,
                 })
-                .then(|order_id, ctx: EffectContext<Deps>| async move {
+                .then(|order_id, ctx: HandlerContext<Deps>| async move {
                     ctx.deps()
                         .notify(order_id, "your order has shipped")
                         .await?;

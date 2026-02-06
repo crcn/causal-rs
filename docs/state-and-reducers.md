@@ -580,7 +580,7 @@ fn build_engine(deps: Deps) -> Engine<OrderState, Deps> {
     let mut engine = Engine::new(deps).with_reducer(build_reducer());
 
     for effect in build_effects() {
-        engine = engine.with_effect(effect);
+        engine = engine.with_handler(effect);
     }
 
     engine

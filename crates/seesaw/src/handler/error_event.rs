@@ -6,7 +6,7 @@ use std::sync::Arc;
 /// Minimal data structure - just what happened and what failed.
 /// Users write explicit handling logic for retries, compensation, etc.
 #[derive(Clone)]
-pub struct EffectError {
+pub struct HandlerError {
     /// The event that triggered the effect.
     pub source_event: Arc<dyn Any + Send + Sync>,
 
@@ -17,7 +17,7 @@ pub struct EffectError {
     pub error: Arc<anyhow::Error>,
 }
 
-impl EffectError {
+impl HandlerError {
     pub fn new(
         source_event: Arc<dyn Any + Send + Sync>,
         source_event_type: TypeId,
@@ -36,9 +36,9 @@ impl EffectError {
     }
 }
 
-impl std::fmt::Debug for EffectError {
+impl std::fmt::Debug for HandlerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EffectError")
+        f.debug_struct("HandlerError")
             .field("source_event_type", &self.source_event_type)
             .field("error", &self.error.to_string())
             .finish()
@@ -64,7 +64,7 @@ mod tests {
         let error = anyhow::anyhow!("test error");
 
         let effect_error =
-            EffectError::new(Arc::new(event.clone()), TypeId::of::<TestEvent>(), error);
+            HandlerError::new(Arc::new(event.clone()), TypeId::of::<TestEvent>(), error);
 
         assert_eq!(effect_error.source_event_type, TypeId::of::<TestEvent>());
         assert!(effect_error.error.to_string().contains("test error"));
@@ -78,7 +78,7 @@ mod tests {
         };
         let error = anyhow::Error::from(custom_error);
 
-        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let effect_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         // Should successfully downcast to CustomError
         let downcasted = effect_error.downcast::<CustomError>();
@@ -91,7 +91,7 @@ mod tests {
         let event = TestEvent;
         let error = anyhow::anyhow!("generic error");
 
-        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let effect_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         // Should fail to downcast to CustomError
         let downcasted = effect_error.downcast::<CustomError>();
@@ -103,10 +103,10 @@ mod tests {
         let event = TestEvent;
         let error = anyhow::anyhow!("formatting test");
 
-        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let effect_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         let debug_str = format!("{:?}", effect_error);
-        assert!(debug_str.contains("EffectError"));
+        assert!(debug_str.contains("HandlerError"));
         assert!(debug_str.contains("formatting test"));
     }
 
@@ -115,7 +115,7 @@ mod tests {
         let event = TestEvent;
         let error = anyhow::anyhow!("clone test");
 
-        let effect_error = EffectError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let effect_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         let cloned = effect_error.clone();
         assert_eq!(cloned.source_event_type, effect_error.source_event_type);

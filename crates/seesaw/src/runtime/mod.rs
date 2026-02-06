@@ -1,19 +1,19 @@
 //! Runtime - worker management for queue-backed engine.
 
-pub mod effect_worker;
 pub mod event_worker;
+pub mod handler_worker;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::effect::EffectContext;
+use crate::handler::HandlerContext;
 use crate::Store;
-use effect_worker::{EffectWorker, EffectWorkerConfig};
 use event_worker::{EventWorker, EventWorkerConfig};
+use handler_worker::{HandlerWorker, HandlerWorkerConfig};
 
 /// Runtime configuration.
 #[derive(Debug, Clone)]
@@ -21,20 +21,20 @@ pub struct RuntimeConfig {
     /// Number of event workers to spawn.
     pub event_workers: usize,
     /// Number of effect workers to spawn.
-    pub effect_workers: usize,
+    pub handler_workers: usize,
     /// Event worker configuration.
     pub event_worker_config: EventWorkerConfig,
-    /// Effect worker configuration.
-    pub effect_worker_config: EffectWorkerConfig,
+    /// Handler worker configuration.
+    pub handler_worker_config: HandlerWorkerConfig,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             event_workers: 2,
-            effect_workers: 4,
+            handler_workers: 4,
             event_worker_config: EventWorkerConfig::default(),
-            effect_worker_config: EffectWorkerConfig::default(),
+            handler_worker_config: HandlerWorkerConfig::default(),
         }
     }
 }
@@ -47,14 +47,17 @@ pub struct Runtime {
 
 impl Runtime {
     /// Start runtime with engine.
-    pub fn start<D, St>(engine: &crate::engine_v2::Engine<D, St>, config: RuntimeConfig) -> Self
+    pub async fn start<D, St>(
+        engine: &crate::engine_v2::Engine<D, St>,
+        config: RuntimeConfig,
+    ) -> Result<Self>
     where
         D: Send + Sync + 'static,
         St: Store,
     {
         info!(
             "Starting runtime: {} event workers, {} effect workers",
-            config.event_workers, config.effect_workers
+            config.event_workers, config.handler_workers
         );
 
         let mut handles = Vec::new();
@@ -68,20 +71,18 @@ impl Runtime {
 
             let deps = engine.deps().clone();
             let effect_id = effect.id.clone();
-            let effect_for_start = effect.clone();
+            let ctx = HandlerContext::new(
+                effect_id.clone(),
+                format!("startup::{}", effect_id),
+                Uuid::nil(),
+                Uuid::nil(),
+                deps,
+            );
 
-            let handle = tokio::spawn(async move {
-                let ctx = EffectContext::new(
-                    effect_id.clone(),
-                    format!("startup::{}", effect_id),
-                    Uuid::nil(),
-                    Uuid::nil(),
-                    deps,
-                );
-                effect_for_start.call_started(ctx).await
-            });
-
-            handles.push(handle);
+            effect
+                .call_started(ctx)
+                .await
+                .with_context(|| format!("startup handler for effect '{}' failed", effect_id))?;
         }
 
         for i in 0..config.event_workers {
@@ -102,25 +103,25 @@ impl Runtime {
             handles.push(handle);
         }
 
-        for i in 0..config.effect_workers {
-            let worker = EffectWorker::new(
+        for i in 0..config.handler_workers {
+            let worker = HandlerWorker::new(
                 engine.store().clone(),
                 engine.deps().clone(),
                 engine.effects().clone(),
-                config.effect_worker_config.clone(),
+                config.handler_worker_config.clone(),
             )
             .with_queue_backend(queue_backend.clone())
             .with_shutdown(shutdown.clone());
 
             let handle = tokio::spawn(async move {
-                info!("Effect worker {} started", i);
+                info!("Handler worker {} started", i);
                 worker.run().await
             });
 
             handles.push(handle);
         }
 
-        Self { handles, shutdown }
+        Ok(Self { handles, shutdown })
     }
 
     /// Shutdown runtime (waits for all workers to complete).
@@ -154,17 +155,16 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::{on_any, EffectContext};
+    use crate::handler::{on_any, HandlerContext};
     use crate::{
-        EmittedEvent, QueuedEffectExecution, QueuedEvent, Store, WorkflowEvent, WorkflowStatus,
+        EmittedEvent, QueuedEvent, QueuedHandlerExecution, Store, WorkflowEvent, WorkflowStatus,
     };
     use anyhow::Result;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use futures::stream;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -190,6 +190,13 @@ mod tests {
             Ok(())
         }
 
+        async fn commit_event_processing(
+            &self,
+            _commit: crate::EventProcessingCommit,
+        ) -> Result<()> {
+            Ok(())
+        }
+
         async fn insert_effect_intent(
             &self,
             _event_id: Uuid,
@@ -205,11 +212,12 @@ mod tests {
             _timeout_seconds: i32,
             _max_attempts: i32,
             _priority: i32,
+            _join_window_timeout_seconds: Option<i32>,
         ) -> Result<()> {
             Ok(())
         }
 
-        async fn poll_next_effect(&self) -> Result<Option<QueuedEffectExecution>> {
+        async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
             Ok(None)
         }
 
@@ -275,10 +283,10 @@ mod tests {
         let started_calls = Arc::new(AtomicUsize::new(0));
         let started_calls_clone = started_calls.clone();
 
-        let engine = crate::Engine::new(TestDeps, NoopStore).with_effect(
+        let engine = crate::Engine::new(TestDeps, NoopStore).with_handler(
             on_any()
                 .id("startup_probe")
-                .started(move |_ctx: EffectContext<TestDeps>| {
+                .started(move |_ctx: HandlerContext<TestDeps>| {
                     let started_calls = started_calls_clone.clone();
                     async move {
                         started_calls.fetch_add(1, Ordering::SeqCst);
@@ -292,12 +300,13 @@ mod tests {
             &engine,
             RuntimeConfig {
                 event_workers: 0,
-                effect_workers: 0,
+                handler_workers: 0,
                 ..Default::default()
             },
-        );
+        )
+        .await
+        .expect("runtime start should succeed");
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             started_calls.load(Ordering::SeqCst),
             1,
@@ -305,5 +314,37 @@ mod tests {
         );
 
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_start_fails_when_started_handler_fails() {
+        let engine = crate::Engine::new(TestDeps, NoopStore).with_handler(
+            on_any()
+                .id("startup_fail")
+                .started(|_ctx: HandlerContext<TestDeps>| async move {
+                    Err(anyhow::anyhow!("startup failed"))
+                })
+                .then(|_, _| async move { Ok(()) }),
+        );
+
+        let startup_result = Runtime::start(
+            &engine,
+            RuntimeConfig {
+                event_workers: 0,
+                handler_workers: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let error = match startup_result {
+            Ok(_) => panic!("runtime startup should fail when a started hook errors"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("startup_fail"),
+            "startup error should include failing effect id: {error}"
+        );
     }
 }

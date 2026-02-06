@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use super::context::EffectContext;
-use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Effect, Emit, EventOutput, JoinMode};
+use super::context::HandlerContext;
+use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Emit, EventOutput, Handler, JoinMode};
 use crate::event_codec::EventCodec;
 
 #[track_caller]
@@ -94,13 +94,14 @@ where
 }
 
 /// A unified builder for effects using a compile-time type-phase pattern.
-pub struct EffectBuilder<EventType, Filter, Started> {
+pub struct HandlerBuilder<EventType, Filter, Started> {
     filter: Filter,
     started: Started,
     id: Option<String>,
     queued: bool,
     delay: Option<Duration>,
     timeout: Option<Duration>,
+    join_window_timeout: Option<Duration>,
     max_attempts: u32,
     priority: Option<i32>,
     codec: Option<Arc<EventCodec>>,
@@ -109,14 +110,15 @@ pub struct EffectBuilder<EventType, Filter, Started> {
 }
 
 /// Create an effect that handles a specific event type.
-pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoStarted> {
-    EffectBuilder {
+pub fn on<E: Send + Sync + 'static>() -> HandlerBuilder<Typed<E>, NoFilter, NoStarted> {
+    HandlerBuilder {
         filter: NoFilter,
         started: NoStarted,
         id: None,
         queued: false,
         delay: None,
         timeout: None,
+        join_window_timeout: None,
         max_attempts: 1,
         priority: None,
         codec: None,
@@ -126,14 +128,15 @@ pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoSta
 }
 
 /// Create an effect that handles all events (observer pattern).
-pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoStarted> {
-    EffectBuilder {
+pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
+    HandlerBuilder {
         filter: NoFilter,
         started: NoStarted,
         id: None,
         queued: false,
         delay: None,
         timeout: None,
+        join_window_timeout: None,
         max_attempts: 1,
         priority: None,
         codec: None,
@@ -142,22 +145,23 @@ pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoStarted> {
     }
 }
 
-impl<E, Started> EffectBuilder<Typed<E>, NoFilter, Started>
+impl<E, Started> HandlerBuilder<Typed<E>, NoFilter, Started>
 where
     E: Send + Sync + 'static,
 {
     /// Add a filter predicate that must pass for the handler to run.
-    pub fn filter<F>(self, predicate: F) -> EffectBuilder<Typed<E>, WithFilter<F>, Started>
+    pub fn filter<F>(self, predicate: F) -> HandlerBuilder<Typed<E>, WithFilter<F>, Started>
     where
         F: Fn(&E) -> bool + Send + Sync + 'static,
     {
-        EffectBuilder {
+        HandlerBuilder {
             filter: WithFilter(predicate),
             started: self.started,
             id: self.id,
-            queued: true,
+            queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
+            join_window_timeout: self.join_window_timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
@@ -170,18 +174,19 @@ where
     pub fn extract<F, T>(
         self,
         extractor: F,
-    ) -> EffectBuilder<Typed<E>, WithFilterMap<F, T>, Started>
+    ) -> HandlerBuilder<Typed<E>, WithFilterMap<F, T>, Started>
     where
         F: Fn(&E) -> Option<T> + Send + Sync + 'static,
         T: Clone + Send + Sync + 'static,
     {
-        EffectBuilder {
+        HandlerBuilder {
             filter: WithFilterMap(extractor, PhantomData),
             started: self.started,
             id: self.id,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
+            join_window_timeout: self.join_window_timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
@@ -191,24 +196,25 @@ where
     }
 }
 
-impl<EventType, Filter> EffectBuilder<EventType, Filter, NoStarted> {
+impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
     /// Add a started handler that runs when the store is activated.
     pub fn started<D, St, StFut>(
         self,
         started: St,
-    ) -> EffectBuilder<EventType, Filter, WithStarted<D, St>>
+    ) -> HandlerBuilder<EventType, Filter, WithStarted<D, St>>
     where
         D: Send + Sync + 'static,
-        St: Fn(EffectContext<D>) -> StFut + Send + Sync + 'static,
+        St: Fn(HandlerContext<D>) -> StFut + Send + Sync + 'static,
         StFut: Future<Output = Result<()>> + Send + 'static,
     {
-        EffectBuilder {
+        HandlerBuilder {
             filter: self.filter,
             started: WithStarted(started, PhantomData),
             id: self.id,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
+            join_window_timeout: self.join_window_timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
@@ -218,7 +224,7 @@ impl<EventType, Filter> EffectBuilder<EventType, Filter, NoStarted> {
     }
 }
 
-impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, Started> {
+impl<EventType, Filter, Started> HandlerBuilder<EventType, Filter, Started> {
     /// Set a custom ID for this effect (default: auto-generated).
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
@@ -226,7 +232,7 @@ impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, Started> {
     }
 }
 
-impl<E, Filter, Started> EffectBuilder<Typed<E>, Filter, Started>
+impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
@@ -265,10 +271,16 @@ where
 }
 
 #[allow(private_bounds)]
-impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, Started>
+impl<EventType, Filter, Started> HandlerBuilder<EventType, Filter, Started>
 where
     EventType: QueueCodecProvider,
 {
+    /// Set a timeout for accumulation windows.
+    pub fn window_timeout(mut self, duration: Duration) -> Self {
+        self.join_window_timeout = Some(duration);
+        self
+    }
+
     /// Force queued execution (default: inline).
     pub fn queued(mut self) -> Self {
         self.queued = true;
@@ -308,25 +320,30 @@ where
 }
 
 /// Builder for durable same-batch join effects.
-pub struct JoinEffectBuilder<E, Started> {
-    inner: EffectBuilder<Typed<E>, NoFilter, Started>,
+pub struct JoinHandlerBuilder<E, Started> {
+    inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
     mode: JoinMode,
 }
 
-impl<E, Started> EffectBuilder<Typed<E>, NoFilter, Started>
+impl<E, Started> HandlerBuilder<Typed<E>, NoFilter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
-    /// Configure this effect as a durable join effect.
-    pub fn join(self) -> JoinEffectBuilder<E, Started> {
-        JoinEffectBuilder {
+    /// Configure this effect as a durable accumulation effect.
+    pub fn accumulate(self) -> JoinHandlerBuilder<E, Started> {
+        JoinHandlerBuilder {
             inner: self,
             mode: JoinMode::SameBatch,
         }
     }
+
+    /// Backward-compatible alias for `accumulate()`.
+    pub fn join(self) -> JoinHandlerBuilder<E, Started> {
+        self.accumulate()
+    }
 }
 
-impl<E, Started> JoinEffectBuilder<E, Started>
+impl<E, Started> JoinHandlerBuilder<E, Started>
 where
     E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
 {
@@ -336,14 +353,20 @@ where
         self
     }
 
+    /// Set a timeout for this accumulation window.
+    pub fn window_timeout(mut self, duration: Duration) -> Self {
+        self.inner.join_window_timeout = Some(duration);
+        self
+    }
+
     /// Set the handler for joined batch execution.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<D, H, Fut, R, O>(mut self, handler: H) -> Effect<D>
+    pub fn then<D, H, Fut, R, O>(mut self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
         Started: StartedHandler<D>,
-        H: Fn(Vec<E>, EffectContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(Vec<E>, HandlerContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
@@ -361,7 +384,7 @@ where
             .take()
             .unwrap_or_else(typed_event_codec::<E>);
 
-        Effect {
+        Handler {
             id,
             codecs: vec![typed_codec],
             can_handle: Arc::new(move |t| t == target),
@@ -386,6 +409,7 @@ where
                     Ok(emit_to_outputs(emit))
                 })
             })),
+            join_window_timeout: self.inner.join_window_timeout,
             dlq_terminal_mapper: self.inner.dlq_terminal_mapper.take(),
             queued: true,
             delay: self.inner.delay,
@@ -439,7 +463,7 @@ where
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>;
+    ) -> Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>>;
 }
 
 impl<D> StartedHandler<D> for NoStarted
@@ -448,7 +472,7 @@ where
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    ) -> Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         None
     }
 }
@@ -456,31 +480,31 @@ where
 impl<D, St, StFut> StartedHandler<D> for WithStarted<D, St>
 where
     D: Send + Sync + 'static,
-    St: Fn(EffectContext<D>) -> StFut + Send + Sync + 'static,
+    St: Fn(HandlerContext<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
     fn into_started(
         self,
-    ) -> Option<Arc<dyn Fn(EffectContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
+    ) -> Option<Arc<dyn Fn(HandlerContext<D>) -> BoxFuture<Result<()>> + Send + Sync>> {
         let started = self.0;
         Some(Arc::new(move |ctx| Box::pin(started(ctx))))
     }
 }
 
-impl<E, Filter, Started> EffectBuilder<Typed<E>, Filter, Started>
+impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
     /// Set the handler that returns the next event (terminal operation).
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<D, T, H, Fut, R, O>(self, handler: H) -> Effect<D>
+    pub fn then<D, T, H, Fut, R, O>(self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
         T: Clone + Send + 'static,
         Filter: Extractor<E, T>,
         Started: StartedHandler<D>,
-        H: Fn(T, EffectContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(T, HandlerContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
@@ -494,7 +518,7 @@ where
             .id
             .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
 
-        Effect {
+        Handler {
             id,
             codecs: codec.into_iter().collect(),
             can_handle: Arc::new(move |t| t == target),
@@ -516,6 +540,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper,
             queued: self.queued,
             delay: self.delay,
@@ -528,14 +553,14 @@ where
     /// Queue-capable variant of [`then`].
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then_queue<D, T, H, Fut, R, O>(self, handler: H) -> Effect<D>
+    pub fn then_queue<D, T, H, Fut, R, O>(self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
         E: Clone + serde::Serialize + serde::de::DeserializeOwned,
         T: Clone + Send + 'static,
         Filter: Extractor<E, T>,
         Started: StartedHandler<D>,
-        H: Fn(T, EffectContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(T, HandlerContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
         O: Send + Sync + 'static,
@@ -549,7 +574,7 @@ where
             .id
             .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
 
-        Effect {
+        Handler {
             id,
             codecs: vec![codec],
             can_handle: Arc::new(move |t| t == target),
@@ -571,6 +596,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper,
             queued: true,
             delay: self.delay,
@@ -581,18 +607,18 @@ where
     }
 }
 
-impl EffectBuilder<Untyped, NoFilter, NoStarted> {
+impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
     /// Set the handler for observing all events.
     #[track_caller]
-    pub fn then<D, H, Fut>(self, handler: H) -> Effect<D>
+    pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
-        H: Fn(AnyEvent, EffectContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(AnyEvent, HandlerContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let id = self.id.unwrap_or_else(|| default_effect_id("effect_any"));
 
-        Effect {
+        Handler {
             id,
             codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
@@ -607,6 +633,7 @@ impl EffectBuilder<Untyped, NoFilter, NoStarted> {
             }),
             join_mode: None,
             join_batch_handler: None,
+            join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
@@ -617,17 +644,17 @@ impl EffectBuilder<Untyped, NoFilter, NoStarted> {
     }
 }
 
-impl<D, St, StFut> EffectBuilder<Untyped, NoFilter, WithStarted<D, St>>
+impl<D, St, StFut> HandlerBuilder<Untyped, NoFilter, WithStarted<D, St>>
 where
     D: Send + Sync + 'static,
-    St: Fn(EffectContext<D>) -> StFut + Send + Sync + 'static,
+    St: Fn(HandlerContext<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
     /// Set the handler for observing all events with started hook.
     #[track_caller]
-    pub fn then<H, Fut>(self, handler: H) -> Effect<D>
+    pub fn then<H, Fut>(self, handler: H) -> Handler<D>
     where
-        H: Fn(AnyEvent, EffectContext<D>) -> Fut + Send + Sync + 'static,
+        H: Fn(AnyEvent, HandlerContext<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let id = self
@@ -635,7 +662,7 @@ where
             .unwrap_or_else(|| default_effect_id("effect_any_started"));
         let started = self.started.0;
 
-        Effect {
+        Handler {
             id,
             codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
@@ -650,6 +677,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
@@ -662,17 +690,17 @@ where
 
 /// Compose multiple effects into a single effect.
 #[track_caller]
-pub fn group<D>(effects: impl IntoIterator<Item = Effect<D>>) -> Effect<D>
+pub fn group<D>(effects: impl IntoIterator<Item = Handler<D>>) -> Handler<D>
 where
     D: Send + Sync + 'static,
 {
-    let effects: Arc<Vec<Effect<D>>> = Arc::new(effects.into_iter().collect());
+    let effects: Arc<Vec<Handler<D>>> = Arc::new(effects.into_iter().collect());
     let mut codecs = Vec::new();
     for effect in effects.iter() {
         codecs.extend(effect.codecs().iter().cloned());
     }
 
-    Effect {
+    Handler {
         id: default_effect_id("effect_group"),
         codecs,
         can_handle: {
@@ -681,7 +709,7 @@ where
         },
         started: {
             let effects = effects.clone();
-            Some(Arc::new(move |ctx: EffectContext<D>| {
+            Some(Arc::new(move |ctx: HandlerContext<D>| {
                 let effects = effects.clone();
                 Box::pin(async move {
                     for effect in effects.iter() {
@@ -696,7 +724,9 @@ where
         handler: {
             let effects = effects.clone();
             Arc::new(
-                move |value: Arc<dyn Any + Send + Sync>, type_id: TypeId, ctx: EffectContext<D>| {
+                move |value: Arc<dyn Any + Send + Sync>,
+                      type_id: TypeId,
+                      ctx: HandlerContext<D>| {
                     let effects = effects.clone();
                     Box::pin(async move {
                         let mut outputs = Vec::new();
@@ -724,6 +754,7 @@ where
         },
         join_mode: None,
         join_batch_handler: None,
+        join_window_timeout: None,
         dlq_terminal_mapper: None,
         queued: false,
         delay: None,
@@ -749,12 +780,25 @@ mod tests {
     #[test]
     fn then_queue_forces_queued_execution() {
         let effect = on::<QueueEvent>().id("queue_probe").then_queue(
-            |_event: Arc<QueueEvent>, _ctx: EffectContext<Deps>| async move { Ok(()) },
+            |_event: Arc<QueueEvent>, _ctx: HandlerContext<Deps>| async move { Ok(()) },
         );
 
         assert!(
             !effect.is_inline(),
             "then_queue() should always create queued effects"
+        );
+    }
+
+    #[test]
+    fn filter_does_not_force_queued_execution() {
+        let effect = on::<QueueEvent>()
+            .id("filter_probe")
+            .filter(|event| event.value > 0)
+            .then(|_event: Arc<QueueEvent>, _ctx: HandlerContext<Deps>| async move { Ok(()) });
+
+        assert!(
+            effect.is_inline(),
+            "filter() should not change inline/queued execution mode"
         );
     }
 }
