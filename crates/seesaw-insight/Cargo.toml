@@ -1,6 +1,6 @@
 [package]
 name = "seesaw-insight"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["Crcn <crcn@example.com>"]
 description = "Real-time observability and visualization for Seesaw workflows"
@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Seesaw core
-seesaw_core = { version = "0.10.0", path = "../seesaw" }
-seesaw-postgres = { version = "0.10.0", path = "../seesaw-postgres" }
+seesaw_core = { version = "0.10.1", path = "../seesaw" }
+seesaw-postgres = { version = "0.10.1", path = "../seesaw-postgres" }
 
 # Core
 anyhow = "1.0"
