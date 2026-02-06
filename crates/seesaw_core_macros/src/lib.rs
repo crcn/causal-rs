@@ -91,6 +91,7 @@ struct EffectArgs {
     on: Option<OnSpec>,
     extract: Vec<Ident>,
     join: bool,
+    queued: bool,
     id: Option<String>,
     dlq_terminal: Option<Path>,
     retry: Option<u32>,
@@ -142,6 +143,12 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "cannot specify both delay_secs and delay_ms",
+        ));
+    }
+    if effect_requires_stable_id(&args) && args.id.is_none() && args.group.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "queued/durable #[effect] requires an explicit id = \"...\" (or group = \"...\")",
         ));
     }
 
@@ -619,6 +626,15 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 }
                 args.join = true;
             }
+            Meta::Path(path) if path.is_ident("queued") => {
+                if args.queued {
+                    return Err(syn::Error::new_spanned(
+                        path,
+                        "queued specified more than once",
+                    ));
+                }
+                args.queued = true;
+            }
             Meta::NameValue(nv) if nv.path.is_ident("id") => {
                 ensure_unset(&args.id, nv, "id")?;
                 args.id = Some(parse_string_lit(&nv.value)?);
@@ -942,6 +958,10 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
         };
     }
 
+    if args.queued {
+        builder = quote! { #builder .queued() };
+    }
+
     if let Some(retry) = args.retry {
         builder = quote! { #builder .retry(#retry) };
     }
@@ -962,6 +982,17 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     }
 
     builder
+}
+
+fn effect_requires_stable_id(args: &EffectArgs) -> bool {
+    args.queued
+        || args.join
+        || args.delay_secs.is_some()
+        || args.delay_ms.is_some()
+        || args.timeout_secs.is_some()
+        || args.timeout_ms.is_some()
+        || args.priority.is_some()
+        || args.retry.unwrap_or(1) > 1
 }
 
 fn has_attr(attrs: &[Attribute], name: &str) -> bool {
@@ -1008,6 +1039,98 @@ fn effect_output_event_type(sig: &Signature) -> syn::Result<Type> {
         Ok(emit_inner)
     } else {
         Ok(result_ok_ty)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+    use syn::parse::Parser;
+
+    fn parse_effect_meta_list(tokens: TokenStream2) -> Punctuated<Meta, Token![,]> {
+        let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+        parser
+            .parse2(tokens)
+            .expect("effect meta list should parse")
+    }
+
+    #[test]
+    fn parse_effect_args_supports_queued_flag() {
+        let metas = parse_effect_meta_list(quote!(on = MyEvent, queued));
+        let args = parse_effect_args(&metas).expect("queued should parse");
+        assert!(args.queued);
+        assert!(matches!(args.on, Some(OnSpec::EventType(_))));
+    }
+
+    #[test]
+    fn parse_effect_args_rejects_duplicate_queued_flag() {
+        let metas = parse_effect_meta_list(quote!(on = MyEvent, queued, queued));
+        let error = parse_effect_args(&metas)
+            .err()
+            .expect("duplicate queued should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("queued specified more than once"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn apply_effect_config_emits_queued_builder_call() {
+        let args = EffectArgs {
+            queued: true,
+            ..EffectArgs::default()
+        };
+        let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
+        let configured = apply_effect_config(
+            quote!(::seesaw_core::effect::on::<MyEvent>()),
+            &args,
+            &handler_ident,
+        );
+        let configured_text = configured.to_string();
+        assert!(
+            configured_text.contains(". queued ()"),
+            "queued builder call should be emitted, got: {}",
+            configured_text
+        );
+    }
+
+    #[test]
+    fn parse_effect_args_rejects_delivery_option() {
+        let metas = parse_effect_meta_list(quote!(on = MyEvent, delivery = "durable"));
+        let error = parse_effect_args(&metas)
+            .err()
+            .expect("delivery option should remain unsupported");
+        assert!(
+            error.to_string().contains("unsupported #[effect] option"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn parse_reducer_args_rejects_queued_option() {
+        let metas = parse_effect_meta_list(quote!(on = MyEvent, queued));
+        let error = parse_reducer_args(&metas)
+            .err()
+            .expect("queued should be unsupported for reducers");
+        assert!(
+            error.to_string().contains("unsupported #[reducer] option"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn stable_id_is_required_for_durable_effect_configs() {
+        let durable = EffectArgs {
+            retry: Some(3),
+            ..EffectArgs::default()
+        };
+        assert!(effect_requires_stable_id(&durable));
     }
 }
 

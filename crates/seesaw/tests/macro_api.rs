@@ -64,7 +64,7 @@ struct AnalyticsEvent;
 mod order_effects {
     use super::*;
 
-    #[effect(on = OrderPlaced)]
+    #[effect(on = OrderPlaced, id = "ship_order")]
     async fn ship_order(
         event: OrderPlaced,
         _ctx: EffectContext<TestState, Deps>,
@@ -74,7 +74,13 @@ mod order_effects {
         })
     }
 
-    #[effect(on = PaymentRequested, retry = 3, timeout_secs = 30, priority = 1)]
+    #[effect(
+        on = PaymentRequested,
+        id = "charge_payment",
+        retry = 3,
+        timeout_secs = 30,
+        priority = 1
+    )]
     async fn charge_payment(
         event: PaymentRequested,
         _ctx: EffectContext<TestState, Deps>,
@@ -89,6 +95,7 @@ mod order_effects {
 
     #[effect(
         on = PaymentRequested,
+        id = "run_search",
         retry = 3,
         dlq_terminal = build_payment_failure
     )]
@@ -113,7 +120,33 @@ mod order_effects {
         }
     }
 
-    #[effect(on = RowValidated, join)]
+    #[effect(on = OrderPlaced, queued, id = "queued_observer")]
+    async fn queued_observer(
+        _event: OrderPlaced,
+        _ctx: EffectContext<TestState, Deps>,
+    ) -> Result<Emit<AnalyticsEvent>> {
+        Ok(Emit::None)
+    }
+
+    #[effect(
+        on = PaymentRequested,
+        queued,
+        retry = 1,
+        id = "queued_retry_one"
+    )]
+    async fn queued_retry_one(
+        event: PaymentRequested,
+        _ctx: EffectContext<TestState, Deps>,
+    ) -> Result<PaymentCharged> {
+        Ok(PaymentCharged {
+            order_id: event.order_id,
+            status: "ok".to_string(),
+            error: None,
+            attempts: 0,
+        })
+    }
+
+    #[effect(on = RowValidated, join, id = "bulk_insert")]
     async fn bulk_insert(
         batch: Vec<RowValidated>,
         _ctx: EffectContext<TestState, Deps>,
@@ -169,7 +202,7 @@ mod state_reducers {
 #[test]
 fn effects_module_registration_works() {
     let effects = order_effects::effects();
-    assert_eq!(effects.len(), 6);
+    assert_eq!(effects.len(), 8);
     assert!(effects
         .iter()
         .any(|effect| effect.can_handle(TypeId::of::<OrderPlaced>())));
@@ -179,6 +212,33 @@ fn effects_module_registration_works() {
     assert!(effects
         .iter()
         .any(|effect| effect.id == "analytics::log_order"));
+
+    let ship_order = effects
+        .iter()
+        .find(|effect| effect.id == "ship_order")
+        .expect("ship_order effect should exist");
+    assert!(
+        ship_order.is_inline(),
+        "default effect should remain inline"
+    );
+
+    let queued_observer = effects
+        .iter()
+        .find(|effect| effect.id == "queued_observer")
+        .expect("queued_observer effect should exist");
+    assert!(
+        !queued_observer.is_inline(),
+        "queued attribute should force queued execution"
+    );
+
+    let queued_retry_one = effects
+        .iter()
+        .find(|effect| effect.id == "queued_retry_one")
+        .expect("queued_retry_one effect should exist");
+    assert!(
+        !queued_retry_one.is_inline(),
+        "queued attribute should force queued execution even when retry = 1"
+    );
 }
 
 #[test]

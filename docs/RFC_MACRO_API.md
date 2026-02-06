@@ -109,6 +109,7 @@ let engine = Engine::new(deps, store)
     on = EventType | [Variant1, Variant2],  // Required: event type(s)
     extract(field1, field2),                 // Optional: field extraction
     join,                                    // Optional: batch accumulation
+    queued,                                  // Optional: force queued execution even without retry/delay/timeout
     id = "custom_id",                       // Optional: effect identifier
     retry = N,                              // Optional: retry count (default 1)
     timeout_secs = N,                       // Optional: timeout in seconds
@@ -133,6 +134,36 @@ async fn effect_name(
 5. Cannot specify both `delay_secs` and `delay_ms`
 6. If `extract()` is used, function parameters must match extracted field types
 7. If `dlq_terminal` is used, handler signature must be `(input_event, ErrorContext) -> OutputEvent`
+8. `retry > 1` implies queued execution semantics (`max_attempts = retry`)
+9. Queued/durable effects must have a stable ID (`id = "..."` or `group = "..."`)
+
+### Runtime Failure Semantics
+
+`#[effect]` config maps to two execution modes with different failure behavior:
+
+1. **Inline effects** (default: no queue knobs set):
+   - Run in-process during event handling.
+   - If inline logic fails, the runtime records `reason = "inline_failed"` and still completes the event path.
+   - Inline failures do **not** block queued intent creation for sibling effects.
+   - No automatic inline re-execution of the same effect from event retries.
+
+2. **Queued effects** (`queued`, `retry > 1`, `join`, `delay_*`, `timeout_*`, `priority`, or explicit `.queued()`):
+   - Execute through `seesaw_effect_executions`.
+   - Retries are tracked per effect (`attempts < max_attempts`).
+   - Exhausted retries go to DLQ (optionally via `dlq_terminal` mapping).
+
+Notes:
+- Event worker processing still has event-level retry (`nack`) for infrastructure failures (decode/save/DB errors), guarded by `EventWorkerConfig::max_inline_retry_attempts` (default `3`).
+- Runtime processes matching effects in two phases: persist queued intents first, then run inline effects, avoiding registration-order coupling.
+- Event commit is atomic at store level (`commit_event_processing`): state save, queued intents, emitted events, inline-failure DLQ writes, and event ack succeed/fail together.
+
+### Queue Backend Contract
+
+Queue backends are a transport optimization, not source of truth:
+
+1. Store remains durable source of truth for queued effect intents.
+2. `on_effect_intent_inserted` is best-effort only.
+3. Effect workers must fall back to store polling if backend poll fails or returns no work.
 
 ### Reducer Attributes
 
@@ -222,7 +253,7 @@ fn build_failure_event(
     ResearchSearchCompleted {
         query: input.query,
         status: "failed".into(),
-        error: Some(err.error),
+        error: Some(err.error.clone()),
         attempts: err.attempts,
     }
 }

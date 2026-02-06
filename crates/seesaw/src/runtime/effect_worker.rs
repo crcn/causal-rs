@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::effect::{DlqTerminalInfo, EffectContext, EventEmitter, JoinMode};
 use crate::effect_registry::EffectRegistry;
+use crate::queue_backend::{QueueBackend, StoreQueueBackend};
 use crate::reducer_registry::ReducerRegistry;
 use crate::{EmittedEvent, Store, NAMESPACE_SEESAW};
 
@@ -67,6 +68,7 @@ where
     deps: Arc<D>,
     reducers: Arc<ReducerRegistry<S>>,
     effects: Arc<EffectRegistry<S, D>>,
+    queue_backend: Arc<dyn QueueBackend<St>>,
     config: EffectWorkerConfig,
     shutdown: Arc<AtomicBool>,
 }
@@ -89,8 +91,16 @@ where
             deps,
             reducers,
             effects,
+            queue_backend: Arc::new(StoreQueueBackend),
             config,
             shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn with_queue_backend(self, queue_backend: Arc<dyn QueueBackend<St>>) -> Self {
+        Self {
+            queue_backend,
+            ..self
         }
     }
 
@@ -125,8 +135,21 @@ where
     ///
     /// Returns true if effect was processed, false if no effects available
     async fn process_next_effect(&self) -> Result<bool> {
-        // Poll next ready effect (priority-based)
-        let Some(execution) = self.store.poll_next_effect().await? else {
+        // Poll next ready effect via backend. If backend is unavailable or empty,
+        // fall back to durable store polling so execution cannot stall.
+        let execution = match self.queue_backend.poll_next_effect(&*self.store).await {
+            Ok(Some(execution)) => Some(execution),
+            Ok(None) => self.store.poll_next_effect().await?,
+            Err(error) => {
+                warn!(
+                    "Queue backend poll failed, falling back to store polling: backend={}, error={}",
+                    self.queue_backend.name(),
+                    error
+                );
+                self.store.poll_next_effect().await?
+            }
+        };
+        let Some(execution) = execution else {
             return Ok(false);
         };
 
@@ -776,6 +799,43 @@ mod tests {
         }
     }
 
+    struct QueueBackendStub {
+        queued_effects: Mutex<VecDeque<crate::QueuedEffectExecution>>,
+        poll_calls: AtomicUsize,
+    }
+
+    impl QueueBackendStub {
+        fn new(effects: Vec<crate::QueuedEffectExecution>) -> Self {
+            Self {
+                queued_effects: Mutex::new(effects.into()),
+                poll_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::queue_backend::QueueBackend<TestStore> for QueueBackendStub {
+        async fn poll_next_effect(
+            &self,
+            _store: &TestStore,
+        ) -> Result<Option<crate::QueuedEffectExecution>> {
+            self.poll_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.queued_effects.lock().pop_front())
+        }
+    }
+
+    struct FailingPollQueueBackend;
+
+    #[async_trait]
+    impl crate::queue_backend::QueueBackend<TestStore> for FailingPollQueueBackend {
+        async fn poll_next_effect(
+            &self,
+            _store: &TestStore,
+        ) -> Result<Option<crate::QueuedEffectExecution>> {
+            anyhow::bail!("queue backend poll failed")
+        }
+    }
+
     #[async_trait]
     impl crate::Store for TestStore {
         async fn publish(&self, _event: crate::QueuedEvent) -> Result<()> {
@@ -1069,6 +1129,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effect_worker_uses_queue_backend_for_polling() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effect = crate::effect::on::<Increment>().then_queue(
+            |event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                Ok(Incremented {
+                    amount: event.amount + 1,
+                })
+            },
+        );
+        let effect_id = effect.id.clone();
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let execution = queued_execution(effect_id.clone());
+        let queue_backend = Arc::new(QueueBackendStub::new(vec![execution]));
+        let store = Arc::new(TestStore::new(vec![]));
+
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        )
+        .with_queue_backend(queue_backend.clone());
+
+        let processed = worker.process_next_effect().await.expect("should process");
+        assert!(processed);
+        assert_eq!(queue_backend.poll_calls.load(Ordering::SeqCst), 1);
+
+        let completed_with_events = store.completed_with_events.lock();
+        assert_eq!(completed_with_events.len(), 1);
+        assert_eq!(completed_with_events[0].1, effect_id);
+    }
+
+    #[tokio::test]
+    async fn effect_worker_falls_back_to_store_when_queue_backend_poll_fails() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effect = crate::effect::on::<Increment>().then_queue(
+            |event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                Ok(Incremented {
+                    amount: event.amount + 1,
+                })
+            },
+        );
+        let effect_id = effect.id.clone();
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let execution = queued_execution(effect_id.clone());
+        let store = Arc::new(TestStore::new(vec![execution]));
+
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        )
+        .with_queue_backend(Arc::new(FailingPollQueueBackend));
+
+        let processed = worker
+            .process_next_effect()
+            .await
+            .expect("backend poll failure should fall back to store polling");
+        assert!(processed);
+
+        let completed_with_events = store.completed_with_events.lock();
+        assert_eq!(completed_with_events.len(), 1);
+        assert_eq!(completed_with_events[0].1, effect_id);
+    }
+
+    #[tokio::test]
+    async fn effect_worker_falls_back_to_store_when_queue_backend_returns_none() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effect = crate::effect::on::<Increment>().then_queue(
+            |event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                Ok(Incremented {
+                    amount: event.amount + 1,
+                })
+            },
+        );
+        let effect_id = effect.id.clone();
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let queue_backend = Arc::new(QueueBackendStub::new(vec![]));
+        let execution = queued_execution(effect_id.clone());
+        let store = Arc::new(TestStore::new(vec![execution]));
+
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        )
+        .with_queue_backend(queue_backend.clone());
+
+        let processed = worker
+            .process_next_effect()
+            .await
+            .expect("backend returning none should fall back to store polling");
+        assert!(processed);
+        assert_eq!(queue_backend.poll_calls.load(Ordering::SeqCst), 1);
+
+        let completed_with_events = store.completed_with_events.lock();
+        assert_eq!(completed_with_events.len(), 1);
+        assert_eq!(completed_with_events[0].1, effect_id);
+    }
+
+    #[tokio::test]
     async fn effect_worker_executes_and_completes_with_emitted_events() {
         let reducers = Arc::new(ReducerRegistry::new());
         reducers.register(
@@ -1167,6 +1354,7 @@ mod tests {
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let handler_calls_clone = handler_calls.clone();
         let effect = crate::effect::on::<BatchItemResult>()
+            .id("join_batch_executes_once")
             .join()
             .same_batch()
             .then(
@@ -1262,6 +1450,7 @@ mod tests {
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let handler_calls_clone = handler_calls.clone();
         let effect = crate::effect::on::<BatchItemResult>()
+            .id("join_batch_retries_after_error")
             .join()
             .same_batch()
             .then(
@@ -1345,6 +1534,7 @@ mod tests {
     async fn effect_worker_join_same_batch_invalid_metadata_is_failed() {
         let reducers = Arc::new(ReducerRegistry::new());
         let effect = crate::effect::on::<BatchItemResult>()
+            .id("join_batch_invalid_metadata")
             .join()
             .same_batch()
             .then(
@@ -1398,6 +1588,7 @@ mod tests {
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let handler_calls_clone = handler_calls.clone();
         let effect = crate::effect::on::<BatchItemResult>()
+            .id("join_batch_stress")
             .join()
             .same_batch()
             .then(
@@ -1469,6 +1660,7 @@ mod tests {
         );
 
         let effect = crate::effect::on::<Increment>()
+            .id("dlq_terminal_mapper_then_effect")
             .queued()
             .retry(1)
             .dlq_terminal(|event: Arc<Increment>, info| Incremented {
@@ -1567,6 +1759,7 @@ mod tests {
     async fn effect_worker_join_same_batch_over_limit_is_failed() {
         let reducers = Arc::new(ReducerRegistry::new());
         let effect = crate::effect::on::<BatchItemResult>()
+            .id("join_batch_over_limit")
             .join()
             .same_batch()
             .then(

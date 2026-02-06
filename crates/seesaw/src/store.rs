@@ -54,6 +54,60 @@ pub struct EmittedEvent {
     pub batch_size: Option<i32>,
 }
 
+/// Persisted intent for a queued effect execution.
+#[derive(Debug, Clone)]
+pub struct QueuedEffectIntent {
+    /// Stable effect identifier.
+    pub effect_id: String,
+    /// Parent event for causality tracking.
+    pub parent_event_id: Option<Uuid>,
+    /// Batch metadata inherited from source event.
+    pub batch_id: Option<Uuid>,
+    pub batch_index: Option<i32>,
+    pub batch_size: Option<i32>,
+    /// Earliest time this effect can execute.
+    pub execute_at: DateTime<Utc>,
+    /// Per-effect timeout in seconds.
+    pub timeout_seconds: i32,
+    /// Max retry attempts for this effect.
+    pub max_attempts: i32,
+    /// Queue priority (lower = higher priority).
+    pub priority: i32,
+}
+
+/// Captured inline effect failure to persist in DLQ at commit time.
+#[derive(Debug, Clone)]
+pub struct InlineEffectFailure {
+    pub effect_id: String,
+    pub error: String,
+    pub reason: String,
+    pub attempts: i32,
+}
+
+/// Atomic event processing commit payload.
+#[derive(Debug)]
+pub struct EventProcessingCommit<S>
+where
+    S: Serialize + Send + Sync,
+{
+    /// Source queue row to acknowledge.
+    pub event_row_id: i64,
+    /// Source event identifiers.
+    pub event_id: Uuid,
+    pub correlation_id: Uuid,
+    pub event_type: String,
+    pub event_payload: serde_json::Value,
+    /// Reducer output and optimistic lock version.
+    pub state: S,
+    pub expected_state_version: i32,
+    /// Queued effect intents to persist.
+    pub queued_effect_intents: Vec<QueuedEffectIntent>,
+    /// Inline effect failures to persist to DLQ.
+    pub inline_effect_failures: Vec<InlineEffectFailure>,
+    /// Inline emitted events to publish.
+    pub emitted_events: Vec<QueuedEvent>,
+}
+
 /// Persisted join entry used for durable same-batch fan-in.
 #[derive(Debug, Clone)]
 pub struct JoinEntry {
@@ -131,6 +185,61 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<i32>
     where
         S: Serialize + Send + Sync;
+
+    /// Atomically commit event processing side effects.
+    ///
+    /// Default implementation composes existing store methods sequentially.
+    /// Stores can override this with a single transaction for stronger
+    /// crash-consistency guarantees.
+    async fn commit_event_processing<S>(&self, commit: EventProcessingCommit<S>) -> Result<i32>
+    where
+        S: Serialize + Send + Sync,
+    {
+        let new_version = self
+            .save_state(
+                commit.correlation_id,
+                &commit.state,
+                commit.expected_state_version,
+            )
+            .await?;
+
+        for intent in commit.queued_effect_intents {
+            self.insert_effect_intent(
+                commit.event_id,
+                intent.effect_id,
+                commit.correlation_id,
+                commit.event_type.clone(),
+                commit.event_payload.clone(),
+                intent.parent_event_id,
+                intent.batch_id,
+                intent.batch_index,
+                intent.batch_size,
+                intent.execute_at,
+                intent.timeout_seconds,
+                intent.max_attempts,
+                intent.priority,
+            )
+            .await?;
+        }
+
+        for event in commit.emitted_events {
+            self.publish(event).await?;
+        }
+
+        for failure in commit.inline_effect_failures {
+            self.dlq_effect(
+                commit.event_id,
+                failure.effect_id,
+                failure.error,
+                failure.reason,
+                failure.attempts,
+            )
+            .await?;
+        }
+
+        self.ack(commit.event_row_id).await?;
+        Ok(new_version)
+    }
 
     // =========================================================================
     // Effect Execution Operations

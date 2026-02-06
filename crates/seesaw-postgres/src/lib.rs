@@ -5,8 +5,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use seesaw_core::{
-    insight::*, EmittedEvent, JoinEntry, QueuedEffectExecution, QueuedEvent, Store,
-    NAMESPACE_SEESAW,
+    insight::*, EmittedEvent, EventProcessingCommit, JoinEntry, QueuedEffectExecution, QueuedEvent,
+    Store, NAMESPACE_SEESAW,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -93,6 +93,18 @@ struct EffectRow {
 
 #[derive(FromRow)]
 struct ParentEventRow {
+    hops: i32,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(FromRow)]
+struct DlqSourceEventRow {
+    correlation_id: Uuid,
+    event_type: String,
+    payload: serde_json::Value,
+    batch_id: Option<Uuid>,
+    batch_index: Option<i32>,
+    batch_size: Option<i32>,
     hops: i32,
     created_at: DateTime<Utc>,
 }
@@ -284,6 +296,199 @@ impl Store for PostgresStore {
         Ok(new_version)
     }
 
+    async fn commit_event_processing<S>(&self, commit: EventProcessingCommit<S>) -> Result<i32>
+    where
+        S: Serialize + Send + Sync,
+    {
+        let EventProcessingCommit {
+            event_row_id,
+            event_id,
+            correlation_id,
+            event_type,
+            event_payload,
+            state,
+            expected_state_version,
+            queued_effect_intents,
+            inline_effect_failures,
+            emitted_events,
+        } = commit;
+
+        let mut tx = self.pool.begin().await?;
+
+        let state_json = serde_json::to_value(&state)?;
+        let new_version = expected_state_version + 1;
+
+        let state_result = sqlx::query(
+            "INSERT INTO seesaw_state (correlation_id, state, version, updated_at)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (correlation_id) DO UPDATE
+             SET state = $2,
+                 version = $3,
+                 updated_at = NOW()
+             WHERE seesaw_state.version = $4",
+        )
+        .bind(correlation_id)
+        .bind(&state_json)
+        .bind(new_version)
+        .bind(expected_state_version)
+        .execute(&mut *tx)
+        .await?;
+
+        if state_result.rows_affected() == 0 {
+            anyhow::bail!("Version conflict: state was modified concurrently");
+        }
+
+        for intent in queued_effect_intents {
+            sqlx::query(
+                "INSERT INTO seesaw_effect_executions (
+                    event_id, effect_id, correlation_id, status,
+                    event_type, event_payload, parent_event_id,
+                    batch_id, batch_index, batch_size,
+                    execute_at, timeout_seconds, max_attempts, priority
+                 )
+                 VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 ON CONFLICT (event_id, effect_id) DO NOTHING",
+            )
+            .bind(event_id)
+            .bind(intent.effect_id)
+            .bind(correlation_id)
+            .bind(&event_type)
+            .bind(&event_payload)
+            .bind(intent.parent_event_id)
+            .bind(intent.batch_id)
+            .bind(intent.batch_index)
+            .bind(intent.batch_size)
+            .bind(intent.execute_at)
+            .bind(intent.timeout_seconds)
+            .bind(intent.max_attempts)
+            .bind(intent.priority)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for event in emitted_events {
+            let inserted: Option<Uuid> = sqlx::query_scalar(
+                "INSERT INTO seesaw_processed (event_id, correlation_id, created_at)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (event_id) DO NOTHING
+                 RETURNING event_id",
+            )
+            .bind(event.event_id)
+            .bind(event.correlation_id)
+            .bind(event.created_at)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if inserted.is_none() {
+                continue;
+            }
+
+            sqlx::query(
+                "INSERT INTO seesaw_events (
+                    event_id, parent_id, correlation_id, event_type, payload, hops, retry_count,
+                    batch_id, batch_index, batch_size, created_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(event.event_id)
+            .bind(event.parent_id)
+            .bind(event.correlation_id)
+            .bind(event.event_type)
+            .bind(event.payload)
+            .bind(event.hops)
+            .bind(event.retry_count)
+            .bind(event.batch_id)
+            .bind(event.batch_index)
+            .bind(event.batch_size)
+            .bind(event.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let source_event: Option<DlqSourceEventRow> = if inline_effect_failures.is_empty() {
+            None
+        } else {
+            sqlx::query_as(
+                "SELECT correlation_id, event_type, payload, batch_id, batch_index, batch_size, hops, created_at
+                 FROM seesaw_events
+                 WHERE event_id = $1
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+            )
+            .bind(event_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        };
+
+        for failure in inline_effect_failures {
+            sqlx::query(
+                "INSERT INTO seesaw_dlq (
+                    event_id, effect_id, correlation_id, error, event_type, event_payload, reason, attempts
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(event_id)
+            .bind(&failure.effect_id)
+            .bind(correlation_id)
+            .bind(&failure.error)
+            .bind(&event_type)
+            .bind(&event_payload)
+            .bind(&failure.reason)
+            .bind(failure.attempts)
+            .execute(&mut *tx)
+            .await?;
+
+            if let Some(source) = source_event.as_ref() {
+                if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
+                    (source.batch_id, source.batch_index, source.batch_size)
+                {
+                    let synthetic_event_id = Uuid::new_v5(
+                        &NAMESPACE_SEESAW,
+                        format!("{}-{}-dlq-terminal", event_id, failure.effect_id).as_bytes(),
+                    );
+                    let synthetic_created_at = emitted_event_created_at(source.created_at);
+
+                    sqlx::query(
+                        "INSERT INTO seesaw_events (
+                            event_id, parent_id, correlation_id, event_type, payload, hops,
+                            batch_id, batch_index, batch_size, created_at
+                         )
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         ON CONFLICT (event_id, created_at) DO NOTHING",
+                    )
+                    .bind(synthetic_event_id)
+                    .bind(Some(event_id))
+                    .bind(correlation_id)
+                    .bind(&event_type)
+                    .bind(&event_payload)
+                    .bind(source.hops + 1)
+                    .bind(Some(batch_id))
+                    .bind(Some(batch_index))
+                    .bind(Some(batch_size))
+                    .bind(synthetic_created_at)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+
+        let ack_result = sqlx::query(
+            "UPDATE seesaw_events SET processed_at = NOW(), locked_until = NULL WHERE id = $1",
+        )
+        .bind(event_row_id)
+        .execute(&mut *tx)
+        .await?;
+        if ack_result.rows_affected() != 1 {
+            anyhow::bail!(
+                "atomic event commit failed to ack source event row {}",
+                event_row_id
+            );
+        }
+
+        tx.commit().await?;
+        Ok(new_version)
+    }
+
     async fn insert_effect_intent(
         &self,
         event_id: Uuid,
@@ -307,7 +512,8 @@ impl Store for PostgresStore {
                 batch_id, batch_index, batch_size,
                 execute_at, timeout_seconds, max_attempts, priority
              )
-             VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             ON CONFLICT (event_id, effect_id) DO NOTHING",
         )
         .bind(event_id)
         .bind(effect_id)
@@ -545,8 +751,9 @@ impl Store for PostgresStore {
         attempts: i32,
         emitted_events: Vec<EmittedEvent>,
     ) -> Result<()> {
-        // Get effect details for DLQ
-        let effect: EffectRow = sqlx::query_as(
+        // Effect details may be missing for inline/synthetic failures. Fall back to
+        // parent event data so DLQ writes still succeed.
+        let effect = sqlx::query_as::<_, EffectRow>(
             "SELECT event_id, effect_id, correlation_id, event_type, event_payload, parent_event_id,
                     batch_id, batch_index, batch_size,
                     execute_at, timeout_seconds, max_attempts, priority, attempts
@@ -555,11 +762,11 @@ impl Store for PostgresStore {
         )
         .bind(event_id)
         .bind(&effect_id)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        let parent = sqlx::query_as::<_, ParentEventRow>(
-            "SELECT hops, created_at
+        let source_event = sqlx::query_as::<_, DlqSourceEventRow>(
+            "SELECT correlation_id, event_type, payload, batch_id, batch_index, batch_size, hops, created_at
              FROM seesaw_events
              WHERE event_id = $1
              ORDER BY created_at ASC, id ASC
@@ -568,6 +775,39 @@ impl Store for PostgresStore {
         .bind(event_id)
         .fetch_optional(&self.pool)
         .await?;
+
+        let (
+            source_correlation_id,
+            source_event_type,
+            source_event_payload,
+            source_batch_id,
+            source_batch_index,
+            source_batch_size,
+        ) = if let Some(effect) = effect {
+            (
+                effect.correlation_id,
+                effect.event_type,
+                effect.event_payload,
+                effect.batch_id,
+                effect.batch_index,
+                effect.batch_size,
+            )
+        } else if let Some(source) = source_event.as_ref() {
+            (
+                source.correlation_id,
+                source.event_type.clone(),
+                source.payload.clone(),
+                source.batch_id,
+                source.batch_index,
+                source.batch_size,
+            )
+        } else {
+            anyhow::bail!(
+                "cannot DLQ unknown effect {} for missing event {}",
+                effect_id,
+                event_id
+            );
+        };
 
         let mut tx = self.pool.begin().await?;
 
@@ -580,24 +820,24 @@ impl Store for PostgresStore {
         )
         .bind(event_id)
         .bind(&effect_id)
-        .bind(effect.correlation_id)
+        .bind(source_correlation_id)
         .bind(&error)
-        .bind(&effect.event_type)
-        .bind(&effect.event_payload)
+        .bind(&source_event_type)
+        .bind(&source_event_payload)
         .bind(&reason)
         .bind(attempts)
         .execute(&mut *tx)
         .await?;
 
-        let synthetic_created_at = parent
+        let synthetic_created_at = source_event
             .as_ref()
             .map(|row| emitted_event_created_at(row.created_at))
             .unwrap_or_else(Utc::now);
-        let synthetic_hops = parent.as_ref().map(|row| row.hops + 1).unwrap_or(0);
+        let synthetic_hops = source_event.as_ref().map(|row| row.hops + 1).unwrap_or(0);
 
         if emitted_events.is_empty() {
             if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
-                (effect.batch_id, effect.batch_index, effect.batch_size)
+                (source_batch_id, source_batch_index, source_batch_size)
             {
                 let synthetic_event_id = Uuid::new_v5(
                     &NAMESPACE_SEESAW,
@@ -614,9 +854,9 @@ impl Store for PostgresStore {
                 )
                 .bind(synthetic_event_id)
                 .bind(Some(event_id))
-                .bind(effect.correlation_id)
-                .bind(&effect.event_type)
-                .bind(&effect.event_payload)
+                .bind(source_correlation_id)
+                .bind(&source_event_type)
+                .bind(&source_event_payload)
                 .bind(synthetic_hops)
                 .bind(Some(batch_id))
                 .bind(Some(batch_index))
@@ -646,13 +886,13 @@ impl Store for PostgresStore {
                 )
                 .bind(synthetic_event_id)
                 .bind(Some(event_id))
-                .bind(effect.correlation_id)
+                .bind(source_correlation_id)
                 .bind(&emitted.event_type)
                 .bind(emitted.payload)
                 .bind(synthetic_hops)
-                .bind(emitted.batch_id.or(effect.batch_id))
-                .bind(emitted.batch_index.or(effect.batch_index))
-                .bind(emitted.batch_size.or(effect.batch_size))
+                .bind(emitted.batch_id.or(source_batch_id))
+                .bind(emitted.batch_index.or(source_batch_index))
+                .bind(emitted.batch_size.or(source_batch_size))
                 .bind(synthetic_created_at)
                 .execute(&mut *tx)
                 .await?;

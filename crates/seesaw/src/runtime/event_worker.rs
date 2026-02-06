@@ -12,8 +12,12 @@ use uuid::Uuid;
 
 use crate::effect::{EffectContext, EventEmitter};
 use crate::effect_registry::EffectRegistry;
+use crate::queue_backend::{QueueBackend, StoreQueueBackend};
 use crate::reducer_registry::ReducerRegistry;
-use crate::{QueuedEvent, Store, NAMESPACE_SEESAW};
+use crate::{
+    EventProcessingCommit, InlineEffectFailure, QueuedEffectIntent, QueuedEvent, Store,
+    NAMESPACE_SEESAW,
+};
 
 struct BufferedEmitter<S, D>
 where
@@ -69,6 +73,7 @@ where
     deps: Arc<D>,
     reducers: Arc<ReducerRegistry<S>>,
     effects: Arc<EffectRegistry<S, D>>,
+    queue_backend: Arc<dyn QueueBackend<St>>,
     config: EventWorkerConfig,
     shutdown: Arc<AtomicBool>,
 }
@@ -91,8 +96,16 @@ where
             deps,
             reducers,
             effects,
+            queue_backend: Arc::new(StoreQueueBackend),
             config,
             shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn with_queue_backend(self, queue_backend: Arc<dyn QueueBackend<St>>) -> Self {
+        Self {
+            queue_backend,
+            ..self
         }
     }
 
@@ -211,10 +224,99 @@ where
             .reducers
             .apply(state, event_type_id, typed_event.as_ref());
 
-        // Save updated state (optimistic locking)
+        // Gather effects once so we can run in two phases:
+        // 1) insert all queued intents, then
+        // 2) execute inline effects. This avoids registration-order coupling where an
+        // early inline failure could prevent queued intent insertion.
+        let matching_effects: Vec<_> = self
+            .effects
+            .all()
+            .into_iter()
+            .filter(|effect| effect.can_handle(event_type_id))
+            .collect();
+
+        // Phase 1: build all queued effect intents.
+        let mut queued_effect_intents = Vec::new();
+        for effect in matching_effects.iter().filter(|effect| !effect.is_inline()) {
+            let execute_at = match effect.delay {
+                Some(delay) => {
+                    chrono::Utc::now()
+                        + chrono::Duration::from_std(delay)
+                            .map_err(|_| anyhow::anyhow!("invalid queued effect delay"))?
+                }
+                None => chrono::Utc::now(),
+            };
+            let timeout_seconds = effect
+                .timeout
+                .map(|d| d.as_secs() as i32)
+                .unwrap_or(30)
+                .max(1);
+            queued_effect_intents.push(QueuedEffectIntent {
+                effect_id: effect.id.clone(),
+                parent_event_id: Some(event.event_id),
+                batch_id: event.batch_id,
+                batch_index: event.batch_index,
+                batch_size: event.batch_size,
+                execute_at,
+                timeout_seconds,
+                max_attempts: effect.max_attempts as i32,
+                priority: effect.priority.unwrap_or(10),
+            });
+        }
+
+        // Phase 2: execute inline effects and collect outputs/failures to persist atomically.
+        let mut inline_effect_failures = Vec::new();
+        let mut emitted_events = Vec::new();
+        for effect in matching_effects.iter().filter(|effect| effect.is_inline()) {
+            match self
+                .run_inline_effect(
+                    effect,
+                    event,
+                    typed_event.clone(),
+                    event_type_id,
+                    prev_state.clone(),
+                    next_state.clone(),
+                )
+                .await
+            {
+                Ok(mut emitted) => emitted_events.append(&mut emitted),
+                Err(error) => {
+                    let error_string = error.to_string();
+                    warn!(
+                        "Inline effect failed and will be persisted to DLQ: event_id={}, effect_id={}, error={}",
+                        event.event_id, effect.id, error_string
+                    );
+                    inline_effect_failures.push(InlineEffectFailure {
+                        effect_id: effect.id.clone(),
+                        error: error_string,
+                        reason: "inline_failed".to_string(),
+                        attempts: event.retry_count.saturating_add(1),
+                    });
+                }
+            }
+        }
+
+        let inline_failure_count = inline_effect_failures.len();
+
+        let queued_effect_ids = queued_effect_intents
+            .iter()
+            .map(|intent| intent.effect_id.clone())
+            .collect::<Vec<_>>();
+
         let new_version = self
             .store
-            .save_state(event.correlation_id, &next_state, version)
+            .commit_event_processing(EventProcessingCommit {
+                event_row_id: event.id,
+                event_id: event.event_id,
+                correlation_id: event.correlation_id,
+                event_type: event.event_type.clone(),
+                event_payload: event.payload.clone(),
+                state: next_state,
+                expected_state_version: version,
+                queued_effect_intents,
+                inline_effect_failures,
+                emitted_events,
+            })
             .await?;
 
         info!(
@@ -222,63 +324,29 @@ where
             event.correlation_id, version, new_version
         );
 
-        // Execute effects (branch on inline vs queued)
-        for effect in self.effects.all() {
-            if !effect.can_handle(event_type_id) {
-                continue;
-            }
-
-            if effect.is_inline() {
-                self.run_inline_effect(
-                    &effect,
-                    event,
-                    typed_event.clone(),
-                    event_type_id,
-                    prev_state.clone(),
-                    next_state.clone(),
-                )
-                .await?;
-            } else {
-                let execute_at = match effect.delay {
-                    Some(delay) => {
-                        chrono::Utc::now()
-                            + chrono::Duration::from_std(delay)
-                                .map_err(|_| anyhow::anyhow!("invalid queued effect delay"))?
-                    }
-                    None => chrono::Utc::now(),
-                };
-                let timeout_seconds = effect
-                    .timeout
-                    .map(|d| d.as_secs() as i32)
-                    .unwrap_or(30)
-                    .max(1);
-                let max_attempts = effect.max_attempts as i32;
-                let priority = effect.priority.unwrap_or(10);
-
-                self.store
-                    .insert_effect_intent(
-                        event.event_id,
-                        effect.id.clone(),
-                        event.correlation_id,
-                        event.event_type.clone(),
-                        event.payload.clone(),
-                        Some(event.event_id),
-                        event.batch_id,
-                        event.batch_index,
-                        event.batch_size,
-                        execute_at,
-                        timeout_seconds,
-                        max_attempts,
-                        priority,
-                    )
-                    .await?;
+        // Backend notification is best-effort. The source of truth remains the store,
+        // and effect workers can always fall back to store polling.
+        for effect_id in queued_effect_ids {
+            if let Err(error) = self
+                .queue_backend
+                .on_effect_intent_inserted(&*self.store, event.event_id, &effect_id)
+                .await
+            {
+                warn!(
+                    "Queue backend notification failed; relying on store polling fallback: event_id={}, effect_id={}, error={}",
+                    event.event_id, effect_id, error
+                );
             }
         }
 
-        // Mark event as processed
-        self.store.ack(event.id).await?;
-
-        info!("Event processed successfully: event_id={}", event.event_id);
+        if inline_failure_count > 0 {
+            warn!(
+                "Event processed with inline failures moved to DLQ: event_id={}, inline_failures={}",
+                event.event_id, inline_failure_count
+            );
+        } else {
+            info!("Event processed successfully: event_id={}", event.event_id);
+        }
 
         Ok(())
     }
@@ -310,7 +378,7 @@ where
         event_type_id: TypeId,
         prev_state: S,
         next_state: S,
-    ) -> Result<()> {
+    ) -> Result<Vec<QueuedEvent>> {
         let emissions: Arc<Mutex<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let emitter = Arc::new(BufferedEmitter::<S, D> {
@@ -396,6 +464,8 @@ where
             None
         };
 
+        let mut emitted_events = Vec::with_capacity(emitted_count);
+
         for (emitted_index, (type_id, event_any)) in drained.into_iter().enumerate() {
             let codec = self
                 .reducers
@@ -436,25 +506,23 @@ where
                 (None, None, None)
             };
 
-            self.store
-                .publish(QueuedEvent {
-                    id: 0,
-                    event_id,
-                    parent_id: Some(source_event.event_id),
-                    correlation_id: source_event.correlation_id,
-                    event_type: codec.event_type.clone(),
-                    payload,
-                    hops: source_event.hops + 1,
-                    retry_count: 0,
-                    batch_id,
-                    batch_index,
-                    batch_size,
-                    created_at,
-                })
-                .await?;
+            emitted_events.push(QueuedEvent {
+                id: 0,
+                event_id,
+                parent_id: Some(source_event.event_id),
+                correlation_id: source_event.correlation_id,
+                event_type: codec.event_type.clone(),
+                payload,
+                hops: source_event.hops + 1,
+                retry_count: 0,
+                batch_id,
+                batch_index,
+                batch_size,
+                created_at,
+            });
         }
 
-        Ok(())
+        Ok(emitted_events)
     }
 }
 
@@ -465,6 +533,7 @@ mod tests {
     use futures::Stream;
     use parking_lot::Mutex;
     use std::collections::{HashSet, VecDeque};
+    use std::sync::Arc;
 
     #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
     struct TestState {
@@ -525,6 +594,40 @@ mod tests {
                 effect_intents: Mutex::new(Vec::new()),
                 published_events: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingQueueBackend {
+        inserted_intents: Mutex<Vec<(Uuid, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::queue_backend::QueueBackend<TestStore> for RecordingQueueBackend {
+        async fn on_effect_intent_inserted(
+            &self,
+            _store: &TestStore,
+            event_id: Uuid,
+            effect_id: &str,
+        ) -> Result<()> {
+            self.inserted_intents
+                .lock()
+                .push((event_id, effect_id.to_string()));
+            Ok(())
+        }
+    }
+
+    struct FailingQueueBackend;
+
+    #[async_trait]
+    impl crate::queue_backend::QueueBackend<TestStore> for FailingQueueBackend {
+        async fn on_effect_intent_inserted(
+            &self,
+            _store: &TestStore,
+            _event_id: Uuid,
+            _effect_id: &str,
+        ) -> Result<()> {
+            anyhow::bail!("queue backend insert hook failed")
         }
     }
 
@@ -693,6 +796,22 @@ mod tests {
         }
     }
 
+    struct AtomicCommitStore {
+        queued_events: Mutex<VecDeque<QueuedEvent>>,
+        commit_calls: Mutex<Vec<(Uuid, Uuid)>>,
+        nacked_ids: Mutex<Vec<i64>>,
+    }
+
+    impl AtomicCommitStore {
+        fn new(event: QueuedEvent) -> Self {
+            Self {
+                queued_events: Mutex::new(vec![event].into()),
+                commit_calls: Mutex::new(Vec::new()),
+                nacked_ids: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn event_worker_applies_reducer_and_queues_non_inline_effect() {
         let event = queued_increment_event();
@@ -706,9 +825,12 @@ mod tests {
         ));
 
         let effects = Arc::new(EffectRegistry::new());
-        let queued_effect = crate::effect::on::<Increment>().queued().then_queue(
-            |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async { Ok(()) },
-        );
+        let queued_effect = crate::effect::on::<Increment>()
+            .id("queued_increment_effect")
+            .queued()
+            .then_queue(
+                |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async { Ok(()) },
+            );
         effects.register(queued_effect);
 
         let worker = EventWorker::new(
@@ -730,6 +852,250 @@ mod tests {
         assert_eq!(saved[0]["count"], serde_json::json!(2));
         assert_eq!(store.effect_intents.lock().len(), 1);
         assert_eq!(*store.acked_ids.lock(), vec![event.id]);
+    }
+
+    #[async_trait]
+    impl crate::Store for AtomicCommitStore {
+        async fn publish(&self, _event: QueuedEvent) -> Result<()> {
+            panic!("publish should not be called directly; event worker must use commit_event_processing");
+        }
+
+        async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
+            Ok(self.queued_events.lock().pop_front())
+        }
+
+        async fn ack(&self, _id: i64) -> Result<()> {
+            panic!(
+                "ack should not be called directly; event worker must use commit_event_processing"
+            );
+        }
+
+        async fn nack(&self, id: i64, _retry_after_secs: u64) -> Result<()> {
+            self.nacked_ids.lock().push(id);
+            Ok(())
+        }
+
+        async fn load_state<S>(&self, _correlation_id: Uuid) -> Result<Option<(S, i32)>>
+        where
+            S: for<'de> serde::Deserialize<'de> + Send,
+        {
+            Ok(None)
+        }
+
+        async fn save_state<S>(
+            &self,
+            _correlation_id: Uuid,
+            _state: &S,
+            _expected_version: i32,
+        ) -> Result<i32>
+        where
+            S: serde::Serialize + Send + Sync,
+        {
+            panic!(
+                "save_state should not be called directly; event worker must use commit_event_processing"
+            );
+        }
+
+        async fn commit_event_processing<S>(&self, commit: EventProcessingCommit<S>) -> Result<i32>
+        where
+            S: serde::Serialize + Send + Sync,
+        {
+            self.commit_calls
+                .lock()
+                .push((commit.event_id, commit.correlation_id));
+            Ok(commit.expected_state_version + 1)
+        }
+
+        async fn insert_effect_intent(
+            &self,
+            _event_id: Uuid,
+            _effect_id: String,
+            _correlation_id: Uuid,
+            _event_type: String,
+            _event_payload: serde_json::Value,
+            _parent_event_id: Option<Uuid>,
+            _batch_id: Option<Uuid>,
+            _batch_index: Option<i32>,
+            _batch_size: Option<i32>,
+            _execute_at: chrono::DateTime<chrono::Utc>,
+            _timeout_seconds: i32,
+            _max_attempts: i32,
+            _priority: i32,
+        ) -> Result<()> {
+            panic!(
+                "insert_effect_intent should not be called directly; event worker must use commit_event_processing"
+            );
+        }
+
+        async fn poll_next_effect(&self) -> Result<Option<crate::QueuedEffectExecution>> {
+            Ok(None)
+        }
+
+        async fn complete_effect(
+            &self,
+            _event_id: Uuid,
+            _effect_id: String,
+            _result: serde_json::Value,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn complete_effect_with_events(
+            &self,
+            _event_id: Uuid,
+            _effect_id: String,
+            _result: serde_json::Value,
+            _emitted_events: Vec<crate::EmittedEvent>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fail_effect(
+            &self,
+            _event_id: Uuid,
+            _effect_id: String,
+            _error: String,
+            _attempts: i32,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dlq_effect(
+            &self,
+            _event_id: Uuid,
+            _effect_id: String,
+            _error: String,
+            _reason: String,
+            _attempts: i32,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_workflow_status(
+            &self,
+            _correlation_id: Uuid,
+        ) -> Result<crate::WorkflowStatus> {
+            Ok(crate::WorkflowStatus {
+                correlation_id: _correlation_id,
+                state: None,
+                pending_effects: 0,
+                is_settled: true,
+                last_event: None,
+            })
+        }
+
+        async fn subscribe_workflow_events(
+            &self,
+            _correlation_id: Uuid,
+        ) -> Result<Box<dyn Stream<Item = crate::WorkflowEvent> + Send + Unpin>> {
+            Ok(Box::new(futures::stream::empty::<crate::WorkflowEvent>()))
+        }
+    }
+
+    #[tokio::test]
+    async fn event_worker_uses_atomic_commit_path() {
+        let event = queued_increment_event();
+        let store = Arc::new(AtomicCommitStore::new(event.clone()));
+
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(crate::reducer::fold::<Increment>().into_queue(
+            |state: TestState, event| TestState {
+                count: state.count + event.amount,
+            },
+        ));
+
+        let effects = Arc::new(EffectRegistry::<TestState, TestDeps>::new());
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+        assert_eq!(store.commit_calls.lock().len(), 1);
+        assert!(store.nacked_ids.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_worker_notifies_queue_backend_for_queued_intents() {
+        let event = queued_effect_only_event();
+        let store = Arc::new(TestStore::new(vec![event.clone()]));
+        let reducers = Arc::new(ReducerRegistry::<TestState>::new());
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("queued_effect")
+                .queued()
+                .then_queue(
+                    |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
+                        Ok(())
+                    },
+                ),
+        );
+
+        let queue_backend = Arc::new(RecordingQueueBackend::default());
+        let worker = EventWorker::new(
+            store,
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        )
+        .with_queue_backend(queue_backend.clone());
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+
+        let inserted = queue_backend.inserted_intents.lock();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].0, event.event_id);
+        assert_eq!(inserted[0].1, "queued_effect");
+    }
+
+    #[tokio::test]
+    async fn event_worker_continues_when_queue_backend_insert_hook_fails() {
+        let event = queued_effect_only_event();
+        let store = Arc::new(TestStore::new(vec![event.clone()]));
+        let reducers = Arc::new(ReducerRegistry::<TestState>::new());
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("queued_effect")
+                .queued()
+                .then_queue(
+                    |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
+                        Ok(())
+                    },
+                ),
+        );
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        )
+        .with_queue_backend(Arc::new(FailingQueueBackend));
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("queue backend notification failure should not fail event processing");
+        assert!(processed);
+        assert_eq!(*store.acked_ids.lock(), vec![event.id]);
+        assert!(store.nacked_ids.lock().is_empty());
+        assert_eq!(store.effect_intents.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -794,11 +1160,16 @@ mod tests {
         let reducers = Arc::new(ReducerRegistry::new());
 
         let effects = Arc::new(EffectRegistry::new());
-        effects.register(crate::effect::on::<EffectOnlyEvent>().queued().then(
-            |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
-                Ok(())
-            },
-        ));
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("effect_only_event_queued")
+                .queued()
+                .then(
+                    |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
+                        Ok(())
+                    },
+                ),
+        );
 
         let worker = EventWorker::new(
             store.clone(),
@@ -851,6 +1222,401 @@ mod tests {
         assert_eq!(dlqed[0].3, "max_retries_exceeded");
         assert_eq!(dlqed[0].4, 3);
         assert!(dlqed[0].2.contains("failed after 3 retry attempts"));
+    }
+
+    #[tokio::test]
+    async fn event_worker_inline_failure_does_not_block_queued_effects() {
+        let event = queued_effect_only_event();
+        let store = Arc::new(TestStore::new(vec![event.clone()]));
+        let reducers = Arc::new(ReducerRegistry::<TestState>::new());
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("inline_failing_effect")
+                .then_queue(
+                    |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                        Err::<(), _>(anyhow::anyhow!("inline effect exploded"))
+                    },
+                ),
+        );
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("queued_effect")
+                .retry(3)
+                .then_queue(
+                    |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
+                        Ok(())
+                    },
+                ),
+        );
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+        assert_eq!(*store.acked_ids.lock(), vec![event.id]);
+        assert!(store.nacked_ids.lock().is_empty());
+
+        let dlqed = store.dlqed.lock();
+        assert_eq!(dlqed.len(), 1);
+        assert_eq!(dlqed[0].0, event.event_id);
+        assert_eq!(dlqed[0].1, "inline_failing_effect");
+        assert_eq!(dlqed[0].3, "inline_failed");
+
+        let intents = store.effect_intents.lock();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].0, "queued_effect");
+    }
+
+    #[tokio::test]
+    async fn multiple_inline_effects_run_independently() {
+        // Verify that when multiple inline effects listen to the same event,
+        // one effect failing does NOT prevent other effects from running.
+
+        let event = queued_effect_only_event();
+        let store = Arc::new(TestStore::new(vec![event.clone()]));
+        let reducers = Arc::new(ReducerRegistry::<TestState>::new());
+
+        // Use a counter to track which effects actually ran
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        #[derive(Clone)]
+        struct TestDepsWithCounter {
+            counter: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        let effects = Arc::new(EffectRegistry::new());
+
+        // Effect 1: Inline, increments counter, then fails
+        let counter_clone = counter.clone();
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("failing_inline")
+                .then_queue(
+                    move |_event: Arc<EffectOnlyEvent>,
+                          _ctx: EffectContext<TestState, TestDepsWithCounter>| {
+                        let counter = counter_clone.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Err::<(), _>(anyhow::anyhow!("boom"))
+                        }
+                    },
+                ),
+        );
+
+        // Effect 2: Inline, increments counter, succeeds
+        let counter_clone = counter.clone();
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("succeeding_inline")
+                .then_queue(
+                    move |_event: Arc<EffectOnlyEvent>,
+                          _ctx: EffectContext<TestState, TestDepsWithCounter>| {
+                        let counter = counter_clone.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                ),
+        );
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDepsWithCounter {
+                counter: counter.clone(),
+            }),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+
+        assert!(processed);
+
+        // Both effects should have run (counter should be 2)
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "Both inline effects should have run"
+        );
+
+        // Event should be ACK'd despite one effect failing
+        assert_eq!(*store.acked_ids.lock(), vec![event.id]);
+        assert!(store.nacked_ids.lock().is_empty());
+
+        // Failed effect should be in DLQ
+        let dlqed = store.dlqed.lock();
+        assert_eq!(dlqed.len(), 1);
+        assert_eq!(dlqed[0].0, event.event_id);
+        assert_eq!(dlqed[0].1, "failing_inline");
+        assert_eq!(dlqed[0].3, "inline_failed");
+    }
+
+    #[tokio::test]
+    async fn multiple_inline_effects_run_but_event_retries_when_dlq_commit_fails() {
+        // Verify that all inline effects run, but event commit fails atomically
+        // if DLQ persistence fails.
+
+        let event = queued_effect_only_event();
+
+        // Create a store that fails on DLQ operations
+        struct FailingDlqStore {
+            inner: TestStore,
+        }
+
+        #[async_trait]
+        impl crate::Store for FailingDlqStore {
+            async fn publish(&self, event: QueuedEvent) -> Result<()> {
+                self.inner.publish(event).await
+            }
+
+            async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
+                self.inner.poll_next().await
+            }
+
+            async fn ack(&self, id: i64) -> Result<()> {
+                self.inner.ack(id).await
+            }
+
+            async fn nack(&self, id: i64, retry_after_secs: u64) -> Result<()> {
+                self.inner.nack(id, retry_after_secs).await
+            }
+
+            async fn load_state<S>(&self, correlation_id: Uuid) -> Result<Option<(S, i32)>>
+            where
+                S: for<'de> serde::Deserialize<'de> + Send,
+            {
+                self.inner.load_state(correlation_id).await
+            }
+
+            async fn save_state<S>(
+                &self,
+                correlation_id: Uuid,
+                state: &S,
+                expected_version: i32,
+            ) -> Result<i32>
+            where
+                S: serde::Serialize + Send + Sync,
+            {
+                self.inner
+                    .save_state(correlation_id, state, expected_version)
+                    .await
+            }
+
+            async fn insert_effect_intent(
+                &self,
+                event_id: Uuid,
+                effect_id: String,
+                correlation_id: Uuid,
+                event_type: String,
+                event_payload: serde_json::Value,
+                parent_event_id: Option<Uuid>,
+                batch_id: Option<Uuid>,
+                batch_index: Option<i32>,
+                batch_size: Option<i32>,
+                execute_at: chrono::DateTime<chrono::Utc>,
+                timeout_seconds: i32,
+                max_attempts: i32,
+                priority: i32,
+            ) -> Result<()> {
+                self.inner
+                    .insert_effect_intent(
+                        event_id,
+                        effect_id,
+                        correlation_id,
+                        event_type,
+                        event_payload,
+                        parent_event_id,
+                        batch_id,
+                        batch_index,
+                        batch_size,
+                        execute_at,
+                        timeout_seconds,
+                        max_attempts,
+                        priority,
+                    )
+                    .await
+            }
+
+            async fn poll_next_effect(&self) -> Result<Option<crate::QueuedEffectExecution>> {
+                self.inner.poll_next_effect().await
+            }
+
+            async fn complete_effect(
+                &self,
+                event_id: Uuid,
+                effect_id: String,
+                result: serde_json::Value,
+            ) -> Result<()> {
+                self.inner
+                    .complete_effect(event_id, effect_id, result)
+                    .await
+            }
+
+            async fn complete_effect_with_events(
+                &self,
+                event_id: Uuid,
+                effect_id: String,
+                result: serde_json::Value,
+                emitted_events: Vec<crate::EmittedEvent>,
+            ) -> Result<()> {
+                self.inner
+                    .complete_effect_with_events(event_id, effect_id, result, emitted_events)
+                    .await
+            }
+
+            async fn fail_effect(
+                &self,
+                event_id: Uuid,
+                effect_id: String,
+                error: String,
+                attempts: i32,
+            ) -> Result<()> {
+                self.inner
+                    .fail_effect(event_id, effect_id, error, attempts)
+                    .await
+            }
+
+            async fn dlq_effect(
+                &self,
+                _event_id: Uuid,
+                _effect_id: String,
+                _error: String,
+                _reason: String,
+                _attempts: i32,
+            ) -> Result<()> {
+                // Always fail
+                anyhow::bail!("DLQ operation failed")
+            }
+
+            async fn get_workflow_status(
+                &self,
+                correlation_id: Uuid,
+            ) -> Result<crate::WorkflowStatus> {
+                self.inner.get_workflow_status(correlation_id).await
+            }
+
+            async fn subscribe_workflow_events(
+                &self,
+                correlation_id: Uuid,
+            ) -> Result<Box<dyn futures::Stream<Item = crate::WorkflowEvent> + Send + Unpin>>
+            {
+                self.inner.subscribe_workflow_events(correlation_id).await
+            }
+        }
+
+        let store = Arc::new(FailingDlqStore {
+            inner: TestStore::new(vec![event.clone()]),
+        });
+        let reducers = Arc::new(ReducerRegistry::<TestState>::new());
+
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        #[derive(Clone)]
+        struct TestDepsWithCounter {
+            counter: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        let effects = Arc::new(EffectRegistry::new());
+
+        // Effect 1: Inline, increments counter, then fails
+        let counter_clone = counter.clone();
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("failing_inline_1")
+                .then_queue(
+                    move |_event: Arc<EffectOnlyEvent>,
+                          _ctx: EffectContext<TestState, TestDepsWithCounter>| {
+                        let counter = counter_clone.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Err::<(), _>(anyhow::anyhow!("boom"))
+                        }
+                    },
+                ),
+        );
+
+        // Effect 2: Inline, increments counter, also fails
+        let counter_clone = counter.clone();
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("failing_inline_2")
+                .then_queue(
+                    move |_event: Arc<EffectOnlyEvent>,
+                          _ctx: EffectContext<TestState, TestDepsWithCounter>| {
+                        let counter = counter_clone.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Err::<(), _>(anyhow::anyhow!("boom again"))
+                        }
+                    },
+                ),
+        );
+
+        // Effect 3: Inline, increments counter, succeeds
+        let counter_clone = counter.clone();
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>()
+                .id("succeeding_inline")
+                .then_queue(
+                    move |_event: Arc<EffectOnlyEvent>,
+                          _ctx: EffectContext<TestState, TestDepsWithCounter>| {
+                        let counter = counter_clone.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                ),
+        );
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDepsWithCounter {
+                counter: counter.clone(),
+            }),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+
+        let error = worker
+            .process_next_event()
+            .await
+            .expect_err("DLQ persistence failure should fail the atomic commit");
+        assert!(
+            error.to_string().contains("DLQ operation failed"),
+            "unexpected error: {error}"
+        );
+
+        // All three effects should have run (counter should be 3)
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "All three inline effects should have run despite DLQ failures"
+        );
+
+        // Commit failed, so event should be nacked for retry.
+        assert!(store.inner.acked_ids.lock().is_empty());
+        assert_eq!(*store.inner.nacked_ids.lock(), vec![event.id]);
+
+        // DLQ should be empty because all DLQ operations failed
+        assert_eq!(store.inner.dlqed.lock().len(), 0);
     }
 
     #[tokio::test]
@@ -925,7 +1691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_worker_inline_batch_emit_over_limit_is_nacked() {
+    async fn event_worker_inline_batch_emit_over_limit_is_dlqd_without_retry() {
         let source = QueuedEvent {
             id: 102,
             event_id: Uuid::new_v4(),
@@ -953,6 +1719,7 @@ mod tests {
         let effects = Arc::new(EffectRegistry::new());
         effects.register(
             crate::effect::on::<FanOut>()
+                .id("oversized_batch_effect")
                 .then_queue::<TestState, TestDeps, Arc<FanOut>, _, _, Vec<FanOutItem>, FanOutItem>(
                     |event: Arc<FanOut>, _ctx: EffectContext<TestState, TestDeps>| async move {
                         Ok((0..event.count)
@@ -975,17 +1742,26 @@ mod tests {
             },
         );
 
-        let result = worker.process_next_event().await;
-        assert!(result.is_err(), "oversized inline batch should fail");
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains("max_batch_size"),
-            "error should mention max_batch_size, got: {}",
-            error
-        );
-        assert_eq!(*store.nacked_ids.lock(), vec![source.id]);
-        assert!(store.acked_ids.lock().is_empty());
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("event should be acked while failed inline effect is DLQ'd");
+        assert!(processed);
+        assert!(store.nacked_ids.lock().is_empty());
+        assert_eq!(*store.acked_ids.lock(), vec![source.id]);
         assert!(store.published_events.lock().is_empty());
+
+        let dlqed = store.dlqed.lock();
+        assert_eq!(dlqed.len(), 1);
+        assert_eq!(dlqed[0].0, source.event_id);
+        assert_eq!(dlqed[0].1, "oversized_batch_effect");
+        assert_eq!(dlqed[0].3, "inline_failed");
+        assert_eq!(dlqed[0].4, 1);
+        assert!(
+            dlqed[0].2.contains("max_batch_size"),
+            "DLQ error should mention max_batch_size, got: {}",
+            dlqed[0].2
+        );
     }
 
     #[tokio::test]
@@ -1071,9 +1847,12 @@ mod tests {
         ));
 
         let effects = Arc::new(EffectRegistry::new());
-        let queued_effect = crate::effect::on::<Increment>().queued().then_queue(
-            |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async { Ok(()) },
-        );
+        let queued_effect = crate::effect::on::<Increment>()
+            .id("queued_increment_batch_metadata")
+            .queued()
+            .then_queue(
+                |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async { Ok(()) },
+            );
         effects.register(queued_effect);
 
         let worker = EventWorker::new(

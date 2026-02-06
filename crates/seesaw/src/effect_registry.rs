@@ -40,7 +40,22 @@ where
 
     /// Register an effect.
     pub fn register(&self, effect: Effect<S, D>) {
-        self.effects.write().push(effect);
+        if effect.id.trim().is_empty() {
+            panic!("Effect ID cannot be empty");
+        }
+
+        if !effect.is_inline() && looks_like_auto_generated_id(&effect.id) {
+            panic!(
+                "Queued effect '{}' must declare an explicit stable id (for example .id(\"...\") or #[effect(id = \"...\")])",
+                effect.id
+            );
+        }
+
+        let mut effects = self.effects.write();
+        if effects.iter().any(|existing| existing.id == effect.id) {
+            panic!("Duplicate effect id '{}'", effect.id);
+        }
+        effects.push(effect);
     }
 
     /// Get all registered effects (cloned).
@@ -85,6 +100,20 @@ where
     }
 }
 
+fn looks_like_auto_generated_id(id: &str) -> bool {
+    let Some((_prefix, location)) = id.rsplit_once('@') else {
+        return false;
+    };
+    let mut parts = location.rsplit(':');
+    let Some(column) = parts.next() else {
+        return false;
+    };
+    let Some(line) = parts.next() else {
+        return false;
+    };
+    line.parse::<u32>().is_ok() && column.parse::<u32>().is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,10 +122,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct EventA;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct EventB;
 
     #[derive(Clone)]
@@ -164,5 +193,33 @@ mod tests {
         let effects = registry.effects.read();
         assert!(effects[0].can_handle(TypeId::of::<EventA>()));
         assert!(effects[0].can_handle(TypeId::of::<EventB>()));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Duplicate effect id 'duplicate'")]
+    async fn test_register_rejects_duplicate_effect_ids() {
+        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+
+        registry.register(
+            effect::on::<EventA>()
+                .id("duplicate")
+                .then(|_, _| async { Ok(()) }),
+        );
+        registry.register(
+            effect::on::<EventB>()
+                .id("duplicate")
+                .then(|_, _| async { Ok(()) }),
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "must declare an explicit stable id")]
+    async fn test_register_rejects_generated_id_for_queued_effect() {
+        let registry: EffectRegistry<TestState, ()> = EffectRegistry::new();
+        registry.register(
+            effect::on::<EventA>()
+                .retry(3)
+                .then(|_, _| async { Ok(()) }),
+        );
     }
 }

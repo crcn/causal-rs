@@ -1,7 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
-use seesaw_core::{EmittedEvent, QueuedEvent, Store, NAMESPACE_SEESAW};
+use seesaw_core::{
+    EmittedEvent, EventProcessingCommit, InlineEffectFailure, QueuedEffectIntent, QueuedEvent,
+    Store, NAMESPACE_SEESAW,
+};
 use seesaw_postgres::PostgresStore;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -15,6 +18,11 @@ struct TestDb {
     container: ContainerAsync<Postgres>,
     pool: PgPool,
     store: PostgresStore,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct CommitState {
+    count: i32,
 }
 
 impl TestDb {
@@ -269,6 +277,352 @@ async fn test_ack_and_nack() -> Result<()> {
     // Should not be available anymore
     let final_check = db.store.poll_next().await?;
     assert!(final_check.is_none(), "Event should be acked");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_commit_event_processing_persists_all_side_effects() -> Result<()> {
+    let db = TestDb::new().await?;
+    let correlation_id = Uuid::new_v4();
+    let source_event_id = Uuid::new_v4();
+
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id: source_event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: "SourceEvent".to_string(),
+            payload: serde_json::json!({ "value": 1 }),
+            hops: 0,
+            retry_count: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: Utc::now(),
+        })
+        .await?;
+
+    let claimed = db
+        .store
+        .poll_next()
+        .await?
+        .expect("source event should exist");
+
+    let emitted_event_id = Uuid::new_v4();
+    db.store
+        .commit_event_processing(EventProcessingCommit {
+            event_row_id: claimed.id,
+            event_id: claimed.event_id,
+            correlation_id: claimed.correlation_id,
+            event_type: claimed.event_type.clone(),
+            event_payload: claimed.payload.clone(),
+            state: CommitState { count: 10 },
+            expected_state_version: 0,
+            queued_effect_intents: vec![QueuedEffectIntent {
+                effect_id: "queued_commit_effect".to_string(),
+                parent_event_id: Some(claimed.event_id),
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+                execute_at: Utc::now(),
+                timeout_seconds: 30,
+                max_attempts: 3,
+                priority: 10,
+            }],
+            inline_effect_failures: vec![InlineEffectFailure {
+                effect_id: "inline_failure".to_string(),
+                error: "boom".to_string(),
+                reason: "inline_failed".to_string(),
+                attempts: 1,
+            }],
+            emitted_events: vec![QueuedEvent {
+                id: 0,
+                event_id: emitted_event_id,
+                parent_id: Some(claimed.event_id),
+                correlation_id: claimed.correlation_id,
+                event_type: "EmittedEvent".to_string(),
+                payload: serde_json::json!({ "ok": true }),
+                hops: claimed.hops + 1,
+                retry_count: 0,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+                created_at: Utc::now(),
+            }],
+        })
+        .await?;
+
+    let loaded_state: Option<(CommitState, i32)> = db.store.load_state(correlation_id).await?;
+    assert_eq!(loaded_state, Some((CommitState { count: 10 }, 1)));
+
+    let effect_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM seesaw_effect_executions
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(source_event_id)
+    .bind("queued_commit_effect")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(effect_count, 1);
+
+    let emitted_row: Option<(Uuid, Option<Uuid>, String)> = sqlx::query_as(
+        "SELECT event_id, parent_id, event_type
+         FROM seesaw_events
+         WHERE event_id = $1",
+    )
+    .bind(emitted_event_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    let emitted_row = emitted_row.expect("emitted event should be persisted");
+    assert_eq!(emitted_row.0, emitted_event_id);
+    assert_eq!(emitted_row.1, Some(source_event_id));
+    assert_eq!(emitted_row.2, "EmittedEvent");
+
+    let dlq_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM seesaw_dlq
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(source_event_id)
+    .bind("inline_failure")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(dlq_count, 1);
+
+    let processed_at_is_set: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL
+         FROM seesaw_events
+         WHERE id = $1",
+    )
+    .bind(claimed.id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(processed_at_is_set, "source event should be acked");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_commit_event_processing_rolls_back_on_mid_commit_failure() -> Result<()> {
+    let db = TestDb::new().await?;
+    let correlation_id = Uuid::new_v4();
+    let source_event_id = Uuid::new_v4();
+
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id: source_event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: "SourceEvent".to_string(),
+            payload: serde_json::json!({ "value": 1 }),
+            hops: 0,
+            retry_count: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: Utc::now(),
+        })
+        .await?;
+
+    let claimed = db
+        .store
+        .poll_next()
+        .await?
+        .expect("source event should exist");
+    let emitted_event_id = Uuid::new_v4();
+
+    let error = db
+        .store
+        .commit_event_processing(EventProcessingCommit {
+            event_row_id: claimed.id,
+            event_id: claimed.event_id,
+            correlation_id: claimed.correlation_id,
+            event_type: claimed.event_type.clone(),
+            event_payload: claimed.payload.clone(),
+            state: CommitState { count: 99 },
+            expected_state_version: 0,
+            queued_effect_intents: vec![QueuedEffectIntent {
+                effect_id: "queued_commit_effect".to_string(),
+                parent_event_id: Some(claimed.event_id),
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+                execute_at: Utc::now(),
+                timeout_seconds: 30,
+                max_attempts: 3,
+                priority: 10,
+            }],
+            inline_effect_failures: vec![
+                InlineEffectFailure {
+                    effect_id: "dup_inline_failure".to_string(),
+                    error: "boom".to_string(),
+                    reason: "inline_failed".to_string(),
+                    attempts: 1,
+                },
+                InlineEffectFailure {
+                    effect_id: "dup_inline_failure".to_string(),
+                    error: "boom again".to_string(),
+                    reason: "inline_failed".to_string(),
+                    attempts: 1,
+                },
+            ],
+            emitted_events: vec![QueuedEvent {
+                id: 0,
+                event_id: emitted_event_id,
+                parent_id: Some(claimed.event_id),
+                correlation_id: claimed.correlation_id,
+                event_type: "EmittedEvent".to_string(),
+                payload: serde_json::json!({ "ok": true }),
+                hops: claimed.hops + 1,
+                retry_count: 0,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+                created_at: Utc::now(),
+            }],
+        })
+        .await
+        .expect_err("duplicate DLQ inserts should fail and rollback whole commit");
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate key value violates unique constraint"),
+        "unexpected error: {error}"
+    );
+
+    let loaded_state: Option<(CommitState, i32)> = db.store.load_state(correlation_id).await?;
+    assert!(loaded_state.is_none(), "state update should roll back");
+
+    let effect_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM seesaw_effect_executions
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(source_event_id)
+    .bind("queued_commit_effect")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(effect_count, 0, "queued intent should roll back");
+
+    let emitted_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM seesaw_events WHERE event_id = $1")
+            .bind(emitted_event_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(emitted_count, 0, "emitted events should roll back");
+
+    let dlq_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM seesaw_dlq
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(source_event_id)
+    .bind("dup_inline_failure")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(dlq_count, 0, "DLQ writes should roll back");
+
+    let processed_at_is_set: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL
+         FROM seesaw_events
+         WHERE id = $1",
+    )
+    .bind(claimed.id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        !processed_at_is_set,
+        "source event ack should roll back when commit fails"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_commit_event_processing_fails_when_source_ack_row_missing() -> Result<()> {
+    let db = TestDb::new().await?;
+    let correlation_id = Uuid::new_v4();
+    let source_event_id = Uuid::new_v4();
+
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id: source_event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: "SourceEvent".to_string(),
+            payload: serde_json::json!({ "value": 1 }),
+            hops: 0,
+            retry_count: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: Utc::now(),
+        })
+        .await?;
+
+    let claimed = db.store.poll_next().await?.expect("source event should exist");
+
+    let error = db
+        .store
+        .commit_event_processing(EventProcessingCommit {
+            event_row_id: claimed.id + 999_999,
+            event_id: claimed.event_id,
+            correlation_id: claimed.correlation_id,
+            event_type: claimed.event_type.clone(),
+            event_payload: claimed.payload.clone(),
+            state: CommitState { count: 7 },
+            expected_state_version: 0,
+            queued_effect_intents: vec![QueuedEffectIntent {
+                effect_id: "queued_commit_effect".to_string(),
+                parent_event_id: Some(claimed.event_id),
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+                execute_at: Utc::now(),
+                timeout_seconds: 30,
+                max_attempts: 3,
+                priority: 10,
+            }],
+            inline_effect_failures: vec![],
+            emitted_events: vec![],
+        })
+        .await
+        .expect_err("invalid source row id should fail atomic commit");
+    assert!(
+        error
+            .to_string()
+            .contains("atomic event commit failed to ack source event row"),
+        "unexpected error: {error}"
+    );
+
+    let loaded_state: Option<(CommitState, i32)> = db.store.load_state(correlation_id).await?;
+    assert!(loaded_state.is_none(), "state update should roll back");
+
+    let effect_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM seesaw_effect_executions
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(source_event_id)
+    .bind("queued_commit_effect")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(effect_count, 0, "intent insert should roll back");
+
+    let processed_at_is_set: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL
+         FROM seesaw_events
+         WHERE id = $1",
+    )
+    .bind(claimed.id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(!processed_at_is_set, "source event should remain unacked");
 
     Ok(())
 }
@@ -531,6 +885,84 @@ async fn test_effect_priority_ordering() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_insert_effect_intent_is_idempotent() -> Result<()> {
+    let db = TestDb::new().await?;
+
+    let event_id = Uuid::new_v4();
+    let effect_id = "idempotent_effect".to_string();
+    let correlation_id = Uuid::new_v4();
+
+    db.store
+        .insert_effect_intent(
+            event_id,
+            effect_id.clone(),
+            correlation_id,
+            "TestEvent".to_string(),
+            serde_json::json!({ "payload": "same" }),
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+            30,
+            3,
+            10,
+        )
+        .await?;
+
+    // Duplicate delivery should not error and should not create another row.
+    db.store
+        .insert_effect_intent(
+            event_id,
+            effect_id.clone(),
+            correlation_id,
+            "TestEvent".to_string(),
+            serde_json::json!({ "payload": "same" }),
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+            30,
+            3,
+            10,
+        )
+        .await?;
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM seesaw_effect_executions
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(event_id)
+    .bind(&effect_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(count, 1, "duplicate insert should be a no-op");
+
+    let polled = db
+        .store
+        .poll_next_effect()
+        .await?
+        .expect("single effect should be available");
+    assert_eq!(polled.event_id, event_id);
+    assert_eq!(polled.effect_id, effect_id);
+
+    db.store
+        .complete_effect(
+            polled.event_id,
+            polled.effect_id.clone(),
+            serde_json::json!({ "ok": true }),
+        )
+        .await?;
+
+    let next = db.store.poll_next_effect().await?;
+    assert!(next.is_none(), "no duplicate execution should exist");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_complete_effect() -> Result<()> {
     let db = TestDb::new().await?;
 
@@ -684,6 +1116,74 @@ async fn test_fail_and_dlq_effect() -> Result<()> {
         .await?;
 
     assert_eq!(dlq_count, 1, "Effect should be in DLQ");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dlq_effect_without_execution_row_uses_parent_event_payload() -> Result<()> {
+    let db = TestDb::new().await?;
+
+    let event_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let effect_id = "__inline_failed__".to_string();
+    let event_type = "InlineOnlyEvent".to_string();
+    let payload = serde_json::json!({ "request_id": "abc123" });
+
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: event_type.clone(),
+            payload: payload.clone(),
+            hops: 0,
+            retry_count: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: Utc::now(),
+        })
+        .await?;
+
+    // No insert_effect_intent call on purpose: this mirrors inline/synthetic failures.
+    db.store
+        .dlq_effect(
+            event_id,
+            effect_id.clone(),
+            "inline failed".to_string(),
+            "inline_failed".to_string(),
+            1,
+        )
+        .await?;
+
+    let dlq_row: (Uuid, String, serde_json::Value, String, i32) = sqlx::query_as(
+        "SELECT correlation_id, event_type, event_payload, reason, attempts
+         FROM seesaw_dlq
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(event_id)
+    .bind(&effect_id)
+    .fetch_one(&db.pool)
+    .await?;
+
+    assert_eq!(dlq_row.0, correlation_id);
+    assert_eq!(dlq_row.1, event_type);
+    assert_eq!(dlq_row.2, payload);
+    assert_eq!(dlq_row.3, "inline_failed");
+    assert_eq!(dlq_row.4, 1);
+
+    let execution_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM seesaw_effect_executions
+         WHERE event_id = $1 AND effect_id = $2",
+    )
+    .bind(event_id)
+    .bind(&effect_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(execution_count, 0);
 
     Ok(())
 }

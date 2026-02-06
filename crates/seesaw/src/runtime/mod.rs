@@ -61,6 +61,7 @@ impl Runtime {
 
         let mut handles = Vec::new();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let queue_backend = engine.queue_backend();
 
         // Spawn event workers
         for i in 0..config.event_workers {
@@ -71,6 +72,7 @@ impl Runtime {
                 engine.effects().clone(),
                 config.event_worker_config.clone(),
             )
+            .with_queue_backend(queue_backend.clone())
             .with_shutdown(shutdown.clone());
 
             let handle = tokio::spawn(async move {
@@ -90,6 +92,7 @@ impl Runtime {
                 engine.effects().clone(),
                 config.effect_worker_config.clone(),
             )
+            .with_queue_backend(queue_backend.clone())
             .with_shutdown(shutdown.clone());
 
             let handle = tokio::spawn(async move {

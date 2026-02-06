@@ -227,7 +227,7 @@ CREATE TABLE seesaw_dlq (
     error TEXT NOT NULL,
     event_type VARCHAR(255) NOT NULL,
     event_payload JSONB NOT NULL,
-    reason VARCHAR(50) NOT NULL,     -- 'failed', 'timeout', 'infinite_loop'
+    reason VARCHAR(50) NOT NULL,     -- e.g. 'failed', 'timeout', 'infinite_loop', 'inline_failed', 'max_retries_exceeded'
     attempts INT NOT NULL DEFAULT 0,
     failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at TIMESTAMPTZ,         -- NULL = unresolved, set when manually fixed
@@ -246,7 +246,7 @@ WHERE resolved_at IS NULL;
 CREATE INDEX idx_dlq_workflow ON seesaw_dlq(correlation_id);
 
 COMMENT ON TABLE seesaw_dlq IS 'Dead letter queue - effects that failed permanently';
-COMMENT ON COLUMN seesaw_dlq.reason IS 'Why it failed: failed (retry exhausted), timeout, infinite_loop';
+COMMENT ON COLUMN seesaw_dlq.reason IS 'Why it failed: failed (retry exhausted), timeout, infinite_loop, inline_failed, max_retries_exceeded';
 
 -- ============================================================
 -- Observability Stream (for real-time visualization)

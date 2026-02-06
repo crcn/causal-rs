@@ -62,6 +62,7 @@ extern crate self as seesaw_core;
 // New module structure
 pub mod effect;
 pub mod insight;
+pub mod queue_backend;
 pub mod reducer;
 pub mod runtime;
 pub mod store;
@@ -82,11 +83,12 @@ pub use insight::{
     EffectNode, EventNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,
 };
 pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
+pub use queue_backend::{QueueBackend, StoreQueueBackend};
 pub use reducer::Reducer;
 pub use runtime::{Runtime, RuntimeConfig};
 pub use store::{
-    EmittedEvent, JoinEntry, QueuedEffectExecution, QueuedEvent, Store, WorkflowEvent,
-    WorkflowStatus, NAMESPACE_SEESAW,
+    EmittedEvent, EventProcessingCommit, InlineEffectFailure, JoinEntry, QueuedEffectExecution,
+    QueuedEffectIntent, QueuedEvent, Store, WorkflowEvent, WorkflowStatus, NAMESPACE_SEESAW,
 };
 pub use task_group::TaskGroup;
 
