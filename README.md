@@ -304,6 +304,62 @@ Key properties:
 - **State transitions**: Use `.transition()` to react only when state changes
 - **Narrow context**: Only `deps()` and state access available
 
+#### Event Batching (v0.10.0+)
+
+Effects can emit multiple events at once using the `Emit` enum:
+
+```rust
+use seesaw_core::effect;
+
+// Emit multiple events in a batch
+effect::on::<ImportEvent>()
+    .extract(|e| match e {
+        ImportEvent::FileUploaded { path } => Some(path.clone()),
+        _ => None,
+    })
+    .then(|path, ctx| async move {
+        let rows = ctx.deps().parse_csv(&path).await?;
+
+        // Return Vec<Event> - auto-converts to Emit::Batch
+        let events: Vec<_> = rows.into_iter()
+            .map(|data| ImportEvent::RowParsed {
+                row_id: Uuid::new_v4(),
+                data
+            })
+            .collect();
+        Ok(events)  // Emits 1000s of events efficiently
+    });
+
+// Join pattern - accumulate batch and process together
+effect::on::<ImportEvent>()
+    .join()  // Accumulates events with same batch_id
+    .then(|batch: Vec<ImportEvent>, ctx| async move {
+        let items: Vec<_> = batch.into_iter()
+            .filter_map(|e| match e {
+                ImportEvent::RowParsed { data, .. } => Some(data),
+                _ => None,
+            })
+            .collect();
+
+        // Bulk insert entire batch
+        ctx.deps().bulk_insert(&items).await?;
+        Ok(ImportEvent::BatchInserted { count: items.len() })
+    });
+```
+
+**Return types:**
+- `Ok(event)` → `Emit::One(event)` (single event)
+- `Ok(vec![e1, e2])` → `Emit::Batch(vec)` (multiple events)
+- `Ok(())` → `Emit::None` (no events)
+
+**Join semantics:**
+- Events emitted in same batch (via `Emit::Batch`) share a `batch_id`
+- `.join()` accumulates all events with matching `batch_id`
+- Once all events in batch arrive, handler receives the full batch
+- Provides 10-50x performance for bulk operations
+
+See [`examples/batch-processor`](./examples/batch-processor) for a complete CSV import example.
+
 ### Reducers
 
 Reducers are pure functions that transform state in response to events. They run before effects.
