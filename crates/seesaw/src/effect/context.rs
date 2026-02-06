@@ -153,7 +153,6 @@ where
     pub(crate) fn emit_any(&self, event: Arc<dyn Any + Send + Sync>, type_id: TypeId) {
         self.emitter.emit(type_id, event, self.clone());
     }
-
 }
 
 #[cfg(test)]

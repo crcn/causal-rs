@@ -171,7 +171,8 @@ pub trait Store: Send + Sync + 'static {
 
     /// Complete effect and atomically publish emitted events (crash-safe)
     ///
-    /// Generates deterministic event IDs from hash(parent_event_id, effect_id, event_type).
+    /// Generates deterministic event IDs from
+    /// hash(parent_event_id, effect_id, event_type, emitted_index).
     /// Uses single transaction so both succeed or both fail (idempotent on retry).
     async fn complete_effect_with_events(
         &self,
@@ -199,6 +200,27 @@ pub trait Store: Send + Sync + 'static {
         reason: String,
         attempts: i32,
     ) -> Result<()>;
+
+    /// Move effect to DLQ and atomically publish mapped terminal events.
+    ///
+    /// Stores that don't support this should return an error when `emitted_events`
+    /// is non-empty so the caller can fall back to plain DLQ behavior.
+    async fn dlq_effect_with_events(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        error: String,
+        reason: String,
+        attempts: i32,
+        emitted_events: Vec<EmittedEvent>,
+    ) -> Result<()> {
+        if emitted_events.is_empty() {
+            return self
+                .dlq_effect(event_id, effect_id, error, reason, attempts)
+                .await;
+        }
+        anyhow::bail!("dlq_effect_with_events is not implemented for this store")
+    }
 
     // =========================================================================
     // LISTEN/NOTIFY Operations (for .wait() pattern)

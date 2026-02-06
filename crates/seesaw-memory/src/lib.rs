@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::broadcast;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// In-memory store for workflows
@@ -197,7 +197,10 @@ impl Store for MemoryStore {
         });
 
         // Add to queue
-        let mut queue = self.events.entry(event.correlation_id).or_insert_with(VecDeque::new);
+        let mut queue = self
+            .events
+            .entry(event.correlation_id)
+            .or_insert_with(VecDeque::new);
         queue.push_back(event);
         Ok(())
     }
@@ -251,7 +254,11 @@ impl Store for MemoryStore {
         if let Some(mut entry) = self.states.get_mut(&correlation_id) {
             let (_, current_version) = entry.value();
             if *current_version != expected_version {
-                return Err(anyhow!("Version mismatch: expected {} but was {}", expected_version, current_version));
+                return Err(anyhow!(
+                    "Version mismatch: expected {} but was {}",
+                    expected_version,
+                    current_version
+                ));
             }
             *entry.value_mut() = (json, new_version);
         } else {
@@ -371,7 +378,8 @@ impl Store for MemoryStore {
         effect_id: String,
         result: serde_json::Value,
     ) -> Result<()> {
-        self.completed_effects.insert((event_id, effect_id.clone()), result.clone());
+        self.completed_effects
+            .insert((event_id, effect_id.clone()), result.clone());
 
         // Update effect history
         if let Some(mut entry) = self.effect_history.get_mut(&(event_id, effect_id.clone())) {
@@ -409,13 +417,18 @@ impl Store for MemoryStore {
         emitted_events: Vec<EmittedEvent>,
     ) -> Result<()> {
         // Mark effect complete
-        self.complete_effect(event_id, effect_id.clone(), result).await?;
+        self.complete_effect(event_id, effect_id.clone(), result)
+            .await?;
 
         let correlation_id = self
             .effect_history
             .get(&(event_id, effect_id.clone()))
             .map(|entry| entry.correlation_id)
-            .or_else(|| self.event_history.get(&event_id).map(|entry| entry.correlation_id))
+            .or_else(|| {
+                self.event_history
+                    .get(&event_id)
+                    .map(|entry| entry.correlation_id)
+            })
             .unwrap_or(event_id);
         let parent_hops = self
             .event_history
@@ -498,19 +511,32 @@ impl Store for MemoryStore {
         error_type: String,
         attempts: i32,
     ) -> Result<()> {
-        let effect_snapshot = self
-            .effect_history
-            .get(&(event_id, effect_id.clone()))
-            .map(|entry| {
-                (
-                    entry.correlation_id,
-                    entry.event_type.clone(),
-                    entry.event_payload.clone(),
-                    entry.batch_id,
-                    entry.batch_index,
-                    entry.batch_size,
-                )
-            });
+        self.dlq_effect_with_events(event_id, effect_id, error, error_type, attempts, Vec::new())
+            .await
+    }
+
+    async fn dlq_effect_with_events(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        error: String,
+        error_type: String,
+        attempts: i32,
+        emitted_events: Vec<EmittedEvent>,
+    ) -> Result<()> {
+        let effect_snapshot =
+            self.effect_history
+                .get(&(event_id, effect_id.clone()))
+                .map(|entry| {
+                    (
+                        entry.correlation_id,
+                        entry.event_type.clone(),
+                        entry.event_payload.clone(),
+                        entry.batch_id,
+                        entry.batch_index,
+                        entry.batch_size,
+                    )
+                });
         let event_snapshot = self.event_history.get(&event_id).map(|event| {
             (
                 event.correlation_id,
@@ -566,31 +592,61 @@ impl Store for MemoryStore {
             },
         );
 
-        if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
-            (batch_id, batch_index, batch_size)
-        {
-            let parent_hops = event_snapshot.map(|snapshot| snapshot.6).unwrap_or(0);
-            let synthetic_event_id = Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!("{}-{}-dlq-terminal", event_id, effect_id).as_bytes(),
-            );
-            self.publish(QueuedEvent {
-                id: self.event_seq.fetch_add(1, Ordering::SeqCst),
-                event_id: synthetic_event_id,
-                parent_id: Some(event_id),
-                correlation_id,
-                event_type: event_type.clone(),
-                payload: event_payload.clone(),
-                hops: parent_hops + 1,
-                batch_id: Some(batch_id),
-                batch_index: Some(batch_index),
-                batch_size: Some(batch_size),
-                created_at: Utc::now(),
-            })
-            .await?;
+        let parent_hops = event_snapshot.map(|snapshot| snapshot.6).unwrap_or(0);
+        if emitted_events.is_empty() {
+            if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
+                (batch_id, batch_index, batch_size)
+            {
+                let synthetic_event_id = Uuid::new_v5(
+                    &NAMESPACE_SEESAW,
+                    format!("{}-{}-dlq-terminal", event_id, effect_id).as_bytes(),
+                );
+                self.publish(QueuedEvent {
+                    id: self.event_seq.fetch_add(1, Ordering::SeqCst),
+                    event_id: synthetic_event_id,
+                    parent_id: Some(event_id),
+                    correlation_id,
+                    event_type: event_type.clone(),
+                    payload: event_payload.clone(),
+                    hops: parent_hops + 1,
+                    batch_id: Some(batch_id),
+                    batch_index: Some(batch_index),
+                    batch_size: Some(batch_size),
+                    created_at: Utc::now(),
+                })
+                .await?;
+            }
+        } else {
+            for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
+                let synthetic_event_id = Uuid::new_v5(
+                    &NAMESPACE_SEESAW,
+                    format!(
+                        "{}-{}-dlq-terminal-{}-{}",
+                        event_id, effect_id, emitted.event_type, emitted_index
+                    )
+                    .as_bytes(),
+                );
+                self.publish(QueuedEvent {
+                    id: self.event_seq.fetch_add(1, Ordering::SeqCst),
+                    event_id: synthetic_event_id,
+                    parent_id: Some(event_id),
+                    correlation_id,
+                    event_type: emitted.event_type,
+                    payload: emitted.payload,
+                    hops: parent_hops + 1,
+                    batch_id: emitted.batch_id.or(batch_id),
+                    batch_index: emitted.batch_index.or(batch_index),
+                    batch_size: emitted.batch_size.or(batch_size),
+                    created_at: Utc::now(),
+                })
+                .await?;
+            }
         }
 
-        eprintln!("Effect sent to DLQ: {}:{} - {} (attempts: {})", event_id, effect_id, error, attempts);
+        eprintln!(
+            "Effect sent to DLQ: {}:{} - {} (attempts: {})",
+            event_id, effect_id, error, attempts
+        );
         Ok(())
     }
 
@@ -642,7 +698,11 @@ impl Store for MemoryStore {
         let ready = window.entries_by_index.len() as i32 >= window.target_count;
         if ready && window.status == MemoryJoinStatus::Open {
             window.status = MemoryJoinStatus::Processing;
-            let mut ordered = window.entries_by_index.values().cloned().collect::<Vec<_>>();
+            let mut ordered = window
+                .entries_by_index
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
             ordered.sort_by_key(|entry| entry.batch_index);
             return Ok(Some(ordered));
         }
@@ -680,15 +740,25 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn subscribe_workflow_events(&self, _correlation_id: Uuid) -> Result<Box<dyn futures::Stream<Item = WorkflowEvent> + Send + Unpin>> {
+    async fn subscribe_workflow_events(
+        &self,
+        _correlation_id: Uuid,
+    ) -> Result<Box<dyn futures::Stream<Item = WorkflowEvent> + Send + Unpin>> {
         // In-memory store doesn't support subscriptions
         Err(anyhow!("Subscriptions not supported in memory store"))
     }
 
     async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<WorkflowStatus> {
         // Check if any events or effects are pending
-        let has_events = self.events.get(&correlation_id).map(|q| !q.is_empty()).unwrap_or(false);
-        let state = self.states.get(&correlation_id).map(|entry| entry.value().0.clone());
+        let has_events = self
+            .events
+            .get(&correlation_id)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false);
+        let state = self
+            .states
+            .get(&correlation_id)
+            .map(|entry| entry.value().0.clone());
         let pending_effects = 0i64; // Simplified
 
         Ok(WorkflowStatus {
@@ -733,7 +803,10 @@ impl InsightStore for MemoryStore {
         let roots = self.build_event_nodes(&events, None, &event_ids, true);
 
         // Get state
-        let state = self.states.get(&correlation_id).map(|entry| entry.value().0.clone());
+        let state = self
+            .states
+            .get(&correlation_id)
+            .map(|entry| entry.value().0.clone());
 
         Ok(WorkflowTree {
             correlation_id,
@@ -931,7 +1004,11 @@ impl InsightStore for MemoryStore {
                 "failed" => {
                     workflow.failed_effects += 1;
                     let at = effect.last_attempted_at.unwrap_or(effect.created_at);
-                    if workflow.last_failed_at.map(|current| at > current).unwrap_or(true) {
+                    if workflow
+                        .last_failed_at
+                        .map(|current| at > current)
+                        .unwrap_or(true)
+                    {
                         workflow.last_failed_at = Some(at);
                         workflow.last_error = effect.error.clone();
                     }
@@ -1118,7 +1195,8 @@ mod tests {
         assert_eq!(next_events[1].seq, 4);
 
         // Verify no duplicates between historical and cursor fetch
-        let all_seqs: Vec<i64> = events.iter()
+        let all_seqs: Vec<i64> = events
+            .iter()
             .chain(next_events.iter())
             .map(|e| e.seq)
             .collect();
@@ -1149,7 +1227,11 @@ mod tests {
 
         // Request events after cursor=10 (beyond all events)
         let events = store.get_recent_events(Some(10), 10).await.unwrap();
-        assert_eq!(events.len(), 0, "Should return no events when cursor is beyond all seq values");
+        assert_eq!(
+            events.len(),
+            0,
+            "Should return no events when cursor is beyond all seq values"
+        );
     }
 
     #[tokio::test]
@@ -1220,7 +1302,10 @@ mod tests {
             .expect("dlq should succeed");
 
         let synthetic = store.poll_next().await.expect("poll should succeed");
-        assert!(synthetic.is_some(), "synthetic terminal event should be published");
+        assert!(
+            synthetic.is_some(),
+            "synthetic terminal event should be published"
+        );
         let synthetic = synthetic.unwrap();
         assert_eq!(synthetic.correlation_id, correlation_id);
         assert_eq!(synthetic.event_type, "BatchItemResult");

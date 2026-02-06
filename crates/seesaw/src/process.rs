@@ -544,12 +544,12 @@ mod tests {
 
         let result = process
             .wait(|event| {
-                event
-                    .downcast_ref::<crate::WorkflowEvent>()
-                    .and_then(|e| match e.event_type.as_str() {
+                event.downcast_ref::<crate::WorkflowEvent>().and_then(|e| {
+                    match e.event_type.as_str() {
                         "TerminalEvent" => Some(Ok(e.payload["ok"].as_bool().unwrap_or(false))),
                         _ => None,
-                    })
+                    }
+                })
             })
             .timeout(Duration::from_millis(250))
             .await

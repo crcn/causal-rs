@@ -11,7 +11,7 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use super::context::EffectContext;
-use super::types::{AnyEvent, BoxFuture, Effect, Emit, EventOutput, JoinMode};
+use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Effect, Emit, EventOutput, JoinMode};
 use crate::event_codec::EventCodec;
 
 #[track_caller]
@@ -122,6 +122,7 @@ pub struct EffectBuilder<EventType, Filter, Trans, Started> {
     max_attempts: u32,
     priority: Option<i32>,
     codec: Option<Arc<EventCodec>>,
+    dlq_terminal_mapper: Option<super::types::DlqTerminalMapper>,
     _marker: PhantomData<EventType>,
 }
 
@@ -151,6 +152,7 @@ pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoTra
         max_attempts: 1,
         priority: None,
         codec: None,
+        dlq_terminal_mapper: None,
         _marker: PhantomData,
     }
 }
@@ -177,6 +179,7 @@ pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
         max_attempts: 1,
         priority: None,
         codec: None,
+        dlq_terminal_mapper: None,
         _marker: PhantomData,
     }
 }
@@ -205,6 +208,7 @@ where
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
+            dlq_terminal_mapper: self.dlq_terminal_mapper,
             _marker: PhantomData,
         }
     }
@@ -242,6 +246,7 @@ where
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
+            dlq_terminal_mapper: self.dlq_terminal_mapper,
             _marker: PhantomData,
         }
     }
@@ -272,6 +277,7 @@ impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, NoTransition, 
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
+            dlq_terminal_mapper: self.dlq_terminal_mapper,
             _marker: PhantomData,
         }
     }
@@ -304,6 +310,7 @@ impl<EventType, Filter, Trans> EffectBuilder<EventType, Filter, Trans, NoStarted
             max_attempts: self.max_attempts,
             priority: self.priority,
             codec: self.codec,
+            dlq_terminal_mapper: self.dlq_terminal_mapper,
             _marker: PhantomData,
         }
     }
@@ -317,6 +324,46 @@ impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, 
     /// Set a custom ID for this effect (default: auto-generated).
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
+        self
+    }
+}
+
+impl<E, Filter, Trans, Started> EffectBuilder<Typed<E>, Filter, Trans, Started>
+where
+    E: Clone + Send + Sync + 'static,
+{
+    /// Map exhausted retries/timeouts to a terminal event before DLQ completion.
+    ///
+    /// This mapper only runs when execution is moving to DLQ, not on intermediate retries.
+    pub fn dlq_terminal<O, M>(mut self, mapper: M) -> Self
+    where
+        O: serde::Serialize + Send + Sync + 'static,
+        M: Fn(Arc<E>, DlqTerminalInfo) -> O + Send + Sync + 'static,
+    {
+        let output_type = std::any::type_name::<O>().to_string();
+        self.dlq_terminal_mapper = Some(Arc::new(move |source_any, source_type, info| {
+            if source_type != TypeId::of::<E>() {
+                anyhow::bail!(
+                    "dlq_terminal source type mismatch: expected {}",
+                    std::any::type_name::<E>()
+                );
+            }
+
+            let typed = source_any.downcast::<E>().map_err(|_| {
+                anyhow::anyhow!(
+                    "dlq_terminal source downcast failed for {}",
+                    std::any::type_name::<E>()
+                )
+            })?;
+
+            Ok(crate::EmittedEvent {
+                event_type: output_type.clone(),
+                payload: serde_json::to_value(mapper(typed, info))?,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+            })
+        }));
         self
     }
 }
@@ -420,7 +467,11 @@ where
             .take()
             .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
         let join_mode = self.mode;
-        let typed_codec = self.inner.codec.take().unwrap_or_else(typed_event_codec::<E>);
+        let typed_codec = self
+            .inner
+            .codec
+            .take()
+            .unwrap_or_else(typed_event_codec::<E>);
 
         Effect {
             id,
@@ -448,6 +499,7 @@ where
                     Ok(emit_to_outputs(emit))
                 })
             })),
+            dlq_terminal_mapper: self.inner.dlq_terminal_mapper.take(),
             queued: true,
             delay: self.inner.delay,
             timeout: self.inner.timeout,
@@ -612,6 +664,7 @@ where
         let filter = self.filter;
         let transition = self.transition;
         let codec = self.codec;
+        let dlq_terminal_mapper = self.dlq_terminal_mapper;
 
         let id = self
             .id
@@ -645,6 +698,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            dlq_terminal_mapper,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -677,6 +731,7 @@ where
         let filter = self.filter;
         let transition = self.transition;
         let codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
+        let dlq_terminal_mapper = self.dlq_terminal_mapper;
 
         let id = self
             .id
@@ -710,6 +765,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            dlq_terminal_mapper,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -751,6 +807,7 @@ impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
             }),
             join_mode: None,
             join_batch_handler: None,
+            dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -796,6 +853,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -839,6 +897,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -887,6 +946,7 @@ where
             }),
             join_mode: None,
             join_batch_handler: None,
+            dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -978,6 +1038,7 @@ where
         },
         join_mode: None,
         join_batch_handler: None,
+        dlq_terminal_mapper: None,
         queued: false,
         delay: None,
         timeout: None,
@@ -1020,6 +1081,7 @@ where
         handler: Arc::new(|_, _, _| Box::pin(async { Ok(Vec::new()) })),
         join_mode: None,
         join_batch_handler: None,
+        dlq_terminal_mapper: None,
         queued: false,
         delay: None,
         timeout: None,
@@ -1088,6 +1150,7 @@ where
         },
         join_mode: None,
         join_batch_handler: None,
+        dlq_terminal_mapper: None,
         queued: false,
         delay: None,
         timeout: None,
@@ -1107,12 +1170,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestDeps;
 
-    #[derive(Clone)]
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct TestEvent {
         value: i32,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, serde::Serialize)]
     struct OutputEvent {
         result: i32,
     }
@@ -1274,11 +1337,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result2.len(), 1);
-        let output = result2[0]
-            .value
-            .clone()
-            .downcast::<OutputEvent>()
-            .unwrap();
+        let output = result2[0].value.clone().downcast::<OutputEvent>().unwrap();
         assert_eq!(output.result, 15 + 30); // original + doubled
     }
 
@@ -1307,5 +1366,42 @@ mod tests {
         effect.call_started(ctx).await.unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_dlq_terminal_mapper_for_typed_effect() {
+        let effect: Effect<TestState, TestDeps> = on::<TestEvent>()
+            .queued()
+            .retry(2)
+            .dlq_terminal(|event: Arc<TestEvent>, info| OutputEvent {
+                result: event.value + info.attempts,
+            })
+            .then(
+                |_event: Arc<TestEvent>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                    anyhow::bail!("forced failure");
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                },
+            );
+
+        let mapper = effect
+            .dlq_terminal_mapper
+            .as_ref()
+            .expect("dlq_terminal mapper should be present");
+        let mapped = mapper(
+            Arc::new(TestEvent { value: 2 }),
+            TypeId::of::<TestEvent>(),
+            DlqTerminalInfo {
+                error: "boom".to_string(),
+                reason: "failed".to_string(),
+                attempts: 1,
+                max_attempts: 2,
+            },
+        )
+        .expect("mapper should succeed");
+
+        assert_eq!(mapped.event_type, std::any::type_name::<OutputEvent>());
+        assert_eq!(mapped.payload["result"], serde_json::json!(3));
+        assert!(mapped.batch_id.is_none());
     }
 }

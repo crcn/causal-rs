@@ -164,10 +164,7 @@ where
 }
 
 /// Tree endpoint - Get workflow causality tree
-async fn get_tree<I>(
-    Path(correlation_id): Path<Uuid>,
-    State(state): State<AppState<I>>,
-) -> Response
+async fn get_tree<I>(Path(correlation_id): Path<Uuid>, State(state): State<AppState<I>>) -> Response
 where
     I: InsightStore + Clone + 'static,
 {
@@ -274,11 +271,7 @@ where
 }
 
 /// Start the web server
-pub async fn serve<I>(
-    insight_store: I,
-    addr: &str,
-    static_dir: Option<&str>,
-) -> anyhow::Result<()>
+pub async fn serve<I>(insight_store: I, addr: &str, static_dir: Option<&str>) -> anyhow::Result<()>
 where
     I: InsightStore + Clone + 'static,
 {

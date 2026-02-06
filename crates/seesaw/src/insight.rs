@@ -242,8 +242,11 @@ pub trait InsightStore: Send + Sync + 'static {
     ///
     /// Returns events starting from cursor (sequence number).
     /// If cursor is None, returns most recent events.
-    async fn get_recent_events(&self, cursor: Option<i64>, limit: usize)
-        -> Result<Vec<InsightEvent>>;
+    async fn get_recent_events(
+        &self,
+        cursor: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<InsightEvent>>;
 
     /// Get effect execution logs for operational debugging.
     ///

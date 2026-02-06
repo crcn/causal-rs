@@ -336,11 +336,13 @@ async fn main() -> Result<()> {
     let file_id = Uuid::new_v4();
     println!("📂 Starting import for file {}\n", file_id);
 
-    engine.process(ImportEvent::FileUploaded {
-        file_id,
-        file_path: "/data/import.csv".to_string(),
-        expected_rows: 1000,
-    }).await?;
+    engine
+        .process(ImportEvent::FileUploaded {
+            file_id,
+            file_path: "/data/import.csv".to_string(),
+            expected_rows: 1000,
+        })
+        .await?;
 
     // Wait for completion
     println!("\n⏳ Waiting for import to complete...\n");

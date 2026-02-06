@@ -57,6 +57,8 @@
 //! handle.process(|_| async { Ok(OrderPlaced { amount: 99.99 }) }).await?;
 //! ```
 
+extern crate self as seesaw_core;
+
 // New module structure
 pub mod effect;
 pub mod insight;
@@ -72,14 +74,16 @@ mod reducer_registry;
 mod task_group;
 
 // Re-export main types
-pub use effect::{AnyEvent, Effect, EffectContext, EffectError, Emit, JoinMode};
+pub use effect::{
+    AnyEvent, DlqTerminalInfo, Effect, EffectContext, EffectError, Emit, ErrorContext, JoinMode,
+};
 pub use engine_v2::Engine;
-pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
-pub use reducer::Reducer;
-pub use runtime::{Runtime, RuntimeConfig};
 pub use insight::{
     EffectNode, EventNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,
 };
+pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
+pub use reducer::Reducer;
+pub use runtime::{Runtime, RuntimeConfig};
 pub use store::{
     EmittedEvent, JoinEntry, QueuedEffectExecution, QueuedEvent, Store, WorkflowEvent,
     WorkflowStatus, NAMESPACE_SEESAW,
@@ -89,6 +93,9 @@ pub use task_group::TaskGroup;
 // Top-level builder functions
 pub use effect::on;
 pub use reducer::fold;
+
+#[cfg(feature = "macros")]
+pub use seesaw_macros::{effect, effects, reducer, reducers};
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;

@@ -6,7 +6,8 @@ license.workspace = true
 description = "A deterministic, event-driven coordination layer where machines decide, effects execute, and transactions define authority"
 
 [features]
-default = []
+default = ["macros"]
+macros = ["dep:seesaw-macros"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,6 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+seesaw-macros = { path = "../seesaw-macros", optional = true }
 
 [dev-dependencies]
 fastrand.workspace = true

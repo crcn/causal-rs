@@ -1060,7 +1060,11 @@ async fn test_workflow_subscription_coalesced_notify_stress_drains_all_events() 
     let mut stream = db.store.subscribe_workflow_events(correlation_id).await?;
 
     // Ack the root event so the queue remains focused on emitted stress events.
-    let root_event = db.store.poll_next().await?.expect("root event should exist");
+    let root_event = db
+        .store
+        .poll_next()
+        .await?
+        .expect("root event should exist");
     assert_eq!(root_event.event_id, parent_event_id);
     db.store.ack(root_event.id).await?;
 
@@ -1086,12 +1090,9 @@ async fn test_workflow_subscription_coalesced_notify_stress_drains_all_events() 
 
     let mut received_indexes = HashSet::with_capacity(FAN_OUT_SIZE);
     while received_indexes.len() < FAN_OUT_SIZE {
-        let maybe_event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            stream.next(),
-        )
-        .await
-        .expect("timed out waiting for stress workflow event");
+        let maybe_event = tokio::time::timeout(tokio::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("timed out waiting for stress workflow event");
         let event = maybe_event.expect("workflow stream ended unexpectedly");
 
         if event.event_type != "StressItem" {
@@ -1100,8 +1101,7 @@ async fn test_workflow_subscription_coalesced_notify_stress_drains_all_events() 
 
         let index = event.payload["index"]
             .as_u64()
-            .expect("StressItem payload should contain numeric index")
-            as usize;
+            .expect("StressItem payload should contain numeric index") as usize;
         assert!(
             received_indexes.insert(index),
             "duplicate StressItem index received: {}",

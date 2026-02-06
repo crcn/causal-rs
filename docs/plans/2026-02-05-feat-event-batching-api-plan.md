@@ -33,6 +33,9 @@ This avoids the failure modes identified in review (ID collisions, ordering regr
   - claim is single-winner (`open -> processing`)
   - failed flushes release the claim for retry
 - DLQ now emits a synthetic terminal event when failed execution had batch metadata, so same-batch windows can close instead of hanging.
+- Typed effects can use `.queued().then(...)` (queue codec is carried by builder flags), so `then_queue()` is optional for queued typed handlers.
+- Typed effects now support `.dlq_terminal(...)` to map retry-exhausted failures into explicit terminal events before DLQ completion.
+- Store API now includes `dlq_effect_with_events(...)` for atomic "DLQ + mapped terminal event" writes; runtime falls back to plain `dlq_effect(...)` if unsupported.
 - Runtime now enforces `max_batch_size` (default `10_000`) for emitted batches and `join().same_batch()` metadata.
 - Workflow event subscriptions now use coalesced wake-up notifications plus cursor-based paging, so large fan-outs are drained safely without one-notify-per-event fetch overhead.
 
@@ -97,6 +100,15 @@ Keep `.then()` call sites working by introducing an internal conversion trait (n
 - `Emit<E>` -> explicit zero/one/many emitted events
 
 This keeps existing handlers source-compatible while enabling explicit batching.
+
+### Key API Changes (Implemented)
+
+- `Emit<E>::Batch(Vec<E>)` for multi-event effect output.
+- `effect::on::<E>().join().same_batch().then(...)` for queued durable same-batch fan-in.
+- `.queued().then(...)` works for queued typed effects (no forced `then_queue()` requirement).
+- `.dlq_terminal(|event, info| ...)` maps retry-exhausted failures into terminal events.
+- `Store::dlq_effect_with_events(...)` enables atomic DLQ plus mapped terminal-event emission.
+- `EventWorkerConfig::max_batch_size` and `EffectWorkerConfig::max_batch_size` enforce fan-out/join safety bounds.
 
 ### Join API (MVP)
 
@@ -258,6 +270,40 @@ DLQ interaction:
 - If a queued item exhausts retries and goes to DLQ, runtime must emit a synthetic terminal failure event (with same `batch_id` / `batch_index` / `item_event_id`) so the join window can complete.
 - Synthetic failure emission must be idempotent (same deterministic event id on retry).
 
+#### Retry Behavior for Individual Batch Items
+
+- Retry is per queued effect execution item, not per upstream emitted batch.
+- If item `50` fails in a `100` item batch, only item `50` is retried according to that effect's `max_attempts`.
+- Items that already reached terminal success are not re-run when another item retries.
+- `join().same_batch()` closes only when terminal rows exist for all `batch_index` values in `[0, batch_size)`.
+- If retries are exhausted, terminal failure still contributes one row for that `batch_index` (via domain failure event or DLQ terminal mapping), so join can close with partial success.
+
+#### Domain Failures vs Runtime Terminal Mapping
+
+- Use handler-level error mapping (`map_err`, `match`, or explicit branching) when a domain failure should be terminal immediately and should not consume retry budget.
+- Use `.dlq_terminal(...)` when runtime retries are allowed and you only want a terminal failure event after retries are exhausted/time out.
+- In `same_batch` joins, normalize both success and failure into a single join input type (for example `ResearchSearchResult::Completed` / `ResearchSearchResult::Failed`) so aggregation logic stays deterministic.
+
+#### Example Flow with Join and Failure Events
+
+```text
+WebsiteResearchCreated
+  -> prepare_searches_effect (queued)
+  -> Emit::Batch([ResearchSearchEnqueued xN])  // carries batch metadata
+
+ResearchSearchEnqueued
+  -> execute_search_effect (queued, parallel workers)
+  -> Emit::One(ResearchSearchCompleted | ResearchSearchFailed)
+
+ResearchSearchCompleted/Failed
+  -> join_searches_effect.join().same_batch().then(|items| ...)
+  -> Emit::One(AssessmentGenerationEnqueued)
+
+AssessmentGenerationEnqueued
+  -> generate_assessment_effect (queued)
+  -> Emit::None
+```
+
 #### Join Persistence Schema (Postgres)
 
 Implemented durable tables:
@@ -293,6 +339,12 @@ This enables transaction-level notification coalescing while keeping correctness
 - treating NOTIFY as a wake-up signal only
 - fetching unseen workflow events by `(created_at, id)` cursor
 - draining in paged queries until caught up
+
+## Performance Guardrails
+
+- `max_batch_size` hard limit prevents unbounded memory/transaction growth during fan-out and join.
+- Workflow subscription uses coalesced `NOTIFY` wake-ups with cursor paging, so large workflows drain without one-notify-per-event overhead.
+- Large fan-outs still execute in a single effect-completion transaction for atomicity; if workloads exceed practical transaction size, split domain work into multiple smaller batches upstream.
 
 ## Implementation Plan
 
@@ -387,6 +439,14 @@ This enables transaction-level notification coalescing while keeping correctness
 - Integration test for same-batch fan-in (`Emit::Batch -> join().same_batch()`).
 - Integration tests for join closure, crash/restart recovery, and flush retry.
 - Integration test for partial failure batch (`N_success + M_failed == batch_size`) with single join closure.
+
+Implemented stress/failure coverage includes:
+
+- `event_worker_inline_batch_emit_stress_generates_unique_ids_and_batch_metadata`
+- `event_worker_inline_batch_emit_over_limit_is_nacked`
+- `effect_worker_join_same_batch_stress_large_batch_closes_once`
+- `effect_worker_join_same_batch_releases_and_retries_after_handler_error`
+- `effect_worker_dlq_terminal_mapper_emits_mapped_event_for_then`
 
 ## Risks and Mitigations
 

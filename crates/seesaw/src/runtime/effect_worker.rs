@@ -11,7 +11,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::effect::{EffectContext, EventEmitter, JoinMode};
+use crate::effect::{DlqTerminalInfo, EffectContext, EventEmitter, JoinMode};
 use crate::effect_registry::EffectRegistry;
 use crate::reducer_registry::ReducerRegistry;
 use crate::{EmittedEvent, Store, NAMESPACE_SEESAW};
@@ -171,6 +171,7 @@ where
 
         let (typed_event, type_id) =
             self.decode_event(&execution.event_type, &execution.event_payload)?;
+        let source_event_for_dlq = typed_event.clone();
         let state: S = self
             .store
             .load_state(execution.correlation_id)
@@ -248,28 +249,20 @@ where
                         let message = error.to_string();
                         warn!(
                             "Join append failed: {} (attempt {}/{}): {}",
-                            execution.effect_id, execution.attempts, execution.max_attempts, message
+                            execution.effect_id,
+                            execution.attempts,
+                            execution.max_attempts,
+                            message
                         );
-                        if execution.attempts >= execution.max_attempts {
-                            self.store
-                                .dlq_effect(
-                                    execution.event_id,
-                                    execution.effect_id.clone(),
-                                    message,
-                                    "failed".to_string(),
-                                    execution.attempts,
-                                )
-                                .await?;
-                        } else {
-                            self.store
-                                .fail_effect(
-                                    execution.event_id,
-                                    execution.effect_id.clone(),
-                                    message,
-                                    execution.attempts,
-                                )
-                                .await?;
-                        }
+                        self.fail_or_dlq_effect(
+                            &execution,
+                            Some(&effect),
+                            source_event_for_dlq.clone(),
+                            type_id,
+                            "failed",
+                            message,
+                        )
+                        .await?;
                         return Ok(true);
                     }
                 }
@@ -334,10 +327,7 @@ where
                     Err(error) => {
                         warn!(
                             "Effect output serialization failed: {} (attempt {}/{}): {}",
-                            execution.effect_id,
-                            execution.attempts,
-                            execution.max_attempts,
-                            error
+                            execution.effect_id, execution.attempts, execution.max_attempts, error
                         );
 
                         if let Some(batch_id) = claimed_batch_id {
@@ -358,26 +348,15 @@ where
                             }
                         }
 
-                        if execution.attempts >= execution.max_attempts {
-                            self.store
-                                .dlq_effect(
-                                    execution.event_id,
-                                    execution.effect_id.clone(),
-                                    error.to_string(),
-                                    "failed".to_string(),
-                                    execution.attempts,
-                                )
-                                .await?;
-                        } else {
-                            self.store
-                                .fail_effect(
-                                    execution.event_id,
-                                    execution.effect_id.clone(),
-                                    error.to_string(),
-                                    execution.attempts,
-                                )
-                                .await?;
-                        }
+                        self.fail_or_dlq_effect(
+                            &execution,
+                            Some(&effect),
+                            source_event_for_dlq.clone(),
+                            type_id,
+                            "failed",
+                            error.to_string(),
+                        )
+                        .await?;
                         return Ok(true);
                     }
                 };
@@ -440,33 +419,15 @@ where
                     }
                 }
 
-                if execution.attempts >= execution.max_attempts {
-                    // Permanently failed - move to DLQ
-                    error!(
-                        "Effect exceeded max attempts, moving to DLQ: {}",
-                        execution.effect_id
-                    );
-
-                    self.store
-                        .dlq_effect(
-                            execution.event_id,
-                            execution.effect_id,
-                            e.to_string(),
-                            "failed".to_string(),
-                            execution.attempts,
-                        )
-                        .await?;
-                } else {
-                    // Mark as failed, will be retried
-                    self.store
-                        .fail_effect(
-                            execution.event_id,
-                            execution.effect_id,
-                            e.to_string(),
-                            execution.attempts,
-                        )
-                        .await?;
-                }
+                self.fail_or_dlq_effect(
+                    &execution,
+                    Some(&effect),
+                    source_event_for_dlq.clone(),
+                    type_id,
+                    "failed",
+                    e.to_string(),
+                )
+                .await?;
             }
             Err(_) => {
                 // Timeout
@@ -490,28 +451,15 @@ where
                     }
                 }
 
-                if execution.attempts >= execution.max_attempts {
-                    // Permanently failed - move to DLQ
-                    self.store
-                        .dlq_effect(
-                            execution.event_id,
-                            execution.effect_id,
-                            "Effect execution timed out".to_string(),
-                            "timeout".to_string(),
-                            execution.attempts,
-                        )
-                        .await?;
-                } else {
-                    // Mark as failed, will be retried
-                    self.store
-                        .fail_effect(
-                            execution.event_id,
-                            execution.effect_id,
-                            "Timeout".to_string(),
-                            execution.attempts,
-                        )
-                        .await?;
-                }
+                self.fail_or_dlq_effect(
+                    &execution,
+                    Some(&effect),
+                    source_event_for_dlq.clone(),
+                    type_id,
+                    "timeout",
+                    "Effect execution timed out".to_string(),
+                )
+                .await?;
             }
         }
 
@@ -629,6 +577,121 @@ where
         }
         Ok(result)
     }
+
+    fn build_dlq_terminal_event(
+        &self,
+        effect: &crate::effect::Effect<S, D>,
+        source_event: Arc<dyn Any + Send + Sync>,
+        source_type_id: TypeId,
+        execution: &crate::QueuedEffectExecution,
+        reason: &str,
+        error: String,
+    ) -> Result<Option<EmittedEvent>> {
+        let Some(mapper) = effect.dlq_terminal_mapper.as_ref() else {
+            return Ok(None);
+        };
+
+        let mut emitted = mapper(
+            source_event,
+            source_type_id,
+            DlqTerminalInfo {
+                error,
+                reason: reason.to_string(),
+                attempts: execution.attempts,
+                max_attempts: execution.max_attempts,
+            },
+        )?;
+
+        if emitted.batch_id.is_none()
+            && emitted.batch_index.is_none()
+            && emitted.batch_size.is_none()
+            && execution.batch_id.is_some()
+            && execution.batch_index.is_some()
+            && execution.batch_size.is_some()
+        {
+            emitted.batch_id = execution.batch_id;
+            emitted.batch_index = execution.batch_index;
+            emitted.batch_size = execution.batch_size;
+        }
+
+        Ok(Some(emitted))
+    }
+
+    async fn fail_or_dlq_effect(
+        &self,
+        execution: &crate::QueuedEffectExecution,
+        effect: Option<&crate::effect::Effect<S, D>>,
+        source_event: Arc<dyn Any + Send + Sync>,
+        source_type_id: TypeId,
+        reason: &str,
+        error: String,
+    ) -> Result<()> {
+        if execution.attempts < execution.max_attempts {
+            self.store
+                .fail_effect(
+                    execution.event_id,
+                    execution.effect_id.clone(),
+                    error,
+                    execution.attempts,
+                )
+                .await?;
+            return Ok(());
+        }
+
+        if let Some(effect) = effect {
+            match self.build_dlq_terminal_event(
+                effect,
+                source_event,
+                source_type_id,
+                execution,
+                reason,
+                error.clone(),
+            ) {
+                Ok(Some(emitted)) => {
+                    let dlq_result = self
+                        .store
+                        .dlq_effect_with_events(
+                            execution.event_id,
+                            execution.effect_id.clone(),
+                            error.clone(),
+                            reason.to_string(),
+                            execution.attempts,
+                            vec![emitted],
+                        )
+                        .await;
+                    if dlq_result.is_ok() {
+                        return Ok(());
+                    }
+
+                    if let Err(store_error) = dlq_result {
+                        warn!(
+                            "dlq_effect_with_events failed for {}: {}. Falling back to dlq_effect",
+                            execution.effect_id, store_error
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(mapper_error) => {
+                    warn!(
+                        "dlq_terminal mapper failed for {}: {}. Falling back to dlq_effect",
+                        execution.effect_id, mapper_error
+                    );
+                }
+            }
+        }
+
+        self.store
+            .dlq_effect(
+                execution.event_id,
+                execution.effect_id.clone(),
+                error,
+                reason.to_string(),
+                execution.attempts,
+            )
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +754,7 @@ mod tests {
         completed_with_events: Mutex<Vec<(Uuid, String, Vec<crate::EmittedEvent>)>>,
         failed: Mutex<Vec<(Uuid, String)>>,
         dlqed: Mutex<Vec<(Uuid, String)>>,
+        dlqed_with_events: Mutex<Vec<(Uuid, String, Vec<crate::EmittedEvent>)>>,
         join_windows: Mutex<HashMap<(String, Uuid, Uuid), JoinWindow>>,
         join_complete_calls: Mutex<Vec<(String, Uuid, Uuid)>>,
         join_release_calls: Mutex<Vec<(String, Uuid, Uuid, String)>>,
@@ -704,6 +768,7 @@ mod tests {
                 completed_with_events: Mutex::new(Vec::new()),
                 failed: Mutex::new(Vec::new()),
                 dlqed: Mutex::new(Vec::new()),
+                dlqed_with_events: Mutex::new(Vec::new()),
                 join_windows: Mutex::new(HashMap::new()),
                 join_complete_calls: Mutex::new(Vec::new()),
                 join_release_calls: Mutex::new(Vec::new()),
@@ -817,6 +882,22 @@ mod tests {
             Ok(())
         }
 
+        async fn dlq_effect_with_events(
+            &self,
+            event_id: Uuid,
+            effect_id: String,
+            _error: String,
+            _reason: String,
+            _attempts: i32,
+            emitted_events: Vec<crate::EmittedEvent>,
+        ) -> Result<()> {
+            self.dlqed.lock().push((event_id, effect_id.clone()));
+            self.dlqed_with_events
+                .lock()
+                .push((event_id, effect_id, emitted_events));
+            Ok(())
+        }
+
         async fn get_workflow_status(
             &self,
             _correlation_id: Uuid,
@@ -899,13 +980,15 @@ mod tests {
             correlation_id: Uuid,
             batch_id: Uuid,
         ) -> Result<()> {
-            self.join_complete_calls
-                .lock()
-                .push((join_effect_id.clone(), correlation_id, batch_id));
-            if let Some(window) = self
-                .join_windows
-                .lock()
-                .get_mut(&(join_effect_id, correlation_id, batch_id))
+            self.join_complete_calls.lock().push((
+                join_effect_id.clone(),
+                correlation_id,
+                batch_id,
+            ));
+            if let Some(window) =
+                self.join_windows
+                    .lock()
+                    .get_mut(&(join_effect_id, correlation_id, batch_id))
             {
                 window.status = JoinStatus::Completed;
             }
@@ -919,13 +1002,16 @@ mod tests {
             batch_id: Uuid,
             error: String,
         ) -> Result<()> {
-            self.join_release_calls
-                .lock()
-                .push((join_effect_id.clone(), correlation_id, batch_id, error));
-            if let Some(window) = self
-                .join_windows
-                .lock()
-                .get_mut(&(join_effect_id, correlation_id, batch_id))
+            self.join_release_calls.lock().push((
+                join_effect_id.clone(),
+                correlation_id,
+                batch_id,
+                error,
+            ));
+            if let Some(window) =
+                self.join_windows
+                    .lock()
+                    .get_mut(&(join_effect_id, correlation_id, batch_id))
             {
                 if window.status == JoinStatus::Processing {
                     window.status = JoinStatus::Open;
@@ -1145,7 +1231,11 @@ mod tests {
             EffectWorkerConfig::default(),
         );
 
-        while worker.process_next_effect().await.expect("process should succeed") {}
+        while worker
+            .process_next_effect()
+            .await
+            .expect("process should succeed")
+        {}
 
         assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.completed.lock().len(), 2);
@@ -1196,15 +1286,35 @@ mod tests {
 
         let correlation_id = Uuid::new_v4();
         let batch_id = Uuid::new_v4();
-        let first_item =
-            queued_batch_execution(effect_id.clone(), correlation_id, batch_id, 0, 2, 1, 2, true);
-        let retrying_item =
-            queued_batch_execution(effect_id.clone(), correlation_id, batch_id, 1, 2, 1, 2, false);
+        let first_item = queued_batch_execution(
+            effect_id.clone(),
+            correlation_id,
+            batch_id,
+            0,
+            2,
+            1,
+            2,
+            true,
+        );
+        let retrying_item = queued_batch_execution(
+            effect_id.clone(),
+            correlation_id,
+            batch_id,
+            1,
+            2,
+            1,
+            2,
+            false,
+        );
         let mut retry_attempt = retrying_item.clone();
         retry_attempt.attempts = 2;
         retry_attempt.max_attempts = 2;
 
-        let store = Arc::new(TestStore::new(vec![first_item, retrying_item, retry_attempt]));
+        let store = Arc::new(TestStore::new(vec![
+            first_item,
+            retrying_item,
+            retry_attempt,
+        ]));
         let worker = EffectWorker::new(
             store.clone(),
             Arc::new(TestDeps),
@@ -1213,7 +1323,11 @@ mod tests {
             EffectWorkerConfig::default(),
         );
 
-        while worker.process_next_effect().await.expect("process should succeed") {}
+        while worker
+            .process_next_effect()
+            .await
+            .expect("process should succeed")
+        {}
 
         assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
         assert_eq!(store.failed.lock().len(), 1);
@@ -1247,10 +1361,7 @@ mod tests {
 
         let mut execution = queued_execution(effect_id);
         execution.event_type = std::any::type_name::<BatchItemResult>().to_string();
-        execution.event_payload = serde_json::json!(BatchItemResult {
-            index: 0,
-            ok: true,
-        });
+        execution.event_payload = serde_json::json!(BatchItemResult { index: 0, ok: true });
         execution.attempts = 1;
         execution.max_attempts = 3;
         execution.batch_id = None;
@@ -1266,7 +1377,10 @@ mod tests {
             EffectWorkerConfig::default(),
         );
 
-        let processed = worker.process_next_effect().await.expect("process should succeed");
+        let processed = worker
+            .process_next_effect()
+            .await
+            .expect("process should succeed");
         assert!(processed);
         assert_eq!(store.failed.lock().len(), 1);
         assert_eq!(store.dlqed.lock().len(), 0);
@@ -1329,7 +1443,11 @@ mod tests {
         );
 
         let mut iterations = 0usize;
-        while worker.process_next_effect().await.expect("process should succeed") {
+        while worker
+            .process_next_effect()
+            .await
+            .expect("process should succeed")
+        {
             iterations += 1;
         }
         assert_eq!(iterations, batch_size as usize);
@@ -1344,27 +1462,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effect_worker_dlq_terminal_mapper_emits_mapped_event_for_then() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        reducers.register(
+            crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _event| state),
+        );
+
+        let effect = crate::effect::on::<Increment>()
+            .queued()
+            .retry(1)
+            .dlq_terminal(|event: Arc<Increment>, info| Incremented {
+                amount: -(event.amount + info.attempts),
+            })
+            .then(
+                |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                    anyhow::bail!("forced failure");
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                },
+            );
+        let effect_id = effect.id.clone();
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(effect);
+
+        let mut execution = queued_execution(effect_id.clone());
+        execution.max_attempts = 1;
+        execution.attempts = 1;
+        execution.batch_id = Some(Uuid::new_v4());
+        execution.batch_index = Some(2);
+        execution.batch_size = Some(5);
+        let store = Arc::new(TestStore::new(vec![execution]));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        );
+
+        let processed = worker
+            .process_next_effect()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+        assert_eq!(store.failed.lock().len(), 0);
+        assert_eq!(store.dlqed.lock().len(), 1);
+        assert_eq!(store.dlqed_with_events.lock().len(), 1);
+
+        let emitted = &store.dlqed_with_events.lock()[0].2[0];
+        assert_eq!(
+            emitted.event_type,
+            std::any::type_name::<Incremented>().to_string()
+        );
+        assert_eq!(emitted.payload["amount"], serde_json::json!(-3));
+        assert!(emitted.batch_id.is_some());
+        assert_eq!(emitted.batch_index, Some(2));
+        assert_eq!(emitted.batch_size, Some(5));
+    }
+
+    #[tokio::test]
     async fn effect_worker_emitted_batch_over_limit_is_failed() {
         let reducers = Arc::new(ReducerRegistry::new());
         reducers.register(
             crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _event| state),
         );
 
-        let effect = crate::effect::on::<Increment>().then_queue::<
-            TestState,
-            TestDeps,
-            Arc<Increment>,
-            _,
-            _,
-            Vec<Incremented>,
-            Incremented,
-        >(
-            |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async move {
-                Ok((0..256)
-                    .map(|idx| Incremented { amount: idx })
-                    .collect::<Vec<_>>())
-            },
-        );
+        let effect = crate::effect::on::<Increment>()
+            .then_queue::<TestState, TestDeps, Arc<Increment>, _, _, Vec<Incremented>, Incremented>(
+                |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                    Ok((0..256)
+                        .map(|idx| Incremented { amount: idx })
+                        .collect::<Vec<_>>())
+                },
+            );
         let effect_id = effect.id.clone();
         let effects = Arc::new(EffectRegistry::new());
         effects.register(effect);

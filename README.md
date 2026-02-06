@@ -39,8 +39,11 @@ Seesaw is **not**:
 - **Stateless Engine**: Reusable runtime, state passed per-execution
 - **Event-Driven**: Events are the only signals - facts about what happened
 - **Closure-Based API**: Simple builder pattern with closures (no trait implementations)
+- **Procedural Macros**: Optional `#[effect]` and `#[reducer]` attributes for concise syntax (v0.10.2+)
 - **Effect Handlers**: React to events, perform IO, return new events
 - **Reducers**: Pure state transformations before effects
+- **DLQ Terminal Mapping**: Map exhausted retries to terminal events for explicit failure handling (v0.10.2+)
+- **Event Batching**: Emit and join multiple events for bulk operations (v0.10.0+)
 - **Pipedream Integration**: Stream composition and bidirectional piping
 - **State Flow**: Per-execution state flows through reducers and effects
 - **Handle Pattern**: `activate(state).run(|_| Ok(event)).settled()` for clean execution
@@ -284,10 +287,93 @@ effect::on::<AnalyticsEvent>()
 - `.delayed(Duration)` - Delay before execution
 - `.priority(i32)` - Priority (lower = higher)
 - `.queued()` - Force queued execution
+- `.dlq_terminal(mapper)` - Map exhausted retries to terminal events (v0.10.2+)
 
 **Execution modes:**
 - **Inline** (default): Immediate, no retry
 - **Queued**: Triggered by `.queued()`, `.delayed()`, `.timeout()`, `.retry() > 1`, or `.priority()`
+
+#### DLQ Terminal Mapping (v0.10.2+)
+
+When an effect exhausts its retry attempts, you can map the failure to a terminal event using `.dlq_terminal()`:
+
+```rust
+use seesaw_core::{effect, DlqTerminalInfo};
+
+// Define terminal events for failures
+#[derive(Clone)]
+enum OrderEvent {
+    OrderPlaced { order_id: Uuid },
+    PaymentCharged { order_id: Uuid },
+    OrderFailed { order_id: Uuid, reason: String },  // Terminal failure event
+}
+
+// Map exhausted retries to terminal event
+effect::on::<OrderEvent>()
+    .extract(|e| match e {
+        OrderEvent::OrderPlaced { order_id } => Some(*order_id),
+        _ => None,
+    })
+    .retry(3)  // Try 3 times
+    .dlq_terminal(|event, info: DlqTerminalInfo| {
+        // Called when effect fails after max attempts
+        OrderEvent::OrderFailed {
+            order_id: event.order_id,
+            reason: format!("Payment failed after {} attempts: {}",
+                info.attempts, info.error),
+        }
+    })
+    .then(|order_id, ctx| async move {
+        ctx.deps().payment.charge(order_id).await?;  // Might fail
+        Ok(OrderEvent::PaymentCharged { order_id })
+    });
+```
+
+**DlqTerminalInfo fields:**
+- `error: String` - The error message
+- `reason: String` - Why it failed ("failed", "timeout", etc.)
+- `attempts: i32` - Number of attempts made
+- `max_attempts: i32` - Maximum allowed attempts
+
+**When to use:**
+- Critical flows where failures must be handled explicitly
+- Workflows that need compensation or rollback events
+- Situations where silent failures are unacceptable
+
+**Alternative: `EffectError` events**
+
+For convenience, use `?` in effects and handle `EffectError` events:
+
+```rust
+// Use ? for ergonomics
+effect::on::<OrderPlaced>().then(|order, ctx| async move {
+    ctx.deps().payment.charge(order.total).await?;  // Propagates error
+    Ok(PaymentCharged { order_id: order.id })
+});
+
+// Handle EffectError events
+effect::on::<EffectError>()
+    .extract(|err| {
+        // Filter by source event + error type
+        if err.source_event_type == TypeId::of::<OrderPlaced>() {
+            err.downcast::<PaymentError>()
+                .map(|pe| (err.source_event.downcast_ref::<OrderPlaced>().unwrap().clone(), pe.clone()))
+        } else {
+            None
+        }
+    })
+    .then(|(order, payment_err), ctx| async move {
+        // Domain-specific compensation based on error type
+        if payment_err.is_retryable() {
+            Ok(PaymentRetryScheduled { order_id: order.id })
+        } else {
+            Ok(OrderCancelled {
+                order_id: order.id,
+                reason: payment_err.to_string(),
+            })
+        }
+    });
+```
 
 Key properties:
 
@@ -357,6 +443,177 @@ effect::on::<ImportEvent>()
 - Provides 10-50x performance for bulk operations
 
 See [`examples/batch-processor`](./examples/batch-processor) for a complete CSV import example.
+
+### Procedural Macro API (v0.10.2+)
+
+For a more concise syntax, use the `#[effect]` and `#[reducer]` procedural macros (enabled by default via the `macros` feature):
+
+```rust
+use seesaw_core::{effect, reducer, EffectContext, DlqTerminalInfo};
+use anyhow::Result;
+
+#[derive(Clone)]
+enum OrderEvent {
+    OrderPlaced { order_id: Uuid, total: f64 },
+    PaymentCharged { order_id: Uuid },
+    OrderShipped { order_id: Uuid },
+    OrderFailed { order_id: Uuid, reason: String },
+}
+
+#[derive(Clone)]
+struct OrderState {
+    order_count: usize,
+    total_revenue: f64,
+}
+
+#[derive(Clone)]
+struct Deps {
+    payment: PaymentService,
+    shipping: ShippingService,
+}
+
+// Effect with attribute macro
+#[effect(
+    on = OrderEvent,
+    extract(order_id, total),
+    retry = 3,
+    timeout_secs = 30,
+    priority = 1,
+    dlq_terminal = order_payment_failed
+)]
+async fn charge_payment(
+    order_id: Uuid,
+    total: f64,
+    ctx: EffectContext<OrderState, Deps>
+) -> Result<OrderEvent> {
+    ctx.deps().payment.charge(order_id, total).await?;
+    Ok(OrderEvent::PaymentCharged { order_id })
+}
+
+// DLQ terminal mapper
+fn order_payment_failed(event: OrderEvent, info: DlqTerminalInfo) -> OrderEvent {
+    OrderEvent::OrderFailed {
+        order_id: match event {
+            OrderEvent::OrderPlaced { order_id, .. } => order_id,
+            _ => panic!("unexpected event"),
+        },
+        reason: format!("Payment failed after {} attempts: {}", info.attempts, info.error),
+    }
+}
+
+// Reducer with attribute macro
+#[reducer(on = OrderEvent, extract(total))]
+fn track_revenue(state: OrderState, total: f64) -> OrderState {
+    OrderState {
+        order_count: state.order_count + 1,
+        total_revenue: state.total_revenue + total,
+    }
+}
+
+// Multi-variant matching with macro
+#[effect(
+    on = [OrderEvent::PaymentCharged, OrderEvent::OrderFailed],
+    extract(order_id)
+)]
+async fn ship_order(
+    order_id: Uuid,
+    ctx: EffectContext<OrderState, Deps>
+) -> Result<OrderEvent> {
+    ctx.deps().shipping.ship(order_id).await?;
+    Ok(OrderEvent::OrderShipped { order_id })
+}
+
+// Join handler with macro
+#[effect(on = OrderEvent, join)]
+async fn process_batch(
+    batch: Vec<OrderEvent>,
+    ctx: EffectContext<OrderState, Deps>
+) -> Result<()> {
+    // Process entire batch together
+    let order_ids: Vec<_> = batch.iter()
+        .filter_map(|e| match e {
+            OrderEvent::OrderPlaced { order_id, .. } => Some(*order_id),
+            _ => None,
+        })
+        .collect();
+    ctx.deps().bulk_process(&order_ids).await?;
+    Ok(())
+}
+```
+
+**Module-level registration:**
+
+Use `#[effects]` and `#[reducers]` to automatically generate registration functions:
+
+```rust
+#[effects]
+mod order_effects {
+    use super::*;
+
+    #[effect(on = OrderEvent, extract(order_id))]
+    async fn charge_payment(
+        order_id: Uuid,
+        ctx: EffectContext<OrderState, Deps>
+    ) -> Result<OrderEvent> {
+        // ... implementation
+    }
+
+    #[effect(on = OrderEvent, extract(order_id))]
+    async fn ship_order(
+        order_id: Uuid,
+        ctx: EffectContext<OrderState, Deps>
+    ) -> Result<OrderEvent> {
+        // ... implementation
+    }
+}
+
+#[reducers]
+mod order_reducers {
+    use super::*;
+
+    #[reducer(on = OrderEvent, extract(total))]
+    fn track_revenue(state: OrderState, total: f64) -> OrderState {
+        // ... implementation
+    }
+
+    #[reducer(on = OrderEvent, extract(order_id))]
+    fn track_orders(state: OrderState, order_id: Uuid) -> OrderState {
+        // ... implementation
+    }
+}
+
+// Register all at once
+let engine = Engine::new(deps, store)
+    .with_effects(order_effects::effects())
+    .with_reducers(order_reducers::reducers());
+```
+
+**Macro attributes:**
+
+**Effect attributes:**
+- `on = EventType` - Single event type
+- `on = [Enum::Variant1, Enum::Variant2]` - Multiple enum variants
+- `extract(field1, field2, ...)` - Extract fields from event
+- `join` - Accumulate batch for bulk processing
+- `id = "name"` - Custom effect identifier
+- `retry = N` - Max retry attempts
+- `timeout_secs = N` / `timeout_ms = N` - Execution timeout
+- `delay_secs = N` / `delay_ms = N` - Delayed execution
+- `priority = N` - Execution priority (lower = higher)
+- `group = "name"` - Effect group (used in ID if no explicit `id`)
+- `dlq_terminal = handler` - Terminal event mapper for exhausted retries
+
+**Reducer attributes:**
+- `on = EventType` - Single event type
+- `on = [Enum::Variant1, Enum::Variant2]` - Multiple enum variants
+- `extract(field1, field2, ...)` - Extract fields from event
+
+**Requirements:**
+- Effect functions must be `async` and return `Result<T>` where `T` is an event or `()`
+- Reducer functions must be synchronous and return the state type
+- All functions must include exactly one `EffectContext<S, D>` parameter (for effects)
+- Parameter names must match extracted field names when using `extract(...)`
+- For `join`, first parameter must be `Vec<EventType>`
 
 ### Reducers
 

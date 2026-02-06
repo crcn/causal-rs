@@ -70,47 +70,47 @@ async fn main() -> Result<()> {
 
     // 2. Define engine once (stateless, reusable)
     let engine = Engine::new(deps, store)
-    // Reducer - pure state transformation
-    .with_reducer(
-        reducer::fold::<OrderEvent>().into(|state: OrderState, event| match event {
-            OrderEvent::Placed { order_id, total } => OrderState {
-                total_orders: state.total_orders + 1,
-                total_revenue: state.total_revenue + *total,
-                last_order_id: Some(*order_id),
-            },
-            _ => state,
-        }),
-    )
-    // Effect chain: Placed -> ship -> Shipped
-    .with_effect(
-        effect::on::<OrderEvent>()
-            .extract(|e| match e {
-                OrderEvent::Placed { order_id, .. } => Some(*order_id),
-                _ => None,
-            })
-            .then(
-                |order_id, ctx: EffectContext<OrderState, Deps>| async move {
-                    ctx.deps().ship(order_id).await?;
-                    Ok(OrderEvent::Shipped { order_id })
+        // Reducer - pure state transformation
+        .with_reducer(
+            reducer::fold::<OrderEvent>().into(|state: OrderState, event| match event {
+                OrderEvent::Placed { order_id, total } => OrderState {
+                    total_orders: state.total_orders + 1,
+                    total_revenue: state.total_revenue + *total,
+                    last_order_id: Some(*order_id),
                 },
-            ),
-    )
-    // Effect chain: Shipped -> notify -> Delivered
-    .with_effect(
-        effect::on::<OrderEvent>()
-            .extract(|e| match e {
-                OrderEvent::Shipped { order_id } => Some(*order_id),
-                _ => None,
-            })
-            .then(
-                |order_id, ctx: EffectContext<OrderState, Deps>| async move {
-                    ctx.deps()
-                        .notify(order_id, "Your order has shipped!")
-                        .await?;
-                    Ok(OrderEvent::Delivered { order_id })
-                },
-            ),
-    );
+                _ => state,
+            }),
+        )
+        // Effect chain: Placed -> ship -> Shipped
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::Placed { order_id, .. } => Some(*order_id),
+                    _ => None,
+                })
+                .then(
+                    |order_id, ctx: EffectContext<OrderState, Deps>| async move {
+                        ctx.deps().ship(order_id).await?;
+                        Ok(OrderEvent::Shipped { order_id })
+                    },
+                ),
+        )
+        // Effect chain: Shipped -> notify -> Delivered
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::Shipped { order_id } => Some(*order_id),
+                    _ => None,
+                })
+                .then(
+                    |order_id, ctx: EffectContext<OrderState, Deps>| async move {
+                        ctx.deps()
+                            .notify(order_id, "Your order has shipped!")
+                            .await?;
+                        Ok(OrderEvent::Delivered { order_id })
+                    },
+                ),
+        );
 
     println!("✓ Engine configured with effects and reducers\n");
 

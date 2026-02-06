@@ -764,13 +764,11 @@ mod tests {
         let reducers = Arc::new(ReducerRegistry::new());
 
         let effects = Arc::new(EffectRegistry::new());
-        effects.register(
-            crate::effect::on::<EffectOnlyEvent>().queued().then(
-                |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
-                    Ok(())
-                },
-            ),
-        );
+        effects.register(crate::effect::on::<EffectOnlyEvent>().queued().then(
+            |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
+                Ok(())
+            },
+        ));
 
         let worker = EventWorker::new(
             store.clone(),
@@ -816,23 +814,16 @@ mod tests {
 
         let effects = Arc::new(EffectRegistry::new());
         effects.register(
-            crate::effect::on::<FanOut>().then_queue::<
-                TestState,
-                TestDeps,
-                Arc<FanOut>,
-                _,
-                _,
-                Vec<FanOutItem>,
-                FanOutItem,
-            >(
-                |event: Arc<FanOut>, _ctx: EffectContext<TestState, TestDeps>| async move {
-                    Ok((0..event.count)
-                        .map(|index| FanOutItem {
-                            index: index as i32,
-                        })
-                        .collect::<Vec<_>>())
-                },
-            ),
+            crate::effect::on::<FanOut>()
+                .then_queue::<TestState, TestDeps, Arc<FanOut>, _, _, Vec<FanOutItem>, FanOutItem>(
+                    |event: Arc<FanOut>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                        Ok((0..event.count)
+                            .map(|index| FanOutItem {
+                                index: index as i32,
+                            })
+                            .collect::<Vec<_>>())
+                    },
+                ),
         );
 
         let worker = EventWorker::new(
@@ -893,23 +884,16 @@ mod tests {
 
         let effects = Arc::new(EffectRegistry::new());
         effects.register(
-            crate::effect::on::<FanOut>().then_queue::<
-                TestState,
-                TestDeps,
-                Arc<FanOut>,
-                _,
-                _,
-                Vec<FanOutItem>,
-                FanOutItem,
-            >(
-                |event: Arc<FanOut>, _ctx: EffectContext<TestState, TestDeps>| async move {
-                    Ok((0..event.count)
-                        .map(|index| FanOutItem {
-                            index: index as i32,
-                        })
-                        .collect::<Vec<_>>())
-                },
-            ),
+            crate::effect::on::<FanOut>()
+                .then_queue::<TestState, TestDeps, Arc<FanOut>, _, _, Vec<FanOutItem>, FanOutItem>(
+                    |event: Arc<FanOut>, _ctx: EffectContext<TestState, TestDeps>| async move {
+                        Ok((0..event.count)
+                            .map(|index| FanOutItem {
+                                index: index as i32,
+                            })
+                            .collect::<Vec<_>>())
+                    },
+                ),
         );
 
         let worker = EventWorker::new(

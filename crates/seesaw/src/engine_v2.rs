@@ -55,11 +55,35 @@ where
         self
     }
 
+    /// Register multiple reducers.
+    pub fn with_reducers<I>(mut self, reducers: I) -> Self
+    where
+        I: IntoIterator<Item = Reducer<S>>,
+    {
+        let registry = Arc::get_mut(&mut self.reducers).expect("Cannot add reducers after cloning");
+        for reducer in reducers {
+            registry.register(reducer);
+        }
+        self
+    }
+
     /// Register an effect
     pub fn with_effect(mut self, effect: Effect<S, D>) -> Self {
         Arc::get_mut(&mut self.effects)
             .expect("Cannot add effect after cloning")
             .register(effect);
+        self
+    }
+
+    /// Register multiple effects.
+    pub fn with_effects<I>(mut self, effects: I) -> Self
+    where
+        I: IntoIterator<Item = Effect<S, D>>,
+    {
+        let registry = Arc::get_mut(&mut self.effects).expect("Cannot add effects after cloning");
+        for effect in effects {
+            registry.register(effect);
+        }
         self
     }
 

@@ -171,10 +171,7 @@ async fn create_order(
         .unwrap_or_else(|| 99.99 + (rand::random::<f64>() * 200.0));
     let data = enqueue_order(&engine, mode, total).await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(data),
-    ))
+    Ok((StatusCode::CREATED, Json(data)))
 }
 
 async fn seed_scenarios(
@@ -204,7 +201,10 @@ async fn seed_scenarios(
         created.push(enqueue_order(&engine, mode, total).await?);
     }
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "created": created }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "created": created })),
+    ))
 }
 
 async fn seed_failures(
@@ -238,7 +238,8 @@ async fn seed_failures(
 
 // Simple HTML toy app
 async fn toy_app() -> Html<&'static str> {
-    Html(r#"
+    Html(
+        r#"
 <!DOCTYPE html>
 <html>
 <head>
@@ -370,7 +371,8 @@ async fn toy_app() -> Html<&'static str> {
     </script>
 </body>
 </html>
-    "#)
+    "#,
+    )
 }
 
 #[tokio::main]
@@ -466,15 +468,15 @@ async fn main() -> Result<()> {
                 .id("fan_out_batch_items")
                 .then_queue::<OrderState, Deps, Uuid, _, _, _, BatchWorkItem>(
                     |order_id, _ctx| async move {
-                    tokio::time::sleep(Duration::from_millis(260)).await;
+                        tokio::time::sleep(Duration::from_millis(260)).await;
 
-                    let item_count = 6usize;
-                    let items: Vec<_> = (0..item_count)
-                        .map(|item_index| BatchWorkItem {
-                            order_id,
-                            item_index,
-                        })
-                        .collect();
+                        let item_count = 6usize;
+                        let items: Vec<_> = (0..item_count)
+                            .map(|item_index| BatchWorkItem {
+                                order_id,
+                                item_index,
+                            })
+                            .collect();
 
                         Ok(items)
                     },
@@ -486,9 +488,12 @@ async fn main() -> Result<()> {
                 .id("process_batch_item")
                 .retry(2)
                 .then_queue(
-                    |item: Arc<BatchWorkItem>, _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
-                        tokio::time::sleep(Duration::from_millis(220 + (item.item_index as u64 * 70)))
-                            .await;
+                    |item: Arc<BatchWorkItem>,
+                     _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                        tokio::time::sleep(Duration::from_millis(
+                            220 + (item.item_index as u64 * 70),
+                        ))
+                        .await;
 
                         let success = (item.item_index + 1) % 4 != 0;
                         Ok(BatchWorkResult {
@@ -511,7 +516,8 @@ async fn main() -> Result<()> {
                 .join()
                 .same_batch()
                 .then(
-                    |items: Vec<BatchWorkResult>, _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                    |items: Vec<BatchWorkResult>,
+                     _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
                         let Some(order_id) = items.first().map(|item| item.order_id) else {
                             anyhow::bail!("join_batch_items received empty batch");
                         };
@@ -534,7 +540,8 @@ async fn main() -> Result<()> {
             effect::on::<BatchJoinReady>()
                 .id("finalize_batch_join")
                 .then_queue(
-                    |summary: Arc<BatchJoinReady>, _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
+                    |summary: Arc<BatchJoinReady>,
+                     _ctx: seesaw_core::EffectContext<OrderState, Deps>| async move {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         if summary.failed > 0 {
                             Ok(OrderEvent::OrderFailed {
@@ -611,11 +618,9 @@ async fn main() -> Result<()> {
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::InventoryReserved {
-                        order_id,
-                        mode,
-                        ..
-                    } => Some((*order_id, *mode)),
+                    OrderEvent::InventoryReserved { order_id, mode, .. } => {
+                        Some((*order_id, *mode))
+                    }
                     _ => None,
                 })
                 .id("ship_order")
@@ -640,11 +645,7 @@ async fn main() -> Result<()> {
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::OrderShipped {
-                        order_id,
-                        mode,
-                        ..
-                    } => Some((*order_id, *mode)),
+                    OrderEvent::OrderShipped { order_id, mode, .. } => Some((*order_id, *mode)),
                     _ => None,
                 })
                 .id("send_confirmation_email")
@@ -665,11 +666,7 @@ async fn main() -> Result<()> {
         .with_effect(
             effect::on::<OrderEvent>()
                 .extract(|e| match e {
-                    OrderEvent::EmailSent {
-                        order_id,
-                        mode,
-                        ..
-                    } => Some((*order_id, *mode)),
+                    OrderEvent::EmailSent { order_id, mode, .. } => Some((*order_id, *mode)),
                     _ => None,
                 })
                 .id("complete_order")
@@ -771,9 +768,7 @@ async fn main() -> Result<()> {
     println!("Press Ctrl+C to stop...\n");
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("Server failed");
+        axum::serve(listener, app).await.expect("Server failed");
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;

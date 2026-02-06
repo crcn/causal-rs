@@ -436,7 +436,8 @@ impl Store for PostgresStore {
 
         // Insert emitted events with deterministic IDs
         for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
-            // Generate deterministic event_id from hash(parent_event_id, effect_id, event_type)
+            // Generate deterministic event_id from
+            // hash(parent_event_id, effect_id, event_type, emitted_index)
             let deterministic_id = Uuid::new_v5(
                 &NAMESPACE_SEESAW,
                 format!(
@@ -528,6 +529,19 @@ impl Store for PostgresStore {
         reason: String,
         attempts: i32,
     ) -> Result<()> {
+        self.dlq_effect_with_events(event_id, effect_id, error, reason, attempts, Vec::new())
+            .await
+    }
+
+    async fn dlq_effect_with_events(
+        &self,
+        event_id: Uuid,
+        effect_id: String,
+        error: String,
+        reason: String,
+        attempts: i32,
+        emitted_events: Vec<EmittedEvent>,
+    ) -> Result<()> {
         // Get effect details for DLQ
         let effect: EffectRow = sqlx::query_as(
             "SELECT event_id, effect_id, correlation_id, event_type, event_payload, parent_event_id,
@@ -572,39 +586,74 @@ impl Store for PostgresStore {
         .execute(&mut *tx)
         .await?;
 
-        if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
-            (effect.batch_id, effect.batch_index, effect.batch_size)
-        {
-            let synthetic_event_id = Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!("{}-{}-dlq-terminal", event_id, effect_id).as_bytes(),
-            );
-            let synthetic_created_at = parent
-                .as_ref()
-                .map(|row| emitted_event_created_at(row.created_at))
-                .unwrap_or_else(Utc::now);
-            let synthetic_hops = parent.as_ref().map(|row| row.hops + 1).unwrap_or(0);
+        let synthetic_created_at = parent
+            .as_ref()
+            .map(|row| emitted_event_created_at(row.created_at))
+            .unwrap_or_else(Utc::now);
+        let synthetic_hops = parent.as_ref().map(|row| row.hops + 1).unwrap_or(0);
 
-            sqlx::query(
-                "INSERT INTO seesaw_events (
-                    event_id, parent_id, correlation_id, event_type, payload, hops,
-                    batch_id, batch_index, batch_size, created_at
-                 )
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                 ON CONFLICT (event_id, created_at) DO NOTHING",
-            )
-            .bind(synthetic_event_id)
-            .bind(Some(event_id))
-            .bind(effect.correlation_id)
-            .bind(&effect.event_type)
-            .bind(&effect.event_payload)
-            .bind(synthetic_hops)
-            .bind(Some(batch_id))
-            .bind(Some(batch_index))
-            .bind(Some(batch_size))
-            .bind(synthetic_created_at)
-            .execute(&mut *tx)
-            .await?;
+        if emitted_events.is_empty() {
+            if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
+                (effect.batch_id, effect.batch_index, effect.batch_size)
+            {
+                let synthetic_event_id = Uuid::new_v5(
+                    &NAMESPACE_SEESAW,
+                    format!("{}-{}-dlq-terminal", event_id, effect_id).as_bytes(),
+                );
+
+                sqlx::query(
+                    "INSERT INTO seesaw_events (
+                        event_id, parent_id, correlation_id, event_type, payload, hops,
+                        batch_id, batch_index, batch_size, created_at
+                     )
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     ON CONFLICT (event_id, created_at) DO NOTHING",
+                )
+                .bind(synthetic_event_id)
+                .bind(Some(event_id))
+                .bind(effect.correlation_id)
+                .bind(&effect.event_type)
+                .bind(&effect.event_payload)
+                .bind(synthetic_hops)
+                .bind(Some(batch_id))
+                .bind(Some(batch_index))
+                .bind(Some(batch_size))
+                .bind(synthetic_created_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+        } else {
+            for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
+                let synthetic_event_id = Uuid::new_v5(
+                    &NAMESPACE_SEESAW,
+                    format!(
+                        "{}-{}-dlq-terminal-{}-{}",
+                        event_id, effect_id, emitted.event_type, emitted_index
+                    )
+                    .as_bytes(),
+                );
+
+                sqlx::query(
+                    "INSERT INTO seesaw_events (
+                        event_id, parent_id, correlation_id, event_type, payload, hops,
+                        batch_id, batch_index, batch_size, created_at
+                     )
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     ON CONFLICT (event_id, created_at) DO NOTHING",
+                )
+                .bind(synthetic_event_id)
+                .bind(Some(event_id))
+                .bind(effect.correlation_id)
+                .bind(&emitted.event_type)
+                .bind(emitted.payload)
+                .bind(synthetic_hops)
+                .bind(emitted.batch_id.or(effect.batch_id))
+                .bind(emitted.batch_index.or(effect.batch_index))
+                .bind(emitted.batch_size.or(effect.batch_size))
+                .bind(synthetic_created_at)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
         // Delete from executions table
@@ -894,7 +943,15 @@ impl Store for PostgresStore {
         let entries = rows
             .into_iter()
             .map(
-                |(source_event_id, event_type, payload, batch_id, batch_index, batch_size, created_at)| JoinEntry {
+                |(
+                    source_event_id,
+                    event_type,
+                    payload,
+                    batch_id,
+                    batch_index,
+                    batch_size,
+                    created_at,
+                )| JoinEntry {
                     source_event_id,
                     event_type,
                     payload,

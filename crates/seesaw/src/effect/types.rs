@@ -18,6 +18,25 @@ use crate::event_codec::EventCodec;
 pub type ErrorHandler<S, D> =
     Arc<dyn Fn(Error, TypeId, EffectContext<S, D>) -> BoxFuture<()> + Send + Sync>;
 
+/// Metadata passed to DLQ terminal mappers when an effect exhausts retries.
+#[derive(Debug, Clone)]
+pub struct DlqTerminalInfo {
+    pub error: String,
+    pub reason: String,
+    pub attempts: i32,
+    pub max_attempts: i32,
+}
+
+/// Alias for DLQ terminal mapper metadata used by macro APIs.
+pub type ErrorContext = DlqTerminalInfo;
+
+/// Optional mapper that converts exhausted effect failures into terminal events.
+pub type DlqTerminalMapper = Arc<
+    dyn Fn(Arc<dyn Any + Send + Sync>, TypeId, DlqTerminalInfo) -> Result<crate::EmittedEvent>
+        + Send
+        + Sync,
+>;
+
 /// A boxed future for async effect handlers.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
@@ -184,6 +203,9 @@ where
         >,
     >,
 
+    /// Optional mapper for creating terminal events when an execution moves to DLQ.
+    pub(crate) dlq_terminal_mapper: Option<DlqTerminalMapper>,
+
     // Execution configuration (determines inline vs queued)
     /// Force queued execution (default: false = inline)
     pub(crate) queued: bool,
@@ -211,6 +233,7 @@ where
             handler: self.handler.clone(),
             join_mode: self.join_mode,
             join_batch_handler: self.join_batch_handler.clone(),
+            dlq_terminal_mapper: self.dlq_terminal_mapper.clone(),
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
