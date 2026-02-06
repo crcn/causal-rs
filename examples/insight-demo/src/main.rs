@@ -1,0 +1,414 @@
+//! Seesaw Insight Demo
+//!
+//! This demo generates realistic workflow events to showcase the insight dashboard.
+
+use anyhow::Result;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{Html, Json},
+    routing::{get, post},
+    Router,
+};
+use seesaw_core::{
+    effect, reducer,
+    runtime::{Runtime, RuntimeConfig},
+    QueueEngine,
+};
+use seesaw_memory::MemoryStore;
+use std::{sync::Arc, time::Duration};
+use tower_http::cors::CorsLayer;
+use uuid::Uuid;
+
+// Domain events
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum OrderEvent {
+    OrderPlaced {
+        order_id: Uuid,
+        customer_id: Uuid,
+        total: f64,
+    },
+    OrderValidated {
+        order_id: Uuid,
+    },
+    PaymentProcessed {
+        order_id: Uuid,
+        amount: f64,
+    },
+    InventoryReserved {
+        order_id: Uuid,
+    },
+    OrderShipped {
+        order_id: Uuid,
+        tracking_number: String,
+    },
+    EmailSent {
+        order_id: Uuid,
+        email_type: String,
+    },
+    OrderCompleted {
+        order_id: Uuid,
+    },
+    OrderFailed {
+        order_id: Uuid,
+        reason: String,
+    },
+}
+
+// Simple state tracking
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct OrderState {
+    validated: bool,
+    payment_processed: bool,
+    inventory_reserved: bool,
+    shipped: bool,
+}
+
+// Mock dependencies
+#[derive(Clone)]
+struct Deps;
+
+// API handler to create new orders
+async fn create_order(
+    State(engine): State<Arc<QueueEngine<OrderState, Deps, MemoryStore>>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let order_id = Uuid::new_v4();
+    let customer_id = Uuid::new_v4();
+    let total = 99.99 + (rand::random::<f64>() * 200.0);
+
+    engine
+        .process(OrderEvent::OrderPlaced {
+            order_id,
+            customer_id,
+            total,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "order_id": order_id,
+            "customer_id": customer_id,
+            "total": total,
+        })),
+    ))
+}
+
+// Simple HTML toy app
+async fn toy_app() -> Html<&'static str> {
+    Html(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Seesaw Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #60a5fa; }
+        .button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 16px 32px;
+            font-size: 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .button:hover { background: #2563eb; transform: translateY(-2px); }
+        .button:active { transform: translateY(0); }
+        .status {
+            margin-top: 20px;
+            padding: 16px;
+            background: #1a1a1a;
+            border-radius: 8px;
+            border-left: 4px solid #3b82f6;
+        }
+        .success { border-left-color: #10b981; color: #10b981; }
+        .error { border-left-color: #ef4444; color: #ef4444; }
+        a { color: #60a5fa; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .info {
+            background: #1a1a1a;
+            padding: 16px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>🚀 Seesaw Demo</h1>
+    <div class="info">
+        <p>This is a live demo of the Seesaw event-driven runtime with in-memory store.</p>
+        <p>Click the button to create a new order workflow and watch it in the <a href="/insights">Insights Dashboard →</a></p>
+    </div>
+
+    <button class="button" onclick="createOrder()">Create Order</button>
+    <div id="status"></div>
+
+    <script>
+        async function createOrder() {
+            const btn = document.querySelector('.button');
+            const status = document.getElementById('status');
+
+            btn.disabled = true;
+            btn.textContent = 'Creating...';
+
+            try {
+                const response = await fetch('/api/create-order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                const data = await response.json();
+
+                status.className = 'status success';
+                status.innerHTML = `✅ Order created!<br>
+                    Order ID: <code>${data.order_id}</code><br>
+                    Total: $${data.total.toFixed(2)}<br>
+                    <a href="/insights">View in Insights Dashboard →</a>`;
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = '❌ Failed to create order: ' + error.message;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Create Order';
+            }
+        }
+    </script>
+</body>
+</html>
+    "#)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Setup tracing
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_level(true)
+        .init();
+
+    println!("🚀 Seesaw Insight Demo Starting...\n");
+    println!("📝 Using in-memory store (no database required)\n");
+
+    // Create in-memory store
+    let store = MemoryStore::new();
+    let deps = Deps;
+
+    let engine = QueueEngine::new(deps, store.clone())
+        .with_reducer(
+            reducer::fold::<OrderEvent>().into_queue(|state: OrderState, event| match event {
+                OrderEvent::OrderValidated { .. } => OrderState {
+                    validated: true,
+                    ..state
+                },
+                OrderEvent::PaymentProcessed { .. } => OrderState {
+                    payment_processed: true,
+                    ..state
+                },
+                OrderEvent::InventoryReserved { .. } => OrderState {
+                    inventory_reserved: true,
+                    ..state
+                },
+                OrderEvent::OrderShipped { .. } => OrderState {
+                    shipped: true,
+                    ..state
+                },
+                _ => state,
+            }),
+        )
+        // Effect: Validate order
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::OrderPlaced { order_id, .. } => Some(*order_id),
+                    _ => None,
+                })
+                .id("validate_order")
+                .then_queue(|order_id, _ctx| async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok(OrderEvent::OrderValidated { order_id })
+                }),
+        )
+        // Effect: Process payment
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::OrderValidated { order_id } => Some(*order_id),
+                    _ => None,
+                })
+                .id("process_payment")
+                .retry(3)
+                .timeout(Duration::from_secs(5))
+                .then_queue(|order_id, _ctx| async move {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    Ok(OrderEvent::PaymentProcessed {
+                        order_id,
+                        amount: 99.99,
+                    })
+                }),
+        )
+        // Effect: Reserve inventory
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::PaymentProcessed { order_id, .. } => Some(*order_id),
+                    _ => None,
+                })
+                .id("reserve_inventory")
+                .priority(1)
+                .then_queue(|order_id, _ctx| async move {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    Ok(OrderEvent::InventoryReserved { order_id })
+                }),
+        )
+        // Effect: Ship order
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::InventoryReserved { order_id } => Some(*order_id),
+                    _ => None,
+                })
+                .id("ship_order")
+                .then_queue(|order_id, _ctx| async move {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    Ok(OrderEvent::OrderShipped {
+                        order_id,
+                        tracking_number: format!(
+                            "TRACK-{}",
+                            order_id.to_string()[..8].to_uppercase()
+                        ),
+                    })
+                }),
+        )
+        // Effect: Send confirmation email
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::OrderShipped { order_id, .. } => Some(*order_id),
+                    _ => None,
+                })
+                .id("send_confirmation_email")
+                .then_queue(|order_id, _ctx| async move {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    Ok(OrderEvent::EmailSent {
+                        order_id,
+                        email_type: "shipping_confirmation".to_string(),
+                    })
+                }),
+        )
+        // Effect: Complete order
+        .with_effect(
+            effect::on::<OrderEvent>()
+                .extract(|e| match e {
+                    OrderEvent::EmailSent { order_id, .. } => Some(*order_id),
+                    _ => None,
+                })
+                .id("complete_order")
+                .then_queue(|order_id, _ctx| async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok(OrderEvent::OrderCompleted { order_id })
+                }),
+        );
+
+    println!("✅ Engine configured with 6 effects");
+
+    // Wrap engine in Arc for sharing across threads
+    let engine = Arc::new(engine);
+
+    // Start runtime workers
+    let runtime = Runtime::start(
+        &engine,
+        RuntimeConfig {
+            event_workers: 2,
+            effect_workers: 4,
+            ..Default::default()
+        },
+    );
+
+    println!("✅ Runtime started (2 event workers, 4 effect workers)\n");
+    println!("🎬 Generating demo workflows...\n");
+
+    // Generate demo workflows
+    for i in 1..=3 {
+        let order_id = Uuid::new_v4();
+        let customer_id = Uuid::new_v4();
+
+        println!(
+            "📦 Workflow {}: Order {} starting",
+            i,
+            &order_id.to_string()[..8]
+        );
+
+        engine
+            .process(OrderEvent::OrderPlaced {
+                order_id,
+                customer_id,
+                total: 99.99 * i as f64,
+            })
+            .await?;
+
+        // Stagger workflow starts
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
+    println!("\n✨ Demo workflows initiated!");
+    println!("\n📊 Open http://localhost:3000 to see them in action!\n");
+    // Build unified server with proper state type handling
+    let static_dir = Some("/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw-insight/static");
+
+    // Create insights app (will be nested at /insights)
+    let insights_app = seesaw_insight::web::app(store.clone(), static_dir, Some("/insights"));
+
+    // Create demo routes with their own state
+    let demo_routes = Router::new()
+        .route("/", get(toy_app))
+        .route("/api/create-order", post(create_order))
+        .with_state(engine.clone());
+
+    // Merge both apps (they have different state types, but that's ok with merge)
+    let app = Router::new()
+        .merge(demo_routes)
+        .merge(insights_app)
+        .layer(CorsLayer::permissive());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .expect("Failed to bind port 3000");
+
+    println!("\n📊 Server started on http://localhost:3000");
+    println!("   Toy App:   http://localhost:3000/");
+    println!("   Insights:  http://localhost:3000/insights");
+    println!("   API:       POST http://localhost:3000/api/create-order\n");
+    println!("Features to try:");
+    println!("  • Click 'Create Order' on the toy app");
+    println!("  • Watch workflows in real-time at /insights");
+    println!("  • See event chains and effect execution\n");
+    println!("Press Ctrl+C to stop...\n");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("Server failed");
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Keep running
+    tokio::signal::ctrl_c().await?;
+    println!("\n🛑 Shutting down gracefully...");
+
+    let _ = runtime.shutdown().await;
+    println!("✅ Runtime stopped");
+
+    Ok(())
+}

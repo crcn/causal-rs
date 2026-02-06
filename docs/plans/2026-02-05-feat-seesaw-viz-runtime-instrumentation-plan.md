@@ -1304,7 +1304,7 @@ For multi-service Seesaw deployments (job queues, webhooks):
 - Use W3C trace context propagation (already planned in enhancement doc)
 - Attach `traceparent` header to external events
 - Reconstruct cross-service causation chains
-- Visualize distributed sagas
+- Visualize distributed workflows
 
 ### IDE Integration
 

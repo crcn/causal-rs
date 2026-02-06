@@ -17,7 +17,7 @@ This document tracks implementation progress against the plan in `docs/plans/202
 - [x] `seesaw_effect_executions` table with priority/timeout/retry
 - [x] `seesaw_dlq` table for permanently failed effects
 - [x] `seesaw_reaper_heartbeat` for monitoring
-- [x] Per-saga FIFO ordering with advisory locks
+- [x] Per-workflow FIFO ordering with advisory locks
 - [x] SKIP LOCKED for concurrent worker polling
 - [x] Idempotency via unique constraint on `(event_id, created_at)`
 - [x] LISTEN/NOTIFY trigger (schema defined, not used yet)
@@ -40,7 +40,7 @@ This document tracks implementation progress against the plan in `docs/plans/202
 - [x] 14 comprehensive integration tests (ALL PASSING)
   - Queue operations (publish, poll, ack, nack)
   - Idempotency
-  - Per-saga FIFO ordering
+  - Per-workflow FIFO ordering
   - Concurrent workers with SKIP LOCKED
   - State management (save, load, optimistic locking)
   - Effect execution (insert, poll, complete, fail, DLQ)
@@ -53,7 +53,7 @@ This document tracks implementation progress against the plan in `docs/plans/202
 - [x] Polls events from queue
 - [x] Runs reducers (state transitions)
 - [x] Inserts effect intents into seesaw_effect_executions
-- [x] Per-saga FIFO with advisory locks
+- [x] Per-workflow FIFO with advisory locks
 - [x] Handles idempotency checks
 
 **Location**: `crates/seesaw/src/runtime/event_worker.rs`
@@ -204,7 +204,7 @@ This document tracks implementation progress against the plan in `docs/plans/202
 **Missing**:
 - WaitFuture doesn't actually listen to PostgreSQL notifications
 - Current implementation is stubbed (doesn't wait)
-- No connection to LISTEN channel `seesaw_saga_{correlation_id}`
+- No connection to LISTEN channel `seesaw_workflow_{correlation_id}`
 
 **Impact**:
 - `.wait()` doesn't work
@@ -394,7 +394,7 @@ docs/
 - ✅ **Store abstraction is clean** - Easy to test and extend
 - ✅ **Separate crate architecture** - Good modularity
 - ✅ **Integration tests are comprehensive** - 14 tests covering all major operations
-- ✅ **Per-saga FIFO works** - Advisory locks + SKIP LOCKED
+- ✅ **Per-workflow FIFO works** - Advisory locks + SKIP LOCKED
 - ✅ **Priority ordering works** - Lower number = higher priority
 - ✅ **DLQ works** - Failed effects are tracked
 - ✅ **Optimistic locking works** - State version conflicts detected

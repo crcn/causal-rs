@@ -6,7 +6,7 @@
 //! 3. Wait for terminal events (true completion)
 
 use anyhow::Result;
-use seesaw_core::{effect, reducer, QueueEngine, WorkflowStatus};
+use seesaw_core::{effect, reducer, EffectContext, QueueEngine, Store, WorkflowStatus};
 use seesaw_postgres::PostgresStore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -83,32 +83,34 @@ async fn main() -> Result<()> {
 
     let engine = QueueEngine::new(deps.clone(), store.clone())
         // Reducer - track state
-        .with_reducer(reducer::on::<OrderEvent>().run(|mut state, event| {
-            match event {
-                OrderEvent::OrderPlaced { order_id, .. } => {
-                    state.order_id = Some(*order_id);
-                    state.status = "placed".to_string();
-                    state.steps_completed.push("placed".to_string());
+        .with_reducer(
+            reducer::fold::<OrderEvent>().into(|mut state: OrderState, event| {
+                match event {
+                    OrderEvent::OrderPlaced { order_id, .. } => {
+                        state.order_id = Some(*order_id);
+                        state.status = "placed".to_string();
+                        state.steps_completed.push("placed".to_string());
+                    }
+                    OrderEvent::PaymentCharged { .. } => {
+                        state.status = "payment_charged".to_string();
+                        state.steps_completed.push("payment".to_string());
+                    }
+                    OrderEvent::InventoryReserved { .. } => {
+                        state.status = "inventory_reserved".to_string();
+                        state.steps_completed.push("inventory".to_string());
+                    }
+                    OrderEvent::OrderCompleted { .. } => {
+                        state.status = "completed".to_string();
+                        state.steps_completed.push("completed".to_string());
+                    }
+                    OrderEvent::OrderFailed { reason, .. } => {
+                        state.status = format!("failed: {}", reason);
+                    }
+                    _ => {}
                 }
-                OrderEvent::PaymentCharged { .. } => {
-                    state.status = "payment_charged".to_string();
-                    state.steps_completed.push("payment".to_string());
-                }
-                OrderEvent::InventoryReserved { .. } => {
-                    state.status = "inventory_reserved".to_string();
-                    state.steps_completed.push("inventory".to_string());
-                }
-                OrderEvent::OrderCompleted { .. } => {
-                    state.status = "completed".to_string();
-                    state.steps_completed.push("completed".to_string());
-                }
-                OrderEvent::OrderFailed { reason, .. } => {
-                    state.status = format!("failed: {}", reason);
-                }
-                _ => {}
-            }
-            state
-        }))
+                state
+            }),
+        )
         // Effect 1: Process payment
         .with_effect(
             effect::on::<OrderEvent>()
@@ -116,12 +118,14 @@ async fn main() -> Result<()> {
                     OrderEvent::OrderPlaced { order_id, total } => Some((*order_id, *total)),
                     _ => None,
                 })
-                .queued()  // Run in background
+                .queued() // Run in background
                 .retry(3)
-                .then(|(order_id, total), ctx| async move {
-                    ctx.deps().payment_service.charge(total).await?;
-                    Ok(OrderEvent::PaymentCharged { order_id })
-                }),
+                .then(
+                    |(order_id, total), ctx: EffectContext<OrderState, Deps>| async move {
+                        ctx.deps().payment_service.charge(total).await?;
+                        Ok(OrderEvent::PaymentCharged { order_id })
+                    },
+                ),
         )
         // Effect 2: Reserve inventory
         .with_effect(
@@ -131,10 +135,12 @@ async fn main() -> Result<()> {
                     _ => None,
                 })
                 .queued()
-                .then(|order_id, ctx| async move {
-                    ctx.deps().inventory_service.reserve(order_id).await?;
-                    Ok(OrderEvent::InventoryReserved { order_id })
-                }),
+                .then(
+                    |order_id, ctx: EffectContext<OrderState, Deps>| async move {
+                        ctx.deps().inventory_service.reserve(order_id).await?;
+                        Ok(OrderEvent::InventoryReserved { order_id })
+                    },
+                ),
         )
         // Effect 3: Mark complete (terminal event)
         .with_effect(
@@ -143,10 +149,12 @@ async fn main() -> Result<()> {
                     OrderEvent::InventoryReserved { order_id } => Some(*order_id),
                     _ => None,
                 })
-                .then(|order_id, _ctx| async move {
-                    println!("✅ Order complete!");
-                    Ok(OrderEvent::OrderCompleted { order_id })
-                }),
+                .then(
+                    |order_id, _ctx: EffectContext<OrderState, Deps>| async move {
+                        println!("✅ Order complete!");
+                        Ok(OrderEvent::OrderCompleted { order_id })
+                    },
+                ),
         );
 
     println!("🚀 Workflow Status Tracking Example\n");
@@ -165,7 +173,10 @@ async fn main() -> Result<()> {
         .await?;
 
     let correlation_id = handle.correlation_id;
-    println!("✓ Started workflow with correlation_id: {}\n", correlation_id);
+    println!(
+        "✓ Started workflow with correlation_id: {}\n",
+        correlation_id
+    );
 
     // =================================================================
     // Pattern 2: Poll workflow status
@@ -197,21 +208,26 @@ async fn main() -> Result<()> {
             total: 149.99,
         })
         .wait(|event| {
-            let evt = event.downcast_ref::<seesaw_core::SagaEvent>()?;
-            match evt.event_type.as_str() {
-                "OrderCompleted" => {
-                    println!("✅ Received terminal event: OrderCompleted");
-                    Some(Ok(true))
-                }
-                "OrderFailed" => {
-                    println!("❌ Received terminal event: OrderFailed");
-                    Some(Err(anyhow::anyhow!("Order failed")))
-                }
-                _ => {
-                    println!("   ... still processing: {}", evt.event_type);
-                    None  // Keep waiting
+            if let Some(evt) = event.downcast_ref::<seesaw_core::WorkflowEvent>() {
+                if let Ok(order_event) = serde_json::from_value::<OrderEvent>(evt.payload.clone()) {
+                    return match order_event {
+                        OrderEvent::OrderCompleted { .. } => {
+                            println!("✅ Received terminal event: OrderCompleted");
+                            Some(Ok(true))
+                        }
+                        OrderEvent::OrderFailed { .. } => {
+                            println!("❌ Received terminal event: OrderFailed");
+                            Some(Err(anyhow::anyhow!("Order failed")))
+                        }
+                        _ => {
+                            println!("   ... still processing: {}", evt.event_type);
+                            None
+                        }
+                    };
                 }
             }
+
+            None
         })
         .timeout(Duration::from_secs(10))
         .await?;
@@ -225,8 +241,14 @@ async fn main() -> Result<()> {
 
     let final_status = store.get_workflow_status(correlation_id).await?;
     println!("Status for correlation_id {}:", correlation_id);
-    println!("  is_settled: {} (no effects running right now)", final_status.is_settled);
-    println!("  last_event: {:?} (might be terminal event)", final_status.last_event);
+    println!(
+        "  is_settled: {} (no effects running right now)",
+        final_status.is_settled
+    );
+    println!(
+        "  last_event: {:?} (might be terminal event)",
+        final_status.last_event
+    );
     println!("\n  → is_settled = momentary state (can start up again)");
     println!("  → Terminal event = user declares 'done forever'\n");
 

@@ -31,7 +31,7 @@ Seesaw **is**:
 Seesaw is **not**:
 
 - Full event sourcing
-- A saga engine
+- A workflow engine
 - An actor framework
 
 ## Features
@@ -456,15 +456,15 @@ let correlation_id = handle.correlation_id;  // Return to client
 let result = engine
     .process(CreateOrder { user_id: 123 })
     .wait(|event| {
-        // Match on SagaEvent (contains event_type and JSON payload)
-        if let Some(saga_event) = event.downcast_ref::<seesaw_core::SagaEvent>() {
-            match saga_event.event_type.as_str() {
+        // Match on WorkflowEvent (contains event_type and JSON payload)
+        if let Some(workflow_event) = event.downcast_ref::<seesaw_core::WorkflowEvent>() {
+            match workflow_event.event_type.as_str() {
                 "OrderCreated" => {
-                    let order_id = saga_event.payload["order_id"].as_str()?;
+                    let order_id = workflow_event.payload["order_id"].as_str()?;
                     Some(Ok(order_id.to_string()))
                 }
                 "OrderFailed" => {
-                    let reason = saga_event.payload["reason"].as_str()?;
+                    let reason = workflow_event.payload["reason"].as_str()?;
                     Some(Err(anyhow!("Failed: {}", reason)))
                 }
                 _ => None  // Keep waiting

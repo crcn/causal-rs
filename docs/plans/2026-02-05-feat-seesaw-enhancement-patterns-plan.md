@@ -1,5 +1,5 @@
 ---
-title: Seesaw Enhancement Patterns - Job Queues, Sagas, Distributed Systems, and Edge Computing
+title: Seesaw Enhancement Patterns - Job Queues, Workflows, Distributed Systems, and Edge Computing
 type: feat
 date: 2026-02-05
 status: draft
@@ -9,9 +9,9 @@ status: draft
 
 ## Overview
 
-This plan explores integration patterns for extending Seesaw's event-driven runtime with advanced capabilities while maintaining its minimalist philosophy. The goal is to provide **seamless, ergonomic patterns** for job queues, saga orchestration, distributed systems (NATS), state machines, workflows, observability (OTEL), and edge computing deployment.
+This plan explores integration patterns for extending Seesaw's event-driven runtime with advanced capabilities while maintaining its minimalist philosophy. The goal is to provide **seamless, ergonomic patterns** for job queues, workflow orchestration, distributed systems (NATS), state machines, workflows, observability (OTEL), and edge computing deployment.
 
-**Key Principle**: Seesaw remains a lightweight event-driven runtime. These enhancements are **patterns and integration guides**, not framework additions. We avoid turning Seesaw into a saga engine, workflow orchestrator, or distributed actor system.
+**Key Principle**: Seesaw remains a lightweight event-driven runtime. These enhancements are **patterns and integration guides**, not framework additions. We avoid turning Seesaw into a workflow engine, workflow, or distributed actor system.
 
 ### Critical Guardrails (Incorporated from Feedback)
 
@@ -38,7 +38,7 @@ Seesaw currently excels at:
 
 However, users need guidance on:
 1. **Job Queue Integration** - Reliable background processing with retries
-2. **Saga Patterns** - Long-running workflows with compensation
+2. **Workflow Patterns** - Long-running workflows with compensation
 3. **Distributed Deployment** - Multi-instance coordination via NATS/Redis
 4. **State Machine Formalization** - Complex state transitions with guards
 5. **Workflow Visualization** - Understanding event flows
@@ -59,16 +59,16 @@ However, users need guidance on:
 ### External Best Practices (2026)
 - **Job Queues**: `apalis` (Rust-native), `asynq` (Redis-backed distributed)
 - **Retry Logic**: `tokio-retry` with exponential backoff + jitter
-- **Saga Patterns**: Choreography > Orchestration for loose coupling
+- **Workflow Patterns**: Choreography > Orchestration for loose coupling
 - **Distributed Messaging**: NATS JetStream (exactly-once semantics)
 - **State Machines**: Type-state pattern, `statig` for hierarchical async FSMs
 - **Observability**: `tracing-opentelemetry` for distributed tracing
-- **Durable Workflows**: Restate/Temporal for long-running sagas
+- **Durable Workflows**: Restate/Temporal for long-running workflows
 
 ### Key Insights
 1. **Transactional Outbox** is the gold standard for reliable event publishing
 2. **Context Propagation** through event metadata enables distributed tracing
-3. **Choreography-based sagas** align perfectly with Seesaw's decentralized model
+3. **Choreography-based workflows** align perfectly with Seesaw's decentralized model
 4. **Stateless engine design** makes Seesaw ideal for serverless/edge deployment
 5. **Effect boundaries** are natural span creation points for observability
 
@@ -172,7 +172,7 @@ effect::on::<JobCompleted>().then(|event, ctx| async move {
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: Uuid,
-    pub correlation_id: Uuid, // Tracks originating request/saga
+    pub correlation_id: Uuid, // Tracks originating request/workflow
     pub data: EventData,
 }
 ```
@@ -258,13 +258,13 @@ effect::on::<JobFailed>().then(|event, ctx| async move {
 - `examples/job-queue-worker/` - Working example with apalis
 - CLAUDE.md section on job queue patterns
 
-### 2. Saga Pattern Implementation
+### 2. Workflow Pattern Implementation
 
-**Pattern**: Choreography-based sagas with compensation events.
+**Pattern**: Choreography-based workflows with compensation events.
 
 **Forward Transaction**:
 ```rust
-// Saga step 1: Reserve inventory
+// Workflow step 1: Reserve inventory
 effect::on::<OrderPlaced>().then(|event, ctx| async move {
     match ctx.deps().inventory.reserve(&event.items).await {
         Ok(reservation) => Ok(InventoryReserved {
@@ -278,7 +278,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
     }
 });
 
-// Saga step 2: Process payment
+// Workflow step 2: Process payment
 effect::on::<InventoryReserved>().then(|event, ctx| async move {
     match ctx.deps().payment.charge(&event).await {
         Ok(payment) => Ok(PaymentProcessed {
@@ -292,7 +292,7 @@ effect::on::<InventoryReserved>().then(|event, ctx| async move {
     }
 });
 
-// Saga step 3: Terminal success
+// Workflow step 3: Terminal success
 effect::on::<PaymentProcessed>().then(|event, ctx| async move {
     Ok(OrderCompleted { order_id: event.order_id })
 });
@@ -312,49 +312,49 @@ effect::on::<InventoryReleased>().then(|event, ctx| async move {
 });
 ```
 
-**Saga State Tracking** (optional):
+**Workflow State Tracking** (optional):
 ```rust
-// Track saga progress in database
+// Track workflow progress in database
 #[derive(Debug, Clone)]
-pub struct SagaState {
+pub struct WorkflowState {
     correlation_id: Uuid,
-    status: SagaStatus,
+    status: WorkflowStatus,
     completed_steps: Vec<String>,
     started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SagaStatus {
+pub enum WorkflowStatus {
     InProgress,
     Completed,
     Compensating,
     Failed,
 }
 
-// Reducer tracks saga state
-let saga_reducer = reducer::fold::<SagaEvent>().into(|mut state, event| {
+// Reducer tracks workflow state
+let workflow_reducer = reducer::fold::<WorkflowEvent>().into(|mut state, event| {
     match event {
-        SagaEvent::Started { correlation_id } => {
-            state.sagas.insert(correlation_id, SagaState {
+        WorkflowEvent::Started { correlation_id } => {
+            state.workflows.insert(correlation_id, WorkflowState {
                 correlation_id,
-                status: SagaStatus::InProgress,
+                status: WorkflowStatus::InProgress,
                 completed_steps: vec![],
                 started_at: Utc::now(),
             });
         }
-        SagaEvent::StepCompleted { correlation_id, step } => {
-            if let Some(saga) = state.sagas.get_mut(&correlation_id) {
-                saga.completed_steps.push(step);
+        WorkflowEvent::StepCompleted { correlation_id, step } => {
+            if let Some(workflow) = state.workflows.get_mut(&correlation_id) {
+                workflow.completed_steps.push(step);
             }
         }
-        SagaEvent::Failed { correlation_id } => {
-            if let Some(saga) = state.sagas.get_mut(&correlation_id) {
-                saga.status = SagaStatus::Compensating;
+        WorkflowEvent::Failed { correlation_id } => {
+            if let Some(workflow) = state.workflows.get_mut(&correlation_id) {
+                workflow.status = WorkflowStatus::Compensating;
             }
         }
-        SagaEvent::Completed { correlation_id } => {
-            if let Some(saga) = state.sagas.get_mut(&correlation_id) {
-                saga.status = SagaStatus::Completed;
+        WorkflowEvent::Completed { correlation_id } => {
+            if let Some(workflow) = state.workflows.get_mut(&correlation_id) {
+                workflow.status = WorkflowStatus::Completed;
             }
         }
     }
@@ -365,30 +365,30 @@ let saga_reducer = reducer::fold::<SagaEvent>().into(|mut state, event| {
 **Timeout Handling**:
 ```rust
 // Effect schedules timeout check
-effect::on::<SagaStarted>().then(|event, ctx| async move {
+effect::on::<WorkflowStarted>().then(|event, ctx| async move {
     // Schedule timeout check (5 minutes)
     ctx.deps().scheduler.schedule_after(
         Duration::from_secs(300),
-        CheckSagaTimeout { correlation_id: event.correlation_id }
+        CheckWorkflowTimeout { correlation_id: event.correlation_id }
     ).await?;
     Ok(())
 });
 
 // Timeout checker emits failure if not complete
-effect::on::<CheckSagaTimeout>().then(|event, ctx| async move {
-    let saga_state = ctx.deps().saga_store.get(event.correlation_id).await?;
+effect::on::<CheckWorkflowTimeout>().then(|event, ctx| async move {
+    let workflow_state = ctx.deps().workflow_store.get(event.correlation_id).await?;
 
-    if !matches!(saga_state.status, SagaStatus::Completed) {
-        Ok(SagaTimedOut { correlation_id: event.correlation_id })
+    if !matches!(workflow_state.status, WorkflowStatus::Completed) {
+        Ok(WorkflowTimedOut { correlation_id: event.correlation_id })
     } else {
-        Ok(()) // Saga completed, no timeout event
+        Ok(()) // Workflow completed, no timeout event
     }
 });
 ```
 
-**Critical: Saga Idempotency in Choreography**
+**Critical: Workflow Idempotency in Choreography**
 
-In choreography, effects may receive the same event twice due to network retries. Every forward saga step MUST be idempotent:
+In choreography, effects may receive the same event twice due to network retries. Every forward workflow step MUST be idempotent:
 
 ```rust
 effect::on::<InventoryReserved>().then(|event, ctx| async move {
@@ -417,9 +417,9 @@ effect::on::<InventoryReserved>().then(|event, ctx| async move {
 3. **State guards**: Check reducer state before executing effect
 
 **Documentation Additions**:
-- `docs/patterns/sagas.md` - Comprehensive saga guide (with idempotency section)
-- `examples/saga-order-workflow/` - Full saga example with compensation
-- CLAUDE.md section on saga patterns
+- `docs/patterns/workflows.md` - Comprehensive workflow guide (with idempotency section)
+- `examples/workflow-order-workflow/` - Full workflow example with compensation
+- CLAUDE.md section on workflow patterns
 
 ### 3. Distributed Systems Integration (NATS)
 
@@ -928,7 +928,7 @@ Event → Transactional Outbox → Durable Queue → Worker → Effect → New E
 2. **Event context**: Every event carries `correlation_id`, `correlation_id`, `event_id`
 3. **State in database**: Load current state from DB, not event replay (thin events)
 4. **Idempotency guards**: Formal Inbox pattern with ProcessedEvents table
-5. **Timeout handling**: Reaper/Sweeper pattern for ghost sagas
+5. **Timeout handling**: Reaper/Sweeper pattern for ghost workflows
 6. **Terminal events**: Explicit workflow completion signals
 7. **At-least-once delivery**: Outbox processor handles duplicates gracefully
 
@@ -1067,7 +1067,7 @@ CREATE TABLE processed_events (
     result_event_id UUID
 );
 
-CREATE INDEX idx_processed_events_saga ON processed_events(correlation_id);
+CREATE INDEX idx_processed_events_workflow ON processed_events(correlation_id);
 ```
 
 **Implementation Pattern**:
@@ -1147,9 +1147,9 @@ tx.commit().await?;
 
 **Comparison to Temporal:**
 
-**The Ghost Saga Problem: Timeout Handling**
+**The Ghost Workflow Problem: Timeout Handling**
 
-**Problem**: In multi-day workflows, sagas can get "stuck" if:
+**Problem**: In multi-day workflows, workflows can get "stuck" if:
 - Worker crashes mid-execution
 - External API never responds
 - Human never approves/rejects
@@ -1167,8 +1167,8 @@ consumer_config.ack_wait = Duration::from_days(3);
 
 **Option 1: External Scheduler (Recommended)**
 ```rust
-// Store saga state in DB with timeout
-CREATE TABLE sagas (
+// Store workflow state in DB with timeout
+CREATE TABLE workflows (
     correlation_id UUID PRIMARY KEY,
     status VARCHAR(50) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -1177,29 +1177,29 @@ CREATE TABLE sagas (
     -- ...
 );
 
-CREATE INDEX idx_sagas_timeout ON sagas(status, timeout_at);
+CREATE INDEX idx_workflows_timeout ON workflows(status, timeout_at);
 
-// Cron job queries for expired sagas
-SELECT correlation_id FROM sagas
+// Cron job queries for expired workflows
+SELECT correlation_id FROM workflows
 WHERE status = 'AwaitingApproval'
   AND timeout_at < NOW();
 
-// Emit timeout event for each expired saga
-for saga in expired_sagas {
-    queue.publish(SagaTimedOut { correlation_id }).await?;
+// Emit timeout event for each expired workflow
+for workflow in expired_workflows {
+    queue.publish(WorkflowTimedOut { correlation_id }).await?;
 }
 ```
 
 **Option 2: DB Trigger + Queue**
 ```sql
 -- Trigger fires when timeout_at passes
-CREATE OR REPLACE FUNCTION check_saga_timeout()
+CREATE OR REPLACE FUNCTION check_workflow_timeout()
 RETURNS trigger AS $$
 BEGIN
     IF NEW.status = 'AwaitingApproval' AND NEW.timeout_at < NOW() THEN
         -- Write to outbox
         INSERT INTO outbox_events (event_type, payload, correlation_id)
-        VALUES ('SagaTimedOut', jsonb_build_object('correlation_id', NEW.correlation_id), NEW.correlation_id);
+        VALUES ('WorkflowTimedOut', jsonb_build_object('correlation_id', NEW.correlation_id), NEW.correlation_id);
     END IF;
     RETURN NEW;
 END;
@@ -1208,23 +1208,23 @@ $$ LANGUAGE plpgsql;
 
 **Reaper Effect**:
 ```rust
-effect::on::<SagaTimedOut>().then(|event, ctx| async move {
+effect::on::<WorkflowTimedOut>().then(|event, ctx| async move {
     let mut tx = ctx.deps().db.begin().await?;
 
-    // Load current saga state
-    let saga = ctx.deps().db.get_saga(event.correlation_id).await?;
+    // Load current workflow state
+    let workflow = ctx.deps().db.get_workflow(event.correlation_id).await?;
 
     // Only timeout if still waiting
-    if saga.status != SagaStatus::AwaitingApproval {
+    if workflow.status != WorkflowStatus::AwaitingApproval {
         return Ok(());  // Already completed, ignore timeout
     }
 
     // Mark as timed out
-    saga.update_status(SagaStatus::TimedOut, &mut tx).await?;
+    workflow.update_status(WorkflowStatus::TimedOut, &mut tx).await?;
 
     // Trigger compensation
     ctx.deps().outbox.write_event(
-        &SagaCompensationRequired { correlation_id: event.correlation_id },
+        &WorkflowCompensationRequired { correlation_id: event.correlation_id },
         &mut tx
     ).await?;
 
@@ -1480,7 +1480,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 - ✅ Reactive workflows (event → effect → event)
 - ✅ Cross-domain event propagation
 - ✅ Stateless edge functions
-- ✅ Choreography-based sagas
+- ✅ Choreography-based workflows
 
 ### Use Seesaw With Caution For:
 - ⚠️ **Long-running durable workflows** → Consider Temporal/Restate OR use "everything in queue" pattern
@@ -1509,7 +1509,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
   - Example: Cron-like schedules, priority queues with preemption, rate limiting
   - Reason: Seesaw dispatches events immediately; it's not a scheduler
 
-- ❌ **Distributed transactions** → Use sagas or 2PC coordinators
+- ❌ **Distributed transactions** → Use workflows or 2PC coordinators
   - Example: Multi-database atomic commits
   - Reason: Seesaw provides choreography patterns, not distributed transaction guarantees
 
@@ -1532,7 +1532,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 - [ ] Write `docs/anti-patterns.md` - "When NOT to use Seesaw"
 - [ ] Document common misuse patterns:
   - [ ] Event amplification loops (re-entrancy footguns)
-  - [ ] Using Seesaw as a workflow orchestrator
+  - [ ] Using Seesaw as a workflow
   - [ ] Treating visualization as source of truth
   - [ ] Over-abstracting with unnecessary FSM libraries
   - [ ] Building "Seesaw adapters" for every library
@@ -1551,7 +1551,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 
 - [ ] Create `docs/patterns/` directory
 - [ ] Write `job-queues.md` with apalis/asynq examples
-- [ ] Write `sagas.md` with choreography patterns
+- [ ] Write `workflows.md` with choreography patterns
 - [ ] Write `distributed-nats.md` with NATS integration
 - [ ] Write `state-machines.md` with implicit/explicit patterns
 - [ ] Write `observability.md` with OTEL integration
@@ -1568,7 +1568,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 **Goal**: Create working examples demonstrating each pattern.
 
 - [ ] `examples/job-queue-apalis/` - Background job processing
-- [ ] `examples/saga-ecommerce/` - Order workflow with compensation
+- [ ] `examples/workflow-ecommerce/` - Order workflow with compensation
 - [ ] `examples/distributed-nats/` - Multi-instance coordination
 - [ ] `examples/state-machine-payment/` - statig integration
 - [ ] `examples/otel-tracing/` - Distributed tracing setup
@@ -1617,7 +1617,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 ### Alternative Approaches Considered
 
 #### Alternative 1: Framework Approach
-**Description**: Turn Seesaw into a full-featured saga/workflow engine with built-in job queue, retry logic, and state machine DSL.
+**Description**: Turn Seesaw into a full-featured workflow engine with built-in job queue, retry logic, and state machine DSL.
 
 **Rejected Because**:
 - Violates Seesaw's minimalist philosophy
@@ -1648,7 +1648,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 ### Functional Requirements
 
 - [ ] **Job Queue Pattern**: Documented with 3 integration examples (tokio channels, apalis, asynq)
-- [ ] **Saga Pattern**: Choreography guide with compensation examples
+- [ ] **Workflow Pattern**: Choreography guide with compensation examples
 - [ ] **Distributed Pattern**: NATS JetStream integration documented and tested
 - [ ] **State Machine Pattern**: Both implicit and explicit approaches documented
 - [ ] **Observability Pattern**: OTEL integration with trace context propagation
@@ -1710,7 +1710,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 - **Mandatory**: Add idempotency/re-entrancy warnings to EVERY external integration pattern
 - Require correlation IDs in all examples
 - Add "Event Amplification Loops" section to anti-patterns doc
-- Include guard examples in job queue, NATS, and saga patterns
+- Include guard examples in job queue, NATS, and workflow patterns
 - Create checklist: "Does this effect ignore its own events?"
 
 ### Risk 1: Complexity Creep
@@ -1799,7 +1799,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 
 **Phase 1 - Core Patterns**:
 - `docs/patterns/job-queues.md` - Job queue integration patterns (includes idempotency section)
-- `docs/patterns/sagas.md` - Saga choreography guide (emphasize choreography over orchestration)
+- `docs/patterns/workflows.md` - Workflow choreography guide (emphasize choreography over orchestration)
 - `docs/patterns/distributed-nats.md` - Multi-instance coordination (with re-entrancy warnings)
 - `docs/patterns/state-machines.md` - State management approaches (with decision rule: <10 transitions = implicit)
 - `docs/patterns/observability.md` - OpenTelemetry integration (three-tier approach)
@@ -1844,10 +1844,10 @@ Each example includes:
 - [asynq - Distributed Task Queue](https://lib.rs/crates/asynq)
 - [The Transactional Outbox Pattern (2026)](https://james-carr.org/posts/2026-01-15-transactional-outbox-pattern/)
 
-**Saga Patterns**:
-- [Saga Pattern: Choreography vs Orchestration](https://blog.bytebytego.com/p/saga-pattern-demystified-orchestration)
-- [Microsoft Azure - Saga Design Pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/saga)
-- [Microservices.io - Saga Pattern](https://microservices.io/patterns/data/saga.html)
+**Workflow Patterns**:
+- [Workflow Pattern: Choreography vs Orchestration](https://blog.bytebytego.com/p/workflow-pattern-demystified-orchestration)
+- [Microsoft Azure - Workflow Design Pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/saga)
+- [Microservices.io - Workflow Pattern](https://microservices.io/patterns/data/workflow.html)
 
 **Distributed Systems**:
 - [NATS.io Documentation](https://docs.nats.io/)
@@ -1920,7 +1920,7 @@ This plan moves Seesaw from **"how do I use this?"** to **"how do I build produc
 - Choreography only, not orchestration
 
 ### What We're NOT Building:
-- ❌ Saga orchestrator
+- ❌ Workflow
 - ❌ Workflow engine
 - ❌ Job scheduler
 - ❌ Actor framework

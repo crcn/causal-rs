@@ -80,7 +80,7 @@ impl<St: Store> ProcessFuture<St> {
             timeout: None,
             init: Some(Box::new(move |timeout| {
                 Box::pin(async move {
-                    let mut stream = store.subscribe_saga_events(correlation_id).await?;
+                    let mut stream = store.subscribe_workflow_events(correlation_id).await?;
 
                     // Publish only after LISTEN is established so terminal events
                     // emitted quickly after processing are not missed.
@@ -107,21 +107,22 @@ impl<St: Store> ProcessFuture<St> {
                         }
 
                         anyhow::bail!(
-                            "Saga event stream ended before a matching terminal event was received"
+                            "Workflow event stream ended before a matching terminal event was received"
                         );
                     };
 
                     match timeout {
-                        Some(duration) => match tokio::time::timeout(duration, wait_for_match).await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                anyhow::bail!(
-                                    "Timed out waiting for matching saga event after {:?}",
-                                    duration
-                                )
+                        Some(duration) => {
+                            match tokio::time::timeout(duration, wait_for_match).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    anyhow::bail!(
+                                        "Timed out waiting for matching workflow event after {:?}",
+                                        duration
+                                    )
+                                }
                             }
-                        },
+                        }
                         None => wait_for_match.await,
                     }
                 })
@@ -265,8 +266,8 @@ mod tests {
         fail_subscribe: AtomicBool,
         gate: Arc<Notify>,
         call_order: Mutex<Vec<&'static str>>,
-        emit_on_publish: Mutex<Option<crate::SagaEvent>>,
-        stream_tx: Mutex<Option<mpsc::UnboundedSender<crate::SagaEvent>>>,
+        emit_on_publish: Mutex<Option<crate::WorkflowEvent>>,
+        stream_tx: Mutex<Option<mpsc::UnboundedSender<crate::WorkflowEvent>>>,
     }
 
     impl TestStore {
@@ -302,7 +303,7 @@ mod tests {
             self.fail_subscribe.store(should_fail, Ordering::SeqCst);
         }
 
-        fn set_emit_on_publish(&self, event: crate::SagaEvent) {
+        fn set_emit_on_publish(&self, event: crate::WorkflowEvent) {
             *self.emit_on_publish.lock() = Some(event);
         }
 
@@ -424,7 +425,10 @@ mod tests {
             Ok(())
         }
 
-        async fn get_workflow_status(&self, _correlation_id: Uuid) -> Result<crate::WorkflowStatus> {
+        async fn get_workflow_status(
+            &self,
+            _correlation_id: Uuid,
+        ) -> Result<crate::WorkflowStatus> {
             Ok(crate::WorkflowStatus {
                 correlation_id: _correlation_id,
                 state: None,
@@ -434,10 +438,10 @@ mod tests {
             })
         }
 
-        async fn subscribe_saga_events(
+        async fn subscribe_workflow_events(
             &self,
             _correlation_id: Uuid,
-        ) -> Result<Box<dyn Stream<Item = crate::SagaEvent> + Send + Unpin>> {
+        ) -> Result<Box<dyn Stream<Item = crate::WorkflowEvent> + Send + Unpin>> {
             if self.fail_subscribe.load(Ordering::SeqCst) {
                 anyhow::bail!("subscribe failed");
             }
@@ -512,7 +516,7 @@ mod tests {
         store.set_hold_publish(false);
 
         let correlation_id = Uuid::new_v4();
-        store.set_emit_on_publish(crate::SagaEvent {
+        store.set_emit_on_publish(crate::WorkflowEvent {
             event_id: Uuid::new_v4(),
             correlation_id,
             event_type: "TerminalEvent".to_string(),
@@ -532,7 +536,7 @@ mod tests {
         let result = process
             .wait(|event| {
                 event
-                    .downcast_ref::<crate::SagaEvent>()
+                    .downcast_ref::<crate::WorkflowEvent>()
                     .and_then(|e| match e.event_type.as_str() {
                         "TerminalEvent" => Some(Ok(e.payload["ok"].as_bool().unwrap_or(false))),
                         _ => None,
@@ -562,7 +566,7 @@ mod tests {
         assert!(result.is_err(), "wait should timeout when no event arrives");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Timed out waiting for matching saga event"),
+            err.contains("Timed out waiting for matching workflow event"),
             "unexpected timeout error message: {}",
             err
         );

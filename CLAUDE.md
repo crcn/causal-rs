@@ -67,7 +67,7 @@ Simple, direct, no ceremony.
 
 - **Is**: Event-driven runtime
 - **Is**: Direct event → effect → event flows
-- **Is Not**: Event sourcing, distributed actors, retry engine, saga orchestrator, workflow engine, job queue
+- **Is Not**: Event sourcing, distributed actors, retry engine, workflow orchestrator, workflow engine, job queue
 
 ## Core Primitives
 
@@ -253,7 +253,6 @@ EffectContext provides:
 - `prev_state()` — state before reducer ran
 - `next_state()` — state after reducer ran
 - `curr_state()` — current live state
-- `within(closure)` — spawn tracked sub-tasks
 
 ### Reducer
 

@@ -45,7 +45,7 @@ let event = OrderPlaced {
     items: vec![...],
     total: 1000.00,
     correlation_id: Uuid::new_v4(), // ← Workflow correlation
-    saga_state: SagaState::Started,
+    workflow_state: WorkflowState::Started,
     initiated_at: Utc::now(),
 };
 

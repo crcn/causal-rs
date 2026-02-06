@@ -13,7 +13,6 @@ use uuid::Uuid;
 use crate::effect::{EffectContext, EventEmitter};
 use crate::effect_registry::EffectRegistry;
 use crate::reducer_registry::ReducerRegistry;
-use crate::task_group::TaskGroup;
 use crate::{EmittedEvent, Store, NAMESPACE_SEESAW};
 
 struct BufferedEmitter<S, D>
@@ -128,7 +127,7 @@ where
         };
 
         info!(
-            "Processing effect: effect_id={}, saga={}, priority={}, attempt={}/{}",
+            "Processing effect: effect_id={}, workflow={}, priority={}, attempt={}/{}",
             execution.effect_id,
             execution.correlation_id,
             execution.priority,
@@ -138,7 +137,10 @@ where
 
         // Find effect handler by stable ID
         let Some(effect) = self.effects.find_by_id(&execution.effect_id) else {
-            let error = format!("No effect handler registered for id '{}'", execution.effect_id);
+            let error = format!(
+                "No effect handler registered for id '{}'",
+                execution.effect_id
+            );
             warn!("{}", error);
             if execution.attempts >= execution.max_attempts {
                 self.store
@@ -173,7 +175,6 @@ where
             .unwrap_or_default();
         let emissions: Arc<Mutex<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let tasks = TaskGroup::new();
         let emitter = Arc::new(BufferedEmitter::<S, D> {
             emissions: emissions.clone(),
             _marker: std::marker::PhantomData,
@@ -194,7 +195,6 @@ where
             live_state,
             self.deps.clone(),
             emitter,
-            tasks.clone(),
         );
 
         // Execute effect with timeout
@@ -213,7 +213,7 @@ where
                 emitted.push((output.type_id, output.value));
             }
 
-            tasks.wait_pending().await;
+            // tasks.wait_pending().await; // TODO: Re-enable when tasks tracking is implemented
             emitted.extend(emissions.lock().drain(..));
             Ok::<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>, anyhow::Error>(emitted)
         })
@@ -229,7 +229,11 @@ where
 
                 if emitted_events.is_empty() {
                     self.store
-                        .complete_effect(execution.event_id, execution.effect_id.clone(), result_value)
+                        .complete_effect(
+                            execution.event_id,
+                            execution.effect_id.clone(),
+                            result_value,
+                        )
                         .await?;
                 } else {
                     self.store
@@ -503,7 +507,10 @@ mod tests {
             Ok(())
         }
 
-        async fn get_workflow_status(&self, _correlation_id: Uuid) -> Result<crate::WorkflowStatus> {
+        async fn get_workflow_status(
+            &self,
+            _correlation_id: Uuid,
+        ) -> Result<crate::WorkflowStatus> {
             Ok(crate::WorkflowStatus {
                 correlation_id: _correlation_id,
                 state: None,
@@ -513,11 +520,11 @@ mod tests {
             })
         }
 
-        async fn subscribe_saga_events(
+        async fn subscribe_workflow_events(
             &self,
             _correlation_id: Uuid,
-        ) -> Result<Box<dyn Stream<Item = crate::SagaEvent> + Send + Unpin>> {
-            Ok(Box::new(futures::stream::empty::<crate::SagaEvent>()))
+        ) -> Result<Box<dyn Stream<Item = crate::WorkflowEvent> + Send + Unpin>> {
+            Ok(Box::new(futures::stream::empty::<crate::WorkflowEvent>()))
         }
     }
 
@@ -541,8 +548,7 @@ mod tests {
     async fn effect_worker_executes_and_completes_with_emitted_events() {
         let reducers = Arc::new(ReducerRegistry::new());
         reducers.register(
-            crate::reducer::fold::<Incremented>()
-                .into_queue(|state: TestState, _event| state),
+            crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _event| state),
         );
 
         let effect = crate::effect::on::<Increment>().then_queue(
@@ -602,5 +608,28 @@ mod tests {
         assert!(processed);
         assert_eq!(store.dlqed.lock().len(), 1);
         assert!(store.failed.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn effect_worker_marks_failed_when_handler_missing_and_attempts_remaining() {
+        let reducers = Arc::new(ReducerRegistry::new());
+        let effects = Arc::new(EffectRegistry::<TestState, TestDeps>::new());
+        let mut execution = queued_execution("missing_effect_id".to_string());
+        execution.attempts = 1;
+        execution.max_attempts = 3;
+
+        let store = Arc::new(TestStore::new(vec![execution]));
+        let worker = EffectWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EffectWorkerConfig::default(),
+        );
+
+        let processed = worker.process_next_effect().await.expect("should process");
+        assert!(processed);
+        assert_eq!(store.failed.lock().len(), 1);
+        assert!(store.dlqed.lock().is_empty());
     }
 }

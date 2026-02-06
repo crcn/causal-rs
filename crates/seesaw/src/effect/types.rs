@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use anyhow::{Error, Result};
 
-use crate::event_codec::EventCodec;
 use super::context::EffectContext;
+use crate::event_codec::EventCodec;
 
 /// Error handler called when an effect returns an error.
 ///

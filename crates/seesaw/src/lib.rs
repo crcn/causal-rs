@@ -59,20 +59,17 @@
 
 // New module structure
 pub mod effect;
+pub mod insight;
 pub mod reducer;
 pub mod runtime;
 pub mod store;
 
 mod effect_registry;
-mod engine;
 mod engine_v2;
 mod event_codec;
 mod process;
 mod reducer_registry;
 mod task_group;
-
-// Service layer (action execution)
-pub mod service;
 
 // OpenTelemetry integration
 #[cfg(feature = "otel")]
@@ -80,13 +77,15 @@ pub mod otel;
 
 // Re-export main types
 pub use effect::{AnyEvent, Effect, EffectContext, EffectError};
-pub use engine::{Engine, Handle};
-pub use engine_v2::Engine as QueueEngine; // New queue-backed engine
+pub use engine_v2::Engine;
 pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
 pub use reducer::Reducer;
 pub use runtime::{Runtime, RuntimeConfig};
+pub use insight::{
+    EffectNode, EventNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,
+};
 pub use store::{
-    EmittedEvent, QueuedEffectExecution, QueuedEvent, SagaEvent, Store, WorkflowStatus,
+    EmittedEvent, QueuedEffectExecution, QueuedEvent, WorkflowEvent, Store, WorkflowStatus,
     NAMESPACE_SEESAW,
 };
 pub use task_group::TaskGroup;
@@ -94,16 +93,6 @@ pub use task_group::TaskGroup;
 // Top-level builder functions
 pub use effect::on;
 pub use reducer::fold;
-
-// Re-export service types at root level
-pub use service::{
-    ActionResult, ActionWithOpts, EmptyResult, GenericActionResult, IntoAction, Service,
-    ServiceError,
-};
-
-// Re-export service submodules for backwards compatibility (use seesaw::action::...)
-pub use service::action;
-pub use service::into_action;
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;

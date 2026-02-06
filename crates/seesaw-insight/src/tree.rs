@@ -15,9 +15,9 @@ pub struct EventNode {
     pub payload: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub hops: i32,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<EventNode>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<EffectNode>,
 }
 
@@ -137,10 +137,8 @@ impl TreeBuilder {
         effects: HashMap<Uuid, Vec<EffectNode>>,
     ) -> Result<Vec<EventNode>> {
         // Build index of events by ID
-        let mut events_by_id: HashMap<Uuid, EventRow> = events
-            .into_iter()
-            .map(|e| (e.event_id, e))
-            .collect();
+        let mut events_by_id: HashMap<Uuid, EventRow> =
+            events.into_iter().map(|e| (e.event_id, e)).collect();
 
         // Find root events (no parent)
         let roots: Vec<Uuid> = events_by_id
@@ -223,7 +221,22 @@ mod tests {
         };
 
         let json = serde_json::to_string(&node).expect("should serialize");
-        let _deserialized: EventNode =
-            serde_json::from_str(&json).expect("should deserialize");
+        let _deserialized: EventNode = serde_json::from_str(&json).expect("should deserialize");
+    }
+
+    #[test]
+    fn event_node_deserializes_without_optional_arrays() {
+        let json = serde_json::json!({
+            "event_id": Uuid::new_v4(),
+            "event_type": "OrderPlaced",
+            "payload": { "order_id": 123 },
+            "created_at": Utc::now(),
+            "hops": 0
+        })
+        .to_string();
+
+        let node: EventNode = serde_json::from_str(&json).expect("should deserialize");
+        assert!(node.children.is_empty());
+        assert!(node.effects.is_empty());
     }
 }

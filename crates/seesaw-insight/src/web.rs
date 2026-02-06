@@ -1,10 +1,5 @@
 //! Web server with SSE and WebSocket endpoints for real-time stream
 
-use crate::{
-    stream::StreamReader,
-    tree::TreeBuilder,
-    websocket::{stream_broadcaster, ws_handler, StreamBroadcast, WsState},
-};
 use axum::{
     extract::{Path, Query, State},
     response::{
@@ -15,10 +10,9 @@ use axum::{
     Json, Router,
 };
 use futures::stream::Stream;
-use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use seesaw_core::insight::InsightStore;
+use serde::Deserialize;
 use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio::sync::broadcast;
 use tower_http::{
     cors::CorsLayer,
     services::ServeDir,
@@ -29,11 +23,8 @@ use uuid::Uuid;
 
 /// Web server state
 #[derive(Clone)]
-pub struct AppState {
-    pub reader: Arc<StreamReader>,
-    pub tree_builder: Arc<TreeBuilder>,
-    pub pool: PgPool,
-    pub broadcast: StreamBroadcast,
+pub struct AppState<I: InsightStore> {
+    pub insight_store: Arc<I>,
 }
 
 /// Query params for /api/stream endpoint
@@ -50,75 +41,76 @@ fn default_limit() -> i64 {
 }
 
 /// Create web server router
-pub fn app(pool: PgPool, static_dir: Option<&str>) -> Router {
-    let reader = Arc::new(StreamReader::new(pool.clone()));
-    let tree_builder = Arc::new(TreeBuilder::new(pool.clone()));
-
-    // Create broadcast channel for WebSocket updates
-    let (broadcast, _) = broadcast::channel(1000);
-
+///
+/// If `base_path` is None, mounts at root. If Some("/insights"), mounts at /insights
+pub fn app<I>(insight_store: I, static_dir: Option<&str>, base_path: Option<&str>) -> Router
+where
+    I: InsightStore + Clone + 'static,
+{
     let state = AppState {
-        reader: reader.clone(),
-        tree_builder,
-        pool,
-        broadcast: broadcast.clone(),
+        insight_store: Arc::new(insight_store),
     };
-
-    let ws_state = WsState {
-        reader: reader.clone(),
-        broadcast: broadcast.clone(),
-    };
-
-    // Start background broadcaster task
-    tokio::spawn(stream_broadcaster(reader, broadcast));
 
     let api_routes = Router::new()
-        .route("/stream", get(sse_stream))
-        .route("/ws", get(ws_handler).with_state(ws_state))
-        .route("/tree/:correlation_id", get(get_tree))
-        .route("/stats", get(get_stats))
+        .route("/stream", get(sse_stream::<I>))
+        .route("/tree/:correlation_id", get(get_tree::<I>))
+        .route("/stats", get(get_stats::<I>))
         .with_state(state);
 
-    let mut app = Router::new().nest("/api", api_routes);
+    let mut insight_app = Router::new().nest("/api", api_routes);
 
     // Serve static files if directory provided
     if let Some(dir) = static_dir {
-        app = app.nest_service("/", ServeDir::new(dir));
+        insight_app = insight_app.nest_service("/", ServeDir::new(dir));
     }
 
-    app.layer(
-        TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-            .on_response(DefaultOnResponse::new().level(Level::INFO)),
-    )
-    .layer(CorsLayer::permissive())
+    insight_app = insight_app
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(CorsLayer::permissive());
+
+    // Mount at base_path if provided
+    if let Some(base) = base_path {
+        Router::new().nest(base, insight_app)
+    } else {
+        insight_app
+    }
 }
 
 /// SSE endpoint for real-time stream
 ///
 /// Long-polls with cursor-based pagination, emitting SSE events as new entries arrive
-async fn sse_stream(
+async fn sse_stream<I>(
     Query(query): Query<StreamQuery>,
-    State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    State(state): State<AppState<I>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
+where
+    I: InsightStore + Clone + 'static,
+{
     let stream = async_stream::stream! {
         let mut cursor = query.cursor;
-        let limit = query.limit;
+        let limit = query.limit as usize;
 
         loop {
-            // Fetch entries from stream table
-            match state.reader.fetch(cursor, limit).await {
-                Ok((entries, next_cursor)) => {
+            // Fetch entries from store
+            match state.insight_store.get_recent_events(cursor, limit).await {
+                Ok(entries) => {
                     if entries.is_empty() {
                         // No new entries, sleep briefly and retry
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     } else {
                         // Emit entries as SSE events
-                        for entry in entries {
+                        for entry in &entries {
                             let json = serde_json::to_string(&entry).unwrap_or_else(|_| "{}".to_string());
                             yield Ok(Event::default().data(json));
                         }
-                        cursor = next_cursor;
+                        // Update cursor to last entry's seq
+                        if let Some(last) = entries.last() {
+                            cursor = Some(last.seq);
+                        }
                     }
                 }
                 Err(e) => {
@@ -133,11 +125,14 @@ async fn sse_stream(
 }
 
 /// Tree endpoint - Get workflow causality tree
-async fn get_tree(
+async fn get_tree<I>(
     Path(correlation_id): Path<Uuid>,
-    State(state): State<AppState>,
-) -> Response {
-    match state.tree_builder.build_tree(correlation_id).await {
+    State(state): State<AppState<I>>,
+) -> Response
+where
+    I: InsightStore + Clone + 'static,
+{
+    match state.insight_store.get_workflow_tree(correlation_id).await {
         Ok(tree) => Json(tree).into_response(),
         Err(e) => {
             tracing::error!("Error building tree: {}", e);
@@ -150,40 +145,17 @@ async fn get_tree(
     }
 }
 
-/// Stats endpoint for dashboard metrics
-#[derive(Debug, Serialize)]
-pub struct Stats {
-    pub total_events: i64,
-    pub active_effects: i64,
-    pub recent_entries: i64,
-}
-
-async fn get_stats(State(state): State<AppState>) -> Response {
-    let result = sqlx::query(
-        r#"
-        SELECT
-            (SELECT COUNT(*) FROM seesaw_events) as total_events,
-            (SELECT COUNT(*) FROM seesaw_effect_executions WHERE status IN ('pending', 'executing')) as active_effects,
-            (SELECT COUNT(*) FROM seesaw_stream WHERE created_at > NOW() - INTERVAL '5 minutes') as recent_entries
-        "#
-    )
-    .fetch_one(&state.pool)
-    .await;
-
-    match result {
-        Ok(row) => {
-            let stats = Stats {
-                total_events: row.try_get::<i64, _>("total_events").unwrap_or(0),
-                active_effects: row.try_get::<i64, _>("active_effects").unwrap_or(0),
-                recent_entries: row.try_get::<i64, _>("recent_entries").unwrap_or(0),
-            };
-            Json(stats).into_response()
-        }
+async fn get_stats<I>(State(state): State<AppState<I>>) -> Response
+where
+    I: InsightStore + Clone + 'static,
+{
+    match state.insight_store.get_stats().await {
+        Ok(stats) => Json(stats).into_response(),
         Err(e) => {
             tracing::error!("Error fetching stats: {}", e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
+                format!("Failed to fetch stats: {}", e),
             )
                 .into_response()
         }
@@ -191,13 +163,20 @@ async fn get_stats(State(state): State<AppState>) -> Response {
 }
 
 /// Start the web server
-pub async fn serve(pool: PgPool, addr: &str, static_dir: Option<&str>) -> anyhow::Result<()> {
-    let app = app(pool, static_dir);
+pub async fn serve<I>(
+    insight_store: I,
+    addr: &str,
+    static_dir: Option<&str>,
+) -> anyhow::Result<()>
+where
+    I: InsightStore + Clone + 'static,
+{
+    let app = app(insight_store, static_dir, None);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Seesaw Insight server listening on {}", addr);
     info!("  SSE endpoint: http://{}/api/stream", addr);
-    info!("  WebSocket endpoint: ws://{}/api/ws", addr);
     info!("  Tree API: http://{}/api/tree/:correlation_id", addr);
+    info!("  Stats API: http://{}/api/stats", addr);
     info!("  Dashboard: http://{}/", addr);
     axum::serve(listener, app).await?;
     Ok(())

@@ -25,7 +25,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
-    correlation_id: Uuid,           // ← Manual saga tracking
+    correlation_id: Uuid,           // ← Manual workflow tracking
     customer_email: String,
     amount_cents: i64,
 }
@@ -629,7 +629,7 @@ async fn main() -> Result<()> {
 
 // Webhook handler (Day 3)
 async fn handle_approval_webhook(order_id: Uuid) -> Result<()> {
-    // ❌ How do we continue the saga from 2 days ago?
+    // ❌ How do we continue the workflow from 2 days ago?
     // ❌ No correlation_id lookup mechanism
     // ❌ State is lost after handle.settled() completed
 
@@ -679,7 +679,7 @@ async fn main() -> Result<()> {
 
     let engine = engine.with_queue(queue);
 
-    // Process initial event (starts new saga)
+    // Process initial event (starts new workflow)
     let correlation_id = engine.process(|| async {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
@@ -689,7 +689,7 @@ async fn main() -> Result<()> {
         })
     }).await?;
 
-    info!("Started order saga: {}", correlation_id);
+    info!("Started order workflow: {}", correlation_id);
 
     // Store correlation_id for later (webhook callbacks)
     sqlx::query!(
@@ -712,7 +712,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Webhook handler (Day 3) - Continue existing saga!
+// Webhook handler (Day 3) - Continue existing workflow!
 async fn handle_approval_webhook(
     order_id: Uuid,
     approver_id: Uuid,
@@ -728,8 +728,8 @@ async fn handle_approval_webhook(
     .await?
     .correlation_id;
 
-    // ✅ Continue existing saga (state preserved from Day 1!)
-    engine.process_saga(correlation_id, || async move {
+    // ✅ Continue existing workflow (state preserved from Day 1!)
+    engine.process_workflow(correlation_id, || async move {
         Ok(ApprovalReceived {
             order_id,
             approver_id,
@@ -796,7 +796,7 @@ async fn test_order_flow() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check state
-    let state = get_saga_state(&pool, correlation_id).await.unwrap();
+    let state = get_workflow_state(&pool, correlation_id).await.unwrap();
     assert_eq!(state.status, OrderStatus::Pending);
     assert!(state.payment_charged);
     assert!(state.confirmation_sent);
@@ -819,7 +819,7 @@ async fn test_order_flow() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check approval requested
-    let state = get_saga_state(&pool, correlation_id).await.unwrap();
+    let state = get_workflow_state(&pool, correlation_id).await.unwrap();
     assert_eq!(state.status, OrderStatus::AwaitingApproval);
 
     engine.shutdown().await.unwrap();
@@ -857,7 +857,7 @@ async fn test_order_flow() {
 - [ ] Change `engine.activate()` → `queue.start_workers()`
 - [ ] Change `handle.run()` → `engine.process()`
 - [ ] Store correlation_id for webhook continuations
-- [ ] Use `engine.process_saga()` for continuing sagas
+- [ ] Use `engine.process_workflow()` for continuing workflows
 - [ ] Add graceful shutdown handler
 - [ ] Run database migrations (`001_queue_tables.sql`)
 - [ ] Update connection pool: `max_connections = workers * 2`

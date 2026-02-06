@@ -4,8 +4,11 @@ members = [
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
+    "examples/workflow-status",
+    "examples/insight-demo",
     "crates/seesaw-postgres",
     "crates/seesaw-insight",
+    "crates/seesaw-memory",
 ]
 resolver = "2"
 

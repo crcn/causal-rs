@@ -116,6 +116,41 @@ impl TaskGroup {
         self.spawn_handles.lock().push(handle);
     }
 
+    /// Run a tracked future on the current task without spawning.
+    ///
+    /// This keeps `pending`/error semantics identical to `spawn` while avoiding
+    /// per-item task allocation overhead in hot paths.
+    pub async fn run_tracked<F>(self: &Arc<Self>, future: F) -> Result<()>
+    where
+        F: Future<Output = Result<()>> + Send,
+    {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+
+        let result = AssertUnwindSafe(future).catch_unwind().await;
+
+        let out = match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                self.capture_error(anyhow!("{}", msg));
+                Err(e)
+            }
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                let err = anyhow!("task panicked: {}", msg);
+                self.capture_error(anyhow!("{}", err));
+                Err(err)
+            }
+        };
+
+        self.decrement();
+        out
+    }
+
     /// Capture an error directly.
     pub fn capture_error(&self, error: Error) {
         let mut lock = self.error.lock();

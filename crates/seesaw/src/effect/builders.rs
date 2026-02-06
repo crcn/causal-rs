@@ -10,9 +10,9 @@ use anyhow::Result;
 #[cfg(test)]
 use uuid::Uuid;
 
-use crate::event_codec::EventCodec;
 use super::context::EffectContext;
 use super::types::{AnyEvent, BoxFuture, Effect, EventOutput};
+use crate::event_codec::EventCodec;
 
 #[track_caller]
 fn default_effect_id(prefix: &str) -> String {
@@ -56,6 +56,44 @@ pub struct NoStarted;
 /// Marker for having a started handler.
 pub struct WithStarted<S, D, St>(St, PhantomData<(S, D)>);
 
+fn typed_event_codec<E>() -> Arc<EventCodec>
+where
+    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+{
+    Arc::new(EventCodec {
+        event_type: std::any::type_name::<E>().to_string(),
+        type_id: TypeId::of::<E>(),
+        decode: Arc::new(|payload| {
+            let event: E = serde_json::from_value(payload.clone())?;
+            Ok(Arc::new(event))
+        }),
+        encode: Arc::new(|event_any| {
+            event_any
+                .downcast_ref::<E>()
+                .and_then(|event| serde_json::to_value(event).ok())
+        }),
+    })
+}
+
+trait QueueCodecProvider {
+    fn queue_codec() -> Option<Arc<EventCodec>>;
+}
+
+impl QueueCodecProvider for Untyped {
+    fn queue_codec() -> Option<Arc<EventCodec>> {
+        None
+    }
+}
+
+impl<E> QueueCodecProvider for Typed<E>
+where
+    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+{
+    fn queue_codec() -> Option<Arc<EventCodec>> {
+        Some(typed_event_codec::<E>())
+    }
+}
+
 // =============================================================================
 // Unified EffectBuilder
 // =============================================================================
@@ -71,6 +109,7 @@ pub struct EffectBuilder<EventType, Filter, Trans, Started> {
     timeout: Option<Duration>,
     max_attempts: u32,
     priority: Option<i32>,
+    codec: Option<Arc<EventCodec>>,
     _marker: PhantomData<EventType>,
 }
 
@@ -99,6 +138,7 @@ pub fn on<E: Send + Sync + 'static>() -> EffectBuilder<Typed<E>, NoFilter, NoTra
         timeout: None,
         max_attempts: 1,
         priority: None,
+        codec: None,
         _marker: PhantomData,
     }
 }
@@ -124,6 +164,7 @@ pub fn on_any() -> EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
         timeout: None,
         max_attempts: 1,
         priority: None,
+        codec: None,
         _marker: PhantomData,
     }
 }
@@ -151,6 +192,7 @@ where
             timeout: self.timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
+            codec: self.codec,
             _marker: PhantomData,
         }
     }
@@ -187,6 +229,7 @@ where
             timeout: self.timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
+            codec: self.codec,
             _marker: PhantomData,
         }
     }
@@ -216,6 +259,7 @@ impl<EventType, Filter, Started> EffectBuilder<EventType, Filter, NoTransition, 
             timeout: self.timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
+            codec: self.codec,
             _marker: PhantomData,
         }
     }
@@ -247,6 +291,7 @@ impl<EventType, Filter, Trans> EffectBuilder<EventType, Filter, Trans, NoStarted
             timeout: self.timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
+            codec: self.codec,
             _marker: PhantomData,
         }
     }
@@ -262,22 +307,30 @@ impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, 
         self.id = Some(id.into());
         self
     }
+}
 
+impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, Started>
+where
+    EventType: QueueCodecProvider,
+{
     /// Force queued execution (default: inline).
     pub fn queued(mut self) -> Self {
         self.queued = true;
+        self.codec = EventType::queue_codec();
         self
     }
 
     /// Add a delay before execution (triggers queued execution).
     pub fn delayed(mut self, duration: Duration) -> Self {
         self.delay = Some(duration);
+        self.codec = EventType::queue_codec();
         self
     }
 
     /// Set execution timeout (triggers queued execution).
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
+        self.codec = EventType::queue_codec();
         self
     }
 
@@ -285,12 +338,16 @@ impl<EventType, Filter, Trans, Started> EffectBuilder<EventType, Filter, Trans, 
     /// Values > 1 trigger queued execution.
     pub fn retry(mut self, attempts: u32) -> Self {
         self.max_attempts = attempts;
+        if attempts > 1 {
+            self.codec = EventType::queue_codec();
+        }
         self
     }
 
     /// Set execution priority (lower = higher priority, triggers queued execution).
     pub fn priority(mut self, level: i32) -> Self {
         self.priority = Some(level);
+        self.codec = EventType::queue_codec();
         self
     }
 }
@@ -448,6 +505,7 @@ where
         let output_is_unit = TypeId::of::<O>() == TypeId::of::<()>();
         let filter = self.filter;
         let transition = self.transition;
+        let codec = self.codec;
 
         let id = self
             .id
@@ -455,7 +513,7 @@ where
 
         Effect {
             id,
-            codecs: Vec::new(),
+            codecs: codec.into_iter().collect(),
             can_handle: Arc::new(move |t| t == target),
             started: self.started.into_started(),
             handler: Arc::new(move |value, _, ctx| {
@@ -513,24 +571,11 @@ where
         let output_is_unit = TypeId::of::<O>() == TypeId::of::<()>();
         let filter = self.filter;
         let transition = self.transition;
+        let codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
 
         let id = self
             .id
             .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
-
-        let codec = Arc::new(EventCodec {
-            event_type: std::any::type_name::<E>().to_string(),
-            type_id: target,
-            decode: Arc::new(|payload| {
-                let event: E = serde_json::from_value(payload.clone())?;
-                Ok(Arc::new(event))
-            }),
-            encode: Arc::new(|event_any| {
-                event_any
-                    .downcast_ref::<E>()
-                    .and_then(|event| serde_json::to_value(event).ok())
-            }),
-        });
 
         Effect {
             id,
@@ -586,9 +631,7 @@ impl EffectBuilder<Untyped, NoFilter, NoTransition, NoStarted> {
         H: Fn(AnyEvent, EffectContext<S, D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let id = self
-            .id
-            .unwrap_or_else(|| default_effect_id("effect_any"));
+        let id = self.id.unwrap_or_else(|| default_effect_id("effect_any"));
 
         Effect {
             id,
@@ -905,7 +948,8 @@ where
                 let rx = rx.clone();
                 let mut receiver = rx.subscribe_all();
 
-                ctx.within(move |ctx| async move {
+                // Spawn background task to forward events from bridge
+                tokio::spawn(async move {
                     while let Some(envelope) = receiver.recv().await {
                         if envelope.origin() == bridge_origin_id {
                             continue;
@@ -913,7 +957,6 @@ where
                         let type_id = envelope.type_id();
                         ctx.emit_any(envelope.value, type_id);
                     }
-                    Ok(())
                 });
 
                 Box::pin(async { Ok(()) })
@@ -966,7 +1009,6 @@ mod tests {
     struct OtherEvent;
 
     fn create_test_ctx() -> EffectContext<TestState, TestDeps> {
-        use crate::task_group::TaskGroup;
         use parking_lot::RwLock;
 
         struct NoopEmitter;
@@ -992,7 +1034,6 @@ mod tests {
             live_state,
             Arc::new(TestDeps),
             Arc::new(NoopEmitter),
-            TaskGroup::new(),
         )
     }
 

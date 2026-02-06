@@ -44,7 +44,7 @@ pub struct EmittedEvent {
 ///
 /// Event notification from LISTEN/NOTIFY for .wait() pattern
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SagaEvent {
+pub struct WorkflowEvent {
     pub event_id: Uuid,
     pub correlation_id: Uuid,
     pub event_type: String,
@@ -67,7 +67,7 @@ pub trait Store: Send + Sync + 'static {
     /// Returns immediately after INSERT. Idempotent via UNIQUE(event_id).
     async fn publish(&self, event: QueuedEvent) -> Result<()>;
 
-    /// Poll next event (per-saga FIFO with advisory locks)
+    /// Poll next event (per-workflow FIFO with advisory locks)
     ///
     /// Returns None if no events available.
     /// Uses SKIP LOCKED for concurrent workers.
@@ -87,17 +87,22 @@ pub trait Store: Send + Sync + 'static {
     // State Operations
     // =========================================================================
 
-    /// Load state for saga
+    /// Load state for workflow
     ///
-    /// Returns None if saga has no state yet.
+    /// Returns None if workflow has no state yet.
     async fn load_state<S>(&self, correlation_id: Uuid) -> Result<Option<(S, i32)>>
     where
         S: for<'de> Deserialize<'de> + Send;
 
-    /// Save state for saga (optimistic locking)
+    /// Save state for workflow (optimistic locking)
     ///
     /// Returns error if version mismatch (concurrent modification detected).
-    async fn save_state<S>(&self, correlation_id: Uuid, state: &S, expected_version: i32) -> Result<i32>
+    async fn save_state<S>(
+        &self,
+        correlation_id: Uuid,
+        state: &S,
+        expected_version: i32,
+    ) -> Result<i32>
     where
         S: Serialize + Send + Sync;
 
@@ -149,7 +154,7 @@ pub trait Store: Send + Sync + 'static {
         emitted_events: Vec<EmittedEvent>,
     ) -> Result<()>;
 
-    /// Mark effect execution as failed
+    /// Mark effect execution as failed and schedule retry (store-defined backoff)
     async fn fail_effect(
         &self,
         event_id: Uuid,
@@ -172,14 +177,14 @@ pub trait Store: Send + Sync + 'static {
     // LISTEN/NOTIFY Operations (for .wait() pattern)
     // =========================================================================
 
-    /// Subscribe to events for a specific saga via LISTEN/NOTIFY.
+    /// Subscribe to events for a specific workflow via LISTEN/NOTIFY.
     ///
-    /// Returns a stream that yields events as they are emitted in the saga.
+    /// Returns a stream that yields events as they are emitted in the workflow.
     /// Used by the .wait() pattern to efficiently wait for terminal events.
-    async fn subscribe_saga_events(
+    async fn subscribe_workflow_events(
         &self,
         correlation_id: Uuid,
-    ) -> Result<Box<dyn futures::Stream<Item = SagaEvent> + Send + Unpin>>;
+    ) -> Result<Box<dyn futures::Stream<Item = WorkflowEvent> + Send + Unpin>>;
 
     // =========================================================================
     // Workflow Status Operations

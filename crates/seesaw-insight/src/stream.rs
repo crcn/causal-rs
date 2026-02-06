@@ -170,7 +170,6 @@ mod tests {
         };
 
         let json = serde_json::to_string(&entry).expect("should serialize");
-        let _deserialized: StreamEntry =
-            serde_json::from_str(&json).expect("should deserialize");
+        let _deserialized: StreamEntry = serde_json::from_str(&json).expect("should deserialize");
     }
 }

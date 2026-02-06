@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- **State is per-saga** - Each workflow has isolated state
+- **State is per-workflow** - Each workflow has isolated state
 - **Reducers are pure** - Transform state before effects run
 - **Effects see latest** - Load fresh state from DB (not snapshots)
 - **Two-phase execution** - Reducers in Phase 1, Effects in Phase 2
@@ -11,9 +11,9 @@
 
 ## 1. State Model
 
-### Per-Saga Isolation
+### Per-Workflow Isolation
 
-Each saga (workflow) has its own state stored in the database:
+Each workflow (workflow) has its own state stored in the database:
 
 ```sql
 CREATE TABLE seesaw_state (
@@ -324,7 +324,7 @@ Day 1, 10:00 AM - OrderPlaced event created
 
 Day 1, 11:00 AM - User updates profile
                   New email: "new@example.com"
-                  (Separate saga, updates user table)
+                  (Separate workflow, updates user table)
 
 Day 1, 12:00 PM - Effect worker runs "send_confirmation"
                   Loads LATEST state
@@ -367,9 +367,9 @@ effect::on::<OrderPlaced>()
 
 ## 5. State Versioning (Optimistic Locking)
 
-### The Hot Saga Problem
+### The Hot Workflow Problem
 
-**Problem**: Multiple events for same saga processed concurrently
+**Problem**: Multiple events for same workflow processed concurrently
 
 ```
 Worker 1: Load state (v1) → Reducer → Save state (v2) ✅
@@ -400,7 +400,7 @@ if rows == 0 {
 ```
 
 **Guarantees**:
-- ✅ Per-saga FIFO processing (retry on conflict)
+- ✅ Per-workflow FIFO processing (retry on conflict)
 - ✅ No lost updates
 - ✅ State transitions are serializable
 
@@ -639,13 +639,13 @@ T=24h+1: Event Worker processes Shipped
 
 | Concept | Summary |
 |---------|---------|
-| **State** | Per-saga, stored in DB, versioned for optimistic locking |
+| **State** | Per-workflow, stored in DB, versioned for optimistic locking |
 | **Reducers** | Pure functions, run in Phase 1, update state synchronously |
 | **Effects** | Impure handlers, run in Phase 2, see **latest** state |
 | **Phase 1** | Event Worker: reducers → save state → insert effect intents (atomic) |
 | **Phase 2** | Effect Worker: load latest → run effect → publish next events (atomic) |
 | **Latest Semantics** | Effects see current state, not snapshot (correct + scalable) |
-| **Versioning** | Optimistic locking prevents lost updates on hot sagas |
+| **Versioning** | Optimistic locking prevents lost updates on hot workflows |
 | **Idempotency** | Deterministic event IDs + ON CONFLICT prevent duplicates |
 
 ---

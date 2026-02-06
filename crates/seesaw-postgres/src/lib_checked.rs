@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// PostgreSQL implementation of Store trait
 ///
 /// Features:
-/// - Per-saga FIFO ordering with advisory locks
+/// - Per-workflow FIFO ordering with advisory locks
 /// - Idempotency via UNIQUE(event_id)
 /// - Optimistic locking for state (version column)
 /// - Priority-based effect execution
@@ -64,8 +64,8 @@ impl Store for PostgresStore {
     }
 
     async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
-        // Per-saga FIFO with advisory locks
-        // pg_advisory_xact_lock ensures only one worker processes events for a saga at a time
+        // Per-workflow FIFO with advisory locks
+        // pg_advisory_xact_lock ensures only one worker processes events for a workflow at a time
         let row = sqlx::query!(
             r#"
             SELECT
@@ -366,11 +366,11 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn subscribe_saga_events(
+    async fn subscribe_workflow_events(
         &self,
         _correlation_id: Uuid,
-    ) -> Result<Box<dyn futures::Stream<Item = seesaw_core::SagaEvent> + Send + Unpin>> {
-        todo!("subscribe_saga_events not implemented in checked version")
+    ) -> Result<Box<dyn futures::Stream<Item = seesaw_core::WorkflowEvent> + Send + Unpin>> {
+        todo!("subscribe_workflow_events not implemented in checked version")
     }
 
     async fn get_workflow_status(

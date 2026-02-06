@@ -118,18 +118,18 @@ CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 
 ### 4. Ordering Semantics
 
-**Decision**: **Per-saga FIFO** with priority override.
+**Decision**: **Per-workflow FIFO** with priority override.
 
 **Guarantees**:
-- Events within a saga process in creation order (`created_at ASC`)
-- Priority can **reorder across sagas** but not within a saga
+- Events within a workflow process in creation order (`created_at ASC`)
+- Priority can **reorder across workflows** but not within a workflow
 - Reducers must be **commutative** if they depend on global state
 
 **Implementation**:
 ```sql
--- Worker query enforces per-saga FIFO with advisory locks
+-- Worker query enforces per-workflow FIFO with advisory locks
 SELECT
-    pg_advisory_xact_lock(hashtext(correlation_id::text)),  -- ← Lock saga for transaction
+    pg_advisory_xact_lock(hashtext(correlation_id::text)),  -- ← Lock workflow for transaction
     *
 FROM seesaw_events
 WHERE processed_at IS NULL
@@ -140,12 +140,12 @@ FOR UPDATE SKIP LOCKED;
 ```
 
 **How it works**:
-1. `pg_advisory_xact_lock(hash(correlation_id))` acquires per-saga lock for transaction duration
-2. Only one worker can process events from a given saga at a time
-3. Other workers skip locked sagas (via SKIP LOCKED) and grab events from different sagas
-4. Ensures strict per-saga FIFO ordering
+1. `pg_advisory_xact_lock(hash(correlation_id))` acquires per-workflow lock for transaction duration
+2. Only one worker can process events from a given workflow at a time
+3. Other workers skip locked workflows (via SKIP LOCKED) and grab events from different workflows
+4. Ensures strict per-workflow FIFO ordering
 
-**Non-Guarantee**: No **cross-saga** ordering. `saga_A.event_1` and `saga_B.event_1` may process in any order.
+**Non-Guarantee**: No **cross-workflow** ordering. `workflow_A.event_1` and `workflow_B.event_1` may process in any order.
 
 **Invariant**: If your reducer accesses global state (e.g., `total_orders++`), you need pessimistic locking or make it commutative.
 
@@ -242,7 +242,7 @@ CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 
 -- 2. Add correlation_id to effect_executions (efficient queries)
 ALTER TABLE seesaw_effect_executions ADD COLUMN correlation_id UUID NOT NULL;
-CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(correlation_id);
+CREATE INDEX idx_effect_executions_workflow ON seesaw_effect_executions(correlation_id);
 
 -- 3. Fix claimed_at default (should be NULL for pending rows)
 ALTER TABLE seesaw_effect_executions
@@ -270,7 +270,7 @@ DELETE FROM seesaw_events WHERE processed_at < NOW() - INTERVAL '30 days';
 | **State Semantics** | Effects see latest state only (no `prev_state`/`next_state`) |
 | **Atomicity** | Effect completion + event emission happen atomically |
 | **Idempotency** | `event_id` is unique, crash+retry safe |
-| **Ordering** | Per-saga FIFO, no cross-saga guarantees |
+| **Ordering** | Per-workflow FIFO, no cross-workflow guarantees |
 | **Ownership** | Runtime owns workers, queue is passive |
 | **Abstractions** | Concrete types (Postgres), no traits in v1 |
 | **Scale** | Control plane queue (500-1000 events/sec), not data plane |
@@ -352,7 +352,7 @@ External Event → engine.process() → Queue.publish()
 3. **Engine** - Business logic (reducers + effects)
    - Receives queue reference via dependency injection
    - Stateless and reusable
-4. **PostgresStateStore** - Per-saga state isolation with versioning (embedded in PostgresQueue)
+4. **PostgresStateStore** - Per-workflow state isolation with versioning (embedded in PostgresQueue)
 5. **Idempotency Layer** - seesaw_events.event_id + seesaw_effect_executions tables
 
 ### Effect Execution Model: Inline vs Queued
@@ -827,17 +827,17 @@ CREATE TABLE seesaw_events (
 -- Idempotency: prevent duplicate event_ids (webhooks, crash+retry)
 CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 
--- Per-saga FIFO with advisory locks (no separate priority index needed)
+-- Per-workflow FIFO with advisory locks (no separate priority index needed)
 CREATE INDEX idx_events_pending
 ON seesaw_events(created_at ASC)
 WHERE processed_at IS NULL;
 
 -- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
-CREATE OR REPLACE FUNCTION notify_saga_event()
+CREATE OR REPLACE FUNCTION notify_workflow_event()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify(
-        'seesaw_saga_' || NEW.correlation_id::text,
+        'seesaw_workflow_' || NEW.correlation_id::text,
         json_build_object(
             'event_type', NEW.event_type,
             'payload', NEW.payload
@@ -850,7 +850,7 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER seesaw_events_notify
     AFTER INSERT ON seesaw_events
     FOR EACH ROW
-    EXECUTE FUNCTION notify_saga_event();
+    EXECUTE FUNCTION notify_workflow_event();
 ```
 
 **Core methods**:
@@ -861,7 +861,7 @@ impl PostgresQueue {
     }
 
     async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
-        // Per-saga FIFO with advisory locks
+        // Per-workflow FIFO with advisory locks
         sqlx::query_as!(
             QueuedEvent,
             "SELECT
@@ -890,7 +890,7 @@ impl PostgresQueue {
 
 **Schema**:
 ```sql
--- State per saga
+-- State per workflow
 CREATE TABLE seesaw_state (
     correlation_id UUID PRIMARY KEY,
     state JSONB NOT NULL,
@@ -902,7 +902,7 @@ CREATE TABLE seesaw_state (
 CREATE TABLE seesaw_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
-    correlation_id UUID NOT NULL,  -- ← For efficient per-saga queries
+    correlation_id UUID NOT NULL,  -- ← For efficient per-workflow queries
     status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, executing, completed, failed
     result JSONB,
     error TEXT,
@@ -933,8 +933,8 @@ WHERE status = 'pending' AND execute_at <= NOW();
 -- Lookup effects by event (for debugging)
 CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
 
--- Lookup effects by saga (for per-saga queries)
-CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(correlation_id);
+-- Lookup effects by workflow (for per-workflow queries)
+CREATE INDEX idx_effect_executions_workflow ON seesaw_effect_executions(correlation_id);
 
 -- Retry monitoring (find failing effects)
 CREATE INDEX idx_effect_executions_status ON seesaw_effect_executions(status, attempts);
@@ -953,7 +953,7 @@ impl PostgresStateStore<S> {
 }
 ```
 
-**Deliverable**: Can load/save state per saga
+**Deliverable**: Can load/save state per workflow
 
 ### Phase 3: Two-Phase Worker Architecture (Week 3)
 
@@ -1297,7 +1297,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
 
 ##### 1. State Initialization Race
 
-**Problem**: First event for a saga → `SELECT ... FOR UPDATE` returns zero rows → crash
+**Problem**: First event for a workflow → `SELECT ... FOR UPDATE` returns zero rows → crash
 
 **Fix**: Initialize state before loading (lines 429-436):
 ```rust
@@ -1521,11 +1521,11 @@ tx.commit().await?;
 - Delayed effects persist across restarts
 - Each effect has its own timeout/retry configuration
 
-##### 5. Hot Saga Bottleneck
+##### 5. Hot Workflow Bottleneck
 
-**Problem**: `FOR UPDATE` lock serializes all events for same saga → throughput collapses under load
+**Problem**: `FOR UPDATE` lock serializes all events for same workflow → throughput collapses under load
 
-**Impact**: Cannot scale beyond ~10 events/sec per saga
+**Impact**: Cannot scale beyond ~10 events/sec per workflow
 
 **Solutions** (pick one):
 
@@ -1533,9 +1533,9 @@ tx.commit().await?;
 ```markdown
 ## Known Limitations
 
-**Per-Saga Throughput**: ~10 events/sec per saga due to serialization lock.
+**Per-Workflow Throughput**: ~10 events/sec per workflow due to serialization lock.
 
-If you have high-throughput sagas:
+If you have high-throughput workflows:
 - Partition work across multiple correlation_ids
 - Use correlation_id as sharding key
 ```
@@ -1745,7 +1745,7 @@ engine.publish_with_priority(SystemReset { ... }, priority: 1).await?;  // Jump 
 **Problem**: Loading multi-megabyte JSONB state on every effect → IO spike → system slowdown
 
 **Symptoms**:
-- Effect latency increases as saga progresses
+- Effect latency increases as workflow progresses
 - Database CPU spikes
 - Query time > 100ms for state load
 
@@ -1789,7 +1789,7 @@ effect::on::<GenerateInvoice>()
     });
 ```
 
-**Rule of thumb**: Keep `seesaw_state` under **10KB per saga**
+**Rule of thumb**: Keep `seesaw_state` under **10KB per workflow**
 - Under 1KB: Excellent (IDs, enums, small strings)
 - 1-10KB: Good (reasonable domain data)
 - 10-100KB: Warning (consider slimming)
@@ -1821,7 +1821,7 @@ LIMIT 10;
 - ✅ No stuck events (reaper)
 - ✅ No data loss (transactional effect intents)
 - ✅ Graceful deploys (shutdown handler)
-- ✅ Scalability documented (hot saga limitation)
+- ✅ Scalability documented (hot workflow limitation)
 - ✅ DLQ for failed events
 - ✅ Priority queue support
 
@@ -1891,7 +1891,7 @@ async fn main() -> Result<()> {
         // No correlation_id! Envelope carries it ✅
     });
 
-    info!("Started saga");
+    info!("Started workflow");
 
     // Keep running until shutdown signal
     tokio::signal::ctrl_c().await?;
@@ -1936,7 +1936,7 @@ async fn main() -> Result<()> {
 ### Multi-Day Workflow (Delayed Effects)
 
 ```rust
-// Day 1: Order placed - NEW saga
+// Day 1: Order placed - NEW workflow
 let correlation_id = engine.process(OrderPlaced {
     order_id: Uuid::new_v4(),
     customer_email: "user@example.com",
@@ -1968,7 +1968,7 @@ effect::on::<OrderPlaced>()
         Ok(ApprovalRequested { order_id: event.order_id })
     });
 
-// Day 3: Approval received via webhook - CONTINUE existing saga
+// Day 3: Approval received via webhook - CONTINUE existing workflow
 async fn handle_approval_webhook(order_id: Uuid) -> Result<()> {
     // Lookup correlation_id from your database
     let correlation_id = db.query!(
@@ -1976,8 +1976,8 @@ async fn handle_approval_webhook(order_id: Uuid) -> Result<()> {
         order_id
     ).fetch_one().await?.correlation_id;
 
-    // Process event in existing saga
-    engine.process_saga(correlation_id, || async move {
+    // Process event in existing workflow
+    engine.process_workflow(correlation_id, || async move {
         Ok(ApprovalReceived {
             order_id,
             // No correlation_id in event! ✅
@@ -2095,10 +2095,10 @@ let result = engine
 ```
 
 **How It Works**:
-1. `.wait()` subscribes to `LISTEN seesaw_saga_{correlation_id}` **before** publishing
+1. `.wait()` subscribes to `LISTEN seesaw_workflow_{correlation_id}` **before** publishing
 2. `process()` publishes event to queue
 3. Workers process event → reducers update state → effects run → terminal event emitted
-4. Trigger fires `NOTIFY seesaw_saga_{correlation_id}` with event payload
+4. Trigger fires `NOTIFY seesaw_workflow_{correlation_id}` with event payload
 5. `.wait()` receives notification, returns typed event
 6. ✅ State is guaranteed committed (terminal event = workflow done)
 
@@ -2107,7 +2107,7 @@ let result = engine
 **Works with Both Inline and Queued Effects**:
 - **Inline effects**: Terminal event emitted immediately during event processing
 - **Queued effects**: Terminal event emitted when effect worker completes execution
-- `.wait()` doesn't care - it just waits for ANY matching event on the saga
+- `.wait()` doesn't care - it just waits for ANY matching event on the workflow
 
 ```rust
 // Example: Wait for queued effect terminal event
@@ -2700,7 +2700,7 @@ queue.retry_from_dlq(event_id, "send_email").await?;
 
 ---
 
-### Saga Introspection APIs (Progress Tracking)
+### Workflow Introspection APIs (Progress Tracking)
 
 **Use Case**: Frontend progress indicators, admin dashboards, debugging
 
@@ -2708,10 +2708,10 @@ queue.retry_from_dlq(event_id, "send_email").await?;
 
 ```rust
 impl PostgresQueue {
-    // ============ Saga Progress Tracking ============
+    // ============ Workflow Progress Tracking ============
 
-    /// Get current state for a saga
-    pub async fn get_saga_state<S>(&self, correlation_id: Uuid) -> Result<Option<S>>
+    /// Get current state for a workflow
+    pub async fn get_workflow_state<S>(&self, correlation_id: Uuid) -> Result<Option<S>>
     where
         S: serde::de::DeserializeOwned,
     {
@@ -2728,8 +2728,8 @@ impl PostgresQueue {
         }
     }
 
-    /// Get all effect executions for a saga (detailed view)
-    pub async fn list_saga_effects(&self, correlation_id: Uuid) -> Result<Vec<EffectExecution>> {
+    /// Get all effect executions for a workflow (detailed view)
+    pub async fn list_workflow_effects(&self, correlation_id: Uuid) -> Result<Vec<EffectExecution>> {
         sqlx::query_as!(
             EffectExecution,
             "SELECT event_id, effect_id, status, execute_at,
@@ -2743,8 +2743,8 @@ impl PostgresQueue {
         .await
     }
 
-    /// Get saga summary (effect counts by status)
-    pub async fn get_saga_summary(&self, correlation_id: Uuid) -> Result<SagaSummary> {
+    /// Get workflow summary (effect counts by status)
+    pub async fn get_workflow_summary(&self, correlation_id: Uuid) -> Result<WorkflowSummary> {
         let row = sqlx::query!(
             "SELECT
                 COUNT(*) FILTER (WHERE status = 'pending') as pending,
@@ -2758,7 +2758,7 @@ impl PostgresQueue {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(SagaSummary {
+        Ok(WorkflowSummary {
             correlation_id,
             pending: row.pending.unwrap_or(0) as u32,
             executing: row.executing.unwrap_or(0) as u32,
@@ -2767,10 +2767,10 @@ impl PostgresQueue {
         })
     }
 
-    /// List all active sagas (have pending/executing effects)
-    pub async fn list_active_sagas(&self) -> Result<Vec<SagaInfo>> {
+    /// List all active workflows (have pending/executing effects)
+    pub async fn list_active_workflows(&self) -> Result<Vec<WorkflowInfo>> {
         sqlx::query_as!(
-            SagaInfo,
+            WorkflowInfo,
             "SELECT DISTINCT correlation_id,
                     MIN(execute_at) as started_at,
                     COUNT(*) as total_effects
@@ -2796,7 +2796,7 @@ pub struct EffectExecution {
     pub event_type: String,
 }
 
-pub struct SagaSummary {
+pub struct WorkflowSummary {
     pub correlation_id: Uuid,
     pub pending: u32,
     pub executing: u32,
@@ -2804,7 +2804,7 @@ pub struct SagaSummary {
     pub failed: u32,
 }
 
-pub struct SagaInfo {
+pub struct WorkflowInfo {
     pub correlation_id: Uuid,
     pub started_at: DateTime<Utc>,
     pub total_effects: i64,
@@ -2820,14 +2820,14 @@ async fn crawl_progress(
     queue: web::Data<Arc<PostgresQueue>>
 ) -> Result<Json<CrawlProgress>> {
     // Get effect summary (one efficient query)
-    let summary = queue.get_saga_summary(*correlation_id).await?;
+    let summary = queue.get_workflow_summary(*correlation_id).await?;
 
     // Get domain state
-    let state: CrawlState = queue.get_saga_state(*correlation_id).await?
-        .ok_or_else(|| anyhow!("Saga not found"))?;
+    let state: CrawlState = queue.get_workflow_state(*correlation_id).await?
+        .ok_or_else(|| anyhow!("Workflow not found"))?;
 
     // Get detailed effects if needed
-    let effects = queue.list_saga_effects(*correlation_id).await?;
+    let effects = queue.list_workflow_effects(*correlation_id).await?;
 
     Ok(Json(CrawlProgress {
         correlation_id: *correlation_id,
@@ -2865,21 +2865,21 @@ async fn crawl_progress(
 **Usage Example: Admin Dashboard**
 
 ```rust
-#[get("/admin/sagas")]
-async fn list_sagas(
+#[get("/admin/workflows")]
+async fn list_workflows(
     queue: web::Data<Arc<PostgresQueue>>
-) -> Result<Json<Vec<SagaListItem>>> {
-    let sagas = queue.list_active_sagas().await?;
+) -> Result<Json<Vec<WorkflowListItem>>> {
+    let workflows = queue.list_active_workflows().await?;
 
     let mut items = vec![];
-    for saga in sagas {
-        if let Some(state) = queue.get_saga_state::<CrawlState>(saga.correlation_id).await? {
-            items.push(SagaListItem {
-                correlation_id: saga.correlation_id,
+    for workflow in workflows {
+        if let Some(state) = queue.get_workflow_state::<CrawlState>(workflow.correlation_id).await? {
+            items.push(WorkflowListItem {
+                correlation_id: workflow.correlation_id,
                 website_url: state.website_url,
                 status: state.status,
-                started_at: saga.started_at,
-                total_effects: saga.total_effects,
+                started_at: workflow.started_at,
+                total_effects: workflow.total_effects,
             });
         }
     }
@@ -2979,12 +2979,12 @@ Total:              ~30-120ms
 ### Throughput
 
 **Single Worker**: ~10-100 events/sec (depends on effect logic)
-**4 Workers**: ~40-400 events/sec (aggregate across all sagas)
+**4 Workers**: ~40-400 events/sec (aggregate across all workflows)
 **Bottleneck**: Usually your business logic, not the queue
 
-**Per-Saga Limit**: ~10 events/sec per correlation_id (due to FOR UPDATE serialization)
-- Multiple sagas process in parallel
-- Single hot saga serializes on state lock
+**Per-Workflow Limit**: ~10 events/sec per correlation_id (due to FOR UPDATE serialization)
+- Multiple workflows process in parallel
+- Single hot workflow serializes on state lock
 - See Phase 3.5 #5 for mitigation strategies
 
 ### Scaling
@@ -3125,8 +3125,8 @@ DROP TABLE seesaw_events_2026_02_04;
 
 **Invariant**: At 1000+ eps, partitioning is **not optional**. Without it, VACUUM becomes the bottleneck within 2 weeks.
 
-#### 2. Hot Saga Bottleneck
-**Problem**: `FOR UPDATE` on single saga serializes all events for that user
+#### 2. Hot Workflow Bottleneck
+**Problem**: `FOR UPDATE` on single workflow serializes all events for that user
 **Solution**: Optimistic locking (Phase 3.5 #5 already documented)
 
 ```rust
@@ -3508,7 +3508,7 @@ Events/sec: ~115/sec (peak: 500/sec)
 
 Database:
 - Events table: ~500MB/day → 15GB/month
-- State table: ~100MB (100K active sagas)
+- State table: ~100MB (100K active workflows)
 - Effect executions: ~1GB/day → 30GB/month
 
 Workers:
@@ -3535,12 +3535,12 @@ Postgres:
 
 **Events are FIFO, Effects are Prioritized**
 
-The architecture enforces per-saga FIFO ordering for events to maintain causal consistency. Effects can be prioritized via the `priority` column in `seesaw_effect_executions`, but events always process in chronological order.
+The architecture enforces per-workflow FIFO ordering for events to maintain causal consistency. Effects can be prioritized via the `priority` column in `seesaw_effect_executions`, but events always process in chronological order.
 
 **Scenario**: 1000 events queued → SystemAlert arrives → SystemAlert waits behind 1000 events
 
 **Why this design**:
-- Per-saga FIFO prevents causality violations (can't process OrderShipped before OrderPlaced)
+- Per-workflow FIFO prevents causality violations (can't process OrderShipped before OrderPlaced)
 - Breaking FIFO requires complex dependency tracking and potential deadlocks
 - Most systems don't need event-level prioritization
 
@@ -3562,7 +3562,7 @@ Then modify the event worker polling query:
 ORDER BY priority DESC, created_at ASC  -- Higher priority first, then FIFO
 ```
 
-**Trade-off**: Priority breaks per-saga FIFO guarantees. Only add if you understand the consequences.
+**Trade-off**: Priority breaks per-workflow FIFO guarantees. Only add if you understand the consequences.
 
 **Recommendation**: Don't add priority until you actually hit the problem (zero users = no problem yet).
 
@@ -3590,18 +3590,18 @@ engine.process(OrderPlaced { id: 123, total: 99.99 }).await?;
 
 ---
 
-#### `process_saga(correlation_id, event)` - Saga Continuation
+#### `process_workflow(correlation_id, event)` - Workflow Continuation
 
 ```rust
 let correlation_id = Uuid::new_v4();
-engine.process_saga(correlation_id, OrderPlaced { ... }).await?;
-engine.process_saga(correlation_id, PaymentReceived { ... }).await?;
+engine.process_workflow(correlation_id, OrderPlaced { ... }).await?;
+engine.process_workflow(correlation_id, PaymentReceived { ... }).await?;
 ```
 
 **Use when**:
-- Continuing an existing saga/workflow
+- Continuing an existing workflow/workflow
 - Multiple events belong to the same logical workflow
-- You need per-saga state isolation
+- You need per-workflow state isolation
 
 **Behavior**:
 - Uses provided correlation_id (caller must generate or track it)
@@ -3655,7 +3655,7 @@ let result = dispatch_request(
 
 **Behavior**:
 - Processes event with `process()`
-- Subscribes to saga events via LISTEN/NOTIFY
+- Subscribes to workflow events via LISTEN/NOTIFY
 - Returns when matching terminal event arrives
 - Timeout after configured duration
 
@@ -3736,7 +3736,7 @@ engine.process(AnalyticsEvent::PageViewed { .. }).await?;
 
 **Implementation**:
 - `Engine::process()` returns `ProcessFuture`
-- `ProcessFuture::wait(closure)` subscribes to saga via LISTEN/NOTIFY
+- `ProcessFuture::wait(closure)` subscribes to workflow via LISTEN/NOTIFY
 - When event arrives, runs closure, keeps waiting if `None`
 - Returns when closure returns `Some(T)`
 - Timeout via `tokio::time::timeout`
@@ -4009,7 +4009,7 @@ impl ListingMutation {
 - Transactional Outbox (automatic via queue)
 - SKIP LOCKED (Postgres queue polling)
 - Inbox Pattern (ProcessedEvents table)
-- Per-Saga State Isolation (correlation_id partitioning)
+- Per-Workflow State Isolation (correlation_id partitioning)
 - Worker Pool (multiple consumers)
 
 ### Similar Systems

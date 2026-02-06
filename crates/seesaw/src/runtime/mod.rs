@@ -4,8 +4,8 @@ pub mod effect_worker;
 pub mod event_worker;
 
 use anyhow::Result;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -245,7 +245,10 @@ mod tests {
             Ok(())
         }
 
-        async fn get_workflow_status(&self, _correlation_id: Uuid) -> Result<crate::WorkflowStatus> {
+        async fn get_workflow_status(
+            &self,
+            _correlation_id: Uuid,
+        ) -> Result<crate::WorkflowStatus> {
             Ok(crate::WorkflowStatus {
                 correlation_id: _correlation_id,
                 state: None,
@@ -255,17 +258,17 @@ mod tests {
             })
         }
 
-        async fn subscribe_saga_events(
+        async fn subscribe_workflow_events(
             &self,
             _correlation_id: Uuid,
-        ) -> Result<Box<dyn Stream<Item = crate::SagaEvent> + Send + Unpin>> {
-            Ok(Box::new(futures::stream::empty::<crate::SagaEvent>()))
+        ) -> Result<Box<dyn Stream<Item = crate::WorkflowEvent> + Send + Unpin>> {
+            Ok(Box::new(futures::stream::empty::<crate::WorkflowEvent>()))
         }
     }
 
     #[tokio::test]
     async fn runtime_shutdown_stops_workers_cooperatively() {
-        let engine = crate::QueueEngine::<TestState, TestDeps, TestStore>::new(TestDeps, TestStore);
+        let engine = crate::Engine::<TestState, TestDeps, TestStore>::new(TestDeps, TestStore);
         let runtime = Runtime::start(
             &engine,
             RuntimeConfig {

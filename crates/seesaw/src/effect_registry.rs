@@ -101,10 +101,6 @@ where
         ctx: &EffectContext<S, D>,
         error_handler: Option<ErrorHandler<S, D>>,
     ) {
-        // Create a transient context - tasks here don't block settled()
-        // but ARE cancelled when the session settles or cancel() is called
-        let bg_ctx = ctx.transient();
-
         // Collect ready signals from effect background loops
         let mut ready_signals = Vec::new();
 
@@ -117,17 +113,12 @@ where
             let ctx = ctx.clone();
 
             // Call started on the foreground context BEFORE spawning the background loop.
-            // This ensures started() effects are tracked by settled().
-            // Errors from started() are propagated to settled().
             if effect.started.is_some() {
-                ctx.within({
-                    let effect = effect.clone();
-                    move |inner_ctx| async move {
-                        if let Some(ref started) = effect.started {
-                            started(inner_ctx).await
-                        } else {
-                            Ok(())
-                        }
+                let effect_clone = effect.clone();
+                let ctx_clone = ctx.clone();
+                tokio::spawn(async move {
+                    if let Some(ref started) = effect_clone.started {
+                        let _ = started(ctx_clone).await;
                     }
                 });
             }
@@ -139,16 +130,14 @@ where
             // Clone error handler for this effect's loop
             let err_handler_for_loop = error_handler.clone();
 
-            // Spawn on background TaskGroup - this tracks the JoinHandle
-            // so it gets aborted when cancel() is called or session settles
-            bg_ctx.within(move |_| {
-                async move {
+            // Spawn background task to listen for events
+            tokio::spawn(async move {
                     // Signal ready before entering the receive loop
                     let _ = ready_tx.send(());
 
                     // Listen for events until channel closes
                     while let Some(envelope) = rx.recv().await {
-                        // Get tracker BEFORE spawning handler - complete after spawn
+                        // Get tracker before handling; complete only after handler work is accounted.
                         let tracker = rx.current_tracker();
 
                         // Only handle if this effect cares about this event type
@@ -166,71 +155,72 @@ where
                                 event_id = ?event_id,
                             );
 
-                            envelope.ctx.within(move |handler_ctx| {
-                                async move {
-                                    // Clone event for error handling (before it's moved into handler)
-                                    let event_for_error = event.clone();
+                            let handler_ctx = envelope.ctx.clone();
+                            let run_result = {
+                                // Clone event for error handling (before it's moved into handler)
+                                let event_for_error = event.clone();
 
-                                    // Run effect handler
-                                    let result =
-                                        (effect.handler)(event, event_type, handler_ctx.clone())
-                                            .await;
+                                // Run effect handler
+                                let result =
+                                    (effect.handler)(event, event_type, handler_ctx.clone())
+                                        .instrument(span)
+                                        .await;
 
-                                    match result {
-                                        Ok(Some(output)) => {
-                                            // Effect returned an event, dispatch it
-                                            handler_ctx.emit_any(output.value, output.type_id);
-                                        }
-                                        Ok(None) => {
-                                            // Observer effect, no event to dispatch
-                                        }
-                                        Err(e) => {
-                                            let error_message = e.to_string();
+                                match result {
+                                    Ok(Some(output)) => {
+                                        // Effect returned an event, dispatch it
+                                        handler_ctx.emit_any(output.value, output.type_id);
+                                    }
+                                    Ok(None) => {
+                                        // Observer effect, no event to dispatch
+                                    }
+                                    Err(e) => {
+                                        let error_message = e.to_string();
 
-                                            // Effect error - isolate it so chain continues
-                                            // Capture error for settled() to return (backwards compatibility)
-                                            handler_ctx.capture_error_for_settled(&e);
+                                        // Effect error - isolate it so chain continues
+                                        // Convert error to EffectError event (preserves error for downcast)
+                                        let effect_error = crate::effect::EffectError::new(
+                                            event_for_error,
+                                            event_type,
+                                            e,
+                                        );
 
-                                            // Convert error to EffectError event (preserves error for downcast)
-                                            let effect_error = crate::effect::EffectError::new(
-                                                event_for_error,
+                                        // Dispatch EffectError using same path as Ok(Some(output))
+                                        let effect_error_output =
+                                            crate::effect::EventOutput::new(effect_error);
+                                        handler_ctx.emit_any(
+                                            effect_error_output.value,
+                                            effect_error_output.type_id,
+                                        );
+
+                                        // Note: on_error callback is now deprecated
+                                        // Error is emitted as EffectError event instead
+                                        if let Some(ref handler) = err_handler {
+                                            let callback_error =
+                                                anyhow::anyhow!(error_message);
+                                            // on_error is best-effort; callback panics must not break the chain.
+                                            let callback = handler(
+                                                callback_error,
                                                 event_type,
-                                                e,
+                                                handler_ctx,
                                             );
-
-                                            // Dispatch EffectError using same path as Ok(Some(output))
-                                            let effect_error_output =
-                                                crate::effect::EventOutput::new(effect_error);
-                                            handler_ctx.emit_any(
-                                                effect_error_output.value,
-                                                effect_error_output.type_id,
-                                            );
-
-                                            // Note: on_error callback is now deprecated
-                                            // Error is emitted as EffectError event instead
-                                            if let Some(ref handler) = err_handler {
-                                                let callback_error = anyhow::anyhow!(error_message);
-                                                // on_error is best-effort; callback panics must not break the chain.
-                                                let callback = handler(
-                                                    callback_error,
-                                                    event_type,
-                                                    handler_ctx,
-                                                );
-                                                let _ = std::panic::AssertUnwindSafe(callback)
-                                                    .catch_unwind()
-                                                    .await;
-                                            }
+                                            let _ = std::panic::AssertUnwindSafe(callback)
+                                                .catch_unwind()
+                                                .await;
                                         }
                                     }
-
-                                    Ok(())
                                 }
-                                .instrument(span)
-                            });
+
+                                Ok::<(), anyhow::Error>(())
+                            };
+
+                            if let Err(e) = run_result {
+                                tracing::warn!("effect handler task failed: {}", e);
+                            }
                         }
 
-                        // Complete tracker AFTER handler is spawned into TaskGroup.
-                        // This ensures send() doesn't return until handler is tracked.
+                        // Complete tracker after handler execution has been accounted for.
+                        // This provides natural backpressure under heavy load.
                         if let Some(t) = tracker {
                             t.complete_one();
                         }
@@ -239,20 +229,16 @@ where
 
                     // Decrement handler count when effect loop exits
                     handler_count.fetch_sub(1, Ordering::SeqCst);
-
-                    Ok(())
-                }
             });
         }
 
         // Spawn a task that waits for all effect loops to be ready
         // This ensures effects are receiving before any events can be emitted
         if !ready_signals.is_empty() {
-            ctx.within(move |_| async move {
+            tokio::spawn(async move {
                 for signal in ready_signals {
                     let _ = signal.await;
                 }
-                Ok(())
             });
         }
     }

@@ -246,8 +246,8 @@ async fn approve_website_sync(ctx: &Context, website_id: Uuid) -> Result<Website
     engine
         .process(WebsiteApprovalEvent::WebsiteApproved { website_id })
         .wait(|event| {
-            if let Some(saga_event) = event.downcast_ref::<SagaEvent>() {
-                match saga_event.event_type.as_str() {
+            if let Some(workflow_event) = event.downcast_ref::<WorkflowEvent>() {
+                match workflow_event.event_type.as_str() {
                     "CrawlCompleted" => Some(Ok(())),
                     "CrawlFailed" => Some(Err(anyhow!("Crawl failed"))),
                     _ => None  // Keep waiting

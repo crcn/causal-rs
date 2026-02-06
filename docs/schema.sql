@@ -3,7 +3,7 @@
 -- Last Updated: 2026-02-05
 --
 -- This schema is designed for millions of users at 1000+ events/sec
--- Features: Per-saga FIFO, idempotency, two-phase execution, table partitioning
+-- Features: Per-workflow FIFO, idempotency, two-phase execution, table partitioning
 
 -- ============================================================
 -- Core Tables
@@ -31,12 +31,12 @@ CREATE TABLE seesaw_events (
 -- For deterministic events, framework uses fixed timestamp to ensure idempotency
 CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id, created_at);
 
--- Per-saga FIFO with advisory locks (workers use this to poll)
+-- Per-workflow FIFO with advisory locks (workers use this to poll)
 CREATE INDEX idx_events_pending ON seesaw_events(created_at ASC)
 WHERE processed_at IS NULL;
 
--- Lookup events by saga (for introspection/debugging)
-CREATE INDEX idx_events_saga ON seesaw_events(correlation_id, created_at);
+-- Lookup events by workflow (for introspection/debugging)
+CREATE INDEX idx_events_workflow ON seesaw_events(correlation_id, created_at);
 
 -- Cleanup: Find old events for archival
 CREATE INDEX idx_events_cleanup ON seesaw_events(processed_at)
@@ -48,11 +48,11 @@ COMMENT ON COLUMN seesaw_events.correlation_id IS 'Envelope metadata - groups re
 
 -- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
 -- Enables engine.process(event).wait::<TerminalEvent>().await
-CREATE OR REPLACE FUNCTION notify_saga_event()
+CREATE OR REPLACE FUNCTION notify_workflow_event()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify(
-        'seesaw_saga_' || NEW.correlation_id::text,
+        'seesaw_workflow_' || NEW.correlation_id::text,
         json_build_object(
             'event_id', NEW.event_id,
             'correlation_id', NEW.correlation_id,
@@ -67,9 +67,9 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER seesaw_events_notify
     AFTER INSERT ON seesaw_events
     FOR EACH ROW
-    EXECUTE FUNCTION notify_saga_event();
+    EXECUTE FUNCTION notify_workflow_event();
 
-COMMENT ON FUNCTION notify_saga_event IS 'Push notification for wait() pattern - enables CQRS without polling';
+COMMENT ON FUNCTION notify_workflow_event IS 'Push notification for wait() pattern - enables CQRS without polling';
 
 -- Create initial partitions (daily partitions - must create before inserts)
 -- In production, automate partition creation (cron job or pg_partman)
@@ -85,7 +85,7 @@ FOR VALUES FROM ('2026-02-07') TO ('2026-02-08');
 -- Note: Create partitions 7 days ahead, drop partitions older than 30 days
 -- See docs/partitioning.md for automation scripts
 
--- State per saga (optimistic locking with version column)
+-- State per workflow (optimistic locking with version column)
 CREATE TABLE seesaw_state (
     correlation_id UUID PRIMARY KEY,
     state JSONB NOT NULL,             -- User's domain state (keep under 10KB!)
@@ -95,7 +95,7 @@ CREATE TABLE seesaw_state (
 
 CREATE INDEX idx_state_updated ON seesaw_state(updated_at DESC);
 
-COMMENT ON TABLE seesaw_state IS 'Per-saga state - loaded/saved by event workers, read by effect workers';
+COMMENT ON TABLE seesaw_state IS 'Per-workflow state - loaded/saved by event workers, read by effect workers';
 COMMENT ON COLUMN seesaw_state.state IS 'Keep under 10KB - store large blobs in S3, not here!';
 COMMENT ON COLUMN seesaw_state.version IS 'Incremented on each update - detects concurrent modifications';
 
@@ -109,7 +109,7 @@ CREATE TABLE seesaw_processed (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_processed_saga ON seesaw_processed(correlation_id);
+CREATE INDEX idx_processed_workflow ON seesaw_processed(correlation_id);
 CREATE INDEX idx_processed_completed ON seesaw_processed(completed_at DESC)
 WHERE completed_at IS NOT NULL;
 
@@ -123,7 +123,7 @@ CREATE TABLE seesaw_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, executing, completed, failed
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, executing, completed, failed (retryable)
     result JSONB,
     error TEXT,
     attempts INT NOT NULL DEFAULT 0,
@@ -153,11 +153,16 @@ CREATE INDEX idx_effect_executions_pending
 ON seesaw_effect_executions(priority ASC, execute_at ASC)
 WHERE status = 'pending';
 
+-- Retry polling for failed effects waiting for backoff expiry.
+CREATE INDEX idx_effect_executions_retry
+ON seesaw_effect_executions(priority ASC, execute_at ASC)
+WHERE status = 'failed';
+
 -- Lookup effects by event (for debugging)
 CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
 
--- Lookup effects by saga (for progress tracking)
-CREATE INDEX idx_effect_executions_saga ON seesaw_effect_executions(correlation_id);
+-- Lookup effects by workflow (for progress tracking)
+CREATE INDEX idx_effect_executions_workflow ON seesaw_effect_executions(correlation_id);
 
 -- Monitor failures
 CREATE INDEX idx_effect_executions_failed ON seesaw_effect_executions(status, attempts)
@@ -194,8 +199,8 @@ WHERE resolved_at IS NULL;
 CREATE INDEX idx_dlq_reason ON seesaw_dlq(reason, failed_at DESC)
 WHERE resolved_at IS NULL;
 
--- Find DLQ entries by saga
-CREATE INDEX idx_dlq_saga ON seesaw_dlq(correlation_id);
+-- Find DLQ entries by workflow
+CREATE INDEX idx_dlq_workflow ON seesaw_dlq(correlation_id);
 
 COMMENT ON TABLE seesaw_dlq IS 'Dead letter queue - effects that failed permanently';
 COMMENT ON COLUMN seesaw_dlq.reason IS 'Why it failed: failed (retry exhausted), timeout, infinite_loop';
@@ -454,10 +459,10 @@ COMMENT ON FUNCTION seesaw_create_next_partition IS 'Create partition 7 days ahe
 -- FROM seesaw_effect_executions
 -- WHERE completed_at > NOW() - INTERVAL '5 minutes';
 
--- Dashboard: Active sagas
--- SELECT COUNT(DISTINCT correlation_id) as active_sagas
+-- Dashboard: Active workflows
+-- SELECT COUNT(DISTINCT correlation_id) as active_workflows
 -- FROM seesaw_effect_executions
--- WHERE status IN ('pending', 'executing');
+-- WHERE status IN ('pending', 'executing', 'failed');
 
 -- Dashboard: Effect execution latency (p50, p95, p99)
 -- SELECT

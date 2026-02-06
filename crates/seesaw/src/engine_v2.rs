@@ -70,15 +70,15 @@ where
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
-        self.process_saga(Uuid::new_v4(), event)
+        self.process_workflow(Uuid::new_v4(), event)
     }
 
-    /// Process event with saga ID
-    pub fn process_saga<E>(&self, correlation_id: Uuid, event: E) -> ProcessFuture<St>
+    /// Process event with workflow ID
+    pub fn process_workflow<E>(&self, correlation_id: Uuid, event: E) -> ProcessFuture<St>
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
-        self.process_saga_with_id(Uuid::new_v4(), correlation_id, event)
+        self.process_workflow_with_id(Uuid::new_v4(), correlation_id, event)
     }
 
     /// Process event with external event ID (webhook idempotency)
@@ -101,11 +101,11 @@ where
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
-        self.process_saga_with_id(event_id, Uuid::new_v4(), event)
+        self.process_workflow_with_id(event_id, Uuid::new_v4(), event)
     }
 
-    /// Process event with event ID and saga ID (for idempotency)
-    pub fn process_saga_with_id<E>(
+    /// Process event with event ID and workflow ID (for idempotency)
+    pub fn process_workflow_with_id<E>(
         &self,
         event_id: Uuid,
         correlation_id: Uuid,

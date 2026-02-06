@@ -12,6 +12,10 @@ name = "seesaw-insight"
 path = "src/main.rs"
 
 [dependencies]
+# Seesaw core
+seesaw_core = { version = "0.8.2", path = "../seesaw" }
+seesaw-postgres = { version = "0.8.2", path = "../seesaw-postgres" }
+
 # Core
 anyhow = "1.0"
 tokio = { version = "1.43", features = ["full"] }

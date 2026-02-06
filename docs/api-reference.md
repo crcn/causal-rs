@@ -55,7 +55,7 @@ where
     // EXTERNAL EVENT PROCESSING (Public API)
     // ============================================================
 
-    /// Process an external event (new saga, generates event_id)
+    /// Process an external event (new workflow, generates event_id)
     ///
     /// Use this for: user actions, cron jobs, manual triggers
     /// Returns: correlation_id for the new workflow
@@ -68,7 +68,7 @@ where
     ///     amount: 99.99,
     /// }).await?;
     ///
-    /// println!("Started saga: {}", correlation_id);
+    /// println!("Started workflow: {}", correlation_id);
     /// ```
     pub async fn process(&self, event: impl Event) -> Result<Uuid>;
 
@@ -386,13 +386,13 @@ where
     // Envelope Metadata (From Queue)
     // ============================================================
 
-    /// Get saga ID (workflow identifier)
+    /// Get workflow ID (workflow identifier)
     ///
     /// All events emitted by this effect inherit this correlation_id.
     ///
     /// # Example
     /// ```rust
-    /// tracing::info!("Processing saga {}", ctx.correlation_id());
+    /// tracing::info!("Processing workflow {}", ctx.correlation_id());
     /// ```
     pub fn correlation_id(&self) -> Uuid;
 
@@ -599,28 +599,28 @@ impl PostgresQueue {
     ) -> Result<()>;
 
     // ============================================================
-    // Saga Introspection (Progress Tracking)
+    // Workflow Introspection (Progress Tracking)
     // ============================================================
 
-    /// Get current state for a saga
+    /// Get current state for a workflow
     ///
     /// # Example
     /// ```rust
-    /// let state: CrawlState = queue.get_saga_state(correlation_id).await?
-    ///     .ok_or_else(|| anyhow!("Saga not found"))?;
+    /// let state: CrawlState = queue.get_workflow_state(correlation_id).await?
+    ///     .ok_or_else(|| anyhow!("Workflow not found"))?;
     /// println!("Pages crawled: {}/{}", state.pages_crawled, state.pages_total);
     /// ```
-    pub async fn get_saga_state<S>(&self, correlation_id: Uuid) -> Result<Option<S>>
+    pub async fn get_workflow_state<S>(&self, correlation_id: Uuid) -> Result<Option<S>>
     where
         S: serde::de::DeserializeOwned;
 
-    /// Get all effect executions for a saga
+    /// Get all effect executions for a workflow
     ///
     /// Returns detailed information about each effect (status, attempts, errors).
     ///
     /// # Example
     /// ```rust
-    /// let effects = queue.list_saga_effects(correlation_id).await?;
+    /// let effects = queue.list_workflow_effects(correlation_id).await?;
     /// for effect in effects {
     ///     println!("{}: {} (attempts: {})",
     ///         effect.effect_id,
@@ -629,35 +629,35 @@ impl PostgresQueue {
     ///     );
     /// }
     /// ```
-    pub async fn list_saga_effects(&self, correlation_id: Uuid) -> Result<Vec<EffectExecution>>;
+    pub async fn list_workflow_effects(&self, correlation_id: Uuid) -> Result<Vec<EffectExecution>>;
 
-    /// Get saga summary (effect counts by status)
+    /// Get workflow summary (effect counts by status)
     ///
     /// Efficient single query that returns counts for pending, executing,
     /// completed, and failed effects.
     ///
     /// # Example
     /// ```rust
-    /// let summary = queue.get_saga_summary(correlation_id).await?;
+    /// let summary = queue.get_workflow_summary(correlation_id).await?;
     /// let progress = summary.completed as f64 /
     ///     (summary.completed + summary.pending + summary.executing) as f64;
     /// println!("Progress: {:.0}%", progress * 100.0);
     /// ```
-    pub async fn get_saga_summary(&self, correlation_id: Uuid) -> Result<SagaSummary>;
+    pub async fn get_workflow_summary(&self, correlation_id: Uuid) -> Result<WorkflowSummary>;
 
-    /// List all active sagas (have pending/executing effects)
+    /// List all active workflows (have pending/executing effects)
     ///
     /// Useful for admin dashboards and monitoring.
     ///
     /// # Example
     /// ```rust
-    /// let sagas = queue.list_active_sagas().await?;
-    /// println!("Active sagas: {}", sagas.len());
-    /// for saga in sagas {
-    ///     println!("  {} - {} effects", saga.correlation_id, saga.total_effects);
+    /// let workflows = queue.list_active_workflows().await?;
+    /// println!("Active workflows: {}", workflows.len());
+    /// for workflow in workflows {
+    ///     println!("  {} - {} effects", workflow.correlation_id, workflow.total_effects);
     /// }
     /// ```
-    pub async fn list_active_sagas(&self) -> Result<Vec<SagaInfo>>;
+    pub async fn list_active_workflows(&self) -> Result<Vec<WorkflowInfo>>;
 
     // ============================================================
     // Health Monitoring
@@ -999,7 +999,7 @@ effect::on::<OrderPlaced>()
 
 **No More**:
 - ❌ `process_with_priority()` - priority is on effects
-- ❌ `process_saga_with_priority()` - removed
+- ❌ `process_workflow_with_priority()` - removed
 - ❌ Engine DLQ methods - moved to Queue
 - ❌ `ctx.prev_state()` / `ctx.next_state()` - only latest state
 

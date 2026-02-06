@@ -1,6 +1,7 @@
 //! Seesaw Insight server binary
 
 use anyhow::Result;
+use seesaw_postgres::PostgresStore;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
 
@@ -13,8 +14,8 @@ async fn main() -> Result<()> {
         .init();
 
     // Get database URL from environment
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/seesaw".to_string());
+    let database_url =
+        env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/seesaw".to_string());
 
     // Connect to database
     let pool = PgPoolOptions::new()
@@ -23,6 +24,9 @@ async fn main() -> Result<()> {
         .await?;
 
     tracing::info!("Connected to database");
+
+    // Create PostgresStore
+    let store = PostgresStore::new(pool);
 
     // Get bind address from environment
     let addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
@@ -47,7 +51,7 @@ async fn main() -> Result<()> {
     }
 
     // Start server
-    seesaw_insight::serve(pool, &addr, static_dir.as_deref()).await?;
+    seesaw_insight::serve(store, &addr, static_dir.as_deref()).await?;
 
     Ok(())
 }

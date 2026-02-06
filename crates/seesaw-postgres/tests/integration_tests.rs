@@ -120,12 +120,12 @@ async fn test_idempotent_publish() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_per_saga_fifo_ordering() -> Result<()> {
+async fn test_per_workflow_fifo_ordering() -> Result<()> {
     let db = TestDb::new().await?;
 
     let correlation_id = Uuid::new_v4();
 
-    // Publish 3 events for same saga
+    // Publish 3 events for same workflow
     for i in 0..3 {
         let event = QueuedEvent {
             id: 0,
@@ -366,7 +366,8 @@ async fn test_save_and_load_state() -> Result<()> {
     assert_eq!(version, 1);
 
     // Load state
-    let (loaded, loaded_version): (TestState, i32) = db.store.load_state(correlation_id).await?.unwrap();
+    let (loaded, loaded_version): (TestState, i32) =
+        db.store.load_state(correlation_id).await?.unwrap();
 
     assert_eq!(loaded, state);
     assert_eq!(loaded_version, 1);
@@ -528,6 +529,65 @@ async fn test_complete_effect() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_fail_effect_schedules_retry() -> Result<()> {
+    let db = TestDb::new().await?;
+
+    let event_id = Uuid::new_v4();
+    let effect_id = "retry_effect".to_string();
+    let correlation_id = Uuid::new_v4();
+
+    db.store
+        .insert_effect_intent(
+            event_id,
+            effect_id.clone(),
+            correlation_id,
+            "TestEvent".to_string(),
+            serde_json::json!({}),
+            None,
+            Utc::now(),
+            30,
+            3,
+            10,
+        )
+        .await?;
+
+    let first = db
+        .store
+        .poll_next_effect()
+        .await?
+        .expect("effect should be polled");
+    assert_eq!(first.attempts, 1);
+
+    db.store
+        .fail_effect(
+            first.event_id,
+            first.effect_id.clone(),
+            "transient failure".to_string(),
+            first.attempts,
+        )
+        .await?;
+
+    let status = db.store.get_workflow_status(correlation_id).await?;
+    assert_eq!(status.pending_effects, 1);
+    assert!(!status.is_settled);
+
+    let immediate_retry = db.store.poll_next_effect().await?;
+    assert!(immediate_retry.is_none(), "retry should respect backoff");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+    let retried = db
+        .store
+        .poll_next_effect()
+        .await?
+        .expect("failed effect should be retried");
+    assert_eq!(retried.event_id, event_id);
+    assert_eq!(retried.effect_id, effect_id);
+    assert_eq!(retried.attempts, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_fail_and_dlq_effect() -> Result<()> {
     let db = TestDb::new().await?;
 
@@ -575,6 +635,32 @@ async fn test_fail_and_dlq_effect() -> Result<()> {
         .await?;
 
     assert_eq!(dlq_count, 1, "Effect should be in DLQ");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_workflow_status_uses_correlation_id_columns() -> Result<()> {
+    let db = TestDb::new().await?;
+
+    let correlation_id = Uuid::new_v4();
+    db.store
+        .publish(QueuedEvent {
+            id: 0,
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id,
+            event_type: "StatusEvent".to_string(),
+            payload: serde_json::json!({}),
+            hops: 0,
+            created_at: Utc::now(),
+        })
+        .await?;
+
+    let status = db.store.get_workflow_status(correlation_id).await?;
+    assert_eq!(status.correlation_id, correlation_id);
+    assert_eq!(status.pending_effects, 0);
+    assert_eq!(status.last_event, Some("StatusEvent".to_string()));
 
     Ok(())
 }
@@ -648,7 +734,8 @@ async fn test_complete_event_workflow() -> Result<()> {
         .await?;
 
     // 8. Verify final state
-    let (final_state, version): (TestState, i32) = db.store.load_state(correlation_id).await?.unwrap();
+    let (final_state, version): (TestState, i32) =
+        db.store.load_state(correlation_id).await?.unwrap();
     assert_eq!(final_state.count, 1);
     assert_eq!(version, 1);
 
@@ -656,10 +743,10 @@ async fn test_complete_event_workflow() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_concurrent_saga_processing() -> Result<()> {
+async fn test_concurrent_workflow_processing() -> Result<()> {
     let db = TestDb::new().await?;
 
-    // Create 3 different sagas, each with 3 events
+    // Create 3 different workflows, each with 3 events
     let correlation_ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
 
     for correlation_id in &correlation_ids {

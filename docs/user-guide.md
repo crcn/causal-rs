@@ -191,7 +191,7 @@ async fn create_order(
     engine: Arc<Engine<OrderState, Deps>>,
     db: &PgPool,
 ) -> Result<Json<OrderResponse>> {
-    // Start new saga
+    // Start new workflow
     let correlation_id = engine.process(|| async move {
         Ok(OrderPlaced {
             order_id: Uuid::new_v4(),
@@ -237,8 +237,8 @@ async fn handle_approval(
     .await?
     .correlation_id;
 
-    // Continue existing saga (state from Day 1 is still there!)
-    engine.process_saga(correlation_id, || async move {
+    // Continue existing workflow (state from Day 1 is still there!)
+    engine.process_workflow(correlation_id, || async move {
         Ok(ApprovalReceived {
             order_id: payload.order_id,
         })

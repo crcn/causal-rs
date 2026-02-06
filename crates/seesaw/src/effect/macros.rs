@@ -413,7 +413,6 @@ mod tests {
     }
 
     fn create_test_ctx() -> EffectContext<TestState, TestDeps> {
-        use crate::task_group::TaskGroup;
         use parking_lot::RwLock;
 
         struct NoopEmitter;
@@ -439,7 +438,6 @@ mod tests {
             live_state,
             Arc::new(TestDeps),
             Arc::new(NoopEmitter),
-            TaskGroup::new(),
         )
     }
 

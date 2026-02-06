@@ -13,7 +13,6 @@ use uuid::Uuid;
 use crate::effect::{EffectContext, EventEmitter};
 use crate::effect_registry::EffectRegistry;
 use crate::reducer_registry::ReducerRegistry;
-use crate::task_group::TaskGroup;
 use crate::{QueuedEvent, Store, NAMESPACE_SEESAW};
 
 struct BufferedEmitter<S, D>
@@ -122,7 +121,7 @@ where
     ///
     /// Returns true if event was processed, false if no events available
     async fn process_next_event(&self) -> Result<bool> {
-        // Poll next event (per-saga FIFO with advisory lock)
+        // Poll next event (per-workflow FIFO with advisory lock)
         let Some(event) = self.store.poll_next().await? else {
             return Ok(false);
         };
@@ -143,7 +142,7 @@ where
         let (typed_event, event_type_id) = self.decode_event(&event.event_type, &event.payload)?;
 
         info!(
-            "Processing event: type={}, saga={}, hops={}",
+            "Processing event: type={}, workflow={}, hops={}",
             event.event_type, event.correlation_id, event.hops
         );
 
@@ -194,7 +193,7 @@ where
             .await?;
 
         info!(
-            "State updated: saga={}, version={} -> {}",
+            "State updated: workflow={}, version={} -> {}",
             event.correlation_id, version, new_version
         );
 
@@ -216,13 +215,18 @@ where
                 .await?;
             } else {
                 let execute_at = match effect.delay {
-                    Some(delay) => chrono::Utc::now()
-                        + chrono::Duration::from_std(delay)
-                            .map_err(|_| anyhow::anyhow!("invalid queued effect delay"))?,
+                    Some(delay) => {
+                        chrono::Utc::now()
+                            + chrono::Duration::from_std(delay)
+                                .map_err(|_| anyhow::anyhow!("invalid queued effect delay"))?
+                    }
                     None => chrono::Utc::now(),
                 };
-                let timeout_seconds =
-                    effect.timeout.map(|d| d.as_secs() as i32).unwrap_or(30).max(1);
+                let timeout_seconds = effect
+                    .timeout
+                    .map(|d| d.as_secs() as i32)
+                    .unwrap_or(30)
+                    .max(1);
                 let max_attempts = effect.max_attempts as i32;
                 let priority = effect.priority.unwrap_or(10);
 
@@ -281,7 +285,6 @@ where
     ) -> Result<()> {
         let emissions: Arc<Mutex<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let tasks = TaskGroup::new();
         let emitter = Arc::new(BufferedEmitter::<S, D> {
             emissions: emissions.clone(),
             _marker: std::marker::PhantomData,
@@ -302,7 +305,6 @@ where
             live_state,
             self.deps.clone(),
             emitter,
-            tasks.clone(),
         );
 
         if let Some(output) = effect
@@ -312,7 +314,7 @@ where
             emissions.lock().push((output.type_id, output.value));
         }
 
-        tasks.wait_pending().await;
+        // tasks.wait_pending().await; // TODO: Re-enable when tasks tracking is implemented
         let drained = emissions.lock().drain(..).collect::<Vec<_>>();
         for (type_id, event_any) in drained {
             let codec = self
@@ -330,7 +332,11 @@ where
             })?;
             let event_id = Uuid::new_v5(
                 &NAMESPACE_SEESAW,
-                format!("{}-{}-{}", source_event.event_id, effect.id, codec.event_type).as_bytes(),
+                format!(
+                    "{}-{}-{}",
+                    source_event.event_id, effect.id, codec.event_type
+                )
+                .as_bytes(),
             );
             let created_at = source_event
                 .created_at
@@ -381,6 +387,11 @@ mod tests {
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct Incremented {
         amount: i32,
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct EffectOnlyEvent {
+        id: i32,
     }
 
     struct TestStore {
@@ -507,7 +518,10 @@ mod tests {
             Ok(())
         }
 
-        async fn get_workflow_status(&self, _correlation_id: Uuid) -> Result<crate::WorkflowStatus> {
+        async fn get_workflow_status(
+            &self,
+            _correlation_id: Uuid,
+        ) -> Result<crate::WorkflowStatus> {
             Ok(crate::WorkflowStatus {
                 correlation_id: _correlation_id,
                 state: None,
@@ -517,11 +531,11 @@ mod tests {
             })
         }
 
-        async fn subscribe_saga_events(
+        async fn subscribe_workflow_events(
             &self,
             _correlation_id: Uuid,
-        ) -> Result<Box<dyn Stream<Item = crate::SagaEvent> + Send + Unpin>> {
-            Ok(Box::new(futures::stream::empty::<crate::SagaEvent>()))
+        ) -> Result<Box<dyn Stream<Item = crate::WorkflowEvent> + Send + Unpin>> {
+            Ok(Box::new(futures::stream::empty::<crate::WorkflowEvent>()))
         }
     }
 
@@ -538,25 +552,35 @@ mod tests {
         }
     }
 
+    fn queued_effect_only_event() -> QueuedEvent {
+        QueuedEvent {
+            id: 8,
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: std::any::type_name::<EffectOnlyEvent>().to_string(),
+            payload: serde_json::json!({ "id": 42 }),
+            hops: 0,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn event_worker_applies_reducer_and_queues_non_inline_effect() {
         let event = queued_increment_event();
         let store = Arc::new(TestStore::new(vec![event.clone()]));
 
         let reducers = Arc::new(ReducerRegistry::new());
-        reducers.register(
-            crate::reducer::fold::<Increment>()
-                .into_queue(|state: TestState, event| TestState {
-                    count: state.count + event.amount,
-                }),
-        );
+        reducers.register(crate::reducer::fold::<Increment>().into_queue(
+            |state: TestState, event| TestState {
+                count: state.count + event.amount,
+            },
+        ));
 
         let effects = Arc::new(EffectRegistry::new());
-        let queued_effect = crate::effect::on::<Increment>()
-            .queued()
-            .then_queue(|_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async {
-                Ok(())
-            });
+        let queued_effect = crate::effect::on::<Increment>().queued().then_queue(
+            |_event: Arc<Increment>, _ctx: EffectContext<TestState, TestDeps>| async { Ok(()) },
+        );
         effects.register(queued_effect);
 
         let worker = EventWorker::new(
@@ -567,7 +591,10 @@ mod tests {
             EventWorkerConfig::default(),
         );
 
-        let processed = worker.process_next_event().await.expect("process should succeed");
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
         assert!(processed);
 
         let saved = store.saved_states.lock();
@@ -583,16 +610,14 @@ mod tests {
         let store = Arc::new(TestStore::new(vec![source.clone()]));
 
         let reducers = Arc::new(ReducerRegistry::new());
-        reducers.register(
-            crate::reducer::fold::<Increment>()
-                .into_queue(|state: TestState, event| TestState {
-                    count: state.count + event.amount,
-                }),
-        );
+        reducers.register(crate::reducer::fold::<Increment>().into_queue(
+            |state: TestState, event| TestState {
+                count: state.count + event.amount,
+            },
+        ));
         // Register codec for emitted event type so inline serialization can succeed.
         reducers.register(
-            crate::reducer::fold::<Incremented>()
-                .into_queue(|state: TestState, _| state),
+            crate::reducer::fold::<Incremented>().into_queue(|state: TestState, _| state),
         );
 
         let effects = Arc::new(EffectRegistry::new());
@@ -613,7 +638,10 @@ mod tests {
             EventWorkerConfig::default(),
         );
 
-        let processed = worker.process_next_event().await.expect("process should succeed");
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
         assert!(processed);
 
         let published = store.published_events.lock();
@@ -626,5 +654,40 @@ mod tests {
             emitted.event_type,
             std::any::type_name::<Incremented>().to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn event_worker_queues_typed_then_without_reducer_codec() {
+        let event = queued_effect_only_event();
+        let store = Arc::new(TestStore::new(vec![event.clone()]));
+
+        // No reducer for EffectOnlyEvent on purpose:
+        // this verifies queued().then() contributes the codec needed for decode.
+        let reducers = Arc::new(ReducerRegistry::new());
+
+        let effects = Arc::new(EffectRegistry::new());
+        effects.register(
+            crate::effect::on::<EffectOnlyEvent>().queued().then(
+                |_event: Arc<EffectOnlyEvent>, _ctx: EffectContext<TestState, TestDeps>| async {
+                    Ok(())
+                },
+            ),
+        );
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig::default(),
+        );
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+        assert_eq!(store.effect_intents.lock().len(), 1);
+        assert_eq!(*store.acked_ids.lock(), vec![event.id]);
     }
 }
