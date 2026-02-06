@@ -5,12 +5,14 @@
 
 use anyhow::Result;
 use seesaw_core::{effect, reducer, EffectContext, Engine};
+use seesaw_memory::MemoryStore;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Events (Facts)
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum FetchEvent {
     /// User requested URLs to be fetched
     FetchRequested { urls: Vec<String> },
@@ -36,7 +38,7 @@ enum FetchEvent {
 // State
 // ============================================================================
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct FetchState {
     urls_to_fetch: Vec<String>,
     success_count: usize,
@@ -59,6 +61,7 @@ struct Deps {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let store = MemoryStore::new();
     let deps = Deps {
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -66,7 +69,7 @@ async fn main() -> Result<()> {
     };
 
     // Define engine with closure-based effects and reducers
-    let engine = Engine::with_deps(deps)
+    let engine = Engine::new(deps, store)
         // Reducer - pure state transformation
         .with_reducer(
             reducer::fold::<FetchEvent>().into(|state: FetchState, event| match event {
@@ -179,13 +182,8 @@ async fn main() -> Result<()> {
         "https://httpbin.org/status/404".to_string(),
     ];
 
-    // Activate with initial state
-    let handle = engine.activate(FetchState::default());
-
-    // Process returns initial event and waits for all effects
-    handle
-        .process(|_| async move { Ok(FetchEvent::FetchRequested { urls }) })
-        .await?;
+    // Process the event directly
+    engine.process(FetchEvent::FetchRequested { urls }).await?;
 
     println!("\nAll fetches complete!");
 

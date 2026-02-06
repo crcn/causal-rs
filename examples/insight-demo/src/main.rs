@@ -13,7 +13,7 @@ use axum::{
 use seesaw_core::{
     effect, reducer,
     runtime::{Runtime, RuntimeConfig},
-    QueueEngine,
+    Engine,
 };
 use seesaw_memory::MemoryStore;
 use std::{sync::Arc, time::Duration};
@@ -70,7 +70,7 @@ struct Deps;
 
 // API handler to create new orders
 async fn create_order(
-    State(engine): State<Arc<QueueEngine<OrderState, Deps, MemoryStore>>>,
+    State(engine): State<Arc<Engine<OrderState, Deps, MemoryStore>>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
@@ -148,7 +148,7 @@ async fn toy_app() -> Html<&'static str> {
     <h1>🚀 Seesaw Demo</h1>
     <div class="info">
         <p>This is a live demo of the Seesaw event-driven runtime with in-memory store.</p>
-        <p>Click the button to create a new order workflow and watch it in the <a href="/insights">Insights Dashboard →</a></p>
+        <p>Click the button to create a new order workflow and watch it in the <a href="/">Insights Dashboard →</a></p>
     </div>
 
     <button class="button" onclick="createOrder()">Create Order</button>
@@ -174,7 +174,7 @@ async fn toy_app() -> Html<&'static str> {
                 status.innerHTML = `✅ Order created!<br>
                     Order ID: <code>${data.order_id}</code><br>
                     Total: $${data.total.toFixed(2)}<br>
-                    <a href="/insights">View in Insights Dashboard →</a>`;
+                    <a href="/">View in Insights Dashboard →</a>`;
             } catch (error) {
                 status.className = 'status error';
                 status.textContent = '❌ Failed to create order: ' + error.message;
@@ -204,7 +204,7 @@ async fn main() -> Result<()> {
     let store = MemoryStore::new();
     let deps = Deps;
 
-    let engine = QueueEngine::new(deps, store.clone())
+    let engine = Engine::new(deps, store.clone())
         .with_reducer(
             reducer::fold::<OrderEvent>().into_queue(|state: OrderState, event| match event {
                 OrderEvent::OrderValidated { .. } => OrderState {
@@ -366,12 +366,12 @@ async fn main() -> Result<()> {
     // Build unified server with proper state type handling
     let static_dir = Some("/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw-insight/static");
 
-    // Create insights app (will be nested at /insights)
-    let insights_app = seesaw_insight::web::app(store.clone(), static_dir, Some("/insights"));
+    // Create insights app at root (dashboard uses /assets which requires root mounting)
+    let insights_app = seesaw_insight::web::app(store.clone(), static_dir, None);
 
     // Create demo routes with their own state
     let demo_routes = Router::new()
-        .route("/", get(toy_app))
+        .route("/demo", get(toy_app))
         .route("/api/create-order", post(create_order))
         .with_state(engine.clone());
 
@@ -386,12 +386,12 @@ async fn main() -> Result<()> {
         .expect("Failed to bind port 3000");
 
     println!("\n📊 Server started on http://localhost:3000");
-    println!("   Toy App:   http://localhost:3000/");
-    println!("   Insights:  http://localhost:3000/insights");
+    println!("   Insights:  http://localhost:3000/ (main dashboard)");
+    println!("   Toy App:   http://localhost:3000/demo");
     println!("   API:       POST http://localhost:3000/api/create-order\n");
     println!("Features to try:");
     println!("  • Click 'Create Order' on the toy app");
-    println!("  • Watch workflows in real-time at /insights");
+    println!("  • Watch workflows in real-time at / (main dashboard)");
     println!("  • See event chains and effect execution\n");
     println!("Press Ctrl+C to stop...\n");
 

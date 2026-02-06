@@ -124,7 +124,7 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, state: WsState) {
                     debug!("WebSocket close message received");
                     break;
                 }
-                Message::Ping(data) => {
+                Message::Ping(_data) => {
                     debug!("WebSocket ping received");
                     // Pong is sent automatically by axum
                 }

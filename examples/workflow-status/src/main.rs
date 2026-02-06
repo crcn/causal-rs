@@ -6,7 +6,7 @@
 //! 3. Wait for terminal events (true completion)
 
 use anyhow::Result;
-use seesaw_core::{effect, reducer, EffectContext, QueueEngine, Store, WorkflowStatus};
+use seesaw_core::{effect, reducer, EffectContext, Engine, Store, WorkflowStatus};
 use seesaw_postgres::PostgresStore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
         inventory_service: InventoryService,
     };
 
-    let engine = QueueEngine::new(deps.clone(), store.clone())
+    let engine = Engine::new(deps.clone(), store.clone())
         // Reducer - track state
         .with_reducer(
             reducer::fold::<OrderEvent>().into(|mut state: OrderState, event| {

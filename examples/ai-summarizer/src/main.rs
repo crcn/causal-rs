@@ -5,6 +5,7 @@
 
 use anyhow::{bail, Result};
 use seesaw_core::{effect, reducer, EffectContext, Engine};
+use seesaw_memory::MemoryStore;
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -13,7 +14,7 @@ use uuid::Uuid;
 // Events (Facts)
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum SummaryEvent {
     /// User requested text to be summarized
     SummarizeRequested { task_id: Uuid, text: String },
@@ -33,7 +34,7 @@ enum SummaryEvent {
 // State
 // ============================================================================
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct SummaryState {
     summary: Option<String>,
     tokens_used: u32,
@@ -119,13 +120,14 @@ async fn main() -> Result<()> {
     let api_key =
         env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY environment variable required");
 
+    let store = MemoryStore::new();
     let deps = Deps {
         http_client: reqwest::Client::new(),
         api_key,
     };
 
     // Define engine with closure-based effects and reducers
-    let engine = Engine::with_deps(deps)
+    let engine = Engine::new(deps, store)
         // Reducer - pure state transformation
         .with_reducer(reducer::fold::<SummaryEvent>().into(
             |state: SummaryState, event| match event {
@@ -215,14 +217,11 @@ async fn main() -> Result<()> {
         lifetime of all references in a program during compilation.
     "#;
 
-    // Activate with initial state
-    let handle = engine.activate(SummaryState::default());
-
-    // Process returns initial event and waits for all effects
+    // Process the event directly
     let task_id = Uuid::new_v4();
     let text = text.to_string();
-    handle
-        .process(|_| async move { Ok(SummaryEvent::SummarizeRequested { task_id, text }) })
+    engine
+        .process(SummaryEvent::SummarizeRequested { task_id, text })
         .await?;
 
     println!("\nDone!");

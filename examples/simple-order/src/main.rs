@@ -8,10 +8,12 @@
 
 use anyhow::Result;
 use seesaw_core::{effect, reducer, EffectContext, Engine};
+use seesaw_memory::MemoryStore;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // Events - facts about what happened
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum OrderEvent {
     Placed { order_id: Uuid, total: f64 },
     Shipped { order_id: Uuid },
@@ -19,7 +21,7 @@ enum OrderEvent {
 }
 
 // State - accumulates as events flow
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 struct OrderState {
     total_orders: u32,
     total_revenue: f64,
@@ -60,10 +62,14 @@ fn place_order(order_id: Uuid, total: f64) -> OrderEvent {
 async fn main() -> Result<()> {
     println!("🚀 Simple Order Processing Example\n");
 
-    // 1. Define engine once (stateless, reusable)
-    let engine = Engine::with_deps(Deps {
+    // 1. Create store and deps
+    let store = MemoryStore::new();
+    let deps = Deps {
         shipping_enabled: true,
-    })
+    };
+
+    // 2. Define engine once (stateless, reusable)
+    let engine = Engine::new(deps, store)
     // Reducer - pure state transformation
     .with_reducer(
         reducer::fold::<OrderEvent>().into(|state: OrderState, event| match event {
@@ -112,24 +118,13 @@ async fn main() -> Result<()> {
     for i in 1..=3 {
         println!("--- Order #{} ---", i);
 
-        // Activate with initial state
-        let handle = engine.activate(OrderState::default());
-
-        // Process the edge function - returns event, waits for completion
+        // Process the event directly
         let order_id = Uuid::new_v4();
         let total = 99.99 * i as f64;
-        handle
-            .process(|_| async move { Ok(place_order(order_id, total)) })
-            .await?;
 
-        println!("✓ Order {} placed", order_id);
+        engine.process(place_order(order_id, total)).await?;
 
-        // Check final state
-        let final_state = handle.context.curr_state();
-        println!(
-            "✓ State: {} orders, ${:.2} revenue\n",
-            final_state.total_orders, final_state.total_revenue
-        );
+        println!("✓ Order {} placed and processed\n", order_id);
     }
 
     println!("🎉 All orders processed successfully!");
