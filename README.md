@@ -56,7 +56,7 @@ Closure → Event → Reducer → Effect → Event → Effect → ... (until set
 ## Quick Start
 
 ```rust
-use seesaw_core::{effect, reducer, Engine};
+use seesaw_core::{effect, reducer, Emit, Engine};
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
                 })
                 .then(|order_id, ctx| async move {
                     ctx.deps().shipping_api.ship(order_id).await?;
-                    Ok(OrderEvent::Shipped { order_id })
+                    Ok(Emit::One(OrderEvent::Shipped { order_id }))
                 })
         )
         // Effect that reacts to Shipped and returns Delivered
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                 })
                 .then(|order_id, ctx| async move {
                     ctx.deps().email_service.send(order_id, "Shipped!").await?;
-                    Ok(OrderEvent::Delivered { order_id })
+                    Ok(Emit::One(OrderEvent::Delivered { order_id }))
                 })
         );
 
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
 
     // Run logic - return event to dispatch
     let order_id = Uuid::new_v4();
-    handle.run(|_ctx| Ok(OrderEvent::Placed { order_id, total: 99.99 }))?;
+    handle.run(|_ctx| Ok(Emit::One(OrderEvent::Placed { order_id, total: 99.99 })))?;
 
     // Wait for all effects to complete
     handle.settled().await?;
@@ -181,10 +181,10 @@ effect::on::<UserEvent>()
             Ok(user)
         }).await?;
 
-        Ok(UserEvent::SignedUp {
+        Ok(Emit::One(UserEvent::SignedUp {
             user_id: user.id,
             email,
-        })
+        }))
     })
 
 // Effect with filter_map (combines filter + destructure)
@@ -198,7 +198,7 @@ effect::on::<CrawlEvent>()
     .then(|(website_id, job_id, page_ids), ctx| async move {
         // Handler receives extracted fields directly!
         ctx.deps().extract(website_id, job_id, page_ids).await?;
-        Ok(CrawlEvent::Extracted { website_id, job_id })
+        Ok(Emit::One(CrawlEvent::Extracted { website_id, job_id }))
     })
 
 // Effect with state transition guard
@@ -207,19 +207,19 @@ effect::on::<StatusEvent>()
     .then(|event, ctx| async move {
         // Only runs when status actually changed
         ctx.deps().notify_status_change(&event).await?;
-        Ok(StatusEvent::Notified { id: event.id })
+        Ok(Emit::One(StatusEvent::Notified { id: event.id }))
     })
 
-// Observer effect - returns () to dispatch nothing
+// Observer effect - returns Emit::None to dispatch nothing
 effect::on::<OrderEvent>().then(|event, ctx| async move {
     ctx.deps().logger.log(&event);
-    Ok(())  // No event dispatched
+    Ok(Emit::None)  // No event dispatched
 })
 
 // Observe ALL events
 effect::on_any().then(|event, ctx| async move {
     ctx.deps().metrics.track(event.type_id);
-    Ok(())
+    Ok(Emit::None)
 })
 ```
 
@@ -239,13 +239,13 @@ let effects = on! {
             website_id,
             parent_job_id: job_id,
         }).await?;
-        Ok(CrawlEvent::ExtractJobEnqueued { website_id })
+        Ok(Emit::One(CrawlEvent::ExtractJobEnqueued { website_id }))
     },
 
     // Single variant
     CrawlEvent::PostsExtractedFromPages { website_id, posts, .. } => |ctx| async move {
         ctx.deps().jobs.enqueue(SyncPostsJob { website_id, posts }).await?;
-        Ok(CrawlEvent::SyncJobEnqueued { website_id })
+        Ok(Emit::One(CrawlEvent::SyncJobEnqueued { website_id }))
     },
 };
 
@@ -266,20 +266,20 @@ effect::on::<PaymentRequested>()
     .priority(1)                         // Higher priority (lower = higher)
     .then(|event, ctx| async move {
         ctx.deps().stripe.charge(&event).await?;
-        Ok(PaymentCharged { order_id: event.order_id })
+        Ok(Emit::One(PaymentCharged { order_id: event.order_id }))
     });
 
 // Delayed execution
 effect::on::<OrderPlaced>()
     .delayed(Duration::from_secs(3600))  // Run 1 hour later
     .then(|event, ctx| async move {
-        Ok(FollowupSent { order_id: event.order_id })
+        Ok(Emit::One(FollowupSent { order_id: event.order_id }))
     });
 
 // Force queued execution
 effect::on::<AnalyticsEvent>()
     .queued()  // Execute in background worker
-    .then(|event, ctx| async move { Ok(()) });
+    .then(|event, ctx| async move { Ok(Emit::None) });
 ```
 
 **Configuration methods:**
@@ -297,7 +297,7 @@ effect::on::<AnalyticsEvent>()
 Key properties:
 
 - **Closure-based**: No trait implementations required
-- **Return events**: Effects return `Ok(Event)` to dispatch, or `Ok(())` to dispatch nothing
+- **Return events**: Effects return `Ok(Emit::One(event))`, `Ok(Emit::Batch(vec![...]))`, or `Ok(Emit::None)`
 - **Access state**: Via `ctx.prev_state()`, `ctx.next_state()`, and `ctx.curr_state()`
 - **Filter + map**: Use `.extract()` to filter and extract fields in one step
 - **Multi-variant matching**: Use `on!` macro for ergonomic enum variant handling
