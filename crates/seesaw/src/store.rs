@@ -27,6 +27,8 @@ pub struct QueuedEvent {
     pub payload: serde_json::Value,
     /// Hop count (for infinite loop detection)
     pub hops: i32,
+    /// Retry count (for inline effect failure tracking)
+    pub retry_count: i32,
     /// Batch identifier for same-batch fan-in semantics.
     pub batch_id: Option<Uuid>,
     /// Position inside a batch (0-based).

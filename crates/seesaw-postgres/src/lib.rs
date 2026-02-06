@@ -60,6 +60,7 @@ struct EventRow {
     event_type: String,
     payload: serde_json::Value,
     hops: i32,
+    retry_count: i32,
     batch_id: Option<Uuid>,
     batch_index: Option<i32>,
     batch_size: Option<i32>,
@@ -132,10 +133,10 @@ impl Store for PostgresStore {
 
         sqlx::query(
             "INSERT INTO seesaw_events (
-                event_id, parent_id, correlation_id, event_type, payload, hops,
+                event_id, parent_id, correlation_id, event_type, payload, hops, retry_count,
                 batch_id, batch_index, batch_size, created_at
              )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(event.event_id)
         .bind(event.parent_id)
@@ -143,6 +144,7 @@ impl Store for PostgresStore {
         .bind(event.event_type)
         .bind(event.payload)
         .bind(event.hops)
+        .bind(event.retry_count)
         .bind(event.batch_id)
         .bind(event.batch_index)
         .bind(event.batch_size)
@@ -181,7 +183,7 @@ impl Store for PostgresStore {
             FROM next_event
             WHERE e.id = next_event.id
             RETURNING e.id, e.event_id, e.parent_id, e.correlation_id, e.event_type, e.payload,
-                      e.hops, e.batch_id, e.batch_index, e.batch_size, e.created_at",
+                      e.hops, e.retry_count, e.batch_id, e.batch_index, e.batch_size, e.created_at",
         )
         .bind(EVENT_CLAIM_SECONDS)
         .fetch_optional(&self.pool)
@@ -195,6 +197,7 @@ impl Store for PostgresStore {
             event_type: r.event_type,
             payload: r.payload,
             hops: r.hops,
+            retry_count: r.retry_count,
             batch_id: r.batch_id,
             batch_index: r.batch_index,
             batch_size: r.batch_size,
@@ -1591,6 +1594,7 @@ mod tests {
             event_type: "OrphanEvent".to_string(),
             payload: serde_json::json!({"ok": true}),
             hops: 1,
+            retry_count: 0,
             batch_id: None,
             batch_index: None,
             batch_size: None,

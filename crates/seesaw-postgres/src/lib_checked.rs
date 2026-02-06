@@ -45,9 +45,9 @@ impl Store for PostgresStore {
     async fn publish(&self, event: QueuedEvent) -> Result<()> {
         sqlx::query!(
             "INSERT INTO seesaw_events (
-                event_id, parent_id, correlation_id, event_type, payload, hops, created_at
+                event_id, parent_id, correlation_id, event_type, payload, hops, retry_count, created_at
              )
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (event_id, created_at) DO NOTHING",
             event.event_id,
             event.parent_id,
@@ -55,6 +55,7 @@ impl Store for PostgresStore {
             event.event_type,
             event.payload,
             event.hops,
+            event.retry_count,
             event.created_at
         )
         .execute(&self.pool)
@@ -70,7 +71,7 @@ impl Store for PostgresStore {
             r#"
             SELECT
                 pg_advisory_xact_lock(hashtext(correlation_id::text)),
-                id, event_id, parent_id, correlation_id, event_type, payload, hops, created_at
+                id, event_id, parent_id, correlation_id, event_type, payload, hops, retry_count, created_at
             FROM seesaw_events
             WHERE processed_at IS NULL
               AND (locked_until IS NULL OR locked_until < NOW())
@@ -91,6 +92,10 @@ impl Store for PostgresStore {
                 event_type: r.event_type,
                 payload: r.payload,
                 hops: r.hops,
+                retry_count: r.retry_count,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
                 created_at: r.created_at,
             })),
             None => Ok(None),

@@ -43,6 +43,8 @@ pub struct EventWorkerConfig {
     pub max_hops: i32,
     /// Maximum number of events an effect may emit in one batch
     pub max_batch_size: usize,
+    /// Maximum retry count for event-level failures in inline processing path
+    pub max_inline_retry_attempts: i32,
 }
 
 impl Default for EventWorkerConfig {
@@ -51,6 +53,7 @@ impl Default for EventWorkerConfig {
             poll_interval: Duration::from_millis(100),
             max_hops: 50,
             max_batch_size: 10_000,
+            max_inline_retry_attempts: 3,
         }
     }
 }
@@ -167,6 +170,25 @@ where
                     error,
                     "infinite_loop".to_string(),
                     event.hops,
+                )
+                .await?;
+            self.store.ack(event.id).await?;
+            return Ok(());
+        }
+
+        if event.retry_count >= self.config.max_inline_retry_attempts {
+            warn!(
+                "Event exceeded max retry attempts ({}), sending to DLQ: event_id={}",
+                self.config.max_inline_retry_attempts, event.event_id
+            );
+            let error = format!("Event failed after {} retry attempts", event.retry_count);
+            self.store
+                .dlq_effect(
+                    event.event_id,
+                    "__inline_effect_retry_exhausted__".to_string(),
+                    error,
+                    "max_retries_exceeded".to_string(),
+                    event.retry_count,
                 )
                 .await?;
             self.store.ack(event.id).await?;
@@ -423,6 +445,7 @@ where
                     event_type: codec.event_type.clone(),
                     payload,
                     hops: source_event.hops + 1,
+                    retry_count: 0,
                     batch_id,
                     batch_index,
                     batch_size,
@@ -485,6 +508,7 @@ mod tests {
         queued_events: Mutex<VecDeque<QueuedEvent>>,
         acked_ids: Mutex<Vec<i64>>,
         nacked_ids: Mutex<Vec<i64>>,
+        dlqed: Mutex<Vec<(Uuid, String, String, String, i32)>>,
         saved_states: Mutex<Vec<serde_json::Value>>,
         effect_intents: Mutex<Vec<(String, Option<Uuid>, Option<i32>, Option<i32>)>>,
         published_events: Mutex<Vec<QueuedEvent>>,
@@ -496,6 +520,7 @@ mod tests {
                 queued_events: Mutex::new(queued_events.into()),
                 acked_ids: Mutex::new(Vec::new()),
                 nacked_ids: Mutex::new(Vec::new()),
+                dlqed: Mutex::new(Vec::new()),
                 saved_states: Mutex::new(Vec::new()),
                 effect_intents: Mutex::new(Vec::new()),
                 published_events: Mutex::new(Vec::new()),
@@ -601,12 +626,15 @@ mod tests {
 
         async fn dlq_effect(
             &self,
-            _event_id: Uuid,
-            _effect_id: String,
-            _error: String,
-            _reason: String,
-            _attempts: i32,
+            event_id: Uuid,
+            effect_id: String,
+            error: String,
+            reason: String,
+            attempts: i32,
         ) -> Result<()> {
+            self.dlqed
+                .lock()
+                .push((event_id, effect_id, error, reason, attempts));
             Ok(())
         }
 
@@ -640,6 +668,7 @@ mod tests {
             event_type: std::any::type_name::<Increment>().to_string(),
             payload: serde_json::json!({ "amount": 2 }),
             hops: 0,
+            retry_count: 0,
             batch_id: None,
             batch_index: None,
             batch_size: None,
@@ -656,6 +685,7 @@ mod tests {
             event_type: std::any::type_name::<EffectOnlyEvent>().to_string(),
             payload: serde_json::json!({ "id": 42 }),
             hops: 0,
+            retry_count: 0,
             batch_id: None,
             batch_index: None,
             batch_size: None,
@@ -788,6 +818,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_worker_dlqs_when_inline_retry_limit_is_reached() {
+        let mut event = queued_effect_only_event();
+        event.retry_count = 3;
+        let store = Arc::new(TestStore::new(vec![event.clone()]));
+        let reducers = Arc::new(ReducerRegistry::<TestState>::new());
+        let effects = Arc::new(EffectRegistry::<TestState, TestDeps>::new());
+
+        let worker = EventWorker::new(
+            store.clone(),
+            Arc::new(TestDeps),
+            reducers,
+            effects,
+            EventWorkerConfig {
+                max_inline_retry_attempts: 3,
+                ..EventWorkerConfig::default()
+            },
+        );
+
+        let processed = worker
+            .process_next_event()
+            .await
+            .expect("process should succeed");
+        assert!(processed);
+        assert_eq!(*store.acked_ids.lock(), vec![event.id]);
+        assert!(store.nacked_ids.lock().is_empty());
+
+        let dlqed = store.dlqed.lock();
+        assert_eq!(dlqed.len(), 1);
+        assert_eq!(dlqed[0].0, event.event_id);
+        assert_eq!(dlqed[0].1, "__inline_effect_retry_exhausted__");
+        assert_eq!(dlqed[0].3, "max_retries_exceeded");
+        assert_eq!(dlqed[0].4, 3);
+        assert!(dlqed[0].2.contains("failed after 3 retry attempts"));
+    }
+
+    #[tokio::test]
     async fn event_worker_inline_batch_emit_stress_generates_unique_ids_and_batch_metadata() {
         let source = QueuedEvent {
             id: 99,
@@ -797,6 +863,7 @@ mod tests {
             event_type: std::any::type_name::<FanOut>().to_string(),
             payload: serde_json::json!(FanOut { count: 256 }),
             hops: 0,
+            retry_count: 0,
             batch_id: None,
             batch_index: None,
             batch_size: None,
@@ -867,6 +934,7 @@ mod tests {
             event_type: std::any::type_name::<FanOut>().to_string(),
             payload: serde_json::json!(FanOut { count: 256 }),
             hops: 0,
+            retry_count: 0,
             batch_id: None,
             batch_index: None,
             batch_size: None,
@@ -933,6 +1001,7 @@ mod tests {
                 marker: "in".to_string(),
             }),
             hops: 0,
+            retry_count: 0,
             batch_id: Some(incoming_batch_id),
             batch_index: Some(7),
             batch_size: Some(42),
@@ -986,6 +1055,7 @@ mod tests {
             event_type: std::any::type_name::<Increment>().to_string(),
             payload: serde_json::json!({ "amount": 1 }),
             hops: 0,
+            retry_count: 0,
             batch_id: Some(Uuid::new_v4()),
             batch_index: Some(3),
             batch_size: Some(10),
