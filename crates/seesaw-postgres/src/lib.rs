@@ -40,6 +40,21 @@ impl PostgresStore {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Check if an event has already been processed (for idempotency).
+    ///
+    /// This is used by the Kafka backend to prevent duplicate processing
+    /// when Kafka redelivers messages.
+    pub async fn is_processed(&self, event_id: Uuid) -> Result<bool> {
+        let result: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM seesaw_processed WHERE event_id = $1)"
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(result)
+    }
 }
 
 impl Clone for PostgresStore {

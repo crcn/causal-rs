@@ -11,6 +11,7 @@ members = [
     "crates/seesaw-postgres",
     "crates/seesaw-insight",
     "crates/seesaw-memory",
+    "crates/seesaw-kafka",
 ]
 resolver = "2"
 
