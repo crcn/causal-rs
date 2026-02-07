@@ -33,6 +33,7 @@
 extern crate self as seesaw_core;
 
 // New module structure
+pub mod backend;
 pub mod dead_letter_queue;
 pub mod distributed_safe;
 pub mod handler;
@@ -47,9 +48,18 @@ mod handler_registry;
 mod process;
 
 // Re-export main types
+pub use backend::{Backend, BackendServeConfig, DispatchedEvent};
+pub use backend::capability::{
+    DeadLetter as DlqDeadLetter, DeadLetterQueueBackend, DlqFilters, InsightBackend, InsightStats as BackendInsightStats,
+    TreeNode, WorkflowStatusBackend, WorkflowSubscriptionBackend, WorkflowTree as BackendWorkflowTree,
+};
+pub use backend::job_executor::{
+    EventProcessingCommit as JobEventProcessingCommit, HandlerExecutionResult, HandlerStatus,
+    InlineHandlerFailure as JobInlineHandlerFailure, JobExecutor,
+};
 pub use dead_letter_queue::{DeadLetter, DeadLetterQueue, DlqStats, DlqStatus, RetrySummary};
 pub use distributed_safe::DistributedSafe;
-pub use engine_v2::{Engine, EngineBackend};
+pub use engine_v2::Engine;
 pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Handler, HandlerError, JoinMode,
 };
@@ -57,13 +67,17 @@ pub use insight::{
     EventNode, HandlerNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,
 };
 pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
-pub use queue_backend::{QueueBackend, StoreQueueBackend};
-pub use runtime::{Runtime, RuntimeConfig};
+pub use runtime::Runtime;
 pub use store::{
     EmittedEvent, EventProcessingCommit, ExpiredJoinWindow, InlineHandlerFailure, JoinEntry,
     QueuedEvent, QueuedHandlerExecution, QueuedHandlerIntent, Store, WorkflowEvent, WorkflowStatus,
     NAMESPACE_SEESAW,
 };
+
+// Legacy exports (still needed internally by examples/postgres backend)
+pub use queue_backend::{QueueBackend, StoreQueueBackend};
+pub use runtime::event_worker::EventWorkerConfig;
+pub use runtime::handler_worker::HandlerWorkerConfig;
 
 // Top-level builder functions
 pub use handler::{on, on_any};

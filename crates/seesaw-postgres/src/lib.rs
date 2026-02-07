@@ -1414,7 +1414,7 @@ impl InsightStore for PostgresStore {
         Ok(Box::new(stream))
     }
 
-    async fn get_workflow_tree(&self, correlation_id: Uuid) -> Result<WorkflowTree> {
+    async fn get_workflow_tree(&self, correlation_id: Uuid) -> Result<seesaw_core::WorkflowTree> {
         // Get all events for this correlation
         let events = sqlx::query_as::<_, EventRow>(
             "SELECT id, event_id, parent_id, correlation_id, event_type, payload, hops,
@@ -1443,7 +1443,7 @@ impl InsightStore for PostgresStore {
         let event_ids: HashSet<Uuid> = events.iter().map(|event| event.event_id).collect();
         let roots = build_event_tree(&events, &effects, None, &event_ids, true);
 
-        Ok(WorkflowTree {
+        Ok(seesaw_core::WorkflowTree {
             correlation_id,
             roots,
             event_count: events.len(),
@@ -1451,7 +1451,7 @@ impl InsightStore for PostgresStore {
         })
     }
 
-    async fn get_stats(&self) -> Result<InsightStats> {
+    async fn get_stats(&self) -> Result<seesaw_core::InsightStats> {
         let total_events = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM seesaw_events")
             .fetch_one(&self.pool)
             .await?
@@ -1479,7 +1479,7 @@ impl InsightStore for PostgresStore {
         .await?
         .0;
 
-        Ok(InsightStats {
+        Ok(seesaw_core::InsightStats {
             total_events,
             active_effects,
             completed_effects,
@@ -1781,6 +1781,367 @@ fn build_event_tree(
             }
         })
         .collect()
+}
+
+// ============================================================================
+// PostgresBackend - v0.11.0 Backend trait implementation
+// ============================================================================
+
+use seesaw_core::backend::{Backend, BackendServeConfig, DispatchedEvent};
+use seesaw_core::backend::capability::*;
+use seesaw_core::backend::job_executor::JobExecutor;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
+
+/// PostgreSQL implementation of Backend trait (v0.11.0).
+///
+/// Wraps PostgresStore internally and implements the new Backend interface.
+pub struct PostgresBackend {
+    store: PostgresStore,
+}
+
+impl PostgresBackend {
+    /// Create new PostgresBackend from connection pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            store: PostgresStore::new(pool),
+        }
+    }
+
+    /// Get reference to underlying pool.
+    pub fn pool(&self) -> &PgPool {
+        self.store.pool()
+    }
+}
+
+impl Clone for PostgresBackend {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl Backend for PostgresBackend {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
+    async fn publish(&self, event: DispatchedEvent) -> Result<()> {
+        let queued_event = QueuedEvent {
+            id: 0, // Will be assigned by database
+            event_id: event.event_id,
+            parent_id: event.parent_id,
+            correlation_id: event.correlation_id,
+            event_type: event.event_type,
+            payload: event.payload,
+            hops: event.hops,
+            retry_count: event.retry_count,
+            batch_id: event.batch_id,
+            batch_index: event.batch_index,
+            batch_size: event.batch_size,
+            created_at: event.created_at,
+        };
+
+        self.store.publish(queued_event).await
+    }
+
+    async fn serve<D>(
+        &self,
+        executor: Arc<JobExecutor<D>>,
+        config: BackendServeConfig,
+        shutdown: CancellationToken,
+    ) -> Result<()>
+    where
+        D: Send + Sync + 'static,
+    {
+        use seesaw_core::backend::job_executor::{EventProcessingCommit as JobCommit, HandlerStatus};
+        use tokio::time::sleep;
+
+        let mut handles = Vec::new();
+
+        // Spawn event workers
+        for i in 0..config.event_workers {
+            let backend = self.clone();
+            let store = self.store.clone();
+            let executor = executor.clone();
+            let config = config.event_worker.clone();
+            let shutdown = shutdown.clone();
+
+            let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+                tracing::info!("Event worker {} started", i);
+
+                while !shutdown.is_cancelled() {
+                    // Poll next event
+                    match store.poll_next().await {
+                        Ok(Some(event)) => {
+                            // Execute using JobExecutor
+                            match executor.execute_event(&event, &backend, &config).await {
+                                Ok(commit) => {
+                                    // Convert JobCommit to Store's EventProcessingCommit
+                                    let store_commit = EventProcessingCommit {
+                                        event_row_id: commit.event_row_id,
+                                        event_id: commit.event_id,
+                                        correlation_id: commit.correlation_id,
+                                        event_type: commit.event_type,
+                                        event_payload: commit.event_payload,
+                                        queued_effect_intents: commit.queued_effect_intents,
+                                        inline_effect_failures: commit.inline_effect_failures.into_iter().map(|f| {
+                                            seesaw_core::InlineHandlerFailure {
+                                                handler_id: f.handler_id,
+                                                error: f.error,
+                                                reason: f.reason,
+                                                attempts: f.attempts,
+                                            }
+                                        }).collect(),
+                                        emitted_events: commit.emitted_events,
+                                    };
+
+                                    if let Err(e) = store.commit_event_processing(store_commit).await {
+                                        tracing::error!("Failed to commit event processing: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Event processing failed: {}, nacking event", e);
+                                    let _ = store.nack(event.id, 1).await;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            sleep(config.poll_interval).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Error polling events: {}", e);
+                            sleep(config.poll_interval).await;
+                        }
+                    }
+                }
+
+                tracing::info!("Event worker {} stopped", i);
+                Ok(())
+            });
+
+            handles.push(handle);
+        }
+
+        // Spawn handler workers
+        for i in 0..config.handler_workers {
+            let backend = self.clone();
+            let store = self.store.clone();
+            let executor = executor.clone();
+            let config = config.handler_worker.clone();
+            let shutdown = shutdown.clone();
+
+            let handle = tokio::spawn(async move {
+                tracing::info!("Handler worker {} started", i);
+
+                while !shutdown.is_cancelled() {
+                    // Poll next handler execution
+                    match store.poll_next_effect().await {
+                        Ok(Some(execution)) => {
+                            // Execute using JobExecutor
+                            match executor.execute_handler(execution.clone(), &backend, &config).await {
+                                Ok(result) => {
+                                    match result.status {
+                                        HandlerStatus::Success => {
+                                            if result.emitted_events.is_empty() {
+                                                if let Err(e) = store.complete_effect(
+                                                    execution.event_id,
+                                                    execution.handler_id,
+                                                    result.result,
+                                                ).await {
+                                                    tracing::error!("Failed to complete effect: {}", e);
+                                                }
+                                            } else {
+                                                if let Err(e) = store.complete_effect_with_events(
+                                                    execution.event_id,
+                                                    execution.handler_id,
+                                                    result.result,
+                                                    result.emitted_events,
+                                                ).await {
+                                                    tracing::error!("Failed to complete effect with events: {}", e);
+                                                }
+                                            }
+                                        }
+                                        HandlerStatus::Failed { error, attempts } | HandlerStatus::Retry { error, attempts } => {
+                                            if attempts >= execution.max_attempts {
+                                                if let Err(e) = store.dlq_effect(
+                                                    execution.event_id,
+                                                    execution.handler_id,
+                                                    error,
+                                                    "max_retries_exceeded".to_string(),
+                                                    attempts,
+                                                ).await {
+                                                    tracing::error!("Failed to DLQ effect: {}", e);
+                                                }
+                                            } else {
+                                                if let Err(e) = store.fail_effect(
+                                                    execution.event_id,
+                                                    execution.handler_id,
+                                                    error,
+                                                    attempts,
+                                                ).await {
+                                                    tracing::error!("Failed to mark effect as failed: {}", e);
+                                                }
+                                            }
+                                        }
+                                        HandlerStatus::Timeout => {
+                                            tracing::warn!("Handler timed out: {}", execution.handler_id);
+                                            if execution.attempts >= execution.max_attempts {
+                                                if let Err(e) = store.dlq_effect(
+                                                    execution.event_id,
+                                                    execution.handler_id,
+                                                    "Handler execution timed out".to_string(),
+                                                    "timeout".to_string(),
+                                                    execution.attempts,
+                                                ).await {
+                                                    tracing::error!("Failed to DLQ timed out effect: {}", e);
+                                                }
+                                            } else {
+                                                if let Err(e) = store.fail_effect(
+                                                    execution.event_id,
+                                                    execution.handler_id,
+                                                    "Handler execution timed out".to_string(),
+                                                    execution.attempts,
+                                                ).await {
+                                                    tracing::error!("Failed to mark timed out effect as failed: {}", e);
+                                                }
+                                            }
+                                        }
+                                        HandlerStatus::JoinWaiting => {
+                                            // Complete with join_waiting status
+                                            if let Err(e) = store.complete_effect(
+                                                execution.event_id,
+                                                execution.handler_id,
+                                                result.result,
+                                            ).await {
+                                                tracing::error!("Failed to complete join_waiting effect: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Handler execution failed: {}", e);
+                                    if execution.attempts >= execution.max_attempts {
+                                        if let Err(e) = store.dlq_effect(
+                                            execution.event_id,
+                                            execution.handler_id,
+                                            format!("Handler execution error: {}", e),
+                                            "execution_error".to_string(),
+                                            execution.attempts,
+                                        ).await {
+                                            tracing::error!("Failed to DLQ effect: {}", e);
+                                        }
+                                    } else {
+                                        if let Err(e) = store.fail_effect(
+                                            execution.event_id,
+                                            execution.handler_id,
+                                            format!("Handler execution error: {}", e),
+                                            execution.attempts,
+                                        ).await {
+                                            tracing::error!("Failed to mark effect as failed: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            sleep(config.poll_interval).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Error polling effects: {}", e);
+                            sleep(config.poll_interval).await;
+                        }
+                    }
+                }
+
+                tracing::info!("Handler worker {} stopped", i);
+                Ok(())
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for shutdown signal
+        shutdown.cancelled().await;
+        tracing::info!("Shutdown signal received, draining workers...");
+
+        // Wait for workers to complete (with timeout)
+        let drain_timeout = config.graceful_shutdown_timeout;
+        tokio::time::timeout(drain_timeout, async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await
+        .ok();
+
+        tracing::info!("PostgresBackend shutdown complete");
+        Ok(())
+    }
+}
+
+// Implement capability traits
+
+#[async_trait]
+impl WorkflowStatusBackend for PostgresBackend {
+    async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<seesaw_core::WorkflowStatus> {
+        self.store.get_workflow_status(correlation_id).await
+    }
+}
+
+#[async_trait]
+impl WorkflowSubscriptionBackend for PostgresBackend {
+    async fn subscribe_workflow_events(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<Box<dyn futures::Stream<Item = seesaw_core::WorkflowEvent> + Send + Unpin>> {
+        self.store.subscribe_workflow_events(correlation_id).await
+    }
+}
+
+#[async_trait]
+impl DeadLetterQueueBackend for PostgresBackend {
+    async fn list_dlq(&self, _filters: DlqFilters) -> Result<Vec<DeadLetter>> {
+        // TODO: Implement with actual filters
+        // For now, return empty list as placeholder
+        Ok(Vec::new())
+    }
+
+    async fn retry_dlq(&self, _event_id: Uuid, _handler_id: String) -> Result<()> {
+        // TODO: Implement DLQ retry from seesaw_dead_letters table
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl InsightBackend for PostgresBackend {
+    async fn get_workflow_tree(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<seesaw_core::backend::capability::WorkflowTree> {
+        // TODO: Implement proper workflow tree conversion
+        // For now, return a minimal tree
+        Ok(seesaw_core::backend::capability::WorkflowTree {
+            correlation_id,
+            nodes: Vec::new(),
+        })
+    }
+
+    async fn get_insight_stats(&self) -> Result<seesaw_core::backend::capability::InsightStats> {
+        // TODO: Query actual stats from database
+        // For now, return zeros
+        Ok(seesaw_core::backend::capability::InsightStats {
+            total_workflows: 0,
+            active_workflows: 0,
+            settled_workflows: 0,
+            total_events: 0,
+            total_handlers_executed: 0,
+            total_dlq_entries: 0,
+        })
+    }
 }
 
 #[cfg(test)]

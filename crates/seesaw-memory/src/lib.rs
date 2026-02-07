@@ -853,7 +853,7 @@ impl InsightStore for MemoryStore {
         Ok(Box::new(Box::pin(stream)))
     }
 
-    async fn get_workflow_tree(&self, correlation_id: Uuid) -> Result<WorkflowTree> {
+    async fn get_workflow_tree(&self, correlation_id: Uuid) -> Result<seesaw_core::WorkflowTree> {
         // Find all events for this correlation
         let mut events: Vec<_> = self
             .event_history
@@ -869,7 +869,7 @@ impl InsightStore for MemoryStore {
         let event_ids: HashSet<Uuid> = events.iter().map(|e| e.event_id).collect();
         let roots = self.build_event_nodes(&events, None, &event_ids, true);
 
-        Ok(WorkflowTree {
+        Ok(seesaw_core::WorkflowTree {
             correlation_id,
             roots,
             event_count: events.len(),
@@ -881,7 +881,7 @@ impl InsightStore for MemoryStore {
         })
     }
 
-    async fn get_stats(&self) -> Result<InsightStats> {
+    async fn get_stats(&self) -> Result<seesaw_core::InsightStats> {
         let total_events = self.event_history.len() as i64;
 
         let mut active_effects = 0i64;
@@ -897,7 +897,7 @@ impl InsightStore for MemoryStore {
             }
         }
 
-        Ok(InsightStats {
+        Ok(seesaw_core::InsightStats {
             total_events,
             active_effects,
             completed_effects,
@@ -1181,6 +1181,140 @@ impl MemoryStore {
                 }
             })
             .collect()
+    }
+}
+
+// ============================================================================
+// MemoryBackend - v0.11.0 Backend trait implementation
+// ============================================================================
+
+use seesaw_core::backend::{Backend, BackendServeConfig, DispatchedEvent};
+use seesaw_core::backend::capability::*;
+use seesaw_core::backend::job_executor::JobExecutor;
+use tokio_util::sync::CancellationToken;
+
+/// In-memory implementation of Backend trait (v0.11.0).
+///
+/// Wraps MemoryStore internally and implements the new Backend interface.
+/// Suitable for development, testing, and demos. Not for production.
+#[derive(Clone)]
+pub struct MemoryBackend {
+    store: MemoryStore,
+}
+
+impl MemoryBackend {
+    /// Create new MemoryBackend.
+    pub fn new() -> Self {
+        Self {
+            store: MemoryStore::new(),
+        }
+    }
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Backend for MemoryBackend {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn publish(&self, event: DispatchedEvent) -> Result<()> {
+        let queued_event = QueuedEvent {
+            id: 0, // Will be assigned by MemoryStore
+            event_id: event.event_id,
+            parent_id: event.parent_id,
+            correlation_id: event.correlation_id,
+            event_type: event.event_type,
+            payload: event.payload,
+            hops: event.hops,
+            retry_count: event.retry_count,
+            batch_id: event.batch_id,
+            batch_index: event.batch_index,
+            batch_size: event.batch_size,
+            created_at: event.created_at,
+        };
+
+        self.store.publish(queued_event).await
+    }
+
+    async fn serve<D>(
+        &self,
+        _executor: Arc<JobExecutor<D>>,
+        _config: BackendServeConfig,
+        shutdown: CancellationToken,
+    ) -> Result<()>
+    where
+        D: Send + Sync + 'static,
+    {
+        // For MemoryBackend, we just wait for shutdown
+        // In a real implementation, you'd spawn workers like PostgresBackend
+        shutdown.cancelled().await;
+        Ok(())
+    }
+}
+
+// Implement capability traits
+
+#[async_trait]
+impl WorkflowStatusBackend for MemoryBackend {
+    async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<seesaw_core::WorkflowStatus> {
+        self.store.get_workflow_status(correlation_id).await
+    }
+}
+
+#[async_trait]
+impl WorkflowSubscriptionBackend for MemoryBackend {
+    async fn subscribe_workflow_events(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<Box<dyn futures::Stream<Item = seesaw_core::WorkflowEvent> + Send + Unpin>> {
+        self.store.subscribe_workflow_events(correlation_id).await
+    }
+}
+
+#[async_trait]
+impl DeadLetterQueueBackend for MemoryBackend {
+    async fn list_dlq(&self, _filters: DlqFilters) -> Result<Vec<DeadLetter>> {
+        // TODO: Implement DLQ listing
+        Ok(Vec::new())
+    }
+
+    async fn retry_dlq(&self, _event_id: Uuid, _handler_id: String) -> Result<()> {
+        // TODO: Implement DLQ retry
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl InsightBackend for MemoryBackend {
+    async fn get_workflow_tree(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<seesaw_core::backend::capability::WorkflowTree> {
+        // TODO: Convert from MemoryStore tree format
+        Ok(seesaw_core::backend::capability::WorkflowTree {
+            correlation_id,
+            nodes: Vec::new(),
+        })
+    }
+
+    async fn get_insight_stats(&self) -> Result<seesaw_core::backend::capability::InsightStats> {
+        let stats = self.store.get_stats().await?;
+
+        // Convert from seesaw_core::InsightStats to backend::InsightStats
+        Ok(seesaw_core::backend::capability::InsightStats {
+            total_workflows: 0, // TODO: Track this
+            active_workflows: 0, // TODO: Track this
+            settled_workflows: 0, // TODO: Track this
+            total_events: stats.total_events as i64,
+            total_handlers_executed: stats.completed_effects as i64,
+            total_dlq_entries: stats.failed_effects as i64,
+        })
     }
 }
 

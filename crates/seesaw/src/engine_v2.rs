@@ -1,120 +1,45 @@
-//! Queue-backed Engine implementation
+//! Queue-backed Engine implementation with Backend trait
 //!
-//! Simplified Engine that publishes to Store instead of in-memory dispatch.
-//! Workers (EventWorker, EffectWorker) poll from store and execute.
+//! Simplified Engine that publishes to Backend instead of Store.
+//! Workers are managed by Backend.serve().
 
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::backend::{Backend, BackendServeConfig};
+use crate::backend::capability::*;
+use crate::backend::job_executor::JobExecutor;
 use crate::handler::Handler;
 use crate::handler_registry::HandlerRegistry;
 use crate::process::ProcessFuture;
-use crate::queue_backend::{QueueBackend, StoreQueueBackend};
-use crate::Store;
+use crate::runtime::Runtime;
+use anyhow::Result;
+use tokio_util::sync::CancellationToken;
 
-/// Adapter trait for Engine backend construction.
+/// Queue-backed Engine with Backend trait.
 ///
-/// This allows `Engine::new` to accept either:
-/// - A plain store (`St`) which uses [`StoreQueueBackend`] by default.
-/// - A tuple (`(St, Q)`) for explicit store + queue backend pairing.
-pub trait EngineBackend {
-    type Store: Store;
-    type Queue: QueueBackend<Self::Store>;
-
-    fn into_engine_parts(self) -> (Self::Store, Self::Queue);
-}
-
-impl<St> EngineBackend for St
-where
-    St: Store,
-{
-    type Store = St;
-    type Queue = StoreQueueBackend;
-
-    fn into_engine_parts(self) -> (Self::Store, Self::Queue) {
-        (self, StoreQueueBackend)
-    }
-}
-
-impl<St, Q> EngineBackend for (St, Q)
-where
-    St: Store,
-    Q: QueueBackend<St>,
-{
-    type Store = St;
-    type Queue = Q;
-
-    fn into_engine_parts(self) -> (Self::Store, Self::Queue) {
-        self
-    }
-}
-
-/// Queue-backed Engine
-///
-/// Publishes events to Store, workers poll and execute.
-pub struct Engine<D, St>
+/// Publishes events to Backend, which handles worker management.
+pub struct Engine<D, B>
 where
     D: Send + Sync + 'static,
-    St: Store,
+    B: Backend,
 {
-    store: Arc<St>,
-    queue_backend: Arc<dyn QueueBackend<St>>,
+    backend: Arc<B>,
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
 }
 
-impl<D, St> Engine<D, St>
+impl<D, B> Engine<D, B>
 where
     D: Send + Sync + 'static,
-    St: Store,
+    B: Backend,
 {
     /// Create new engine with dependencies and backend.
-    ///
-    /// Accepts either:
-    /// - `store` (defaults to store-backed queue dispatch)
-    /// - `(store, queue_backend)` for explicit queue backend wiring
-    pub fn new<B>(deps: D, backend: B) -> Self
-    where
-        B: EngineBackend<Store = St>,
-    {
-        let (store, queue_backend) = backend.into_engine_parts();
-        Self::from_parts(deps, store, Vec::new(), Arc::new(queue_backend))
-    }
-
-    /// Create a builder for engine configuration.
-    pub fn builder(deps: D, store: St) -> EngineBuilder<D, St> {
-        EngineBuilder {
-            store,
-            deps,
-            effects: Vec::new(),
-        }
-    }
-
-    /// Queue backend name for diagnostics.
-    pub fn queue_backend_name(&self) -> &'static str {
-        self.queue_backend.name()
-    }
-
-    fn from_parts(
-        deps: D,
-        store: St,
-        effects: Vec<Handler<D>>,
-        queue_backend: Arc<dyn QueueBackend<St>>,
-    ) -> Self {
-        let mut handler_registry = Arc::new(HandlerRegistry::new());
-
-        // Safe because registry was just created and is uniquely owned.
-        let effects_target = Arc::get_mut(&mut handler_registry)
-            .expect("new effect registry should be uniquely owned");
-        for effect in effects {
-            effects_target.register(effect);
-        }
-
+    pub fn new(deps: D, backend: B) -> Self {
         Self {
-            store: Arc::new(store),
-            queue_backend,
+            backend: Arc::new(backend),
             deps: Arc::new(deps),
-            effects: handler_registry,
+            effects: Arc::new(HandlerRegistry::new()),
         }
     }
 
@@ -138,10 +63,15 @@ where
         self
     }
 
-    /// Dispatch event (returns lazy future)
+    /// Backend name for diagnostics.
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
+    }
+
+    /// Dispatch event (returns lazy future).
     ///
-    /// Event is serialized and published to store when future is polled.
-    pub fn dispatch<E>(&self, event: E) -> ProcessFuture<St>
+    /// Event is serialized and published to backend when future is polled.
+    pub fn dispatch<E>(&self, event: E) -> ProcessFuture<B>
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
@@ -151,7 +81,7 @@ where
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
 
         ProcessFuture::new(
-            self.store.clone(),
+            self.backend.clone(),
             event_id,
             correlation_id,
             None, // parent_id will be set by workers
@@ -161,80 +91,107 @@ where
         )
     }
 
-    /// Get store reference (for workers)
-    pub(crate) fn store(&self) -> &Arc<St> {
-        &self.store
+    /// Convenience for worker-only processes (blocking).
+    ///
+    /// Runs backend workers until shutdown token is cancelled.
+    pub async fn serve(self, shutdown: CancellationToken) -> Result<()> {
+        let executor = Arc::new(JobExecutor::new(self.deps.clone(), self.effects.clone()));
+        let config = BackendServeConfig::default();
+        self.backend.serve(executor, config, shutdown).await
     }
 
-    /// Get queue backend (for workers)
-    pub(crate) fn queue_backend(&self) -> Arc<dyn QueueBackend<St>> {
-        self.queue_backend.clone()
+    /// Non-blocking handle (for HTTP servers).
+    ///
+    /// Spawns backend workers in background and returns handle for shutdown.
+    pub async fn start(self, config: BackendServeConfig) -> Result<Runtime> {
+        Runtime::start(self, config).await
     }
 
-    /// Get deps reference (for workers)
+    /// Get backend reference (for Runtime).
+    pub(crate) fn backend(&self) -> &Arc<B> {
+        &self.backend
+    }
+
+    /// Get deps reference (for Runtime).
     pub(crate) fn deps(&self) -> &Arc<D> {
         &self.deps
     }
 
-    /// Get effects (for event/effect workers)
+    /// Get effects (for Runtime).
     pub(crate) fn effects(&self) -> &Arc<HandlerRegistry<D>> {
         &self.effects
     }
 }
 
-impl<D, St> Clone for Engine<D, St>
+impl<D, B> Clone for Engine<D, B>
 where
     D: Send + Sync + 'static,
-    St: Store,
+    B: Backend,
 {
     fn clone(&self) -> Self {
         Self {
-            store: self.store.clone(),
-            queue_backend: self.queue_backend.clone(),
+            backend: self.backend.clone(),
             deps: self.deps.clone(),
             effects: self.effects.clone(),
         }
     }
 }
 
-/// Builder for queue-backed [`Engine`].
-pub struct EngineBuilder<D, St>
+// Capability-based methods - only available when backend supports them
+
+impl<D, B> Engine<D, B>
 where
     D: Send + Sync + 'static,
-    St: Store,
+    B: WorkflowStatusBackend,
 {
-    store: St,
-    deps: D,
-    effects: Vec<Handler<D>>,
+    /// Get workflow status (requires WorkflowStatusBackend).
+    pub async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<crate::WorkflowStatus> {
+        self.backend.get_workflow_status(correlation_id).await
+    }
 }
 
-impl<D, St> EngineBuilder<D, St>
+impl<D, B> Engine<D, B>
 where
     D: Send + Sync + 'static,
-    St: Store,
+    B: WorkflowSubscriptionBackend,
 {
-    /// Register a handler.
-    pub fn with_handler(mut self, handler: Handler<D>) -> Self {
-        self.effects.push(handler);
-        self
+    /// Subscribe to workflow events (requires WorkflowSubscriptionBackend).
+    pub async fn subscribe_workflow(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<Box<dyn futures::Stream<Item = crate::WorkflowEvent> + Send + Unpin>> {
+        self.backend.subscribe_workflow_events(correlation_id).await
+    }
+}
+
+impl<D, B> Engine<D, B>
+where
+    D: Send + Sync + 'static,
+    B: DeadLetterQueueBackend,
+{
+    /// List dead letter queue entries (requires DeadLetterQueueBackend).
+    pub async fn list_dlq(&self, filters: DlqFilters) -> Result<Vec<DeadLetter>> {
+        self.backend.list_dlq(filters).await
     }
 
-    /// Register multiple handlers.
-    pub fn with_handlers<I>(mut self, handlers: I) -> Self
-    where
-        I: IntoIterator<Item = Handler<D>>,
-    {
-        self.effects.extend(handlers);
-        self
+    /// Retry a dead letter (requires DeadLetterQueueBackend).
+    pub async fn retry_dlq(&self, event_id: Uuid, handler_id: String) -> Result<()> {
+        self.backend.retry_dlq(event_id, handler_id).await
+    }
+}
+
+impl<D, B> Engine<D, B>
+where
+    D: Send + Sync + 'static,
+    B: InsightBackend,
+{
+    /// Get workflow execution tree (requires InsightBackend).
+    pub async fn get_workflow_tree(&self, correlation_id: Uuid) -> Result<WorkflowTree> {
+        self.backend.get_workflow_tree(correlation_id).await
     }
 
-    /// Build engine.
-    pub fn build(self) -> Engine<D, St> {
-        Engine::from_parts(
-            self.deps,
-            self.store,
-            self.effects,
-            Arc::new(StoreQueueBackend),
-        )
+    /// Get aggregate workflow statistics (requires InsightBackend).
+    pub async fn get_insight_stats(&self) -> Result<InsightStats> {
+        self.backend.get_insight_stats().await
     }
 }

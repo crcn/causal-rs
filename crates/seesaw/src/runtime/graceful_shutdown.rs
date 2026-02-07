@@ -5,10 +5,11 @@
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Graceful shutdown coordinator
 pub struct GracefulShutdown {
@@ -33,6 +34,7 @@ impl GracefulShutdown {
     }
 
     /// Install signal handlers and wait for shutdown signal
+    #[cfg(unix)]
     pub async fn wait_for_signal(&self) {
         let token = self.token.clone();
 
@@ -64,6 +66,13 @@ impl GracefulShutdown {
 
             token.cancel();
         });
+    }
+
+    /// Install signal handlers and wait for shutdown signal (non-Unix fallback)
+    #[cfg(not(unix))]
+    pub async fn wait_for_signal(&self) {
+        // On non-Unix systems, just wait for the token to be cancelled externally
+        self.token.cancelled().await;
     }
 
     /// Drain remaining tasks with timeout

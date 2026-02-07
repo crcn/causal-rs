@@ -166,30 +166,33 @@ mod tests {
         let counter_a = counter.clone();
         let counter_b = counter.clone();
 
-        registry.register(handler::group([
-            handler::on::<EventA>().then(move |_, _| {
+        // TODO: handler::group was removed in v0.11.0, register handlers individually
+        registry.register(
+            handler::on::<EventA>().id("test_a").then(move |_, _| {
                 let c = counter_a.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }
-            }),
-            handler::on::<EventB>().then(move |_, _| {
+            })
+        );
+        registry.register(
+            handler::on::<EventB>().id("test_b").then(move |_, _| {
                 let c = counter_b.clone();
                 async move {
                     c.fetch_add(10, Ordering::SeqCst);
                     Ok(())
                 }
-            }),
-        ]));
+            })
+        );
 
-        // Single grouped effect registered
-        assert_eq!(registry.effects.read().len(), 1);
+        // Two separate effects registered (handler::group removed in v0.11.0)
+        assert_eq!(registry.effects.read().len(), 2);
 
-        // Can handle both event types
+        // Each can handle its respective event type
         let effects = registry.effects.read();
-        assert!(effects[0].can_handle(TypeId::of::<EventA>()));
-        assert!(effects[0].can_handle(TypeId::of::<EventB>()));
+        assert!(effects.iter().any(|e| e.can_handle(TypeId::of::<EventA>())));
+        assert!(effects.iter().any(|e| e.can_handle(TypeId::of::<EventB>())));
     }
 
     #[tokio::test]
