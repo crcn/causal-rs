@@ -7,6 +7,8 @@ Build reactive systems with a simple **Event → Handler → Event** flow. Named
 ```rust
 use seesaw_core::{handler, Context, Engine};
 use seesaw_memory::MemoryBackend;
+use serde::{Deserialize, Serialize};
+use anyhow::Result;
 
 // Events are facts - what happened
 #[derive(Clone, Serialize, Deserialize)]
@@ -16,22 +18,27 @@ enum OrderEvent {
     Delivered { order_id: Uuid },
 }
 
-// Handlers react to events and return new events
-let engine = Engine::new(deps, MemoryBackend::new())
-    .with_handler(
-        handler::on::<OrderEvent>()
-            .extract(|e| match e {
-                OrderEvent::Placed { order_id, .. } => Some(*order_id),
-                _ => None,
-            })
-            .then(|order_id, ctx: Context<Deps>| async move {
-                ctx.deps().ship(order_id).await?;
-                Ok(OrderEvent::Shipped { order_id })
-            })
-    );
+#[derive(Clone)]
+struct Deps {
+    shipping_api: ShippingApi,
+}
 
-// Dispatch events
-engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
+// Define handlers with the #[handler] macro
+#[handler(on = OrderEvent, extract(order_id), id = "ship_order")]
+async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
+    ctx.deps().shipping_api.ship(order_id).await?;
+    Ok(OrderEvent::Shipped { order_id })
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let engine = Engine::new(deps, MemoryBackend::new())
+        .with_handler(ship_order());
+
+    // Dispatch events
+    engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
+    Ok(())
+}
 ```
 
 ## Features
@@ -39,11 +46,12 @@ engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
 - **🎯 Event-Driven**: Events are the only signals — immutable facts about what happened
 - **⚡ High Performance**: 50k-100k events/sec with Kafka backend
 - **🔄 Handler Pattern**: React to events, perform IO, return new events
+- **✨ Declarative Macros**: Clean `#[handler]` syntax for defining handlers
 - **🎨 Flexible Backends**: In-memory, PostgreSQL, or Kafka
 - **📈 Horizontal Scaling**: Scale via Kafka partitions and consumer groups
 - **🔒 Exactly-Once**: Idempotency and atomic commits prevent duplicate processing
 - **🔍 Observable**: Real-time visualization with Seesaw Insight
-- **🚀 Simple API**: Closure-based builder pattern, no trait implementations
+- **🚀 Simple API**: Declarative macros or closure-based builder pattern
 
 ## Architecture
 
@@ -76,7 +84,9 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 ```
 
-### Basic Example
+### Basic Example with `#[handler]`
+
+The `#[handler]` macro provides a clean, declarative way to define handlers:
 
 ```rust
 use anyhow::Result;
@@ -100,47 +110,32 @@ struct Deps {
     email_service: EmailService,
 }
 
+// Handler: Placed → Shipped
+#[handler(on = OrderEvent, extract(order_id), id = "ship_order")]
+async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
+    ctx.deps().shipping_api.ship(order_id).await?;
+    Ok(OrderEvent::Shipped { order_id })
+}
+
+// Handler: Shipped → Delivered
+#[handler(on = OrderEvent, extract(order_id), id = "notify_shipped")]
+async fn notify_shipped(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
+    ctx.deps().email_service.send(order_id, "Shipped!").await?;
+    Ok(OrderEvent::Delivered { order_id })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create backend
     let backend = MemoryBackend::new();
-
-    // Create dependencies
     let deps = Deps {
         shipping_api: ShippingApi::new(),
         email_service: EmailService::new(),
     };
 
-    // Build engine with handlers
+    // Build engine with handlers (each #[handler] generates a function)
     let engine = Engine::new(deps, backend)
-        // Handler: Placed → Shipped
-        .with_handler(
-            handler::on::<OrderEvent>()
-                .id("ship_order")
-                .extract(|e| match e {
-                    OrderEvent::Placed { order_id, .. } => Some(*order_id),
-                    _ => None,
-                })
-                .then(|order_id, ctx: Context<Deps>| async move {
-                    // Perform async IO
-                    ctx.deps().shipping_api.ship(order_id).await?;
-                    // Return new event
-                    Ok(OrderEvent::Shipped { order_id })
-                }),
-        )
-        // Handler: Shipped → Delivered
-        .with_handler(
-            handler::on::<OrderEvent>()
-                .id("notify_shipped")
-                .extract(|e| match e {
-                    OrderEvent::Shipped { order_id } => Some(*order_id),
-                    _ => None,
-                })
-                .then(|order_id, ctx: Context<Deps>| async move {
-                    ctx.deps().email_service.send(order_id, "Shipped!").await?;
-                    Ok(OrderEvent::Delivered { order_id })
-                }),
-        );
+        .with_handler(ship_order())
+        .with_handler(notify_shipped());
 
     // Dispatch event
     let order_id = Uuid::new_v4();
@@ -155,91 +150,164 @@ async fn main() -> Result<()> {
 
 Handlers are the core abstraction in Seesaw. They react to events, perform side effects, and return new events.
 
-### Basic Handler
+### Declarative Handlers with `#[handler]`
+
+The `#[handler]` macro provides a clean way to define handlers:
 
 ```rust
-handler::on::<OrderEvent>()
-    .extract(|e| match e {
-        OrderEvent::Placed { order_id, .. } => Some(*order_id),
-        _ => None,
-    })
-    .then(|order_id, ctx: Context<Deps>| async move {
-        ctx.deps().process(order_id).await?;
-        Ok(OrderEvent::Processed { order_id })
-    })
+use seesaw_core::{handler, Context};
+
+// Basic handler that extracts a field
+#[handler(on = OrderEvent, extract(order_id))]
+async fn process_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
+    ctx.deps().process(order_id).await?;
+    Ok(OrderEvent::Processed { order_id })
+}
 ```
 
-**Pattern breakdown:**
-1. **`.on::<Event>()`** - Listen for specific event type
-2. **`.extract()`** - Filter and extract data from events
-3. **`.then()`** - Async closure that performs IO and returns event
+**Macro breakdown:**
+1. **`on = Event`** - Listen for specific event type
+2. **`extract(field1, field2, ...)`** - Extract fields from matching events
+3. Function receives extracted fields directly
 
 ### Handler Configuration
 
-Handlers support configuration for retry, timeout, priority, and more:
+Configure handlers with retry, timeout, priority, and more:
 
 ```rust
-handler::on::<PaymentEvent>()
-    .id("charge_payment")              // Custom identifier
-    .retry(3)                          // Retry 3 times on failure
-    .timeout(Duration::from_secs(30))  // 30 second timeout
-    .priority(1)                       // Higher priority (lower number = higher priority)
-    .delay(Duration::from_secs(60))    // Delay 1 minute before execution
-    .then(|event, ctx| async move {
-        ctx.deps().stripe.charge(&event).await?;
-        Ok(PaymentCharged { order_id: event.order_id })
-    })
+#[handler(
+    on = PaymentEvent,
+    extract(order_id, total),
+    id = "charge_payment",
+    retry = 3,
+    timeout_secs = 30,
+    priority = 1,
+    delay_secs = 60
+)]
+async fn charge_payment(
+    order_id: Uuid,
+    total: f64,
+    ctx: Context<Deps>
+) -> Result<PaymentEvent> {
+    ctx.deps().stripe.charge(order_id, total).await?;
+    Ok(PaymentEvent::Charged { order_id })
+}
 ```
 
 **Configuration options:**
-- `.id(String)` - Custom handler identifier (for tracing/debugging)
-- `.retry(u32)` - Max retry attempts on failure
-- `.timeout(Duration)` - Execution timeout
-- `.delay(Duration)` - Delay before execution
-- `.priority(i32)` - Execution priority (lower = higher priority)
+- `id = "name"` - Custom handler identifier (for tracing/debugging)
+- `retry = N` - Max retry attempts on failure
+- `timeout_secs = N` / `timeout_ms = N` - Execution timeout
+- `delay_secs = N` / `delay_ms = N` - Delay before execution
+- `priority = N` - Execution priority (lower = higher priority)
+- `queued` - Force queued execution (required when using retry/timeout/delay)
 
 ### Multiple Handlers, Same Event
 
 Multiple handlers can react to the same event (fan-out pattern):
 
 ```rust
+// Handler 1: Update inventory
+#[handler(on = OrderEvent, extract(order_id, items), id = "reserve_inventory")]
+async fn reserve_inventory(
+    order_id: Uuid,
+    items: Vec<Item>,
+    ctx: Context<Deps>
+) -> Result<InventoryEvent> {
+    ctx.deps().inventory.reserve(&items).await?;
+    Ok(InventoryEvent::Reserved { order_id })
+}
+
+// Handler 2: Charge payment
+#[handler(on = OrderEvent, extract(order_id, total), id = "charge_payment")]
+async fn charge_payment(
+    order_id: Uuid,
+    total: f64,
+    ctx: Context<Deps>
+) -> Result<PaymentEvent> {
+    ctx.deps().payment.charge(total).await?;
+    Ok(PaymentEvent::Charged { order_id })
+}
+
+// Handler 3: Send notification (returns () = no new event)
+#[handler(on = OrderEvent, extract(order_id), id = "send_notification")]
+async fn send_notification(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
+    ctx.deps().email.send(order_id, "Order received!").await?;
+    Ok(())
+}
+
 let engine = Engine::new(deps, backend)
-    // Handler 1: Update inventory
-    .with_handler(
-        handler::on::<OrderEvent>()
-            .extract(|e| match e {
-                OrderEvent::Placed { order_id, items } => Some((*order_id, items.clone())),
-                _ => None,
-            })
-            .then(|(order_id, items), ctx| async move {
-                ctx.deps().inventory.reserve(&items).await?;
-                Ok(InventoryReserved { order_id })
-            })
-    )
-    // Handler 2: Charge payment
-    .with_handler(
-        handler::on::<OrderEvent>()
-            .extract(|e| match e {
-                OrderEvent::Placed { order_id, total } => Some((*order_id, *total)),
-                _ => None,
-            })
-            .then(|(order_id, total), ctx| async move {
-                ctx.deps().payment.charge(total).await?;
-                Ok(PaymentCharged { order_id })
-            })
-    )
-    // Handler 3: Send notification
-    .with_handler(
-        handler::on::<OrderEvent>()
-            .extract(|e| match e {
-                OrderEvent::Placed { order_id, .. } => Some(*order_id),
-                _ => None,
-            })
-            .then(|order_id, ctx| async move {
-                ctx.deps().email.send(order_id, "Order received!").await?;
-                Ok(()) // No new event
-            })
-    );
+    .with_handler(reserve_inventory())
+    .with_handler(charge_payment())
+    .with_handler(send_notification());
+```
+
+### Handling Specific Enum Variants
+
+Match specific enum variants with the `on = [...]` syntax:
+
+```rust
+#[handler(
+    on = [OrderEvent::Placed, OrderEvent::Updated],
+    extract(order_id, total),
+    id = "process_order_changes"
+)]
+async fn process_order_changes(
+    order_id: Uuid,
+    total: f64,
+    ctx: Context<Deps>
+) -> Result<OrderEvent> {
+    // Only runs for Placed or Updated variants
+    ctx.deps().process_order(order_id, total).await?;
+    Ok(OrderEvent::Processed { order_id })
+}
+```
+
+### Batch Processing with `accumulate`
+
+Use `accumulate` to process events in batches:
+
+```rust
+#[handler(on = ImportEvent, accumulate, id = "batch_import", window_timeout_secs = 5)]
+async fn batch_import(batch: Vec<ImportEvent>, ctx: Context<Deps>) -> Result<()> {
+    // Accumulates all ImportEvents, processes them together
+    let items: Vec<_> = batch.into_iter()
+        .filter_map(|e| match e {
+            ImportEvent::RowParsed { data, .. } => Some(data),
+            _ => None,
+        })
+        .collect();
+
+    ctx.deps().bulk_insert(&items).await?;
+    Ok(())
+}
+```
+
+### Module-level Registration
+
+Use `#[handlers]` to automatically generate registration functions:
+
+```rust
+#[handlers]
+mod order_handlers {
+    use super::*;
+
+    #[handler(on = OrderEvent, extract(order_id), id = "ship")]
+    async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
+        ctx.deps().ship(order_id).await?;
+        Ok(OrderEvent::Shipped { order_id })
+    }
+
+    #[handler(on = OrderEvent, extract(order_id), id = "email")]
+    async fn email_customer(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
+        ctx.deps().email.send(order_id).await?;
+        Ok(())
+    }
+}
+
+// Register all handlers at once
+let engine = Engine::new(deps, backend)
+    .with_handlers(order_handlers::handlers());
 ```
 
 ## Backends
@@ -331,14 +399,14 @@ See [`crates/seesaw-kafka/README.md`](crates/seesaw-kafka/README.md) for Kafka b
 Handlers receive a `Context<Deps>` that provides access to dependencies:
 
 ```rust
-handler::on::<Event>()
-    .then(|data, ctx: Context<Deps>| async move {
-        // Access shared dependencies
-        ctx.deps().database.query(...).await?;
-        ctx.deps().api_client.call(...).await?;
+#[handler(on = MyEvent, extract(data), id = "process")]
+async fn process(data: Data, ctx: Context<Deps>) -> Result<MyEvent> {
+    // Access shared dependencies
+    ctx.deps().database.query(...).await?;
+    ctx.deps().api_client.call(...).await?;
 
-        Ok(NewEvent)
-    })
+    Ok(MyEvent::Processed)
+}
 ```
 
 **Context methods:**
@@ -422,21 +490,21 @@ enum UserEvent {
 Handlers are async functions that react to events, perform IO, and return new events:
 
 ```rust
-handler::on::<UserEvent>()
-    .extract(|e| match e {
-        UserEvent::SignupRequested { email, name } => Some((email.clone(), name.clone())),
-        _ => None,
-    })
-    .then(|(email, name), ctx| async move {
-        // Perform IO
-        let user = ctx.deps().db.create_user(&email, &name).await?;
+#[handler(on = UserEvent, extract(email, name), id = "create_user")]
+async fn create_user(
+    email: String,
+    name: String,
+    ctx: Context<Deps>
+) -> Result<UserEvent> {
+    // Perform IO
+    let user = ctx.deps().db.create_user(&email, &name).await?;
 
-        // Return new event
-        Ok(UserEvent::SignedUp {
-            user_id: user.id,
-            email,
-        })
+    // Return new event
+    Ok(UserEvent::SignedUp {
+        user_id: user.id,
+        email,
     })
+}
 ```
 
 **Key properties:**
@@ -444,6 +512,7 @@ handler::on::<UserEvent>()
 - Access dependencies via `ctx.deps()`
 - Return `Result<Event>` or `Result<()>`
 - Can fail and retry (if configured)
+- Declarative syntax with `#[handler]` macro
 
 ### Dependencies
 
@@ -480,23 +549,19 @@ let engine = Engine::new(deps, backend);
 Test handlers using the in-memory backend:
 
 ```rust
+#[handler(on = OrderEvent, extract(order_id), id = "ship_order")]
+async fn ship_order(order_id: Uuid, ctx: Context<MockDeps>) -> Result<OrderEvent> {
+    ctx.deps().ship(order_id).await?;
+    Ok(OrderEvent::Shipped { order_id })
+}
+
 #[tokio::test]
 async fn test_order_processing() {
     let deps = MockDeps::new();
     let backend = MemoryBackend::new();
 
     let engine = Engine::new(deps.clone(), backend)
-        .with_handler(
-            handler::on::<OrderEvent>()
-                .extract(|e| match e {
-                    OrderEvent::Placed { order_id, .. } => Some(*order_id),
-                    _ => None,
-                })
-                .then(|order_id, ctx| async move {
-                    ctx.deps().ship(order_id).await?;
-                    Ok(OrderEvent::Shipped { order_id })
-                })
-        );
+        .with_handler(ship_order());
 
     let order_id = Uuid::new_v4();
     engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
@@ -534,6 +599,85 @@ async fn test_order_processing() {
 - **[Kafka Backend Guide](crates/seesaw-kafka/README.md)** - High-throughput Kafka backend
 - **[PostgreSQL Backend Guide](crates/seesaw-postgres/README.md)** - Durable PostgreSQL backend
 - **[Insight Guide](crates/seesaw-insight/README.md)** - Real-time observability
+
+## Alternative: Builder API
+
+For more dynamic or programmatic handler creation, use the builder API with `handler::on()`:
+
+### Basic Builder Pattern
+
+```rust
+use seesaw_core::{handler, Context};
+
+let engine = Engine::new(deps, backend)
+    .with_handler(
+        handler::on::<OrderEvent>()
+            .extract(|e| match e {
+                OrderEvent::Placed { order_id, .. } => Some(*order_id),
+                _ => None,
+            })
+            .then(|order_id, ctx: Context<Deps>| async move {
+                ctx.deps().process(order_id).await?;
+                Ok(OrderEvent::Processed { order_id })
+            })
+    );
+```
+
+### Builder with Configuration
+
+```rust
+handler::on::<PaymentEvent>()
+    .id("charge_payment")
+    .retry(3)
+    .timeout(Duration::from_secs(30))
+    .priority(1)
+    .then(|event, ctx: Context<Deps>| async move {
+        ctx.deps().stripe.charge(&event).await?;
+        Ok(PaymentEvent::Charged { order_id: event.order_id })
+    })
+```
+
+### Multiple Event Variants
+
+```rust
+handler::on::<OrderEvent>()
+    .extract(|e| match e {
+        OrderEvent::Placed { order_id, total } | OrderEvent::Updated { order_id, total } => {
+            Some((order_id, total))
+        }
+        _ => None,
+    })
+    .then(|(order_id, total), ctx| async move {
+        ctx.deps().process(order_id, total).await?;
+        Ok(OrderEvent::Processed { order_id })
+    })
+```
+
+### Observer Pattern (All Events)
+
+```rust
+handler::on_any()
+    .then(|event, ctx: Context<Deps>| async move {
+        ctx.deps().logger.log_event(event).await?;
+        Ok(()) // No new event
+    })
+```
+
+**Builder API methods:**
+- `.id(String)` - Custom handler identifier
+- `.extract(closure)` - Filter and extract data from events
+- `.then(closure)` - Async handler implementation
+- `.retry(u32)` - Max retry attempts
+- `.timeout(Duration)` - Execution timeout
+- `.delayed(Duration)` - Delay before execution
+- `.priority(i32)` - Execution priority
+- `.queued()` - Force queued execution
+
+**When to use:**
+- Dynamic handler creation at runtime
+- Conditional handler registration
+- When closures are more convenient than functions
+- Integration with existing closure-heavy code
 
 ## Contributing
 
