@@ -160,7 +160,11 @@ fn result_to_events(kind: &ReturnKind) -> TokenStream2 {
         ReturnKind::Unit => quote! { ::seesaw_core::Events::new() },
         ReturnKind::Events => quote! { __result },
         ReturnKind::Emit => quote! { ::seesaw_core::IntoEvents::into_events(__result) },
-        ReturnKind::SingleEvent => quote! { ::seesaw_core::Events::new().add(__result) },
+        ReturnKind::SingleEvent => quote! { {
+            let mut __ev = ::seesaw_core::Events::new();
+            __ev.push(__result);
+            __ev
+        } },
     }
 }
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use seesaw_core::insight::InsightEvent;
-use seesaw_core::{emit, handler, Context, Engine, Events};
+use seesaw_core::{events, handler, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -63,7 +63,7 @@ async fn basic_handler_fires() -> Result<()> {
             let c = counter_clone.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(emit![])
+                Ok(events![])
             }
         }),
     );
@@ -87,7 +87,7 @@ async fn handler_emits_chain() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                Ok(emit![EventB {
+                Ok(events![EventB {
                     value: event.value + 1,
                 }])
             },
@@ -97,7 +97,7 @@ async fn handler_emits_chain() -> Result<()> {
                 let c = b_counter_clone.clone();
                 async move {
                     c.fetch_add(event.value as usize, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -123,7 +123,7 @@ async fn multiple_handlers_same_event() -> Result<()> {
                     let c = ca.clone();
                     async move {
                         c.fetch_add(1, Ordering::SeqCst);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         )
@@ -134,7 +134,7 @@ async fn multiple_handlers_same_event() -> Result<()> {
                     let c = cb.clone();
                     async move {
                         c.fetch_add(10, Ordering::SeqCst);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -164,7 +164,7 @@ async fn queued_handler_executes() -> Result<()> {
                 let c = counter_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -193,7 +193,7 @@ async fn emit_requires_settled() -> Result<()> {
                 let c = counter_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -218,7 +218,7 @@ async fn emit_requires_settled() -> Result<()> {
 async fn handler_returns_nothing() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-            Ok(emit![])
+            Ok(events![])
         }),
     );
 
@@ -253,7 +253,7 @@ async fn retry_succeeds_on_second_attempt() -> Result<()> {
                         anyhow::bail!("first attempt fails");
                     }
                     sc.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -301,7 +301,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
                 let c = tc.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -331,7 +331,7 @@ async fn accumulate_batch() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                Ok(emit![..vec![
+                Ok(events![..vec![
                     BatchItem { index: 0 },
                     BatchItem { index: 1 },
                     BatchItem { index: 2 },
@@ -348,7 +348,7 @@ async fn accumulate_batch() -> Result<()> {
                     async move {
                         bs.store(batch.len(), Ordering::SeqCst);
                         rc.fetch_add(1, Ordering::SeqCst);
-                        Ok(emit![BatchResult { count: batch.len() }])
+                        Ok(events![BatchResult { count: batch.len() }])
                     }
                 }),
         );
@@ -383,7 +383,7 @@ async fn insight_callback_fires() -> Result<()> {
             ic.fetch_add(1, Ordering::SeqCst);
         })
         .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
 
     engine
@@ -411,7 +411,7 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
                 .id("emit_b_queued")
                 .queued()
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                    Ok(emit![EventB {
+                    Ok(events![EventB {
                         value: event.value + 1,
                     }])
                 }),
@@ -421,7 +421,7 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
                 let sc = sc.clone();
                 async move {
                     *sc.lock() = Some(ctx.correlation_id);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -462,7 +462,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
                 let sc = sc.clone();
                 async move {
                     *sc.lock() = Some(ctx.correlation_id);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -495,7 +495,7 @@ async fn insight_seq_monotonically_increases() -> Result<()> {
             handler::on::<EventA>()
                 .id("queued_for_insight")
                 .queued()
-                .then(|_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(emit![]) }),
+                .then(|_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(events![]) }),
         );
 
     engine.emit(EventA { value: 42 }).settled().await?;
@@ -534,7 +534,7 @@ async fn context_is_replay_defaults_to_false() -> Result<()> {
             let sr = sr.clone();
             async move {
                 *sr.lock() = Some(ctx.is_replay());
-                Ok(emit![])
+                Ok(events![])
             }
         }),
     );

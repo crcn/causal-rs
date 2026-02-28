@@ -108,20 +108,20 @@ impl EventOutput {
 
 /// The universal return type for all handlers.
 ///
-/// Use the [`emit!`](crate::emit) macro:
+/// Use the [`events!`](crate::events) macro:
 ///
 /// ```ignore
 /// // Single event
-/// Ok(emit![OrderShipped { order_id }])
+/// Ok(events![OrderShipped { order_id }])
 ///
 /// // Multiple heterogeneous events
-/// Ok(emit![ScrapeEvent { data }, LifecycleEvent::PhaseCompleted])
+/// Ok(events![ScrapeEvent { data }, LifecycleEvent::PhaseCompleted])
 ///
 /// // Fan-out batch
-/// Ok(emit![..items])
+/// Ok(events![..items])
 ///
 /// // Nothing
-/// Ok(emit![])
+/// Ok(events![])
 /// ```
 #[derive(Clone, Default)]
 pub struct Events {
@@ -136,10 +136,20 @@ impl Events {
         }
     }
 
-    /// Add a single event to the collection.
+    /// Add a single event to the collection (builder-style, chainable).
     pub fn add<E: Send + Sync + serde::Serialize + 'static>(mut self, event: E) -> Self {
         self.outputs.push(EventOutput::new(event));
         self
+    }
+
+    /// Add a single event to the collection (Vec-style, in-place).
+    pub fn push<E: Send + Sync + serde::Serialize + 'static>(&mut self, event: E) {
+        self.outputs.push(EventOutput::new(event));
+    }
+
+    /// Append all events from another `Events` collection.
+    pub fn extend(&mut self, other: Events) {
+        self.outputs.extend(other.outputs);
     }
 
     /// Add all items from an iterator as individual events (fan-out).

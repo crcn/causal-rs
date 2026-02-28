@@ -5,7 +5,7 @@
 Seesaw is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, and event sourcing — and plugs into [Restate](https://restate.dev/) for durable execution with zero code changes.
 
 ```rust
-use seesaw_core::{emit, handler, Context, Engine};
+use seesaw_core::{events, handler, Context, Engine};
 
 let engine = Engine::new(deps)
     .with_handler(
@@ -13,7 +13,7 @@ let engine = Engine::new(deps)
             .id("ship_order")
             .then(|event, ctx: Context<Deps>| async move {
                 ctx.deps().shipping_api.ship(event.order_id).await?;
-                Ok(emit![OrderShipped { order_id: event.order_id }])
+                Ok(events![OrderShipped { order_id: event.order_id }])
             }),
     );
 
@@ -49,24 +49,24 @@ async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipp
 let engine = Engine::new(deps).with_handler(ship_order());
 ```
 
-**Builder style** — return `Result<Events>` via the `emit![]` macro:
+**Builder style** — return `Result<Events>` via the `events![]` macro:
 
 ```rust
 handler::on::<OrderPlaced>()
     .id("ship_order")
     .then(|event, ctx: Context<Deps>| async move {
         ctx.deps().shipping_api.ship(event.order_id).await?;
-        Ok(emit![OrderShipped { order_id: event.order_id }])
+        Ok(events![OrderShipped { order_id: event.order_id }])
     })
 ```
 
-The `emit![]` macro handles all return shapes:
+The `events![]` macro handles all return shapes:
 
 ```rust
-Ok(emit![])                              // No events
-Ok(emit![OrderShipped { order_id }])     // Single event
-Ok(emit![EventA { .. }, EventB { .. }])  // Multiple heterogeneous events
-Ok(emit![..items])                       // Fan-out batch from iterator
+Ok(events![])                              // No events
+Ok(events![OrderShipped { order_id }])     // Single event
+Ok(events![EventA { .. }, EventB { .. }])  // Multiple heterogeneous events
+Ok(events![..items])                       // Fan-out batch from iterator
 ```
 
 ### Settlement
@@ -118,7 +118,7 @@ let engine = Engine::new(deps)
             })
             .then(|order_id, ctx: Context<Deps>| async move {
                 ctx.deps().notify_shipped(order_id).await?;
-                Ok(emit![])
+                Ok(events![])
             }),
     );
 ```
@@ -211,7 +211,7 @@ handler::on_any()
         if let Some(order) = event.downcast::<OrderPlaced>() {
             println!("Order placed: {:?}", order.order_id);
         }
-        Ok(emit![])
+        Ok(events![])
     })
 ```
 
@@ -365,7 +365,7 @@ impl OrderWorkflow for OrderWorkflowImpl {
 | Exactly-once effects | Idempotency keys | Restate journal |
 | Delayed execution | Seesaw delay queue | Restate timers |
 
-**What doesn't change:** `#[handler]`, `Engine`, `emit![]`, `.extract()`, `.transition()`, `.accumulate()`, `Aggregate`, `EventStore`. User code is backend-agnostic.
+**What doesn't change:** `#[handler]`, `Engine`, `events![]`, `.extract()`, `.transition()`, `.accumulate()`, `Aggregate`, `EventStore`. User code is backend-agnostic.
 
 ## Context API
 

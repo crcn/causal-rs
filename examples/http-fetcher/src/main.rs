@@ -1,7 +1,7 @@
 //! HTTP Fetcher Example
 
 use anyhow::Result;
-use seesaw_core::{emit, handler, Context, Engine};
+use seesaw_core::{events, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
                                 Ok(response) if response.status().is_success() => {
                                     let status = response.status().as_u16();
                                     let _ = response.text().await?;
-                                    Ok(emit![
+                                    Ok(events![
                                         FetchEvent::Fetched { url, status },
                                         FetchEvent::FetchRequested {
                                             urls: rest,
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
                                         },
                                     ])
                                 }
-                                Ok(response) => Ok(emit![
+                                Ok(response) => Ok(events![
                                     FetchEvent::FetchFailed {
                                         url,
                                         reason: format!("HTTP {}", response.status().as_u16()),
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
                                         failure_count: failure_count + 1,
                                     },
                                 ]),
-                                Err(error) => Ok(emit![
+                                Err(error) => Ok(events![
                                     FetchEvent::FetchFailed {
                                         url,
                                         reason: error.to_string(),
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
                                 ]),
                             }
                         } else {
-                            Ok(emit![FetchEvent::AllComplete {
+                            Ok(events![FetchEvent::AllComplete {
                                 success_count,
                                 failure_count,
                             }])
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
                 })
                 .then(|(ok, fail), _ctx: Context<Deps>| async move {
                     println!("all fetches complete: ok={}, fail={}", ok, fail);
-                    Ok(emit![])
+                    Ok(events![])
                 }),
         );
 

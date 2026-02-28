@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use parking_lot::Mutex;
 use seesaw_core::insight::{InsightEvent, StreamType};
-use seesaw_core::{emit, handler, Aggregate, Apply, Context, Engine, Events};
+use seesaw_core::{events, handler, Aggregate, Apply, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -125,7 +125,7 @@ async fn parent_event_id_set_on_inline_chain() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                Ok(emit![EventB {
+                Ok(events![EventB {
                     value: event.value + 1,
                 }])
             },
@@ -135,7 +135,7 @@ async fn parent_event_id_set_on_inline_chain() -> Result<()> {
                 let sp = sp.clone();
                 async move {
                     *sp.lock() = Some(ctx.parent_event_id().unwrap());
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -159,7 +159,7 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
                 .id("emit_b")
                 .queued()
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                    Ok(emit![EventB {
+                    Ok(events![EventB {
                         value: event.value + 1,
                     }])
                 }),
@@ -169,7 +169,7 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
                 let sp = sp.clone();
                 async move {
                     *sp.lock() = Some(ctx.parent_event_id().unwrap());
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -192,7 +192,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                Ok(emit![EventB {
+                Ok(events![EventB {
                     value: event.value + 1,
                 }])
             },
@@ -202,7 +202,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
                 let p = p1.clone();
                 async move {
                     p.lock().push(("B".into(), ctx.parent_event_id()));
-                    Ok(emit![EventC {
+                    Ok(events![EventC {
                         value: event.value + 1,
                     }])
                 }
@@ -213,7 +213,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
                 let p = p2.clone();
                 async move {
                     p.lock().push(("C".into(), ctx.parent_event_id()));
-                    Ok(emit![EventD {
+                    Ok(events![EventD {
                         value: event.value + 1,
                     }])
                 }
@@ -224,7 +224,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
                 let p = p3.clone();
                 async move {
                     p.lock().push(("D".into(), ctx.parent_event_id()));
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -270,7 +270,7 @@ async fn aggregate_state_transitions_correctly() -> Result<()> {
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
         .with_handler(handler::on::<OrderPlaced>().then(
             |event: Arc<OrderPlaced>, _ctx: Context<Deps>| async move {
-                Ok(emit![OrderShipped {
+                Ok(events![OrderShipped {
                     order_id: event.order_id,
                 }])
             },
@@ -285,7 +285,7 @@ async fn aggregate_state_transitions_correctly() -> Result<()> {
                     let n = n.clone();
                     async move {
                         n.lock().push(order_id);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -325,7 +325,7 @@ async fn transition_guard_blocks_duplicate_transition() -> Result<()> {
                     let fc = fc.clone();
                     async move {
                         fc.fetch_add(1, Ordering::SeqCst);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -378,7 +378,7 @@ async fn transition_guard_does_not_fire_when_guard_returns_false() -> Result<()>
                     let fc = fc.clone();
                     async move {
                         fc.fetch_add(1, Ordering::SeqCst);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -421,7 +421,7 @@ async fn aggregate_state_isolated_between_ids() -> Result<()> {
                     let fi = fi.clone();
                     async move {
                         fi.lock().push(id);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -475,7 +475,7 @@ async fn filter_blocks_non_matching_events() -> Result<()> {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -509,7 +509,7 @@ async fn extract_returns_none_skips_handler() -> Result<()> {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -545,7 +545,7 @@ async fn inline_handlers_execute_in_priority_order() -> Result<()> {
                     let eo = eo1.clone();
                     async move {
                         eo.lock().push("low".into());
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         )
@@ -557,7 +557,7 @@ async fn inline_handlers_execute_in_priority_order() -> Result<()> {
                     let eo = eo2.clone();
                     async move {
                         eo.lock().push("high".into());
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         )
@@ -569,7 +569,7 @@ async fn inline_handlers_execute_in_priority_order() -> Result<()> {
                     let eo = eo3.clone();
                     async move {
                         eo.lock().push("medium".into());
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -600,7 +600,7 @@ async fn idempotency_key_is_deterministic() -> Result<()> {
             let sk = sk.clone();
             async move {
                 sk.lock().push(ctx.idempotency_key().to_string());
-                Ok(emit![])
+                Ok(events![])
             }
         },
     ));
@@ -645,7 +645,7 @@ async fn context_exposes_all_fields() -> Result<()> {
                         ctx.handler_id().to_string(),
                         ctx.idempotency_key().to_string(),
                     ));
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -683,7 +683,7 @@ async fn hops_limit_prevents_infinite_loop() -> Result<()> {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(emit![EventA {
+                Ok(events![EventA {
                     value: event.value + 1,
                 }])
             }
@@ -712,14 +712,14 @@ async fn hops_increment_through_chain() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                Ok(emit![EventB {
+                Ok(events![EventB {
                     value: event.value,
                 }])
             },
         ))
         .with_handler(handler::on::<EventB>().then(
             |event: Arc<EventB>, _ctx: Context<Deps>| async move {
-                Ok(emit![EventC {
+                Ok(events![EventC {
                     value: event.value,
                 }])
             },
@@ -729,7 +729,7 @@ async fn hops_increment_through_chain() -> Result<()> {
                 let vs = vs.clone();
                 async move {
                     vs.lock().push(event.value);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -766,7 +766,7 @@ async fn inline_handler_error_does_not_stop_other_handlers() -> Result<()> {
                     let sc = sc.clone();
                     async move {
                         sc.fetch_add(1, Ordering::SeqCst);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -832,14 +832,14 @@ async fn emit_none_produces_no_events() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ))
         .with_handler(handler::on::<EventA>().then(
             move |_event: Arc<EventA>, _ctx: Context<Deps>| {
                 let dc = dc.clone();
                 async move {
                     dc.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -867,7 +867,7 @@ async fn emit_batch_creates_correct_metadata() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                Ok(emit![..vec![
+                Ok(events![..vec![
                     BatchItem { index: 0 },
                     BatchItem { index: 1 },
                     BatchItem { index: 2 },
@@ -884,7 +884,7 @@ async fn emit_batch_creates_correct_metadata() -> Result<()> {
                     let bs = bs.clone();
                     async move {
                         bs.lock().push(batch.len());
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -910,7 +910,7 @@ async fn emit_option_none_produces_no_events() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                Ok(emit![])
+                Ok(events![])
             },
         ))
         .with_handler(handler::on::<EventA>().then(
@@ -918,7 +918,7 @@ async fn emit_option_none_produces_no_events() -> Result<()> {
                 let dc = dc.clone();
                 async move {
                     dc.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -942,7 +942,7 @@ async fn emit_option_some_produces_event() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                Ok(emit![EventA { value: 42 }])
+                Ok(events![EventA { value: 42 }])
             },
         ))
         .with_handler(handler::on::<EventA>().then(
@@ -950,7 +950,7 @@ async fn emit_option_some_produces_event() -> Result<()> {
                 let dc = dc.clone();
                 async move {
                     dc.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -1022,7 +1022,7 @@ async fn custom_runtime_wraps_execution() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_runtime(runtime)
         .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
 
     engine
@@ -1051,7 +1051,7 @@ async fn multiple_dispatches_have_independent_correlation_ids() -> Result<()> {
             let c = c.clone();
             async move {
                 c.lock().push(ctx.correlation_id);
-                Ok(emit![])
+                Ok(events![])
             }
         },
     ));
@@ -1111,7 +1111,7 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
                 let td = td.clone();
                 async move {
                     *td.lock() = Some((event.error.clone(), event.attempts));
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -1146,7 +1146,7 @@ async fn insight_events_contain_correct_stream_types() -> Result<()> {
             ev.lock().push(event);
         })
         .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
 
     engine
@@ -1244,18 +1244,18 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
                             "unknown"
                         };
                         st.lock().push(type_name.into());
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         )
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                Ok(emit![EventA { value: 1 }])
+                Ok(events![EventA { value: 1 }])
             },
         ))
         // Need a handler for EventA so its codec is registered
         .with_handler(handler::on::<EventA>().then(
-            |_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+            |_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
 
     engine
@@ -1285,7 +1285,7 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
     let engine = Engine::new(Deps)
         // Typed Ping handler so codec is registered
         .with_handler(handler::on::<Ping>().id("ping_noop").then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ))
         // on_any emits EventB when it sees a Ping
         .with_handler(
@@ -1293,9 +1293,9 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
                 .id("emitter")
                 .then(|event: seesaw_core::handler::AnyEvent, _ctx: Context<Deps>| async move {
                     if event.is::<Ping>() {
-                        Ok(emit![EventB { value: 42 }])
+                        Ok(events![EventB { value: 42 }])
                     } else {
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         )
@@ -1306,7 +1306,7 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
                 async move {
                     assert_eq!(event.value, 42);
                     ch.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -1350,7 +1350,7 @@ async fn handler_with_init_compiles_and_handles_events() -> Result<()> {
                 let hr = hr.clone();
                 async move {
                     hr.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -1384,7 +1384,7 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -1433,7 +1433,7 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
                 .id("emit_b_queued")
                 .queued()
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                    Ok(emit![EventB {
+                    Ok(events![EventB {
                         value: event.value * 2,
                     }])
                 }),
@@ -1443,7 +1443,7 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
                 let bc = bc.clone();
                 async move {
                     bc.fetch_add(event.value as usize, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -1477,7 +1477,7 @@ async fn handler_can_access_deps() -> Result<()> {
             let sv = sv.clone();
             async move {
                 sv.store(ctx.deps().value, Ordering::SeqCst);
-                Ok(emit![])
+                Ok(events![])
             }
         },
     ));
@@ -1507,7 +1507,7 @@ async fn accumulate_large_batch() -> Result<()> {
             handler::on::<Ping>().then(
                 |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                     let items: Vec<BatchItem> = (0..100).map(|i| BatchItem { index: i }).collect();
-                    Ok(emit![..items])
+                    Ok(events![..items])
                 },
             ),
         )
@@ -1519,7 +1519,7 @@ async fn accumulate_large_batch() -> Result<()> {
                     let bs = bs.clone();
                     async move {
                         bs.store(batch.len(), Ordering::SeqCst);
-                        Ok(emit![])
+                        Ok(events![])
                     }
                 }),
         );
@@ -1552,7 +1552,7 @@ async fn accumulate_handler_emits_downstream_event() -> Result<()> {
         .with_handler(
             handler::on::<Ping>().then(
                 |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                    Ok(emit![..vec![
+                    Ok(events![..vec![
                         BatchItem { index: 0 },
                         BatchItem { index: 1 },
                     ]])
@@ -1564,7 +1564,7 @@ async fn accumulate_handler_emits_downstream_event() -> Result<()> {
                 .id("batch_with_result")
                 .accumulate()
                 .then(|batch: Vec<BatchItem>, _ctx: Context<Deps>| async move {
-                    Ok(emit![BatchResult { count: batch.len() }])
+                    Ok(events![BatchResult { count: batch.len() }])
                 }),
         )
         .with_handler(handler::on::<BatchResult>().then(
@@ -1572,7 +1572,7 @@ async fn accumulate_handler_emits_downstream_event() -> Result<()> {
                 let rs = rs.clone();
                 async move {
                     rs.store(event.count, Ordering::SeqCst);
-                    Ok(emit![])
+                    Ok(events![])
                 }
             },
         ));
@@ -1599,7 +1599,7 @@ async fn accumulate_handler_emits_downstream_event() -> Result<()> {
 #[tokio::test]
 async fn dispatch_returns_valid_process_handle() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(handler::on::<Ping>().then(
-        |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+        |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
     ));
 
     let handle = engine
@@ -1635,7 +1635,7 @@ async fn queued_handler_timeout_goes_to_dlq() -> Result<()> {
                     c.fetch_add(1, Ordering::SeqCst);
                     // Sleep longer than timeout
                     tokio::time::sleep(Duration::from_secs(10)).await;
-                    Ok(emit![])
+                    Ok(events![])
                 }
             }),
     );
@@ -1699,7 +1699,7 @@ async fn fanout_map_fanin_batch_metadata_propagates() -> Result<()> {
                 .id("fanout_a")
                 .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                     let items: Vec<FanItem> = (0..4).map(|i| FanItem { index: i }).collect();
-                    Ok(emit![..items])
+                    Ok(events![..items])
                 }),
         )
         // Handler B: map each FanItem → MappedItem (1:1)
@@ -1711,7 +1711,7 @@ async fn fanout_map_fanin_batch_metadata_propagates() -> Result<()> {
                     let b = b_count.clone();
                     async move {
                         b.fetch_add(1, Ordering::SeqCst);
-                        Ok(emit![MappedItem {
+                        Ok(events![MappedItem {
                             index: event.index,
                             transformed: true,
                         }])
@@ -1734,7 +1734,7 @@ async fn fanout_map_fanin_batch_metadata_propagates() -> Result<()> {
                             indices,
                         };
                         *r.lock() = Some(res.clone());
-                        Ok(emit![res])
+                        Ok(events![res])
                     }
                 }),
         );

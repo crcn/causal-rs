@@ -343,7 +343,7 @@ where
         self
     }
 
-    /// Set the handler for joined batch execution. Return `emit![]` from the handler.
+    /// Set the handler for joined batch execution. Return `events![]` from the handler.
     #[track_caller]
     #[allow(private_bounds)]
     pub fn then<D, H, Fut>(mut self, handler: H) -> Handler<D>
@@ -475,7 +475,7 @@ impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
 {
-    /// Set the handler (terminal operation). Return `emit![]` from the handler.
+    /// Set the handler (terminal operation). Return `events![]` from the handler.
     #[track_caller]
     #[allow(private_bounds)]
     pub fn then<D, T, H, Fut>(self, handler: H) -> Handler<D>
@@ -530,7 +530,7 @@ where
 }
 
 impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
-    /// Set the handler for observing all events. Return `emit![]` from the handler.
+    /// Set the handler for observing all events. Return `events![]` from the handler.
     #[track_caller]
     pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
     where
@@ -572,7 +572,7 @@ where
     St: Fn(Context<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
-    /// Set the handler for observing all events with started hook. Return `emit![]`.
+    /// Set the handler for observing all events with started hook. Return `events![]`.
     #[track_caller]
     pub fn then<H, Fut>(self, handler: H) -> Handler<D>
     where
@@ -679,7 +679,7 @@ where
         self
     }
 
-    /// Set the handler that runs when the transition guard passes. Return `emit![]`.
+    /// Set the handler that runs when the transition guard passes. Return `events![]`.
     #[track_caller]
     #[allow(private_bounds)]
     pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
@@ -772,7 +772,7 @@ mod tests {
             .id("filter_probe")
             .filter(|event| event.value > 0)
             .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move {
-                Ok(crate::emit![])
+                Ok(crate::events![])
             });
 
         assert!(

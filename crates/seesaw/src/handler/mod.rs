@@ -29,7 +29,7 @@
 //! // on_any() — receives all events, can emit child events
 //! store.with_handler(
 //!     effect::on_any()
-//!         .then(|event: AnyEvent, ctx| async move { Ok(emit![]) })
+//!         .then(|event: AnyEvent, ctx| async move { Ok(events![]) })
 //! );
 //! ```
 

@@ -60,30 +60,46 @@ pub use handler::{
 
 /// The universal return macro for all handlers.
 ///
+/// Works like `vec![]` — constructs an [`Events`] collection:
+///
 /// ```ignore
 /// // Nothing — no events emitted
-/// Ok(emit![])
+/// Ok(events![])
 ///
 /// // Single event
-/// Ok(emit![OrderShipped { order_id }])
+/// Ok(events![OrderShipped { order_id }])
 ///
 /// // Multiple heterogeneous events
-/// Ok(emit![ScrapeEvent { data }, LifecycleEvent::PhaseCompleted])
+/// Ok(events![ScrapeEvent { data }, LifecycleEvent::PhaseCompleted])
 ///
 /// // Fan-out batch (each element becomes a separate event with batch metadata)
-/// Ok(emit![..items])
+/// Ok(events![..items])
 /// ```
 #[macro_export]
-macro_rules! emit {
+macro_rules! events {
     () => {
         $crate::Events::new()
     };
     (.. $spread:expr) => {
         $crate::Events::batch($spread)
     };
-    ($($event:expr),+ $(,)?) => {
-        $crate::Events::new()$(.add($event))+
-    };
+    ($single:expr $(,)?) => {{
+        let mut __ev = $crate::Events::new();
+        __ev.push($single);
+        __ev
+    }};
+    ($($event:expr),+ $(,)?) => {{
+        let mut __ev = $crate::Events::new();
+        $(__ev.push($event);)+
+        __ev
+    }};
+}
+
+/// Deprecated — use [`events!`] instead.
+#[deprecated(since = "0.15.1", note = "renamed to `events![]`")]
+#[macro_export]
+macro_rules! emit {
+    ($($tt:tt)*) => { $crate::events![$($tt)*] };
 }
 pub use runtime::{DirectRuntime, Runtime};
 pub use insight::{InsightEvent, StreamType};
