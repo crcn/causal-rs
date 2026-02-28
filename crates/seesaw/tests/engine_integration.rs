@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use seesaw_core::insight::InsightEvent;
 use seesaw_core::{events, handler, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -374,33 +373,6 @@ async fn accumulate_batch() -> Result<()> {
 }
 
 #[tokio::test]
-async fn insight_callback_fires() -> Result<()> {
-    let insight_count = Arc::new(AtomicUsize::new(0));
-    let ic = insight_count.clone();
-
-    let engine = Engine::new(Deps)
-        .with_on_insight(move |_event| {
-            ic.fetch_add(1, Ordering::SeqCst);
-        })
-        .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
-        ));
-
-    engine
-        .emit(Ping {
-            msg: "hello".into(),
-        })
-        .settled()
-        .await?;
-
-    assert!(
-        insight_count.load(Ordering::SeqCst) >= 1,
-        "insight callback should fire at least once (for EventDispatched)"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn correlation_preserved_through_queued_chain() -> Result<()> {
     let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sc = seen_correlation.clone();
@@ -479,48 +451,6 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
         seen, handle.correlation_id,
         "DLQ terminal event must carry the original correlation_id"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn insight_seq_monotonically_increases() -> Result<()> {
-    let collected: Arc<Mutex<Vec<InsightEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let cc = collected.clone();
-
-    let engine = Engine::new(Deps)
-        .with_on_insight(move |event| {
-            cc.lock().push(event);
-        })
-        .with_handler(
-            handler::on::<EventA>()
-                .id("queued_for_insight")
-                .queued()
-                .then(|_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(events![]) }),
-        );
-
-    engine.emit(EventA { value: 42 }).settled().await?;
-
-    let events = collected.lock();
-    assert!(
-        events.len() >= 2,
-        "should have at least EventDispatched + EffectCompleted, got {}",
-        events.len()
-    );
-
-    for window in events.windows(2) {
-        assert!(
-            window[1].seq > window[0].seq,
-            "insight seq must be strictly increasing: {} should be > {}",
-            window[1].seq,
-            window[0].seq
-        );
-    }
-
-    // All seq values should be > 0
-    for event in events.iter() {
-        assert!(event.seq > 0, "insight seq should never be 0, got 0");
-    }
-
     Ok(())
 }
 

@@ -37,7 +37,6 @@ pub mod aggregator;
 pub mod event_store;
 pub mod handler;
 pub mod runtime;
-pub mod insight;
 pub mod job_executor;
 pub mod types;
 
@@ -102,7 +101,6 @@ macro_rules! emit {
     ($($tt:tt)*) => { $crate::events![$($tt)*] };
 }
 pub use runtime::{DirectRuntime, Runtime};
-pub use insight::{InsightEvent, StreamType};
 pub use job_executor::{
     EventProcessingCommit as JobEventProcessingCommit, HandlerExecutionResult, HandlerStatus,
     InlineHandlerFailure as JobInlineHandlerFailure, JobExecutor, JoinClaim,

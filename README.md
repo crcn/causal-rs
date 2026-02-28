@@ -381,18 +381,6 @@ ctx.idempotency_key()   // Deterministic key for deduplication
 ctx.is_replay()         // true during event replay (skip side effects)
 ```
 
-## Observability
-
-Attach an insight callback to stream internal events in real time:
-
-```rust
-let engine = Engine::new(deps)
-    .with_on_insight(|event: InsightEvent| {
-        // event.stream_type: EventDispatched | EffectStarted | EffectCompleted | EffectFailed
-        // event.correlation_id, event.handler_id, event.error, ...
-    });
-```
-
 ## Examples
 
 ```bash

@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use seesaw_core::insight::{InsightEvent, StreamType};
 use seesaw_core::{events, handler, Aggregate, Apply, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1129,74 +1128,6 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
         error
     );
     assert_eq!(*attempts, 2, "should report final attempt count");
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════
-// INSIGHT EVENTS DETAIL CHECK
-// ═══════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn insight_events_contain_correct_stream_types() -> Result<()> {
-    let events: Arc<Mutex<Vec<InsightEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let ev = events.clone();
-
-    let engine = Engine::new(Deps)
-        .with_on_insight(move |event| {
-            ev.lock().push(event);
-        })
-        .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
-        ));
-
-    engine
-        .emit(Ping {
-            msg: "insight".into(),
-        })
-        .settled()
-        .await?;
-
-    let events = events.lock();
-    let types: Vec<_> = events.iter().map(|e| e.stream_type.clone()).collect();
-    assert!(
-        types.contains(&StreamType::EventDispatched),
-        "should have EventDispatched, got: {:?}",
-        types
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn insight_events_for_failed_queued_handler() -> Result<()> {
-    let events: Arc<Mutex<Vec<InsightEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let ev = events.clone();
-
-    let engine = Engine::new(Deps)
-        .with_on_insight(move |event| {
-            ev.lock().push(event);
-        })
-        .with_handler(
-            handler::on::<FailEvent>()
-                .id("fail_insight")
-                .queued()
-                .retry(1)
-                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
-                    Err::<Events, _>(anyhow::anyhow!("fail for insight"))
-                }),
-        );
-
-    engine
-        .emit(FailEvent { attempt: 0 })
-        .settled()
-        .await?;
-
-    let events = events.lock();
-    let types: Vec<_> = events.iter().map(|e| e.stream_type.clone()).collect();
-    assert!(
-        types.contains(&StreamType::EffectFailed),
-        "failed handler should emit EffectFailed insight, got: {:?}",
-        types
-    );
     Ok(())
 }
 

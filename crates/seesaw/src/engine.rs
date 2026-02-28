@@ -5,7 +5,6 @@
 //! a `Runtime` (e.g. RestateRuntime).
 
 use std::any::Any;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -16,7 +15,6 @@ use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::handler::{Context, Handler};
 use crate::handler_registry::HandlerRegistry;
 use crate::runtime::{DirectRuntime, Runtime};
-use crate::insight::{InsightEvent, StreamType};
 use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
 use crate::process::{EmitFuture, ProcessHandle};
@@ -37,8 +35,6 @@ where
     effects: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
     runtime: Arc<dyn Runtime>,
-    on_insight: Option<Arc<dyn Fn(InsightEvent) + Send + Sync>>,
-    insight_seq: Arc<AtomicU64>,
 }
 
 impl<D> Engine<D>
@@ -53,8 +49,6 @@ where
             effects: Arc::new(HandlerRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
             runtime: Arc::new(DirectRuntime::new()),
-            on_insight: None,
-            insight_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -128,15 +122,6 @@ where
         for aggregator in aggregators {
             registry.register(aggregator);
         }
-        self
-    }
-
-    /// Set an insight callback for observability events.
-    pub fn with_on_insight<F>(mut self, callback: F) -> Self
-    where
-        F: Fn(InsightEvent) + Send + Sync + 'static,
-    {
-        self.on_insight = Some(Arc::new(callback));
         self
     }
 
@@ -268,16 +253,6 @@ where
                     match exec_result {
                         Ok(result) => match result.status {
                             HandlerStatus::Success => {
-                                self.emit_insight(self.make_insight(
-                                    StreamType::EffectCompleted,
-                                    execution_clone.correlation_id,
-                                    Some(event_id),
-                                    Some(handler_id.clone()),
-                                    Some(execution_clone.event_type.clone()),
-                                    Some("completed".to_string()),
-                                    None,
-                                    None,
-                                ));
                                 if result.emitted_events.is_empty() {
                                     self.store
                                         .complete_effect(event_id, handler_id, result.result)
@@ -296,16 +271,6 @@ where
                                 }
                             }
                             HandlerStatus::Failed { error, attempts } => {
-                                self.emit_insight(self.make_insight(
-                                    StreamType::EffectFailed,
-                                    execution_clone.correlation_id,
-                                    Some(event_id),
-                                    Some(handler_id.clone()),
-                                    Some(execution_clone.event_type.clone()),
-                                    Some("failed".to_string()),
-                                    Some(error.clone()),
-                                    None,
-                                ));
                                 if result.emitted_events.is_empty() {
                                     self.store
                                         .dlq_effect(
@@ -431,17 +396,6 @@ where
 
         self.store.publish(queued).await?;
 
-        self.emit_insight(self.make_insight(
-            StreamType::EventDispatched,
-            correlation_id,
-            Some(event_id),
-            None,
-            Some(event_type),
-            None,
-            None,
-            Some(payload),
-        ));
-
         Ok(ProcessHandle {
             correlation_id,
             event_id,
@@ -452,38 +406,6 @@ where
     fn apply_to_aggregators(&self, event: &QueuedEvent) {
         self.aggregators
             .apply_event(&event.event_type, &event.payload, &*self.runtime);
-    }
-
-    fn emit_insight(&self, event: InsightEvent) {
-        if let Some(ref cb) = self.on_insight {
-            cb(event);
-        }
-    }
-
-    fn make_insight(
-        &self,
-        stream_type: StreamType,
-        correlation_id: Uuid,
-        event_id: Option<Uuid>,
-        handler_id: Option<String>,
-        event_type: Option<String>,
-        status: Option<String>,
-        error: Option<String>,
-        payload: Option<serde_json::Value>,
-    ) -> InsightEvent {
-        InsightEvent {
-            seq: self.insight_seq.fetch_add(1, Ordering::SeqCst) as i64,
-            stream_type,
-            correlation_id,
-            event_id,
-            effect_event_id: event_id,
-            handler_id,
-            event_type,
-            status,
-            error,
-            payload,
-            created_at: chrono::Utc::now(),
-        }
     }
 
     async fn handle_join_waiting(
@@ -646,8 +568,6 @@ where
             effects: self.effects.clone(),
             aggregators: self.aggregators.clone(),
             runtime: self.runtime.clone(),
-            on_insight: self.on_insight.clone(),
-            insight_seq: self.insight_seq.clone(),
         }
     }
 }
