@@ -47,11 +47,13 @@ async fn main() -> Result<()> {
 - **⚡ High Performance**: 50k-100k events/sec with Kafka backend
 - **🔄 Handler Pattern**: React to events, perform IO, return new events
 - **✨ Declarative Macros**: Clean `#[handler]` syntax for defining handlers
-- **🎨 Flexible Backends**: In-memory, PostgreSQL, or Kafka
+- **🎨 Flexible Backends**: In-memory, PostgreSQL, Kafka, or Restate (via `HandlerRunner`)
 - **📈 Horizontal Scaling**: Scale via Kafka partitions and consumer groups
 - **🔒 Exactly-Once**: Idempotency and atomic commits prevent duplicate processing
 - **🔍 Observable**: Real-time visualization with Seesaw Insight
 - **🚀 Simple API**: Declarative macros or closure-based builder pattern
+- **📦 Event Sourcing**: Built-in EventStore with aggregates, optimistic concurrency, and schema evolution
+- **⏳ Settlement**: `engine.process(event).settled().await` drives the full causal tree to completion
 
 ## Architecture
 
@@ -460,51 +462,213 @@ Settlement is available on any backend that implements `SettleableBackend`. The 
 
 ## Event Sourcing
 
-Seesaw includes an event sourcing module for persisting events and reconstructing aggregate state.
-
-### ES Projector
-
-The `es_projector` handler automatically persists every event to an EventStore before reactive handlers run. It runs as a priority-0 inline handler, guaranteeing that aggregate state is always up-to-date when other handlers execute:
-
-```rust
-use seesaw_core::es_projector;
-
-let engine = Engine::new(deps, backend)
-    // Projector runs first (priority 0), persists to EventStore
-    .with_handler(es_projector::<OrderEvent, OrderAggregate, _, _>(|e| e.order_id))
-    // Reactive handlers see updated aggregate state
-    .with_handler(ship_order());
-```
-
-This pattern ensures:
-1. **Projector** (priority 0, inline) writes every event to the EventStore
-2. **Reactive handlers** load current aggregate state via the EventStore
-3. Since the projector always runs first, reactive handlers see up-to-date state
+Seesaw includes a first-class event sourcing module: permanent event storage, aggregate state reconstruction, optimistic concurrency, and schema evolution.
 
 ### Aggregates
 
-Define aggregates with the `Aggregate` trait:
+Define domain aggregates with the `Aggregate` trait. Aggregates are pure state machines — `apply()` has no side effects:
 
 ```rust
-use seesaw_core::es::Aggregate;
+use seesaw_core::es::{Aggregate, EventUpcast};
+use serde::{Deserialize, Serialize};
 
-struct OrderAggregate;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OrderEvent {
+    Placed { order_id: Uuid, total: f64 },
+    Shipped { order_id: Uuid },
+}
 
-impl Aggregate for OrderAggregate {
+// Opt into schema evolution (default version 1, no upcasting needed)
+impl EventUpcast for OrderEvent {}
+
+#[derive(Debug, Default)]
+struct Order {
+    status: OrderStatus,
+    total: f64,
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum OrderStatus { #[default] Draft, Placed, Shipped }
+
+impl Aggregate for Order {
     type Event = OrderEvent;
-    type State = OrderState;
 
-    fn aggregate_type() -> &'static str { "order" }
+    fn aggregate_type() -> &'static str { "Order" }
 
-    fn apply(state: &mut Self::State, event: &Self::Event) {
+    fn apply(&mut self, event: OrderEvent) {
         match event {
-            OrderEvent::Placed { total, .. } => state.total = *total,
-            OrderEvent::Shipped { .. } => state.shipped = true,
-            _ => {}
+            OrderEvent::Placed { total, .. } => {
+                self.status = OrderStatus::Placed;
+                self.total = total;
+            }
+            OrderEvent::Shipped { .. } => {
+                self.status = OrderStatus::Shipped;
+            }
         }
     }
 }
 ```
+
+### EventStore
+
+The `EventStore` trait provides permanent event storage with optimistic concurrency. Load aggregate state by replaying events, and append new events with version checks:
+
+```rust
+use seesaw_core::es::EventStoreExt;
+use seesaw_memory::event_store::MemoryEventStore;
+
+let event_store = MemoryEventStore::new();
+let order_id = Uuid::new_v4();
+
+// Load aggregate state (replays all events)
+let order = event_store.aggregate::<Order>(order_id).load().await?;
+assert_eq!(order.status, OrderStatus::Draft);
+assert_eq!(order.version(), 0);
+
+// Append events with optimistic concurrency check
+let new_version = event_store
+    .aggregate::<Order>(order_id)
+    .append(order.version(), vec![OrderEvent::Placed { order_id, total: 99.99 }])
+    .await?;
+
+// State is reconstructed from events
+let order = event_store.aggregate::<Order>(order_id).load().await?;
+assert_eq!(order.status, OrderStatus::Placed);
+assert_eq!(order.version(), 1);
+```
+
+**Optimistic concurrency** prevents lost writes. If two writers load the same version and try to append, the second write fails with `ConcurrencyError`:
+
+```rust
+use seesaw_core::es::ConcurrencyError;
+
+let stale_version = 0; // loaded before another write bumped to v1
+let result = event_store
+    .aggregate::<Order>(order_id)
+    .append(stale_version, vec![OrderEvent::Shipped { order_id }])
+    .await;
+
+match result {
+    Err(e) if e.downcast_ref::<ConcurrencyError>().is_some() => {
+        // Reload and retry
+    }
+    _ => {}
+}
+```
+
+### EventStore Backends
+
+| Backend | Crate | Type | Use case |
+|---------|-------|------|----------|
+| `MemoryEventStore` | `seesaw-memory` | In-memory | Development, testing |
+| `PostgresEventStore` | `seesaw-postgres` | PostgreSQL | Production, ACID guarantees |
+
+```rust
+// In-memory (development)
+use seesaw_memory::event_store::MemoryEventStore;
+let es = MemoryEventStore::new();
+
+// PostgreSQL (production)
+use seesaw_postgres::event_store::PostgresEventStore;
+let es = PostgresEventStore::new(pool);
+```
+
+### Schema Evolution with EventUpcast
+
+Events evolve over time. The `EventUpcast` trait handles deserializing old event versions:
+
+```rust
+use seesaw_core::es::EventUpcast;
+
+// Version 1: original schema
+// Version 2: added `currency` field
+impl EventUpcast for OrderEvent {
+    fn current_version() -> u32 { 2 }
+
+    fn upcast_from(version: u32, data: serde_json::Value) -> Result<Self> {
+        match version {
+            1 => {
+                // Migrate v1 → v2: add default currency
+                let mut data = data;
+                data["currency"] = serde_json::json!("USD");
+                Ok(serde_json::from_value(data)?)
+            }
+            2 => Ok(serde_json::from_value(data)?),
+            v => anyhow::bail!("unknown OrderEvent version {v}"),
+        }
+    }
+}
+```
+
+For events that don't need upcasting, implement the trait with defaults:
+
+```rust
+impl EventUpcast for OrderEvent {} // version 1, no migration
+```
+
+### Wiring EventStore into Handlers
+
+Use the `HasEventStore` trait to give handlers access to the event store via `ctx.deps()`:
+
+```rust
+use seesaw_core::es::{EventStore, HasEventStore};
+
+#[derive(Clone)]
+struct Deps {
+    event_store: MemoryEventStore,
+}
+
+impl HasEventStore for Deps {
+    type Store = MemoryEventStore;
+    fn event_store(&self) -> &Self::Store {
+        &self.event_store
+    }
+}
+
+// Now handlers can load aggregate state
+#[handler(on = OrderEvent, extract(order_id), id = "check_inventory")]
+async fn check_inventory(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
+    let order = ctx.deps().event_store().aggregate::<Order>(order_id).load().await?;
+    println!("Order status: {:?}, total: {}", order.status, order.total);
+    Ok(())
+}
+```
+
+### ES Projector
+
+The `es_projector` handler automatically persists every event to the EventStore before reactive handlers run. It runs as a priority-0 inline handler, guaranteeing aggregate state is always current when other handlers execute:
+
+```rust
+use seesaw_core::es_projector;
+
+let engine = Engine::new(deps, MemoryBackend::new())
+    // Projector runs first (priority 0), persists to EventStore
+    .with_handler(es_projector::<OrderEvent, Order, _, _>(|e| match e {
+        OrderEvent::Placed { order_id, .. } => *order_id,
+        OrderEvent::Shipped { order_id } => *order_id,
+    }))
+    // Reactive handlers see updated aggregate state
+    .with_handler(check_inventory());
+```
+
+This pattern ensures:
+1. **Projector** (priority 0, inline) persists every event to the EventStore
+2. **Reactive handlers** load current aggregate state via `ctx.deps().event_store()`
+3. Since the projector always runs first, reactive handlers always see up-to-date state
+
+### Causal Tracking
+
+Append events with a causal link back to the event that triggered them:
+
+```rust
+let order = event_store.aggregate::<Order>(order_id).load().await?;
+event_store
+    .aggregate::<Order>(order_id)
+    .append_caused_by(order.version(), causing_event_id, vec![OrderEvent::Shipped { order_id }])
+    .await?;
+```
+
+The `es_projector` does this automatically — it links every persisted event to `ctx.event_id`.
 
 ## Real-time Observability (Seesaw Insight)
 
@@ -539,6 +703,7 @@ The repository includes several examples demonstrating different patterns:
 - **[http-fetcher](examples/http-fetcher)** - HTTP request workflow with retries
 - **[ai-summarizer](examples/ai-summarizer)** - AI text summarization pipeline
 - **[batch-processor](examples/batch-processor)** - Bulk data processing with joins
+- **[es-order](examples/es-order)** - Event sourcing with aggregates and handler layer
 - **[workflow-status](examples/workflow-status)** - Status tracking and queries
 - **[insight-demo](examples/insight-demo)** - Real-time observability demo
 
@@ -574,42 +739,123 @@ This architecture enables:
 - **Pluggable Execution**: The `HandlerRunner` trait lets backends wrap individual handler calls
 - **Testing**: Use in-memory backend for fast tests, PostgreSQL/Kafka for integration tests
 
-### Handler Runner
+### Handler Runner (Pluggable Execution)
 
-Every handler invocation flows through a `HandlerRunner`, a trait that wraps `effect.call_handler()`:
+Every handler invocation flows through a `HandlerRunner`, a trait that wraps each handler call:
 
 ```
-executor.execute_event() → runner.run(handler_future) → handler body
+Without runner:  executor → effect.call_handler() → handler body
+With runner:     executor → runner.run(handler_future) → handler body
 ```
 
-The default `DirectRunner` is a pass-through — identical to calling the handler directly. Custom runners can wrap handler calls for durable execution, dry-run testing, or tracing:
+The default `DirectRunner` is a zero-overhead pass-through. Custom runners wrap handler calls for durable execution, dry-run testing, or tracing.
+
+#### DirectRunner (Default)
 
 ```rust
 use seesaw_core::{HandlerRunner, DirectRunner};
 
-// DirectRunner (default) — pass-through, zero overhead
+// Zero overhead — just runs the handler directly
 static RUNNER: DirectRunner = DirectRunner;
+```
 
-// Custom runner example — wrap each handler call
-struct TracingRunner;
+All built-in backends (Memory, PostgreSQL, Kafka) use `DirectRunner`. Retry, timeout, and DLQ are handled by seesaw's worker loops.
 
-impl HandlerRunner for TracingRunner {
+#### Restate Integration
+
+[Restate](https://restate.dev/) provides durable execution via journaled replay. Seesaw's handler decomposition pattern is the journaling strategy — each small handler becomes a journal entry. The user writes zero Restate code.
+
+```
+User writes:     #[handler] async fn ship_order(...)
+Seesaw does:     route event → handler, extract fields, transition guard
+Restate does:    journal the handler invocation, replay on crash
+```
+
+A `RestateRunner` wraps each handler call in `restate_ctx.run()` for automatic durability:
+
+```rust
+use std::pin::Pin;
+use std::future::Future;
+use anyhow::Result;
+use seesaw_core::{HandlerRunner, handler::EventOutput};
+
+/// Wraps each handler call in Restate's journaling context.
+struct RestateRunner<'a> {
+    ctx: &'a restate_sdk::Context<'a>,
+}
+
+impl HandlerRunner for RestateRunner<'_> {
     fn run(
         &self,
         handler_id: &str,
         execution: Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>> {
+        let ctx = self.ctx;
         Box::pin(async move {
-            tracing::info!("Starting handler: {}", handler_id);
-            let result = execution.await;
-            tracing::info!("Finished handler: {}", handler_id);
-            result
+            // Restate journals the result — on crash, replays from journal
+            ctx.run(|| execution).await
         })
     }
 }
 ```
 
-This enables future backends like [Restate](https://restate.dev/) where each handler call is wrapped in `restate_ctx.run()` for journaled replay — the user writes zero Restate code because seesaw's handler decomposition pattern *is* the journaling strategy.
+A `RestateBackend` would use this runner in its `serve()` implementation:
+
+```rust
+// Inside RestateBackend's Restate service handler:
+async fn process_event(restate_ctx: restate_sdk::Context<'_>, event: QueuedEvent) {
+    let runner = RestateRunner { ctx: &restate_ctx };
+
+    // Existing seesaw routing — each matched handler runs through the runner
+    let commit = executor.execute_event(&event, &config, &runner).await?;
+
+    // Emitted events routed back through Restate service calls
+    for emitted in commit.emitted_events {
+        restate_ctx.service::<SeesawRouter>()
+            .process_event(emitted)
+            .send().await?;
+    }
+}
+```
+
+**What changes with Restate:**
+
+| Concern | Without Restate | With Restate |
+|---------|----------------|--------------|
+| Handler routing | Seesaw | Seesaw (unchanged) |
+| Extract/filter/transition guards | Seesaw | Seesaw (unchanged) |
+| Durable execution | Seesaw retry/timeout/DLQ | Restate journal + replay |
+| Exactly-once side effects | Idempotency keys | Restate journal |
+| Delayed execution | Seesaw delay queue | Restate timers |
+| User code | `#[handler]` | `#[handler]` (unchanged) |
+
+**What doesn't change:** `#[handler]` macro, `Engine`, `handler::on()`, `.extract()`, `.transition()`, `.accumulate()`, `EventStore`, `Aggregate` — all unchanged. User code is identical across backends.
+
+#### Custom Runners
+
+The trait is simple enough for any wrapping strategy:
+
+```rust
+/// Dry-run runner — records calls without executing
+struct DryRunRunner {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl HandlerRunner for DryRunRunner {
+    fn run(
+        &self,
+        handler_id: &str,
+        _execution: Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>> {
+        let calls = self.calls.clone();
+        let id = handler_id.to_string();
+        Box::pin(async move {
+            calls.lock().unwrap().push(id);
+            Ok(Vec::new()) // Skip actual execution
+        })
+    }
+}
+```
 
 ## Core Concepts
 
