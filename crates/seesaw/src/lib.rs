@@ -36,6 +36,7 @@ extern crate self as seesaw_core;
 pub mod backend;
 pub mod dead_letter_queue;
 pub mod distributed_safe;
+pub mod es;
 pub mod handler;
 pub mod insight;
 pub mod queue_backend;
@@ -47,6 +48,12 @@ mod event_codec;
 mod handler_registry;
 mod process;
 
+// Re-export ES types
+pub use es::{
+    Aggregate, AggregateLoader, ConcurrencyError, EventStore, EventStoreExt, EventUpcast,
+    HasEventStore, NewEvent, StoredEvent as EsStoredEvent, Versioned,
+};
+
 // Re-export main types
 pub use backend::{Backend, BackendServeConfig, DispatchedEvent};
 pub use backend::capability::{
@@ -57,7 +64,7 @@ pub use backend::job_executor::{
     EventProcessingCommit as JobEventProcessingCommit, HandlerExecutionResult, HandlerStatus,
     InlineHandlerFailure as JobInlineHandlerFailure, JobExecutor,
 };
-pub use dead_letter_queue::{DeadLetter, DeadLetterQueue, DlqStats, DlqStatus, RetrySummary};
+pub use dead_letter_queue::{DeadLetter, DlqStats, DlqStatus, RetrySummary};
 pub use distributed_safe::DistributedSafe;
 pub use engine_v2::Engine;
 pub use handler::{

@@ -1,3 +1,5 @@
+pub mod event_store;
+
 // Simplified PostgresStore without compile-time checked queries
 // Uses dynamic queries for easier testing
 
@@ -7,7 +9,9 @@ use chrono::{DateTime, Duration, Utc};
 use seesaw_core::{
     insight::*, EmittedEvent, EventProcessingCommit, ExpiredJoinWindow, JoinEntry, QueuedEvent,
     QueuedHandlerExecution, Store, NAMESPACE_SEESAW,
+    DeadLetter as CoreDeadLetter, DlqStats, DlqStatus,
 };
+use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -1806,7 +1810,6 @@ use seesaw_core::backend::{Backend, BackendServeConfig, DispatchedEvent};
 use seesaw_core::backend::capability::*;
 use seesaw_core::backend::job_executor::JobExecutor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// PostgreSQL implementation of Backend trait (v0.11.0).
@@ -1872,7 +1875,7 @@ impl Backend for PostgresBackend {
     where
         D: Send + Sync + 'static,
     {
-        use seesaw_core::backend::job_executor::{EventProcessingCommit as JobCommit, HandlerStatus};
+        use seesaw_core::backend::job_executor::HandlerStatus;
         use tokio::time::sleep;
 
         let mut handles = Vec::new();
@@ -2155,6 +2158,278 @@ impl InsightBackend for PostgresBackend {
             total_events: 0,
             total_handlers_executed: 0,
             total_dlq_entries: 0,
+        })
+    }
+}
+
+// ============================================================================
+// DeadLetterQueue - PostgreSQL implementation
+// ============================================================================
+
+/// PostgreSQL-specific row for seesaw_dead_letter_queue table
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DlqRow {
+    id: Uuid,
+    event_id: Uuid,
+    handler_id: String,
+    intent_id: Uuid,
+    error_message: String,
+    error_details: Option<Value>,
+    retry_count: i32,
+    first_failed_at: DateTime<Utc>,
+    last_failed_at: DateTime<Utc>,
+    event_payload: Value,
+    status: String,
+    retry_attempts: i32,
+    last_retry_at: Option<DateTime<Utc>>,
+    resolved_at: Option<DateTime<Utc>>,
+    resolution_note: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+impl From<DlqRow> for CoreDeadLetter {
+    fn from(row: DlqRow) -> Self {
+        let status = match row.status.as_str() {
+            "open" => DlqStatus::Open,
+            "retrying" => DlqStatus::Retrying,
+            "replayed" => DlqStatus::Replayed,
+            "resolved" => DlqStatus::Resolved,
+            _ => DlqStatus::Open, // Default fallback
+        };
+
+        CoreDeadLetter {
+            id: row.id,
+            event_id: row.event_id,
+            handler_id: row.handler_id,
+            intent_id: row.intent_id,
+            error_message: row.error_message,
+            error_details: row.error_details,
+            retry_count: row.retry_count,
+            first_failed_at: row.first_failed_at,
+            last_failed_at: row.last_failed_at,
+            event_payload: row.event_payload,
+            status,
+            retry_attempts: row.retry_attempts,
+            last_retry_at: row.last_retry_at,
+            resolved_at: row.resolved_at,
+            resolution_note: row.resolution_note,
+            created_at: row.created_at,
+        }
+    }
+}
+
+/// Dead Letter Queue operations for PostgreSQL
+#[derive(Clone)]
+pub struct DeadLetterQueue {
+    pool: PgPool,
+}
+
+impl DeadLetterQueue {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Insert a handler failure into the DLQ
+    pub async fn insert(
+        &self,
+        event_id: Uuid,
+        handler_id: &str,
+        intent_id: Uuid,
+        error_message: &str,
+        error_details: Option<Value>,
+        retry_count: i32,
+        first_failed_at: DateTime<Utc>,
+        last_failed_at: DateTime<Utc>,
+        event_payload: Value,
+    ) -> Result<Uuid> {
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO seesaw_dead_letter_queue
+             (event_id, handler_id, intent_id, error_message, error_details,
+              retry_count, first_failed_at, last_failed_at, event_payload, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open')
+             ON CONFLICT (intent_id) DO UPDATE SET
+               error_message = EXCLUDED.error_message,
+               error_details = EXCLUDED.error_details,
+               retry_count = EXCLUDED.retry_count,
+               last_failed_at = EXCLUDED.last_failed_at,
+               status = 'open'
+             RETURNING id",
+        )
+        .bind(event_id)
+        .bind(handler_id)
+        .bind(intent_id)
+        .bind(error_message)
+        .bind(error_details)
+        .bind(retry_count)
+        .bind(first_failed_at)
+        .bind(last_failed_at)
+        .bind(event_payload)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
+    /// List open or retrying DLQ entries
+    pub async fn list(&self, limit: i64) -> Result<Vec<CoreDeadLetter>> {
+        let entries = sqlx::query_as::<_, DlqRow>(
+            "SELECT * FROM seesaw_dead_letter_queue
+             WHERE status IN ('open', 'retrying')
+             ORDER BY created_at DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(entries.into_iter().map(Into::into).collect())
+    }
+
+    /// List DLQ entries for a specific handler
+    pub async fn list_by_handler(&self, handler_id: &str, limit: i64) -> Result<Vec<CoreDeadLetter>> {
+        let entries = sqlx::query_as::<_, DlqRow>(
+            "SELECT * FROM seesaw_dead_letter_queue
+             WHERE handler_id = $1 AND status IN ('open', 'retrying')
+             ORDER BY created_at DESC
+             LIMIT $2",
+        )
+        .bind(handler_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(entries.into_iter().map(Into::into).collect())
+    }
+
+    /// Get a single DLQ entry by ID
+    pub async fn get(&self, dlq_id: Uuid) -> Result<CoreDeadLetter> {
+        let entry =
+            sqlx::query_as::<_, DlqRow>("SELECT * FROM seesaw_dead_letter_queue WHERE id = $1")
+                .bind(dlq_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(entry.into())
+    }
+
+    /// Mark a DLQ entry as retrying and return it (with lock)
+    pub async fn start_retry(&self, dlq_id: Uuid) -> Result<CoreDeadLetter> {
+        let mut tx = self.pool.begin().await?;
+
+        // Lock row so only one operator retries this entry at a time
+        let entry = sqlx::query_as::<_, DlqRow>(
+            "SELECT * FROM seesaw_dead_letter_queue
+             WHERE id = $1
+             FOR UPDATE",
+        )
+        .bind(dlq_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Update status to retrying
+        sqlx::query(
+            "UPDATE seesaw_dead_letter_queue
+             SET status = 'retrying',
+                 retry_attempts = retry_attempts + 1,
+                 last_retry_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(dlq_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(entry.into())
+    }
+
+    /// Mark a DLQ entry as successfully replayed
+    pub async fn mark_replayed(&self, dlq_id: Uuid, resolution_note: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE seesaw_dead_letter_queue
+             SET status = 'replayed',
+                 resolved_at = NOW(),
+                 resolution_note = $2
+             WHERE id = $1",
+        )
+        .bind(dlq_id)
+        .bind(resolution_note)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark a DLQ entry as failed (retry failed, back to open)
+    pub async fn mark_retry_failed(
+        &self,
+        dlq_id: Uuid,
+        error_message: &str,
+        error_details: Option<Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE seesaw_dead_letter_queue
+             SET status = 'open',
+                 last_failed_at = NOW(),
+                 error_message = $2,
+                 error_details = $3
+             WHERE id = $1",
+        )
+        .bind(dlq_id)
+        .bind(error_message)
+        .bind(error_details)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark a DLQ entry as resolved (won't retry, manual fix)
+    pub async fn mark_resolved(&self, dlq_id: Uuid, resolution_note: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE seesaw_dead_letter_queue
+             SET status = 'resolved',
+                 resolved_at = NOW(),
+                 resolution_note = $2
+             WHERE id = $1",
+        )
+        .bind(dlq_id)
+        .bind(resolution_note)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get statistics about the DLQ
+    pub async fn stats(&self) -> Result<DlqStats> {
+        #[derive(sqlx::FromRow)]
+        struct StatsRow {
+            open: Option<i64>,
+            retrying: Option<i64>,
+            replayed: Option<i64>,
+            resolved: Option<i64>,
+            total: Option<i64>,
+        }
+
+        let row: StatsRow = sqlx::query_as(
+            "SELECT
+                COUNT(*) FILTER (WHERE status = 'open') as open,
+                COUNT(*) FILTER (WHERE status = 'retrying') as retrying,
+                COUNT(*) FILTER (WHERE status = 'replayed') as replayed,
+                COUNT(*) FILTER (WHERE status = 'resolved') as resolved,
+                COUNT(*) as total
+             FROM seesaw_dead_letter_queue",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(DlqStats {
+            open: row.open.unwrap_or(0) as usize,
+            retrying: row.retrying.unwrap_or(0) as usize,
+            replayed: row.replayed.unwrap_or(0) as usize,
+            resolved: row.resolved.unwrap_or(0) as usize,
+            total: row.total.unwrap_or(0) as usize,
         })
     }
 }

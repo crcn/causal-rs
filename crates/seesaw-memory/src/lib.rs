@@ -3,6 +3,8 @@
 //! This is a simple in-memory store suitable for development, testing, and demos.
 //! Not suitable for production use as all data is lost on restart.
 
+pub mod event_store;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};

@@ -109,15 +109,6 @@ mod sqlx_impls {
 
     impl sealed::Sealed for sqlx::PgPool {}
     impl DistributedSafe for sqlx::PgPool {}
-
-    impl sealed::Sealed for sqlx::MySqlPool {}
-    impl DistributedSafe for sqlx::MySqlPool {}
-
-    impl sealed::Sealed for sqlx::SqlitePool {}
-    impl DistributedSafe for sqlx::SqlitePool {}
-
-    impl sealed::Sealed for sqlx::AnyPool {}
-    impl DistributedSafe for sqlx::AnyPool {}
 }
 
 #[cfg(feature = "reqwest")]

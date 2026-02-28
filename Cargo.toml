@@ -12,6 +12,7 @@ members = [
     "crates/seesaw-insight",
     "crates/seesaw-memory",
     "crates/seesaw-kafka",
+    "examples/es-order",
 ]
 resolver = "2"
 

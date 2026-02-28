@@ -332,10 +332,10 @@ let engine = Engine::new(deps, backend);
 
 ### PostgreSQL Backend (Production)
 
-Durable, ACID transactions, queue-backed execution.
+Durable, ACID transactions, queue-backed execution, with built-in Dead Letter Queue (DLQ).
 
 ```rust
-use seesaw_postgres::PostgresStore;
+use seesaw_postgres::{PostgresStore, PostgresBackend, DeadLetterQueue};
 use sqlx::postgres::PgPoolOptions;
 
 let pool = PgPoolOptions::new()
@@ -343,9 +343,13 @@ let pool = PgPoolOptions::new()
     .connect("postgres://localhost/seesaw")
     .await?;
 
-let store = PostgresStore::new(pool);
+let store = PostgresStore::new(pool.clone());
 let backend = PostgresBackend::new(store);
 let engine = Engine::new(deps, backend);
+
+// Access DLQ for failed handlers
+let dlq = DeadLetterQueue::new(pool);
+let failed_entries = dlq.list(50).await?;
 ```
 
 **Use when:**
@@ -353,6 +357,12 @@ let engine = Engine::new(deps, backend);
 - Durability required
 - ~1-5k events/sec throughput
 - Single-node simplicity preferred
+- Need DLQ for handling persistent failures
+
+**PostgreSQL-Specific Features:**
+- **Dead Letter Queue**: Handlers that exhaust retries are moved to the DLQ for manual inspection and replay
+- **ACID Guarantees**: Full transactional consistency across event processing
+- **LISTEN/NOTIFY**: Real-time event streaming via PostgreSQL's pub/sub
 
 ### Kafka Backend (High Scale)
 
@@ -458,11 +468,26 @@ cargo run --example simple-order
 
 This repository is organized as a Cargo workspace:
 
-- **[seesaw_core](crates/seesaw)** - Core event-driven runtime and handler system
-- **[seesaw-postgres](crates/seesaw-postgres)** - PostgreSQL backend (durable, ACID)
+- **[seesaw_core](crates/seesaw)** - Core event-driven runtime and handler system (backend-agnostic)
+- **[seesaw-postgres](crates/seesaw-postgres)** - PostgreSQL backend (durable, ACID, includes DLQ implementation)
 - **[seesaw-kafka](crates/seesaw-kafka)** - Kafka backend (high throughput, horizontal scaling)
 - **[seesaw-memory](crates/seesaw-memory)** - In-memory backend (fast, ephemeral)
 - **[seesaw-insight](crates/seesaw-insight)** - Real-time observability and visualization
+
+### Architecture Philosophy
+
+**Backend-Agnostic Core**: The core crate (`seesaw_core`) is intentionally decoupled from any specific backend implementation. This means:
+
+- Core types (events, handlers, context) have no database dependencies
+- Backend-specific features (like `DeadLetterQueue`) live in their respective backend crates
+- The `HandlerContext` trait allows custom backends to provide enhanced capabilities
+- SQLx is an optional dependency in core, only needed when using database-backed backends
+
+This architecture enables:
+- **Flexibility**: Swap backends without touching business logic
+- **Minimal Dependencies**: Core stays lightweight with minimal dependencies
+- **Custom Backends**: Build your own backend (e.g., Restate, Redis) by implementing the backend traits
+- **Testing**: Use in-memory backend for fast tests, PostgreSQL/Kafka for integration tests
 
 ## Core Concepts
 

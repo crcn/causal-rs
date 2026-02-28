@@ -94,6 +94,8 @@ struct EffectArgs {
     delay_ms: Option<u64>,
     priority: Option<i32>,
     group: Option<String>,
+    aggregate: Option<Path>,
+    transition: Option<syn::ExprClosure>,
 }
 
 struct ParamInfo {
@@ -177,7 +179,65 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
     let input_builder = quote! { ::seesaw_core::on::<#on_event_type>() };
     let builder = apply_effect_config(input_builder, &args, &fn_ident);
 
-    let chain = if is_accumulate {
+    // Validate aggregate/transition pairing
+    if args.aggregate.is_some() != args.transition.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "aggregate and transition must be specified together",
+        ));
+    }
+
+    let chain = if args.aggregate.is_some() && args.transition.is_some() {
+        // Transition guard path
+        let aggregate_ty = args.aggregate.as_ref().unwrap();
+        let transition_closure = args.transition.as_ref().unwrap();
+
+        if args.extract.len() != 1 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "transition handlers require extract() with exactly one Uuid field (the aggregate ID)",
+            ));
+        }
+
+        if non_ctx_params.len() != 1 {
+            return Err(syn::Error::new_spanned(
+                &input_fn.sig.inputs,
+                "transition handler function takes (aggregate_id: Uuid, ctx: Context<Deps>)",
+            ));
+        }
+
+        let field = &args.extract[0];
+        let param_ident = &non_ctx_params[0].ident;
+
+        let extract_call = match &on {
+            OnSpec::EventType(_) => {
+                quote! {
+                    .extract(|__seesaw_event| Some(__seesaw_event.#field.clone()))
+                }
+            }
+            OnSpec::Variants(variants) => {
+                let match_arms = variants.iter().map(|variant| {
+                    quote! {
+                        #variant { #field, .. } => Some(#field.clone()),
+                    }
+                });
+                quote! {
+                    .extract(|__seesaw_event| match __seesaw_event {
+                        #(#match_arms)*
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    })
+                }
+            }
+        };
+
+        quote! {
+            #builder
+                #extract_call
+                .transition::<#aggregate_ty, _>(#transition_closure)
+                .then::<#deps_ty, _, _, _, #output_event_ty>(|#param_ident, __seesaw_ctx| #fn_ident(#param_ident, __seesaw_ctx))
+        }
+    } else if is_accumulate {
         if !args.extract.is_empty() {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
@@ -482,6 +542,19 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 ensure_unset(&args.group, nv, "group")?;
                 args.group = Some(parse_string_lit(&nv.value)?);
             }
+            Meta::NameValue(nv) if nv.path.is_ident("aggregate") => {
+                ensure_unset(&args.aggregate, nv, "aggregate")?;
+                args.aggregate = Some(parse_path_expr(&nv.value, "aggregate")?);
+            }
+            Meta::NameValue(nv) if nv.path.is_ident("transition") => {
+                if args.transition.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        nv,
+                        "transition specified more than once",
+                    ));
+                }
+                args.transition = Some(parse_closure_expr(&nv.value)?);
+            }
             _ => {
                 return Err(syn::Error::new_spanned(
                     meta,
@@ -591,6 +664,16 @@ fn parse_path_expr(expr: &Expr, label: &str) -> syn::Result<Path> {
         _ => Err(syn::Error::new_spanned(
             expr,
             format!("expected path for {label}, e.g. module::handler"),
+        )),
+    }
+}
+
+fn parse_closure_expr(expr: &Expr) -> syn::Result<syn::ExprClosure> {
+    match strip_expr_groups(expr) {
+        Expr::Closure(closure) => Ok(closure.clone()),
+        _ => Err(syn::Error::new_spanned(
+            expr,
+            "expected a closure, e.g. |prev, next| prev.x > 0 && next.x == 0",
         )),
     }
 }

@@ -1,6 +1,6 @@
 //! Effect builder functions and types.
 
-use std::any::{Any, TypeId};
+use std::any::TypeId;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -622,6 +622,157 @@ where
             timeout: self.timeout,
             max_attempts: self.max_attempts,
             priority: self.priority,
+        }
+    }
+}
+
+// ── Transition guard builder ─────────────────────────────────────────────
+
+use crate::es::{Aggregate, EventStoreExt, HasEventStore};
+
+/// Builder for handlers guarded by aggregate state transitions.
+///
+/// Created by calling `.transition::<A>(guard)` after `.extract()` on a
+/// `HandlerBuilder`. The guard function receives `(&prev_state, &next_state)`
+/// and returns `true` to fire the handler.
+pub struct TransitionHandlerBuilder<E, A, G, Started> {
+    inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
+    extractor: Box<dyn Fn(&E) -> Option<uuid::Uuid> + Send + Sync>,
+    guard: G,
+    _aggregate: PhantomData<A>,
+}
+
+impl<E, F, Started> HandlerBuilder<Typed<E>, WithFilterMap<F, uuid::Uuid>, Started>
+where
+    E: Clone + Send + Sync + 'static,
+    F: Fn(&E) -> Option<uuid::Uuid> + Send + Sync + 'static,
+    Started: Send + Sync + 'static,
+{
+    /// Add a transition guard. The handler fires only when the aggregate
+    /// state transitions in the way described by `guard(prev, next)`.
+    ///
+    /// The `.extract()` must return `Option<Uuid>` (the aggregate ID).
+    pub fn transition<A, G>(self, guard: G) -> TransitionHandlerBuilder<E, A, G, Started>
+    where
+        A: Aggregate,
+        G: Fn(&A, &A) -> bool + Send + Sync + 'static,
+    {
+        TransitionHandlerBuilder {
+            inner: HandlerBuilder {
+                filter: NoFilter,
+                started: self.started,
+                id: self.id,
+                queued: self.queued,
+                delay: self.delay,
+                timeout: self.timeout,
+                join_window: self.join_window,
+                max_attempts: self.max_attempts,
+                priority: self.priority,
+                codec: self.codec,
+                dlq_terminal_mapper: self.dlq_terminal_mapper,
+                _marker: PhantomData,
+            },
+            extractor: Box::new(self.filter.0),
+            guard,
+            _aggregate: PhantomData,
+        }
+    }
+}
+
+impl<E, A, G, Started> TransitionHandlerBuilder<E, A, G, Started>
+where
+    E: Clone + Send + Sync + 'static,
+    A: Aggregate,
+    G: Fn(&A, &A) -> bool + Send + Sync + 'static,
+{
+    /// Set a custom ID for this handler.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.inner.id = Some(id.into());
+        self
+    }
+
+    /// Set the handler that runs when the transition guard passes.
+    ///
+    /// `D` must implement `HasEventStore` so the guard can load aggregate state.
+    #[track_caller]
+    #[allow(private_bounds)]
+    pub fn then<D, H, Fut, R, O>(self, handler: H) -> Handler<D>
+    where
+        D: HasEventStore + Send + Sync + 'static,
+        Started: StartedHandler<D>,
+        H: Fn(uuid::Uuid, Context<D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
+        R: Into<Emit<O>> + Send + 'static,
+        O: Send + Sync + 'static,
+    {
+        let target = TypeId::of::<E>();
+        let extractor: Arc<dyn Fn(&E) -> Option<uuid::Uuid> + Send + Sync> =
+            Arc::from(self.extractor);
+        let guard = Arc::new(self.guard);
+        let handler = Arc::new(handler);
+
+        let id = self
+            .inner
+            .id
+            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
+
+        let codec = self.inner.codec;
+
+        Handler {
+            id,
+            codecs: codec.into_iter().collect(),
+            can_handle: Arc::new(move |t| t == target),
+            started: self.inner.started.into_started(),
+            handler: Arc::new(move |value, _, ctx: Context<D>| {
+                let typed = value.downcast::<E>().expect("type checked by can_handle");
+                let extractor = extractor.clone();
+                let guard = guard.clone();
+                let handler = handler.clone();
+
+                match extractor(&typed) {
+                    Some(aggregate_id) => {
+                        Box::pin(async move {
+                            // Load aggregate at current version (next state)
+                            let es = ctx.deps().event_store();
+                            let next: crate::es::Versioned<A> =
+                                es.aggregate(aggregate_id).load().await?;
+
+                            if next.version() == 0 {
+                                // No events yet — no transition possible
+                                return Ok(Vec::new());
+                            }
+
+                            // Load at version - 1 (prev state)
+                            let prev: crate::es::Versioned<A> = if next.version() > 1 {
+                                es.aggregate(aggregate_id)
+                                    .load_at_version(next.version() - 1)
+                                    .await?
+                            } else {
+                                crate::es::Versioned::new(A::default(), 0)
+                            };
+
+                            if !guard(&prev.state, &next.state) {
+                                return Ok(Vec::new());
+                            }
+
+                            // Guard passed — call the handler
+                            let result: R = handler(aggregate_id, ctx).await?;
+                            let emit: Emit<O> = result.into();
+                            Ok(emit_to_outputs(emit))
+                        })
+                    }
+                    None => Box::pin(async { Ok(Vec::new()) }),
+                }
+            }),
+            join_mode: None,
+            join_batch_handler: None,
+            join_window_timeout: self.inner.join_window,
+            dlq_terminal_mapper: self.inner.dlq_terminal_mapper,
+            queued: self.inner.queued,
+            delay: self.inner.delay,
+            timeout: self.inner.timeout,
+            max_attempts: self.inner.max_attempts,
+            priority: self.inner.priority,
         }
     }
 }

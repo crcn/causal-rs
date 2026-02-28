@@ -34,12 +34,12 @@
 //! ```
 
 mod builders;
-pub(crate) mod context;
+pub mod context;
 mod error_event;
 mod types;
 
-pub use builders::{on, on_any};
-pub use context::Context;
+pub use builders::{on, on_any, TransitionHandlerBuilder};
+pub use context::{Context, HandlerContext};
 pub use error_event::HandlerError;
 pub use types::{
     AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Handler, JoinMode,

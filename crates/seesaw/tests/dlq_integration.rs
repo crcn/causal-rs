@@ -4,8 +4,8 @@
 //! They will fail initially until we integrate DLQ with the handler worker.
 
 use anyhow::Result;
-use seesaw_core::{handler, Context, DeadLetterQueue, DlqStatus, Engine, Runtime};
-use seesaw_postgres::PostgresStore;
+use seesaw_core::{handler, Context, DlqStatus, Engine, Runtime};
+use seesaw_postgres::{DeadLetterQueue, PostgresStore};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
