@@ -410,6 +410,12 @@ where
             let typed = (codec.decode)(payload)?;
             Ok((typed, codec.type_id))
         } else {
+            warn!(
+                event_type = %event_type,
+                "No codec registered for event type — falling back to raw JSON. \
+                 If this event was emitted by a queued handler, ensure the \
+                 receiving handler is registered with the engine."
+            );
             Ok((Arc::new(payload.clone()), TypeId::of::<serde_json::Value>()))
         }
     }

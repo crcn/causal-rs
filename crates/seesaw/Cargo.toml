@@ -26,3 +26,4 @@ seesaw_core_macros = { version = "0.14.0", path = "../seesaw_core_macros", optio
 [dev-dependencies]
 fastrand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+trybuild.workspace = true

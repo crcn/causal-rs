@@ -100,6 +100,25 @@ Ok(emit![..items])                       // Fan-out batch from iterator
 
 The `#[handler]` macro handles conversion automatically — return `Result<YourEvent>` or `Result<()>` directly.
 
+### Filter events
+
+Skip events that don't match a predicate. The filter function receives `&Event` and returns `bool`:
+
+```rust
+fn is_high_value(event: &OrderPlaced) -> bool {
+    event.total > 1000.0
+}
+
+#[handler(on = OrderPlaced, filter = is_high_value, id = "ship_high_value")]
+async fn ship_high_value(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+    Ok(OrderShipped { order_id: event.order_id })
+}
+```
+
+Builder API equivalent: `.filter(|e| e.total > 1000.0)`.
+
+> `filter` and `extract` are mutually exclusive — use one or the other.
+
 ### Extract fields from enum variants
 
 ```rust
@@ -134,7 +153,7 @@ async fn charge_payment(event: PaymentRequested, ctx: Context<Deps>) -> Result<P
 }
 ```
 
-Options: `id`, `queued`, `retry`, `timeout_secs`, `timeout_ms`, `delay_secs`, `delay_ms`, `priority`.
+Options: `id`, `queued`, `filter`, `retry`, `timeout_secs`, `timeout_ms`, `delay_secs`, `delay_ms`, `priority`.
 
 ### Module registration
 

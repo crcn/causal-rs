@@ -56,6 +56,21 @@ struct ExtractEnqueued {
 #[derive(Clone, Serialize, Deserialize)]
 struct AnalyticsEvent;
 
+#[derive(Clone, Serialize, Deserialize)]
+struct HighValueOrder {
+    order_id: Uuid,
+    total: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct HighValueShipped {
+    order_id: Uuid,
+}
+
+fn is_high_value(event: &HighValueOrder) -> bool {
+    event.total > 500.0
+}
+
 #[handles]
 mod order_effects {
     use super::*;
@@ -174,6 +189,16 @@ mod order_effects {
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
     }
+
+    #[handle(on = HighValueOrder, filter = is_high_value, id = "ship_high_value")]
+    async fn ship_high_value(
+        event: HighValueOrder,
+        _ctx: Context<Deps>,
+    ) -> Result<HighValueShipped> {
+        Ok(HighValueShipped {
+            order_id: event.order_id,
+        })
+    }
 }
 
 // ── Aggregator macro tests ──────────────────────────────────────────────
@@ -245,7 +270,7 @@ fn aggregator_apply_trait_generated() {
 #[test]
 fn effects_module_registration_works() {
     let effects = order_effects::handles();
-    assert_eq!(effects.len(), 8);
+    assert_eq!(effects.len(), 9);
     assert!(effects
         .iter()
         .any(|effect| effect.can_handle(TypeId::of::<OrderPlaced>())));
@@ -281,5 +306,14 @@ fn effects_module_registration_works() {
     assert!(
         !queued_retry_one.is_inline(),
         "queued attribute should force queued execution even when retry = 1"
+    );
+
+    let ship_high_value = effects
+        .iter()
+        .find(|effect| effect.id == "ship_high_value")
+        .expect("ship_high_value effect should exist");
+    assert!(
+        ship_high_value.can_handle(TypeId::of::<HighValueOrder>()),
+        "filter handler should handle HighValueOrder events"
     );
 }
