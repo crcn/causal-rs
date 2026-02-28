@@ -73,12 +73,12 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-seesaw_core = "0.12"
-seesaw-memory = "0.12"    # For in-memory backend
+seesaw_core = "0.13"
+seesaw-memory = "0.13"    # For in-memory backend
 # OR
-seesaw-postgres = "0.12"  # For durable PostgreSQL backend
+seesaw-postgres = "0.13"  # For durable PostgreSQL backend
 # OR
-seesaw-kafka = "0.12"     # For high-throughput Kafka backend
+seesaw-kafka = "0.13"     # For high-throughput Kafka backend
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
