@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
         let order_id = Uuid::new_v4();
         let total = 99.99 * i as f64;
         println!("Placing order {} (${:.2})", order_id, total);
-        engine.dispatch(place_order(order_id, total)).settled().await?;
+        engine.emit(place_order(order_id, total)).settled().await?;
     }
 
     println!("\nAll orders processed successfully!");

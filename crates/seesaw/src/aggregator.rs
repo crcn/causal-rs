@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use uuid::Uuid;
 
+use crate::event_store::event_type_short_name;
 use crate::runtime::Runtime;
 
 // ── Aggregate + Apply traits ─────────────────────────────────────
@@ -256,6 +257,50 @@ impl AggregatorRegistry {
 
         // Store updated state
         runtime.set_state(key, Arc::from(next_state));
+    }
+
+    /// Replay a sequence of persisted events to reconstruct aggregate state.
+    ///
+    /// Takes `(event_type, payload)` pairs (decoupled from `PersistedEvent`).
+    /// Uses short name matching so persisted events (e.g. `"OrderPlaced"`)
+    /// match aggregators registered with full type paths.
+    ///
+    /// Returns `None` if no aggregators are registered for this aggregate type.
+    pub fn replay_events(
+        &self,
+        aggregate_type: &str,
+        events: &[(&str, &serde_json::Value)],
+    ) -> Result<Option<Box<dyn Any + Send + Sync>>> {
+        // Find any aggregator for this aggregate_type to get default_state
+        let first = self
+            .aggregators
+            .iter()
+            .find(|a| a.aggregate_type == aggregate_type);
+
+        let first = match first {
+            Some(agg) => agg,
+            None => return Ok(None),
+        };
+
+        let mut state = first.default_state();
+
+        for (event_type, payload) in events {
+            // Find aggregators where the short name matches
+            let matching: Vec<&Aggregator> = self
+                .aggregators
+                .iter()
+                .filter(|a| {
+                    a.aggregate_type == aggregate_type
+                        && event_type_short_name(&a.event_type) == *event_type
+                })
+                .collect();
+
+            for agg in matching {
+                agg.apply_to(state.as_mut(), (*payload).clone())?;
+            }
+        }
+
+        Ok(Some(state))
     }
 
     /// Get the (prev, next) transition for an aggregate from the Runtime.

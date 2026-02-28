@@ -33,6 +33,12 @@ where
     /// Get the parent event ID (for causal tracking).
     fn parent_event_id(&self) -> Option<Uuid>;
 
+    /// Whether this handler is being invoked during event replay.
+    ///
+    /// When `true`, handlers should skip side effects (API calls, emails, etc.)
+    /// and only perform state reconstruction.
+    fn is_replay(&self) -> bool;
+
     /// Get shared dependencies.
     fn deps(&self) -> &D;
 }
@@ -53,6 +59,8 @@ where
     /// Parent event ID for causal tracking.
     pub parent_event_id: Option<Uuid>,
     pub(crate) deps: Arc<D>,
+    /// Whether this handler is being invoked during event replay.
+    pub(crate) is_replay: bool,
     /// Aggregator registry for transition guard replay.
     pub(crate) aggregator_registry: Option<Arc<AggregatorRegistry>>,
     /// Runtime for aggregate state access.
@@ -71,6 +79,7 @@ where
             event_id: self.event_id,
             parent_event_id: self.parent_event_id,
             deps: self.deps.clone(),
+            is_replay: self.is_replay,
             aggregator_registry: self.aggregator_registry.clone(),
             runtime: self.runtime.clone(),
         }
@@ -96,6 +105,7 @@ where
             event_id,
             parent_event_id,
             deps,
+            is_replay: false,
             aggregator_registry: None,
             runtime: None,
         }
@@ -113,6 +123,13 @@ where
     /// Attach a runtime (used by the engine for aggregate state access).
     pub(crate) fn with_runtime(mut self, runtime: Arc<dyn Runtime>) -> Self {
         self.runtime = Some(runtime);
+        self
+    }
+
+    /// Set the replay flag (used during event replay to suppress side effects).
+    #[allow(dead_code)]
+    pub(crate) fn with_replay(mut self, is_replay: bool) -> Self {
+        self.is_replay = is_replay;
         self
     }
 
@@ -150,6 +167,14 @@ where
     pub fn parent_event_id(&self) -> Option<Uuid> {
         self.parent_event_id
     }
+
+    /// Whether this handler is being invoked during event replay.
+    ///
+    /// When `true`, handlers should skip side effects (API calls, emails, etc.)
+    /// and only perform state reconstruction.
+    pub fn is_replay(&self) -> bool {
+        self.is_replay
+    }
 }
 
 impl<D> HandlerContext<D> for Context<D>
@@ -174,6 +199,10 @@ where
 
     fn parent_event_id(&self) -> Option<Uuid> {
         self.parent_event_id
+    }
+
+    fn is_replay(&self) -> bool {
+        self.is_replay
     }
 
     fn deps(&self) -> &D {

@@ -19,7 +19,7 @@ use crate::runtime::{DirectRuntime, Runtime};
 use crate::insight::{InsightEvent, StreamType};
 use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
-use crate::process::{DispatchFuture, ProcessHandle};
+use crate::process::{EmitFuture, ProcessHandle};
 use crate::types::{
     EventWorkerConfig, HandlerWorkerConfig, QueuedEvent, QueuedHandlerExecution, NAMESPACE_SEESAW,
 };
@@ -140,19 +140,19 @@ where
         self
     }
 
-    /// Dispatch event (returns lazy future).
+    /// Emit an event into the engine (returns lazy future).
     ///
     /// Awaiting directly publishes the event (fire-and-forget).
     /// Chain `.settled()` to drive the full causal tree to completion:
     ///
     /// ```ignore
     /// // Fire-and-forget
-    /// engine.dispatch(event).await?;
+    /// engine.emit(event).await?;
     ///
     /// // Synchronous settlement
-    /// engine.dispatch(event).settled().await?;
+    /// engine.emit(event).settled().await?;
     /// ```
-    pub fn dispatch<E>(&self, event: E) -> DispatchFuture
+    pub fn emit<E>(&self, event: E) -> EmitFuture
     where
         E: Clone + Send + Sync + serde::Serialize + 'static,
     {
@@ -167,7 +167,16 @@ where
             Box::pin(async move { engine2.settle().await })
         });
 
-        DispatchFuture::new(publish, settle)
+        EmitFuture::new(publish, settle)
+    }
+
+    /// Deprecated: use `emit()` instead.
+    #[deprecated(note = "renamed to emit()")]
+    pub fn dispatch<E>(&self, event: E) -> EmitFuture
+    where
+        E: Clone + Send + Sync + serde::Serialize + 'static,
+    {
+        self.emit(event)
     }
 
     /// Drive all pending events and effects to completion.

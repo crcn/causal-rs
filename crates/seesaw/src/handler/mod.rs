@@ -26,10 +26,10 @@
 //!         .then(handle_my_event)
 //! );
 //!
-//! // on_any() observer pattern
+//! // on_any() — receives all events, can emit child events
 //! store.with_handler(
 //!     effect::on_any()
-//!         .then(|event, ctx| async move { Ok(()) })
+//!         .then(|event: AnyEvent, ctx| async move { Ok(emit![]) })
 //! );
 //! ```
 

@@ -28,7 +28,7 @@ let engine = Engine::new(Deps)
             }),
     );
 
-engine.dispatch(OrderPlaced { order_id: Uuid::new_v4(), total: 99.99 })
+engine.emit(OrderPlaced { order_id: Uuid::new_v4(), total: 99.99 })
     .settled().await?;
 ```
 
@@ -50,7 +50,7 @@ Runtime (durability, retries, state)
 
 ```toml
 [dependencies]
-seesaw_core = "0.14"
+seesaw_core = "0.15"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -188,13 +188,28 @@ async fn bulk_insert(batch: Vec<RowValidated>, ctx: Context<Deps>) -> Result<Bat
 }
 ```
 
-### Observer (all events)
+### Observe all events
+
+`on_any()` handlers receive every event and can emit child events like any other handler:
 
 ```rust
 handler::on_any()
     .id("logger")
-    .then(|event, ctx: Context<Deps>| async move {
+    .then(|event: AnyEvent, ctx: Context<Deps>| async move {
         println!("event: {:?}", event.type_id);
+        Ok(emit![])
+    })
+```
+
+Downcast to react to specific types:
+
+```rust
+handler::on_any()
+    .id("enricher")
+    .then(|event: AnyEvent, ctx: Context<Deps>| async move {
+        if let Some(order) = event.downcast::<OrderPlaced>() {
+            return Ok(emit![OrderEnriched { order_id: order.order_id }]);
+        }
         Ok(emit![])
     })
 ```
@@ -281,10 +296,10 @@ Drive the full causal tree to completion:
 
 ```rust
 // Fire-and-forget
-engine.dispatch(event).await?;
+engine.emit(event).await?;
 
 // Wait for all handlers to complete
-engine.dispatch(event).settled().await?;
+engine.emit(event).settled().await?;
 ```
 
 ## Runtime Trait
@@ -378,7 +393,7 @@ impl OrderWorkflow for OrderWorkflowImpl {
             .with_handler(ship_order())
             .with_handler(notify_shipped());
 
-        engine.dispatch(input).settled().await?;
+        engine.emit(input).settled().await?;
         Ok(())
     }
 }
@@ -453,7 +468,7 @@ cargo run --example simple-order
 3. **Runtime owns the lifecycle** — Execute handlers, manage state, handle journaling
 4. **Engine declares, Runtime executes** — Engine routes events and declares aggregates; Runtime wraps execution and persists state
 5. **User code is backend-agnostic** — Same `#[handler]` works with DirectRuntime or RestateRuntime
-6. **Settle on demand** — `engine.dispatch(event).settled().await` drives the full causal tree
+6. **Settle on demand** — `engine.emit(event).settled().await` drives the full causal tree
 
 ## License
 

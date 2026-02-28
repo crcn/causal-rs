@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
     ];
 
     engine
-        .dispatch(FetchEvent::FetchRequested {
+        .emit(FetchEvent::FetchRequested {
             urls,
             success_count: 0,
             failure_count: 0,

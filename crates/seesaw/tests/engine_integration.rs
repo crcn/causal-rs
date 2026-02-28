@@ -69,7 +69,7 @@ async fn basic_handler_fires() -> Result<()> {
     );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .settled()
@@ -102,7 +102,7 @@ async fn handler_emits_chain() -> Result<()> {
             },
         ));
 
-    engine.dispatch(EventA { value: 10 }).settled().await?;
+    engine.emit(EventA { value: 10 }).settled().await?;
 
     assert_eq!(b_counter.load(Ordering::SeqCst), 11);
     Ok(())
@@ -140,7 +140,7 @@ async fn multiple_handlers_same_event() -> Result<()> {
         );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .settled()
@@ -170,7 +170,7 @@ async fn queued_handler_executes() -> Result<()> {
     );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .settled()
@@ -181,7 +181,7 @@ async fn queued_handler_executes() -> Result<()> {
 }
 
 #[tokio::test]
-async fn dispatch_requires_settled() -> Result<()> {
+async fn emit_requires_settled() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
@@ -198,9 +198,9 @@ async fn dispatch_requires_settled() -> Result<()> {
             }),
     );
 
-    // Fire-and-forget: dispatch without settled
+    // Fire-and-forget: emit without settled
     let _handle = engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .await?;
@@ -223,7 +223,7 @@ async fn handler_returns_nothing() -> Result<()> {
     );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .settled()
@@ -259,7 +259,7 @@ async fn retry_succeeds_on_second_attempt() -> Result<()> {
     );
 
     engine
-        .dispatch(FailEvent { attempt: 0 })
+        .emit(FailEvent { attempt: 0 })
         .settled()
         .await?;
 
@@ -307,7 +307,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
         ));
 
     engine
-        .dispatch(FailEvent { attempt: 0 })
+        .emit(FailEvent { attempt: 0 })
         .settled()
         .await?;
 
@@ -354,7 +354,7 @@ async fn accumulate_batch() -> Result<()> {
         );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "trigger".into(),
         })
         .settled()
@@ -387,7 +387,7 @@ async fn insight_callback_fires() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .settled()
@@ -426,7 +426,7 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
             },
         ));
 
-    let handle = engine.dispatch(EventA { value: 1 }).settled().await?;
+    let handle = engine.emit(EventA { value: 1 }).settled().await?;
 
     let seen = seen_correlation.lock().expect("EventB handler should have run");
     assert_eq!(
@@ -468,7 +468,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
         ));
 
     let handle = engine
-        .dispatch(FailEvent { attempt: 0 })
+        .emit(FailEvent { attempt: 0 })
         .settled()
         .await?;
 
@@ -498,7 +498,7 @@ async fn insight_seq_monotonically_increases() -> Result<()> {
                 .then(|_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(emit![]) }),
         );
 
-    engine.dispatch(EventA { value: 42 }).settled().await?;
+    engine.emit(EventA { value: 42 }).settled().await?;
 
     let events = collected.lock();
     assert!(
@@ -521,5 +521,31 @@ async fn insight_seq_monotonically_increases() -> Result<()> {
         assert!(event.seq > 0, "insight seq should never be 0, got 0");
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_is_replay_defaults_to_false() -> Result<()> {
+    let saw_replay = Arc::new(Mutex::new(None));
+    let sr = saw_replay.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
+            let sr = sr.clone();
+            async move {
+                *sr.lock() = Some(ctx.is_replay());
+                Ok(emit![])
+            }
+        }),
+    );
+
+    engine
+        .emit(Ping {
+            msg: "hello".into(),
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(*saw_replay.lock(), Some(false));
     Ok(())
 }

@@ -26,14 +26,15 @@
 //!         Ok(UserWelcomed { name: event.name.clone() })
 //!     }));
 //!
-//! // Dispatch + settle the full causal tree.
-//! engine.dispatch(UserCreated { name: "Alice".into() }).settled().await?;
+//! // Emit + settle the full causal tree.
+//! engine.emit(UserCreated { name: "Alice".into() }).settled().await?;
 //! ```
 
 extern crate self as seesaw_core;
 
 // Module structure
 pub mod aggregator;
+pub mod event_store;
 pub mod handler;
 pub mod runtime;
 pub mod insight;
@@ -90,7 +91,9 @@ pub use job_executor::{
     EventProcessingCommit as JobEventProcessingCommit, HandlerExecutionResult, HandlerStatus,
     InlineHandlerFailure as JobInlineHandlerFailure, JobExecutor, JoinClaim,
 };
-pub use process::{DispatchFuture, ProcessHandle, SettleFuture};
+#[allow(deprecated)]
+pub use process::DispatchFuture;
+pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
     EmittedEvent, EventProcessingCommit, EventWorkerConfig, ExpiredJoinWindow,
     HandlerWorkerConfig, InlineHandlerFailure, JoinEntry, QueuedEvent,

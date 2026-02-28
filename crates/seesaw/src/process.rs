@@ -1,4 +1,4 @@
-//! Dispatch future and process handle for event submission.
+//! Emit future and process handle for event submission.
 
 use anyhow::Result;
 use std::future::Future;
@@ -19,17 +19,17 @@ pub(crate) type PublishFn =
 pub(crate) type SettleFn =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
 
-/// Future returned by `Engine::dispatch()`.
+/// Future returned by `Engine::emit()`.
 ///
 /// Awaiting directly publishes the event (fire-and-forget).
 /// Chain `.settled()` to also drive the full causal tree to completion.
-pub struct DispatchFuture {
+pub struct EmitFuture {
     publish: Option<PublishFn>,
     settle: Option<SettleFn>,
     task: Option<Pin<Box<dyn Future<Output = Result<ProcessHandle>> + Send>>>,
 }
 
-impl DispatchFuture {
+impl EmitFuture {
     pub(crate) fn new(publish: PublishFn, settle: SettleFn) -> Self {
         Self {
             publish: Some(publish),
@@ -51,7 +51,7 @@ impl DispatchFuture {
     }
 }
 
-impl Future for DispatchFuture {
+impl Future for EmitFuture {
     type Output = Result<ProcessHandle>;
 
     fn poll(
@@ -64,13 +64,17 @@ impl Future for DispatchFuture {
             let publish = this
                 .publish
                 .take()
-                .expect("DispatchFuture polled after completion");
+                .expect("EmitFuture polled after completion");
             this.task = Some(publish());
         }
 
         this.task.as_mut().unwrap().as_mut().poll(cx)
     }
 }
+
+/// Deprecated: use `EmitFuture` instead.
+#[deprecated(note = "renamed to EmitFuture")]
+pub type DispatchFuture = EmitFuture;
 
 /// Future for synchronous settlement.
 ///

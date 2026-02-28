@@ -140,7 +140,7 @@ async fn parent_event_id_set_on_inline_chain() -> Result<()> {
             },
         ));
 
-    let handle = engine.dispatch(EventA { value: 1 }).settled().await?;
+    let handle = engine.emit(EventA { value: 1 }).settled().await?;
 
     let parent = seen_parent.lock().unwrap();
     // EventB's parent should be the root event (EventA)
@@ -174,7 +174,7 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
             },
         ));
 
-    let _handle = engine.dispatch(EventA { value: 1 }).settled().await?;
+    let _handle = engine.emit(EventA { value: 1 }).settled().await?;
     assert!(seen_parent.lock().is_some(), "EventB handler should have run");
     Ok(())
 }
@@ -229,7 +229,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
             },
         ));
 
-    engine.dispatch(EventA { value: 0 }).settled().await?;
+    engine.emit(EventA { value: 0 }).settled().await?;
 
     let parents = parents.lock();
     assert_eq!(parents.len(), 3, "B, C, D handlers should all fire");
@@ -291,7 +291,7 @@ async fn aggregate_state_transitions_correctly() -> Result<()> {
         );
 
     engine
-        .dispatch(OrderPlaced {
+        .emit(OrderPlaced {
             order_id,
             total: 99.99,
         })
@@ -332,14 +332,14 @@ async fn transition_guard_blocks_duplicate_transition() -> Result<()> {
 
     // First: Place then Ship → guard fires
     engine
-        .dispatch(OrderPlaced {
+        .emit(OrderPlaced {
             order_id,
             total: 50.0,
         })
         .settled()
         .await?;
     engine
-        .dispatch(OrderShipped { order_id })
+        .emit(OrderShipped { order_id })
         .settled()
         .await?;
 
@@ -347,7 +347,7 @@ async fn transition_guard_blocks_duplicate_transition() -> Result<()> {
 
     // Second: Ship again → guard should NOT fire (already Shipped→Shipped)
     engine
-        .dispatch(OrderShipped { order_id })
+        .emit(OrderShipped { order_id })
         .settled()
         .await?;
 
@@ -384,7 +384,7 @@ async fn transition_guard_does_not_fire_when_guard_returns_false() -> Result<()>
         );
 
     engine
-        .dispatch(OrderPlaced {
+        .emit(OrderPlaced {
             order_id,
             total: 50.0,
         })
@@ -428,27 +428,27 @@ async fn aggregate_state_isolated_between_ids() -> Result<()> {
 
     // Place and ship order A
     engine
-        .dispatch(OrderPlaced {
+        .emit(OrderPlaced {
             order_id: order_a,
             total: 10.0,
         })
         .settled()
         .await?;
     engine
-        .dispatch(OrderShipped { order_id: order_a })
+        .emit(OrderShipped { order_id: order_a })
         .settled()
         .await?;
 
     // Place and ship order B
     engine
-        .dispatch(OrderPlaced {
+        .emit(OrderPlaced {
             order_id: order_b,
             total: 20.0,
         })
         .settled()
         .await?;
     engine
-        .dispatch(OrderShipped { order_id: order_b })
+        .emit(OrderShipped { order_id: order_b })
         .settled()
         .await?;
 
@@ -481,11 +481,11 @@ async fn filter_blocks_non_matching_events() -> Result<()> {
     );
 
     // value=5: filtered out
-    engine.dispatch(EventA { value: 5 }).settled().await?;
+    engine.emit(EventA { value: 5 }).settled().await?;
     assert_eq!(counter.load(Ordering::SeqCst), 0, "value=5 should be filtered");
 
     // value=20: passes filter
-    engine.dispatch(EventA { value: 20 }).settled().await?;
+    engine.emit(EventA { value: 20 }).settled().await?;
     assert_eq!(counter.load(Ordering::SeqCst), 1, "value=20 should pass filter");
 
     Ok(())
@@ -515,11 +515,11 @@ async fn extract_returns_none_skips_handler() -> Result<()> {
     );
 
     // value=0: extract returns None, handler skipped
-    engine.dispatch(EventA { value: 0 }).settled().await?;
+    engine.emit(EventA { value: 0 }).settled().await?;
     assert_eq!(counter.load(Ordering::SeqCst), 0, "extract→None should skip handler");
 
     // value=5: extract returns Some, handler runs
-    engine.dispatch(EventA { value: 5 }).settled().await?;
+    engine.emit(EventA { value: 5 }).settled().await?;
     assert_eq!(counter.load(Ordering::SeqCst), 1, "extract→Some should run handler");
 
     Ok(())
@@ -575,7 +575,7 @@ async fn inline_handlers_execute_in_priority_order() -> Result<()> {
         );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "test".into(),
         })
         .settled()
@@ -606,7 +606,7 @@ async fn idempotency_key_is_deterministic() -> Result<()> {
     ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .settled()
@@ -651,7 +651,7 @@ async fn context_exposes_all_fields() -> Result<()> {
     );
 
     let handle = engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "hello".into(),
         })
         .settled()
@@ -691,7 +691,7 @@ async fn hops_limit_prevents_infinite_loop() -> Result<()> {
     ));
 
     // This should NOT hang forever due to max_hops (default 50)
-    engine.dispatch(EventA { value: 0 }).settled().await?;
+    engine.emit(EventA { value: 0 }).settled().await?;
 
     let count = counter.load(Ordering::SeqCst);
     assert!(
@@ -734,7 +734,7 @@ async fn hops_increment_through_chain() -> Result<()> {
             },
         ));
 
-    engine.dispatch(EventA { value: 42 }).settled().await?;
+    engine.emit(EventA { value: 42 }).settled().await?;
 
     let values = values_seen.lock();
     assert_eq!(values.len(), 1);
@@ -772,7 +772,7 @@ async fn inline_handler_error_does_not_stop_other_handlers() -> Result<()> {
         );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "test".into(),
         })
         .settled()
@@ -806,7 +806,7 @@ async fn queued_handler_exhausts_retries_then_dlqs() -> Result<()> {
     );
 
     engine
-        .dispatch(FailEvent { attempt: 0 })
+        .emit(FailEvent { attempt: 0 })
         .settled()
         .await?;
 
@@ -845,7 +845,7 @@ async fn emit_none_produces_no_events() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "noop".into(),
         })
         .settled()
@@ -890,7 +890,7 @@ async fn emit_batch_creates_correct_metadata() -> Result<()> {
         );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "batch".into(),
         })
         .settled()
@@ -924,7 +924,7 @@ async fn emit_option_none_produces_no_events() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "maybe".into(),
         })
         .settled()
@@ -956,7 +956,7 @@ async fn emit_option_some_produces_event() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "maybe".into(),
         })
         .settled()
@@ -1026,7 +1026,7 @@ async fn custom_runtime_wraps_execution() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "spy".into(),
         })
         .settled()
@@ -1057,13 +1057,13 @@ async fn multiple_dispatches_have_independent_correlation_ids() -> Result<()> {
     ));
 
     let h1 = engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "one".into(),
         })
         .settled()
         .await?;
     let h2 = engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "two".into(),
         })
         .settled()
@@ -1117,7 +1117,7 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
         ));
 
     engine
-        .dispatch(FailEvent { attempt: 0 })
+        .emit(FailEvent { attempt: 0 })
         .settled()
         .await?;
 
@@ -1150,7 +1150,7 @@ async fn insight_events_contain_correct_stream_types() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "insight".into(),
         })
         .settled()
@@ -1186,7 +1186,7 @@ async fn insight_events_for_failed_queued_handler() -> Result<()> {
         );
 
     engine
-        .dispatch(FailEvent { attempt: 0 })
+        .emit(FailEvent { attempt: 0 })
         .settled()
         .await?;
 
@@ -1210,7 +1210,7 @@ async fn dispatch_event_with_no_handler_settles_cleanly() -> Result<()> {
 
     // Dispatch an event that no handler listens to
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "nobody".into(),
         })
         .settled()
@@ -1259,7 +1259,7 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "observed".into(),
         })
         .settled()
@@ -1273,6 +1273,55 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
     assert!(
         types.contains(&"EventA".to_string()),
         "on_any should see EventA emitted by Ping handler"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn on_any_handler_emits_child_events() -> Result<()> {
+    let child_handled = Arc::new(AtomicUsize::new(0));
+    let ch = child_handled.clone();
+
+    let engine = Engine::new(Deps)
+        // Typed Ping handler so codec is registered
+        .with_handler(handler::on::<Ping>().id("ping_noop").then(
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
+        ))
+        // on_any emits EventB when it sees a Ping
+        .with_handler(
+            handler::on_any()
+                .id("emitter")
+                .then(|event: seesaw_core::handler::AnyEvent, _ctx: Context<Deps>| async move {
+                    if event.is::<Ping>() {
+                        Ok(emit![EventB { value: 42 }])
+                    } else {
+                        Ok(emit![])
+                    }
+                }),
+        )
+        // Typed handler proves the child event was dispatched
+        .with_handler(handler::on::<EventB>().id("child_receiver").then(
+            move |event: Arc<EventB>, _ctx: Context<Deps>| {
+                let ch = ch.clone();
+                async move {
+                    assert_eq!(event.value, 42);
+                    ch.fetch_add(1, Ordering::SeqCst);
+                    Ok(emit![])
+                }
+            },
+        ));
+
+    engine
+        .emit(Ping {
+            msg: "trigger".into(),
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(
+        child_handled.load(Ordering::SeqCst),
+        1,
+        "on_any should emit EventB and it should be handled by child_receiver"
     );
     Ok(())
 }
@@ -1307,7 +1356,7 @@ async fn handler_with_init_compiles_and_handles_events() -> Result<()> {
     );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "init".into(),
         })
         .settled()
@@ -1343,7 +1392,7 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
     // First settle: processes the event and creates the delayed effect intent.
     // The effect's execute_at is in the future, so it won't be polled yet.
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "delayed".into(),
         })
         .settled()
@@ -1399,7 +1448,7 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
             },
         ));
 
-    engine.dispatch(EventA { value: 5 }).settled().await?;
+    engine.emit(EventA { value: 5 }).settled().await?;
 
     assert_eq!(
         b_counter.load(Ordering::SeqCst),
@@ -1434,7 +1483,7 @@ async fn handler_can_access_deps() -> Result<()> {
     ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "deps".into(),
         })
         .settled()
@@ -1476,7 +1525,7 @@ async fn accumulate_large_batch() -> Result<()> {
         );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "large".into(),
         })
         .settled()
@@ -1529,7 +1578,7 @@ async fn accumulate_handler_emits_downstream_event() -> Result<()> {
         ));
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "chain".into(),
         })
         .settled()
@@ -1554,7 +1603,7 @@ async fn dispatch_returns_valid_process_handle() -> Result<()> {
     ));
 
     let handle = engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "handle".into(),
         })
         .settled()
@@ -1592,7 +1641,7 @@ async fn queued_handler_timeout_goes_to_dlq() -> Result<()> {
     );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "timeout".into(),
         })
         .settled()
@@ -1691,7 +1740,7 @@ async fn fanout_map_fanin_batch_metadata_propagates() -> Result<()> {
         );
 
     engine
-        .dispatch(Ping {
+        .emit(Ping {
             msg: "fanout".into(),
         })
         .settled()

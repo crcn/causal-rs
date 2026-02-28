@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
     .to_string();
 
     engine
-        .dispatch(SummaryEvent::SummarizeRequested { task_id, text })
+        .emit(SummaryEvent::SummarizeRequested { task_id, text })
         .settled()
         .await?;
 
