@@ -10,8 +10,8 @@ keywords = ["kafka", "event-driven", "workflow", "orchestration"]
 categories = ["asynchronous", "database"]
 
 [dependencies]
-seesaw_core = { path = "../seesaw", version = "0.10.3" }
-seesaw-postgres = { path = "../seesaw-postgres", version = "0.10.3" }
+seesaw_core = { path = "../seesaw", version = "0.11.0" }
+seesaw-postgres = { path = "../seesaw-postgres", version = "0.11.0" }
 rdkafka = { version = "0.36", features = ["cmake-build"] }
 tokio = { version = "1.49", features = ["full"] }
 anyhow = "1.0"
