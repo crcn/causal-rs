@@ -260,6 +260,18 @@ where
         (self.handler)(value, type_id, ctx).await
     }
 
+    /// Create the handler future without awaiting it.
+    ///
+    /// Returns a `'static` future suitable for wrapping in a `HandlerRunner`.
+    pub fn make_handler_future(
+        &self,
+        value: Arc<dyn Any + Send + Sync>,
+        type_id: TypeId,
+        ctx: Context<D>,
+    ) -> BoxFuture<Result<Vec<EventOutput>>> {
+        (self.handler)(value, type_id, ctx)
+    }
+
     /// Call the join batch handler if configured.
     pub async fn call_join_batch_handler(
         &self,

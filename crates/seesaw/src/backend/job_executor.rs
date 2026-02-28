@@ -10,9 +10,9 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::backend::Backend;
 use crate::handler::{Context, DlqTerminalInfo, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
+use crate::handler_runner::HandlerRunner;
 use crate::runtime::event_worker::EventWorkerConfig;
 use crate::runtime::handler_worker::HandlerWorkerConfig;
 use crate::store::{EmittedEvent, QueuedEvent, QueuedHandlerExecution, QueuedHandlerIntent};
@@ -43,11 +43,11 @@ where
     ///
     /// Extracted from EventWorker::process_claimed_event().
     /// Returns commit payload for atomic transaction.
-    pub async fn execute_event<B: Backend>(
+    pub async fn execute_event(
         &self,
         event: &QueuedEvent,
-        _backend: &B,
         config: &EventWorkerConfig,
+        runner: &dyn HandlerRunner,
     ) -> Result<EventProcessingCommit> {
         info!(
             "Processing event: type={}, workflow={}, hops={}",
@@ -127,7 +127,7 @@ where
         let mut emitted_events = Vec::new();
         for effect in matching_effects.iter().filter(|effect| effect.is_inline()) {
             match self
-                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config)
+                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runner)
                 .await
             {
                 Ok(mut emitted) => emitted_events.append(&mut emitted),
@@ -163,11 +163,11 @@ where
     /// Execute handler (queued effect).
     ///
     /// Extracted from HandlerWorker::process_next_effect().
-    pub async fn execute_handler<B: Backend>(
+    pub async fn execute_handler(
         &self,
         execution: QueuedHandlerExecution,
-        _backend: &B,
         config: &HandlerWorkerConfig,
+        runner: &dyn HandlerRunner,
     ) -> Result<HandlerExecutionResult> {
         info!(
             "Processing effect: effect_id={}, workflow={}, priority={}, attempt={}/{}",
@@ -251,14 +251,10 @@ where
             config.default_timeout
         };
 
+        let handler_fut = effect.make_handler_future(typed_event.clone(), type_id, ctx.clone());
         let result = timeout(timeout_duration, async {
-            let mut emitted = Vec::new();
-            for output in effect
-                .call_handler(typed_event.clone(), type_id, ctx.clone())
-                .await?
-            {
-                emitted.push((output.type_id, output.value));
-            }
+            let outputs = runner.run(&execution.handler_id, Box::pin(handler_fut)).await?;
+            let emitted = outputs.into_iter().map(|o| (o.type_id, o.value)).collect();
             Ok::<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>, anyhow::Error>(emitted)
         })
         .await;
@@ -398,6 +394,7 @@ where
         typed_event: Arc<dyn Any + Send + Sync>,
         event_type_id: TypeId,
         config: &EventWorkerConfig,
+        runner: &dyn HandlerRunner,
     ) -> Result<Vec<QueuedEvent>> {
         let idempotency_key = Uuid::new_v5(
             &NAMESPACE_SEESAW,
@@ -413,8 +410,9 @@ where
             self.deps.clone(),
         );
 
-        let drained = effect
-            .call_handler(typed_event, event_type_id, ctx.clone())
+        let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
+        let drained = runner
+            .run(&effect.id, Box::pin(handler_fut))
             .await?
             .into_iter()
             .map(|output| (output.type_id, output.value))

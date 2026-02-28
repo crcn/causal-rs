@@ -11,7 +11,9 @@ use anyhow::Result;
 use rdkafka::consumer::StreamConsumer;
 use seesaw_core::backend::job_executor::JobExecutor;
 use seesaw_core::runtime::event_worker::EventWorkerConfig;
-use seesaw_core::{EventProcessingCommit, InlineHandlerFailure, QueuedEvent, Store};
+use seesaw_core::{DirectRunner, EventProcessingCommit, InlineHandlerFailure, QueuedEvent, Store};
+
+static DIRECT_RUNNER: DirectRunner = DirectRunner;
 use seesaw_postgres::PostgresStore;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -23,18 +25,16 @@ use crate::kafka_client::{commit_message_offset, deserialize_event_message, Logg
 ///
 /// This worker polls events from Kafka, checks idempotency, processes them,
 /// and commits both to PostgreSQL and Kafka for exactly-once semantics.
-pub async fn spawn_kafka_event_worker<D, B>(
+pub async fn spawn_kafka_event_worker<D>(
     worker_id: usize,
     consumer: StreamConsumer<LoggingConsumerContext>,
     executor: Arc<JobExecutor<D>>,
-    backend: Arc<B>,
     store: PostgresStore,
     config: EventWorkerConfig,
     shutdown: CancellationToken,
 ) -> Result<()>
 where
     D: Send + Sync + 'static,
-    B: seesaw_core::Backend,
 {
     info!("Kafka event worker {} started", worker_id);
 
@@ -106,7 +106,7 @@ where
                 };
 
                 // Execute event via JobExecutor
-                match executor.execute_event(&queued_event, backend.as_ref(), &config).await {
+                match executor.execute_event(&queued_event, &config, &DIRECT_RUNNER).await {
                     Ok(job_commit) => {
                         // Convert JobCommit to Store's EventProcessingCommit
                         let store_commit = EventProcessingCommit {

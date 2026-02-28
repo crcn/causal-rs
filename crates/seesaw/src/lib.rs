@@ -38,6 +38,7 @@ pub mod dead_letter_queue;
 pub mod distributed_safe;
 pub mod es;
 pub mod handler;
+pub mod handler_runner;
 pub mod insight;
 pub mod queue_backend;
 pub mod runtime;
@@ -70,6 +71,7 @@ pub use engine_v2::Engine;
 pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Handler, HandlerError, JoinMode,
 };
+pub use handler_runner::{DirectRunner, HandlerRunner};
 pub use insight::{
     EventNode, HandlerNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,
 };

@@ -1809,8 +1809,11 @@ fn build_event_tree(
 use seesaw_core::backend::{Backend, BackendServeConfig, DispatchedEvent};
 use seesaw_core::backend::capability::*;
 use seesaw_core::backend::job_executor::JobExecutor;
+use seesaw_core::DirectRunner;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+static DIRECT_RUNNER: DirectRunner = DirectRunner;
 
 /// PostgreSQL implementation of Backend trait (v0.11.0).
 ///
@@ -1882,7 +1885,6 @@ impl Backend for PostgresBackend {
 
         // Spawn event workers
         for i in 0..config.event_workers {
-            let backend = self.clone();
             let store = self.store.clone();
             let executor = executor.clone();
             let config = config.event_worker.clone();
@@ -1896,7 +1898,7 @@ impl Backend for PostgresBackend {
                     match store.poll_next().await {
                         Ok(Some(event)) => {
                             // Execute using JobExecutor
-                            match executor.execute_event(&event, &backend, &config).await {
+                            match executor.execute_event(&event, &config, &DIRECT_RUNNER).await {
                                 Ok(commit) => {
                                     // Convert JobCommit to Store's EventProcessingCommit
                                     let store_commit = EventProcessingCommit {
@@ -1946,7 +1948,6 @@ impl Backend for PostgresBackend {
 
         // Spawn handler workers
         for i in 0..config.handler_workers {
-            let backend = self.clone();
             let store = self.store.clone();
             let executor = executor.clone();
             let config = config.handler_worker.clone();
@@ -1960,7 +1961,7 @@ impl Backend for PostgresBackend {
                     match store.poll_next_effect().await {
                         Ok(Some(execution)) => {
                             // Execute using JobExecutor
-                            match executor.execute_handler(execution.clone(), &backend, &config).await {
+                            match executor.execute_handler(execution.clone(), &config, &DIRECT_RUNNER).await {
                                 Ok(result) => {
                                     match result.status {
                                         HandlerStatus::Success => {

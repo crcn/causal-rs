@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use seesaw_core::backend::job_executor::{HandlerStatus, JobExecutor};
 use seesaw_core::backend::{Backend, BackendServeConfig, DispatchedEvent};
-use seesaw_core::Store;
+use seesaw_core::{DirectRunner, Store};
+
+static DIRECT_RUNNER: DirectRunner = DirectRunner;
 use seesaw_postgres::PostgresStore;
 use std::sync::Arc;
 use tokio::time::sleep;
@@ -132,13 +134,12 @@ impl Backend for KafkaBackend {
                 .create_consumer(i)
                 .context("Failed to create Kafka consumer")?;
             let executor = executor.clone();
-            let backend = Arc::new(self.clone());
             let store = self.store.clone();
             let event_config = config.event_worker.clone();
             let shutdown = shutdown.clone();
 
             let handle = tokio::spawn(async move {
-                spawn_kafka_event_worker(i, consumer, executor, backend, store, event_config, shutdown)
+                spawn_kafka_event_worker(i, consumer, executor, store, event_config, shutdown)
                     .await
             });
 
@@ -147,7 +148,6 @@ impl Backend for KafkaBackend {
 
         // Spawn PostgreSQL handler workers (same as PostgresBackend)
         for i in 0..config.handler_workers {
-            let backend = self.clone();
             let store = self.store.clone();
             let executor = executor.clone();
             let handler_config = config.handler_worker.clone();
@@ -162,7 +162,7 @@ impl Backend for KafkaBackend {
                         Ok(Some(execution)) => {
                             // Execute using JobExecutor
                             match executor
-                                .execute_handler(execution.clone(), &backend, &handler_config)
+                                .execute_handler(execution.clone(), &handler_config, &DIRECT_RUNNER)
                                 .await
                             {
                                 Ok(result) => {
