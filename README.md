@@ -487,7 +487,45 @@ This architecture enables:
 - **Flexibility**: Swap backends without touching business logic
 - **Minimal Dependencies**: Core stays lightweight with minimal dependencies
 - **Custom Backends**: Build your own backend (e.g., Restate, Redis) by implementing the backend traits
+- **Pluggable Execution**: The `HandlerRunner` trait lets backends wrap individual handler calls
 - **Testing**: Use in-memory backend for fast tests, PostgreSQL/Kafka for integration tests
+
+### Handler Runner
+
+Every handler invocation flows through a `HandlerRunner`, a trait that wraps `effect.call_handler()`:
+
+```
+executor.execute_event() → runner.run(handler_future) → handler body
+```
+
+The default `DirectRunner` is a pass-through — identical to calling the handler directly. Custom runners can wrap handler calls for durable execution, dry-run testing, or tracing:
+
+```rust
+use seesaw_core::{HandlerRunner, DirectRunner};
+
+// DirectRunner (default) — pass-through, zero overhead
+static RUNNER: DirectRunner = DirectRunner;
+
+// Custom runner example — wrap each handler call
+struct TracingRunner;
+
+impl HandlerRunner for TracingRunner {
+    fn run(
+        &self,
+        handler_id: &str,
+        execution: Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>> {
+        Box::pin(async move {
+            tracing::info!("Starting handler: {}", handler_id);
+            let result = execution.await;
+            tracing::info!("Finished handler: {}", handler_id);
+            result
+        })
+    }
+}
+```
+
+This enables future backends like [Restate](https://restate.dev/) where each handler call is wrapped in `restate_ctx.run()` for journaled replay — the user writes zero Restate code because seesaw's handler decomposition pattern *is* the journaling strategy.
 
 ## Core Concepts
 
@@ -568,6 +606,7 @@ let engine = Engine::new(deps, backend);
 4. **Async All The Way**: Handlers can perform async IO
 5. **Composition Over Inheritance**: Build complex workflows from simple handlers
 6. **Pluggable Backends**: Choose the right backend for your use case
+7. **Pluggable Execution**: The `HandlerRunner` trait wraps handler calls, enabling durable execution (Restate), dry-run testing, and tracing without changing user code
 
 ## Testing
 
