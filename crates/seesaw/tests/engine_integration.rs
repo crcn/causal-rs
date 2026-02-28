@@ -4,8 +4,11 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::Mutex;
+use seesaw_core::insight::InsightEvent;
 use seesaw_core::{handler, Context, Emit, Engine};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct Deps;
@@ -394,5 +397,129 @@ async fn insight_callback_fires() -> Result<()> {
         insight_count.load(Ordering::SeqCst) >= 1,
         "insight callback should fire at least once (for EventDispatched)"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn correlation_preserved_through_queued_chain() -> Result<()> {
+    let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+    let sc = seen_correlation.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<EventA>()
+                .id("emit_b_queued")
+                .queued()
+                .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
+                    Ok(EventB {
+                        value: event.value + 1,
+                    })
+                }),
+        )
+        .with_handler(handler::on::<EventB>().then(
+            move |_event: Arc<EventB>, ctx: Context<Deps>| {
+                let sc = sc.clone();
+                async move {
+                    *sc.lock() = Some(ctx.correlation_id);
+                    Ok(())
+                }
+            },
+        ));
+
+    let handle = engine.dispatch(EventA { value: 1 }).settled().await?;
+
+    let seen = seen_correlation.lock().expect("EventB handler should have run");
+    assert_eq!(
+        seen, handle.correlation_id,
+        "EventB emitted by queued handler must carry the original correlation_id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dlq_terminal_preserves_correlation() -> Result<()> {
+    let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+    let sc = seen_correlation.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<FailEvent>()
+                .id("always_fail_corr")
+                .queued()
+                .retry(1)
+                .on_failure(|_event: Arc<FailEvent>, info: seesaw_core::ErrorContext| {
+                    FailedTerminal {
+                        error: info.error,
+                        attempts: info.attempts,
+                    }
+                })
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    Err::<(), _>(anyhow::anyhow!("always fails"))
+                }),
+        )
+        .with_handler(handler::on::<FailedTerminal>().then(
+            move |_event: Arc<FailedTerminal>, ctx: Context<Deps>| {
+                let sc = sc.clone();
+                async move {
+                    *sc.lock() = Some(ctx.correlation_id);
+                    Ok(())
+                }
+            },
+        ));
+
+    let handle = engine
+        .dispatch(FailEvent { attempt: 0 })
+        .settled()
+        .await?;
+
+    let seen = seen_correlation
+        .lock()
+        .expect("FailedTerminal handler should have run");
+    assert_eq!(
+        seen, handle.correlation_id,
+        "DLQ terminal event must carry the original correlation_id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn insight_seq_monotonically_increases() -> Result<()> {
+    let collected: Arc<Mutex<Vec<InsightEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let cc = collected.clone();
+
+    let engine = Engine::new(Deps)
+        .with_on_insight(move |event| {
+            cc.lock().push(event);
+        })
+        .with_handler(
+            handler::on::<EventA>()
+                .id("queued_for_insight")
+                .queued()
+                .then(|_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(()) }),
+        );
+
+    engine.dispatch(EventA { value: 42 }).settled().await?;
+
+    let events = collected.lock();
+    assert!(
+        events.len() >= 2,
+        "should have at least EventDispatched + EffectCompleted, got {}",
+        events.len()
+    );
+
+    for window in events.windows(2) {
+        assert!(
+            window[1].seq > window[0].seq,
+            "insight seq must be strictly increasing: {} should be > {}",
+            window[1].seq,
+            window[0].seq
+        );
+    }
+
+    // All seq values should be > 0
+    for event in events.iter() {
+        assert!(event.seq > 0, "insight seq should never be 0, got 0");
+    }
+
     Ok(())
 }

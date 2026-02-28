@@ -115,6 +115,7 @@ where
                 timeout_seconds,
                 max_attempts: effect.max_attempts as i32,
                 priority: effect.priority.unwrap_or(10),
+                hops: event.hops,
                 join_window_timeout_seconds: effect
                     .join_window_timeout
                     .map(|d| d.as_secs() as i32)
@@ -539,7 +540,7 @@ where
         Ok(emitted_events)
     }
 
-    fn serialize_emitted_events(
+    pub(crate) fn serialize_emitted_events(
         &self,
         emitted: Vec<(TypeId, Arc<dyn Any + Send + Sync>)>,
         execution: &QueuedHandlerExecution,

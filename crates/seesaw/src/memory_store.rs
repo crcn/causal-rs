@@ -93,6 +93,7 @@ impl MemoryStore {
                 intent.timeout_seconds,
                 intent.max_attempts,
                 intent.priority,
+                intent.hops,
                 intent.join_window_timeout_seconds,
             )
             .await?;
@@ -133,6 +134,7 @@ impl MemoryStore {
         timeout_seconds: i32,
         max_attempts: i32,
         priority: i32,
+        hops: i32,
         join_window_timeout_seconds: Option<i32>,
     ) -> Result<()> {
         let execution = QueuedHandlerExecution {
@@ -149,6 +151,7 @@ impl MemoryStore {
             timeout_seconds,
             max_attempts,
             priority,
+            hops,
             attempts: 0,
             join_window_timeout_seconds,
         };
@@ -185,14 +188,11 @@ impl MemoryStore {
         handler_id: String,
         result: serde_json::Value,
         emitted_events: Vec<EmittedEvent>,
+        correlation_id: Uuid,
+        parent_hops: i32,
     ) -> Result<()> {
         self.complete_effect(event_id, handler_id.clone(), result)
             .await?;
-
-        // Look up correlation_id and hops from completed effects map
-        // For in-memory, we use the event_id as correlation_id fallback
-        let correlation_id = event_id;
-        let parent_hops = 0;
 
         for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
             let new_event_id = Uuid::new_v5(
@@ -270,12 +270,13 @@ impl MemoryStore {
         reason: String,
         attempts: i32,
         emitted_events: Vec<EmittedEvent>,
+        correlation_id: Uuid,
+        parent_hops: i32,
     ) -> Result<()> {
         self.dlq_effect(event_id, handler_id.clone(), error, reason, attempts)
             .await?;
 
         // Publish terminal events from on_failure mapper
-        let correlation_id = event_id; // fallback for in-memory
         for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
             let new_event_id = Uuid::new_v5(
                 &NAMESPACE_SEESAW,
@@ -293,7 +294,7 @@ impl MemoryStore {
                 correlation_id,
                 event_type: emitted.event_type,
                 payload: emitted.payload,
-                hops: 0,
+                hops: parent_hops + 1,
                 retry_count: 0,
                 batch_id: emitted.batch_id,
                 batch_index: emitted.batch_index,

@@ -5,6 +5,7 @@
 //! a `HandlerRunner` (e.g. RestateRunner).
 
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -19,8 +20,7 @@ use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
 use crate::process::{DispatchFuture, ProcessHandle};
 use crate::types::{
-    EmittedEvent, EventWorkerConfig, HandlerWorkerConfig, QueuedEvent, QueuedHandlerExecution,
-    NAMESPACE_SEESAW,
+    EventWorkerConfig, HandlerWorkerConfig, QueuedEvent, QueuedHandlerExecution, NAMESPACE_SEESAW,
 };
 
 /// In-memory Engine with built-in settle loop.
@@ -36,6 +36,7 @@ where
     effects: Arc<HandlerRegistry<D>>,
     runner: Arc<dyn HandlerRunner>,
     on_insight: Option<Arc<dyn Fn(InsightEvent) + Send + Sync>>,
+    insight_seq: Arc<AtomicU64>,
 }
 
 impl<D> Engine<D>
@@ -50,6 +51,7 @@ where
             effects: Arc::new(HandlerRegistry::new()),
             runner: Arc::new(DirectRunner),
             on_insight: None,
+            insight_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -186,19 +188,16 @@ where
                 {
                     Ok(result) => match result.status {
                         HandlerStatus::Success => {
-                            self.emit_insight(InsightEvent {
-                                seq: 0,
-                                stream_type: StreamType::EffectCompleted,
-                                correlation_id: execution_clone.correlation_id,
-                                event_id: Some(event_id),
-                                effect_event_id: Some(event_id),
-                                handler_id: Some(handler_id.clone()),
-                                event_type: Some(execution_clone.event_type.clone()),
-                                status: Some("completed".to_string()),
-                                error: None,
-                                payload: None,
-                                created_at: chrono::Utc::now(),
-                            });
+                            self.emit_insight(self.make_insight(
+                                StreamType::EffectCompleted,
+                                execution_clone.correlation_id,
+                                Some(event_id),
+                                Some(handler_id.clone()),
+                                Some(execution_clone.event_type.clone()),
+                                Some("completed".to_string()),
+                                None,
+                                None,
+                            ));
                             if result.emitted_events.is_empty() {
                                 self.store
                                     .complete_effect(event_id, handler_id, result.result)
@@ -210,24 +209,23 @@ where
                                         handler_id,
                                         result.result,
                                         result.emitted_events,
+                                        execution_clone.correlation_id,
+                                        execution_clone.hops,
                                     )
                                     .await?;
                             }
                         }
                         HandlerStatus::Failed { error, attempts } => {
-                            self.emit_insight(InsightEvent {
-                                seq: 0,
-                                stream_type: StreamType::EffectFailed,
-                                correlation_id: execution_clone.correlation_id,
-                                event_id: Some(event_id),
-                                effect_event_id: Some(event_id),
-                                handler_id: Some(handler_id.clone()),
-                                event_type: Some(execution_clone.event_type.clone()),
-                                status: Some("failed".to_string()),
-                                error: Some(error.clone()),
-                                payload: None,
-                                created_at: chrono::Utc::now(),
-                            });
+                            self.emit_insight(self.make_insight(
+                                StreamType::EffectFailed,
+                                execution_clone.correlation_id,
+                                Some(event_id),
+                                Some(handler_id.clone()),
+                                Some(execution_clone.event_type.clone()),
+                                Some("failed".to_string()),
+                                Some(error.clone()),
+                                None,
+                            ));
                             if result.emitted_events.is_empty() {
                                 self.store
                                     .dlq_effect(
@@ -247,6 +245,8 @@ where
                                         "failed".to_string(),
                                         attempts,
                                         result.emitted_events,
+                                        execution_clone.correlation_id,
+                                        execution_clone.hops,
                                     )
                                     .await?;
                             }
@@ -350,19 +350,16 @@ where
 
         self.store.publish(queued).await?;
 
-        self.emit_insight(InsightEvent {
-            seq: 0,
-            stream_type: StreamType::EventDispatched,
+        self.emit_insight(self.make_insight(
+            StreamType::EventDispatched,
             correlation_id,
-            event_id: Some(event_id),
-            effect_event_id: None,
-            handler_id: None,
-            event_type: Some(event_type),
-            status: None,
-            error: None,
-            payload: Some(payload),
-            created_at: chrono::Utc::now(),
-        });
+            Some(event_id),
+            None,
+            Some(event_type),
+            None,
+            None,
+            Some(payload),
+        ));
 
         Ok(ProcessHandle {
             correlation_id,
@@ -373,6 +370,32 @@ where
     fn emit_insight(&self, event: InsightEvent) {
         if let Some(ref cb) = self.on_insight {
             cb(event);
+        }
+    }
+
+    fn make_insight(
+        &self,
+        stream_type: StreamType,
+        correlation_id: Uuid,
+        event_id: Option<Uuid>,
+        handler_id: Option<String>,
+        event_type: Option<String>,
+        status: Option<String>,
+        error: Option<String>,
+        payload: Option<serde_json::Value>,
+    ) -> InsightEvent {
+        InsightEvent {
+            seq: self.insight_seq.fetch_add(1, Ordering::SeqCst) as i64,
+            stream_type,
+            correlation_id,
+            event_id,
+            effect_event_id: event_id,
+            handler_id,
+            event_type,
+            status,
+            error,
+            payload,
+            created_at: chrono::Utc::now(),
         }
     }
 
@@ -441,10 +464,15 @@ where
                     match effect.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {
                             // Serialize emitted events
-                            let emitted_events = self.serialize_join_outputs(
-                                outputs,
+                            let emitted_raw: Vec<_> = outputs
+                                .into_iter()
+                                .map(|o| (o.type_id, o.value))
+                                .collect();
+                            let handler_config = HandlerWorkerConfig::default();
+                            let emitted_events = executor.serialize_emitted_events(
+                                emitted_raw,
                                 execution,
-                                executor,
+                                handler_config.max_batch_size,
                             )?;
 
                             if emitted_events.is_empty() {
@@ -462,6 +490,8 @@ where
                                         handler_id.to_string(),
                                         serde_json::json!({ "status": "join_completed" }),
                                         emitted_events,
+                                        execution.correlation_id,
+                                        execution.hops,
                                     )
                                     .await?;
                             }
@@ -519,57 +549,6 @@ where
         Ok(())
     }
 
-    fn serialize_join_outputs(
-        &self,
-        outputs: Vec<crate::handler::EventOutput>,
-        execution: &QueuedHandlerExecution,
-        executor: &JobExecutor<D>,
-    ) -> Result<Vec<EmittedEvent>> {
-        let count = outputs.len();
-        let mut emitted = Vec::with_capacity(count);
-        let batch_id = if count > 1 {
-            Some(Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!(
-                    "{}-{}-join-batch",
-                    execution.event_id, execution.handler_id
-                )
-                .as_bytes(),
-            ))
-        } else {
-            None
-        };
-
-        for (i, output) in outputs.into_iter().enumerate() {
-            let codec = executor
-                .effects()
-                .find_codec_by_type_id(output.type_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No queue codec registered for join output TypeId {:?}",
-                        output.type_id
-                    )
-                })?;
-            let payload = (codec.encode)(output.value.as_ref()).ok_or_else(|| {
-                anyhow::anyhow!("Failed to serialize join output {}", codec.event_type)
-            })?;
-
-            let (b_id, b_idx, b_size) = if count > 1 {
-                (batch_id, Some(i as i32), Some(count as i32))
-            } else {
-                (None, None, None)
-            };
-
-            emitted.push(EmittedEvent {
-                event_type: codec.event_type.clone(),
-                payload,
-                batch_id: b_id,
-                batch_index: b_idx,
-                batch_size: b_size,
-            });
-        }
-        Ok(emitted)
-    }
 }
 
 impl<D> Clone for Engine<D>
@@ -583,6 +562,7 @@ where
             effects: self.effects.clone(),
             runner: self.runner.clone(),
             on_insight: self.on_insight.clone(),
+            insight_seq: self.insight_seq.clone(),
         }
     }
 }

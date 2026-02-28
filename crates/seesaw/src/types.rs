@@ -101,6 +101,8 @@ pub struct QueuedHandlerIntent {
     pub max_attempts: i32,
     /// Queue priority (lower = higher priority).
     pub priority: i32,
+    /// Hop count inherited from source event (for infinite loop detection).
+    pub hops: i32,
     /// Optional timeout for same-batch accumulation windows.
     pub join_window_timeout_seconds: Option<i32>,
 }
@@ -164,6 +166,7 @@ pub struct QueuedHandlerExecution {
     pub timeout_seconds: i32,
     pub max_attempts: i32,
     pub priority: i32,
+    pub hops: i32,
     pub attempts: i32,
     pub join_window_timeout_seconds: Option<i32>,
 }
