@@ -35,7 +35,7 @@ extern crate self as seesaw_core;
 // Module structure
 pub mod aggregator;
 pub mod handler;
-pub mod handler_runner;
+pub mod runtime;
 pub mod insight;
 pub mod job_executor;
 pub mod types;
@@ -56,7 +56,7 @@ pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Handler, HandlerContext, HandlerError,
     JoinMode,
 };
-pub use handler_runner::{DirectRunner, HandlerRunner};
+pub use runtime::{DirectRuntime, Runtime};
 pub use insight::{InsightEvent, StreamType};
 pub use job_executor::{
     EventProcessingCommit as JobEventProcessingCommit, HandlerExecutionResult, HandlerStatus,

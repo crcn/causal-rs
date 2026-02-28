@@ -252,7 +252,7 @@ where
 
     /// Create the handler future without awaiting it.
     ///
-    /// Returns a `'static` future suitable for wrapping in a `HandlerRunner`.
+    /// Returns a `'static` future suitable for wrapping in a `Runtime`.
     pub fn make_handler_future(
         &self,
         value: Arc<dyn Any + Send + Sync>,

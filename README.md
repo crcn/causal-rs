@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
 - **⚡ High Performance**: 50k-100k events/sec with Kafka backend
 - **🔄 Handler Pattern**: React to events, perform IO, return new events
 - **✨ Declarative Macros**: Clean `#[handler]` syntax for defining handlers
-- **🎨 Flexible Backends**: In-memory, PostgreSQL, Kafka, or Restate (via `HandlerRunner`)
+- **🎨 Flexible Backends**: In-memory, PostgreSQL, Kafka, or Restate (via `Runtime`)
 - **📈 Horizontal Scaling**: Scale via Kafka partitions and consumer groups
 - **🔒 Exactly-Once**: Idempotency and atomic commits prevent duplicate processing
 - **🔍 Observable**: Real-time visualization with Seesaw Insight
@@ -522,30 +522,30 @@ This architecture enables:
 - **Flexibility**: Swap backends without touching business logic
 - **Minimal Dependencies**: Core stays lightweight with minimal dependencies
 - **Custom Backends**: Build your own backend (e.g., Restate, Redis) by implementing the backend traits
-- **Pluggable Execution**: The `HandlerRunner` trait lets backends wrap individual handler calls
+- **Pluggable Execution**: The `Runtime` trait lets backends wrap individual handler calls
 - **Testing**: Use in-memory backend for fast tests, PostgreSQL/Kafka for integration tests
 
-### Handler Runner (Pluggable Execution)
+### Runtime (Pluggable Execution & State)
 
-Every handler invocation flows through a `HandlerRunner`, a trait that wraps each handler call:
+Every handler invocation flows through a `Runtime`, a trait that wraps each handler call and manages aggregate state:
 
 ```
-Without runner:  executor → effect.call_handler() → handler body
-With runner:     executor → runner.run(handler_future) → handler body
+Without runtime:  executor → effect.call_handler() → handler body
+With runtime:     executor → runtime.run(handler_future) → handler body
 ```
 
-The default `DirectRunner` is a zero-overhead pass-through. Custom runners wrap handler calls for durable execution, dry-run testing, or tracing.
+The default `DirectRuntime` is a zero-overhead pass-through. Custom runtimes wrap handler calls for durable execution, dry-run testing, or tracing.
 
-#### DirectRunner (Default)
+#### DirectRuntime (Default)
 
 ```rust
-use seesaw_core::{HandlerRunner, DirectRunner};
+use seesaw_core::{Runtime, DirectRuntime};
 
-// Zero overhead — just runs the handler directly
-static RUNNER: DirectRunner = DirectRunner;
+// Zero overhead — just runs the handler directly, state stored in DashMap
+let runtime = DirectRuntime::new();
 ```
 
-All built-in backends (Memory, PostgreSQL, Kafka) use `DirectRunner`. Retry, timeout, and DLQ are handled by seesaw's worker loops.
+All built-in backends (Memory, PostgreSQL, Kafka) use `DirectRuntime`. Retry, timeout, and DLQ are handled by seesaw's worker loops.
 
 #### Restate Integration
 
@@ -557,20 +557,20 @@ Seesaw does:     route event → handler, extract fields, transition guard
 Restate does:    journal the handler invocation, replay on crash
 ```
 
-A `RestateRunner` wraps each handler call in `restate_ctx.run()` for automatic durability:
+A `RestateRuntime` wraps each handler call in `restate_ctx.run()` for automatic durability:
 
 ```rust
 use std::pin::Pin;
 use std::future::Future;
 use anyhow::Result;
-use seesaw_core::{HandlerRunner, handler::EventOutput};
+use seesaw_core::{Runtime, handler::EventOutput};
 
 /// Wraps each handler call in Restate's journaling context.
-struct RestateRunner<'a> {
+struct RestateRuntime<'a> {
     ctx: &'a restate_sdk::Context<'a>,
 }
 
-impl HandlerRunner for RestateRunner<'_> {
+impl Runtime for RestateRuntime<'_> {
     fn run(
         &self,
         handler_id: &str,
@@ -590,10 +590,10 @@ A `RestateBackend` would use this runner in its `serve()` implementation:
 ```rust
 // Inside RestateBackend's Restate service handler:
 async fn process_event(restate_ctx: restate_sdk::Context<'_>, event: QueuedEvent) {
-    let runner = RestateRunner { ctx: &restate_ctx };
+    let runtime = RestateRuntime { ctx: &restate_ctx };
 
-    // Existing seesaw routing — each matched handler runs through the runner
-    let commit = executor.execute_event(&event, &config, &runner).await?;
+    // Existing seesaw routing — each matched handler runs through the runtime
+    let commit = executor.execute_event(&event, &config, &runtime).await?;
 
     // Emitted events routed back through Restate service calls
     for emitted in commit.emitted_events {
@@ -623,11 +623,11 @@ The trait is simple enough for any wrapping strategy:
 
 ```rust
 /// Dry-run runner — records calls without executing
-struct DryRunRunner {
+struct DryRunRuntime {
     calls: Arc<Mutex<Vec<String>>>,
 }
 
-impl HandlerRunner for DryRunRunner {
+impl Runtime for DryRunRuntime {
     fn run(
         &self,
         handler_id: &str,
@@ -722,7 +722,7 @@ let engine = Engine::new(deps, backend);
 4. **Async All The Way**: Handlers can perform async IO
 5. **Composition Over Inheritance**: Build complex workflows from simple handlers
 6. **Pluggable Backends**: Choose the right backend for your use case
-7. **Pluggable Execution**: The `HandlerRunner` trait wraps handler calls, enabling durable execution (Restate), dry-run testing, and tracing without changing user code
+7. **Pluggable Execution**: The `Runtime` trait wraps handler calls, enabling durable execution (Restate), dry-run testing, and tracing without changing user code
 8. **Settle on Demand**: `engine.dispatch(event).settled().await` drives the full causal tree to completion synchronously
 
 ## Testing

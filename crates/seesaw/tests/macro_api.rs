@@ -178,7 +178,7 @@ mod order_effects {
 
 // ── Aggregator macro tests ──────────────────────────────────────────────
 
-#[derive(Debug, Default, PartialEq, Clone)]
+#[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
 enum TestOrderStatus {
     #[default]
     Draft,
@@ -186,7 +186,7 @@ enum TestOrderStatus {
     Shipped,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct TestOrder {
     status: TestOrderStatus,
     total: f64,

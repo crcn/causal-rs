@@ -699,7 +699,7 @@ where
 impl<E, A, G, Started> TransitionHandlerBuilder<E, A, G, Started>
 where
     E: Clone + Send + Sync + 'static,
-    A: Aggregate,
+    A: Aggregate + serde::Serialize + serde::de::DeserializeOwned,
     G: Fn(&A, &A) -> bool + Send + Sync + 'static,
 {
     /// Set a custom ID for this handler.
@@ -754,8 +754,13 @@ where
                                     "transition guard requires aggregator registry on context"
                                 )
                             })?;
+                            let runtime = ctx.runtime().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "transition guard requires runtime on context"
+                                )
+                            })?;
 
-                            let (prev, next) = registry.get_transition::<A>(aggregate_id);
+                            let (prev, next) = registry.get_transition::<A>(aggregate_id, runtime);
 
                             if !guard(&prev, &next) {
                                 return Ok(Vec::new());

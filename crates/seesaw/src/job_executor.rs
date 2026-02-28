@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::aggregator::AggregatorRegistry;
 use crate::handler::{Context, DlqTerminalInfo, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
-use crate::handler_runner::HandlerRunner;
+use crate::runtime::Runtime;
 use crate::types::{
     EmittedEvent, EventWorkerConfig, HandlerWorkerConfig, QueuedEvent,
     QueuedHandlerExecution, QueuedHandlerIntent, NAMESPACE_SEESAW,
@@ -30,6 +30,7 @@ where
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
     aggregator_registry: Arc<AggregatorRegistry>,
+    runtime: Arc<dyn Runtime>,
 }
 
 impl<D> JobExecutor<D>
@@ -41,11 +42,13 @@ where
         deps: Arc<D>,
         effects: Arc<HandlerRegistry<D>>,
         aggregator_registry: Arc<AggregatorRegistry>,
+        runtime: Arc<dyn Runtime>,
     ) -> Self {
         Self {
             deps,
             effects,
             aggregator_registry,
+            runtime,
         }
     }
 
@@ -57,7 +60,7 @@ where
         &self,
         event: &QueuedEvent,
         config: &EventWorkerConfig,
-        runner: &dyn HandlerRunner,
+        runtime: &dyn Runtime,
     ) -> Result<EventProcessingCommit> {
         info!(
             "Processing event: type={}, workflow={}, hops={}",
@@ -140,7 +143,7 @@ where
         inline_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
         for effect in inline_effects {
             match self
-                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runner)
+                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runtime)
                 .await
             {
                 Ok(mut emitted) => emitted_events.append(&mut emitted),
@@ -180,7 +183,7 @@ where
         &self,
         execution: QueuedHandlerExecution,
         config: &HandlerWorkerConfig,
-        runner: &dyn HandlerRunner,
+        runtime: &dyn Runtime,
     ) -> Result<HandlerExecutionResult> {
         info!(
             "Processing effect: effect_id={}, workflow={}, priority={}, attempt={}/{}",
@@ -233,7 +236,8 @@ where
             execution.parent_event_id,
             self.deps.clone(),
         )
-        .with_aggregator_registry(self.aggregator_registry.clone());
+        .with_aggregator_registry(self.aggregator_registry.clone())
+        .with_runtime(self.runtime.clone());
 
         // 2. Handle join/accumulation (if configured)
         let join_claim = if effect.join_mode == Some(JoinMode::SameBatch) {
@@ -268,7 +272,7 @@ where
 
         let handler_fut = effect.make_handler_future(typed_event.clone(), type_id, ctx.clone());
         let result = timeout(timeout_duration, async {
-            let outputs = runner.run(&execution.handler_id, Box::pin(handler_fut)).await?;
+            let outputs = runtime.run(&execution.handler_id, Box::pin(handler_fut)).await?;
             let emitted = outputs.into_iter().map(|o| (o.type_id, o.value)).collect();
             Ok::<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>, anyhow::Error>(emitted)
         })
@@ -372,7 +376,8 @@ where
                 None,
                 self.deps.clone(),
             )
-            .with_aggregator_registry(self.aggregator_registry.clone());
+            .with_aggregator_registry(self.aggregator_registry.clone())
+        .with_runtime(self.runtime.clone());
 
             effect
                 .call_started(ctx)
@@ -411,7 +416,7 @@ where
         typed_event: Arc<dyn Any + Send + Sync>,
         event_type_id: TypeId,
         config: &EventWorkerConfig,
-        runner: &dyn HandlerRunner,
+        runtime: &dyn Runtime,
     ) -> Result<Vec<QueuedEvent>> {
         let idempotency_key = Uuid::new_v5(
             &NAMESPACE_SEESAW,
@@ -427,10 +432,11 @@ where
             source_event.parent_id,
             self.deps.clone(),
         )
-        .with_aggregator_registry(self.aggregator_registry.clone());
+        .with_aggregator_registry(self.aggregator_registry.clone())
+        .with_runtime(self.runtime.clone());
 
         let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
-        let drained = runner
+        let drained = runtime
             .run(&effect.id, Box::pin(handler_fut))
             .await?
             .into_iter()

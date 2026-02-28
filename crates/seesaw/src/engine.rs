@@ -2,7 +2,7 @@
 //!
 //! Engine<D> publishes events to an internal MemoryStore and settles
 //! the full causal tree synchronously. For durable execution, plug in
-//! a `HandlerRunner` (e.g. RestateRunner).
+//! a `Runtime` (e.g. RestateRuntime).
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +15,7 @@ use tracing::info;
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::handler::{Context, Handler};
 use crate::handler_registry::HandlerRegistry;
-use crate::handler_runner::{DirectRunner, HandlerRunner};
+use crate::runtime::{DirectRuntime, Runtime};
 use crate::insight::{InsightEvent, StreamType};
 use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
@@ -27,7 +27,7 @@ use crate::types::{
 /// In-memory Engine with built-in settle loop.
 ///
 /// Publishes events to an internal queue and drives them to completion
-/// using `JobExecutor` + `HandlerRunner`.
+/// using `JobExecutor` + `Runtime`.
 pub struct Engine<D>
 where
     D: Send + Sync + 'static,
@@ -36,7 +36,7 @@ where
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
-    runner: Arc<dyn HandlerRunner>,
+    runtime: Arc<dyn Runtime>,
     on_insight: Option<Arc<dyn Fn(InsightEvent) + Send + Sync>>,
     insight_seq: Arc<AtomicU64>,
 }
@@ -52,15 +52,15 @@ where
             deps: Arc::new(deps),
             effects: Arc::new(HandlerRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
-            runner: Arc::new(DirectRunner),
+            runtime: Arc::new(DirectRuntime::new()),
             on_insight: None,
             insight_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    /// Set a custom handler runner (e.g. RestateRunner for durable execution).
-    pub fn with_runner<R: HandlerRunner + 'static>(mut self, runner: R) -> Self {
-        self.runner = Arc::new(runner);
+    /// Set a custom runtime (e.g. RestateRuntime for durable execution).
+    pub fn with_runtime<R: Runtime + 'static>(mut self, runtime: R) -> Self {
+        self.runtime = Arc::new(runtime);
         self
     }
 
@@ -96,7 +96,7 @@ where
     pub fn with_aggregator<E, A, F>(mut self, extract_id: F) -> Self
     where
         E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
-        A: Aggregate + Apply<E>,
+        A: Aggregate + Apply<E> + serde::Serialize + serde::de::DeserializeOwned,
         F: Fn(&E) -> Uuid + Send + Sync + 'static,
     {
         // Register event codec so emitted events of this type can be serialized
@@ -181,6 +181,7 @@ where
             self.deps.clone(),
             self.effects.clone(),
             self.aggregators.clone(),
+            self.runtime.clone(),
         );
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
@@ -196,7 +197,7 @@ where
                 self.apply_to_aggregators(&event);
 
                 match executor
-                    .execute_event(&event, &event_config, &*self.runner)
+                    .execute_event(&event, &event_config, &*self.runtime)
                     .await
                 {
                     Ok(commit) => {
@@ -246,7 +247,7 @@ where
                 let execution_clone = execution.clone();
 
                 match executor
-                    .execute_handler(execution, &handler_config, &*self.runner)
+                    .execute_handler(execution, &handler_config, &*self.runtime)
                     .await
                 {
                     Ok(result) => match result.status {
@@ -430,10 +431,10 @@ where
         })
     }
 
-    /// Apply event to live aggregator state (no persistence).
+    /// Apply event to aggregator state via the runtime.
     fn apply_to_aggregators(&self, event: &QueuedEvent) {
         self.aggregators
-            .apply_event(&event.event_type, &event.payload);
+            .apply_event(&event.event_type, &event.payload, &*self.runtime);
     }
 
     fn emit_insight(&self, event: InsightEvent) {
@@ -529,7 +530,8 @@ where
                         execution.parent_event_id,
                         self.deps.clone(),
                     )
-                    .with_aggregator_registry(self.aggregators.clone());
+                    .with_aggregator_registry(self.aggregators.clone())
+                    .with_runtime(self.runtime.clone());
 
                     match effect.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {
@@ -630,7 +632,7 @@ where
             deps: self.deps.clone(),
             effects: self.effects.clone(),
             aggregators: self.aggregators.clone(),
-            runner: self.runner.clone(),
+            runtime: self.runtime.clone(),
             on_insight: self.on_insight.clone(),
             insight_seq: self.insight_seq.clone(),
         }
