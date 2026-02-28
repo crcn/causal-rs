@@ -34,5 +34,5 @@ seesaw_core_macros = { version = "0.11.0", path = "../seesaw_core_macros", optio
 fastrand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 sqlx.workspace = true
-seesaw-postgres = { version = "0.11.0", path = "../seesaw-postgres" }
-seesaw-memory = { version = "0.11.0", path = "../seesaw-memory" }
+seesaw-postgres = { path = "../seesaw-postgres" }
+seesaw-memory = { path = "../seesaw-memory" }
