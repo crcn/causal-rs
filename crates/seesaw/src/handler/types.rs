@@ -89,11 +89,13 @@ pub struct EventOutput {
     pub value: Arc<dyn Any + Send + Sync>,
     /// Serializer captured at emit-time (avoids codec registry lookup).
     pub(crate) encode: Arc<dyn Fn(&dyn Any) -> Option<serde_json::Value> + Send + Sync>,
+    /// Codec captured at emit-time for automatic registration.
+    pub(crate) codec: Arc<EventCodec>,
 }
 
 impl EventOutput {
     /// Create a new EventOutput from a typed event.
-    pub fn new<E: Send + Sync + serde::Serialize + 'static>(event: E) -> Self {
+    pub fn new<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(event: E) -> Self {
         Self {
             type_id: TypeId::of::<E>(),
             event_type: std::any::type_name::<E>().to_string(),
@@ -101,6 +103,14 @@ impl EventOutput {
             encode: Arc::new(|any| {
                 any.downcast_ref::<E>()
                     .and_then(|e| serde_json::to_value(e).ok())
+            }),
+            codec: Arc::new(EventCodec {
+                event_type: std::any::type_name::<E>().to_string(),
+                type_id: TypeId::of::<E>(),
+                decode: Arc::new(|payload| {
+                    let event: E = serde_json::from_value(payload.clone())?;
+                    Ok(Arc::new(event))
+                }),
             }),
         }
     }
@@ -137,13 +147,13 @@ impl Events {
     }
 
     /// Add a single event to the collection (builder-style, chainable).
-    pub fn add<E: Send + Sync + serde::Serialize + 'static>(mut self, event: E) -> Self {
+    pub fn add<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(mut self, event: E) -> Self {
         self.outputs.push(EventOutput::new(event));
         self
     }
 
     /// Add a single event to the collection (Vec-style, in-place).
-    pub fn push<E: Send + Sync + serde::Serialize + 'static>(&mut self, event: E) {
+    pub fn push<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(&mut self, event: E) {
         self.outputs.push(EventOutput::new(event));
     }
 
@@ -153,7 +163,7 @@ impl Events {
     }
 
     /// Add all items from an iterator as individual events (fan-out).
-    pub fn batch<E: Send + Sync + serde::Serialize + 'static>(items: impl IntoIterator<Item = E>) -> Self {
+    pub fn batch<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(items: impl IntoIterator<Item = E>) -> Self {
         Self {
             outputs: items.into_iter().map(EventOutput::new).collect(),
         }
@@ -187,7 +197,7 @@ impl IntoEvents for () {
     }
 }
 
-impl<E: Send + Sync + serde::Serialize + 'static> IntoEvents for Emit<E> {
+impl<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static> IntoEvents for Emit<E> {
     fn into_events(self) -> Events {
         if TypeId::of::<E>() == TypeId::of::<()>() {
             return Events::new();

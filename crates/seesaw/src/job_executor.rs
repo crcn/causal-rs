@@ -510,6 +510,9 @@ where
         let mut emitted_events = Vec::with_capacity(emitted_count);
 
         for (emitted_index, output) in drained.into_iter().enumerate() {
+            // Auto-register codec so the event can be decoded in the next dispatch cycle
+            self.effects.register_codec(output.codec.clone());
+
             let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
                 anyhow::anyhow!("Failed to serialize emitted event {}", output.event_type)
             })?;
@@ -624,6 +627,9 @@ where
 
         let mut result = Vec::with_capacity(emitted_count);
         for (emitted_index, output) in emitted.into_iter().enumerate() {
+            // Auto-register codec so the event can be decoded in the next dispatch cycle
+            self.effects.register_codec(output.codec.clone());
+
             let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
                 anyhow::anyhow!("Failed to serialize emitted event {}", output.event_type)
             })?;

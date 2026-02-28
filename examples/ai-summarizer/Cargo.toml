@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-seesaw_core = { version = "0.15.0", path = "../../crates/seesaw" }
+seesaw_core = { version = "0.15.3", path = "../../crates/seesaw" }
 tokio = { version = "1.49", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
