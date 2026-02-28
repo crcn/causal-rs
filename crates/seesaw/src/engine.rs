@@ -139,7 +139,7 @@ where
     /// ```
     pub fn emit<E>(&self, event: E) -> EmitFuture
     where
-        E: Clone + Send + Sync + serde::Serialize + 'static,
+        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         let engine = self.clone();
         let engine2 = self.clone();
@@ -159,7 +159,7 @@ where
     #[deprecated(note = "renamed to emit()")]
     pub fn dispatch<E>(&self, event: E) -> EmitFuture
     where
-        E: Clone + Send + Sync + serde::Serialize + 'static,
+        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         self.emit(event)
     }
@@ -367,8 +367,19 @@ where
 
     async fn publish_event<E>(&self, event: E) -> Result<ProcessHandle>
     where
-        E: Clone + Send + Sync + serde::Serialize + 'static,
+        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        // Auto-register codec so the event can be decoded in the settle loop
+        let codec = Arc::new(crate::event_codec::EventCodec {
+            event_type: std::any::type_name::<E>().to_string(),
+            type_id: std::any::TypeId::of::<E>(),
+            decode: Arc::new(|payload| {
+                let event: E = serde_json::from_value(payload.clone())?;
+                Ok(Arc::new(event))
+            }),
+        });
+        self.effects.register_codec(codec);
+
         let event_id = Uuid::new_v4();
         let correlation_id = Uuid::new_v4();
         let event_type = std::any::type_name::<E>().to_string();
