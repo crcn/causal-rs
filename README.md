@@ -266,10 +266,10 @@ pub trait Runtime: Send + Sync {
         -> Pin<Box<dyn Future<...> + Send>>;
 
     /// Get aggregate state by key.
-    fn get_state(&self, key: &str) -> Option<serde_json::Value>;
+    fn get_state(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>>;
 
     /// Set aggregate state by key.
-    fn set_state(&self, key: &str, value: serde_json::Value);
+    fn set_state(&self, key: &str, value: Arc<dyn Any + Send + Sync>);
 }
 ```
 
@@ -320,14 +320,18 @@ impl Runtime for RestateRuntime<'_> {
         })
     }
 
-    fn get_state(&self, key: &str) -> Option<serde_json::Value> {
-        // Read from Restate's durable K/V store
-        self.ctx.get::<serde_json::Value>(key).await.ok().flatten()
+    fn get_state(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        // Read JSON from Restate K/V, wrap as Arc<dyn Any>
+        let json: serde_json::Value = self.ctx.get(key).await.ok().flatten()?;
+        Some(Arc::new(json))
     }
 
-    fn set_state(&self, key: &str, value: serde_json::Value) {
-        // Write to Restate's durable K/V store
-        self.ctx.set(key, value);
+    fn set_state(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
+        // Aggregator passes concrete types; serialize via aggregator closures
+        // or downcast to serde_json::Value if pre-serialized
+        if let Some(json) = value.downcast_ref::<serde_json::Value>() {
+            self.ctx.set(key, json.clone());
+        }
     }
 }
 ```
@@ -384,8 +388,8 @@ impl Runtime for DryRunRuntime {
         })
     }
 
-    fn get_state(&self, _key: &str) -> Option<serde_json::Value> { None }
-    fn set_state(&self, _key: &str, _value: serde_json::Value) {}
+    fn get_state(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> { None }
+    fn set_state(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
 }
 ```
 

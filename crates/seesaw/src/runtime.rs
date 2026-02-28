@@ -4,8 +4,10 @@
 //! and manages aggregate state. This enables durable execution (Restate),
 //! dry-run testing, tracing, etc.
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -19,6 +21,10 @@ use crate::handler::EventOutput;
 /// - `run` — wrap a handler invocation (journaling for Restate, pass-through for direct)
 /// - `get_state` — read aggregate state by key
 /// - `set_state` — write aggregate state by key
+///
+/// State is type-erased via `Arc<dyn Any + Send + Sync>`. The `DirectRuntime`
+/// stores concrete types for zero-cost downcasting. Durable runtimes (Restate,
+/// Temporal) serialize at the boundary using the aggregator's closures.
 pub trait Runtime: Send + Sync {
     /// Wrap a handler invocation.
     ///
@@ -31,15 +37,15 @@ pub trait Runtime: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>>;
 
     /// Get aggregate state by key. Returns None if no state exists.
-    fn get_state(&self, key: &str) -> Option<serde_json::Value>;
+    fn get_state(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>>;
 
     /// Set aggregate state by key.
-    fn set_state(&self, key: &str, value: serde_json::Value);
+    fn set_state(&self, key: &str, value: Arc<dyn Any + Send + Sync>);
 }
 
 /// Default runtime — executes handlers directly, stores state in-memory.
 pub struct DirectRuntime {
-    state: DashMap<String, serde_json::Value>,
+    state: DashMap<String, Arc<dyn Any + Send + Sync>>,
 }
 
 impl DirectRuntime {
@@ -65,11 +71,11 @@ impl Runtime for DirectRuntime {
         execution
     }
 
-    fn get_state(&self, key: &str) -> Option<serde_json::Value> {
-        self.state.get(key).map(|v| v.value().clone())
+    fn get_state(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.state.get(key).map(|v| Arc::clone(v.value()))
     }
 
-    fn set_state(&self, key: &str, value: serde_json::Value) {
+    fn set_state(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
         self.state.insert(key.to_string(), value);
     }
 }

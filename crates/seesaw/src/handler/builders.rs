@@ -699,7 +699,7 @@ where
 impl<E, A, G, Started> TransitionHandlerBuilder<E, A, G, Started>
 where
     E: Clone + Send + Sync + 'static,
-    A: Aggregate + serde::Serialize + serde::de::DeserializeOwned,
+    A: Aggregate,
     G: Fn(&A, &A) -> bool + Send + Sync + 'static,
 {
     /// Set a custom ID for this handler.

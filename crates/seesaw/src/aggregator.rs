@@ -53,9 +53,9 @@ pub struct Aggregator {
     clone_state: Arc<dyn Fn(&dyn Any) -> Box<dyn Any + Send + Sync> + Send + Sync>,
     /// Create a default aggregate state.
     default_state: Arc<dyn Fn() -> Box<dyn Any + Send + Sync> + Send + Sync>,
-    /// Serialize aggregate state to JSON.
+    /// Serialize aggregate state to JSON (for durable runtimes).
     serialize_state: Arc<dyn Fn(&dyn Any) -> Result<serde_json::Value> + Send + Sync>,
-    /// Deserialize aggregate state from JSON.
+    /// Deserialize aggregate state from JSON (for durable runtimes).
     deserialize_state:
         Arc<dyn Fn(serde_json::Value) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>,
 }
@@ -130,12 +130,12 @@ impl Aggregator {
         (self.default_state)()
     }
 
-    /// Serialize aggregate state to JSON.
+    /// Serialize aggregate state to JSON (for durable runtimes).
     pub fn serialize_state(&self, state: &dyn Any) -> Result<serde_json::Value> {
         (self.serialize_state)(state)
     }
 
-    /// Deserialize aggregate state from JSON.
+    /// Deserialize aggregate state from JSON (for durable runtimes).
     pub fn deserialize_state(
         &self,
         value: serde_json::Value,
@@ -179,7 +179,10 @@ impl AggregatorRegistry {
     /// For each matching aggregator:
     /// 1. Read current state from runtime (or create default)
     /// 2. Clone current state → prev snapshot, store via runtime
-    /// 3. Apply event to current state, store via runtime
+    /// 3. Apply event to cloned current state, store via runtime
+    ///
+    /// State is stored as concrete types via `Arc<dyn Any>` — zero serialization
+    /// overhead for `DirectRuntime`.
     pub fn apply_event(
         &self,
         event_type: &str,
@@ -201,67 +204,80 @@ impl AggregatorRegistry {
             let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
             let prev_key = format!("{}:prev", key);
 
-            // Get or create current state from runtime
-            let mut state: Box<dyn Any + Send + Sync> =
-                if let Some(json_state) = runtime.get_state(&key) {
-                    match agg.deserialize_state(json_state) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to deserialize aggregate state {}: {}",
-                                key,
-                                e
-                            );
-                            agg.default_state()
-                        }
-                    }
-                } else {
-                    agg.default_state()
-                };
-
-            // Snapshot prev before applying
-            let prev = agg.clone_state(state.as_ref());
-            match agg.serialize_state(prev.as_ref()) {
-                Ok(prev_json) => runtime.set_state(&prev_key, prev_json),
-                Err(e) => {
-                    tracing::error!("Failed to serialize prev state {}: {}", prev_key, e)
+            // Get current state from runtime, or create default.
+            // The Arc wraps the concrete aggregate type (e.g., Order).
+            let current_arc = runtime.get_state(&key);
+            let current: &dyn Any = match current_arc.as_deref() {
+                Some(state) => state,
+                None => {
+                    // No state yet — create default, store it, and get a reference
+                    let default = Arc::from(agg.default_state());
+                    runtime.set_state(&key, default);
+                    // Re-read to get the Arc reference
+                    return self.apply_event_inner(agg, &key, &prev_key, payload, runtime);
                 }
-            }
+            };
 
-            // Apply event to current state
-            if let Err(e) = agg.apply_to(state.as_mut(), payload.clone()) {
+            // Clone current state for mutation
+            let mut next_state = agg.clone_state(current);
+
+            // Store prev snapshot (cheap Arc clone of existing state)
+            runtime.set_state(&prev_key, current_arc.unwrap());
+
+            // Apply event to the cloned state
+            if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
                 tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
             }
 
-            // Write updated state back to runtime
-            match agg.serialize_state(state.as_ref()) {
-                Ok(json_state) => runtime.set_state(&key, json_state),
-                Err(e) => {
-                    tracing::error!("Failed to serialize aggregate state {}: {}", key, e)
-                }
-            }
+            // Store updated state
+            runtime.set_state(&key, Arc::from(next_state));
         }
+    }
+
+    /// Helper for the case where we just created default state and need to re-read.
+    fn apply_event_inner(
+        &self,
+        agg: &Aggregator,
+        key: &str,
+        prev_key: &str,
+        payload: &serde_json::Value,
+        runtime: &dyn Runtime,
+    ) {
+        let current_arc = runtime.get_state(key).unwrap();
+        let mut next_state = agg.clone_state(current_arc.as_ref());
+
+        // Store prev snapshot
+        runtime.set_state(prev_key, current_arc);
+
+        // Apply event
+        if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
+            tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
+        }
+
+        // Store updated state
+        runtime.set_state(key, Arc::from(next_state));
     }
 
     /// Get the (prev, next) transition for an aggregate from the Runtime.
     ///
-    /// Returns `(prev_state, current_state)` by reading from the runtime.
+    /// Returns `(prev_state, current_state)` by reading from the runtime
+    /// and downcasting to the concrete aggregate type. Zero serialization.
     /// If no state exists, returns `(A::default(), A::default())`.
     pub fn get_transition<A>(&self, id: Uuid, runtime: &dyn Runtime) -> (A, A)
     where
-        A: Aggregate + serde::Serialize + serde::de::DeserializeOwned + 'static,
+        A: Aggregate + 'static,
     {
         let key = format!("{}:{}", A::aggregate_type(), id);
         let prev_key = format!("{}:prev", key);
 
         let next = runtime
             .get_state(&key)
-            .and_then(|json| serde_json::from_value::<A>(json).ok())
+            .and_then(|arc| arc.downcast_ref::<A>().cloned())
             .unwrap_or_default();
 
         let prev = runtime
             .get_state(&prev_key)
-            .and_then(|json| serde_json::from_value::<A>(json).ok())
+            .and_then(|arc| arc.downcast_ref::<A>().cloned())
             .unwrap_or_default();
 
         (prev, next)
