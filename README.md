@@ -71,12 +71,12 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-seesaw_core = "0.10.3"
-seesaw-memory = "0.10.3"   # For in-memory backend
+seesaw_core = "0.12"
+seesaw-memory = "0.12"    # For in-memory backend
 # OR
-seesaw-postgres = "0.10.3" # For durable PostgreSQL backend
+seesaw-postgres = "0.12"  # For durable PostgreSQL backend
 # OR
-seesaw-kafka = "0.11.0"    # For high-throughput Kafka backend
+seesaw-kafka = "0.12"     # For high-throughput Kafka backend
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -199,7 +199,7 @@ async fn charge_payment(
 - `retry = N` - Max retry attempts on failure
 - `timeout_secs = N` / `timeout_ms = N` - Execution timeout
 - `delay_secs = N` / `delay_ms = N` - Delay before execution
-- `priority = N` - Execution priority (lower = higher priority)
+- `priority = N` - Execution priority (lower = higher priority). Works with both inline and queued handlers
 - `queued` - Force queued execution (required when using retry/timeout/delay)
 
 ### Multiple Handlers, Same Event
@@ -421,6 +421,90 @@ async fn process(data: Data, ctx: Context<Deps>) -> Result<MyEvent> {
 
 **Context methods:**
 - `ctx.deps()` - Access shared dependencies (database, APIs, config, etc.)
+- `ctx.event_id` - Current event's unique ID
+- `ctx.correlation_id` - Workflow/correlation ID grouping related events
+- `ctx.parent_event_id` - Parent event ID for causal tracking
+- `ctx.idempotency_key()` - Deterministic key for deduplicating external API calls
+- `ctx.handler_id()` - Human-readable handler identifier
+
+## Synchronous Settlement
+
+Process an event and wait for the entire causal tree to settle (all handlers and their emitted events fully processed):
+
+```rust
+use seesaw_core::Engine;
+use seesaw_memory::MemoryBackend;
+
+let engine = Engine::new(deps, MemoryBackend::new())
+    .with_handler(ship_order())
+    .with_handler(notify_shipped());
+
+// Fire-and-forget (returns after publishing)
+engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
+
+// Synchronous settlement (returns after all handlers complete)
+let handle = engine.process(OrderEvent::Placed { order_id, total: 99.99 })
+    .settled()
+    .await?;
+```
+
+`engine.process(event)` returns a `DispatchFuture` that supports:
+- `.settled()` - Wait for the full causal tree to settle
+- `.with_id(uuid)` - Set custom event ID for idempotency
+- `.with_workflow_id(uuid)` - Set correlation/workflow ID
+- `.with_parent(uuid)` - Set parent event for causation tracking
+- `.wait(matcher)` - Wait for a terminal event (requires `WorkflowSubscriptionBackend`)
+- Direct `.await` - Fire-and-forget (same as `dispatch()`)
+
+Settlement is available on any backend that implements `SettleableBackend`. The `MemoryBackend` implements this out of the box.
+
+## Event Sourcing
+
+Seesaw includes an event sourcing module for persisting events and reconstructing aggregate state.
+
+### ES Projector
+
+The `es_projector` handler automatically persists every event to an EventStore before reactive handlers run. It runs as a priority-0 inline handler, guaranteeing that aggregate state is always up-to-date when other handlers execute:
+
+```rust
+use seesaw_core::es_projector;
+
+let engine = Engine::new(deps, backend)
+    // Projector runs first (priority 0), persists to EventStore
+    .with_handler(es_projector::<OrderEvent, OrderAggregate, _, _>(|e| e.order_id))
+    // Reactive handlers see updated aggregate state
+    .with_handler(ship_order());
+```
+
+This pattern ensures:
+1. **Projector** (priority 0, inline) writes every event to the EventStore
+2. **Reactive handlers** load current aggregate state via the EventStore
+3. Since the projector always runs first, reactive handlers see up-to-date state
+
+### Aggregates
+
+Define aggregates with the `Aggregate` trait:
+
+```rust
+use seesaw_core::es::Aggregate;
+
+struct OrderAggregate;
+
+impl Aggregate for OrderAggregate {
+    type Event = OrderEvent;
+    type State = OrderState;
+
+    fn aggregate_type() -> &'static str { "order" }
+
+    fn apply(state: &mut Self::State, event: &Self::Event) {
+        match event {
+            OrderEvent::Placed { total, .. } => state.total = *total,
+            OrderEvent::Shipped { .. } => state.shipped = true,
+            _ => {}
+        }
+    }
+}
+```
 
 ## Real-time Observability (Seesaw Insight)
 
@@ -607,6 +691,7 @@ let engine = Engine::new(deps, backend);
 5. **Composition Over Inheritance**: Build complex workflows from simple handlers
 6. **Pluggable Backends**: Choose the right backend for your use case
 7. **Pluggable Execution**: The `HandlerRunner` trait wraps handler calls, enabling durable execution (Restate), dry-run testing, and tracing without changing user code
+8. **Settle on Demand**: `engine.process(event).settled().await` drives the full causal tree to completion synchronously
 
 ## Testing
 
@@ -734,7 +819,7 @@ handler::on_any()
 - `.retry(u32)` - Max retry attempts
 - `.timeout(Duration)` - Execution timeout
 - `.delayed(Duration)` - Delay before execution
-- `.priority(i32)` - Execution priority
+- `.priority(i32)` - Execution priority (lower = first). Works with inline handlers
 - `.queued()` - Force queued execution
 
 **When to use:**
