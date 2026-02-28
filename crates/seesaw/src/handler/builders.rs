@@ -369,7 +369,7 @@ where
         H: Fn(Vec<E>, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
         R: Into<Emit<O>> + Send + 'static,
-        O: Send + Sync + 'static,
+        O: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
     {
         let target = TypeId::of::<E>();
         let id = self
@@ -378,15 +378,22 @@ where
             .take()
             .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
         let join_mode = self.mode;
-        let typed_codec = self
+        let input_codec = self
             .inner
             .codec
             .take()
             .unwrap_or_else(typed_event_codec::<E>);
+        let output_codec = typed_event_codec::<O>();
+
+        let mut codecs = vec![input_codec];
+        // Register output codec if it differs from the input
+        if TypeId::of::<O>() != TypeId::of::<E>() && TypeId::of::<O>() != TypeId::of::<()>() {
+            codecs.push(output_codec);
+        }
 
         Handler {
             id,
-            codecs: vec![typed_codec],
+            codecs,
             can_handle: Arc::new(move |t| t == target),
             started: self.inner.started.into_started(),
             handler: Arc::new(move |_, _, _| Box::pin(async { Ok(Vec::new()) })),
@@ -492,7 +499,7 @@ where
 
 impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
 where
-    E: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
 {
     /// Set the handler that returns the next event (terminal operation).
     #[track_caller]
@@ -510,7 +517,8 @@ where
     {
         let target = TypeId::of::<E>();
         let filter = self.filter;
-        let codec = self.codec;
+        // Always register input codec so Engine::decode_event works for both inline and queued handlers
+        let input_codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
         let dlq_terminal_mapper = self.dlq_terminal_mapper;
 
         let id = self
@@ -519,7 +527,7 @@ where
 
         Handler {
             id,
-            codecs: codec.into_iter().collect(),
+            codecs: vec![input_codec],
             can_handle: Arc::new(move |t| t == target),
             started: self.started.into_started(),
             handler: Arc::new(move |value, _, ctx| {

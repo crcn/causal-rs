@@ -1,8 +1,7 @@
-//! HTTP Fetcher Example (stateless)
+//! HTTP Fetcher Example
 
 use anyhow::Result;
-use seesaw_core::{effect, Context, Engine};
-use seesaw_memory::MemoryStore;
+use seesaw_core::{handler, Context, Emit, Engine};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,16 +32,16 @@ struct Deps {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let store = MemoryStore::new();
     let deps = Deps {
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
     };
 
-    let engine = Engine::new(deps, store)
+    let engine = Engine::new(deps)
         .with_handler(
             handler::on::<FetchEvent>()
+                .id("fetch_url")
                 .extract(|e| match e {
                     FetchEvent::FetchRequested {
                         urls,
@@ -51,7 +50,7 @@ async fn main() -> Result<()> {
                     } => Some((urls.clone(), *success_count, *failure_count)),
                     _ => None,
                 })
-                .then::<Deps, (Vec<String>, usize, usize), _, _, Vec<FetchEvent>, FetchEvent>(
+                .then::<Deps, _, _, _, _, FetchEvent>(
                     |(urls, success_count, failure_count), ctx: Context<Deps>| async move {
                         if let Some((url, rest)) = urls.split_first() {
                             let url = url.clone();
@@ -61,16 +60,16 @@ async fn main() -> Result<()> {
                                 Ok(response) if response.status().is_success() => {
                                     let status = response.status().as_u16();
                                     let _ = response.text().await?;
-                                    Ok(vec![
+                                    Ok(Emit::Batch(vec![
                                         FetchEvent::Fetched { url, status },
                                         FetchEvent::FetchRequested {
                                             urls: rest,
                                             success_count: success_count + 1,
                                             failure_count,
                                         },
-                                    ])
+                                    ]))
                                 }
-                                Ok(response) => Ok(vec![
+                                Ok(response) => Ok(Emit::Batch(vec![
                                     FetchEvent::FetchFailed {
                                         url,
                                         reason: format!("HTTP {}", response.status().as_u16()),
@@ -80,8 +79,8 @@ async fn main() -> Result<()> {
                                         success_count,
                                         failure_count: failure_count + 1,
                                     },
-                                ]),
-                                Err(error) => Ok(vec![
+                                ])),
+                                Err(error) => Ok(Emit::Batch(vec![
                                     FetchEvent::FetchFailed {
                                         url,
                                         reason: error.to_string(),
@@ -91,19 +90,20 @@ async fn main() -> Result<()> {
                                         success_count,
                                         failure_count: failure_count + 1,
                                     },
-                                ]),
+                                ])),
                             }
                         } else {
-                            Ok(vec![FetchEvent::AllComplete {
+                            Ok(Emit::Batch(vec![FetchEvent::AllComplete {
                                 success_count,
                                 failure_count,
-                            }])
+                            }]))
                         }
                     },
                 ),
         )
         .with_handler(
             handler::on::<FetchEvent>()
+                .id("all_complete")
                 .extract(|e| match e {
                     FetchEvent::AllComplete {
                         success_count,
@@ -111,12 +111,10 @@ async fn main() -> Result<()> {
                     } => Some((*success_count, *failure_count)),
                     _ => None,
                 })
-                .then::<Deps, (usize, usize), _, _, Vec<FetchEvent>, FetchEvent>(
-                    |(ok, fail), _ctx: Context<Deps>| async move {
-                        println!("all fetches complete: ok={}, fail={}", ok, fail);
-                        Ok(Vec::<FetchEvent>::new())
-                    },
-                ),
+                .then(|(ok, fail), _ctx: Context<Deps>| async move {
+                    println!("all fetches complete: ok={}, fail={}", ok, fail);
+                    Ok(())
+                }),
         );
 
     let urls = vec![
@@ -131,6 +129,7 @@ async fn main() -> Result<()> {
             success_count: 0,
             failure_count: 0,
         })
+        .settled()
         .await?;
 
     Ok(())

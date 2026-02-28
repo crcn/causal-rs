@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 seesaw_core = { path = "../../crates/seesaw" }
-seesaw-memory = { path = "../../crates/seesaw-memory" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.49", features = ["full"] }

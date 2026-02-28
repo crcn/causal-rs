@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{handle, handles, Emit, ErrorContext, HandlerContext};
+use seesaw_core::{handle, handles, Context, Emit, ErrorContext};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -60,7 +60,7 @@ mod order_effects {
     use super::*;
 
     #[handle(on = OrderPlaced, id = "ship_order")]
-    async fn ship_order(event: OrderPlaced, _ctx: HandlerContext<Deps>) -> Result<OrderShipped> {
+    async fn ship_order(event: OrderPlaced, _ctx: Context<Deps>) -> Result<OrderShipped> {
         Ok(OrderShipped {
             order_id: event.order_id,
         })
@@ -69,13 +69,14 @@ mod order_effects {
     #[handle(
         on = PaymentRequested,
         id = "charge_payment",
+        queued,
         retry = 3,
         timeout_secs = 30,
         priority = 1
     )]
     async fn charge_payment(
         event: PaymentRequested,
-        _ctx: HandlerContext<Deps>,
+        _ctx: Context<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -88,12 +89,13 @@ mod order_effects {
     #[handle(
         on = PaymentRequested,
         id = "run_search",
+        queued,
         retry = 3,
         dlq_terminal = build_payment_failure
     )]
     async fn run_search(
         event: PaymentRequested,
-        _ctx: HandlerContext<Deps>,
+        _ctx: Context<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -115,7 +117,7 @@ mod order_effects {
     #[handle(on = OrderPlaced, queued, id = "queued_observer")]
     async fn queued_observer(
         _event: OrderPlaced,
-        _ctx: HandlerContext<Deps>,
+        _ctx: Context<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
     }
@@ -128,7 +130,7 @@ mod order_effects {
     )]
     async fn queued_retry_one(
         event: PaymentRequested,
-        _ctx: HandlerContext<Deps>,
+        _ctx: Context<Deps>,
     ) -> Result<PaymentCharged> {
         Ok(PaymentCharged {
             order_id: event.order_id,
@@ -146,7 +148,7 @@ mod order_effects {
     )]
     async fn bulk_insert(
         batch: Vec<RowValidated>,
-        _ctx: HandlerContext<Deps>,
+        _ctx: Context<Deps>,
     ) -> Result<BatchInserted> {
         Ok(BatchInserted { count: batch.len() })
     }
@@ -158,7 +160,7 @@ mod order_effects {
     async fn enqueue_extract(
         website_id: Uuid,
         job_id: Uuid,
-        _ctx: HandlerContext<Deps>,
+        _ctx: Context<Deps>,
     ) -> Result<ExtractEnqueued> {
         let _ = job_id;
         Ok(ExtractEnqueued { website_id })
@@ -167,7 +169,7 @@ mod order_effects {
     #[handle(on = OrderPlaced, group = "analytics")]
     async fn log_order(
         _event: OrderPlaced,
-        _ctx: HandlerContext<Deps>,
+        _ctx: Context<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
     }

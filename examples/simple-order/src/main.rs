@@ -1,8 +1,7 @@
-//! Simple Order Processing Example (v0.11.0 Backend API)
+//! Simple Order Processing Example
 
 use anyhow::Result;
 use seesaw_core::{handler, Context, Engine};
-use seesaw_memory::MemoryBackend;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -21,14 +20,14 @@ struct Deps {
 impl Deps {
     async fn ship(&self, order_id: Uuid) -> Result<()> {
         if self.shipping_enabled {
-            println!("📦 Shipping order {}", order_id);
+            println!("Shipping order {}", order_id);
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
         Ok(())
     }
 
     async fn notify(&self, order_id: Uuid, message: &str) -> Result<()> {
-        println!("📧 Notify order {}: {}", order_id, message);
+        println!("Notify order {}: {}", order_id, message);
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         Ok(())
     }
@@ -40,13 +39,11 @@ fn place_order(order_id: Uuid, total: f64) -> OrderEvent {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Use new MemoryBackend (v0.11.0)
-    let backend = MemoryBackend::new();
     let deps = Deps {
         shipping_enabled: true,
     };
 
-    let engine = Engine::new(deps, backend)
+    let engine = Engine::new(deps)
         .with_handler(
             handler::on::<OrderEvent>()
                 .id("ship_order")
@@ -74,15 +71,15 @@ async fn main() -> Result<()> {
                 }),
         );
 
-    println!("🚀 Processing orders using v0.11.0 Backend API...\n");
+    println!("Processing orders...\n");
 
     for i in 1..=3 {
         let order_id = Uuid::new_v4();
         let total = 99.99 * i as f64;
-        println!("💰 Placing order {} (${:.2})", order_id, total);
-        engine.dispatch(place_order(order_id, total)).await?;
+        println!("Placing order {} (${:.2})", order_id, total);
+        engine.dispatch(place_order(order_id, total)).settled().await?;
     }
 
-    println!("\n✅ All orders dispatched successfully!");
+    println!("\nAll orders processed successfully!");
     Ok(())
 }

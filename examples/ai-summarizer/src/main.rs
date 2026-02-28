@@ -1,8 +1,7 @@
-//! AI Summarizer Example (stateless)
+//! AI Summarizer Example
 
 use anyhow::{bail, Result};
-use seesaw_core::{effect, Context, Engine};
-use seesaw_memory::MemoryStore;
+use seesaw_core::{handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -88,14 +87,14 @@ async fn main() -> Result<()> {
     let api_key =
         env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY environment variable required");
 
-    let store = MemoryStore::new();
     let deps = Deps {
         http_client: reqwest::Client::new(),
         api_key,
     };
 
-    let engine = Engine::new(deps, store).with_handler(
+    let engine = Engine::new(deps).with_handler(
         handler::on::<SummaryEvent>()
+            .id("summarize")
             .extract(|e| match e {
                 SummaryEvent::SummarizeRequested { task_id, text } => {
                     Some((*task_id, text.clone()))
@@ -104,7 +103,7 @@ async fn main() -> Result<()> {
             })
             .then(|(task_id, text), ctx: Context<Deps>| async move {
                 let request = AnthropicRequest {
-                    model: "claude-3-5-sonnet-20241022".to_string(),
+                    model: "claude-sonnet-4-20250514".to_string(),
                     max_tokens: 1024,
                     messages: vec![Message {
                         role: "user".to_string(),
@@ -145,6 +144,7 @@ async fn main() -> Result<()> {
 
     engine
         .dispatch(SummaryEvent::SummarizeRequested { task_id, text })
+        .settled()
         .await?;
 
     Ok(())

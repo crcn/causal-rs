@@ -25,7 +25,6 @@ smallvec.workspace = true
 sqlx = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 seesaw_core_macros = { version = "0.12.1", path = "../seesaw_core_macros", optional = true }

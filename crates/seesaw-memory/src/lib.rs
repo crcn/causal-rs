@@ -1,36 +1,29 @@
-//! In-memory Store implementation for Seesaw
+//! In-memory InsightStore implementation for Seesaw
 //!
-//! This is a simple in-memory store suitable for development, testing, and demos.
-//! Not suitable for production use as all data is lost on restart.
+//! Provides an in-memory InsightStore suitable for development, testing, and demos,
+//! and an in-memory ES EventStore via the `event_store` module.
 
 pub mod event_store;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use seesaw_core::insight::*;
-use seesaw_core::store::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use seesaw_core::QueuedEvent;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::broadcast;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// In-memory store for workflows
+/// In-memory InsightStore for workflows.
+///
+/// Tracks event and effect history for observability. Use `record_event()`
+/// and related methods to populate data, then query via InsightStore trait.
 #[derive(Clone)]
 pub struct MemoryStore {
-    /// Event queue (FIFO per correlation_id)
-    events: Arc<DashMap<Uuid, VecDeque<QueuedEvent>>>,
-    /// Global event sequence for IDs
-    event_seq: Arc<AtomicI64>,
-    /// Effect executions queue
-    effects: Arc<Mutex<VecDeque<QueuedHandlerExecution>>>,
-    /// Completed effects (for idempotency)
-    completed_effects: Arc<DashMap<(Uuid, String), serde_json::Value>>,
-
     // Insight/observability fields
     /// Broadcast channel for live events
     insight_tx: Arc<broadcast::Sender<InsightEvent>>,
@@ -42,8 +35,6 @@ pub struct MemoryStore {
     effect_history: Arc<DashMap<(Uuid, String), StoredEffect>>,
     /// Dead letter history
     dead_letter_history: Arc<DashMap<(Uuid, String), StoredDeadLetter>>,
-    /// Durable-ish join windows for same-batch fan-in (in-memory only).
-    join_windows: Arc<Mutex<HashMap<(String, Uuid, Uuid), MemoryJoinWindow>>>,
 }
 
 /// Stored event for history/tree reconstruction
@@ -56,7 +47,6 @@ struct StoredEvent {
     event_type: String,
     payload: serde_json::Value,
     hops: i32,
-    retry_count: i32,
     batch_id: Option<Uuid>,
     batch_index: Option<i32>,
     batch_size: Option<i32>,
@@ -70,6 +60,7 @@ struct StoredEffect {
     event_id: Uuid,
     correlation_id: Uuid,
     event_type: String,
+    #[allow(dead_code)]
     event_payload: serde_json::Value,
     batch_id: Option<Uuid>,
     batch_index: Option<i32>,
@@ -83,22 +74,6 @@ struct StoredEffect {
     claimed_at: Option<DateTime<Utc>>,
     last_attempted_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryJoinStatus {
-    Open,
-    Processing,
-    Completed,
-}
-
-#[derive(Debug, Clone)]
-struct MemoryJoinWindow {
-    target_count: i32,
-    status: MemoryJoinStatus,
-    source_event_ids: HashSet<Uuid>,
-    entries_by_index: HashMap<i32, JoinEntry>,
-    expires_at: Option<DateTime<Utc>>,
 }
 
 /// Stored dead letter entry for insight diagnostics.
@@ -120,43 +95,25 @@ impl MemoryStore {
     pub fn new() -> Self {
         let (insight_tx, _) = broadcast::channel(1000);
         Self {
-            events: Arc::new(DashMap::new()),
-            event_seq: Arc::new(AtomicI64::new(1)),
-            effects: Arc::new(Mutex::new(VecDeque::new())),
-            completed_effects: Arc::new(DashMap::new()),
             insight_tx: Arc::new(insight_tx),
             insight_seq: Arc::new(AtomicI64::new(1)),
             event_history: Arc::new(DashMap::new()),
             effect_history: Arc::new(DashMap::new()),
             dead_letter_history: Arc::new(DashMap::new()),
-            join_windows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Publish insight event to broadcast channel
-    fn publish_insight(&self, event: InsightEvent) {
-        // Ignore send errors (no subscribers is fine)
-        let _ = self.insight_tx.send(event);
-    }
-}
-
-impl Default for MemoryStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Store for MemoryStore {
-    async fn publish(&self, event: QueuedEvent) -> Result<()> {
+    /// Record an event for insight tracking.
+    ///
+    /// This populates the event history used by InsightStore queries
+    /// and broadcasts an insight event to live subscribers.
+    pub fn record_event(&self, event: &QueuedEvent) {
         if self.event_history.contains_key(&event.event_id) {
-            return Ok(());
+            return;
         }
 
-        // Generate sequence number
         let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
 
-        // Store in event history with seq
         self.event_history.insert(
             event.event_id,
             StoredEvent {
@@ -167,7 +124,6 @@ impl Store for MemoryStore {
                 event_type: event.event_type.clone(),
                 payload: event.payload.clone(),
                 hops: event.hops,
-                retry_count: event.retry_count,
                 batch_id: event.batch_id,
                 batch_index: event.batch_index,
                 batch_size: event.batch_size,
@@ -175,8 +131,7 @@ impl Store for MemoryStore {
             },
         );
 
-        // Publish insight event
-        self.publish_insight(InsightEvent {
+        let _ = self.insight_tx.send(InsightEvent {
             seq,
             stream_type: StreamType::EventDispatched,
             correlation_id: event.correlation_id,
@@ -196,647 +151,17 @@ impl Store for MemoryStore {
             })),
             created_at: event.created_at,
         });
-
-        // Add to queue
-        let mut queue = self
-            .events
-            .entry(event.correlation_id)
-            .or_insert_with(VecDeque::new);
-        queue.push_back(event);
-        Ok(())
     }
 
-    async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
-        // Simple round-robin across workflows
-        for mut entry in self.events.iter_mut() {
-            if let Some(event) = entry.value_mut().pop_front() {
-                return Ok(Some(event));
-            }
-        }
-        Ok(None)
+    /// Publish insight event to broadcast channel
+    fn publish_insight(&self, event: InsightEvent) {
+        let _ = self.insight_tx.send(event);
     }
+}
 
-    async fn ack(&self, _id: i64) -> Result<()> {
-        // No-op for in-memory (event already removed in poll_next)
-        Ok(())
-    }
-
-    async fn nack(&self, _id: i64, _retry_after_secs: u64) -> Result<()> {
-        // For simplicity, just drop failed events in memory store
-        Ok(())
-    }
-
-    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
-        for intent in commit.queued_effect_intents {
-            self.insert_effect_intent(
-                commit.event_id,
-                intent.handler_id,
-                commit.correlation_id,
-                commit.event_type.clone(),
-                commit.event_payload.clone(),
-                intent.parent_event_id,
-                intent.batch_id,
-                intent.batch_index,
-                intent.batch_size,
-                intent.execute_at,
-                intent.timeout_seconds,
-                intent.max_attempts,
-                intent.priority,
-                intent.join_window_timeout_seconds,
-            )
-            .await?;
-        }
-
-        for event in commit.emitted_events {
-            self.publish(event).await?;
-        }
-
-        for failure in commit.inline_effect_failures {
-            self.dlq_effect(
-                commit.event_id,
-                failure.handler_id,
-                failure.error,
-                failure.reason,
-                failure.attempts,
-            )
-            .await?;
-        }
-
-        self.ack(commit.event_row_id).await?;
-        Ok(())
-    }
-
-    async fn insert_effect_intent(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        correlation_id: Uuid,
-        event_type: String,
-        event_payload: serde_json::Value,
-        parent_event_id: Option<Uuid>,
-        batch_id: Option<Uuid>,
-        batch_index: Option<i32>,
-        batch_size: Option<i32>,
-        execute_at: DateTime<Utc>,
-        timeout_seconds: i32,
-        max_attempts: i32,
-        priority: i32,
-        join_window_timeout_seconds: Option<i32>,
-    ) -> Result<()> {
-        let execution = QueuedHandlerExecution {
-            event_id,
-            handler_id: handler_id.clone(),
-            correlation_id,
-            event_type,
-            event_payload,
-            parent_event_id,
-            batch_id,
-            batch_index,
-            batch_size,
-            execute_at,
-            timeout_seconds,
-            max_attempts,
-            priority,
-            attempts: 0,
-            join_window_timeout_seconds,
-        };
-
-        // Store in effect history
-        let now = Utc::now();
-        self.effect_history.insert(
-            (event_id, handler_id.clone()),
-            StoredEffect {
-                handler_id: handler_id.clone(),
-                event_id,
-                correlation_id,
-                event_type: execution.event_type.clone(),
-                event_payload: execution.event_payload.clone(),
-                batch_id: execution.batch_id,
-                batch_index: execution.batch_index,
-                batch_size: execution.batch_size,
-                status: "pending".to_string(),
-                result: None,
-                error: None,
-                attempts: 0,
-                created_at: now,
-                execute_at,
-                claimed_at: None,
-                last_attempted_at: None,
-                completed_at: None,
-            },
-        );
-
-        // Publish insight event
-        let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
-        self.publish_insight(InsightEvent {
-            seq,
-            stream_type: StreamType::EffectStarted,
-            correlation_id,
-            event_id: None,
-            effect_event_id: Some(event_id),
-            handler_id: Some(handler_id),
-            event_type: None,
-            status: Some("pending".to_string()),
-            error: None,
-            payload: None,
-            created_at: now,
-        });
-
-        let mut queue = self.effects.lock();
-        queue.push_back(execution);
-        Ok(())
-    }
-
-    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
-        let mut queue = self.effects.lock();
-
-        // Find first effect that's ready to execute
-        let now = Utc::now();
-        if let Some(pos) = queue.iter().position(|e| e.execute_at <= now) {
-            if let Some(next) = queue.remove(pos) {
-                if let Some(mut effect) = self
-                    .effect_history
-                    .get_mut(&(next.event_id, next.handler_id.clone()))
-                {
-                    effect.status = "executing".to_string();
-                    effect.claimed_at = Some(now);
-                    effect.last_attempted_at = Some(now);
-                    effect.attempts = next.attempts + 1;
-                }
-                Ok(Some(next))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn complete_effect(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        result: serde_json::Value,
-    ) -> Result<()> {
-        self.completed_effects
-            .insert((event_id, handler_id.clone()), result.clone());
-
-        // Update effect history
-        if let Some(mut entry) = self.effect_history.get_mut(&(event_id, handler_id.clone())) {
-            entry.status = "completed".to_string();
-            entry.result = Some(result.clone());
-            let completed_at = Utc::now();
-            entry.completed_at = Some(completed_at);
-            entry.last_attempted_at = Some(completed_at);
-
-            // Publish insight event
-            let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
-            self.publish_insight(InsightEvent {
-                seq,
-                stream_type: StreamType::EffectCompleted,
-                correlation_id: entry.correlation_id,
-                event_id: None,
-                effect_event_id: Some(event_id),
-                handler_id: Some(handler_id),
-                event_type: None,
-                status: Some("completed".to_string()),
-                error: None,
-                payload: Some(result),
-                created_at: completed_at,
-            });
-        }
-
-        Ok(())
-    }
-
-    async fn complete_effect_with_events(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        result: serde_json::Value,
-        emitted_events: Vec<EmittedEvent>,
-    ) -> Result<()> {
-        // Mark effect complete
-        self.complete_effect(event_id, handler_id.clone(), result)
-            .await?;
-
-        let correlation_id = self
-            .effect_history
-            .get(&(event_id, handler_id.clone()))
-            .map(|entry| entry.correlation_id)
-            .or_else(|| {
-                self.event_history
-                    .get(&event_id)
-                    .map(|entry| entry.correlation_id)
-            })
-            .unwrap_or(event_id);
-        let parent_hops = self
-            .event_history
-            .get(&event_id)
-            .map(|entry| entry.hops)
-            .unwrap_or(0);
-
-        // Publish emitted events
-        for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
-            let new_event_id = Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!(
-                    "{}-{}-{}-{}",
-                    event_id, handler_id, emitted.event_type, emitted_index
-                )
-                .as_bytes(),
-            );
-
-            let queued = QueuedEvent {
-                id: self.event_seq.fetch_add(1, Ordering::SeqCst),
-                event_id: new_event_id,
-                parent_id: Some(event_id),
-                correlation_id,
-                event_type: emitted.event_type,
-                payload: emitted.payload,
-                hops: parent_hops + 1,
-                retry_count: 0,
-                batch_id: emitted.batch_id,
-                batch_index: emitted.batch_index,
-                batch_size: emitted.batch_size,
-                created_at: Utc::now(),
-            };
-
-            self.publish(queued).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn fail_effect(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        error: String,
-        _retry_after_secs: i32,
-    ) -> Result<()> {
-        // Update effect history
-        if let Some(mut entry) = self.effect_history.get_mut(&(event_id, handler_id.clone())) {
-            let failed_at = Utc::now();
-            entry.status = "failed".to_string();
-            entry.error = Some(error.clone());
-            entry.attempts += 1;
-            entry.last_attempted_at = Some(failed_at);
-
-            // Publish insight event
-            let seq = self.insight_seq.fetch_add(1, Ordering::SeqCst);
-            self.publish_insight(InsightEvent {
-                seq,
-                stream_type: StreamType::EffectFailed,
-                correlation_id: entry.correlation_id,
-                event_id: None,
-                effect_event_id: Some(event_id),
-                handler_id: Some(handler_id),
-                event_type: None,
-                status: Some("failed".to_string()),
-                error: Some(error.clone()),
-                payload: None,
-                created_at: failed_at,
-            });
-        }
-
-        eprintln!("Handler failed: {}", error);
-        Ok(())
-    }
-
-    async fn dlq_effect(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        error: String,
-        error_type: String,
-        attempts: i32,
-    ) -> Result<()> {
-        self.dlq_effect_with_events(
-            event_id,
-            handler_id,
-            error,
-            error_type,
-            attempts,
-            Vec::new(),
-        )
-        .await
-    }
-
-    async fn dlq_effect_with_events(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        error: String,
-        error_type: String,
-        attempts: i32,
-        emitted_events: Vec<EmittedEvent>,
-    ) -> Result<()> {
-        let effect_snapshot = self
-            .effect_history
-            .get(&(event_id, handler_id.clone()))
-            .map(|entry| {
-                (
-                    entry.correlation_id,
-                    entry.event_type.clone(),
-                    entry.event_payload.clone(),
-                    entry.batch_id,
-                    entry.batch_index,
-                    entry.batch_size,
-                )
-            });
-        let event_snapshot = self.event_history.get(&event_id).map(|event| {
-            (
-                event.correlation_id,
-                event.event_type.clone(),
-                event.payload.clone(),
-                event.batch_id,
-                event.batch_index,
-                event.batch_size,
-                event.hops,
-            )
-        });
-
-        let (correlation_id, event_type, event_payload, batch_id, batch_index, batch_size) =
-            if let Some(snapshot) = effect_snapshot.clone() {
-                (
-                    snapshot.0, snapshot.1, snapshot.2, snapshot.3, snapshot.4, snapshot.5,
-                )
-            } else if let Some(snapshot) = event_snapshot.clone() {
-                (
-                    snapshot.0, snapshot.1, snapshot.2, snapshot.3, snapshot.4, snapshot.5,
-                )
-            } else {
-                (
-                    event_id,
-                    "unknown".to_string(),
-                    serde_json::Value::Null,
-                    None,
-                    None,
-                    None,
-                )
-            };
-
-        if let Some(mut effect) = self.effect_history.get_mut(&(event_id, handler_id.clone())) {
-            effect.status = "failed".to_string();
-            effect.error = Some(error.clone());
-            effect.attempts = attempts;
-            effect.last_attempted_at = Some(Utc::now());
-        }
-        let preserve_batch_terminal = error_type != "accumulate_timeout";
-
-        self.dead_letter_history.insert(
-            (event_id, handler_id.clone()),
-            StoredDeadLetter {
-                event_id,
-                handler_id: handler_id.clone(),
-                correlation_id,
-                event_type: event_type.clone(),
-                event_payload: event_payload.clone(),
-                error: error.clone(),
-                reason: error_type.clone(),
-                attempts,
-                failed_at: Utc::now(),
-                resolved_at: None,
-            },
-        );
-
-        let parent_hops = event_snapshot.map(|snapshot| snapshot.6).unwrap_or(0);
-        if emitted_events.is_empty() {
-            if !preserve_batch_terminal {
-                eprintln!(
-                    "Handler sent to DLQ without synthetic terminal event: {}:{} - {} (attempts: {})",
-                    event_id, handler_id, error, attempts
-                );
-                return Ok(());
-            }
-            if let (Some(batch_id), Some(batch_index), Some(batch_size)) =
-                (batch_id, batch_index, batch_size)
-            {
-                let synthetic_event_id = Uuid::new_v5(
-                    &NAMESPACE_SEESAW,
-                    format!("{}-{}-dlq-terminal", event_id, handler_id).as_bytes(),
-                );
-                self.publish(QueuedEvent {
-                    id: self.event_seq.fetch_add(1, Ordering::SeqCst),
-                    event_id: synthetic_event_id,
-                    parent_id: Some(event_id),
-                    correlation_id,
-                    event_type: event_type.clone(),
-                    payload: event_payload.clone(),
-                    hops: parent_hops + 1,
-                    retry_count: 0,
-                    batch_id: Some(batch_id),
-                    batch_index: Some(batch_index),
-                    batch_size: Some(batch_size),
-                    created_at: Utc::now(),
-                })
-                .await?;
-            }
-        } else {
-            for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
-                let synthetic_event_id = Uuid::new_v5(
-                    &NAMESPACE_SEESAW,
-                    format!(
-                        "{}-{}-dlq-terminal-{}-{}",
-                        event_id, handler_id, emitted.event_type, emitted_index
-                    )
-                    .as_bytes(),
-                );
-                self.publish(QueuedEvent {
-                    id: self.event_seq.fetch_add(1, Ordering::SeqCst),
-                    event_id: synthetic_event_id,
-                    parent_id: Some(event_id),
-                    correlation_id,
-                    event_type: emitted.event_type,
-                    payload: emitted.payload,
-                    hops: parent_hops + 1,
-                    retry_count: 0,
-                    batch_id: emitted.batch_id.or(if preserve_batch_terminal {
-                        batch_id
-                    } else {
-                        None
-                    }),
-                    batch_index: emitted.batch_index.or(if preserve_batch_terminal {
-                        batch_index
-                    } else {
-                        None
-                    }),
-                    batch_size: emitted.batch_size.or(if preserve_batch_terminal {
-                        batch_size
-                    } else {
-                        None
-                    }),
-                    created_at: Utc::now(),
-                })
-                .await?;
-            }
-        }
-
-        eprintln!(
-            "Handler sent to DLQ: {}:{} - {} (attempts: {})",
-            event_id, handler_id, error, attempts
-        );
-        Ok(())
-    }
-
-    async fn join_same_batch_append_and_maybe_claim(
-        &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        source_event_id: Uuid,
-        source_event_type: String,
-        source_payload: serde_json::Value,
-        source_created_at: DateTime<Utc>,
-        batch_id: Uuid,
-        batch_index: i32,
-        batch_size: i32,
-        join_window_timeout_seconds: Option<i32>,
-    ) -> Result<Option<Vec<JoinEntry>>> {
-        let key = (join_handler_id.clone(), correlation_id, batch_id);
-        let mut windows = self.join_windows.lock();
-        let window = windows.entry(key).or_insert_with(|| MemoryJoinWindow {
-            target_count: batch_size,
-            status: MemoryJoinStatus::Open,
-            source_event_ids: HashSet::new(),
-            entries_by_index: HashMap::new(),
-            expires_at: join_window_timeout_seconds
-                .map(|seconds| Utc::now() + Duration::seconds(seconds as i64)),
-        });
-
-        if window.status == MemoryJoinStatus::Completed {
-            return Ok(None);
-        }
-
-        if window.target_count != batch_size {
-            window.target_count = batch_size;
-        }
-        if window.expires_at.is_none() {
-            window.expires_at = join_window_timeout_seconds
-                .map(|seconds| Utc::now() + Duration::seconds(seconds as i64));
-        }
-
-        let already_seen_source = !window.source_event_ids.insert(source_event_id);
-        if !already_seen_source {
-            window
-                .entries_by_index
-                .entry(batch_index)
-                .or_insert_with(|| JoinEntry {
-                    source_event_id,
-                    event_type: source_event_type,
-                    payload: source_payload,
-                    batch_id,
-                    batch_index,
-                    batch_size,
-                    created_at: source_created_at,
-                });
-        }
-
-        let ready = window.entries_by_index.len() as i32 >= window.target_count;
-        if ready && window.status == MemoryJoinStatus::Open {
-            window.status = MemoryJoinStatus::Processing;
-            let mut ordered = window
-                .entries_by_index
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            ordered.sort_by_key(|entry| entry.batch_index);
-            return Ok(Some(ordered));
-        }
-
-        Ok(None)
-    }
-
-    async fn join_same_batch_complete(
-        &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        batch_id: Uuid,
-    ) -> Result<()> {
-        let key = (join_handler_id, correlation_id, batch_id);
-        if let Some(window) = self.join_windows.lock().get_mut(&key) {
-            window.status = MemoryJoinStatus::Completed;
-        }
-        self.join_windows.lock().remove(&key);
-        Ok(())
-    }
-
-    async fn join_same_batch_release(
-        &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        batch_id: Uuid,
-        _error: String,
-    ) -> Result<()> {
-        let key = (join_handler_id, correlation_id, batch_id);
-        if let Some(window) = self.join_windows.lock().get_mut(&key) {
-            if window.status == MemoryJoinStatus::Processing {
-                window.status = MemoryJoinStatus::Open;
-            }
-        }
-        Ok(())
-    }
-
-    async fn expire_same_batch_windows(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<ExpiredJoinWindow>> {
-        let mut windows = self.join_windows.lock();
-        let mut expired = Vec::new();
-        let mut expired_keys = Vec::new();
-
-        for (key, window) in windows.iter() {
-            if window.status != MemoryJoinStatus::Open {
-                continue;
-            }
-            let Some(expires_at) = window.expires_at else {
-                continue;
-            };
-            if expires_at > now {
-                continue;
-            }
-
-            let mut source_event_ids = window.source_event_ids.iter().copied().collect::<Vec<_>>();
-            source_event_ids.sort();
-            expired.push(ExpiredJoinWindow {
-                join_handler_id: key.0.clone(),
-                correlation_id: key.1,
-                batch_id: key.2,
-                source_event_ids,
-            });
-            expired_keys.push(key.clone());
-        }
-
-        for key in expired_keys {
-            windows.remove(&key);
-        }
-
-        Ok(expired)
-    }
-
-    async fn subscribe_workflow_events(
-        &self,
-        _correlation_id: Uuid,
-    ) -> Result<Box<dyn futures::Stream<Item = WorkflowEvent> + Send + Unpin>> {
-        // In-memory store doesn't support subscriptions
-        Err(anyhow!("Subscriptions not supported in memory store"))
-    }
-
-    async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<WorkflowStatus> {
-        // Check if any events or effects are pending
-        let has_events = self
-            .events
-            .get(&correlation_id)
-            .map(|q| !q.is_empty())
-            .unwrap_or(false);
-        let pending_effects = 0i64; // Simplified
-
-        Ok(WorkflowStatus {
-            correlation_id,
-            pending_effects,
-            is_settled: !has_events && pending_effects == 0,
-            last_event: None, // Could track this if needed
-        })
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -912,13 +237,11 @@ impl InsightStore for MemoryStore {
         cursor: Option<i64>,
         limit: usize,
     ) -> Result<Vec<InsightEvent>> {
-        // Get events from history with proper seq
         let mut events: Vec<_> = self
             .event_history
             .iter()
             .filter_map(|e| {
                 let stored = e.value();
-                // Filter by cursor if provided
                 if let Some(cursor_seq) = cursor {
                     if stored.seq <= cursor_seq {
                         return None;
@@ -947,7 +270,6 @@ impl InsightStore for MemoryStore {
             })
             .collect();
 
-        // Sort by seq (oldest first for consistent cursor pagination)
         events.sort_by_key(|e| e.seq);
         events.truncate(limit);
 
@@ -1186,301 +508,15 @@ impl MemoryStore {
     }
 }
 
-// ============================================================================
-// MemoryBackend - v0.11.0 Backend trait implementation
-// ============================================================================
-
-use seesaw_core::backend::{Backend, BackendServeConfig, DispatchedEvent};
-use seesaw_core::backend::capability::*;
-use seesaw_core::backend::job_executor::{self as job, HandlerStatus, JobExecutor};
-use seesaw_core::handler_runner::DirectRunner;
-use seesaw_core::runtime::event_worker::EventWorkerConfig;
-use seesaw_core::runtime::handler_worker::HandlerWorkerConfig;
-use tokio_util::sync::CancellationToken;
-
-/// In-memory implementation of Backend trait (v0.11.0).
-///
-/// Wraps MemoryStore internally and implements the new Backend interface.
-/// Suitable for development, testing, and demos. Not for production.
-#[derive(Clone)]
-pub struct MemoryBackend {
-    store: MemoryStore,
-}
-
-impl MemoryBackend {
-    /// Create new MemoryBackend.
-    pub fn new() -> Self {
-        Self {
-            store: MemoryStore::new(),
-        }
-    }
-}
-
-impl Default for MemoryBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Backend for MemoryBackend {
-    fn name(&self) -> &'static str {
-        "memory"
-    }
-
-    async fn publish(&self, event: DispatchedEvent) -> Result<()> {
-        let queued_event = QueuedEvent {
-            id: 0, // Will be assigned by MemoryStore
-            event_id: event.event_id,
-            parent_id: event.parent_id,
-            correlation_id: event.correlation_id,
-            event_type: event.event_type,
-            payload: event.payload,
-            hops: event.hops,
-            retry_count: event.retry_count,
-            batch_id: event.batch_id,
-            batch_index: event.batch_index,
-            batch_size: event.batch_size,
-            created_at: event.created_at,
-        };
-
-        self.store.publish(queued_event).await
-    }
-
-    async fn serve<D>(
-        &self,
-        _executor: Arc<JobExecutor<D>>,
-        _config: BackendServeConfig,
-        shutdown: CancellationToken,
-    ) -> Result<()>
-    where
-        D: Send + Sync + 'static,
-    {
-        // For MemoryBackend, we just wait for shutdown
-        // In a real implementation, you'd spawn workers like PostgresBackend
-        shutdown.cancelled().await;
-        Ok(())
-    }
-}
-
-// Implement capability traits
-
-#[async_trait]
-impl WorkflowStatusBackend for MemoryBackend {
-    async fn get_workflow_status(&self, correlation_id: Uuid) -> Result<seesaw_core::WorkflowStatus> {
-        self.store.get_workflow_status(correlation_id).await
-    }
-}
-
-#[async_trait]
-impl WorkflowSubscriptionBackend for MemoryBackend {
-    async fn subscribe_workflow_events(
-        &self,
-        correlation_id: Uuid,
-    ) -> Result<Box<dyn futures::Stream<Item = seesaw_core::WorkflowEvent> + Send + Unpin>> {
-        self.store.subscribe_workflow_events(correlation_id).await
-    }
-}
-
-#[async_trait]
-impl DeadLetterQueueBackend for MemoryBackend {
-    async fn list_dlq(&self, _filters: DlqFilters) -> Result<Vec<DeadLetter>> {
-        // TODO: Implement DLQ listing
-        Ok(Vec::new())
-    }
-
-    async fn retry_dlq(&self, _event_id: Uuid, _handler_id: String) -> Result<()> {
-        // TODO: Implement DLQ retry
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl InsightBackend for MemoryBackend {
-    async fn get_workflow_tree(
-        &self,
-        correlation_id: Uuid,
-    ) -> Result<seesaw_core::backend::capability::WorkflowTree> {
-        // TODO: Convert from MemoryStore tree format
-        Ok(seesaw_core::backend::capability::WorkflowTree {
-            correlation_id,
-            nodes: Vec::new(),
-        })
-    }
-
-    async fn get_insight_stats(&self) -> Result<seesaw_core::backend::capability::InsightStats> {
-        let stats = self.store.get_stats().await?;
-
-        // Convert from seesaw_core::InsightStats to backend::InsightStats
-        Ok(seesaw_core::backend::capability::InsightStats {
-            total_workflows: 0, // TODO: Track this
-            active_workflows: 0, // TODO: Track this
-            settled_workflows: 0, // TODO: Track this
-            total_events: stats.total_events as i64,
-            total_handlers_executed: stats.completed_effects as i64,
-            total_dlq_entries: stats.failed_effects as i64,
-        })
-    }
-}
-
-/// Convert JobExecutor's EventProcessingCommit to Store's EventProcessingCommit.
-fn convert_commit(commit: job::EventProcessingCommit) -> EventProcessingCommit {
-    EventProcessingCommit {
-        event_row_id: commit.event_row_id,
-        event_id: commit.event_id,
-        correlation_id: commit.correlation_id,
-        event_type: commit.event_type,
-        event_payload: commit.event_payload,
-        queued_effect_intents: commit.queued_effect_intents,
-        inline_effect_failures: commit
-            .inline_effect_failures
-            .into_iter()
-            .map(|f| InlineHandlerFailure {
-                handler_id: f.handler_id,
-                error: f.error,
-                reason: f.reason,
-                attempts: f.attempts,
-            })
-            .collect(),
-        emitted_events: commit.emitted_events,
-    }
-}
-
-#[async_trait]
-impl SettleableBackend for MemoryBackend {
-    async fn settle<D: Send + Sync + 'static>(
-        &self,
-        executor: &Arc<JobExecutor<D>>,
-        _correlation_id: Uuid,
-    ) -> Result<()> {
-        let event_config = EventWorkerConfig::default();
-        let handler_config = HandlerWorkerConfig::default();
-        let runner = DirectRunner;
-
-        loop {
-            let mut processed_any = false;
-
-            // Drain event queue
-            while let Some(event) = self.store.poll_next().await? {
-                processed_any = true;
-                match executor.execute_event(&event, &event_config, &runner).await {
-                    Ok(commit) => {
-                        let store_commit = convert_commit(commit);
-                        self.store.commit_event_processing(store_commit).await?;
-                    }
-                    Err(e) => {
-                        // DLQ the event and continue
-                        self.store
-                            .dlq_effect(
-                                event.event_id,
-                                "__settle_event_error__".to_string(),
-                                e.to_string(),
-                                "settle_error".to_string(),
-                                event.retry_count,
-                            )
-                            .await?;
-                        self.store.ack(event.id).await?;
-                    }
-                }
-            }
-
-            // Drain effect queue
-            while let Some(execution) = self.store.poll_next_effect().await? {
-                processed_any = true;
-                let event_id = execution.event_id;
-                let handler_id = execution.handler_id.clone();
-
-                match executor
-                    .execute_handler(execution, &handler_config, &runner)
-                    .await
-                {
-                    Ok(result) => match result.status {
-                        HandlerStatus::Success => {
-                            if result.emitted_events.is_empty() {
-                                self.store
-                                    .complete_effect(event_id, handler_id, result.result)
-                                    .await?;
-                            } else {
-                                self.store
-                                    .complete_effect_with_events(
-                                        event_id,
-                                        handler_id,
-                                        result.result,
-                                        result.emitted_events,
-                                    )
-                                    .await?;
-                            }
-                        }
-                        HandlerStatus::Failed { error, attempts } => {
-                            self.store
-                                .dlq_effect(
-                                    event_id,
-                                    handler_id,
-                                    error,
-                                    "failed".to_string(),
-                                    attempts,
-                                )
-                                .await?;
-                        }
-                        HandlerStatus::Retry { error, attempts } => {
-                            self.store
-                                .fail_effect(event_id, handler_id, error, attempts)
-                                .await?;
-                        }
-                        HandlerStatus::Timeout => {
-                            self.store
-                                .dlq_effect(
-                                    event_id,
-                                    handler_id,
-                                    "timeout".to_string(),
-                                    "timeout".to_string(),
-                                    0,
-                                )
-                                .await?;
-                        }
-                        HandlerStatus::JoinWaiting => {
-                            self.store
-                                .complete_effect(
-                                    event_id,
-                                    handler_id,
-                                    serde_json::json!({ "status": "join_waiting" }),
-                                )
-                                .await?;
-                        }
-                    },
-                    Err(e) => {
-                        self.store
-                            .dlq_effect(
-                                event_id,
-                                handler_id,
-                                e.to_string(),
-                                "settle_handler_error".to_string(),
-                                0,
-                            )
-                            .await?;
-                    }
-                }
-            }
-
-            if !processed_any {
-                break; // Settled!
-            }
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seesaw_core::store::Store;
 
     #[tokio::test]
     async fn test_insight_events_have_unique_seq() {
         let store = MemoryStore::new();
 
-        // Publish 3 events
+        // Record 3 events
         for i in 1..=3 {
             let event = QueuedEvent {
                 id: i as i64,
@@ -1496,7 +532,7 @@ mod tests {
                 batch_index: None,
                 batch_size: None,
             };
-            store.publish(event).await.unwrap();
+            store.record_event(&event);
         }
 
         // Get recent events - should have seq 1, 2, 3
@@ -1512,7 +548,7 @@ mod tests {
         let store = MemoryStore::new();
         let correlation_id = Uuid::new_v4();
 
-        // Publish 5 events
+        // Record 5 events
         for i in 1..=5 {
             let event = QueuedEvent {
                 id: i as i64,
@@ -1528,7 +564,7 @@ mod tests {
                 batch_index: None,
                 batch_size: None,
             };
-            store.publish(event).await.unwrap();
+            store.record_event(&event);
         }
 
         // Get first 2 events (no cursor)
@@ -1556,7 +592,7 @@ mod tests {
     async fn test_no_events_before_cursor() {
         let store = MemoryStore::new();
 
-        // Publish 3 events
+        // Record 3 events
         for i in 1..=3 {
             let event = QueuedEvent {
                 id: i as i64,
@@ -1572,7 +608,7 @@ mod tests {
                 batch_index: None,
                 batch_size: None,
             };
-            store.publish(event).await.unwrap();
+            store.record_event(&event);
         }
 
         // Request events after cursor=10 (beyond all events)
@@ -1591,199 +627,24 @@ mod tests {
         let event_id = Uuid::new_v4();
         let missing_parent = Uuid::new_v4();
 
-        store
-            .publish(QueuedEvent {
-                id: 1,
-                event_id,
-                parent_id: Some(missing_parent),
-                correlation_id,
-                event_type: "OrphanEvent".to_string(),
-                payload: serde_json::json!({"ok": true}),
-                created_at: Utc::now(),
-                hops: 1,
-                retry_count: 0,
-                batch_id: None,
-                batch_index: None,
-                batch_size: None,
-            })
-            .await
-            .unwrap();
+        store.record_event(&QueuedEvent {
+            id: 1,
+            event_id,
+            parent_id: Some(missing_parent),
+            correlation_id,
+            event_type: "OrphanEvent".to_string(),
+            payload: serde_json::json!({"ok": true}),
+            created_at: Utc::now(),
+            hops: 1,
+            retry_count: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+        });
 
         let tree = store.get_workflow_tree(correlation_id).await.unwrap();
         assert_eq!(tree.event_count, 1);
         assert_eq!(tree.roots.len(), 1);
         assert_eq!(tree.roots[0].event_id, event_id);
-    }
-
-    #[tokio::test]
-    async fn test_dlq_with_batch_metadata_publishes_synthetic_terminal_event() {
-        let store = MemoryStore::new();
-        let event_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
-        let batch_id = Uuid::new_v4();
-
-        store
-            .insert_effect_intent(
-                event_id,
-                "join_effect".to_string(),
-                correlation_id,
-                "BatchItemResult".to_string(),
-                serde_json::json!({ "index": 2, "ok": false }),
-                None,
-                Some(batch_id),
-                Some(2),
-                Some(5),
-                Utc::now(),
-                30,
-                1,
-                10,
-                None,
-            )
-            .await
-            .expect("insert should succeed");
-
-        store
-            .dlq_effect(
-                event_id,
-                "join_effect".to_string(),
-                "forced failure".to_string(),
-                "failed".to_string(),
-                1,
-            )
-            .await
-            .expect("dlq should succeed");
-
-        let synthetic = store.poll_next().await.expect("poll should succeed");
-        assert!(
-            synthetic.is_some(),
-            "synthetic terminal event should be published"
-        );
-        let synthetic = synthetic.unwrap();
-        assert_eq!(synthetic.correlation_id, correlation_id);
-        assert_eq!(synthetic.event_type, "BatchItemResult");
-        assert_eq!(synthetic.batch_id, Some(batch_id));
-        assert_eq!(synthetic.batch_index, Some(2));
-        assert_eq!(synthetic.batch_size, Some(5));
-    }
-
-    #[tokio::test]
-    async fn test_dlq_without_batch_metadata_does_not_publish_synthetic_terminal_event() {
-        let store = MemoryStore::new();
-        let event_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
-
-        store
-            .insert_effect_intent(
-                event_id,
-                "normal_effect".to_string(),
-                correlation_id,
-                "NormalEvent".to_string(),
-                serde_json::json!({ "ok": true }),
-                None,
-                None,
-                None,
-                None,
-                Utc::now(),
-                30,
-                1,
-                10,
-                None,
-            )
-            .await
-            .expect("insert should succeed");
-
-        store
-            .dlq_effect(
-                event_id,
-                "normal_effect".to_string(),
-                "forced failure".to_string(),
-                "failed".to_string(),
-                1,
-            )
-            .await
-            .expect("dlq should succeed");
-
-        let next = store.poll_next().await.expect("poll should succeed");
-        assert!(next.is_none(), "no synthetic terminal event expected");
-    }
-
-    #[tokio::test]
-    async fn test_accumulate_timeout_reason_does_not_publish_synthetic_terminal_event() {
-        let store = MemoryStore::new();
-        let event_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
-        let batch_id = Uuid::new_v4();
-
-        store
-            .insert_effect_intent(
-                event_id,
-                "join_effect".to_string(),
-                correlation_id,
-                "BatchItemResult".to_string(),
-                serde_json::json!({ "index": 2, "ok": false }),
-                None,
-                Some(batch_id),
-                Some(2),
-                Some(5),
-                Utc::now(),
-                30,
-                1,
-                10,
-                Some(1),
-            )
-            .await
-            .expect("insert should succeed");
-
-        store
-            .dlq_effect(
-                event_id,
-                "join_effect".to_string(),
-                "window timed out".to_string(),
-                "accumulate_timeout".to_string(),
-                1,
-            )
-            .await
-            .expect("dlq should succeed");
-
-        let next = store.poll_next().await.expect("poll should succeed");
-        assert!(
-            next.is_none(),
-            "accumulate_timeout should not publish synthetic terminal events"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_expire_same_batch_windows_removes_stale_window() {
-        let store = MemoryStore::new();
-        let correlation_id = Uuid::new_v4();
-        let batch_id = Uuid::new_v4();
-        let source_event_id = Uuid::new_v4();
-
-        let claimed = store
-            .join_same_batch_append_and_maybe_claim(
-                "bulk_insert".to_string(),
-                correlation_id,
-                source_event_id,
-                "RowValidated".to_string(),
-                serde_json::json!({ "row_id": source_event_id }),
-                Utc::now(),
-                batch_id,
-                0,
-                2,
-                Some(1),
-            )
-            .await
-            .expect("append should succeed");
-        assert!(claimed.is_none(), "window should remain open");
-
-        let expired = store
-            .expire_same_batch_windows(Utc::now() + Duration::seconds(2))
-            .await
-            .expect("expiry should succeed");
-        assert_eq!(expired.len(), 1, "one stale window should expire");
-        assert_eq!(expired[0].join_handler_id, "bulk_insert");
-        assert_eq!(expired[0].correlation_id, correlation_id);
-        assert_eq!(expired[0].batch_id, batch_id);
-        assert_eq!(expired[0].source_event_ids, vec![source_event_id]);
     }
 }

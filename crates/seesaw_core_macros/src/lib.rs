@@ -806,7 +806,7 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     if let Some(dlq_terminal) = &args.dlq_terminal {
         builder = quote! {
             #builder
-                .dlq_terminal(|__seesaw_source, __seesaw_info| {
+                .on_failure(|__seesaw_source: ::std::sync::Arc<_>, __seesaw_info| {
                     #dlq_terminal((__seesaw_source).as_ref().clone(), __seesaw_info)
                 })
         };
@@ -828,13 +828,13 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     if let Some(window_timeout_secs) = args.window_timeout_secs {
         builder = quote! {
             #builder
-                .window_timeout(::std::time::Duration::from_secs(#window_timeout_secs))
+                .window(::std::time::Duration::from_secs(#window_timeout_secs))
         };
     }
     if let Some(window_timeout_ms) = args.window_timeout_ms {
         builder = quote! {
             #builder
-                .window_timeout(::std::time::Duration::from_millis(#window_timeout_ms))
+                .window(::std::time::Duration::from_millis(#window_timeout_ms))
         };
     }
     if let Some(delay_secs) = args.delay_secs {
@@ -1077,9 +1077,9 @@ mod tests {
         );
         let configured_text = configured.to_string();
         assert!(
-            configured_text.contains(". window_timeout (")
+            configured_text.contains(". window (")
                 && configured_text.contains("Duration :: from_secs"),
-            "window_timeout builder call should be emitted, got: {}",
+            "window builder call should be emitted, got: {}",
             configured_text
         );
     }

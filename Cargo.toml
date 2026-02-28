@@ -2,17 +2,13 @@
 members = [
     "crates/seesaw",
     "crates/seesaw_core_macros",
-    "examples/simple-order",
-    "examples/http-fetcher",
-    "examples/ai-summarizer",
-    "examples/workflow-status",
-    "examples/insight-demo",
-    "examples/batch-processor",
     "crates/seesaw-postgres",
     "crates/seesaw-insight",
     "crates/seesaw-memory",
-    "crates/seesaw-kafka",
+    "examples/simple-order",
     "examples/es-order",
+    "examples/http-fetcher",
+    "examples/ai-summarizer",
 ]
 resolver = "2"
 

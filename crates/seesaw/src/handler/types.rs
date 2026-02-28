@@ -72,16 +72,6 @@ impl<E> From<Option<E>> for Emit<E> {
     }
 }
 
-impl<E> From<Vec<E>> for Emit<E> {
-    fn from(value: Vec<E>) -> Self {
-        match value.len() {
-            0 => Emit::None,
-            1 => Emit::One(value.into_iter().next().expect("len checked above")),
-            _ => Emit::Batch(value),
-        }
-    }
-}
-
 /// Join mode for queued batch fan-in effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinMode {
@@ -332,7 +322,7 @@ mod tests {
         let opt_none: Emit<i32> = Option::<i32>::None.into();
         assert_eq!(opt_none.into_vec().len(), 0);
 
-        let vec_emit: Emit<i32> = vec![1, 2, 3].into();
+        let vec_emit: Emit<i32> = Emit::Batch(vec![1, 2, 3]);
         assert_eq!(vec_emit.into_vec(), vec![1, 2, 3]);
     }
 

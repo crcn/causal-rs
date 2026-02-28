@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
 - **🔍 Observable**: Real-time visualization with Seesaw Insight
 - **🚀 Simple API**: Declarative macros or closure-based builder pattern
 - **📦 Event Sourcing**: Built-in EventStore with aggregates, optimistic concurrency, and schema evolution
-- **⏳ Settlement**: `engine.process(event).settled().await` drives the full causal tree to completion
+- **⏳ Settlement**: `engine.dispatch(event).settled().await` drives the full causal tree to completion
 
 ## Architecture
 
@@ -445,18 +445,18 @@ let engine = Engine::new(deps, MemoryBackend::new())
 engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
 
 // Synchronous settlement (returns after all handlers complete)
-let handle = engine.process(OrderEvent::Placed { order_id, total: 99.99 })
+let handle = engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 })
     .settled()
     .await?;
 ```
 
-`engine.process(event)` returns a `DispatchFuture` that supports:
-- `.settled()` - Wait for the full causal tree to settle
+`engine.dispatch(event)` returns a `DispatchFuture` that supports:
+- `.await` - Fire-and-forget (publish and return)
+- `.settled()` - Drive the full causal tree to completion (requires `SettleableBackend`)
+- `.wait(matcher)` - Wait for a terminal event (requires `WorkflowSubscriptionBackend`)
 - `.with_id(uuid)` - Set custom event ID for idempotency
 - `.with_workflow_id(uuid)` - Set correlation/workflow ID
 - `.with_parent(uuid)` - Set parent event for causation tracking
-- `.wait(matcher)` - Wait for a terminal event (requires `WorkflowSubscriptionBackend`)
-- Direct `.await` - Fire-and-forget (same as `dispatch()`)
 
 Settlement is available on any backend that implements `SettleableBackend`. The `MemoryBackend` implements this out of the box.
 
@@ -937,7 +937,7 @@ let engine = Engine::new(deps, backend);
 5. **Composition Over Inheritance**: Build complex workflows from simple handlers
 6. **Pluggable Backends**: Choose the right backend for your use case
 7. **Pluggable Execution**: The `HandlerRunner` trait wraps handler calls, enabling durable execution (Restate), dry-run testing, and tracing without changing user code
-8. **Settle on Demand**: `engine.process(event).settled().await` drives the full causal tree to completion synchronously
+8. **Settle on Demand**: `engine.dispatch(event).settled().await` drives the full causal tree to completion synchronously
 
 ## Testing
 

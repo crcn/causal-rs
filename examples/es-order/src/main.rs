@@ -2,17 +2,16 @@
 //!
 //! Shows both layers working together:
 //! - EventStore: permanent storage + state reconstruction
-//! - Engine: reactions via #[handler] system (unchanged)
+//! - Engine: reactions via handler system
 
 use anyhow::Result;
 use seesaw_core::es::*;
 use seesaw_core::{handler, Context, Engine};
 use seesaw_memory::event_store::MemoryEventStore;
-use seesaw_memory::MemoryBackend;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// ── Domain events ────────────────────────────────────────────────────────
+// -- Domain events --
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum OrderEvent {
@@ -23,7 +22,7 @@ enum OrderEvent {
 
 impl EventUpcast for OrderEvent {}
 
-// ── Aggregate (ES layer) ────────────────────────────────────────────────
+// -- Aggregate (ES layer) --
 
 #[derive(Debug, Default)]
 struct Order {
@@ -60,7 +59,7 @@ impl Aggregate for Order {
     }
 }
 
-// ── Dependencies ─────────────────────────────────────────────────────────
+// -- Dependencies --
 
 #[derive(Clone)]
 struct Deps;
@@ -77,15 +76,15 @@ impl Deps {
     }
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────
+// -- Main --
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // === ES layer: permanent event storage ===
     let event_store = MemoryEventStore::new();
 
-    // === Handler layer: reactions (UNCHANGED from existing seesaw usage) ===
-    let engine = Engine::new(Deps, MemoryBackend::new())
+    // === Handler layer: reactions ===
+    let engine = Engine::new(Deps)
         .with_handler(
             handler::on::<OrderEvent>()
                 .id("ship_order")
@@ -116,10 +115,15 @@ async fn main() -> Result<()> {
     // === Use both layers together ===
     let order_id = Uuid::new_v4();
 
-    // 1. Load current state (empty — brand new aggregate)
+    // 1. Load current state (empty -- brand new aggregate)
     let order: Versioned<Order> = event_store.aggregate(order_id).load().await?;
     assert_eq!(order.status, OrderStatus::Draft);
-    println!("Order {} loaded: {:?} (version {})", order_id, order.status, order.version());
+    println!(
+        "Order {} loaded: {:?} (version {})",
+        order_id,
+        order.status,
+        order.version()
+    );
 
     // 2. Append domain events to permanent store
     let events = vec![OrderEvent::Placed {
@@ -133,7 +137,7 @@ async fn main() -> Result<()> {
         .await?;
     println!("Appended events, new version: {}", new_version);
 
-    // 3. Dispatch to handler layer — triggers reactions
+    // 3. Dispatch to handler layer -- triggers reactions
     for event in &events {
         engine.dispatch(event.clone()).await?;
     }
@@ -142,7 +146,10 @@ async fn main() -> Result<()> {
     let order: Versioned<Order> = event_store.aggregate(order_id).load().await?;
     println!(
         "Order {} reconstructed: {:?}, total=${:.2} (version {})",
-        order_id, order.status, order.total, order.version()
+        order_id,
+        order.status,
+        order.total,
+        order.version()
     );
     assert_eq!(order.status, OrderStatus::Placed);
 
@@ -151,10 +158,7 @@ async fn main() -> Result<()> {
     let stale_version = 0; // pretend we loaded this earlier
     let result = event_store
         .aggregate::<Order>(order_id)
-        .append(
-            stale_version,
-            vec![OrderEvent::Shipped { order_id }],
-        )
+        .append(stale_version, vec![OrderEvent::Shipped { order_id }])
         .await;
 
     match result {
@@ -171,10 +175,7 @@ async fn main() -> Result<()> {
     // 6. Correct append with right version
     event_store
         .aggregate::<Order>(order_id)
-        .append(
-            new_version,
-            vec![OrderEvent::Shipped { order_id }],
-        )
+        .append(new_version, vec![OrderEvent::Shipped { order_id }])
         .await?;
 
     let final_order: Versioned<Order> = event_store.aggregate(order_id).load().await?;
