@@ -641,13 +641,16 @@ where
 
 // ── Transition guard builder ─────────────────────────────────────────────
 
-use crate::es::{Aggregate, EventStoreExt, HasEventStore};
+use crate::aggregator::Aggregate;
 
 /// Builder for handlers guarded by aggregate state transitions.
 ///
 /// Created by calling `.transition::<A>(guard)` after `.extract()` on a
 /// `HandlerBuilder`. The guard function receives `(&prev_state, &next_state)`
 /// and returns `true` to fire the handler.
+///
+/// Aggregate state is replayed using the engine's aggregator registry —
+/// no extra configuration needed on the guard.
 pub struct TransitionHandlerBuilder<E, A, G, Started> {
     inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
     extractor: Box<dyn Fn(&E) -> Option<uuid::Uuid> + Send + Sync>,
@@ -665,6 +668,7 @@ where
     /// state transitions in the way described by `guard(prev, next)`.
     ///
     /// The `.extract()` must return `Option<Uuid>` (the aggregate ID).
+    /// Aggregate state is replayed using the engine's aggregator registry.
     pub fn transition<A, G>(self, guard: G) -> TransitionHandlerBuilder<E, A, G, Started>
     where
         A: Aggregate,
@@ -706,12 +710,12 @@ where
 
     /// Set the handler that runs when the transition guard passes.
     ///
-    /// `D` must implement `HasEventStore` so the guard can load aggregate state.
+    /// The engine's aggregator registry provides live `(prev, next)` state.
     #[track_caller]
     #[allow(private_bounds)]
     pub fn then<D, H, Fut, R, O>(self, handler: H) -> Handler<D>
     where
-        D: HasEventStore + Send + Sync + 'static,
+        D: Send + Sync + 'static,
         Started: StartedHandler<D>,
         H: Fn(uuid::Uuid, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
@@ -745,30 +749,18 @@ where
                 match extractor(&typed) {
                     Some(aggregate_id) => {
                         Box::pin(async move {
-                            // Load aggregate at current version (next state)
-                            let es = ctx.deps().event_store();
-                            let next: crate::es::Versioned<A> =
-                                es.aggregate(aggregate_id).load().await?;
+                            let registry = ctx.aggregator_registry().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "transition guard requires aggregator registry on context"
+                                )
+                            })?;
 
-                            if next.version() == 0 {
-                                // No events yet — no transition possible
+                            let (prev, next) = registry.get_transition::<A>(aggregate_id);
+
+                            if !guard(&prev, &next) {
                                 return Ok(Vec::new());
                             }
 
-                            // Load at version - 1 (prev state)
-                            let prev: crate::es::Versioned<A> = if next.version() > 1 {
-                                es.aggregate(aggregate_id)
-                                    .load_at_version(next.version() - 1)
-                                    .await?
-                            } else {
-                                crate::es::Versioned::new(A::default(), 0)
-                            };
-
-                            if !guard(&prev.state, &next.state) {
-                                return Ok(Vec::new());
-                            }
-
-                            // Guard passed — call the handler
                             let result: R = handler(aggregate_id, ctx).await?;
                             let emit: Emit<O> = result.into();
                             Ok(emit_to_outputs(emit))

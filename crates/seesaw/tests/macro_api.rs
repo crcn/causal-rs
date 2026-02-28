@@ -1,7 +1,8 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{handle, handles, Context, Emit, ErrorContext};
+use seesaw_core::{aggregator, aggregators, handle, handles, Context, Emit, ErrorContext};
+use seesaw_core::{Aggregate, Apply};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -174,6 +175,72 @@ mod order_effects {
         Ok(Emit::None)
     }
 }
+
+// ── Aggregator macro tests ──────────────────────────────────────────────
+
+#[derive(Debug, Default, PartialEq, Clone)]
+enum TestOrderStatus {
+    #[default]
+    Draft,
+    Placed,
+    Shipped,
+}
+
+#[derive(Debug, Default, Clone)]
+struct TestOrder {
+    status: TestOrderStatus,
+    total: f64,
+}
+
+impl Aggregate for TestOrder {
+    fn aggregate_type() -> &'static str {
+        "TestOrder"
+    }
+}
+
+#[aggregators]
+mod order_aggregators {
+    use super::*;
+
+    #[aggregator(id = "order_id")]
+    fn on_placed(order: &mut TestOrder, event: OrderPlaced) {
+        order.status = TestOrderStatus::Placed;
+        order.total = 99.99;
+        let _ = event;
+    }
+
+    #[aggregator(id = "order_id")]
+    fn on_shipped(order: &mut TestOrder, event: OrderShipped) {
+        order.status = TestOrderStatus::Shipped;
+        let _ = event;
+    }
+}
+
+#[test]
+fn aggregators_module_produces_vec() {
+    let aggs = order_aggregators::aggregators();
+    assert_eq!(aggs.len(), 2);
+    assert_eq!(aggs[0].aggregate_type, "TestOrder");
+    assert_eq!(aggs[1].aggregate_type, "TestOrder");
+}
+
+#[test]
+fn aggregator_apply_trait_generated() {
+    let mut order = TestOrder::default();
+    assert_eq!(order.status, TestOrderStatus::Draft);
+
+    order.apply(OrderPlaced {
+        order_id: Uuid::nil(),
+    });
+    assert_eq!(order.status, TestOrderStatus::Placed);
+
+    order.apply(OrderShipped {
+        order_id: Uuid::nil(),
+    });
+    assert_eq!(order.status, TestOrderStatus::Shipped);
+}
+
+// ── Handler macro tests ────────────────────────────────────────────────
 
 #[test]
 fn effects_module_registration_works() {

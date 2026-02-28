@@ -1,7 +1,6 @@
 //! Core data types for seesaw event processing.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
@@ -126,28 +125,6 @@ pub struct ExpiredJoinWindow {
     pub correlation_id: Uuid,
     pub batch_id: Uuid,
     pub source_event_ids: Vec<Uuid>,
-}
-
-/// Event notification for workflow events.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WorkflowEvent {
-    pub event_id: Uuid,
-    pub correlation_id: Uuid,
-    pub event_type: String,
-    pub payload: serde_json::Value,
-}
-
-/// Workflow status for a correlation ID
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowStatus {
-    /// Correlation ID (workflow identifier)
-    pub correlation_id: Uuid,
-    /// Number of effects pending/executing
-    pub pending_effects: i64,
-    /// True when no effects are pending/executing (workflow is idle)
-    pub is_settled: bool,
-    /// Most recent event type
-    pub last_event: Option<String>,
 }
 
 /// Queued effect execution from store

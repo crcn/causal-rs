@@ -8,21 +8,16 @@ description = "A deterministic, event-driven coordination layer where machines d
 [features]
 default = ["macros"]
 macros = ["dep:seesaw_core_macros"]
-sqlx = ["dep:sqlx"]
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
-erased-serde.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
-pipedream.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-smallvec.workspace = true
-sqlx = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -32,6 +27,3 @@ seesaw_core_macros = { version = "0.12.2", path = "../seesaw_core_macros", optio
 [dev-dependencies]
 fastrand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-sqlx.workspace = true
-seesaw-postgres = { path = "../seesaw-postgres" }
-seesaw-memory = { path = "../seesaw-memory" }

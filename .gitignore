@@ -24,6 +24,12 @@ ehthumbs.db
 *.swn
 .fleet/
 
+# Test binaries
+test_emit*
+
+# Backup files
+*.backup
+
 # Environment
 .env
 .env.local

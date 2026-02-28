@@ -13,6 +13,8 @@ where
     D: Send + Sync + 'static,
 {
     effects: RwLock<Vec<Handler<D>>>,
+    /// Standalone codecs registered independently of handlers (e.g. from aggregators).
+    standalone_codecs: RwLock<Vec<Arc<EventCodec>>>,
 }
 
 impl<D> Default for HandlerRegistry<D>
@@ -20,7 +22,10 @@ where
     D: Send + Sync + 'static,
 {
     fn default() -> Self {
-        Self::new()
+        Self {
+            effects: RwLock::new(Vec::new()),
+            standalone_codecs: RwLock::new(Vec::new()),
+        }
     }
 }
 
@@ -32,7 +37,19 @@ where
     pub fn new() -> Self {
         Self {
             effects: RwLock::new(Vec::new()),
+            standalone_codecs: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Register a standalone event codec (e.g. for aggregator event types).
+    pub(crate) fn register_codec(&self, codec: Arc<EventCodec>) {
+        let codecs = self.standalone_codecs.read();
+        // Skip if already registered for this type
+        if codecs.iter().any(|c| c.type_id == codec.type_id) {
+            return;
+        }
+        drop(codecs);
+        self.standalone_codecs.write().push(codec);
     }
 
     /// Register an effect.
@@ -78,6 +95,11 @@ where
                 }
             }
         }
+        for codec in self.standalone_codecs.read().iter() {
+            if codec.event_type == event_type {
+                return Some(codec.clone());
+            }
+        }
         None
     }
 
@@ -91,6 +113,11 @@ where
                 if codec.type_id == type_id {
                     return Some(codec.clone());
                 }
+            }
+        }
+        for codec in self.standalone_codecs.read().iter() {
+            if codec.type_id == type_id {
+                return Some(codec.clone());
             }
         }
         None
@@ -166,7 +193,6 @@ mod tests {
         let counter_a = counter.clone();
         let counter_b = counter.clone();
 
-        // TODO: handler::group was removed in v0.11.0, register handlers individually
         registry.register(
             handler::on::<EventA>().id("test_a").then(move |_, _| {
                 let c = counter_a.clone();
@@ -186,7 +212,6 @@ mod tests {
             })
         );
 
-        // Two separate effects registered (handler::group removed in v0.11.0)
         assert_eq!(registry.effects.read().len(), 2);
 
         // Each can handle its respective event type

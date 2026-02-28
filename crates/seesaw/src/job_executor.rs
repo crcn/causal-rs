@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::aggregator::AggregatorRegistry;
 use crate::handler::{Context, DlqTerminalInfo, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::handler_runner::HandlerRunner;
@@ -28,6 +29,7 @@ where
 {
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
+    aggregator_registry: Arc<AggregatorRegistry>,
 }
 
 impl<D> JobExecutor<D>
@@ -35,8 +37,16 @@ where
     D: Send + Sync + 'static,
 {
     /// Create a new job executor.
-    pub fn new(deps: Arc<D>, effects: Arc<HandlerRegistry<D>>) -> Self {
-        Self { deps, effects }
+    pub fn new(
+        deps: Arc<D>,
+        effects: Arc<HandlerRegistry<D>>,
+        aggregator_registry: Arc<AggregatorRegistry>,
+    ) -> Self {
+        Self {
+            deps,
+            effects,
+            aggregator_registry,
+        }
     }
 
     /// Execute event processing (inline handlers + queue intents).
@@ -222,7 +232,8 @@ where
             execution.event_id,
             execution.parent_event_id,
             self.deps.clone(),
-        );
+        )
+        .with_aggregator_registry(self.aggregator_registry.clone());
 
         // 2. Handle join/accumulation (if configured)
         let join_claim = if effect.join_mode == Some(JoinMode::SameBatch) {
@@ -360,7 +371,8 @@ where
                 Uuid::nil(),
                 None,
                 self.deps.clone(),
-            );
+            )
+            .with_aggregator_registry(self.aggregator_registry.clone());
 
             effect
                 .call_started(ctx)
@@ -414,7 +426,8 @@ where
             source_event.event_id,
             source_event.parent_id,
             self.deps.clone(),
-        );
+        )
+        .with_aggregator_registry(self.aggregator_registry.clone());
 
         let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
         let drained = runner

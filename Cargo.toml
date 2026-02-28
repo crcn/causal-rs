@@ -2,11 +2,7 @@
 members = [
     "crates/seesaw",
     "crates/seesaw_core_macros",
-    "crates/seesaw-postgres",
-    "crates/seesaw-insight",
-    "crates/seesaw-memory",
     "examples/simple-order",
-    "examples/es-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
 ]
@@ -24,21 +20,14 @@ anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6.1"
-erased-serde = "0.4"
 futures = "0.3"
 parking_lot = "0.12"
-pipedream = { package = "pipedream-rs", version = "0.2.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-smallvec = "1.15"
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["sync", "rt", "time", "macros"] }
-tokio-util = "0.7"
 tracing = "0.1"
 uuid = { version = "1.20", features = ["v4", "v5", "serde"] }
-
-# Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"] }
 
 # Dev dependencies
 fastrand = "2.3"

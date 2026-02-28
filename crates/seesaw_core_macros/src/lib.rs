@@ -39,6 +39,56 @@ pub fn handlers(attr: TokenStream, item: TokenStream) -> TokenStream {
     handles(attr, item)
 }
 
+/// Marks a function as an aggregator — generates `impl Apply<E> for A` and an `Aggregator` factory.
+///
+/// The function signature must be `fn name(agg: &mut AggregateType, event: EventType)`.
+/// The `id` attribute parameter specifies the event field used as aggregate ID.
+///
+/// ```ignore
+/// #[aggregator(id = "order_id")]
+/// fn on_placed(order: &mut Order, event: OrderPlaced) {
+///     order.status = Status::Placed;
+///     order.total = event.total;
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let metas = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    match expand_aggregator(&metas, input_fn) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Collects `#[aggregator]` functions in a module into a `fn aggregators() -> Vec<Aggregator>`.
+///
+/// ```ignore
+/// #[aggregators]
+/// mod order_aggregators {
+///     #[aggregator(id = "order_id")]
+///     fn on_placed(order: &mut Order, event: OrderPlaced) {
+///         order.status = Status::Placed;
+///     }
+///
+///     #[aggregator(id = "order_id")]
+///     fn on_shipped(order: &mut Order, event: OrderShipped) {
+///         order.status = Status::Shipped;
+///     }
+/// }
+///
+/// // Usage: engine.with_aggregators(order_aggregators::aggregators())
+/// ```
+#[proc_macro_attribute]
+pub fn aggregators(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut module = parse_macro_input!(item as ItemMod);
+    match expand_aggregators_module(&mut module) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 #[derive(Clone)]
 enum OnSpec {
     EventType(Path),
@@ -1260,4 +1310,161 @@ fn type_contains_lock(ty: &Type) -> bool {
         }
         _ => false,
     }
+}
+
+// ── Aggregator macros ────────────────────────────────────────────────────
+
+/// Parse the `id` attribute from `#[aggregator(id = "field_name")]`.
+fn parse_aggregator_id_field(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<Ident> {
+    for meta in metas {
+        if let Meta::NameValue(nv) = meta {
+            if nv.path.is_ident("id") {
+                if let Expr::Lit(expr_lit) = &nv.value {
+                    if let Lit::Str(lit_str) = &expr_lit.lit {
+                        return Ok(Ident::new(&lit_str.value(), lit_str.span()));
+                    }
+                }
+                return Err(syn::Error::new_spanned(
+                    &nv.value,
+                    "expected string literal for `id`, e.g. id = \"order_id\"",
+                ));
+            }
+        }
+    }
+    Err(syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "#[aggregator] requires `id = \"field_name\"` to specify the aggregate ID field on the event",
+    ))
+}
+
+/// Extract `(&mut AggregateType, EventType)` from function signature.
+fn parse_aggregator_params(sig: &Signature) -> syn::Result<(Type, Ident, Type, Ident)> {
+    let params: Vec<_> = sig.inputs.iter().collect();
+    if params.len() != 2 {
+        return Err(syn::Error::new_spanned(
+            &sig.inputs,
+            "#[aggregator] function must have exactly 2 parameters: (agg: &mut Aggregate, event: Event)",
+        ));
+    }
+
+    // First param: &mut AggregateType
+    let (agg_ty, agg_ident) = match &params[0] {
+        FnArg::Typed(pat_type) => {
+            let ident = match pat_type.pat.as_ref() {
+                Pat::Ident(pat_ident) => pat_ident.ident.clone(),
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &pat_type.pat,
+                        "expected a simple identifier for aggregate parameter",
+                    ))
+                }
+            };
+            match pat_type.ty.as_ref() {
+                Type::Reference(type_ref) if type_ref.mutability.is_some() => {
+                    (type_ref.elem.as_ref().clone(), ident)
+                }
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &pat_type.ty,
+                        "first parameter must be `&mut AggregateType`",
+                    ))
+                }
+            }
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                params[0],
+                "first parameter must be a typed parameter",
+            ))
+        }
+    };
+
+    // Second param: EventType
+    let (event_ty, event_ident) = match &params[1] {
+        FnArg::Typed(pat_type) => {
+            let ident = match pat_type.pat.as_ref() {
+                Pat::Ident(pat_ident) => pat_ident.ident.clone(),
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &pat_type.pat,
+                        "expected a simple identifier for event parameter",
+                    ))
+                }
+            };
+            (pat_type.ty.as_ref().clone(), ident)
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                params[1],
+                "second parameter must be a typed parameter",
+            ))
+        }
+    };
+
+    Ok((agg_ty, agg_ident, event_ty, event_ident))
+}
+
+/// Expand `#[aggregator(id = "field")]` on a function.
+fn expand_aggregator(
+    metas: &Punctuated<Meta, Token![,]>,
+    input_fn: ItemFn,
+) -> syn::Result<TokenStream2> {
+    let id_field = parse_aggregator_id_field(metas)?;
+    let (agg_ty, agg_ident, event_ty, event_ident) = parse_aggregator_params(&input_fn.sig)?;
+    let fn_name = &input_fn.sig.ident;
+    let body = &input_fn.block;
+    let factory_name = format_ident!("__seesaw_aggregator_{}", fn_name);
+
+    Ok(quote! {
+        impl ::seesaw_core::Apply<#event_ty> for #agg_ty {
+            fn apply(&mut self, #event_ident: #event_ty) {
+                let #agg_ident = self;
+                #body
+            }
+        }
+
+        fn #factory_name() -> ::seesaw_core::Aggregator {
+            ::seesaw_core::Aggregator::new::<#event_ty, #agg_ty, _>(|e| e.#id_field)
+        }
+    })
+}
+
+/// Expand `#[aggregators]` on a module.
+fn expand_aggregators_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
+    let Some((_, items)) = &mut module.content else {
+        return Err(syn::Error::new_spanned(
+            module,
+            "#[aggregators] requires an inline module",
+        ));
+    };
+
+    let mut factory_names = Vec::new();
+
+    for item in items.iter() {
+        let Item::Fn(item_fn) = item else {
+            continue;
+        };
+        if !has_attr_any(&item_fn.attrs, &["aggregator"]) {
+            continue;
+        }
+
+        let factory_name = format_ident!("__seesaw_aggregator_{}", item_fn.sig.ident);
+        factory_names.push(factory_name);
+    }
+
+    if factory_names.is_empty() {
+        return Err(syn::Error::new_spanned(
+            module,
+            "#[aggregators] module must contain at least one #[aggregator] function",
+        ));
+    }
+
+    let aggregators_fn: ItemFn = parse_quote! {
+        pub fn aggregators() -> ::std::vec::Vec<::seesaw_core::Aggregator> {
+            ::std::vec![#(#factory_names()),*]
+        }
+    };
+    items.push(Item::Fn(aggregators_fn));
+
+    Ok(quote! { #module })
 }

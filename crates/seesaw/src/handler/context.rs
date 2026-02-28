@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+use crate::aggregator::AggregatorRegistry;
+
 /// Trait for handler context types.
 ///
 /// This trait allows different backend implementations to provide
@@ -50,6 +52,8 @@ where
     /// Parent event ID for causal tracking.
     pub parent_event_id: Option<Uuid>,
     pub(crate) deps: Arc<D>,
+    /// Aggregator registry for transition guard replay.
+    pub(crate) aggregator_registry: Option<Arc<AggregatorRegistry>>,
 }
 
 impl<D> Clone for Context<D>
@@ -64,6 +68,7 @@ where
             event_id: self.event_id,
             parent_event_id: self.parent_event_id,
             deps: self.deps.clone(),
+            aggregator_registry: self.aggregator_registry.clone(),
         }
     }
 }
@@ -87,7 +92,22 @@ where
             event_id,
             parent_event_id,
             deps,
+            aggregator_registry: None,
         }
+    }
+
+    /// Attach an aggregator registry (used by the engine for transition guards).
+    pub(crate) fn with_aggregator_registry(
+        mut self,
+        registry: Arc<AggregatorRegistry>,
+    ) -> Self {
+        self.aggregator_registry = Some(registry);
+        self
+    }
+
+    /// Get the aggregator registry (if set).
+    pub fn aggregator_registry(&self) -> Option<&AggregatorRegistry> {
+        self.aggregator_registry.as_deref()
     }
 
     /// Get the handler ID (human-readable identifier).
