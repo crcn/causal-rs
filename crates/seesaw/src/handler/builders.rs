@@ -110,7 +110,10 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
 }
 
 /// Create an effect that handles a specific event type.
-pub fn on<E: Send + Sync + 'static>() -> HandlerBuilder<Typed<E>, NoFilter, NoStarted> {
+pub fn on<E>() -> HandlerBuilder<Typed<E>, NoFilter, NoStarted>
+where
+    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+{
     HandlerBuilder {
         filter: NoFilter,
         started: NoStarted,
@@ -121,7 +124,7 @@ pub fn on<E: Send + Sync + 'static>() -> HandlerBuilder<Typed<E>, NoFilter, NoSt
         join_window: None,
         max_attempts: 1,
         priority: None,
-        codec: None,
+        codec: Some(typed_event_codec::<E>()),
         dlq_terminal_mapper: None,
         _marker: PhantomData,
     }
