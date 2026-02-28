@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::context::Context;
-use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Emit, EventOutput, Handler, JoinMode};
+use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Handler, JoinMode};
 use crate::event_codec::EventCodec;
 
 #[track_caller]
@@ -21,17 +21,6 @@ fn default_effect_id(prefix: &str) -> String {
         location.line(),
         location.column()
     )
-}
-
-fn emit_to_outputs<E: Send + Sync + 'static>(emit: Emit<E>) -> Vec<EventOutput> {
-    if TypeId::of::<E>() == TypeId::of::<()>() {
-        return Vec::new();
-    }
-
-    emit.into_vec()
-        .into_iter()
-        .map(EventOutput::new)
-        .collect::<Vec<_>>()
 }
 
 /// Marker for typed event effects (`on::<E>()`).
@@ -65,11 +54,6 @@ where
         decode: Arc::new(|payload| {
             let event: E = serde_json::from_value(payload.clone())?;
             Ok(Arc::new(event))
-        }),
-        encode: Arc::new(|event_any| {
-            event_any
-                .downcast_ref::<E>()
-                .and_then(|event| serde_json::to_value(event).ok())
         }),
     })
 }
@@ -359,17 +343,15 @@ where
         self
     }
 
-    /// Set the handler for joined batch execution.
+    /// Set the handler for joined batch execution. Return `emit![]` from the handler.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<D, H, Fut, R, O>(mut self, handler: H) -> Handler<D>
+    pub fn then<D, H, Fut>(mut self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
         Started: StartedHandler<D>,
         H: Fn(Vec<E>, Context<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
-        R: Into<Emit<O>> + Send + 'static,
-        O: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+        Fut: Future<Output = Result<Events>> + Send + 'static,
     {
         let target = TypeId::of::<E>();
         let id = self
@@ -383,17 +365,10 @@ where
             .codec
             .take()
             .unwrap_or_else(typed_event_codec::<E>);
-        let output_codec = typed_event_codec::<O>();
-
-        let mut codecs = vec![input_codec];
-        // Register output codec if it differs from the input
-        if TypeId::of::<O>() != TypeId::of::<E>() && TypeId::of::<O>() != TypeId::of::<()>() {
-            codecs.push(output_codec);
-        }
 
         Handler {
             id,
-            codecs,
+            codecs: vec![input_codec],
             can_handle: Arc::new(move |t| t == target),
             started: self.inner.started.into_started(),
             handler: Arc::new(move |_, _, _| Box::pin(async { Ok(Vec::new()) })),
@@ -411,9 +386,8 @@ where
 
                 let fut = handler(typed, ctx);
                 Box::pin(async move {
-                    let output: R = fut.await?;
-                    let emit: Emit<O> = output.into();
-                    Ok(emit_to_outputs(emit))
+                    let events: Events = fut.await?;
+                    Ok(events.into_outputs())
                 })
             })),
             join_window_timeout: self.inner.join_window,
@@ -501,19 +475,17 @@ impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
 {
-    /// Set the handler that returns the next event (terminal operation).
+    /// Set the handler (terminal operation). Return `emit![]` from the handler.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<D, T, H, Fut, R, O>(self, handler: H) -> Handler<D>
+    pub fn then<D, T, H, Fut>(self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
         T: Clone + Send + 'static,
         Filter: Extractor<E, T>,
         Started: StartedHandler<D>,
         H: Fn(T, Context<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
-        R: Into<Emit<O>> + Send + 'static,
-        O: Send + Sync + 'static,
+        Fut: Future<Output = Result<Events>> + Send + 'static,
     {
         let target = TypeId::of::<E>();
         let filter = self.filter;
@@ -537,9 +509,8 @@ where
                     Some(extracted) => {
                         let fut = handler(extracted, ctx);
                         Box::pin(async move {
-                            let output: R = fut.await?;
-                            let emit: Emit<O> = output.into();
-                            Ok(emit_to_outputs(emit))
+                            let events: Events = fut.await?;
+                            Ok(events.into_outputs())
                         })
                     }
                     None => Box::pin(async { Ok(Vec::new()) }),
@@ -559,13 +530,13 @@ where
 }
 
 impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
-    /// Set the handler for observing all events.
+    /// Set the handler for observing all events. Return `emit![]` from the handler.
     #[track_caller]
     pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
         H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        Fut: Future<Output = Result<Events>> + Send + 'static,
     {
         let id = self.id.unwrap_or_else(|| default_effect_id("effect_any"));
 
@@ -578,8 +549,8 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
                 let event = AnyEvent { value, type_id };
                 let fut = handler(event, ctx);
                 Box::pin(async move {
-                    fut.await?;
-                    Ok(Vec::new())
+                    let events: Events = fut.await?;
+                    Ok(events.into_outputs())
                 })
             }),
             join_mode: None,
@@ -601,12 +572,12 @@ where
     St: Fn(Context<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
-    /// Set the handler for observing all events with started hook.
+    /// Set the handler for observing all events with started hook. Return `emit![]`.
     #[track_caller]
     pub fn then<H, Fut>(self, handler: H) -> Handler<D>
     where
         H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        Fut: Future<Output = Result<Events>> + Send + 'static,
     {
         let id = self
             .id
@@ -622,8 +593,8 @@ where
                 let event = AnyEvent { value, type_id };
                 let fut = handler(event, ctx);
                 Box::pin(async move {
-                    fut.await?;
-                    Ok(Vec::new())
+                    let events: Events = fut.await?;
+                    Ok(events.into_outputs())
                 })
             }),
             join_mode: None,
@@ -708,19 +679,15 @@ where
         self
     }
 
-    /// Set the handler that runs when the transition guard passes.
-    ///
-    /// The engine's aggregator registry provides live `(prev, next)` state.
+    /// Set the handler that runs when the transition guard passes. Return `emit![]`.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<D, H, Fut, R, O>(self, handler: H) -> Handler<D>
+    pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
     where
         D: Send + Sync + 'static,
         Started: StartedHandler<D>,
         H: Fn(uuid::Uuid, Context<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
-        R: Into<Emit<O>> + Send + 'static,
-        O: Send + Sync + 'static,
+        Fut: Future<Output = Result<Events>> + Send + 'static,
     {
         let target = TypeId::of::<E>();
         let extractor: Arc<dyn Fn(&E) -> Option<uuid::Uuid> + Send + Sync> =
@@ -766,9 +733,8 @@ where
                                 return Ok(Vec::new());
                             }
 
-                            let result: R = handler(aggregate_id, ctx).await?;
-                            let emit: Emit<O> = result.into();
-                            Ok(emit_to_outputs(emit))
+                            let events: Events = handler(aggregate_id, ctx).await?;
+                            Ok(events.into_outputs())
                         })
                     }
                     None => Box::pin(async { Ok(Vec::new()) }),
@@ -805,7 +771,9 @@ mod tests {
         let effect = on::<QueueEvent>()
             .id("filter_probe")
             .filter(|event| event.value > 0)
-            .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move { Ok(()) });
+            .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move {
+                Ok(crate::emit![])
+            });
 
         assert!(
             effect.is_inline(),

@@ -153,11 +153,20 @@ struct ParamInfo {
     ty: Type,
 }
 
+/// Generate the expression that converts `__result` into `Events`.
+fn result_to_events(kind: &ReturnKind) -> TokenStream2 {
+    match kind {
+        ReturnKind::Unit => quote! { ::seesaw_core::Events::new() },
+        ReturnKind::Events => quote! { __result },
+        ReturnKind::Emit => quote! { ::seesaw_core::IntoEvents::into_events(__result) },
+        ReturnKind::SingleEvent => quote! { ::seesaw_core::Events::new().add(__result) },
+    }
+}
+
 fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result<TokenStream2> {
     let args = args?;
     let fn_ident = input_fn.sig.ident.clone();
     let wrapper_ident = format_ident!("__seesaw_effect_{}", fn_ident);
-    let output_event_ty = effect_output_event_type(&input_fn.sig)?;
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -171,6 +180,9 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             "#[handler] does not support generic functions",
         ));
     }
+
+    let return_kind = classify_return(&input_fn.sig)?;
+    let convert_result = result_to_events(&return_kind);
 
     if args.timeout_secs.is_some() && args.timeout_ms.is_some() {
         return Err(syn::Error::new(
@@ -285,7 +297,10 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             #builder
                 #extract_call
                 .transition::<#aggregate_ty, _>(#transition_closure)
-                .then::<#deps_ty, _, _, _, #output_event_ty>(|#param_ident, __seesaw_ctx| #fn_ident(#param_ident, __seesaw_ctx))
+                .then::<#deps_ty, _, _>(|#param_ident, __seesaw_ctx| async move {
+                    let __result = #fn_ident(#param_ident, __seesaw_ctx).await?;
+                    Ok(#convert_result)
+                })
         }
     } else if is_accumulate {
         if !args.extract.is_empty() {
@@ -326,7 +341,10 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         quote! {
             #builder
                 .accumulate()
-                .then::<#deps_ty, _, _, _, #output_event_ty>(|#batch_ident, __seesaw_ctx| #fn_ident(#batch_ident, __seesaw_ctx))
+                .then::<#deps_ty, _, _>(|#batch_ident, __seesaw_ctx| async move {
+                    let __result = #fn_ident(#batch_ident, __seesaw_ctx).await?;
+                    Ok(#convert_result)
+                })
         }
     } else if !args.extract.is_empty() {
         if non_ctx_params.len() != args.extract.len() {
@@ -392,14 +410,20 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             quote! {
                 #builder
                     #extract_call
-                    .then::<#deps_ty, #extracted_ty, _, _, _, #output_event_ty>(|#field, __seesaw_ctx| #fn_ident(#field, __seesaw_ctx))
+                    .then::<#deps_ty, #extracted_ty, _, _>(|#field, __seesaw_ctx| async move {
+                        let __result = #fn_ident(#field, __seesaw_ctx).await?;
+                        Ok(#convert_result)
+                    })
             }
         } else {
             let extracted_tys: Vec<&Type> = non_ctx_params.iter().map(|param| &param.ty).collect();
             quote! {
                 #builder
                     #extract_call
-                    .then::<#deps_ty, (#(#extracted_tys),*), _, _, _, #output_event_ty>(|(#(#fields),*), __seesaw_ctx| #fn_ident(#(#fields),*, __seesaw_ctx))
+                    .then::<#deps_ty, (#(#extracted_tys),*), _, _>(|(#(#fields),*), __seesaw_ctx| async move {
+                        let __result = #fn_ident(#(#fields),*, __seesaw_ctx).await?;
+                        Ok(#convert_result)
+                    })
             }
         }
     } else {
@@ -427,7 +451,10 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         let event_ident = &event_param.ident;
         quote! {
             #builder
-                .then::<#deps_ty, ::std::sync::Arc<#on_event_type>, _, _, _, #output_event_ty>(|#event_ident, __seesaw_ctx| #fn_ident((#event_ident).as_ref().clone(), __seesaw_ctx))
+                .then::<#deps_ty, ::std::sync::Arc<#on_event_type>, _, _>(|#event_ident, __seesaw_ctx| async move {
+                    let __result = #fn_ident((#event_ident).as_ref().clone(), __seesaw_ctx).await?;
+                    Ok(#convert_result)
+                })
         }
     };
 
@@ -977,77 +1004,66 @@ fn ensure_unset<T>(existing: &Option<T>, meta: &MetaNameValue, name: &str) -> sy
     Ok(())
 }
 
-fn effect_output_event_type(sig: &Signature) -> syn::Result<Type> {
+/// Classify the handler return type to generate appropriate Events conversion code.
+enum ReturnKind {
+    /// `Result<()>` — empty events
+    Unit,
+    /// `Result<Events>` — pass-through
+    Events,
+    /// `Result<Emit<T>>` — legacy emit, use IntoEvents
+    Emit,
+    /// `Result<T>` — single event, wrap with Events::new().add()
+    SingleEvent,
+}
+
+fn classify_return(sig: &Signature) -> syn::Result<ReturnKind> {
     let ReturnType::Type(_, output_ty) = &sig.output else {
-        return Err(syn::Error::new_spanned(
-            &sig.output,
-            "#[handler] must return Result<T>",
-        ));
+        return Ok(ReturnKind::Unit);
     };
 
-    let result_ok_ty = result_ok_type(output_ty)?;
-    if let Some(emit_inner) = emit_inner_type(&result_ok_ty) {
-        Ok(emit_inner)
-    } else {
-        Ok(result_ok_ty)
+    let ok_ty = result_ok_type(output_ty)?;
+
+    // Check for ()
+    if let Type::Tuple(t) = &ok_ty {
+        if t.elems.is_empty() {
+            return Ok(ReturnKind::Unit);
+        }
     }
+
+    // Check for named types: Events or Emit<T>
+    if let Type::Path(type_path) = &ok_ty {
+        if let Some(last) = type_path.path.segments.last() {
+            if last.ident == "Events" {
+                return Ok(ReturnKind::Events);
+            }
+            if last.ident == "Emit" {
+                return Ok(ReturnKind::Emit);
+            }
+        }
+    }
+
+    Ok(ReturnKind::SingleEvent)
 }
 
 fn result_ok_type(ty: &Type) -> syn::Result<Type> {
     let Type::Path(type_path) = ty else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
+        return Err(syn::Error::new_spanned(ty, "expected return type Result<T>"));
     };
     let Some(last) = type_path.path.segments.last() else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
+        return Err(syn::Error::new_spanned(ty, "expected return type Result<T>"));
     };
     if last.ident != "Result" {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
+        return Err(syn::Error::new_spanned(ty, "expected return type Result<T>"));
     }
-
     let PathArguments::AngleBracketed(args) = &last.arguments else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "expected return type Result<T>",
-        ));
+        return Err(syn::Error::new_spanned(ty, "expected return type Result<T>"));
     };
     for arg in &args.args {
         if let GenericArgument::Type(inner) = arg {
             return Ok(inner.clone());
         }
     }
-
-    Err(syn::Error::new_spanned(
-        ty,
-        "expected return type Result<T>",
-    ))
-}
-
-fn emit_inner_type(ty: &Type) -> Option<Type> {
-    let Type::Path(type_path) = ty else {
-        return None;
-    };
-    let last = type_path.path.segments.last()?;
-    if last.ident != "Emit" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &last.arguments else {
-        return None;
-    };
-    for arg in &args.args {
-        if let GenericArgument::Type(inner) = arg {
-            return Some(inner.clone());
-        }
-    }
-    None
+    Err(syn::Error::new_spanned(ty, "expected return type Result<T>"))
 }
 
 #[cfg(test)]

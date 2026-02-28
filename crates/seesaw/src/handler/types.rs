@@ -87,15 +87,107 @@ pub struct EventOutput {
     pub event_type: String,
     /// The type-erased event value.
     pub value: Arc<dyn Any + Send + Sync>,
+    /// Serializer captured at emit-time (avoids codec registry lookup).
+    pub(crate) encode: Arc<dyn Fn(&dyn Any) -> Option<serde_json::Value> + Send + Sync>,
 }
 
 impl EventOutput {
     /// Create a new EventOutput from a typed event.
-    pub fn new<E: Send + Sync + 'static>(event: E) -> Self {
+    pub fn new<E: Send + Sync + serde::Serialize + 'static>(event: E) -> Self {
         Self {
             type_id: TypeId::of::<E>(),
             event_type: std::any::type_name::<E>().to_string(),
             value: Arc::new(event),
+            encode: Arc::new(|any| {
+                any.downcast_ref::<E>()
+                    .and_then(|e| serde_json::to_value(e).ok())
+            }),
+        }
+    }
+}
+
+/// The universal return type for all handlers.
+///
+/// Use the [`emit!`](crate::emit) macro:
+///
+/// ```ignore
+/// // Single event
+/// Ok(emit![OrderShipped { order_id }])
+///
+/// // Multiple heterogeneous events
+/// Ok(emit![ScrapeEvent { data }, LifecycleEvent::PhaseCompleted])
+///
+/// // Fan-out batch
+/// Ok(emit![..items])
+///
+/// // Nothing
+/// Ok(emit![])
+/// ```
+#[derive(Clone, Default)]
+pub struct Events {
+    pub(crate) outputs: Vec<EventOutput>,
+}
+
+impl Events {
+    /// Create an empty event collection.
+    pub fn new() -> Self {
+        Self {
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Add a single event to the collection.
+    pub fn add<E: Send + Sync + serde::Serialize + 'static>(mut self, event: E) -> Self {
+        self.outputs.push(EventOutput::new(event));
+        self
+    }
+
+    /// Add all items from an iterator as individual events (fan-out).
+    pub fn batch<E: Send + Sync + serde::Serialize + 'static>(items: impl IntoIterator<Item = E>) -> Self {
+        Self {
+            outputs: items.into_iter().map(EventOutput::new).collect(),
+        }
+    }
+
+    /// Convert into the internal `Vec<EventOutput>`.
+    pub fn into_outputs(self) -> Vec<EventOutput> {
+        self.outputs
+    }
+}
+
+/// Trait for converting handler return values into [`Events`].
+///
+/// The blanket impl converts any `T: Send + Sync + 'static` into a single-event `Events`.
+/// Specialized impls exist for `Events` (pass-through), `()` (empty), `Emit<T>` (legacy).
+///
+/// Used by the proc macro to wrap user function return values.
+pub trait IntoEvents {
+    fn into_events(self) -> Events;
+}
+
+impl IntoEvents for Events {
+    fn into_events(self) -> Events {
+        self
+    }
+}
+
+impl IntoEvents for () {
+    fn into_events(self) -> Events {
+        Events::new()
+    }
+}
+
+impl<E: Send + Sync + serde::Serialize + 'static> IntoEvents for Emit<E> {
+    fn into_events(self) -> Events {
+        if TypeId::of::<E>() == TypeId::of::<()>() {
+            return Events::new();
+        }
+        Events {
+            outputs: self
+                .into_vec()
+                .into_iter()
+                .map(EventOutput::new)
+                .collect(),
         }
     }
 }

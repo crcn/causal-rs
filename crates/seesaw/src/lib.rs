@@ -53,9 +53,37 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 // Re-export main types
 pub use engine::Engine;
 pub use handler::{
-    AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Handler, HandlerContext, HandlerError,
-    JoinMode,
+    AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Events, Handler, HandlerContext,
+    HandlerError, IntoEvents, JoinMode,
 };
+
+/// The universal return macro for all handlers.
+///
+/// ```ignore
+/// // Nothing — no events emitted
+/// Ok(emit![])
+///
+/// // Single event
+/// Ok(emit![OrderShipped { order_id }])
+///
+/// // Multiple heterogeneous events
+/// Ok(emit![ScrapeEvent { data }, LifecycleEvent::PhaseCompleted])
+///
+/// // Fan-out batch (each element becomes a separate event with batch metadata)
+/// Ok(emit![..items])
+/// ```
+#[macro_export]
+macro_rules! emit {
+    () => {
+        $crate::Events::new()
+    };
+    (.. $spread:expr) => {
+        $crate::Events::batch($spread)
+    };
+    ($($event:expr),+ $(,)?) => {
+        $crate::Events::new()$(.add($event))+
+    };
+}
 pub use runtime::{DirectRuntime, Runtime};
 pub use insight::{InsightEvent, StreamType};
 pub use job_executor::{

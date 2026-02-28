@@ -11,5 +11,4 @@ pub(crate) struct EventCodec {
     pub decode: Arc<
         dyn Fn(&serde_json::Value) -> Result<Arc<dyn Any + Send + Sync>> + Send + Sync + 'static,
     >,
-    pub encode: Arc<dyn Fn(&dyn Any) -> Option<serde_json::Value> + Send + Sync + 'static>,
 }

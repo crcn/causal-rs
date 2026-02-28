@@ -103,25 +103,6 @@ where
         None
     }
 
-    /// Find queue codec by Rust TypeId.
-    pub(crate) fn find_codec_by_type_id(
-        &self,
-        type_id: std::any::TypeId,
-    ) -> Option<Arc<EventCodec>> {
-        for effect in self.effects.read().iter() {
-            for codec in effect.codecs() {
-                if codec.type_id == type_id {
-                    return Some(codec.clone());
-                }
-            }
-        }
-        for codec in self.standalone_codecs.read().iter() {
-            if codec.type_id == type_id {
-                return Some(codec.clone());
-            }
-        }
-        None
-    }
 }
 
 fn looks_like_auto_generated_id(id: &str) -> bool {
@@ -159,7 +140,7 @@ mod tests {
     async fn test_handler_registry_registers_effects() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
 
-        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(()) }));
+        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
 
         assert_eq!(registry.effects.read().len(), 1);
     }
@@ -168,8 +149,8 @@ mod tests {
     async fn test_multiple_effects() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
 
-        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(()) }));
-        registry.register(handler::on::<EventB>().then(|_, _| async { Ok(()) }));
+        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
+        registry.register(handler::on::<EventB>().then(|_, _| async { Ok(crate::Events::new()) }));
 
         assert_eq!(registry.effects.read().len(), 2);
     }
@@ -178,7 +159,7 @@ mod tests {
     async fn test_effect_can_handle() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
 
-        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(()) }));
+        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
 
         let effects = registry.effects.read();
         assert!(effects[0].can_handle(TypeId::of::<EventA>()));
@@ -198,7 +179,7 @@ mod tests {
                 let c = counter_a.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(crate::Events::new())
                 }
             })
         );
@@ -207,7 +188,7 @@ mod tests {
                 let c = counter_b.clone();
                 async move {
                     c.fetch_add(10, Ordering::SeqCst);
-                    Ok(())
+                    Ok(crate::Events::new())
                 }
             })
         );
@@ -228,12 +209,12 @@ mod tests {
         registry.register(
             handler::on::<EventA>()
                 .id("duplicate")
-                .then(|_, _| async { Ok(()) }),
+                .then(|_, _| async { Ok(crate::Events::new()) }),
         );
         registry.register(
             handler::on::<EventB>()
                 .id("duplicate")
-                .then(|_, _| async { Ok(()) }),
+                .then(|_, _| async { Ok(crate::Events::new()) }),
         );
     }
 
@@ -244,7 +225,7 @@ mod tests {
         registry.register(
             handler::on::<EventA>()
                 .retry(3)
-                .then(|_, _| async { Ok(()) }),
+                .then(|_, _| async { Ok(crate::Events::new()) }),
         );
     }
 }

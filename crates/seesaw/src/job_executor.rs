@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
-use crate::handler::{Context, DlqTerminalInfo, Handler, JoinMode};
+use crate::handler::{Context, DlqTerminalInfo, EventOutput, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::runtime::Runtime;
 use crate::types::{
@@ -136,16 +136,23 @@ where
             });
         }
 
-        // 6. Execute inline handlers (sorted by priority, lower = first)
+        // 6. Execute inline handlers in parallel (sorted by priority for result ordering)
         let mut inline_effect_failures = Vec::new();
         let mut emitted_events = Vec::new();
         let mut inline_effects: Vec<_> = matching_effects.iter().filter(|effect| effect.is_inline()).collect();
         inline_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
-        for effect in inline_effects {
-            match self
-                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runtime)
-                .await
-            {
+
+        let inline_futures: Vec<_> = inline_effects
+            .iter()
+            .map(|effect| {
+                self.run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runtime)
+            })
+            .collect();
+
+        let inline_results = futures::future::join_all(inline_futures).await;
+
+        for (result, effect) in inline_results.into_iter().zip(inline_effects.iter()) {
+            match result {
                 Ok(mut emitted) => emitted_events.append(&mut emitted),
                 Err(error) => {
                     let error_string = error.to_string();
@@ -272,9 +279,7 @@ where
 
         let handler_fut = effect.make_handler_future(typed_event.clone(), type_id, ctx.clone());
         let result = timeout(timeout_duration, async {
-            let outputs = runtime.run(&execution.handler_id, Box::pin(handler_fut)).await?;
-            let emitted = outputs.into_iter().map(|o| (o.type_id, o.value)).collect();
-            Ok::<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>, anyhow::Error>(emitted)
+            runtime.run(&execution.handler_id, Box::pin(handler_fut)).await
         })
         .await;
 
@@ -438,10 +443,7 @@ where
         let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
         let drained = runtime
             .run(&effect.id, Box::pin(handler_fut))
-            .await?
-            .into_iter()
-            .map(|output| (output.type_id, output.value))
-            .collect::<Vec<_>>();
+            .await?;
 
         let emitted_count = drained.len();
         if emitted_count > config.max_batch_size {
@@ -501,22 +503,16 @@ where
 
         let mut emitted_events = Vec::with_capacity(emitted_count);
 
-        for (emitted_index, (type_id, event_any)) in drained.into_iter().enumerate() {
-            let codec = self.effects.find_codec_by_type_id(type_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No queue codec registered for emitted event TypeId {:?}",
-                    type_id
-                )
-            })?;
-            let payload = (codec.encode)(event_any.as_ref()).ok_or_else(|| {
-                anyhow::anyhow!("Failed to serialize emitted event {}", codec.event_type)
+        for (emitted_index, output) in drained.into_iter().enumerate() {
+            let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
+                anyhow::anyhow!("Failed to serialize emitted event {}", output.event_type)
             })?;
 
             let event_id = Uuid::new_v5(
                 &NAMESPACE_SEESAW,
                 format!(
                     "{}-{}-{}-{}",
-                    source_event.event_id, effect.id, codec.event_type, emitted_index
+                    source_event.event_id, effect.id, output.event_type, emitted_index
                 )
                 .as_bytes(),
             );
@@ -545,7 +541,7 @@ where
                 event_id,
                 parent_id: Some(source_event.event_id),
                 correlation_id: source_event.correlation_id,
-                event_type: codec.event_type.clone(),
+                event_type: output.event_type,
                 payload,
                 hops: source_event.hops + 1,
                 retry_count: 0,
@@ -561,7 +557,7 @@ where
 
     pub(crate) fn serialize_emitted_events(
         &self,
-        emitted: Vec<(TypeId, Arc<dyn Any + Send + Sync>)>,
+        emitted: Vec<EventOutput>,
         execution: &QueuedHandlerExecution,
         max_batch_size: usize,
     ) -> Result<Vec<EmittedEvent>> {
@@ -621,15 +617,9 @@ where
         };
 
         let mut result = Vec::with_capacity(emitted_count);
-        for (emitted_index, (type_id, event_any)) in emitted.into_iter().enumerate() {
-            let codec = self.effects.find_codec_by_type_id(type_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No queue codec registered for emitted event TypeId {:?}",
-                    type_id
-                )
-            })?;
-            let payload = (codec.encode)(event_any.as_ref()).ok_or_else(|| {
-                anyhow::anyhow!("Failed to serialize emitted event {}", codec.event_type)
+        for (emitted_index, output) in emitted.into_iter().enumerate() {
+            let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
+                anyhow::anyhow!("Failed to serialize emitted event {}", output.event_type)
             })?;
 
             let (batch_id, batch_index, batch_size) = if let Some(inherited) = inherited_batch {
@@ -645,7 +635,7 @@ where
             };
 
             result.push(EmittedEvent {
-                event_type: codec.event_type.clone(),
+                event_type: output.event_type,
                 payload,
                 batch_id,
                 batch_index,

@@ -1,7 +1,7 @@
 //! HTTP Fetcher Example
 
 use anyhow::Result;
-use seesaw_core::{handler, Context, Emit, Engine};
+use seesaw_core::{emit, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
                     } => Some((urls.clone(), *success_count, *failure_count)),
                     _ => None,
                 })
-                .then::<Deps, _, _, _, _, FetchEvent>(
+                .then(
                     |(urls, success_count, failure_count), ctx: Context<Deps>| async move {
                         if let Some((url, rest)) = urls.split_first() {
                             let url = url.clone();
@@ -60,16 +60,16 @@ async fn main() -> Result<()> {
                                 Ok(response) if response.status().is_success() => {
                                     let status = response.status().as_u16();
                                     let _ = response.text().await?;
-                                    Ok(Emit::Batch(vec![
+                                    Ok(emit![
                                         FetchEvent::Fetched { url, status },
                                         FetchEvent::FetchRequested {
                                             urls: rest,
                                             success_count: success_count + 1,
                                             failure_count,
                                         },
-                                    ]))
+                                    ])
                                 }
-                                Ok(response) => Ok(Emit::Batch(vec![
+                                Ok(response) => Ok(emit![
                                     FetchEvent::FetchFailed {
                                         url,
                                         reason: format!("HTTP {}", response.status().as_u16()),
@@ -79,8 +79,8 @@ async fn main() -> Result<()> {
                                         success_count,
                                         failure_count: failure_count + 1,
                                     },
-                                ])),
-                                Err(error) => Ok(Emit::Batch(vec![
+                                ]),
+                                Err(error) => Ok(emit![
                                     FetchEvent::FetchFailed {
                                         url,
                                         reason: error.to_string(),
@@ -90,13 +90,13 @@ async fn main() -> Result<()> {
                                         success_count,
                                         failure_count: failure_count + 1,
                                     },
-                                ])),
+                                ]),
                             }
                         } else {
-                            Ok(Emit::Batch(vec![FetchEvent::AllComplete {
+                            Ok(emit![FetchEvent::AllComplete {
                                 success_count,
                                 failure_count,
-                            }]))
+                            }])
                         }
                     },
                 ),
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
                 })
                 .then(|(ok, fail), _ctx: Context<Deps>| async move {
                     println!("all fetches complete: ok={}, fail={}", ok, fail);
-                    Ok(())
+                    Ok(emit![])
                 }),
         );
 

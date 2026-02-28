@@ -1,7 +1,7 @@
 //! Simple Order Processing Example
 
 use anyhow::Result;
-use seesaw_core::{handler, Context, Engine};
+use seesaw_core::{emit, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
                 })
                 .then(|order_id, ctx: Context<Deps>| async move {
                     ctx.deps().ship(order_id).await?;
-                    Ok(OrderEvent::Shipped { order_id })
+                    Ok(emit![OrderEvent::Shipped { order_id }])
                 }),
         )
         .with_handler(
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
                     ctx.deps()
                         .notify(order_id, "your order has shipped")
                         .await?;
-                    Ok(OrderEvent::Delivered { order_id })
+                    Ok(emit![OrderEvent::Delivered { order_id }])
                 }),
         );
 

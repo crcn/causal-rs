@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use seesaw_core::insight::InsightEvent;
-use seesaw_core::{handler, Context, Emit, Engine};
+use seesaw_core::{emit, handler, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -63,7 +63,7 @@ async fn basic_handler_fires() -> Result<()> {
             let c = counter_clone.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(emit![])
             }
         }),
     );
@@ -87,9 +87,9 @@ async fn handler_emits_chain() -> Result<()> {
     let engine = Engine::new(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                Ok(EventB {
+                Ok(emit![EventB {
                     value: event.value + 1,
-                })
+                }])
             },
         ))
         .with_handler(handler::on::<EventB>().then(
@@ -97,7 +97,7 @@ async fn handler_emits_chain() -> Result<()> {
                 let c = b_counter_clone.clone();
                 async move {
                     c.fetch_add(event.value as usize, Ordering::SeqCst);
-                    Ok(())
+                    Ok(emit![])
                 }
             },
         ));
@@ -123,7 +123,7 @@ async fn multiple_handlers_same_event() -> Result<()> {
                     let c = ca.clone();
                     async move {
                         c.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
+                        Ok(emit![])
                     }
                 }),
         )
@@ -134,7 +134,7 @@ async fn multiple_handlers_same_event() -> Result<()> {
                     let c = cb.clone();
                     async move {
                         c.fetch_add(10, Ordering::SeqCst);
-                        Ok(())
+                        Ok(emit![])
                     }
                 }),
         );
@@ -164,7 +164,7 @@ async fn queued_handler_executes() -> Result<()> {
                 let c = counter_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(emit![])
                 }
             }),
     );
@@ -193,7 +193,7 @@ async fn dispatch_requires_settled() -> Result<()> {
                 let c = counter_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(emit![])
                 }
             }),
     );
@@ -218,7 +218,7 @@ async fn dispatch_requires_settled() -> Result<()> {
 async fn handler_returns_nothing() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-            Ok(())
+            Ok(emit![])
         }),
     );
 
@@ -253,7 +253,7 @@ async fn retry_succeeds_on_second_attempt() -> Result<()> {
                         anyhow::bail!("first attempt fails");
                     }
                     sc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(emit![])
                 }
             }),
     );
@@ -293,7 +293,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
                     }
                 })
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
-                    Err::<(), _>(anyhow::anyhow!("always fails"))
+                    Err::<Events, _>(anyhow::anyhow!("always fails"))
                 }),
         )
         .with_handler(handler::on::<FailedTerminal>().then(
@@ -301,7 +301,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
                 let c = tc.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(emit![])
                 }
             },
         ));
@@ -326,16 +326,16 @@ async fn accumulate_batch() -> Result<()> {
     let rc = result_counter.clone();
     let bs = batch_size_seen.clone();
 
-    // An inline handler emits Emit::Batch which sets batch metadata automatically.
+    // An inline handler emits a batch which sets batch metadata automatically.
     // The accumulate handler collects all items in the batch.
     let engine = Engine::new(Deps)
-        .with_handler(handler::on::<Ping>().then::<Deps, _, _, _, _, BatchItem>(
+        .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                Ok(Emit::Batch(vec![
+                Ok(emit![..vec![
                     BatchItem { index: 0 },
                     BatchItem { index: 1 },
                     BatchItem { index: 2 },
-                ]))
+                ]])
             },
         ))
         .with_handler(
@@ -348,7 +348,7 @@ async fn accumulate_batch() -> Result<()> {
                     async move {
                         bs.store(batch.len(), Ordering::SeqCst);
                         rc.fetch_add(1, Ordering::SeqCst);
-                        Ok(BatchResult { count: batch.len() })
+                        Ok(emit![BatchResult { count: batch.len() }])
                     }
                 }),
         );
@@ -383,7 +383,7 @@ async fn insight_callback_fires() -> Result<()> {
             ic.fetch_add(1, Ordering::SeqCst);
         })
         .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(()) },
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(emit![]) },
         ));
 
     engine
@@ -411,9 +411,9 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
                 .id("emit_b_queued")
                 .queued()
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
-                    Ok(EventB {
+                    Ok(emit![EventB {
                         value: event.value + 1,
-                    })
+                    }])
                 }),
         )
         .with_handler(handler::on::<EventB>().then(
@@ -421,7 +421,7 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
                 let sc = sc.clone();
                 async move {
                     *sc.lock() = Some(ctx.correlation_id);
-                    Ok(())
+                    Ok(emit![])
                 }
             },
         ));
@@ -454,7 +454,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
                     }
                 })
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
-                    Err::<(), _>(anyhow::anyhow!("always fails"))
+                    Err::<Events, _>(anyhow::anyhow!("always fails"))
                 }),
         )
         .with_handler(handler::on::<FailedTerminal>().then(
@@ -462,7 +462,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
                 let sc = sc.clone();
                 async move {
                     *sc.lock() = Some(ctx.correlation_id);
-                    Ok(())
+                    Ok(emit![])
                 }
             },
         ));
@@ -495,7 +495,7 @@ async fn insight_seq_monotonically_increases() -> Result<()> {
             handler::on::<EventA>()
                 .id("queued_for_insight")
                 .queued()
-                .then(|_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(()) }),
+                .then(|_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(emit![]) }),
         );
 
     engine.dispatch(EventA { value: 42 }).settled().await?;

@@ -1,7 +1,7 @@
 //! AI Summarizer Example
 
 use anyhow::{bail, Result};
-use seesaw_core::{handler, Context, Engine};
+use seesaw_core::{emit, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -121,16 +121,16 @@ async fn main() -> Result<()> {
 
                         let tokens = response.usage.input_tokens + response.usage.output_tokens;
 
-                        Ok(SummaryEvent::Summarized {
+                        Ok(emit![SummaryEvent::Summarized {
                             task_id,
                             summary,
                             tokens_used: tokens,
-                        })
+                        }])
                     }
-                    Err(e) => Ok(SummaryEvent::SummaryFailed {
+                    Err(e) => Ok(emit![SummaryEvent::SummaryFailed {
                         task_id,
                         reason: e.to_string(),
-                    }),
+                    }]),
                 }
             }),
     );

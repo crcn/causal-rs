@@ -107,11 +107,6 @@ where
                 let event: E = serde_json::from_value(payload.clone())?;
                 Ok(Arc::new(event))
             }),
-            encode: Arc::new(|event_any| {
-                event_any
-                    .downcast_ref::<E>()
-                    .and_then(|event| serde_json::to_value(event).ok())
-            }),
         });
         Arc::get_mut(&mut self.effects)
             .expect("Cannot add aggregator after cloning")
@@ -239,136 +234,149 @@ where
                 }
             }
 
-            // Drain effect queue
+            // Drain all ready effects and run them in parallel
+            let mut executions = Vec::new();
             while let Some(execution) = self.store.poll_next_effect().await? {
-                processed_any = true;
-                let event_id = execution.event_id;
-                let handler_id = execution.handler_id.clone();
-                let execution_clone = execution.clone();
+                executions.push(execution);
+            }
 
-                match executor
-                    .execute_handler(execution, &handler_config, &*self.runtime)
-                    .await
-                {
-                    Ok(result) => match result.status {
-                        HandlerStatus::Success => {
-                            self.emit_insight(self.make_insight(
-                                StreamType::EffectCompleted,
-                                execution_clone.correlation_id,
-                                Some(event_id),
-                                Some(handler_id.clone()),
-                                Some(execution_clone.event_type.clone()),
-                                Some("completed".to_string()),
-                                None,
-                                None,
-                            ));
-                            if result.emitted_events.is_empty() {
+            if !executions.is_empty() {
+                processed_any = true;
+
+                let effect_futures: Vec<_> = executions
+                    .iter()
+                    .map(|execution| {
+                        executor.execute_handler(execution.clone(), &handler_config, &*self.runtime)
+                    })
+                    .collect();
+
+                let effect_results = futures::future::join_all(effect_futures).await;
+
+                for (exec_result, execution_clone) in effect_results.into_iter().zip(executions) {
+                    let event_id = execution_clone.event_id;
+                    let handler_id = execution_clone.handler_id.clone();
+
+                    match exec_result {
+                        Ok(result) => match result.status {
+                            HandlerStatus::Success => {
+                                self.emit_insight(self.make_insight(
+                                    StreamType::EffectCompleted,
+                                    execution_clone.correlation_id,
+                                    Some(event_id),
+                                    Some(handler_id.clone()),
+                                    Some(execution_clone.event_type.clone()),
+                                    Some("completed".to_string()),
+                                    None,
+                                    None,
+                                ));
+                                if result.emitted_events.is_empty() {
+                                    self.store
+                                        .complete_effect(event_id, handler_id, result.result)
+                                        .await?;
+                                } else {
+                                    self.store
+                                        .complete_effect_with_events(
+                                            event_id,
+                                            handler_id,
+                                            result.result,
+                                            result.emitted_events,
+                                            execution_clone.correlation_id,
+                                            execution_clone.hops,
+                                        )
+                                        .await?;
+                                }
+                            }
+                            HandlerStatus::Failed { error, attempts } => {
+                                self.emit_insight(self.make_insight(
+                                    StreamType::EffectFailed,
+                                    execution_clone.correlation_id,
+                                    Some(event_id),
+                                    Some(handler_id.clone()),
+                                    Some(execution_clone.event_type.clone()),
+                                    Some("failed".to_string()),
+                                    Some(error.clone()),
+                                    None,
+                                ));
+                                if result.emitted_events.is_empty() {
+                                    self.store
+                                        .dlq_effect(
+                                            event_id,
+                                            handler_id,
+                                            error,
+                                            "failed".to_string(),
+                                            attempts,
+                                        )
+                                        .await?;
+                                } else {
+                                    self.store
+                                        .dlq_effect_with_events(
+                                            event_id,
+                                            handler_id,
+                                            error,
+                                            "failed".to_string(),
+                                            attempts,
+                                            result.emitted_events,
+                                            execution_clone.correlation_id,
+                                            execution_clone.hops,
+                                        )
+                                        .await?;
+                                }
+                            }
+                            HandlerStatus::Retry { error, attempts } => {
                                 self.store
-                                    .complete_effect(event_id, handler_id, result.result)
-                                    .await?;
-                            } else {
-                                self.store
-                                    .complete_effect_with_events(
+                                    .fail_effect(
                                         event_id,
                                         handler_id,
-                                        result.result,
-                                        result.emitted_events,
-                                        execution_clone.correlation_id,
-                                        execution_clone.hops,
+                                        error,
+                                        attempts,
+                                        execution_clone,
                                     )
                                     .await?;
                             }
-                        }
-                        HandlerStatus::Failed { error, attempts } => {
-                            self.emit_insight(self.make_insight(
-                                StreamType::EffectFailed,
-                                execution_clone.correlation_id,
-                                Some(event_id),
-                                Some(handler_id.clone()),
-                                Some(execution_clone.event_type.clone()),
-                                Some("failed".to_string()),
-                                Some(error.clone()),
-                                None,
-                            ));
-                            if result.emitted_events.is_empty() {
+                            HandlerStatus::Timeout => {
                                 self.store
                                     .dlq_effect(
                                         event_id,
                                         handler_id,
-                                        error,
-                                        "failed".to_string(),
-                                        attempts,
-                                    )
-                                    .await?;
-                            } else {
-                                self.store
-                                    .dlq_effect_with_events(
-                                        event_id,
-                                        handler_id,
-                                        error,
-                                        "failed".to_string(),
-                                        attempts,
-                                        result.emitted_events,
-                                        execution_clone.correlation_id,
-                                        execution_clone.hops,
+                                        "timeout".to_string(),
+                                        "timeout".to_string(),
+                                        0,
                                     )
                                     .await?;
                             }
-                        }
-                        HandlerStatus::Retry { error, attempts } => {
-                            self.store
-                                .fail_effect(
-                                    event_id,
-                                    handler_id,
-                                    error,
-                                    attempts,
-                                    execution_clone,
-                                )
-                                .await?;
-                        }
-                        HandlerStatus::Timeout => {
+                            HandlerStatus::JoinWaiting => {
+                                // Wire join/accumulate coordination
+                                if let Some(join_claim) = result.join_claim {
+                                    self.handle_join_waiting(
+                                        &executor,
+                                        event_id,
+                                        &handler_id,
+                                        &execution_clone,
+                                        join_claim.batch_id,
+                                    )
+                                    .await?;
+                                } else {
+                                    self.store
+                                        .complete_effect(
+                                            event_id,
+                                            handler_id,
+                                            serde_json::json!({ "status": "join_waiting" }),
+                                        )
+                                        .await?;
+                                }
+                            }
+                        },
+                        Err(e) => {
                             self.store
                                 .dlq_effect(
                                     event_id,
                                     handler_id,
-                                    "timeout".to_string(),
-                                    "timeout".to_string(),
+                                    e.to_string(),
+                                    "settle_handler_error".to_string(),
                                     0,
                                 )
                                 .await?;
                         }
-                        HandlerStatus::JoinWaiting => {
-                            // Wire join/accumulate coordination
-                            if let Some(join_claim) = result.join_claim {
-                                self.handle_join_waiting(
-                                    &executor,
-                                    event_id,
-                                    &handler_id,
-                                    &execution_clone,
-                                    join_claim.batch_id,
-                                )
-                                .await?;
-                            } else {
-                                self.store
-                                    .complete_effect(
-                                        event_id,
-                                        handler_id,
-                                        serde_json::json!({ "status": "join_waiting" }),
-                                    )
-                                    .await?;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        self.store
-                            .dlq_effect(
-                                event_id,
-                                handler_id,
-                                e.to_string(),
-                                "settle_handler_error".to_string(),
-                                0,
-                            )
-                            .await?;
                     }
                 }
             }
@@ -536,13 +544,9 @@ where
                     match effect.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {
                             // Serialize emitted events
-                            let emitted_raw: Vec<_> = outputs
-                                .into_iter()
-                                .map(|o| (o.type_id, o.value))
-                                .collect();
                             let handler_config = HandlerWorkerConfig::default();
                             let emitted_events = executor.serialize_emitted_events(
-                                emitted_raw,
+                                outputs,
                                 execution,
                                 handler_config.max_batch_size,
                             )?;
