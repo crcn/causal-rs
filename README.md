@@ -5,7 +5,7 @@
 Build reactive systems with a simple **Event → Handler → Event** flow. Seesaw handles routing, composition, and settlement — plug in a `Runtime` for durable execution via [Restate](https://restate.dev/) or [Temporal](https://temporal.io/).
 
 ```rust
-use seesaw_core::{handler, Context, Engine};
+use seesaw_core::{emit, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use uuid::Uuid;
@@ -24,7 +24,7 @@ let engine = Engine::new(Deps)
         handler::on::<OrderPlaced>()
             .id("ship_order")
             .then(|event, ctx: Context<Deps>| async move {
-                Ok(OrderShipped { order_id: event.order_id })
+                Ok(emit![OrderShipped { order_id: event.order_id }])
             }),
     );
 
@@ -50,7 +50,7 @@ Runtime (durability, retries, state)
 
 ```toml
 [dependencies]
-seesaw_core = "0.13"
+seesaw_core = "0.14"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -83,9 +83,22 @@ handler::on::<OrderPlaced>()
     .id("ship_order")
     .then(|event, ctx: Context<Deps>| async move {
         ctx.deps().shipping_api.ship(event.order_id).await?;
-        Ok(OrderShipped { order_id: event.order_id })
+        Ok(emit![OrderShipped { order_id: event.order_id }])
     })
 ```
+
+### The `emit![]` macro
+
+All builder API handlers return `Result<Events>` via the `emit![]` macro:
+
+```rust
+Ok(emit![])                              // No events
+Ok(emit![OrderShipped { order_id }])     // Single event
+Ok(emit![EventA { .. }, EventB { .. }])  // Multiple heterogeneous events
+Ok(emit![..items])                       // Fan-out batch from iterator
+```
+
+The `#[handler]` macro handles conversion automatically — return `Result<YourEvent>` or `Result<()>` directly.
 
 ### Extract fields from enum variants
 
@@ -163,7 +176,7 @@ handler::on_any()
     .id("logger")
     .then(|event, ctx: Context<Deps>| async move {
         println!("event: {:?}", event.type_id);
-        Ok(())
+        Ok(emit![])
     })
 ```
 
@@ -215,7 +228,7 @@ let engine = Engine::new(deps)
             })
             .then(|order_id, ctx: Context<Deps>| async move {
                 ctx.deps().notify_shipped(order_id).await?;
-                Ok(())
+                Ok(emit![])
             }),
     );
 ```
