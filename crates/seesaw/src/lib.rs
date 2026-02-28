@@ -76,5 +76,3 @@ pub use handler::{on, on_any};
 #[cfg(feature = "macros")]
 pub use seesaw_core_macros::{aggregator, aggregators, handle, handler, handlers, handles};
 
-// Re-export commonly used external types
-pub use async_trait::async_trait;
