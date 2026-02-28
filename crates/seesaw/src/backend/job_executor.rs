@@ -122,10 +122,12 @@ where
             });
         }
 
-        // 6. Execute inline handlers
+        // 6. Execute inline handlers (sorted by priority, lower = first)
         let mut inline_effect_failures = Vec::new();
         let mut emitted_events = Vec::new();
-        for effect in matching_effects.iter().filter(|effect| effect.is_inline()) {
+        let mut inline_effects: Vec<_> = matching_effects.iter().filter(|effect| effect.is_inline()).collect();
+        inline_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
+        for effect in inline_effects {
             match self
                 .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runner)
                 .await
@@ -217,6 +219,7 @@ where
             idempotency_key,
             execution.correlation_id,
             execution.event_id,
+            execution.parent_event_id,
             self.deps.clone(),
         );
 
@@ -354,6 +357,7 @@ where
                 format!("startup::{}", effect.id),
                 Uuid::nil(),
                 Uuid::nil(),
+                None,
                 self.deps.clone(),
             );
 
@@ -407,6 +411,7 @@ where
             idempotency_key,
             source_event.correlation_id,
             source_event.event_id,
+            source_event.parent_id,
             self.deps.clone(),
         );
 

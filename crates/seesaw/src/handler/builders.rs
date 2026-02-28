@@ -311,10 +311,12 @@ where
         self
     }
 
-    /// Set execution priority (lower = higher priority, triggers queued execution).
+    /// Set execution priority (lower = higher priority).
+    ///
+    /// For inline handlers, lower priority runs first.
+    /// For queued handlers, lower priority is polled first.
     pub fn priority(mut self, level: i32) -> Self {
         self.priority = Some(level);
-        self.codec = EventType::queue_codec();
         self
     }
 }

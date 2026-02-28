@@ -6,9 +6,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::Backend;
+use super::job_executor::JobExecutor;
 use crate::store::{WorkflowEvent, WorkflowStatus};
 
 /// Workflow status query capability.
@@ -97,6 +99,20 @@ pub struct TreeNode {
     pub parent_id: Option<Uuid>,
     pub event_type: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Synchronous settlement capability.
+///
+/// Backends that implement this support `engine.process(event).settled().await`,
+/// which drives the entire causal tree to completion before returning.
+#[async_trait]
+pub trait SettleableBackend: Backend {
+    /// Drive all pending events and effects for a correlation ID to completion.
+    async fn settle<D: Send + Sync + 'static>(
+        &self,
+        executor: &Arc<JobExecutor<D>>,
+        correlation_id: Uuid,
+    ) -> Result<()>;
 }
 
 /// Aggregate workflow statistics.

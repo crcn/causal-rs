@@ -36,6 +36,7 @@
 mod builders;
 pub mod context;
 mod error_event;
+pub mod es_projector;
 mod types;
 
 pub use builders::{on, on_any, TransitionHandlerBuilder};

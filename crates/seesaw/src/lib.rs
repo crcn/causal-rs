@@ -59,7 +59,7 @@ pub use es::{
 pub use backend::{Backend, BackendServeConfig, DispatchedEvent};
 pub use backend::capability::{
     DeadLetter as DlqDeadLetter, DeadLetterQueueBackend, DlqFilters, InsightBackend, InsightStats as BackendInsightStats,
-    TreeNode, WorkflowStatusBackend, WorkflowSubscriptionBackend, WorkflowTree as BackendWorkflowTree,
+    SettleableBackend, TreeNode, WorkflowStatusBackend, WorkflowSubscriptionBackend, WorkflowTree as BackendWorkflowTree,
 };
 pub use backend::job_executor::{
     EventProcessingCommit as JobEventProcessingCommit, HandlerExecutionResult, HandlerStatus,
@@ -71,11 +71,12 @@ pub use engine_v2::Engine;
 pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Handler, HandlerError, JoinMode,
 };
+pub use handler::es_projector::es_projector;
 pub use handler_runner::{DirectRunner, HandlerRunner};
 pub use insight::{
     EventNode, HandlerNode, InsightEvent, InsightStats, InsightStore, StreamType, WorkflowTree,
 };
-pub use process::{ProcessFuture, ProcessHandle, WaitFuture};
+pub use process::{DispatchFuture, ProcessFuture, ProcessHandle, SettleFuture, WaitFuture};
 pub use runtime::Runtime;
 pub use store::{
     EmittedEvent, EventProcessingCommit, ExpiredJoinWindow, InlineHandlerFailure, JoinEntry,

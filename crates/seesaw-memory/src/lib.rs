@@ -1192,7 +1192,10 @@ impl MemoryStore {
 
 use seesaw_core::backend::{Backend, BackendServeConfig, DispatchedEvent};
 use seesaw_core::backend::capability::*;
-use seesaw_core::backend::job_executor::JobExecutor;
+use seesaw_core::backend::job_executor::{self as job, HandlerStatus, JobExecutor};
+use seesaw_core::handler_runner::DirectRunner;
+use seesaw_core::runtime::event_worker::EventWorkerConfig;
+use seesaw_core::runtime::handler_worker::HandlerWorkerConfig;
 use tokio_util::sync::CancellationToken;
 
 /// In-memory implementation of Backend trait (v0.11.0).
@@ -1317,6 +1320,154 @@ impl InsightBackend for MemoryBackend {
             total_handlers_executed: stats.completed_effects as i64,
             total_dlq_entries: stats.failed_effects as i64,
         })
+    }
+}
+
+/// Convert JobExecutor's EventProcessingCommit to Store's EventProcessingCommit.
+fn convert_commit(commit: job::EventProcessingCommit) -> EventProcessingCommit {
+    EventProcessingCommit {
+        event_row_id: commit.event_row_id,
+        event_id: commit.event_id,
+        correlation_id: commit.correlation_id,
+        event_type: commit.event_type,
+        event_payload: commit.event_payload,
+        queued_effect_intents: commit.queued_effect_intents,
+        inline_effect_failures: commit
+            .inline_effect_failures
+            .into_iter()
+            .map(|f| InlineHandlerFailure {
+                handler_id: f.handler_id,
+                error: f.error,
+                reason: f.reason,
+                attempts: f.attempts,
+            })
+            .collect(),
+        emitted_events: commit.emitted_events,
+    }
+}
+
+#[async_trait]
+impl SettleableBackend for MemoryBackend {
+    async fn settle<D: Send + Sync + 'static>(
+        &self,
+        executor: &Arc<JobExecutor<D>>,
+        _correlation_id: Uuid,
+    ) -> Result<()> {
+        let event_config = EventWorkerConfig::default();
+        let handler_config = HandlerWorkerConfig::default();
+        let runner = DirectRunner;
+
+        loop {
+            let mut processed_any = false;
+
+            // Drain event queue
+            while let Some(event) = self.store.poll_next().await? {
+                processed_any = true;
+                match executor.execute_event(&event, &event_config, &runner).await {
+                    Ok(commit) => {
+                        let store_commit = convert_commit(commit);
+                        self.store.commit_event_processing(store_commit).await?;
+                    }
+                    Err(e) => {
+                        // DLQ the event and continue
+                        self.store
+                            .dlq_effect(
+                                event.event_id,
+                                "__settle_event_error__".to_string(),
+                                e.to_string(),
+                                "settle_error".to_string(),
+                                event.retry_count,
+                            )
+                            .await?;
+                        self.store.ack(event.id).await?;
+                    }
+                }
+            }
+
+            // Drain effect queue
+            while let Some(execution) = self.store.poll_next_effect().await? {
+                processed_any = true;
+                let event_id = execution.event_id;
+                let handler_id = execution.handler_id.clone();
+
+                match executor
+                    .execute_handler(execution, &handler_config, &runner)
+                    .await
+                {
+                    Ok(result) => match result.status {
+                        HandlerStatus::Success => {
+                            if result.emitted_events.is_empty() {
+                                self.store
+                                    .complete_effect(event_id, handler_id, result.result)
+                                    .await?;
+                            } else {
+                                self.store
+                                    .complete_effect_with_events(
+                                        event_id,
+                                        handler_id,
+                                        result.result,
+                                        result.emitted_events,
+                                    )
+                                    .await?;
+                            }
+                        }
+                        HandlerStatus::Failed { error, attempts } => {
+                            self.store
+                                .dlq_effect(
+                                    event_id,
+                                    handler_id,
+                                    error,
+                                    "failed".to_string(),
+                                    attempts,
+                                )
+                                .await?;
+                        }
+                        HandlerStatus::Retry { error, attempts } => {
+                            self.store
+                                .fail_effect(event_id, handler_id, error, attempts)
+                                .await?;
+                        }
+                        HandlerStatus::Timeout => {
+                            self.store
+                                .dlq_effect(
+                                    event_id,
+                                    handler_id,
+                                    "timeout".to_string(),
+                                    "timeout".to_string(),
+                                    0,
+                                )
+                                .await?;
+                        }
+                        HandlerStatus::JoinWaiting => {
+                            self.store
+                                .complete_effect(
+                                    event_id,
+                                    handler_id,
+                                    serde_json::json!({ "status": "join_waiting" }),
+                                )
+                                .await?;
+                        }
+                    },
+                    Err(e) => {
+                        self.store
+                            .dlq_effect(
+                                event_id,
+                                handler_id,
+                                e.to_string(),
+                                "settle_handler_error".to_string(),
+                                0,
+                            )
+                            .await?;
+                    }
+                }
+            }
+
+            if !processed_any {
+                break; // Settled!
+            }
+        }
+
+        Ok(())
     }
 }
 

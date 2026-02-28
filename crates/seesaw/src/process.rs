@@ -281,3 +281,134 @@ where
         }
     }
 }
+
+// ── DispatchFuture / SettleFuture ────────────────────────────────────────
+
+/// Type-erased settle driver closure.
+pub type SettleDriver = Arc<
+    dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
+>;
+
+/// Future returned by `Engine::process()` (when `B: SettleableBackend`).
+///
+/// Wraps `ProcessFuture` and adds `.settled()` for synchronous settlement.
+/// Can also be awaited directly (fire-and-forget, same as `dispatch()`).
+pub struct DispatchFuture<B: Backend> {
+    inner: ProcessFuture<B>,
+    settle_driver: Option<SettleDriver>,
+}
+
+impl<B: Backend> DispatchFuture<B> {
+    pub(crate) fn new(inner: ProcessFuture<B>, settle_driver: Option<SettleDriver>) -> Self {
+        Self {
+            inner,
+            settle_driver,
+        }
+    }
+
+    /// Set custom event ID (for idempotency).
+    pub fn with_id(mut self, event_id: Uuid) -> Self {
+        self.inner = self.inner.with_id(event_id);
+        self
+    }
+
+    /// Set workflow/correlation ID.
+    pub fn with_workflow_id(mut self, correlation_id: Uuid) -> Self {
+        self.inner = self.inner.with_workflow_id(correlation_id);
+        self
+    }
+
+    /// Set parent event ID (for causation tracking).
+    pub fn with_parent(mut self, parent_id: Uuid) -> Self {
+        self.inner = self.inner.with_parent(parent_id);
+        self
+    }
+
+    /// Settle: publish event, then drive the entire causal tree to completion.
+    ///
+    /// Returns after all inline and queued handlers (and their emitted events)
+    /// have been fully processed.
+    pub fn settled(self) -> SettleFuture<B> {
+        SettleFuture {
+            inner: self.inner,
+            settle_driver: self.settle_driver,
+            settle_task: None,
+            handle: None,
+        }
+    }
+}
+
+// Forward .wait() for WorkflowSubscriptionBackend
+impl<B> DispatchFuture<B>
+where
+    B: WorkflowSubscriptionBackend,
+{
+    /// Wait for terminal event matching closure (requires WorkflowSubscriptionBackend).
+    pub fn wait<T, F>(self, matcher: F) -> WaitFuture<T, F, B>
+    where
+        F: Fn(&dyn std::any::Any) -> Option<Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.inner.wait(matcher)
+    }
+}
+
+// Awaiting DispatchFuture directly delegates to ProcessFuture (fire-and-forget).
+impl<B: Backend> Future for DispatchFuture<B> {
+    type Output = Result<ProcessHandle>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll(cx)
+    }
+}
+
+/// Future for synchronous settlement.
+///
+/// Two phases:
+/// 1. Publish the event (poll inner ProcessFuture)
+/// 2. Drive settlement (call settle_driver with correlation_id)
+pub struct SettleFuture<B: Backend> {
+    inner: ProcessFuture<B>,
+    settle_driver: Option<SettleDriver>,
+    settle_task: Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
+    handle: Option<ProcessHandle>,
+}
+
+impl<B: Backend> Future for SettleFuture<B> {
+    type Output = Result<ProcessHandle>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        // Phase 1: publish event
+        if this.handle.is_none() {
+            match Pin::new(&mut this.inner).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(handle)) => {
+                    // Start phase 2
+                    if let Some(driver) = this.settle_driver.take() {
+                        this.settle_task = Some(driver(handle.correlation_id));
+                    }
+                    this.handle = Some(handle);
+                }
+            }
+        }
+
+        // Phase 2: drive settlement
+        if let Some(task) = this.settle_task.as_mut() {
+            match task.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    this.settle_task = None;
+                    return Poll::Ready(Ok(this.handle.take().unwrap()));
+                }
+            }
+        }
+
+        // No settle driver — just return the handle
+        Poll::Ready(Ok(this.handle.take().unwrap()))
+    }
+}

@@ -219,7 +219,9 @@ where
 
         let mut inline_effect_failures = Vec::new();
         let mut emitted_events = Vec::new();
-        for effect in matching_effects.iter().filter(|effect| effect.is_inline()) {
+        let mut inline_effects: Vec<_> = matching_effects.iter().filter(|effect| effect.is_inline()).collect();
+        inline_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
+        for effect in inline_effects {
             match self
                 .run_inline_effect(effect, event, typed_event.clone(), event_type_id)
                 .await
@@ -323,6 +325,7 @@ where
             idempotency_key,
             source_event.correlation_id,
             source_event.event_id,
+            source_event.parent_id,
             self.deps.clone(),
         );
         let drained = effect

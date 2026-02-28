@@ -204,7 +204,7 @@ where
     pub(crate) timeout: Option<Duration>,
     /// Maximum retry attempts (default: 1 = no retry = inline)
     pub(crate) max_attempts: u32,
-    /// Execution priority (lower = higher priority, triggers queued)
+    /// Execution priority (lower = higher priority).
     pub(crate) priority: Option<i32>,
 }
 
@@ -296,7 +296,6 @@ where
             && self.delay.is_none()
             && self.timeout.is_none()
             && self.max_attempts == 1
-            && self.priority.is_none()
     }
 }
 

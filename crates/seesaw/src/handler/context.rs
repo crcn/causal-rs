@@ -27,6 +27,9 @@ where
     /// Get the current event ID.
     fn event_id(&self) -> Uuid;
 
+    /// Get the parent event ID (for causal tracking).
+    fn parent_event_id(&self) -> Option<Uuid>;
+
     /// Get shared dependencies.
     fn deps(&self) -> &D;
 }
@@ -44,6 +47,8 @@ where
     pub correlation_id: Uuid,
     /// Current event's unique ID from envelope.
     pub event_id: Uuid,
+    /// Parent event ID for causal tracking.
+    pub parent_event_id: Option<Uuid>,
     pub(crate) deps: Arc<D>,
 }
 
@@ -57,6 +62,7 @@ where
             idempotency_key: self.idempotency_key.clone(),
             correlation_id: self.correlation_id,
             event_id: self.event_id,
+            parent_event_id: self.parent_event_id,
             deps: self.deps.clone(),
         }
     }
@@ -71,6 +77,7 @@ where
         idempotency_key: String,
         correlation_id: Uuid,
         event_id: Uuid,
+        parent_event_id: Option<Uuid>,
         deps: Arc<D>,
     ) -> Self {
         Self {
@@ -78,6 +85,7 @@ where
             idempotency_key,
             correlation_id,
             event_id,
+            parent_event_id,
             deps,
         }
     }
@@ -101,6 +109,11 @@ where
     pub fn current_event_id(&self) -> Uuid {
         self.event_id
     }
+
+    /// Get the parent event ID for causal tracking.
+    pub fn parent_event_id(&self) -> Option<Uuid> {
+        self.parent_event_id
+    }
 }
 
 impl<D> HandlerContext<D> for Context<D>
@@ -121,6 +134,10 @@ where
 
     fn event_id(&self) -> Uuid {
         self.event_id
+    }
+
+    fn parent_event_id(&self) -> Option<Uuid> {
+        self.parent_event_id
     }
 
     fn deps(&self) -> &D {
@@ -144,6 +161,7 @@ mod tests {
             "test_idempotency_key".to_string(),
             Uuid::nil(),
             Uuid::nil(),
+            None,
             deps,
         )
     }

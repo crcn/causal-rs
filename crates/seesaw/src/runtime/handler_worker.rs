@@ -177,6 +177,7 @@ where
             idempotency_key,
             execution.correlation_id,
             execution.event_id,
+            execution.parent_event_id,
             self.deps.clone(),
         );
 

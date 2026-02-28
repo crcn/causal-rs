@@ -11,7 +11,7 @@ use crate::backend::capability::*;
 use crate::backend::job_executor::JobExecutor;
 use crate::handler::Handler;
 use crate::handler_registry::HandlerRegistry;
-use crate::process::ProcessFuture;
+use crate::process::{DispatchFuture, ProcessFuture, SettleDriver};
 use crate::runtime::Runtime;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
@@ -177,6 +177,43 @@ where
     /// Retry a dead letter (requires DeadLetterQueueBackend).
     pub async fn retry_dlq(&self, event_id: Uuid, handler_id: String) -> Result<()> {
         self.backend.retry_dlq(event_id, handler_id).await
+    }
+}
+
+impl<D, B> Engine<D, B>
+where
+    D: Send + Sync + 'static,
+    B: SettleableBackend,
+{
+    /// Dispatch event with settlement support.
+    ///
+    /// Returns a `DispatchFuture` that can be:
+    /// - Awaited directly (fire-and-forget, same as `dispatch()`)
+    /// - Chained with `.settled()` to drive the entire causal tree to completion
+    ///
+    /// ```ignore
+    /// // Fire-and-forget
+    /// engine.process(event).await?;
+    ///
+    /// // Synchronous settlement
+    /// engine.process(event).settled().await?;
+    /// ```
+    pub fn process<E>(&self, event: E) -> DispatchFuture<B>
+    where
+        E: Clone + Send + Sync + serde::Serialize + 'static,
+    {
+        let inner = self.dispatch(event);
+
+        let backend = self.backend.clone();
+        let deps = self.deps.clone();
+        let effects = self.effects.clone();
+        let settle_driver: SettleDriver = Arc::new(move |correlation_id| {
+            let executor = Arc::new(JobExecutor::new(deps.clone(), effects.clone()));
+            let backend = backend.clone();
+            Box::pin(async move { backend.settle(&executor, correlation_id).await })
+        });
+
+        DispatchFuture::new(inner, Some(settle_driver))
     }
 }
 
