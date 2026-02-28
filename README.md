@@ -2,554 +2,293 @@
 
 **Event-driven orchestration for Rust**
 
-Build reactive systems with a simple **Event → Handler → Event** flow. Named after the playground equipment that balances back and forth — representing the continuous flow of events through the system.
+Build reactive systems with a simple **Event → Handler → Event** flow. Seesaw handles routing, composition, and settlement — plug in a `Runtime` for durable execution via [Restate](https://restate.dev/) or [Temporal](https://temporal.io/).
 
 ```rust
 use seesaw_core::{handler, Context, Engine};
-use seesaw_memory::MemoryBackend;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use uuid::Uuid;
 
-// Events are facts - what happened
 #[derive(Clone, Serialize, Deserialize)]
-enum OrderEvent {
-    Placed { order_id: Uuid, total: f64 },
-    Shipped { order_id: Uuid },
-    Delivered { order_id: Uuid },
-}
+struct OrderPlaced { order_id: Uuid, total: f64 }
+
+#[derive(Clone, Serialize, Deserialize)]
+struct OrderShipped { order_id: Uuid }
 
 #[derive(Clone)]
-struct Deps {
-    shipping_api: ShippingApi,
-}
+struct Deps;
 
-// Define handlers with the #[handler] macro
-#[handler(on = OrderEvent, extract(order_id), id = "ship_order")]
-async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
-    ctx.deps().shipping_api.ship(order_id).await?;
-    Ok(OrderEvent::Shipped { order_id })
-}
+let engine = Engine::new(Deps)
+    .with_handler(
+        handler::on::<OrderPlaced>()
+            .id("ship_order")
+            .then(|event, ctx: Context<Deps>| async move {
+                Ok(OrderShipped { order_id: event.order_id })
+            }),
+    );
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let engine = Engine::new(deps, MemoryBackend::new())
-        .with_handler(ship_order());
-
-    // Dispatch events
-    engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
-    Ok(())
-}
+engine.dispatch(OrderPlaced { order_id: Uuid::new_v4(), total: 99.99 })
+    .settled().await?;
 ```
-
-## Features
-
-- **🎯 Event-Driven**: Events are the only signals — immutable facts about what happened
-- **⚡ High Performance**: 50k-100k events/sec with Kafka backend
-- **🔄 Handler Pattern**: React to events, perform IO, return new events
-- **✨ Declarative Macros**: Clean `#[handler]` syntax for defining handlers
-- **🎨 Flexible Backends**: In-memory, PostgreSQL, Kafka, or Restate (via `Runtime`)
-- **📈 Horizontal Scaling**: Scale via Kafka partitions and consumer groups
-- **🔒 Exactly-Once**: Idempotency and atomic commits prevent duplicate processing
-- **🔍 Observable**: Real-time visualization with Seesaw Insight
-- **🚀 Simple API**: Declarative macros or closure-based builder pattern
-- **📦 Aggregates**: In-memory aggregate state with transition guards for state-driven handler logic
-- **⏳ Settlement**: `engine.dispatch(event).settled().await` drives the full causal tree to completion
 
 ## Architecture
 
 ```
-Event → Handler → Event → Handler → ... (until settled)
-          ↓
-      Async IO, side effects
-          ↓
-      Return new Event
+Runtime (durability, retries, state)
+  └── Seesaw (routing, composition, DSL, settle loop)
+        └── Runtime.run() wraps each handler invocation
+        └── Runtime.get_state() / set_state() manages aggregate state
 ```
 
-**Core Principle**: Events flow through handlers. Handlers perform side effects and return new events. Simple, direct, composable.
+- **Seesaw** owns: event routing, handler composition, DSL ergonomics, settle loop, aggregates
+- **Runtime** owns: handler execution wrapping, state persistence
+- **DirectRuntime** (default): pass-through execution, in-memory DashMap state
+- **RestateRuntime** (custom): journals each handler via `ctx.run()`, state via Restate K/V
 
-## Quick Start
-
-Add to your `Cargo.toml`:
+## Install
 
 ```toml
 [dependencies]
 seesaw_core = "0.13"
-seesaw-memory = "0.13"    # For in-memory backend
-# OR
-seesaw-postgres = "0.13"  # For durable PostgreSQL backend
-# OR
-seesaw-kafka = "0.13"     # For high-throughput Kafka backend
-
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 ```
 
-### Basic Example with `#[handler]`
+## Handlers
 
-The `#[handler]` macro provides a clean, declarative way to define handlers:
+Handlers react to events, perform side effects, and return new events.
 
-```rust
-use anyhow::Result;
-use seesaw_core::{handler, Context, Engine};
-use seesaw_memory::MemoryBackend;
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-// Define events (what happened)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum OrderEvent {
-    Placed { order_id: Uuid, total: f64 },
-    Shipped { order_id: Uuid },
-    Delivered { order_id: Uuid },
-}
-
-// Define dependencies (shared services)
-#[derive(Clone)]
-struct Deps {
-    shipping_api: ShippingApi,
-    email_service: EmailService,
-}
-
-// Handler: Placed → Shipped
-#[handler(on = OrderEvent, extract(order_id), id = "ship_order")]
-async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
-    ctx.deps().shipping_api.ship(order_id).await?;
-    Ok(OrderEvent::Shipped { order_id })
-}
-
-// Handler: Shipped → Delivered
-#[handler(on = OrderEvent, extract(order_id), id = "notify_shipped")]
-async fn notify_shipped(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
-    ctx.deps().email_service.send(order_id, "Shipped!").await?;
-    Ok(OrderEvent::Delivered { order_id })
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let backend = MemoryBackend::new();
-    let deps = Deps {
-        shipping_api: ShippingApi::new(),
-        email_service: EmailService::new(),
-    };
-
-    // Build engine with handlers (each #[handler] generates a function)
-    let engine = Engine::new(deps, backend)
-        .with_handler(ship_order())
-        .with_handler(notify_shipped());
-
-    // Dispatch event
-    let order_id = Uuid::new_v4();
-    engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
-    // Engine automatically processes: Placed → Shipped → Delivered
-
-    Ok(())
-}
-```
-
-## Handler Pattern
-
-Handlers are the core abstraction in Seesaw. They react to events, perform side effects, and return new events.
-
-### Declarative Handlers with `#[handler]`
-
-The `#[handler]` macro provides a clean way to define handlers:
+### Declarative with `#[handler]` macro
 
 ```rust
 use seesaw_core::{handler, Context};
 
-// Basic handler that extracts a field
-#[handler(on = OrderEvent, extract(order_id))]
-async fn process_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
-    ctx.deps().process(order_id).await?;
-    Ok(OrderEvent::Processed { order_id })
+#[handler(on = OrderPlaced, id = "ship_order")]
+async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+    ctx.deps().shipping_api.ship(event.order_id).await?;
+    Ok(OrderShipped { order_id: event.order_id })
 }
+
+let engine = Engine::new(deps)
+    .with_handler(ship_order());
 ```
 
-**Macro breakdown:**
-1. **`on = Event`** - Listen for specific event type
-2. **`extract(field1, field2, ...)`** - Extract fields from matching events
-3. Function receives extracted fields directly
+### Builder API
 
-### Handler Configuration
+```rust
+handler::on::<OrderPlaced>()
+    .id("ship_order")
+    .then(|event, ctx: Context<Deps>| async move {
+        ctx.deps().shipping_api.ship(event.order_id).await?;
+        Ok(OrderShipped { order_id: event.order_id })
+    })
+```
 
-Configure handlers with retry, timeout, priority, and more:
+### Extract fields from enum variants
 
 ```rust
 #[handler(
-    on = PaymentEvent,
-    extract(order_id, total),
+    on = [CrawlEvent::Ingested, CrawlEvent::Regenerated],
+    extract(website_id, job_id),
+    id = "enqueue_extract"
+)]
+async fn enqueue_extract(
+    website_id: Uuid,
+    job_id: Uuid,
+    ctx: Context<Deps>,
+) -> Result<ExtractEnqueued> {
+    Ok(ExtractEnqueued { website_id })
+}
+```
+
+### Configuration
+
+```rust
+#[handler(
+    on = PaymentRequested,
     id = "charge_payment",
+    queued,
     retry = 3,
     timeout_secs = 30,
-    priority = 1,
-    delay_secs = 60
+    priority = 1
 )]
-async fn charge_payment(
-    order_id: Uuid,
-    total: f64,
-    ctx: Context<Deps>
-) -> Result<PaymentEvent> {
-    ctx.deps().stripe.charge(order_id, total).await?;
-    Ok(PaymentEvent::Charged { order_id })
+async fn charge_payment(event: PaymentRequested, ctx: Context<Deps>) -> Result<PaymentCharged> {
+    ctx.deps().stripe.charge(event.order_id).await?;
+    Ok(PaymentCharged { order_id: event.order_id })
 }
 ```
 
-**Configuration options:**
-- `id = "name"` - Custom handler identifier (for tracing/debugging)
-- `retry = N` - Max retry attempts on failure
-- `timeout_secs = N` / `timeout_ms = N` - Execution timeout
-- `delay_secs = N` / `delay_ms = N` - Delay before execution
-- `priority = N` - Execution priority (lower = higher priority). Works with both inline and queued handlers
-- `queued` - Force queued execution (required when using retry/timeout/delay)
+Options: `id`, `queued`, `retry`, `timeout_secs`, `timeout_ms`, `delay_secs`, `delay_ms`, `priority`.
 
-### Multiple Handlers, Same Event
-
-Multiple handlers can react to the same event (fan-out pattern):
-
-```rust
-// Handler 1: Update inventory
-#[handler(on = OrderEvent, extract(order_id, items), id = "reserve_inventory")]
-async fn reserve_inventory(
-    order_id: Uuid,
-    items: Vec<Item>,
-    ctx: Context<Deps>
-) -> Result<InventoryEvent> {
-    ctx.deps().inventory.reserve(&items).await?;
-    Ok(InventoryEvent::Reserved { order_id })
-}
-
-// Handler 2: Charge payment
-#[handler(on = OrderEvent, extract(order_id, total), id = "charge_payment")]
-async fn charge_payment(
-    order_id: Uuid,
-    total: f64,
-    ctx: Context<Deps>
-) -> Result<PaymentEvent> {
-    ctx.deps().payment.charge(total).await?;
-    Ok(PaymentEvent::Charged { order_id })
-}
-
-// Handler 3: Send notification (returns () = no new event)
-#[handler(on = OrderEvent, extract(order_id), id = "send_notification")]
-async fn send_notification(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
-    ctx.deps().email.send(order_id, "Order received!").await?;
-    Ok(())
-}
-
-let engine = Engine::new(deps, backend)
-    .with_handler(reserve_inventory())
-    .with_handler(charge_payment())
-    .with_handler(send_notification());
-```
-
-### Handling Specific Enum Variants
-
-Match specific enum variants with the `on = [...]` syntax:
-
-```rust
-#[handler(
-    on = [OrderEvent::Placed, OrderEvent::Updated],
-    extract(order_id, total),
-    id = "process_order_changes"
-)]
-async fn process_order_changes(
-    order_id: Uuid,
-    total: f64,
-    ctx: Context<Deps>
-) -> Result<OrderEvent> {
-    // Only runs for Placed or Updated variants
-    ctx.deps().process_order(order_id, total).await?;
-    Ok(OrderEvent::Processed { order_id })
-}
-```
-
-### Batch Processing with `accumulate`
-
-Use `accumulate` to process events in batches:
-
-```rust
-#[handler(on = ImportEvent, accumulate, id = "batch_import", window_timeout_secs = 5)]
-async fn batch_import(batch: Vec<ImportEvent>, ctx: Context<Deps>) -> Result<()> {
-    // Accumulates all ImportEvents, processes them together
-    let items: Vec<_> = batch.into_iter()
-        .filter_map(|e| match e {
-            ImportEvent::RowParsed { data, .. } => Some(data),
-            _ => None,
-        })
-        .collect();
-
-    ctx.deps().bulk_insert(&items).await?;
-    Ok(())
-}
-```
-
-### Module-level Registration
-
-Use `#[handlers]` to automatically generate registration functions:
+### Module registration
 
 ```rust
 #[handlers]
 mod order_handlers {
     use super::*;
 
-    #[handler(on = OrderEvent, extract(order_id), id = "ship")]
-    async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
-        ctx.deps().ship(order_id).await?;
-        Ok(OrderEvent::Shipped { order_id })
+    #[handler(on = OrderPlaced, id = "ship")]
+    async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+        Ok(OrderShipped { order_id: event.order_id })
     }
 
-    #[handler(on = OrderEvent, extract(order_id), id = "email")]
-    async fn email_customer(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
-        ctx.deps().email.send(order_id).await?;
+    #[handler(on = OrderShipped, id = "notify")]
+    async fn notify(event: OrderShipped, ctx: Context<Deps>) -> Result<()> {
+        ctx.deps().email.send(event.order_id).await?;
         Ok(())
     }
 }
 
-// Register all handlers at once
-let engine = Engine::new(deps, backend)
+let engine = Engine::new(deps)
     .with_handlers(order_handlers::handlers());
 ```
 
-## Backends
-
-Seesaw supports multiple backends for different use cases:
-
-### In-Memory Backend (Development)
-
-Fast, ephemeral, perfect for development and testing.
+### Batch processing with `accumulate`
 
 ```rust
-use seesaw_memory::MemoryBackend;
-
-let backend = MemoryBackend::new();
-let engine = Engine::new(deps, backend);
-```
-
-**Use when:**
-- Development and testing
-- No durability needed
-- Latency < 1ms is critical
-
-### PostgreSQL Backend (Production)
-
-Durable, ACID transactions, queue-backed execution, with built-in Dead Letter Queue (DLQ).
-
-```rust
-use seesaw_postgres::{PostgresStore, PostgresBackend, DeadLetterQueue};
-use sqlx::postgres::PgPoolOptions;
-
-let pool = PgPoolOptions::new()
-    .max_connections(20)
-    .connect("postgres://localhost/seesaw")
-    .await?;
-
-let store = PostgresStore::new(pool.clone());
-let backend = PostgresBackend::new(store);
-let engine = Engine::new(deps, backend);
-
-// Access DLQ for failed handlers
-let dlq = DeadLetterQueue::new(pool);
-let failed_entries = dlq.list(50).await?;
-```
-
-**Use when:**
-- Production deployments
-- Durability required
-- ~1-5k events/sec throughput
-- Single-node simplicity preferred
-- Need DLQ for handling persistent failures
-
-**PostgreSQL-Specific Features:**
-- **Dead Letter Queue**: Handlers that exhaust retries are moved to the DLQ for manual inspection and replay
-- **ACID Guarantees**: Full transactional consistency across event processing
-- **LISTEN/NOTIFY**: Real-time event streaming via PostgreSQL's pub/sub
-
-### Kafka Backend (High Scale)
-
-High throughput, horizontal scaling, event replay capabilities.
-
-```rust
-use seesaw_kafka::{KafkaBackend, KafkaBackendConfig};
-use seesaw_postgres::PostgresStore;
-
-// PostgreSQL for coordination state
-let pool = PgPoolOptions::new()
-    .connect("postgres://localhost/seesaw")
-    .await?;
-let store = PostgresStore::new(pool);
-
-// Kafka for event streaming
-let kafka_config = KafkaBackendConfig::new(vec!["localhost:9092".to_string()])
-    .with_topic_events("seesaw.events")
-    .with_num_partitions(16);
-
-let backend = KafkaBackend::new(kafka_config, store)?;
-let engine = Engine::new(deps, backend);
-```
-
-**Use when:**
-- High throughput (50k-100k events/sec)
-- Horizontal scaling needed
-- Event replay required
-- Cross-platform integration
-- Multiple consumers need same events
-
-**Performance comparison:**
-
-| Backend    | Throughput      | Scaling    | Durability | Complexity |
-|------------|-----------------|------------|------------|------------|
-| Memory     | ~100k evt/sec   | Vertical   | ❌ None    | ⭐ Simple  |
-| PostgreSQL | ~1-5k evt/sec   | Vertical   | ✅ ACID    | ⭐⭐ Medium |
-| Kafka      | ~50-100k evt/sec| Horizontal | ✅ Durable | ⭐⭐⭐ Complex |
-
-See [`crates/seesaw-kafka/README.md`](crates/seesaw-kafka/README.md) for Kafka backend details.
-
-## Context API
-
-Handlers receive a `Context<Deps>` that provides access to dependencies:
-
-```rust
-#[handler(on = MyEvent, extract(data), id = "process")]
-async fn process(data: Data, ctx: Context<Deps>) -> Result<MyEvent> {
-    // Access shared dependencies
-    ctx.deps().database.query(...).await?;
-    ctx.deps().api_client.call(...).await?;
-
-    Ok(MyEvent::Processed)
+#[handler(on = RowValidated, accumulate, id = "bulk_insert", window_timeout_secs = 5)]
+async fn bulk_insert(batch: Vec<RowValidated>, ctx: Context<Deps>) -> Result<BatchInserted> {
+    ctx.deps().db.bulk_insert(&batch).await?;
+    Ok(BatchInserted { count: batch.len() })
 }
 ```
 
-**Context methods:**
-- `ctx.deps()` - Access shared dependencies (database, APIs, config, etc.)
-- `ctx.event_id` - Current event's unique ID
-- `ctx.correlation_id` - Workflow/correlation ID grouping related events
-- `ctx.parent_event_id` - Parent event ID for causal tracking
-- `ctx.idempotency_key()` - Deterministic key for deduplicating external API calls
-- `ctx.handler_id()` - Human-readable handler identifier
-
-## Synchronous Settlement
-
-Process an event and wait for the entire causal tree to settle (all handlers and their emitted events fully processed):
+### Observer (all events)
 
 ```rust
-use seesaw_core::Engine;
-use seesaw_memory::MemoryBackend;
-
-let engine = Engine::new(deps, MemoryBackend::new())
-    .with_handler(ship_order())
-    .with_handler(notify_shipped());
-
-// Fire-and-forget (returns after publishing)
-engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
-
-// Synchronous settlement (returns after all handlers complete)
-let handle = engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 })
-    .settled()
-    .await?;
+handler::on_any()
+    .id("logger")
+    .then(|event, ctx: Context<Deps>| async move {
+        println!("event: {:?}", event.type_id);
+        Ok(())
+    })
 ```
 
-`engine.dispatch(event)` returns a `DispatchFuture` that supports:
-- `.await` - Fire-and-forget (publish and return)
-- `.settled()` - Drive the full causal tree to completion (requires `SettleableBackend`)
-- `.wait(matcher)` - Wait for a terminal event (requires `WorkflowSubscriptionBackend`)
-- `.with_id(uuid)` - Set custom event ID for idempotency
-- `.with_workflow_id(uuid)` - Set correlation/workflow ID
-- `.with_parent(uuid)` - Set parent event for causation tracking
+## Aggregates
 
-Settlement is available on any backend that implements `SettleableBackend`. The `MemoryBackend` implements this out of the box.
-
-## Real-time Observability (Seesaw Insight)
-
-Visualize your workflows in real-time with the Insight server:
-
-```bash
-# Start PostgreSQL
-docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres
-
-# Run migrations
-cd crates/seesaw-postgres
-cargo run --example migrate
-
-# Start insight server
-export DATABASE_URL="postgres://postgres:postgres@localhost/seesaw"
-cargo run -p seesaw-insight
-
-# Open http://localhost:3000
-```
-
-**Features:**
-- 📊 **Live Stream**: Real-time view of all workflow events
-- 🌳 **Tree Visualization**: Interactive causality tree showing event relationships
-- 📈 **Real-time Stats**: Total events, active handlers, recent activity
-- 🔄 **Dual Protocols**: WebSocket and SSE support
-
-## Examples
-
-The repository includes several examples demonstrating different patterns:
-
-- **[simple-order](examples/simple-order)** - Basic order processing workflow
-- **[http-fetcher](examples/http-fetcher)** - HTTP request workflow with retries
-- **[ai-summarizer](examples/ai-summarizer)** - AI text summarization pipeline
-
-Run any example:
-
-```bash
-cargo run --example simple-order
-```
-
-## Workspace Structure
-
-This repository is organized as a Cargo workspace:
-
-- **[seesaw_core](crates/seesaw)** - Core event-driven runtime and handler system (backend-agnostic)
-- **[seesaw-postgres](crates/seesaw-postgres)** - PostgreSQL backend (durable, ACID, includes DLQ implementation)
-- **[seesaw-kafka](crates/seesaw-kafka)** - Kafka backend (high throughput, horizontal scaling)
-- **[seesaw-memory](crates/seesaw-memory)** - In-memory backend (fast, ephemeral)
-- **[seesaw-insight](crates/seesaw-insight)** - Real-time observability and visualization
-
-### Architecture Philosophy
-
-**Backend-Agnostic Core**: The core crate (`seesaw_core`) is intentionally decoupled from any specific backend implementation. This means:
-
-- Core types (events, handlers, context) have no database dependencies
-- Backend-specific features (like `DeadLetterQueue`) live in their respective backend crates
-- The `HandlerContext` trait allows custom backends to provide enhanced capabilities
-- SQLx is an optional dependency in core, only needed when using database-backed backends
-
-This architecture enables:
-- **Flexibility**: Swap backends without touching business logic
-- **Minimal Dependencies**: Core stays lightweight with minimal dependencies
-- **Custom Backends**: Build your own backend (e.g., Restate, Redis) by implementing the backend traits
-- **Pluggable Execution**: The `Runtime` trait lets backends wrap individual handler calls
-- **Testing**: Use in-memory backend for fast tests, PostgreSQL/Kafka for integration tests
-
-### Runtime (Pluggable Execution & State)
-
-Every handler invocation flows through a `Runtime`, a trait that wraps each handler call and manages aggregate state:
-
-```
-Without runtime:  executor → effect.call_handler() → handler body
-With runtime:     executor → runtime.run(handler_future) → handler body
-```
-
-The default `DirectRuntime` is a zero-overhead pass-through. Custom runtimes wrap handler calls for durable execution, dry-run testing, or tracing.
-
-#### DirectRuntime (Default)
+Maintain in-memory aggregate state with transition guards for state-driven handler logic. Aggregate state is managed by the `Runtime`.
 
 ```rust
-use seesaw_core::{Runtime, DirectRuntime};
+use seesaw_core::{Aggregate, Apply};
 
-// Zero overhead — just runs the handler directly, state stored in DashMap
-let runtime = DirectRuntime::new();
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct Order {
+    status: OrderStatus,
+    total: f64,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
+enum OrderStatus { #[default] Draft, Placed, Shipped }
+
+impl Aggregate for Order {
+    fn aggregate_type() -> &'static str { "Order" }
+}
+
+impl Apply<OrderPlaced> for Order {
+    fn apply(&mut self, event: OrderPlaced) {
+        self.status = OrderStatus::Placed;
+        self.total = event.total;
+    }
+}
+
+impl Apply<OrderShipped> for Order {
+    fn apply(&mut self, _event: OrderShipped) {
+        self.status = OrderStatus::Shipped;
+    }
+}
 ```
 
-All built-in backends (Memory, PostgreSQL, Kafka) use `DirectRuntime`. Retry, timeout, and DLQ are handled by seesaw's worker loops.
+Register aggregators and use transition guards:
 
-#### Restate Integration
+```rust
+let engine = Engine::new(deps)
+    .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
+    .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
+    .with_handler(
+        handler::on::<OrderShipped>()
+            .extract(|e| Some(e.order_id))
+            .transition::<Order, _>(|prev, next| {
+                prev.status != OrderStatus::Shipped && next.status == OrderStatus::Shipped
+            })
+            .then(|order_id, ctx: Context<Deps>| async move {
+                ctx.deps().notify_shipped(order_id).await?;
+                Ok(())
+            }),
+    );
+```
 
-[Restate](https://restate.dev/) provides durable execution via journaled replay. Seesaw's handler decomposition pattern is the journaling strategy — each small handler becomes a journal entry. The user writes zero Restate code.
+With macros:
+
+```rust
+#[aggregators]
+mod order_aggregators {
+    use super::*;
+
+    #[aggregator(id = "order_id")]
+    fn on_placed(order: &mut Order, event: OrderPlaced) {
+        order.status = OrderStatus::Placed;
+        order.total = event.total;
+    }
+
+    #[aggregator(id = "order_id")]
+    fn on_shipped(order: &mut Order, _event: OrderShipped) {
+        order.status = OrderStatus::Shipped;
+    }
+}
+
+let engine = Engine::new(deps)
+    .with_aggregators(order_aggregators::aggregators());
+```
+
+## Settlement
+
+Drive the full causal tree to completion:
+
+```rust
+// Fire-and-forget
+engine.dispatch(event).await?;
+
+// Wait for all handlers to complete
+engine.dispatch(event).settled().await?;
+```
+
+## Runtime Trait
+
+The `Runtime` trait is the integration point for durable execution backends. Three primitives:
+
+```rust
+pub trait Runtime: Send + Sync {
+    /// Wrap a handler invocation (journaling for Restate, pass-through for direct).
+    fn run(&self, handler_id: &str, execution: Pin<Box<dyn Future<...> + Send>>)
+        -> Pin<Box<dyn Future<...> + Send>>;
+
+    /// Get aggregate state by key.
+    fn get_state(&self, key: &str) -> Option<serde_json::Value>;
+
+    /// Set aggregate state by key.
+    fn set_state(&self, key: &str, value: serde_json::Value);
+}
+```
+
+### DirectRuntime (default)
+
+Pass-through execution, in-memory state via DashMap. Used automatically — zero config needed.
+
+```rust
+// Engine uses DirectRuntime by default
+let engine = Engine::new(deps);
+
+// Or explicitly
+let engine = Engine::new(deps)
+    .with_runtime(DirectRuntime::new());
+```
+
+### Restate Integration
+
+[Restate](https://restate.dev/) provides durable execution via journaled replay. Seesaw runs *inside* Restate — each handler becomes a journal entry. User code is unchanged.
 
 ```
 User writes:     #[handler] async fn ship_order(...)
@@ -557,7 +296,7 @@ Seesaw does:     route event → handler, extract fields, transition guard
 Restate does:    journal the handler invocation, replay on crash
 ```
 
-A `RestateRuntime` wraps each handler call in `restate_ctx.run()` for automatic durability:
+A `RestateRuntime` wraps each handler in `restate_ctx.run()` and uses Restate's K/V store for aggregate state:
 
 ```rust
 use std::pin::Pin;
@@ -565,7 +304,6 @@ use std::future::Future;
 use anyhow::Result;
 use seesaw_core::{Runtime, handler::EventOutput};
 
-/// Wraps each handler call in Restate's journaling context.
 struct RestateRuntime<'a> {
     ctx: &'a restate_sdk::Context<'a>,
 }
@@ -573,56 +311,61 @@ struct RestateRuntime<'a> {
 impl Runtime for RestateRuntime<'_> {
     fn run(
         &self,
-        handler_id: &str,
+        _handler_id: &str,
         execution: Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>> {
         let ctx = self.ctx;
         Box::pin(async move {
-            // Restate journals the result — on crash, replays from journal
             ctx.run(|| execution).await
         })
+    }
+
+    fn get_state(&self, key: &str) -> Option<serde_json::Value> {
+        // Read from Restate's durable K/V store
+        self.ctx.get::<serde_json::Value>(key).await.ok().flatten()
+    }
+
+    fn set_state(&self, key: &str, value: serde_json::Value) {
+        // Write to Restate's durable K/V store
+        self.ctx.set(key, value);
     }
 }
 ```
 
-A `RestateBackend` would use this runner in its `serve()` implementation:
+Use it inside a Restate workflow handler:
 
 ```rust
-// Inside RestateBackend's Restate service handler:
-async fn process_event(restate_ctx: restate_sdk::Context<'_>, event: QueuedEvent) {
-    let runtime = RestateRuntime { ctx: &restate_ctx };
+impl OrderWorkflow for OrderWorkflowImpl {
+    async fn run(&self, ctx: &mut WorkflowContext, input: OrderPlaced) -> Result<()> {
+        let engine = Engine::new(deps)
+            .with_runtime(RestateRuntime { ctx })
+            .with_handler(ship_order())
+            .with_handler(notify_shipped());
 
-    // Existing seesaw routing — each matched handler runs through the runtime
-    let commit = executor.execute_event(&event, &config, &runtime).await?;
-
-    // Emitted events routed back through Restate service calls
-    for emitted in commit.emitted_events {
-        restate_ctx.service::<SeesawRouter>()
-            .process_event(emitted)
-            .send().await?;
+        engine.dispatch(input).settled().await?;
+        Ok(())
     }
 }
 ```
 
 **What changes with Restate:**
 
-| Concern | Without Restate | With Restate |
-|---------|----------------|--------------|
-| Handler routing | Seesaw | Seesaw (unchanged) |
-| Extract/filter/transition guards | Seesaw | Seesaw (unchanged) |
-| Durable execution | Seesaw retry/timeout/DLQ | Restate journal + replay |
+| Concern | DirectRuntime | RestateRuntime |
+|---------|--------------|----------------|
+| Handler execution | Direct call | Journaled via `ctx.run()` |
+| Aggregate state | In-memory DashMap | Restate K/V store |
+| Crash recovery | State lost | Replay from journal |
 | Exactly-once side effects | Idempotency keys | Restate journal |
 | Delayed execution | Seesaw delay queue | Restate timers |
-| User code | `#[handler]` | `#[handler]` (unchanged) |
 
-**What doesn't change:** `#[handler]` macro, `Engine`, `handler::on()`, `.extract()`, `.transition()`, `.accumulate()`, `Aggregate` — all unchanged. User code is identical across backends.
+**What doesn't change:** `#[handler]`, `Engine`, `handler::on()`, `.extract()`, `.transition()`, `.accumulate()`, `Aggregate`. User code is identical.
 
-#### Custom Runners
+### Custom Runtimes
 
-The trait is simple enough for any wrapping strategy:
+The trait is simple enough for any strategy:
 
 ```rust
-/// Dry-run runner — records calls without executing
+/// Dry-run runtime — records calls without executing
 struct DryRunRuntime {
     calls: Arc<Mutex<Vec<String>>>,
 }
@@ -637,232 +380,44 @@ impl Runtime for DryRunRuntime {
         let id = handler_id.to_string();
         Box::pin(async move {
             calls.lock().unwrap().push(id);
-            Ok(Vec::new()) // Skip actual execution
+            Ok(Vec::new())
         })
     }
+
+    fn get_state(&self, _key: &str) -> Option<serde_json::Value> { None }
+    fn set_state(&self, _key: &str, _value: serde_json::Value) {}
 }
 ```
 
-## Core Concepts
-
-### Events
-
-Events are immutable facts describing what happened. Any type that is `Clone + Send + Sync + Serialize + Deserialize + 'static` can be an event.
+## Context API
 
 ```rust
-#[derive(Clone, Serialize, Deserialize)]
-enum UserEvent {
-    SignupRequested { email: String, name: String },
-    SignedUp { user_id: Uuid, email: String },
-    Verified { user_id: Uuid },
-    Deleted { user_id: Uuid },
-}
+ctx.deps()              // Shared dependencies
+ctx.event_id            // Current event's unique ID
+ctx.correlation_id      // Workflow grouping ID
+ctx.parent_event_id     // Parent event for causal tracking
+ctx.idempotency_key()   // Deterministic key for deduplication
+ctx.handler_id()        // Handler identifier
 ```
 
-**Event naming conventions:**
-- Use past tense (what happened, not what should happen)
-- Be specific and descriptive
-- Include relevant identifiers
+## Examples
 
-### Handlers
-
-Handlers are async functions that react to events, perform IO, and return new events:
-
-```rust
-#[handler(on = UserEvent, extract(email, name), id = "create_user")]
-async fn create_user(
-    email: String,
-    name: String,
-    ctx: Context<Deps>
-) -> Result<UserEvent> {
-    // Perform IO
-    let user = ctx.deps().db.create_user(&email, &name).await?;
-
-    // Return new event
-    Ok(UserEvent::SignedUp {
-        user_id: user.id,
-        email,
-    })
-}
+```bash
+cargo run --example simple-order
 ```
 
-**Key properties:**
-- Async (can perform IO)
-- Access dependencies via `ctx.deps()`
-- Return `Result<Event>` or `Result<()>`
-- Can fail and retry (if configured)
-- Declarative syntax with `#[handler]` macro
-
-### Dependencies
-
-Dependencies are shared services injected into the engine:
-
-```rust
-#[derive(Clone)]
-struct Deps {
-    db: Arc<Database>,
-    api_client: Arc<ApiClient>,
-    config: Arc<Config>,
-}
-
-let engine = Engine::new(deps, backend);
-```
-
-**Best practices:**
-- Wrap expensive-to-clone types in `Arc<>`
-- Keep dependencies immutable
-- Use connection pools for databases
-- Share HTTP clients
+- **[simple-order](examples/simple-order)** — Basic order processing workflow
+- **[http-fetcher](examples/http-fetcher)** — HTTP request workflow with retries
+- **[ai-summarizer](examples/ai-summarizer)** — AI text summarization pipeline
 
 ## Design Philosophy
 
-1. **Events are Facts**: Immutable descriptions of what happened
-2. **Event → Handler → Event**: Simple, direct flow
-3. **Handlers Return Events**: No imperative "emit" calls, just return values
-4. **Async All The Way**: Handlers can perform async IO
-5. **Composition Over Inheritance**: Build complex workflows from simple handlers
-6. **Pluggable Backends**: Choose the right backend for your use case
-7. **Pluggable Execution**: The `Runtime` trait wraps handler calls, enabling durable execution (Restate), dry-run testing, and tracing without changing user code
-8. **Settle on Demand**: `engine.dispatch(event).settled().await` drives the full causal tree to completion synchronously
-
-## Testing
-
-Test handlers using the in-memory backend:
-
-```rust
-#[handler(on = OrderEvent, extract(order_id), id = "ship_order")]
-async fn ship_order(order_id: Uuid, ctx: Context<MockDeps>) -> Result<OrderEvent> {
-    ctx.deps().ship(order_id).await?;
-    Ok(OrderEvent::Shipped { order_id })
-}
-
-#[tokio::test]
-async fn test_order_processing() {
-    let deps = MockDeps::new();
-    let backend = MemoryBackend::new();
-
-    let engine = Engine::new(deps.clone(), backend)
-        .with_handler(ship_order());
-
-    let order_id = Uuid::new_v4();
-    engine.dispatch(OrderEvent::Placed { order_id, total: 99.99 }).await?;
-
-    // Verify side effects
-    assert!(deps.was_shipped(order_id));
-}
-```
-
-## Guarantees
-
-**Memory Backend:**
-- ✅ Event ordering within single engine instance
-- ✅ At-most-once handler execution
-- ❌ No durability (events lost on crash)
-- ❌ No distribution (single process only)
-
-**PostgreSQL Backend:**
-- ✅ Durable (events survive crashes)
-- ✅ Distributed (multiple workers can process queue)
-- ✅ Exactly-once handler execution (via idempotency)
-- ✅ ACID transactions
-- ❌ Limited throughput (~1-5k events/sec)
-
-**Kafka Backend:**
-- ✅ High throughput (50k-100k events/sec)
-- ✅ Horizontal scaling (via partitions)
-- ✅ Exactly-once handler execution (via idempotency)
-- ✅ Event replay and time-travel
-- ✅ Cross-platform integration
-- ❌ Operational complexity (requires Kafka cluster)
-
-## Documentation
-
-- **[Kafka Backend Guide](crates/seesaw-kafka/README.md)** - High-throughput Kafka backend
-- **[PostgreSQL Backend Guide](crates/seesaw-postgres/README.md)** - Durable PostgreSQL backend
-- **[Insight Guide](crates/seesaw-insight/README.md)** - Real-time observability
-
-## Alternative: Builder API
-
-For more dynamic or programmatic handler creation, use the builder API with `handler::on()`:
-
-### Basic Builder Pattern
-
-```rust
-use seesaw_core::{handler, Context};
-
-let engine = Engine::new(deps, backend)
-    .with_handler(
-        handler::on::<OrderEvent>()
-            .extract(|e| match e {
-                OrderEvent::Placed { order_id, .. } => Some(*order_id),
-                _ => None,
-            })
-            .then(|order_id, ctx: Context<Deps>| async move {
-                ctx.deps().process(order_id).await?;
-                Ok(OrderEvent::Processed { order_id })
-            })
-    );
-```
-
-### Builder with Configuration
-
-```rust
-handler::on::<PaymentEvent>()
-    .id("charge_payment")
-    .retry(3)
-    .timeout(Duration::from_secs(30))
-    .priority(1)
-    .then(|event, ctx: Context<Deps>| async move {
-        ctx.deps().stripe.charge(&event).await?;
-        Ok(PaymentEvent::Charged { order_id: event.order_id })
-    })
-```
-
-### Multiple Event Variants
-
-```rust
-handler::on::<OrderEvent>()
-    .extract(|e| match e {
-        OrderEvent::Placed { order_id, total } | OrderEvent::Updated { order_id, total } => {
-            Some((order_id, total))
-        }
-        _ => None,
-    })
-    .then(|(order_id, total), ctx| async move {
-        ctx.deps().process(order_id, total).await?;
-        Ok(OrderEvent::Processed { order_id })
-    })
-```
-
-### Observer Pattern (All Events)
-
-```rust
-handler::on_any()
-    .then(|event, ctx: Context<Deps>| async move {
-        ctx.deps().logger.log_event(event).await?;
-        Ok(()) // No new event
-    })
-```
-
-**Builder API methods:**
-- `.id(String)` - Custom handler identifier
-- `.extract(closure)` - Filter and extract data from events
-- `.then(closure)` - Async handler implementation
-- `.retry(u32)` - Max retry attempts
-- `.timeout(Duration)` - Execution timeout
-- `.delayed(Duration)` - Delay before execution
-- `.priority(i32)` - Execution priority (lower = first). Works with inline handlers
-- `.queued()` - Force queued execution
-
-**When to use:**
-- Dynamic handler creation at runtime
-- Conditional handler registration
-- When closures are more convenient than functions
-- Integration with existing closure-heavy code
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+1. **Events are facts** — Immutable, past-tense descriptions of what happened
+2. **Event → Handler → Event** — Simple, direct, composable
+3. **Runtime owns the lifecycle** — Execute handlers, manage state, handle journaling
+4. **Engine declares, Runtime executes** — Engine routes events and declares aggregates; Runtime wraps execution and persists state
+5. **User code is backend-agnostic** — Same `#[handler]` works with DirectRuntime or RestateRuntime
+6. **Settle on demand** — `engine.dispatch(event).settled().await` drives the full causal tree
 
 ## License
 
