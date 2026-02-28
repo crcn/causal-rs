@@ -52,6 +52,11 @@ where
         }
     }
 
+    /// Access the shared dependencies.
+    pub fn deps(&self) -> &Arc<D> {
+        &self.deps
+    }
+
     /// Set a custom runtime (e.g. RestateRuntime for durable execution).
     pub fn with_runtime<R: Runtime + 'static>(mut self, runtime: R) -> Self {
         self.runtime = Arc::new(runtime);
