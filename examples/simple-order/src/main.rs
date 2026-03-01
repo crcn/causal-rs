@@ -1,15 +1,24 @@
 //! Simple Order Processing Example
 
 use anyhow::Result;
-use seesaw_core::{events, handler, Context, Engine};
+use seesaw_core::{handles, Context, Engine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum OrderEvent {
-    Placed { order_id: Uuid, total: f64 },
-    Shipped { order_id: Uuid },
-    Delivered { order_id: Uuid },
+struct OrderPlaced {
+    order_id: Uuid,
+    total: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderShipped {
+    order_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderDelivered {
+    order_id: Uuid,
 }
 
 #[derive(Clone)]
@@ -33,8 +42,21 @@ impl Deps {
     }
 }
 
-fn place_order(order_id: Uuid, total: f64) -> OrderEvent {
-    OrderEvent::Placed { order_id, total }
+#[handles]
+mod order_handlers {
+    use super::*;
+
+    async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+        ctx.deps().ship(event.order_id).await?;
+        Ok(OrderShipped { order_id: event.order_id })
+    }
+
+    async fn notify_shipped(event: OrderShipped, ctx: Context<Deps>) -> Result<OrderDelivered> {
+        ctx.deps()
+            .notify(event.order_id, "your order has shipped")
+            .await?;
+        Ok(OrderDelivered { order_id: event.order_id })
+    }
 }
 
 #[tokio::main]
@@ -43,33 +65,7 @@ async fn main() -> Result<()> {
         shipping_enabled: true,
     };
 
-    let engine = Engine::new(deps)
-        .with_handler(
-            handler::on::<OrderEvent>()
-                .id("ship_order")
-                .extract(|e| match e {
-                    OrderEvent::Placed { order_id, .. } => Some(*order_id),
-                    _ => None,
-                })
-                .then(|order_id, ctx: Context<Deps>| async move {
-                    ctx.deps().ship(order_id).await?;
-                    Ok(events![OrderEvent::Shipped { order_id }])
-                }),
-        )
-        .with_handler(
-            handler::on::<OrderEvent>()
-                .id("notify_shipped")
-                .extract(|e| match e {
-                    OrderEvent::Shipped { order_id } => Some(*order_id),
-                    _ => None,
-                })
-                .then(|order_id, ctx: Context<Deps>| async move {
-                    ctx.deps()
-                        .notify(order_id, "your order has shipped")
-                        .await?;
-                    Ok(events![OrderEvent::Delivered { order_id }])
-                }),
-        );
+    let engine = Engine::new(deps).with_handlers(order_handlers::handles());
 
     println!("Processing orders...\n");
 
@@ -77,7 +73,7 @@ async fn main() -> Result<()> {
         let order_id = Uuid::new_v4();
         let total = 99.99 * i as f64;
         println!("Placing order {} (${:.2})", order_id, total);
-        engine.emit(place_order(order_id, total)).settled().await?;
+        engine.emit(OrderPlaced { order_id, total }).settled().await?;
     }
 
     println!("\nAll orders processed successfully!");

@@ -5,17 +5,34 @@
 Seesaw is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, and event sourcing — and plugs into [Restate](https://restate.dev/) for durable execution with zero code changes.
 
 ```rust
-use seesaw_core::{events, handler, Context, Engine};
+use seesaw_core::{aggregators, handles, events, Context, Engine, Events};
+
+#[aggregators(id = "order_id")]
+mod order_aggregators {
+    fn on_placed(order: &mut Order, event: OrderPlaced) {
+        order.status = OrderStatus::Placed;
+        order.total = event.total;
+    }
+    fn on_shipped(order: &mut Order, _event: OrderShipped) {
+        order.status = OrderStatus::Shipped;
+    }
+}
+
+#[handles]
+mod order_handlers {
+    async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+        ctx.deps().shipping_api.ship(event.order_id).await?;
+        Ok(OrderShipped { order_id: event.order_id })
+    }
+    async fn notify(event: OrderShipped, ctx: Context<Deps>) -> Result<()> {
+        ctx.deps().email.send(event.order_id).await?;
+        Ok(())
+    }
+}
 
 let engine = Engine::new(deps)
-    .with_handler(
-        handler::on::<OrderPlaced>()
-            .id("ship_order")
-            .then(|event, ctx: Context<Deps>| async move {
-                ctx.deps().shipping_api.ship(event.order_id).await?;
-                Ok(events![OrderShipped { order_id: event.order_id }])
-            }),
-    );
+    .with_aggregators(order_aggregators::aggregators())
+    .with_handlers(order_handlers::handles());
 
 engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 ```
@@ -35,29 +52,25 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 ### Handlers
 
-Handlers react to events, perform side effects, and return new events. Two equivalent styles:
-
-**Macro style** — return your event type directly:
+Handlers react to events, perform side effects, and return new events:
 
 ```rust
-#[handler(on = OrderPlaced, id = "ship_order")]
-async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
-    ctx.deps().shipping_api.ship(event.order_id).await?;
-    Ok(OrderShipped { order_id: event.order_id })
+#[handles]
+mod order_handlers {
+    // Event type inferred from parameter — no #[handle] needed
+    async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+        ctx.deps().shipping_api.ship(event.order_id).await?;
+        Ok(OrderShipped { order_id: event.order_id })
+    }
+
+    // Use #[handle] for advanced features (extract, retry, etc.)
+    #[handle(on = [OrderEvent::Placed], extract(order_id), id = "enqueue")]
+    async fn enqueue(order_id: Uuid, ctx: Context<Deps>) -> Result<Events> {
+        Ok(events![Enqueued { order_id }])
+    }
 }
 
-let engine = Engine::new(deps).with_handler(ship_order());
-```
-
-**Builder style** — return `Result<Events>` via the `events![]` macro:
-
-```rust
-handler::on::<OrderPlaced>()
-    .id("ship_order")
-    .then(|event, ctx: Context<Deps>| async move {
-        ctx.deps().shipping_api.ship(event.order_id).await?;
-        Ok(events![OrderShipped { order_id: event.order_id }])
-    })
+let engine = Engine::new(deps).with_handlers(order_handlers::handles());
 ```
 
 The `events![]` macro handles all return shapes:
@@ -123,20 +136,18 @@ let engine = Engine::new(deps)
     );
 ```
 
-Or use the macro shorthand:
+Or use the macro shorthand — ID specified once at the module level:
 
 ```rust
-#[aggregators]
+#[aggregators(id = "order_id")]
 mod order_aggregators {
     use super::*;
 
-    #[aggregator(id = "order_id")]
     fn on_placed(order: &mut Order, event: OrderPlaced) {
         order.status = OrderStatus::Placed;
         order.total = event.total;
     }
 
-    #[aggregator(id = "order_id")]
     fn on_shipped(order: &mut Order, _event: OrderShipped) {
         order.status = OrderStatus::Shipped;
     }
@@ -144,6 +155,17 @@ mod order_aggregators {
 
 let engine = Engine::new(deps)
     .with_aggregators(order_aggregators::aggregators());
+```
+
+For single-instance aggregates (no ID field needed), use `singleton`:
+
+```rust
+#[aggregators(singleton)]
+mod pipeline_aggregators {
+    fn on_step(stats: &mut RunStats, event: StepCompleted) {
+        stats.event_count += 1;
+    }
+}
 ```
 
 ## Handler Configuration
@@ -226,26 +248,27 @@ handler::on_any()
 
 ### Module registration
 
-Group related handlers into a module:
+Group related handlers into a module. Bare async functions are auto-registered — `#[handle]` is only needed for advanced features:
 
 ```rust
-#[handlers]
+#[handles]
 mod order_handlers {
     use super::*;
 
-    #[handler(on = OrderPlaced, id = "ship")]
+    // Bare fn — event type inferred, id = "ship"
     async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
         Ok(OrderShipped { order_id: event.order_id })
     }
 
-    #[handler(on = OrderShipped, id = "notify")]
-    async fn notify(event: OrderShipped, ctx: Context<Deps>) -> Result<()> {
-        ctx.deps().email.send(event.order_id).await?;
+    // Explicit #[handle] for extract, retry, etc.
+    #[handle(on = [OrderEvent::Shipped], extract(order_id), id = "notify")]
+    async fn notify(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
+        ctx.deps().email.send(order_id).await?;
         Ok(())
     }
 }
 
-let engine = Engine::new(deps).with_handlers(order_handlers::handlers());
+let engine = Engine::new(deps).with_handlers(order_handlers::handles());
 ```
 
 ## Event Sourcing
