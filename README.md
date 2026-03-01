@@ -256,23 +256,26 @@ pub trait EventStore: Send + Sync {
 
 Three methods: load all events, append with optimistic concurrency, and load from a version (for snapshot + partial replay).
 
-### Persist and replay
+### Auto-persist and hydration
+
+When an `EventStore` is configured, the engine automatically persists events and hydrates aggregates on cold access — no manual loading needed:
 
 ```rust
-use seesaw_core::event_store::{persist_event, load_aggregate, MemoryEventStore, Versioned};
+use seesaw_core::event_store::MemoryEventStore;
 
-let store = MemoryEventStore::new(); // or your PostgresEventStore
+let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
 
-// Persist an event
-let version = persist_event::<OrderPlaced, Order>(&store, order_id, 0, &event).await?;
+let engine = Engine::new(deps)
+    .with_event_store(event_store)
+    .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
+    .with_handler(on_order_placed());
 
-// Reconstruct aggregate from event stream
-let Versioned { state, version } = load_aggregate::<Order>(&store, &aggregators, order_id).await?;
-assert_eq!(state.status, OrderStatus::Shipped);
-assert_eq!(version, 2);
+// Events matching aggregators are auto-persisted.
+// On restart, aggregates hydrate from the EventStore automatically.
+engine.emit(OrderPlaced { order_id, total: 100 }).settled().await?;
 ```
 
-`persist_event` stores events with short type names (e.g. `"OrderPlaced"` not `"my_crate::events::OrderPlaced"`) so refactoring modules never breaks replay. `load_aggregate` returns `Versioned<A>` with the reconstructed state and current version for optimistic concurrency on subsequent writes.
+`persist_event` is available for manual persistence with short type names (e.g. `"OrderPlaced"` not `"my_crate::events::OrderPlaced"`) so refactoring modules never breaks replay.
 
 ### Replay context flag
 
