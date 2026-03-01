@@ -21,11 +21,15 @@ mod order_aggregators {
 #[handles]
 mod order_handlers {
     async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
-        ctx.deps().shipping_api.ship(event.order_id).await?;
+        ctx.run(|| async {
+            ctx.deps().shipping_api.ship(event.order_id).await
+        }).await?;
         Ok(OrderShipped { order_id: event.order_id })
     }
     async fn notify(event: OrderShipped, ctx: Context<Deps>) -> Result<()> {
-        ctx.deps().email.send(event.order_id).await?;
+        ctx.run(|| async {
+            ctx.deps().email.send(event.order_id).await
+        }).await?;
         Ok(())
     }
 }
@@ -59,7 +63,9 @@ Handlers react to events, perform side effects, and return new events:
 mod order_handlers {
     // Event type inferred from parameter — no #[handle] needed
     async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
-        ctx.deps().shipping_api.ship(event.order_id).await?;
+        ctx.run(|| async {
+            ctx.deps().shipping_api.ship(event.order_id).await
+        }).await?;
         Ok(OrderShipped { order_id: event.order_id })
     }
 
@@ -130,7 +136,9 @@ let engine = Engine::new(deps)
                 prev.status != OrderStatus::Shipped && next.status == OrderStatus::Shipped
             })
             .then(|order_id, ctx: Context<Deps>| async move {
-                ctx.deps().notify_shipped(order_id).await?;
+                ctx.run(|| async {
+                    ctx.deps().notify_shipped(order_id).await
+                }).await?;
                 Ok(events![])
             }),
     );
@@ -191,7 +199,9 @@ async fn enqueue(website_id: Uuid, job_id: Uuid, ctx: Context<Deps>) -> Result<E
 ```rust
 #[handler(on = PaymentRequested, id = "charge", retry = 3, timeout_secs = 30, priority = 1)]
 async fn charge(event: PaymentRequested, ctx: Context<Deps>) -> Result<PaymentCharged> {
-    ctx.deps().stripe.charge(event.order_id).await?;
+    ctx.run(|| async {
+        ctx.deps().stripe.charge(event.order_id).await
+    }).await?;
     Ok(PaymentCharged { order_id: event.order_id })
 }
 ```
@@ -203,7 +213,9 @@ Fan-out events and collect them back with `accumulate`:
 ```rust
 #[handler(on = RowValidated, accumulate, id = "bulk_insert", window_timeout_secs = 5)]
 async fn bulk_insert(batch: Vec<RowValidated>, ctx: Context<Deps>) -> Result<BatchInserted> {
-    ctx.deps().db.bulk_insert(&batch).await?;
+    ctx.run(|| async {
+        ctx.deps().db.bulk_insert(&batch).await
+    }).await?;
     Ok(BatchInserted { count: batch.len() })
 }
 ```
@@ -263,7 +275,9 @@ mod order_handlers {
     // Explicit #[handle] for extract, retry, etc.
     #[handle(on = [OrderEvent::Shipped], extract(order_id), id = "notify")]
     async fn notify(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
-        ctx.deps().email.send(order_id).await?;
+        ctx.run(|| async {
+            ctx.deps().email.send(order_id).await
+        }).await?;
         Ok(())
     }
 }
