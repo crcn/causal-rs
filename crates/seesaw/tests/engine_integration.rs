@@ -1635,3 +1635,199 @@ async fn save_snapshot_helper_works() -> Result<()> {
     assert_eq!(loaded.state["total"], 999);
     Ok(())
 }
+
+#[tokio::test]
+async fn auto_snapshot_every_n_events() -> Result<()> {
+    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let order_id = Uuid::new_v4();
+
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone())
+        .with_snapshot_store(snapshot_store.clone())
+        .snapshot_every(5)
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
+        .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
+
+    // Emit 5 OrderCreated events (version 1-5)
+    for i in 0..5 {
+        engine
+            .emit(OrderCreated { order_id, total: (i + 1) * 100 })
+            .settled()
+            .await?;
+    }
+
+    // Should have snapshot at version 5
+    let snap = snapshot_store
+        .load_snapshot("Order", order_id)
+        .await?
+        .expect("snapshot should exist at V5");
+    assert_eq!(snap.version, 5);
+
+    // Emit 5 more (version 6-10)
+    for i in 5..10 {
+        engine
+            .emit(OrderCreated { order_id, total: (i + 1) * 100 })
+            .settled()
+            .await?;
+    }
+
+    // Should have snapshot at version 10
+    let snap = snapshot_store
+        .load_snapshot("Order", order_id)
+        .await?
+        .expect("snapshot should exist at V10");
+    assert_eq!(snap.version, 10);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
+    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let order_id = Uuid::new_v4();
+
+    // First engine: emit 10 events with auto-snapshot every 5
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone())
+        .with_snapshot_store(snapshot_store.clone())
+        .snapshot_every(5)
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
+
+    for i in 0..10 {
+        engine
+            .emit(OrderCreated { order_id, total: (i + 1) * 100 })
+            .settled()
+            .await?;
+    }
+
+    // Verify snapshot at V10
+    let snap = snapshot_store
+        .load_snapshot("Order", order_id)
+        .await?
+        .expect("snapshot should exist");
+    assert_eq!(snap.version, 10);
+
+    // New engine (cold start) — should hydrate from snapshot at V10
+    let engine2 = Engine::new(Deps)
+        .with_event_store(event_store.clone())
+        .with_snapshot_store(snapshot_store.clone())
+        .snapshot_every(5)
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
+        .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
+
+    // Emit one more event — triggers hydration from snapshot
+    let fired = Arc::new(AtomicUsize::new(0));
+    let f = fired.clone();
+
+    let engine2 = engine2.with_handler(
+        handler::on::<OrderConfirmed>()
+            .extract(|e| Some(e.order_id))
+            .transition::<Order, _>(|prev, next| {
+                prev.status == "created" && next.status == "confirmed"
+            })
+            .then(
+                move |_id: Uuid, _ctx: Context<Deps>| {
+                    let f = f.clone();
+                    async move {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        Ok(events![])
+                    }
+                },
+            ),
+    );
+
+    engine2
+        .emit(OrderConfirmed { order_id })
+        .settled()
+        .await?;
+
+    // Transition handler should fire — proves hydration worked (state was "created" from snapshot)
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "handler should fire from snapshot-hydrated state");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_snapshot_without_threshold() -> Result<()> {
+    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let order_id = Uuid::new_v4();
+
+    // snapshot_store but NO snapshot_every
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone())
+        .with_snapshot_store(snapshot_store.clone())
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
+
+    for _ in 0..10 {
+        engine
+            .emit(OrderCreated { order_id, total: 100 })
+            .settled()
+            .await?;
+    }
+
+    // No snapshot should exist
+    let snap = snapshot_store
+        .load_snapshot("Order", order_id)
+        .await?;
+    assert!(snap.is_none(), "no snapshot should be saved without snapshot_every");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
+    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let order_id = Uuid::new_v4();
+
+    // Pre-populate 50 events in store
+    for i in 0..50 {
+        event_store
+            .append_events(
+                "Order",
+                order_id,
+                i as u64,
+                vec![NewEvent {
+                    event_type: "OrderCreated".to_string(),
+                    payload: serde_json::json!({"order_id": order_id, "total": (i + 1) * 10}),
+                    schema_version: 0,
+                }],
+            )
+            .await?;
+    }
+
+    // Pre-populate snapshot at V50
+    snapshot_store
+        .save_snapshot(Snapshot {
+            aggregate_type: "Order".to_string(),
+            aggregate_id: order_id,
+            version: 50,
+            state: serde_json::json!({"status": "created", "total": 500}),
+            created_at: chrono::Utc::now(),
+        })
+        .await?;
+
+    // New engine with snapshot_every(100) — threshold NOT met (only 1 event since snapshot)
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone())
+        .with_snapshot_store(snapshot_store.clone())
+        .snapshot_every(100)
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
+
+    engine
+        .emit(OrderCreated { order_id, total: 999 })
+        .settled()
+        .await?;
+
+    // Snapshot should still be at V50 (not re-saved at V51)
+    let snap = snapshot_store
+        .load_snapshot("Order", order_id)
+        .await?
+        .expect("original snapshot should still exist");
+    assert_eq!(snap.version, 50, "snapshot should remain at V50, not V51");
+
+    Ok(())
+}

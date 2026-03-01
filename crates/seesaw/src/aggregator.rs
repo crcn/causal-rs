@@ -157,6 +157,8 @@ struct StateEntry {
     state: Arc<dyn Any + Send + Sync>,
     /// Stream version from the EventStore (0 = never persisted / unknown).
     version: u64,
+    /// Version at which last snapshot was taken (0 = never).
+    snapshot_at_version: u64,
 }
 
 /// Registry of aggregators with owned in-memory state.
@@ -220,12 +222,12 @@ impl AggregatorRegistry {
 
             // Get current entry, or create default.
             let current_entry = self.state.get(&key).map(|v| v.value().clone());
-            let (current_state, current_version) = match current_entry {
-                Some(entry) => (entry.state, entry.version),
+            let (current_state, current_version, snapshot_at) = match current_entry {
+                Some(entry) => (entry.state, entry.version, entry.snapshot_at_version),
                 None => {
                     // No state yet — create default, store it, and apply
                     let default = Arc::from(agg.default_state());
-                    self.state.insert(key.clone(), StateEntry { state: default, version: 0 });
+                    self.state.insert(key.clone(), StateEntry { state: default, version: 0, snapshot_at_version: 0 });
                     return self.apply_event_inner(agg, &key, &prev_key, payload);
                 }
             };
@@ -234,7 +236,7 @@ impl AggregatorRegistry {
             let mut next_state = agg.clone_state(current_state.as_ref());
 
             // Store prev snapshot (cheap Arc clone of existing state)
-            self.state.insert(prev_key, StateEntry { state: current_state, version: 0 });
+            self.state.insert(prev_key, StateEntry { state: current_state, version: 0, snapshot_at_version: 0 });
 
             // Apply event to the cloned state
             if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
@@ -245,6 +247,7 @@ impl AggregatorRegistry {
             self.state.insert(key, StateEntry {
                 state: Arc::from(next_state),
                 version: current_version + 1,
+                snapshot_at_version: snapshot_at,
             });
         }
     }
@@ -264,6 +267,7 @@ impl AggregatorRegistry {
         self.state.insert(prev_key.to_string(), StateEntry {
             state: current_entry.state,
             version: 0,
+            snapshot_at_version: 0,
         });
 
         // Apply event
@@ -275,6 +279,7 @@ impl AggregatorRegistry {
         self.state.insert(key.to_string(), StateEntry {
             state: Arc::from(next_state),
             version: current_entry.version + 1,
+            snapshot_at_version: current_entry.snapshot_at_version,
         });
     }
 
@@ -366,8 +371,8 @@ impl AggregatorRegistry {
     /// Inject hydrated state + version into the DashMap.
     ///
     /// Used during cold-start hydration from the EventStore.
-    pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: u64) {
-        self.state.insert(key.to_string(), StateEntry { state, version });
+    pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: u64, snapshot_at_version: u64) {
+        self.state.insert(key.to_string(), StateEntry { state, version, snapshot_at_version });
     }
 
     /// Read the stream version from the DashMap entry.
@@ -378,6 +383,23 @@ impl AggregatorRegistry {
             .get(key)
             .map(|entry| entry.version)
             .unwrap_or(0)
+    }
+
+    /// Read the snapshot_at_version from the DashMap entry.
+    ///
+    /// Returns 0 if no state exists (consistent with "never snapshotted").
+    pub fn get_snapshot_at_version(&self, key: &str) -> u64 {
+        self.state
+            .get(key)
+            .map(|entry| entry.snapshot_at_version)
+            .unwrap_or(0)
+    }
+
+    /// Update snapshot_at_version after saving a snapshot.
+    pub fn update_snapshot_at_version(&self, key: &str, version: u64) {
+        if let Some(mut entry) = self.state.get_mut(key) {
+            entry.snapshot_at_version = version;
+        }
     }
 
     /// Get a clone of the state for a given aggregate key.

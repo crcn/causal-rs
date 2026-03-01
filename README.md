@@ -277,6 +277,28 @@ engine.emit(OrderPlaced { order_id, total: 100 }).settled().await?;
 
 `persist_event` is available for manual persistence with short type names (e.g. `"OrderPlaced"` not `"my_crate::events::OrderPlaced"`) so refactoring modules never breaks replay.
 
+### Snapshots
+
+Snapshots accelerate cold-start hydration by saving aggregate state at a point-in-time, so only the delta needs replaying.
+
+**Auto-checkpoint** — save snapshots automatically every N events:
+
+```rust
+let engine = Engine::new(deps)
+    .with_event_store(event_store)
+    .with_snapshot_store(snapshot_store)
+    .snapshot_every(100)  // auto-checkpoint every 100 events
+    .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id);
+```
+
+On cold start, the engine loads the latest snapshot and replays only events after it.
+
+| Configuration | Behavior |
+|---|---|
+| No snapshot store | No snapshots |
+| `with_snapshot_store` only | Manual snapshots via `save_snapshot()` |
+| `with_snapshot_store` + `snapshot_every(N)` | Auto-checkpoint every N events |
+
 ### Replay context flag
 
 During replay, handlers should skip side effects. Check `ctx.is_replay()`:

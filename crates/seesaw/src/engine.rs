@@ -42,6 +42,7 @@ where
     runtime: Arc<dyn Runtime>,
     event_store: Option<Arc<dyn EventStore>>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    snapshot_every: Option<u64>,
 }
 
 impl<D> Engine<D>
@@ -59,6 +60,7 @@ where
             runtime: Arc::new(DirectRuntime::new()),
             event_store: None,
             snapshot_store: None,
+            snapshot_every: None,
         }
     }
 
@@ -88,6 +90,15 @@ where
     /// all events from the EventStore.
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
         self.snapshot_store = Some(store);
+        self
+    }
+
+    /// Enable auto-checkpoint snapshots every N events.
+    ///
+    /// Requires a snapshot store to be set. When both are configured,
+    /// snapshots are saved automatically during the settle loop.
+    pub fn snapshot_every(mut self, events: u64) -> Self {
+        self.snapshot_every = Some(events);
         self
     }
 
@@ -300,6 +311,11 @@ where
 
                 // Apply event to live aggregator state before handlers run
                 self.apply_to_aggregators(&event);
+
+                // Auto-checkpoint snapshots if configured
+                if let (Some(snapshot_store), Some(threshold)) = (&self.snapshot_store, self.snapshot_every) {
+                    self.maybe_auto_snapshot(&event, snapshot_store.as_ref(), threshold).await?;
+                }
 
                 match executor
                     .execute_event(&event, &event_config, runtime)
@@ -609,7 +625,7 @@ where
 
                     let final_version = snapshot.version + remaining.len() as u64;
                     self.aggregators
-                        .set_state(key, Arc::from(state), final_version);
+                        .set_state(key, Arc::from(state), final_version, snapshot.version);
                     return Ok(());
                 }
             }
@@ -634,7 +650,7 @@ where
             &self.upcasters,
         )? {
             self.aggregators
-                .set_state(key, Arc::from(state), last_version);
+                .set_state(key, Arc::from(state), last_version, 0);
         }
 
         Ok(())
@@ -724,6 +740,50 @@ where
             correlation_id,
             event_id,
         })
+    }
+
+    /// Auto-snapshot aggregates if the event count since last snapshot exceeds the threshold.
+    async fn maybe_auto_snapshot(
+        &self,
+        event: &QueuedEvent,
+        snapshot_store: &dyn SnapshotStore,
+        threshold: u64,
+    ) -> Result<()> {
+        let matching = self.aggregators.find_by_event_type(&event.event_type);
+
+        for agg in matching {
+            let aggregate_id = match agg.extract_id_from_json(&event.payload) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
+            let version = self.aggregators.get_version(&key);
+            let snapshot_at = self.aggregators.get_snapshot_at_version(&key);
+
+            if version - snapshot_at >= threshold {
+                let state_ref = match self.aggregators.get_state(&key) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let state_json = agg.serialize_state(state_ref.as_ref())?;
+
+                snapshot_store
+                    .save_snapshot(crate::event_store::Snapshot {
+                        aggregate_type: agg.aggregate_type.clone(),
+                        aggregate_id,
+                        version,
+                        state: state_json,
+                        created_at: chrono::Utc::now(),
+                    })
+                    .await?;
+
+                self.aggregators.update_snapshot_at_version(&key, version);
+            }
+        }
+
+        Ok(())
     }
 
     /// Apply event to aggregator state.
@@ -894,6 +954,7 @@ where
             runtime: self.runtime.clone(),
             event_store: self.event_store.clone(),
             snapshot_store: self.snapshot_store.clone(),
+            snapshot_every: self.snapshot_every,
         }
     }
 }
