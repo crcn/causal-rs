@@ -133,6 +133,7 @@ struct EffectArgs {
     filter: Option<Path>,
     accumulate: bool,
     join: bool,
+    projection: bool,
     queued: bool,
     id: Option<String>,
     dlq_terminal: Option<Path>,
@@ -575,6 +576,15 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 }
                 args.join = true;
             }
+            Meta::Path(path) if path.is_ident("projection") => {
+                if args.projection {
+                    return Err(syn::Error::new_spanned(
+                        path,
+                        "projection specified more than once",
+                    ));
+                }
+                args.projection = true;
+            }
             Meta::Path(path) if path.is_ident("queued") => {
                 if args.queued {
                     return Err(syn::Error::new_spanned(
@@ -902,6 +912,10 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
                     #dlq_terminal((__seesaw_source).as_ref().clone(), __seesaw_info)
                 })
         };
+    }
+
+    if args.projection {
+        builder = quote! { #builder .projection() };
     }
 
     if args.queued {

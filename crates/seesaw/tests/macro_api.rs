@@ -199,6 +199,14 @@ mod order_effects {
             order_id: event.order_id,
         })
     }
+
+    #[handle(on = OrderPlaced, projection, id = "order_read_model")]
+    async fn update_read_model(
+        _event: OrderPlaced,
+        _ctx: Context<Deps>,
+    ) -> Result<Emit<AnalyticsEvent>> {
+        Ok(Emit::None)
+    }
 }
 
 // ── Aggregator macro tests ──────────────────────────────────────────────
@@ -270,7 +278,7 @@ fn aggregator_apply_trait_generated() {
 #[test]
 fn effects_module_registration_works() {
     let effects = order_effects::handles();
-    assert_eq!(effects.len(), 9);
+    assert_eq!(effects.len(), 10);
     assert!(effects
         .iter()
         .any(|effect| effect.can_handle(TypeId::of::<OrderPlaced>())));
@@ -315,5 +323,23 @@ fn effects_module_registration_works() {
     assert!(
         ship_high_value.can_handle(TypeId::of::<HighValueOrder>()),
         "filter handler should handle HighValueOrder events"
+    );
+
+    let projection = effects
+        .iter()
+        .find(|effect| effect.id == "order_read_model")
+        .expect("order_read_model projection should exist");
+    assert!(
+        projection.is_projection(),
+        "projection attribute should mark handler as projection"
+    );
+    assert!(
+        projection.is_inline(),
+        "projection handler should remain inline"
+    );
+
+    assert!(
+        !ship_order.is_projection(),
+        "regular handler should not be a projection"
     );
 }
