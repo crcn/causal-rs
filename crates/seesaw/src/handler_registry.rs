@@ -60,7 +60,7 @@ where
 
         if !effect.is_inline() && looks_like_auto_generated_id(&effect.id) {
             panic!(
-                "Queued effect '{}' must declare an explicit stable id (for example .id(\"...\") or #[effect(id = \"...\")])",
+                "Background handler '{}' must declare an explicit stable id (for example .id(\"...\") or #[handler(id = \"...\")])",
                 effect.id
             );
         }
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "must declare an explicit stable id")]
+    #[should_panic(expected = "Background handler")]
     async fn test_register_rejects_generated_id_for_queued_effect() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
         registry.register(

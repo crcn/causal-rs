@@ -164,10 +164,10 @@ async fn enqueue(website_id: Uuid, job_id: Uuid, ctx: Context<Deps>) -> Result<E
 }
 ```
 
-### Queued, retry, timeout, delay, priority
+### Retry, timeout, delay, priority
 
 ```rust
-#[handler(on = PaymentRequested, id = "charge", queued, retry = 3, timeout_secs = 30, priority = 1)]
+#[handler(on = PaymentRequested, id = "charge", retry = 3, timeout_secs = 30, priority = 1)]
 async fn charge(event: PaymentRequested, ctx: Context<Deps>) -> Result<PaymentCharged> {
     ctx.deps().stripe.charge(event.order_id).await?;
     Ok(PaymentCharged { order_id: event.order_id })
@@ -193,7 +193,6 @@ Map exhausted retries to a terminal event:
 ```rust
 handler::on::<FailEvent>()
     .id("risky_op")
-    .queued()
     .retry(3)
     .on_failure(|_event, info: ErrorContext| OperationFailed {
         error: info.error,

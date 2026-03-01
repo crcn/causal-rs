@@ -154,6 +154,7 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
+            #[allow(deprecated)]
             handler::on::<EventA>()
                 .id("emit_b")
                 .queued()
@@ -793,7 +794,6 @@ async fn queued_handler_exhausts_retries_then_dlqs() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<FailEvent>()
             .id("always_fail_retry3")
-            .queued()
             .retry(3)
             .then(move |_event: Arc<FailEvent>, _ctx: Context<Deps>| {
                 let ac = ac.clone();
@@ -1083,7 +1083,6 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
         .with_handler(
             handler::on::<FailEvent>()
                 .id("fail_with_info")
-                .queued()
                 .retry(2)
                 .on_failure(|_event: Arc<FailEvent>, info: seesaw_core::ErrorContext| {
                     FailedTerminal {
@@ -1338,6 +1337,7 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
+            #[allow(deprecated)]
             handler::on::<EventA>()
                 .id("emit_b_queued")
                 .queued()
@@ -1536,7 +1536,6 @@ async fn queued_handler_timeout_goes_to_dlq() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<Ping>()
             .id("timeout_handler")
-            .queued()
             .timeout(Duration::from_millis(50))
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                 let c = c.clone();
@@ -1613,6 +1612,7 @@ async fn fanout_map_fanin_batch_metadata_propagates() -> Result<()> {
         )
         // Handler B: map each FanItem → MappedItem (1:1)
         .with_handler(
+            #[allow(deprecated)]
             handler::on::<FanItem>()
                 .id("map_b")
                 .queued()

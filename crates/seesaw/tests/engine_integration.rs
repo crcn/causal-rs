@@ -160,6 +160,7 @@ async fn queued_handler_executes() -> Result<()> {
     let counter_clone = counter.clone();
 
     let engine = Engine::new(Deps).with_handler(
+        #[allow(deprecated)]
         handler::on::<Ping>()
             .id("queued_ping")
             .queued()
@@ -189,6 +190,7 @@ async fn emit_requires_settled() -> Result<()> {
     let counter_clone = counter.clone();
 
     let engine = Engine::new(Deps).with_handler(
+        #[allow(deprecated)]
         handler::on::<Ping>()
             .id("queued_fire_forget")
             .queued()
@@ -245,7 +247,6 @@ async fn retry_succeeds_on_second_attempt() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<FailEvent>()
             .id("retry_handler")
-            .queued()
             .retry(3)
             .then(move |_event: Arc<FailEvent>, _ctx: Context<Deps>| {
                 let ac = ac.clone();
@@ -285,6 +286,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
+            #[allow(deprecated)]
             handler::on::<FailEvent>()
                 .id("always_fail")
                 .queued()
@@ -383,6 +385,7 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
+            #[allow(deprecated)]
             handler::on::<EventA>()
                 .id("emit_b_queued")
                 .queued()
@@ -419,6 +422,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
+            #[allow(deprecated)]
             handler::on::<FailEvent>()
                 .id("always_fail_corr")
                 .queued()
@@ -659,6 +663,7 @@ async fn settled_timeout_succeeds_when_fast() -> Result<()> {
 #[tokio::test]
 async fn settled_timeout_errors_when_slow() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
+        #[allow(deprecated)]
         handler::on::<Ping>()
             .id("slow_handler")
             .queued()
@@ -695,7 +700,6 @@ async fn backoff_retries_handler_with_exponential_delay() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<Ping>()
             .id("backoff_ping")
-            .queued()
             .retry(3)
             .backoff(std::time::Duration::from_millis(20))
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
