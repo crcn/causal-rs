@@ -85,9 +85,11 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// // Usage: engine.with_aggregators(order_aggregators::aggregators())
 /// ```
 #[proc_macro_attribute]
-pub fn aggregators(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn aggregators(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let module_metas =
+        parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
     let mut module = parse_macro_input!(item as ItemMod);
-    match expand_aggregators_module(&mut module) {
+    match expand_aggregators_module(&module_metas, &mut module) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
@@ -1584,12 +1586,20 @@ fn expand_aggregator(
     input_fn: ItemFn,
 ) -> syn::Result<TokenStream2> {
     let id_access = parse_aggregator_id_access(metas)?;
+    expand_aggregator_with_id(&id_access, &input_fn)
+}
+
+/// Expand an aggregator function with a pre-resolved `IdAccess`.
+fn expand_aggregator_with_id(
+    id_access: &IdAccess,
+    input_fn: &ItemFn,
+) -> syn::Result<TokenStream2> {
     let (agg_ty, agg_ident, event_ty, event_ident) = parse_aggregator_params(&input_fn.sig)?;
     let fn_name = &input_fn.sig.ident;
     let body = &input_fn.block;
     let factory_name = format_ident!("__seesaw_aggregator_{}", fn_name);
 
-    let id_expr = match &id_access {
+    let id_expr = match id_access {
         IdAccess::Field(ident) => quote! { e.#ident },
         IdAccess::Method(ident) => quote! { e.#ident() },
         IdAccess::Singleton => quote! { ::uuid::Uuid::nil() },
@@ -1610,7 +1620,15 @@ fn expand_aggregator(
 }
 
 /// Expand `#[aggregators]` on a module.
-fn expand_aggregators_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
+///
+/// When `#[aggregators(singleton)]` (or `id = "..."` / `id_fn = "..."`) is provided,
+/// all `fn` items in the module are treated as aggregator functions — no per-function
+/// `#[aggregator]` attribute needed. Functions with their own `#[aggregator(...)]`
+/// override the module-level default.
+fn expand_aggregators_module(
+    module_metas: &Punctuated<Meta, Token![,]>,
+    module: &mut ItemMod,
+) -> syn::Result<TokenStream2> {
     let Some((_, items)) = &mut module.content else {
         return Err(syn::Error::new_spanned(
             module,
@@ -1618,26 +1636,54 @@ fn expand_aggregators_module(module: &mut ItemMod) -> syn::Result<TokenStream2> 
         ));
     };
 
+    let module_id_access = if module_metas.is_empty() {
+        None
+    } else {
+        Some(parse_aggregator_id_access(module_metas)?)
+    };
+
     let mut factory_names = Vec::new();
+    let mut expanded_fns = Vec::new();
+    let mut expanded_fn_names = Vec::new();
 
     for item in items.iter() {
         let Item::Fn(item_fn) = item else {
             continue;
         };
-        if !has_attr_any(&item_fn.attrs, &["aggregator"]) {
-            continue;
-        }
 
-        let factory_name = format_ident!("__seesaw_aggregator_{}", item_fn.sig.ident);
-        factory_names.push(factory_name);
+        let has_aggregator_attr = has_attr_any(&item_fn.attrs, &["aggregator"]);
+
+        if has_aggregator_attr {
+            // Has per-function #[aggregator(...)]: standalone proc macro handles it
+            let factory_name = format_ident!("__seesaw_aggregator_{}", item_fn.sig.ident);
+            factory_names.push(factory_name);
+        } else if let Some(ref default_id) = module_id_access {
+            // No per-function attr, but module-level default exists: expand inline
+            let factory_name = format_ident!("__seesaw_aggregator_{}", item_fn.sig.ident);
+            factory_names.push(factory_name.clone());
+            expanded_fn_names.push(item_fn.sig.ident.to_string());
+            expanded_fns.push(expand_aggregator_with_id(default_id, item_fn)?);
+        }
     }
 
     if factory_names.is_empty() {
-        return Err(syn::Error::new_spanned(
-            module,
-            "#[aggregators] module must contain at least one #[aggregator] function",
-        ));
+        let msg = if module_id_access.is_some() {
+            "#[aggregators] module must contain at least one function"
+        } else {
+            "#[aggregators] module must contain at least one #[aggregator] function"
+        };
+        return Err(syn::Error::new_spanned(module, msg));
     }
+
+    // Remove functions that were expanded via module-level default
+    // (they live outside the module now as impl + factory)
+    items.retain(|item| {
+        if let Item::Fn(item_fn) = item {
+            !expanded_fn_names.contains(&item_fn.sig.ident.to_string())
+        } else {
+            true
+        }
+    });
 
     let aggregators_fn: ItemFn = parse_quote! {
         pub fn aggregators() -> ::std::vec::Vec<::seesaw_core::Aggregator> {
@@ -1646,5 +1692,9 @@ fn expand_aggregators_module(module: &mut ItemMod) -> syn::Result<TokenStream2> 
     };
     items.push(Item::Fn(aggregators_fn));
 
-    Ok(quote! { #module })
+    let expanded = quote! { #module };
+    Ok(quote! {
+        #expanded
+        #(#expanded_fns)*
+    })
 }

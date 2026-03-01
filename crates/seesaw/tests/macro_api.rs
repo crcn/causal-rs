@@ -356,12 +356,21 @@ struct StepCompleted {
     name: String,
 }
 
-#[aggregators]
+#[derive(Clone, Serialize, Deserialize)]
+struct StepFailed {
+    reason: String,
+}
+
+// Module-level singleton — no #[aggregator] needed on each fn
+#[aggregators(singleton)]
 mod singleton_aggregators {
     use super::*;
 
-    #[aggregator(singleton)]
     fn on_step(stats: &mut RunStats, _event: StepCompleted) {
+        stats.event_count += 1;
+    }
+
+    fn on_failure(stats: &mut RunStats, _event: StepFailed) {
         stats.event_count += 1;
     }
 }
@@ -369,8 +378,9 @@ mod singleton_aggregators {
 #[test]
 fn singleton_aggregator_produces_vec() {
     let aggs = singleton_aggregators::aggregators();
-    assert_eq!(aggs.len(), 1);
+    assert_eq!(aggs.len(), 2);
     assert_eq!(aggs[0].aggregate_type, "RunStats");
+    assert_eq!(aggs[1].aggregate_type, "RunStats");
 }
 
 #[test]
@@ -383,8 +393,8 @@ fn singleton_aggregator_apply_works() {
     });
     assert_eq!(stats.event_count, 1);
 
-    stats.apply(StepCompleted {
-        name: "transform".into(),
+    stats.apply(StepFailed {
+        reason: "timeout".into(),
     });
     assert_eq!(stats.event_count, 2);
 }
