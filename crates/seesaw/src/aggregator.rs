@@ -361,6 +361,33 @@ impl AggregatorRegistry {
         (prev, next)
     }
 
+    /// Get the (prev, next) transition as `Arc<A>` — zero-clone read access.
+    ///
+    /// Prefer this over [`get_transition`] when the aggregate is expensive to
+    /// clone (e.g. contains `HashMap`s). Returns `Arc::new(A::default())` when
+    /// no state exists.
+    pub fn get_transition_arc<A>(&self, id: Uuid) -> (Arc<A>, Arc<A>)
+    where
+        A: Aggregate + 'static,
+    {
+        let key = format!("{}:{}", A::aggregate_type(), id);
+        let prev_key = format!("{}:prev", key);
+
+        let next = self
+            .state
+            .get(&key)
+            .and_then(|entry| entry.state.clone().downcast::<A>().ok())
+            .unwrap_or_else(|| Arc::new(A::default()));
+
+        let prev = self
+            .state
+            .get(&prev_key)
+            .and_then(|entry| entry.state.clone().downcast::<A>().ok())
+            .unwrap_or_else(|| Arc::new(A::default()));
+
+        (prev, next)
+    }
+
     // ── EventStore integration helpers ──────────────────────────────
 
     /// Check if the DashMap has state for a given aggregate key.
