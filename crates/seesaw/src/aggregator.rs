@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::event_store::event_type_short_name;
+use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate + Apply traits ─────────────────────────────────────
 
@@ -147,10 +148,21 @@ impl Aggregator {
 
 // ── AggregatorRegistry ──────────────────────────────────────────────
 
+/// State entry that pairs aggregate state with its stream version.
+///
+/// Version travels with state in a single DashMap entry to avoid
+/// split-brain between separate maps.
+#[derive(Clone)]
+struct StateEntry {
+    state: Arc<dyn Any + Send + Sync>,
+    /// Stream version from the EventStore (0 = never persisted / unknown).
+    version: u64,
+}
+
 /// Registry of aggregators with owned in-memory state.
 pub struct AggregatorRegistry {
     aggregators: Vec<Aggregator>,
-    state: DashMap<String, Arc<dyn Any + Send + Sync>>,
+    state: DashMap<String, StateEntry>,
 }
 
 impl AggregatorRegistry {
@@ -183,6 +195,7 @@ impl AggregatorRegistry {
     /// 1. Read current state (or create default)
     /// 2. Clone current state → prev snapshot
     /// 3. Apply event to cloned current state
+    /// 4. Increment version atomically with state update
     ///
     /// State is stored as concrete types via `Arc<dyn Any>` — zero serialization overhead.
     pub fn apply_event(
@@ -205,31 +218,34 @@ impl AggregatorRegistry {
             let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
             let prev_key = format!("{}:prev", key);
 
-            // Get current state, or create default.
-            let current_arc = self.state.get(&key).map(|v| Arc::clone(v.value()));
-            let current: &dyn Any = match current_arc.as_deref() {
-                Some(state) => state,
+            // Get current entry, or create default.
+            let current_entry = self.state.get(&key).map(|v| v.value().clone());
+            let (current_state, current_version) = match current_entry {
+                Some(entry) => (entry.state, entry.version),
                 None => {
                     // No state yet — create default, store it, and apply
                     let default = Arc::from(agg.default_state());
-                    self.state.insert(key.clone(), default);
+                    self.state.insert(key.clone(), StateEntry { state: default, version: 0 });
                     return self.apply_event_inner(agg, &key, &prev_key, payload);
                 }
             };
 
             // Clone current state for mutation
-            let mut next_state = agg.clone_state(current);
+            let mut next_state = agg.clone_state(current_state.as_ref());
 
             // Store prev snapshot (cheap Arc clone of existing state)
-            self.state.insert(prev_key, current_arc.unwrap());
+            self.state.insert(prev_key, StateEntry { state: current_state, version: 0 });
 
             // Apply event to the cloned state
             if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
                 tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
             }
 
-            // Store updated state
-            self.state.insert(key, Arc::from(next_state));
+            // Store updated state with incremented version
+            self.state.insert(key, StateEntry {
+                state: Arc::from(next_state),
+                version: current_version + 1,
+            });
         }
     }
 
@@ -241,11 +257,14 @@ impl AggregatorRegistry {
         prev_key: &str,
         payload: &serde_json::Value,
     ) {
-        let current_arc = self.state.get(key).map(|v| Arc::clone(v.value())).unwrap();
-        let mut next_state = agg.clone_state(current_arc.as_ref());
+        let current_entry = self.state.get(key).map(|v| v.value().clone()).unwrap();
+        let mut next_state = agg.clone_state(current_entry.state.as_ref());
 
         // Store prev snapshot
-        self.state.insert(prev_key.to_string(), current_arc);
+        self.state.insert(prev_key.to_string(), StateEntry {
+            state: current_entry.state,
+            version: 0,
+        });
 
         // Apply event
         if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
@@ -253,7 +272,10 @@ impl AggregatorRegistry {
         }
 
         // Store updated state
-        self.state.insert(key.to_string(), Arc::from(next_state));
+        self.state.insert(key.to_string(), StateEntry {
+            state: Arc::from(next_state),
+            version: current_entry.version + 1,
+        });
     }
 
     /// Replay a sequence of persisted events to reconstruct aggregate state.
@@ -262,11 +284,15 @@ impl AggregatorRegistry {
     /// Uses short name matching so persisted events (e.g. `"OrderPlaced"`)
     /// match aggregators registered with full type paths.
     ///
+    /// Upcasters are applied to each event payload before deserialization,
+    /// transforming old schemas to the current version.
+    ///
     /// Returns `None` if no aggregators are registered for this aggregate type.
     pub fn replay_events(
         &self,
         aggregate_type: &str,
         events: &[(&str, &serde_json::Value)],
+        upcasters: &UpcasterRegistry,
     ) -> Result<Option<Box<dyn Any + Send + Sync>>> {
         // Find any aggregator for this aggregate_type to get default_state
         let first = self
@@ -282,6 +308,9 @@ impl AggregatorRegistry {
         let mut state = first.default_state();
 
         for (event_type, payload) in events {
+            // Apply upcasters before deserialization (schema_version=0 as default)
+            let upcasted_payload = upcasters.upcast(event_type, 0, (*payload).clone())?;
+
             // Find aggregators where the short name matches
             let matching: Vec<&Aggregator> = self
                 .aggregators
@@ -293,7 +322,7 @@ impl AggregatorRegistry {
                 .collect();
 
             for agg in matching {
-                agg.apply_to(state.as_mut(), (*payload).clone())?;
+                agg.apply_to(state.as_mut(), upcasted_payload.clone())?;
             }
         }
 
@@ -315,16 +344,87 @@ impl AggregatorRegistry {
         let next = self
             .state
             .get(&key)
-            .and_then(|arc| arc.downcast_ref::<A>().cloned())
+            .and_then(|entry| entry.state.downcast_ref::<A>().cloned())
             .unwrap_or_default();
 
         let prev = self
             .state
             .get(&prev_key)
-            .and_then(|arc| arc.downcast_ref::<A>().cloned())
+            .and_then(|entry| entry.state.downcast_ref::<A>().cloned())
             .unwrap_or_default();
 
         (prev, next)
+    }
+
+    // ── EventStore integration helpers ──────────────────────────────
+
+    /// Check if the DashMap has state for a given aggregate key.
+    pub fn has_state(&self, key: &str) -> bool {
+        self.state.contains_key(key)
+    }
+
+    /// Inject hydrated state + version into the DashMap.
+    ///
+    /// Used during cold-start hydration from the EventStore.
+    pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: u64) {
+        self.state.insert(key.to_string(), StateEntry { state, version });
+    }
+
+    /// Read the stream version from the DashMap entry.
+    ///
+    /// Returns 0 if no state exists (consistent with "version 0 = empty stream").
+    pub fn get_version(&self, key: &str) -> u64 {
+        self.state
+            .get(key)
+            .map(|entry| entry.version)
+            .unwrap_or(0)
+    }
+
+    /// Get a clone of the state for a given aggregate key.
+    ///
+    /// Returns `None` if no state exists. Used by `save_snapshot`.
+    pub fn get_state(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.state.get(key).map(|entry| entry.state.clone())
+    }
+
+    /// Find the first aggregator registered for a given aggregate type string.
+    ///
+    /// Used to access `deserialize_state` / `default_state` during hydration.
+    pub fn find_first_by_aggregate_type(&self, aggregate_type: &str) -> Option<&Aggregator> {
+        self.aggregators
+            .iter()
+            .find(|a| a.aggregate_type == aggregate_type)
+    }
+
+    /// Replay events onto an existing state (for snapshot + partial replay).
+    ///
+    /// Matches events by short type name (same as `replay_events`).
+    /// Upcasters are applied before deserialization.
+    pub fn replay_events_onto(
+        &self,
+        aggregate_type: &str,
+        state: &mut dyn Any,
+        events: &[(&str, &serde_json::Value)],
+        upcasters: &UpcasterRegistry,
+    ) -> Result<()> {
+        for (event_type, payload) in events {
+            let upcasted = upcasters.upcast(event_type, 0, (*payload).clone())?;
+
+            let matching: Vec<&Aggregator> = self
+                .aggregators
+                .iter()
+                .filter(|a| {
+                    a.aggregate_type == aggregate_type
+                        && event_type_short_name(&a.event_type) == *event_type
+                })
+                .collect();
+
+            for agg in matching {
+                agg.apply_to(state, upcasted.clone())?;
+            }
+        }
+
+        Ok(())
     }
 }
 

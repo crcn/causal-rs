@@ -9,6 +9,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use dashmap::DashMap;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -32,6 +34,8 @@ pub struct PersistedEvent {
     pub event_type: String,
     /// JSON payload.
     pub payload: serde_json::Value,
+    /// Schema version for upcaster chain (0 = original/current).
+    pub schema_version: u32,
     /// When the event was persisted.
     pub created_at: DateTime<Utc>,
 }
@@ -43,6 +47,8 @@ pub struct NewEvent {
     pub event_type: String,
     /// JSON payload.
     pub payload: serde_json::Value,
+    /// Schema version for upcaster chain (0 = original/current).
+    pub schema_version: u32,
 }
 
 /// Concurrency conflict when appending events.
@@ -165,6 +171,7 @@ impl EventStore for MemoryEventStore {
                 aggregate_id,
                 event_type: new_event.event_type,
                 payload: new_event.payload,
+                schema_version: new_event.schema_version,
                 created_at: Utc::now(),
             });
         }
@@ -194,48 +201,6 @@ impl EventStore for MemoryEventStore {
 
 // ── Standalone functions ───────────────────────────────────────────
 
-/// Load an aggregate by replaying its event stream.
-///
-/// Returns `Versioned<A>` with the reconstructed state and current stream version.
-/// If no events exist, returns the default state at version 0.
-pub async fn load_aggregate<A: Aggregate>(
-    store: &dyn EventStore,
-    aggregators: &AggregatorRegistry,
-    id: Uuid,
-) -> Result<Versioned<A>> {
-    let events = store.load_events(id).await?;
-
-    if events.is_empty() {
-        return Ok(Versioned {
-            state: A::default(),
-            version: 0,
-        });
-    }
-
-    let event_pairs: Vec<(&str, &serde_json::Value)> = events
-        .iter()
-        .map(|e| (e.event_type.as_str(), &e.payload))
-        .collect();
-
-    let last_version = events.last().unwrap().version;
-
-    match aggregators.replay_events(A::aggregate_type(), &event_pairs)? {
-        Some(state) => {
-            let state = state
-                .downcast::<A>()
-                .map_err(|_| anyhow::anyhow!("failed to downcast replayed state to {}", A::aggregate_type()))?;
-            Ok(Versioned {
-                state: *state,
-                version: last_version,
-            })
-        }
-        None => Ok(Versioned {
-            state: A::default(),
-            version: last_version,
-        }),
-    }
-}
-
 /// Persist an event to the event store.
 ///
 /// Uses the short type name (e.g. `"OrderPlaced"`) for durable storage.
@@ -261,8 +226,114 @@ where
             vec![NewEvent {
                 event_type,
                 payload,
+                schema_version: 0,
             }],
         )
+        .await
+}
+
+// ── Snapshot types ──────────────────────────────────────────────────
+
+/// A serialized snapshot of aggregate state at a specific stream version.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub aggregate_type: String,
+    pub aggregate_id: Uuid,
+    pub version: u64,
+    pub state: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Persistent store for aggregate snapshots.
+///
+/// Optional optimization — without it, cold-start hydration replays
+/// all events from the EventStore.
+pub trait SnapshotStore: Send + Sync {
+    /// Load the latest snapshot for an aggregate.
+    fn load_snapshot(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Snapshot>>> + Send + '_>>;
+
+    /// Save a snapshot of aggregate state.
+    fn save_snapshot(
+        &self,
+        snapshot: Snapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+/// In-memory `SnapshotStore` for testing.
+pub struct MemorySnapshotStore {
+    snapshots: DashMap<(String, Uuid), Snapshot>,
+}
+
+impl MemorySnapshotStore {
+    pub fn new() -> Self {
+        Self {
+            snapshots: DashMap::new(),
+        }
+    }
+}
+
+impl Default for MemorySnapshotStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SnapshotStore for MemorySnapshotStore {
+    fn load_snapshot(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Snapshot>>> + Send + '_>> {
+        let key = (aggregate_type.to_string(), aggregate_id);
+        let snapshot = self.snapshots.get(&key).map(|v| v.value().clone());
+        Box::pin(std::future::ready(Ok(snapshot)))
+    }
+
+    fn save_snapshot(
+        &self,
+        snapshot: Snapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let key = (snapshot.aggregate_type.clone(), snapshot.aggregate_id);
+        self.snapshots.insert(key, snapshot);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+/// Save a snapshot of aggregate state from the AggregatorRegistry.
+///
+/// Serializes the current in-memory state of aggregate `A` at `id` and
+/// persists it to the snapshot store for future hydration acceleration.
+pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::DeserializeOwned>(
+    snapshot_store: &dyn SnapshotStore,
+    aggregators: &AggregatorRegistry,
+    id: Uuid,
+) -> Result<()> {
+    let key = format!("{}:{}", A::aggregate_type(), id);
+    let version = aggregators.get_version(&key);
+
+    // Find the aggregator to serialize state
+    let agg = aggregators
+        .find_first_by_aggregate_type(A::aggregate_type())
+        .ok_or_else(|| anyhow::anyhow!("No aggregator registered for {}", A::aggregate_type()))?;
+
+    let state_ref = aggregators
+        .get_state(&key)
+        .ok_or_else(|| anyhow::anyhow!("No state for aggregate {}:{}", A::aggregate_type(), id))?;
+
+    let state_json = agg.serialize_state(state_ref.as_ref())?;
+
+    snapshot_store
+        .save_snapshot(Snapshot {
+            aggregate_type: A::aggregate_type().to_string(),
+            aggregate_id: id,
+            version,
+            state: state_json,
+            created_at: Utc::now(),
+        })
         .await
 }
 
@@ -300,10 +371,12 @@ mod tests {
                     NewEvent {
                         event_type: "OrderPlaced".to_string(),
                         payload: serde_json::json!({"total": 100}),
+                        schema_version: 0,
                     },
                     NewEvent {
                         event_type: "OrderShipped".to_string(),
                         payload: serde_json::json!({"tracking": "ABC"}),
+                        schema_version: 0,
                     },
                 ],
             )
@@ -334,6 +407,7 @@ mod tests {
                 vec![NewEvent {
                     event_type: "OrderPlaced".to_string(),
                     payload: serde_json::json!({}),
+                    schema_version: 0,
                 }],
             )
             .await
@@ -348,6 +422,7 @@ mod tests {
                 vec![NewEvent {
                     event_type: "OrderShipped".to_string(),
                     payload: serde_json::json!({}),
+                    schema_version: 0,
                 }],
             )
             .await;
@@ -372,14 +447,17 @@ mod tests {
                     NewEvent {
                         event_type: "OrderPlaced".to_string(),
                         payload: serde_json::json!({}),
+                        schema_version: 0,
                     },
                     NewEvent {
                         event_type: "OrderShipped".to_string(),
                         payload: serde_json::json!({}),
+                        schema_version: 0,
                     },
                     NewEvent {
                         event_type: "OrderDelivered".to_string(),
                         payload: serde_json::json!({}),
+                        schema_version: 0,
                     },
                 ],
             )
@@ -406,6 +484,7 @@ mod tests {
                 vec![NewEvent {
                     event_type: "OrderPlaced".to_string(),
                     payload: serde_json::json!({}),
+                    schema_version: 0,
                 }],
             )
             .await
@@ -419,6 +498,7 @@ mod tests {
                 vec![NewEvent {
                     event_type: "UserCreated".to_string(),
                     payload: serde_json::json!({}),
+                    schema_version: 0,
                 }],
             )
             .await
@@ -446,6 +526,7 @@ mod tests {
                 vec![NewEvent {
                     event_type: "OrderPlaced".to_string(),
                     payload: serde_json::json!({}),
+                    schema_version: 0,
                 }],
             )
             .await
@@ -459,6 +540,7 @@ mod tests {
                 vec![NewEvent {
                     event_type: "UserCreated".to_string(),
                     payload: serde_json::json!({}),
+                    schema_version: 0,
                 }],
             )
             .await
@@ -469,108 +551,6 @@ mod tests {
 
         // Positions should be globally unique and ordered
         assert!(events2[0].position > events1[0].position);
-    }
-
-    // Integration tests for load_aggregate and persist_event require
-    // Aggregate + Apply impls, tested in engine_integration.rs
-    #[tokio::test]
-    async fn load_aggregate_replays_from_event_store() {
-        use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
-
-        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-        struct Order {
-            status: String,
-            total: u64,
-        }
-
-        impl Aggregate for Order {
-            fn aggregate_type() -> &'static str {
-                "Order"
-            }
-        }
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct OrderPlaced {
-            order_id: Uuid,
-            total: u64,
-        }
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct OrderShipped {
-            order_id: Uuid,
-        }
-
-        impl Apply<OrderPlaced> for Order {
-            fn apply(&mut self, event: OrderPlaced) {
-                self.status = "placed".to_string();
-                self.total = event.total;
-            }
-        }
-
-        impl Apply<OrderShipped> for Order {
-            fn apply(&mut self, _event: OrderShipped) {
-                self.status = "shipped".to_string();
-            }
-        }
-
-        let store = MemoryEventStore::new();
-        let order_id = Uuid::new_v4();
-
-        // Pre-populate events using short names (as persist_event would)
-        store
-            .append_events(
-                "Order",
-                order_id,
-                0,
-                vec![
-                    NewEvent {
-                        event_type: "OrderPlaced".to_string(),
-                        payload: serde_json::json!({"order_id": order_id, "total": 250}),
-                    },
-                    NewEvent {
-                        event_type: "OrderShipped".to_string(),
-                        payload: serde_json::json!({"order_id": order_id}),
-                    },
-                ],
-            )
-            .await
-            .unwrap();
-
-        let mut aggregators = AggregatorRegistry::new();
-        aggregators.register(Aggregator::new::<OrderPlaced, Order, _>(|e| e.order_id));
-        aggregators.register(Aggregator::new::<OrderShipped, Order, _>(|e| e.order_id));
-
-        let versioned: Versioned<Order> =
-            load_aggregate(&store, &aggregators, order_id).await.unwrap();
-
-        assert_eq!(versioned.version, 2);
-        assert_eq!(versioned.state.status, "shipped");
-        assert_eq!(versioned.state.total, 250);
-    }
-
-    #[tokio::test]
-    async fn load_aggregate_returns_default_when_no_events() {
-        use crate::aggregator::{Aggregate, AggregatorRegistry};
-
-        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-        struct Order {
-            status: String,
-        }
-
-        impl Aggregate for Order {
-            fn aggregate_type() -> &'static str {
-                "Order"
-            }
-        }
-
-        let store = MemoryEventStore::new();
-        let aggregators = AggregatorRegistry::new();
-
-        let versioned: Versioned<Order> =
-            load_aggregate(&store, &aggregators, Uuid::new_v4()).await.unwrap();
-
-        assert_eq!(versioned.version, 0);
-        assert_eq!(versioned.state, Order::default());
     }
 
     #[tokio::test]

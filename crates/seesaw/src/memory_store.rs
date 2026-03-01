@@ -171,6 +171,15 @@ impl MemoryStore {
         }
     }
 
+    /// Returns the earliest `execute_at` of any queued effect, if any exist.
+    ///
+    /// Used by the settle loop to sleep until the next effect becomes ready
+    /// instead of exiting prematurely when only future-dated effects remain.
+    pub fn earliest_pending_effect_at(&self) -> Option<DateTime<Utc>> {
+        let queue = self.effects.lock();
+        queue.iter().map(|e| e.execute_at).min()
+    }
+
     pub async fn complete_effect(
         &self,
         event_id: Uuid,

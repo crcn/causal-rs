@@ -88,6 +88,7 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
     timeout: Option<Duration>,
     join_window: Option<Duration>,
     max_attempts: u32,
+    backoff: Option<Duration>,
     priority: Option<i32>,
     codec: Option<Arc<EventCodec>>,
     dlq_terminal_mapper: Option<super::types::DlqTerminalMapper>,
@@ -109,6 +110,7 @@ where
         timeout: None,
         join_window: None,
         max_attempts: 1,
+        backoff: None,
         priority: None,
         codec: Some(typed_event_codec::<E>()),
         dlq_terminal_mapper: None,
@@ -128,6 +130,7 @@ pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
         timeout: None,
         join_window: None,
         max_attempts: 1,
+        backoff: None,
         priority: None,
         codec: None,
         dlq_terminal_mapper: None,
@@ -154,6 +157,7 @@ where
             timeout: self.timeout,
             join_window: self.join_window,
             max_attempts: self.max_attempts,
+            backoff: self.backoff,
             priority: self.priority,
             codec: self.codec,
             dlq_terminal_mapper: self.dlq_terminal_mapper,
@@ -180,6 +184,7 @@ where
             timeout: self.timeout,
             join_window: self.join_window,
             max_attempts: self.max_attempts,
+            backoff: self.backoff,
             priority: self.priority,
             codec: self.codec,
             dlq_terminal_mapper: self.dlq_terminal_mapper,
@@ -209,6 +214,7 @@ impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
             timeout: self.timeout,
             join_window: self.join_window,
             max_attempts: self.max_attempts,
+            backoff: self.backoff,
             priority: self.priority,
             codec: self.codec,
             dlq_terminal_mapper: self.dlq_terminal_mapper,
@@ -313,6 +319,19 @@ where
         self
     }
 
+    /// Set exponential backoff base duration for retries.
+    ///
+    /// Each retry waits `base * 2^(attempt-1)`. For example, with
+    /// `backoff(Duration::from_secs(1))` and `retry(4)`:
+    /// - Attempt 1: immediate
+    /// - Attempt 2: 1s delay
+    /// - Attempt 3: 2s delay
+    /// - Attempt 4: 4s delay
+    pub fn backoff(mut self, base: Duration) -> Self {
+        self.backoff = Some(base);
+        self
+    }
+
     /// Set execution priority (lower = higher priority).
     ///
     /// For inline handlers, lower priority runs first.
@@ -412,6 +431,7 @@ where
             delay: self.inner.delay,
             timeout: self.inner.timeout,
             max_attempts: self.inner.max_attempts.max(1),
+            backoff: self.inner.backoff,
             priority: self.inner.priority,
         }
     }
@@ -541,6 +561,7 @@ where
             delay: self.delay,
             timeout: self.timeout,
             max_attempts: self.max_attempts,
+            backoff: self.backoff,
             priority: self.priority,
         }
     }
@@ -579,6 +600,7 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
             delay: self.delay,
             timeout: self.timeout,
             max_attempts: self.max_attempts,
+            backoff: self.backoff,
             priority: self.priority,
         }
     }
@@ -624,6 +646,7 @@ where
             delay: self.delay,
             timeout: self.timeout,
             max_attempts: self.max_attempts,
+            backoff: self.backoff,
             priority: self.priority,
         }
     }
@@ -675,6 +698,7 @@ where
                 timeout: self.timeout,
                 join_window: self.join_window,
                 max_attempts: self.max_attempts,
+                backoff: self.backoff,
                 priority: self.priority,
                 codec: self.codec,
                 dlq_terminal_mapper: self.dlq_terminal_mapper,
@@ -764,6 +788,7 @@ where
             delay: self.inner.delay,
             timeout: self.inner.timeout,
             max_attempts: self.inner.max_attempts,
+            backoff: self.inner.backoff,
             priority: self.inner.priority,
         }
     }

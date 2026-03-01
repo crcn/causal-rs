@@ -3,11 +3,13 @@
 use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::runtime::Runtime;
 
 /// Handle returned after an event is published.
+#[derive(Debug)]
 pub struct ProcessHandle {
     pub correlation_id: Uuid,
     pub event_id: Uuid,
@@ -64,6 +66,7 @@ impl EmitFuture {
         SettleFuture {
             publish: self.publish,
             settle: self.settle,
+            timeout_duration: None,
             task: None,
         }
     }
@@ -78,6 +81,7 @@ impl EmitFuture {
             publish: self.publish,
             settle_with_runtime: self.settle_with_runtime,
             runtime,
+            timeout_duration: None,
             task: None,
         }
     }
@@ -113,10 +117,32 @@ pub type DispatchFuture = EmitFuture;
 /// Two phases:
 /// 1. Publish the event
 /// 2. Drive settlement (process all pending events/effects)
+///
+/// Optionally wraps settlement with a wall-clock timeout via `.timeout()`.
 pub struct SettleFuture {
     publish: Option<PublishFn>,
     settle: Option<SettleFn>,
+    timeout_duration: Option<Duration>,
     task: Option<Pin<Box<dyn Future<Output = Result<ProcessHandle>> + Send>>>,
+}
+
+impl SettleFuture {
+    /// Set a wall-clock timeout for the settlement phase.
+    ///
+    /// If settlement takes longer than `duration`, returns an error.
+    /// The publish phase is not subject to the timeout — only the
+    /// settle loop (processing all pending events/effects).
+    ///
+    /// ```ignore
+    /// engine.emit(event)
+    ///     .settled()
+    ///     .timeout(Duration::from_secs(30))
+    ///     .await?;
+    /// ```
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout_duration = Some(duration);
+        self
+    }
 }
 
 impl Future for SettleFuture {
@@ -137,9 +163,21 @@ impl Future for SettleFuture {
                 .settle
                 .take()
                 .expect("SettleFuture polled after completion");
+            let timeout_duration = this.timeout_duration;
             this.task = Some(Box::pin(async move {
                 let handle = publish().await?;
-                settle().await?;
+                if let Some(duration) = timeout_duration {
+                    tokio::time::timeout(duration, settle())
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "Settlement timed out after {:.1}s",
+                                duration.as_secs_f64()
+                            )
+                        })??;
+                } else {
+                    settle().await?;
+                }
                 Ok(handle)
             }));
         }
@@ -153,11 +191,24 @@ impl Future for SettleFuture {
 /// Two phases:
 /// 1. Publish the event
 /// 2. Drive settlement using the borrowed runtime for `run()`
+///
+/// Optionally wraps settlement with a wall-clock timeout via `.timeout()`.
 pub struct SettleWithFuture<'a> {
     publish: Option<PublishFn>,
     settle_with_runtime: Option<SettleWithRuntimeFn>,
     runtime: &'a dyn Runtime,
+    timeout_duration: Option<Duration>,
     task: Option<Pin<Box<dyn Future<Output = Result<ProcessHandle>> + Send + 'a>>>,
+}
+
+impl<'a> SettleWithFuture<'a> {
+    /// Set a wall-clock timeout for the settlement phase.
+    ///
+    /// If settlement takes longer than `duration`, returns an error.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout_duration = Some(duration);
+        self
+    }
 }
 
 impl<'a> Future for SettleWithFuture<'a> {
@@ -179,9 +230,21 @@ impl<'a> Future for SettleWithFuture<'a> {
                 .take()
                 .expect("SettleWithFuture polled after completion");
             let runtime = this.runtime;
+            let timeout_duration = this.timeout_duration;
             this.task = Some(Box::pin(async move {
                 let handle = publish().await?;
-                settle_with(runtime).await?;
+                if let Some(duration) = timeout_duration {
+                    tokio::time::timeout(duration, settle_with(runtime))
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "Settlement timed out after {:.1}s",
+                                duration.as_secs_f64()
+                            )
+                        })??;
+                } else {
+                    settle_with(runtime).await?;
+                }
                 Ok(handle)
             }));
         }

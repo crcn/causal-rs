@@ -12,6 +12,9 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
+use crate::event_store::{
+    event_type_short_name, ConcurrencyError, EventStore, NewEvent, SnapshotStore,
+};
 use crate::handler::{Context, Handler};
 use crate::handler_registry::HandlerRegistry;
 use crate::runtime::{DirectRuntime, Runtime};
@@ -21,6 +24,7 @@ use crate::process::{EmitFuture, ProcessHandle, SettleWithRuntimeFn};
 use crate::types::{
     EventWorkerConfig, HandlerWorkerConfig, QueuedEvent, QueuedHandlerExecution, NAMESPACE_SEESAW,
 };
+use crate::upcaster::{Upcaster, UpcasterRegistry};
 
 /// In-memory Engine with built-in settle loop.
 ///
@@ -34,7 +38,10 @@ where
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
+    upcasters: Arc<UpcasterRegistry>,
     runtime: Arc<dyn Runtime>,
+    event_store: Option<Arc<dyn EventStore>>,
+    snapshot_store: Option<Arc<dyn SnapshotStore>>,
 }
 
 impl<D> Engine<D>
@@ -48,7 +55,10 @@ where
             deps: Arc::new(deps),
             effects: Arc::new(HandlerRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
+            upcasters: Arc::new(UpcasterRegistry::new()),
             runtime: Arc::new(DirectRuntime::new()),
+            event_store: None,
+            snapshot_store: None,
         }
     }
 
@@ -60,6 +70,24 @@ where
     /// Set a custom runtime (e.g. RestateRuntime for durable execution).
     pub fn with_runtime<R: Runtime + 'static>(mut self, runtime: R) -> Self {
         self.runtime = Arc::new(runtime);
+        self
+    }
+
+    /// Set a persistent event store for auto-persist and cold-start hydration.
+    ///
+    /// When set, events matching registered aggregators are automatically
+    /// persisted, and aggregates are hydrated from the store on cold access.
+    pub fn with_event_store(mut self, store: Arc<dyn EventStore>) -> Self {
+        self.event_store = Some(store);
+        self
+    }
+
+    /// Set a snapshot store for hydration acceleration.
+    ///
+    /// Optional optimization — without it, cold-start hydration replays
+    /// all events from the EventStore.
+    pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
+        self.snapshot_store = Some(store);
         self
     }
 
@@ -127,6 +155,34 @@ where
         for aggregator in aggregators {
             registry.register(aggregator);
         }
+        self
+    }
+
+    /// Register an upcaster for event type `E`.
+    ///
+    /// Upcasters transform old event payloads to the current schema during decode.
+    /// Chain multiple upcasters to evolve through versions: v1 → v2 → v3 → current.
+    ///
+    /// ```ignore
+    /// let engine = Engine::new(deps)
+    ///     .with_upcaster::<OrderPlaced>(1, |mut v: serde_json::Value| {
+    ///         v["currency"] = serde_json::json!("USD");
+    ///         Ok(v)
+    ///     });
+    /// ```
+    pub fn with_upcaster<E, F>(mut self, from_version: u32, transform: F) -> Self
+    where
+        E: 'static,
+        F: Fn(serde_json::Value) -> anyhow::Result<serde_json::Value> + Send + Sync + 'static,
+    {
+        let short_name = event_type_short_name(std::any::type_name::<E>()).to_string();
+        Arc::get_mut(&mut self.upcasters)
+            .expect("Cannot add upcaster after cloning")
+            .register(Upcaster {
+                event_type: short_name,
+                from_version,
+                transform: Arc::new(transform),
+            });
         self
     }
 
@@ -222,6 +278,7 @@ where
             self.deps.clone(),
             self.effects.clone(),
             self.aggregators.clone(),
+            self.upcasters.clone(),
         );
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
@@ -232,6 +289,14 @@ where
             // Drain event queue
             while let Some(event) = self.store.poll_next().await? {
                 processed_any = true;
+
+                // Hydrate cold aggregates + auto-persist before state mutation.
+                // The settle loop processes events sequentially (single-writer),
+                // so multiple events targeting the same aggregate in one batch
+                // are safe — each sees the version left by the previous one.
+                if self.event_store.is_some() {
+                    self.hydrate_and_persist(&event).await?;
+                }
 
                 // Apply event to live aggregator state before handlers run
                 self.apply_to_aggregators(&event);
@@ -348,13 +413,24 @@ where
                                 }
                             }
                             HandlerStatus::Retry { error, attempts } => {
+                                // Apply exponential backoff if configured
+                                let mut retried = execution_clone;
+                                if let Some(effect) = executor.effects().find_by_id(&handler_id) {
+                                    if let Some(base) = effect.backoff {
+                                        let multiplier = 2u64.saturating_pow(attempts.max(1) as u32 - 1);
+                                        let delay = base.saturating_mul(multiplier as u32);
+                                        retried.execute_at = chrono::Utc::now()
+                                            + chrono::Duration::from_std(delay)
+                                                .unwrap_or(chrono::Duration::seconds(60));
+                                    }
+                                }
                                 self.store
                                     .fail_effect(
                                         event_id,
                                         handler_id,
                                         error,
                                         attempts,
-                                        execution_clone,
+                                        retried,
                                     )
                                     .await?;
                             }
@@ -407,6 +483,16 @@ where
             }
 
             if !processed_any {
+                // Check if there are future-dated effects (from backoff or delay).
+                // If so, sleep until the earliest one becomes ready instead of exiting.
+                if let Some(earliest) = self.store.earliest_pending_effect_at() {
+                    let now = chrono::Utc::now();
+                    if earliest > now {
+                        let wait = (earliest - now).to_std().unwrap_or_default();
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                }
                 break; // Settled!
             }
         }
@@ -415,6 +501,144 @@ where
     }
 
     // --- Internal ---
+
+    /// Hydrate cold aggregates from EventStore and auto-persist the event.
+    ///
+    /// For each aggregator matching this event type:
+    /// 1. If DashMap is cold, hydrate from EventStore (with snapshot acceleration)
+    /// 2. Auto-persist the event to the aggregate's stream
+    async fn hydrate_and_persist(&self, event: &QueuedEvent) -> Result<()> {
+        let event_store = self.event_store.as_ref().unwrap();
+
+        let matching = self.aggregators.find_by_event_type(&event.event_type);
+        if matching.is_empty() {
+            return Ok(()); // No aggregators care about this event — not persisted
+        }
+
+        for agg in matching {
+            let aggregate_id = match agg.extract_id_from_json(&event.payload) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
+
+            // Step 1: Hydrate if cold
+            if !self.aggregators.has_state(&key) {
+                self.hydrate_aggregate(
+                    event_store.as_ref(),
+                    &agg.aggregate_type,
+                    aggregate_id,
+                    &key,
+                )
+                .await?;
+            }
+
+            // Step 2: Auto-persist
+            let current_version = self.aggregators.get_version(&key);
+            let short_name = event_type_short_name(&event.event_type);
+
+            match event_store
+                .append_events(
+                    &agg.aggregate_type,
+                    aggregate_id,
+                    current_version,
+                    vec![NewEvent {
+                        event_type: short_name.to_string(),
+                        payload: event.payload.clone(),
+                        schema_version: 0,
+                    }],
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    // ConcurrencyError: treat as idempotent success
+                    // (Restate replay may re-deliver already-persisted events)
+                    if e.downcast_ref::<ConcurrencyError>().is_some() {
+                        tracing::debug!(
+                            key,
+                            "ConcurrencyError during auto-persist, treating as idempotent"
+                        );
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Hydrate a single aggregate from EventStore (with optional snapshot acceleration).
+    async fn hydrate_aggregate(
+        &self,
+        event_store: &dyn EventStore,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+        key: &str,
+    ) -> Result<()> {
+        // Try snapshot store first
+        if let Some(snapshot_store) = &self.snapshot_store {
+            if let Some(snapshot) = snapshot_store
+                .load_snapshot(aggregate_type, aggregate_id)
+                .await?
+            {
+                let agg = self.aggregators.find_first_by_aggregate_type(aggregate_type);
+                if let Some(agg) = agg {
+                    let mut state = agg.deserialize_state(snapshot.state)?;
+
+                    // Load remaining events after snapshot
+                    let remaining = event_store
+                        .load_events_from(aggregate_id, snapshot.version + 1)
+                        .await?;
+
+                    if !remaining.is_empty() {
+                        let event_pairs: Vec<(&str, &serde_json::Value)> = remaining
+                            .iter()
+                            .map(|e| (e.event_type.as_str(), &e.payload))
+                            .collect();
+
+                        self.aggregators.replay_events_onto(
+                            aggregate_type,
+                            state.as_mut(),
+                            &event_pairs,
+                            &self.upcasters,
+                        )?;
+                    }
+
+                    let final_version = snapshot.version + remaining.len() as u64;
+                    self.aggregators
+                        .set_state(key, Arc::from(state), final_version);
+                    return Ok(());
+                }
+            }
+        }
+
+        // No snapshot — full replay
+        let events = event_store.load_events(aggregate_id).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let event_pairs: Vec<(&str, &serde_json::Value)> = events
+            .iter()
+            .map(|e| (e.event_type.as_str(), &e.payload))
+            .collect();
+
+        let last_version = events.last().unwrap().version;
+
+        if let Some(state) = self.aggregators.replay_events(
+            aggregate_type,
+            &event_pairs,
+            &self.upcasters,
+        )? {
+            self.aggregators
+                .set_state(key, Arc::from(state), last_version);
+        }
+
+        Ok(())
+    }
 
     async fn publish_event<E>(&self, event: E) -> Result<ProcessHandle>
     where
@@ -666,7 +890,10 @@ where
             deps: self.deps.clone(),
             effects: self.effects.clone(),
             aggregators: self.aggregators.clone(),
+            upcasters: self.upcasters.clone(),
             runtime: self.runtime.clone(),
+            event_store: self.event_store.clone(),
+            snapshot_store: self.snapshot_store.clone(),
         }
     }
 }

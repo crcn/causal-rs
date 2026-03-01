@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
+use crate::event_store::event_type_short_name;
 use crate::handler::{Context, DlqTerminalInfo, EventOutput, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::runtime::Runtime;
@@ -18,6 +19,7 @@ use crate::types::{
     EmittedEvent, EventWorkerConfig, HandlerWorkerConfig, QueuedEvent,
     QueuedHandlerExecution, QueuedHandlerIntent, NAMESPACE_SEESAW,
 };
+use crate::upcaster::UpcasterRegistry;
 
 /// Extracted execution logic for events and handlers.
 ///
@@ -30,6 +32,7 @@ where
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
     aggregator_registry: Arc<AggregatorRegistry>,
+    upcasters: Arc<UpcasterRegistry>,
 }
 
 impl<D> JobExecutor<D>
@@ -41,11 +44,13 @@ where
         deps: Arc<D>,
         effects: Arc<HandlerRegistry<D>>,
         aggregator_registry: Arc<AggregatorRegistry>,
+        upcasters: Arc<UpcasterRegistry>,
     ) -> Self {
         Self {
             deps,
             effects,
             aggregator_registry,
+            upcasters,
         }
     }
 
@@ -432,10 +437,16 @@ where
         event_type: &str,
         payload: &serde_json::Value,
     ) -> Result<(Arc<dyn Any + Send + Sync>, TypeId)> {
+        // Apply upcasters before decoding (schema_version=0 for now — events
+        // without a persisted version get the full upcaster chain as a no-op
+        // when no upcasters are registered).
+        let short_name = event_type_short_name(event_type);
+        let upcasted = self.upcasters.upcast(short_name, 0, payload.clone())?;
+
         let codec = self.effects.find_codec_by_event_type(event_type);
 
         if let Some(codec) = codec {
-            let typed = (codec.decode)(payload)?;
+            let typed = (codec.decode)(&upcasted)?;
             Ok((typed, codec.type_id))
         } else {
             warn!(
@@ -444,7 +455,7 @@ where
                  If this event was emitted by a queued handler, ensure the \
                  receiving handler is registered with the engine."
             );
-            Ok((Arc::new(payload.clone()), TypeId::of::<serde_json::Value>()))
+            Ok((Arc::new(upcasted), TypeId::of::<serde_json::Value>()))
         }
     }
 

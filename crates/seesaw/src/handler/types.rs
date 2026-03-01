@@ -318,6 +318,8 @@ where
     pub(crate) timeout: Option<Duration>,
     /// Maximum retry attempts (default: 1 = no retry = inline)
     pub(crate) max_attempts: u32,
+    /// Exponential backoff base duration for retries.
+    pub(crate) backoff: Option<Duration>,
     /// Execution priority (lower = higher priority).
     pub(crate) priority: Option<i32>,
 }
@@ -342,6 +344,7 @@ where
             delay: self.delay,
             timeout: self.timeout,
             max_attempts: self.max_attempts,
+            backoff: self.backoff,
             priority: self.priority,
         }
     }

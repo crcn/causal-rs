@@ -46,9 +46,18 @@ mod handler_registry;
 #[allow(dead_code)]
 pub(crate) mod memory_store;
 mod process;
+pub mod upcaster;
 
 // Re-export aggregator types
 pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
+
+// Re-export event store types
+pub use event_store::{
+    MemorySnapshotStore, Snapshot, SnapshotStore, save_snapshot,
+};
+
+// Re-export upcaster types
+pub use upcaster::{Upcaster, UpcasterRegistry};
 
 // Re-export main types
 pub use engine::Engine;

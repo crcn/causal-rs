@@ -1310,8 +1310,8 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
             }),
     );
 
-    // First settle: processes the event and creates the delayed effect intent.
-    // The effect's execute_at is in the future, so it won't be polled yet.
+    // settled() drives the full causal tree including delayed effects.
+    // The settle loop sleeps until the delay expires, then executes the handler.
     engine
         .emit(Ping {
             msg: "delayed".into(),
@@ -1321,20 +1321,8 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
 
     assert_eq!(
         counter.load(Ordering::SeqCst),
-        0,
-        "delayed handler should NOT execute immediately"
-    );
-
-    // Wait for the delay to expire
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Second settle: now the delayed effect is ready
-    engine.settle().await?;
-
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
         1,
-        "delayed handler should execute after delay"
+        "delayed handler should execute after delay within settled()"
     );
     Ok(())
 }
