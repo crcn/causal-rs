@@ -107,7 +107,7 @@ pub use job_executor::{
 };
 #[allow(deprecated)]
 pub use process::DispatchFuture;
-pub use process::{EmitFuture, ProcessHandle, SettleFuture};
+pub use process::{EmitFuture, ProcessHandle, SettleFuture, SettleWithFuture};
 pub use types::{
     EmittedEvent, EventProcessingCommit, EventWorkerConfig, ExpiredJoinWindow,
     HandlerWorkerConfig, InlineHandlerFailure, JoinEntry, QueuedEvent,

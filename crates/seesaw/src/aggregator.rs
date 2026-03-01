@@ -1,20 +1,20 @@
-//! Aggregator registry — purely declarative aggregate definitions.
+//! Aggregator registry — manages aggregate definitions and state.
 //!
 //! When an event is dispatched through the engine, matching aggregators
-//! apply it to state managed by the Runtime. No internal DashMap, no state ownership.
+//! apply it to state managed by the registry's internal DashMap.
 
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 
 use anyhow::Result;
+use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::event_store::event_type_short_name;
-use crate::runtime::Runtime;
 
 // ── Aggregate + Apply traits ─────────────────────────────────────
 
-/// Domain aggregate whose state is maintained by the Runtime.
+/// Domain aggregate whose state is maintained by the AggregatorRegistry.
 ///
 /// No event type association — use `Apply<E>` to define per-event state transitions.
 pub trait Aggregate: Default + Clone + Send + Sync + 'static {
@@ -147,15 +147,17 @@ impl Aggregator {
 
 // ── AggregatorRegistry ──────────────────────────────────────────────
 
-/// Purely declarative registry of aggregators. State lives in the Runtime.
+/// Registry of aggregators with owned in-memory state.
 pub struct AggregatorRegistry {
     aggregators: Vec<Aggregator>,
+    state: DashMap<String, Arc<dyn Any + Send + Sync>>,
 }
 
 impl AggregatorRegistry {
     pub fn new() -> Self {
         Self {
             aggregators: Vec::new(),
+            state: DashMap::new(),
         }
     }
 
@@ -175,20 +177,18 @@ impl AggregatorRegistry {
         self.aggregators.is_empty()
     }
 
-    /// Apply an event to all matching aggregators, using the Runtime for state.
+    /// Apply an event to all matching aggregators, using internal state.
     ///
     /// For each matching aggregator:
-    /// 1. Read current state from runtime (or create default)
-    /// 2. Clone current state → prev snapshot, store via runtime
-    /// 3. Apply event to cloned current state, store via runtime
+    /// 1. Read current state (or create default)
+    /// 2. Clone current state → prev snapshot
+    /// 3. Apply event to cloned current state
     ///
-    /// State is stored as concrete types via `Arc<dyn Any>` — zero serialization
-    /// overhead for `DirectRuntime`.
+    /// State is stored as concrete types via `Arc<dyn Any>` — zero serialization overhead.
     pub fn apply_event(
         &self,
         event_type: &str,
         payload: &serde_json::Value,
-        runtime: &dyn Runtime,
     ) {
         let matching: Vec<&Aggregator> = self
             .aggregators
@@ -205,17 +205,15 @@ impl AggregatorRegistry {
             let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
             let prev_key = format!("{}:prev", key);
 
-            // Get current state from runtime, or create default.
-            // The Arc wraps the concrete aggregate type (e.g., Order).
-            let current_arc = runtime.get_state(&key);
+            // Get current state, or create default.
+            let current_arc = self.state.get(&key).map(|v| Arc::clone(v.value()));
             let current: &dyn Any = match current_arc.as_deref() {
                 Some(state) => state,
                 None => {
-                    // No state yet — create default, store it, and get a reference
+                    // No state yet — create default, store it, and apply
                     let default = Arc::from(agg.default_state());
-                    runtime.set_state(&key, default);
-                    // Re-read to get the Arc reference
-                    return self.apply_event_inner(agg, &key, &prev_key, payload, runtime);
+                    self.state.insert(key.clone(), default);
+                    return self.apply_event_inner(agg, &key, &prev_key, payload);
                 }
             };
 
@@ -223,7 +221,7 @@ impl AggregatorRegistry {
             let mut next_state = agg.clone_state(current);
 
             // Store prev snapshot (cheap Arc clone of existing state)
-            runtime.set_state(&prev_key, current_arc.unwrap());
+            self.state.insert(prev_key, current_arc.unwrap());
 
             // Apply event to the cloned state
             if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
@@ -231,7 +229,7 @@ impl AggregatorRegistry {
             }
 
             // Store updated state
-            runtime.set_state(&key, Arc::from(next_state));
+            self.state.insert(key, Arc::from(next_state));
         }
     }
 
@@ -242,13 +240,12 @@ impl AggregatorRegistry {
         key: &str,
         prev_key: &str,
         payload: &serde_json::Value,
-        runtime: &dyn Runtime,
     ) {
-        let current_arc = runtime.get_state(key).unwrap();
+        let current_arc = self.state.get(key).map(|v| Arc::clone(v.value())).unwrap();
         let mut next_state = agg.clone_state(current_arc.as_ref());
 
         // Store prev snapshot
-        runtime.set_state(prev_key, current_arc);
+        self.state.insert(prev_key.to_string(), current_arc);
 
         // Apply event
         if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
@@ -256,7 +253,7 @@ impl AggregatorRegistry {
         }
 
         // Store updated state
-        runtime.set_state(key, Arc::from(next_state));
+        self.state.insert(key.to_string(), Arc::from(next_state));
     }
 
     /// Replay a sequence of persisted events to reconstruct aggregate state.
@@ -303,25 +300,27 @@ impl AggregatorRegistry {
         Ok(Some(state))
     }
 
-    /// Get the (prev, next) transition for an aggregate from the Runtime.
+    /// Get the (prev, next) transition for an aggregate from internal state.
     ///
-    /// Returns `(prev_state, current_state)` by reading from the runtime
+    /// Returns `(prev_state, current_state)` by reading from the internal DashMap
     /// and downcasting to the concrete aggregate type. Zero serialization.
     /// If no state exists, returns `(A::default(), A::default())`.
-    pub fn get_transition<A>(&self, id: Uuid, runtime: &dyn Runtime) -> (A, A)
+    pub fn get_transition<A>(&self, id: Uuid) -> (A, A)
     where
         A: Aggregate + 'static,
     {
         let key = format!("{}:{}", A::aggregate_type(), id);
         let prev_key = format!("{}:prev", key);
 
-        let next = runtime
-            .get_state(&key)
+        let next = self
+            .state
+            .get(&key)
             .and_then(|arc| arc.downcast_ref::<A>().cloned())
             .unwrap_or_default();
 
-        let prev = runtime
-            .get_state(&prev_key)
+        let prev = self
+            .state
+            .get(&prev_key)
             .and_then(|arc| arc.downcast_ref::<A>().cloned())
             .unwrap_or_default();
 

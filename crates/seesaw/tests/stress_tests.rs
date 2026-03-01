@@ -979,7 +979,6 @@ async fn custom_runtime_wraps_execution() -> Result<()> {
 
     struct SpyRuntime {
         calls: Arc<Mutex<Vec<String>>>,
-        inner: seesaw_core::DirectRuntime,
     }
 
     impl seesaw_core::Runtime for SpyRuntime {
@@ -1001,21 +1000,12 @@ async fn custom_runtime_wraps_execution() -> Result<()> {
             >,
         > {
             self.calls.lock().push(handler_id.to_string());
-            self.inner.run(handler_id, execution)
-        }
-
-        fn get_state(&self, key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-            self.inner.get_state(key)
-        }
-
-        fn set_state(&self, key: &str, value: Arc<dyn std::any::Any + Send + Sync>) {
-            self.inner.set_state(key, value)
+            execution
         }
     }
 
     let runtime = SpyRuntime {
         calls: calls_clone,
-        inner: seesaw_core::DirectRuntime::new(),
     };
 
     let engine = Engine::new(Deps)

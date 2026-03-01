@@ -17,7 +17,7 @@ use crate::handler_registry::HandlerRegistry;
 use crate::runtime::{DirectRuntime, Runtime};
 use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
-use crate::process::{EmitFuture, ProcessHandle};
+use crate::process::{EmitFuture, ProcessHandle, SettleWithRuntimeFn};
 use crate::types::{
     EventWorkerConfig, HandlerWorkerConfig, QueuedEvent, QueuedHandlerExecution, NAMESPACE_SEESAW,
 };
@@ -148,6 +148,7 @@ where
     {
         let engine = self.clone();
         let engine2 = self.clone();
+        let engine3 = self.clone();
 
         let publish: crate::process::PublishFn = Box::new(move || {
             Box::pin(async move { engine.publish_event(event).await })
@@ -157,7 +158,11 @@ where
             Box::pin(async move { engine2.settle().await })
         });
 
-        EmitFuture::new(publish, settle)
+        let settle_with: SettleWithRuntimeFn = Box::new(move |runtime| {
+            Box::pin(async move { engine3.settle_with(runtime).await })
+        });
+
+        EmitFuture::new(publish, settle, settle_with)
     }
 
     /// Emit a type-erased `EventOutput` directly.
@@ -173,6 +178,7 @@ where
     pub fn emit_output(&self, output: crate::handler::EventOutput) -> EmitFuture {
         let engine = self.clone();
         let engine2 = self.clone();
+        let engine3 = self.clone();
 
         let publish: crate::process::PublishFn = Box::new(move || {
             Box::pin(async move { engine.publish_output(output).await })
@@ -182,7 +188,11 @@ where
             Box::pin(async move { engine2.settle().await })
         });
 
-        EmitFuture::new(publish, settle)
+        let settle_with: SettleWithRuntimeFn = Box::new(move |runtime| {
+            Box::pin(async move { engine3.settle_with(runtime).await })
+        });
+
+        EmitFuture::new(publish, settle, settle_with)
     }
 
     /// Deprecated: use `emit()` instead.
@@ -196,11 +206,22 @@ where
 
     /// Drive all pending events and effects to completion.
     pub async fn settle(&self) -> Result<()> {
+        self.settle_inner(&*self.runtime).await
+    }
+
+    /// Drive all pending events and effects to completion using a borrowed runtime.
+    ///
+    /// This allows using borrowed runtimes (e.g. Restate's `WorkflowContext<'ctx>`)
+    /// that can't be stored in `Arc<dyn Runtime>`.
+    pub async fn settle_with(&self, runtime: &dyn Runtime) -> Result<()> {
+        self.settle_inner(runtime).await
+    }
+
+    async fn settle_inner(&self, runtime: &dyn Runtime) -> Result<()> {
         let executor = JobExecutor::new(
             self.deps.clone(),
             self.effects.clone(),
             self.aggregators.clone(),
-            self.runtime.clone(),
         );
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
@@ -216,7 +237,7 @@ where
                 self.apply_to_aggregators(&event);
 
                 match executor
-                    .execute_event(&event, &event_config, &*self.runtime)
+                    .execute_event(&event, &event_config, runtime)
                     .await
                 {
                     Ok(commit) => {
@@ -270,7 +291,7 @@ where
                 let effect_futures: Vec<_> = executions
                     .iter()
                     .map(|execution| {
-                        executor.execute_handler(execution.clone(), &handler_config, &*self.runtime)
+                        executor.execute_handler(execution.clone(), &handler_config, runtime)
                     })
                     .collect();
 
@@ -481,10 +502,10 @@ where
         })
     }
 
-    /// Apply event to aggregator state via the runtime.
+    /// Apply event to aggregator state.
     fn apply_to_aggregators(&self, event: &QueuedEvent) {
         self.aggregators
-            .apply_event(&event.event_type, &event.payload, &*self.runtime);
+            .apply_event(&event.event_type, &event.payload);
     }
 
     async fn handle_join_waiting(
@@ -548,8 +569,7 @@ where
                         execution.parent_event_id,
                         self.deps.clone(),
                     )
-                    .with_aggregator_registry(self.aggregators.clone())
-                    .with_runtime(self.runtime.clone());
+                    .with_aggregator_registry(self.aggregators.clone());
 
                     match effect.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {

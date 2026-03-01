@@ -741,13 +741,8 @@ where
                                     "transition guard requires aggregator registry on context"
                                 )
                             })?;
-                            let runtime = ctx.runtime().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "transition guard requires runtime on context"
-                                )
-                            })?;
 
-                            let (prev, next) = registry.get_transition::<A>(aggregate_id, runtime);
+                            let (prev, next) = registry.get_transition::<A>(aggregate_id);
 
                             if !guard(&prev, &next) {
                                 return Ok(Vec::new());

@@ -30,7 +30,6 @@ where
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
     aggregator_registry: Arc<AggregatorRegistry>,
-    runtime: Arc<dyn Runtime>,
 }
 
 impl<D> JobExecutor<D>
@@ -42,13 +41,11 @@ where
         deps: Arc<D>,
         effects: Arc<HandlerRegistry<D>>,
         aggregator_registry: Arc<AggregatorRegistry>,
-        runtime: Arc<dyn Runtime>,
     ) -> Self {
         Self {
             deps,
             effects,
             aggregator_registry,
-            runtime,
         }
     }
 
@@ -276,8 +273,7 @@ where
             execution.parent_event_id,
             self.deps.clone(),
         )
-        .with_aggregator_registry(self.aggregator_registry.clone())
-        .with_runtime(self.runtime.clone());
+        .with_aggregator_registry(self.aggregator_registry.clone());
 
         // 2. Handle join/accumulation (if configured)
         let join_claim = if effect.join_mode == Some(JoinMode::SameBatch) {
@@ -414,8 +410,7 @@ where
                 None,
                 self.deps.clone(),
             )
-            .with_aggregator_registry(self.aggregator_registry.clone())
-        .with_runtime(self.runtime.clone());
+            .with_aggregator_registry(self.aggregator_registry.clone());
 
             effect
                 .call_started(ctx)
@@ -476,8 +471,7 @@ where
             source_event.parent_id,
             self.deps.clone(),
         )
-        .with_aggregator_registry(self.aggregator_registry.clone())
-        .with_runtime(self.runtime.clone());
+        .with_aggregator_registry(self.aggregator_registry.clone());
 
         let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
         let drained = runtime

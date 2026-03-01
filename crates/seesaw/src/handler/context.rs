@@ -5,7 +5,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
-use crate::runtime::Runtime;
 
 /// Trait for handler context types.
 ///
@@ -63,8 +62,6 @@ where
     pub(crate) is_replay: bool,
     /// Aggregator registry for transition guard replay.
     pub(crate) aggregator_registry: Option<Arc<AggregatorRegistry>>,
-    /// Runtime for aggregate state access.
-    pub(crate) runtime: Option<Arc<dyn Runtime>>,
 }
 
 impl<D> Clone for Context<D>
@@ -81,7 +78,6 @@ where
             deps: self.deps.clone(),
             is_replay: self.is_replay,
             aggregator_registry: self.aggregator_registry.clone(),
-            runtime: self.runtime.clone(),
         }
     }
 }
@@ -107,7 +103,6 @@ where
             deps,
             is_replay: false,
             aggregator_registry: None,
-            runtime: None,
         }
     }
 
@@ -117,12 +112,6 @@ where
         registry: Arc<AggregatorRegistry>,
     ) -> Self {
         self.aggregator_registry = Some(registry);
-        self
-    }
-
-    /// Attach a runtime (used by the engine for aggregate state access).
-    pub(crate) fn with_runtime(mut self, runtime: Arc<dyn Runtime>) -> Self {
-        self.runtime = Some(runtime);
         self
     }
 
@@ -136,11 +125,6 @@ where
     /// Get the aggregator registry (if set).
     pub fn aggregator_registry(&self) -> Option<&AggregatorRegistry> {
         self.aggregator_registry.as_deref()
-    }
-
-    /// Get the runtime (if set).
-    pub fn runtime(&self) -> Option<&dyn Runtime> {
-        self.runtime.as_deref()
     }
 
     /// Get the handler ID (human-readable identifier).
