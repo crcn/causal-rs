@@ -1695,3 +1695,237 @@ async fn fanout_map_fanin_batch_metadata_propagates() -> Result<()> {
 
     Ok(())
 }
+
+// ═══════════════════════════════════════════════════════════
+// PROJECTION HANDLERS
+// ═══════════════════════════════════════════════════════════
+
+/// Simulates a read model / projection store.
+#[derive(Clone)]
+struct ProjectionDeps {
+    store: Arc<dashmap::DashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderCreated {
+    order_id: String,
+    customer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderProjected {
+    order_id: String,
+}
+
+#[tokio::test]
+async fn projection_handler_runs_before_regular_handlers() -> Result<()> {
+    let store = Arc::new(dashmap::DashMap::new());
+    let deps = ProjectionDeps { store: store.clone() };
+
+    // Track what the regular handler saw
+    let reader_saw_projection = Arc::new(parking_lot::Mutex::new(false));
+    let rs = reader_saw_projection.clone();
+
+    let engine = Engine::new(deps)
+        // Projection handler: writes to the store FIRST
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .id("order_projection")
+                .projection()
+                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+                    async move {
+                        ctx.deps().store.insert(
+                            event.order_id.clone(),
+                            event.customer.clone(),
+                        );
+                        Ok(events![])
+                    }
+                }),
+        )
+        // Regular handler: reads from the store — should see the projection
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .id("order_reader")
+                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+                    let rs = rs.clone();
+                    async move {
+                        let found = ctx.deps().store.get(&event.order_id).is_some();
+                        *rs.lock() = found;
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(OrderCreated {
+            order_id: "order-1".into(),
+            customer: "Alice".into(),
+        })
+        .settled()
+        .await?;
+
+    assert!(
+        *reader_saw_projection.lock(),
+        "regular handler should see projection data — projection must run first"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Result<()> {
+    let store = Arc::new(dashmap::DashMap::new());
+    let deps = ProjectionDeps { store: store.clone() };
+
+    let execution_order: Arc<parking_lot::Mutex<Vec<String>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let eo1 = execution_order.clone();
+    let eo2 = execution_order.clone();
+    let eo3 = execution_order.clone();
+    let eo4 = execution_order.clone();
+
+    let engine = Engine::new(deps)
+        // Projection 1
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .id("projection_1")
+                .projection()
+                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+                    let eo = eo1.clone();
+                    async move {
+                        ctx.deps().store.insert(
+                            event.order_id.clone(),
+                            event.customer.clone(),
+                        );
+                        eo.lock().push("projection_1".into());
+                        Ok(events![])
+                    }
+                }),
+        )
+        // Projection 2
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .id("projection_2")
+                .projection()
+                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+                    let eo = eo2.clone();
+                    async move {
+                        ctx.deps().store.insert(
+                            format!("{}_index", event.order_id),
+                            "indexed".into(),
+                        );
+                        eo.lock().push("projection_2".into());
+                        Ok(events![])
+                    }
+                }),
+        )
+        // Regular handler A
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .id("handler_a")
+                .then(move |_event: Arc<OrderCreated>, _ctx: Context<ProjectionDeps>| {
+                    let eo = eo3.clone();
+                    async move {
+                        eo.lock().push("handler_a".into());
+                        Ok(events![])
+                    }
+                }),
+        )
+        // Regular handler B
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .id("handler_b")
+                .then(move |_event: Arc<OrderCreated>, _ctx: Context<ProjectionDeps>| {
+                    let eo = eo4.clone();
+                    async move {
+                        eo.lock().push("handler_b".into());
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(OrderCreated {
+            order_id: "order-2".into(),
+            customer: "Bob".into(),
+        })
+        .settled()
+        .await?;
+
+    let order = execution_order.lock();
+
+    // Both projections must come before any regular handler
+    let proj_1_pos = order.iter().position(|s| s == "projection_1").unwrap();
+    let proj_2_pos = order.iter().position(|s| s == "projection_2").unwrap();
+    let handler_a_pos = order.iter().position(|s| s == "handler_a").unwrap();
+    let handler_b_pos = order.iter().position(|s| s == "handler_b").unwrap();
+
+    assert!(
+        proj_1_pos < handler_a_pos && proj_1_pos < handler_b_pos,
+        "projection_1 must run before regular handlers, order: {:?}",
+        *order
+    );
+    assert!(
+        proj_2_pos < handler_a_pos && proj_2_pos < handler_b_pos,
+        "projection_2 must run before regular handlers, order: {:?}",
+        *order
+    );
+
+    // Both read model entries should exist
+    assert!(store.get("order-2").is_some());
+    assert!(store.get("order-2_index").is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_handler_can_emit_events() -> Result<()> {
+    let store = Arc::new(dashmap::DashMap::new());
+    let deps = ProjectionDeps { store: store.clone() };
+
+    let projected_count = Arc::new(AtomicUsize::new(0));
+    let pc = projected_count.clone();
+
+    let engine = Engine::new(deps)
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .projection()
+                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+                    async move {
+                        ctx.deps().store.insert(
+                            event.order_id.clone(),
+                            event.customer.clone(),
+                        );
+                        Ok(events![OrderProjected {
+                            order_id: event.order_id.clone(),
+                        }])
+                    }
+                }),
+        )
+        .with_handler(
+            handler::on::<OrderProjected>()
+                .then(move |_event: Arc<OrderProjected>, _ctx: Context<ProjectionDeps>| {
+                    let pc = pc.clone();
+                    async move {
+                        pc.fetch_add(1, Ordering::SeqCst);
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(OrderCreated {
+            order_id: "order-3".into(),
+            customer: "Charlie".into(),
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(
+        projected_count.load(Ordering::SeqCst),
+        1,
+        "projection-emitted event should be handled"
+    );
+    assert!(store.get("order-3").is_some());
+    Ok(())
+}

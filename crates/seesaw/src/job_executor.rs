@@ -136,10 +136,43 @@ where
             });
         }
 
-        // 6. Execute inline handlers in parallel (sorted by priority for result ordering)
+        // 6a. Execute projection handlers sequentially (before other handlers)
         let mut inline_effect_failures = Vec::new();
         let mut emitted_events = Vec::new();
-        let mut inline_effects: Vec<_> = matching_effects.iter().filter(|effect| effect.is_inline()).collect();
+
+        let mut projection_effects: Vec<_> = matching_effects
+            .iter()
+            .filter(|effect| effect.is_inline() && effect.is_projection())
+            .collect();
+        projection_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
+
+        for effect in &projection_effects {
+            match self
+                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runtime)
+                .await
+            {
+                Ok(mut emitted) => emitted_events.append(&mut emitted),
+                Err(error) => {
+                    let error_string = error.to_string();
+                    warn!(
+                        "Projection handler failed: event_id={}, effect_id={}, error={}",
+                        event.event_id, effect.id, error_string
+                    );
+                    inline_effect_failures.push(InlineHandlerFailure {
+                        handler_id: effect.id.clone(),
+                        error: error_string,
+                        reason: "projection_failed".to_string(),
+                        attempts: event.retry_count.saturating_add(1),
+                    });
+                }
+            }
+        }
+
+        // 6b. Execute regular inline handlers in parallel
+        let mut inline_effects: Vec<_> = matching_effects
+            .iter()
+            .filter(|effect| effect.is_inline() && !effect.is_projection())
+            .collect();
         inline_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
 
         let inline_futures: Vec<_> = inline_effects

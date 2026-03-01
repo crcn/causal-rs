@@ -308,6 +308,8 @@ where
     pub(crate) dlq_terminal_mapper: Option<DlqTerminalMapper>,
 
     // Execution configuration (determines inline vs queued)
+    /// Mark as projection handler (runs before all other handlers, sequentially).
+    pub(crate) projection: bool,
     /// Force queued execution (default: false = inline)
     pub(crate) queued: bool,
     /// Delay before execution (triggers queued)
@@ -335,6 +337,7 @@ where
             join_batch_handler: self.join_batch_handler.clone(),
             join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper: self.dlq_terminal_mapper.clone(),
+            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -400,6 +403,11 @@ where
     /// Internal queue codec metadata.
     pub(crate) fn codecs(&self) -> &[std::sync::Arc<EventCodec>] {
         &self.codecs
+    }
+
+    /// Check if this is a projection handler (runs before other handlers).
+    pub fn is_projection(&self) -> bool {
+        self.projection
     }
 
     /// Check if this effect should execute inline.
