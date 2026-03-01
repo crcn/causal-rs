@@ -64,6 +64,9 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Collects `#[aggregator]` functions in a module into a `fn aggregators() -> Vec<Aggregator>`.
 ///
+/// Use `id = "field"` for struct events (field access) or `id_fn = "method"` for enum
+/// events (method call).
+///
 /// ```ignore
 /// #[aggregators]
 /// mod order_aggregators {
@@ -72,9 +75,10 @@ pub fn aggregator(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         order.status = Status::Placed;
 ///     }
 ///
-///     #[aggregator(id = "order_id")]
-///     fn on_shipped(order: &mut Order, event: OrderShipped) {
-///         order.status = Status::Shipped;
+///     // For enum events, use id_fn to call a method instead of accessing a field:
+///     #[aggregator(id_fn = "order_id")]
+///     fn on_status_changed(order: &mut Order, event: OrderEvent) {
+///         // event.order_id() is called to extract the aggregate ID
 ///     }
 /// }
 ///
@@ -1452,14 +1456,25 @@ fn type_contains_lock(ty: &Type) -> bool {
 
 // ── Aggregator macros ────────────────────────────────────────────────────
 
-/// Parse the `id` attribute from `#[aggregator(id = "field_name")]`.
-fn parse_aggregator_id_field(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<Ident> {
+/// Whether the aggregate ID is extracted via field access or method call.
+enum IdAccess {
+    /// `e.field` — for struct events with a public field.
+    Field(Ident),
+    /// `e.method()` — for enum events with an accessor method.
+    Method(Ident),
+}
+
+/// Parse `id = "field"` or `id_fn = "method"` from `#[aggregator(...)]`.
+fn parse_aggregator_id_access(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<IdAccess> {
     for meta in metas {
         if let Meta::NameValue(nv) = meta {
             if nv.path.is_ident("id") {
                 if let Expr::Lit(expr_lit) = &nv.value {
                     if let Lit::Str(lit_str) = &expr_lit.lit {
-                        return Ok(Ident::new(&lit_str.value(), lit_str.span()));
+                        return Ok(IdAccess::Field(Ident::new(
+                            &lit_str.value(),
+                            lit_str.span(),
+                        )));
                     }
                 }
                 return Err(syn::Error::new_spanned(
@@ -1467,11 +1482,25 @@ fn parse_aggregator_id_field(metas: &Punctuated<Meta, Token![,]>) -> syn::Result
                     "expected string literal for `id`, e.g. id = \"order_id\"",
                 ));
             }
+            if nv.path.is_ident("id_fn") {
+                if let Expr::Lit(expr_lit) = &nv.value {
+                    if let Lit::Str(lit_str) = &expr_lit.lit {
+                        return Ok(IdAccess::Method(Ident::new(
+                            &lit_str.value(),
+                            lit_str.span(),
+                        )));
+                    }
+                }
+                return Err(syn::Error::new_spanned(
+                    &nv.value,
+                    "expected string literal for `id_fn`, e.g. id_fn = \"run_id\"",
+                ));
+            }
         }
     }
     Err(syn::Error::new(
         proc_macro2::Span::call_site(),
-        "#[aggregator] requires `id = \"field_name\"` to specify the aggregate ID field on the event",
+        "#[aggregator] requires `id = \"field\"` or `id_fn = \"method\"` to specify how to extract the aggregate ID from the event",
     ))
 }
 
@@ -1542,16 +1571,21 @@ fn parse_aggregator_params(sig: &Signature) -> syn::Result<(Type, Ident, Type, I
     Ok((agg_ty, agg_ident, event_ty, event_ident))
 }
 
-/// Expand `#[aggregator(id = "field")]` on a function.
+/// Expand `#[aggregator(id = "field")]` or `#[aggregator(id_fn = "method")]` on a function.
 fn expand_aggregator(
     metas: &Punctuated<Meta, Token![,]>,
     input_fn: ItemFn,
 ) -> syn::Result<TokenStream2> {
-    let id_field = parse_aggregator_id_field(metas)?;
+    let id_access = parse_aggregator_id_access(metas)?;
     let (agg_ty, agg_ident, event_ty, event_ident) = parse_aggregator_params(&input_fn.sig)?;
     let fn_name = &input_fn.sig.ident;
     let body = &input_fn.block;
     let factory_name = format_ident!("__seesaw_aggregator_{}", fn_name);
+
+    let id_expr = match &id_access {
+        IdAccess::Field(ident) => quote! { e.#ident },
+        IdAccess::Method(ident) => quote! { e.#ident() },
+    };
 
     Ok(quote! {
         impl ::seesaw_core::Apply<#event_ty> for #agg_ty {
@@ -1562,7 +1596,7 @@ fn expand_aggregator(
         }
 
         fn #factory_name() -> ::seesaw_core::Aggregator {
-            ::seesaw_core::Aggregator::new::<#event_ty, #agg_ty, _>(|e| e.#id_field)
+            ::seesaw_core::Aggregator::new::<#event_ty, #agg_ty, _>(|e| #id_expr)
         }
     })
 }

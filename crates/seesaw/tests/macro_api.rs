@@ -279,6 +279,65 @@ fn aggregator_apply_trait_generated() {
     assert_eq!(order.status, TestOrderStatus::Shipped);
 }
 
+// ── Aggregator id_fn tests (enum events with method access) ───────────
+
+#[derive(Clone, Serialize, Deserialize)]
+enum PipelineEvent {
+    Started { run_id: Uuid },
+    Completed { run_id: Uuid },
+}
+
+impl PipelineEvent {
+    fn run_id(&self) -> Uuid {
+        match self {
+            PipelineEvent::Started { run_id } => *run_id,
+            PipelineEvent::Completed { run_id } => *run_id,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+struct PipelineState {
+    started: bool,
+    completed: bool,
+}
+
+impl Aggregate for PipelineState {
+    fn aggregate_type() -> &'static str {
+        "PipelineState"
+    }
+}
+
+#[aggregators]
+mod pipeline_aggregators {
+    use super::*;
+
+    #[aggregator(id_fn = "run_id")]
+    fn on_started(state: &mut PipelineState, event: PipelineEvent) {
+        if let PipelineEvent::Started { .. } = event {
+            state.started = true;
+        }
+    }
+}
+
+#[test]
+fn aggregator_id_fn_produces_vec() {
+    let aggs = pipeline_aggregators::aggregators();
+    assert_eq!(aggs.len(), 1);
+    assert_eq!(aggs[0].aggregate_type, "PipelineState");
+}
+
+#[test]
+fn aggregator_id_fn_apply_works() {
+    let mut state = PipelineState::default();
+    assert!(!state.started);
+
+    state.apply(PipelineEvent::Started {
+        run_id: Uuid::nil(),
+    });
+    assert!(state.started);
+}
+
 // ── Handler macro tests ────────────────────────────────────────────────
 
 #[test]
