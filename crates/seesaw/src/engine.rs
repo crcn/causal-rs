@@ -72,14 +72,14 @@ where
         &self.deps
     }
 
-    /// Read aggregate state by ID. Returns `A::default()` if no state exists.
-    pub fn aggregate<A: Aggregate + 'static>(&self, id: Uuid) -> A {
-        self.aggregators.get_transition::<A>(id).1
+    /// Read aggregate state by ID. Returns `Arc::new(A::default())` if no state exists.
+    pub fn aggregate<A: Aggregate + 'static>(&self, id: Uuid) -> Arc<A> {
+        self.aggregators.get_transition_arc::<A>(id).1
     }
 
-    /// Read singleton aggregate state. Returns `A::default()` if no state exists.
-    pub fn singleton<A: Aggregate + 'static>(&self) -> A {
-        self.aggregators.get_singleton::<A>().1
+    /// Read singleton aggregate state. Returns `Arc::new(A::default())` if no state exists.
+    pub fn singleton<A: Aggregate + 'static>(&self) -> Arc<A> {
+        self.aggregators.get_singleton_arc::<A>().1
     }
 
     /// Set a custom runtime (e.g. RestateRuntime for durable execution).

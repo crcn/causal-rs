@@ -172,30 +172,28 @@ where
 
     /// Get the (prev, next) transition for an aggregate by ID.
     ///
-    /// Returns `(A::default(), A::default())` if no state exists.
-    /// Panics if no aggregator registry is configured.
-    pub fn aggregate<A>(&self, id: Uuid) -> (A, A)
+    /// Returns `(Arc::new(A::default()), Arc::new(A::default()))` if no state exists.
+    pub fn aggregate<A>(&self, id: Uuid) -> (Arc<A>, Arc<A>)
     where
         A: crate::Aggregate + 'static,
     {
         self.aggregator_registry
             .as_ref()
             .expect("aggregate() requires an aggregator registry")
-            .get_transition::<A>(id)
+            .get_transition_arc::<A>(id)
     }
 
     /// Get the (prev, next) transition for a singleton aggregate.
     ///
-    /// Returns `(A::default(), A::default())` if no state exists.
-    /// Panics if no aggregator registry is configured.
-    pub fn singleton<A>(&self) -> (A, A)
+    /// Returns `(Arc::new(A::default()), Arc::new(A::default()))` if no state exists.
+    pub fn singleton<A>(&self) -> (Arc<A>, Arc<A>)
     where
         A: crate::Aggregate + 'static,
     {
         self.aggregator_registry
             .as_ref()
             .expect("singleton() requires an aggregator registry")
-            .get_singleton::<A>()
+            .get_singleton_arc::<A>()
     }
 
     /// Get the handler ID (human-readable identifier).
