@@ -160,6 +160,31 @@ where
         EmitFuture::new(publish, settle)
     }
 
+    /// Emit a type-erased `EventOutput` directly.
+    ///
+    /// Use when you have heterogeneous events from an `Events` bag
+    /// and need to emit them without downcasting.
+    ///
+    /// ```ignore
+    /// for output in events.into_outputs() {
+    ///     engine.emit_output(output).settled().await?;
+    /// }
+    /// ```
+    pub fn emit_output(&self, output: crate::handler::EventOutput) -> EmitFuture {
+        let engine = self.clone();
+        let engine2 = self.clone();
+
+        let publish: crate::process::PublishFn = Box::new(move || {
+            Box::pin(async move { engine.publish_output(output).await })
+        });
+
+        let settle: crate::process::SettleFn = Box::new(move || {
+            Box::pin(async move { engine2.settle().await })
+        });
+
+        EmitFuture::new(publish, settle)
+    }
+
     /// Deprecated: use `emit()` instead.
     #[deprecated(note = "renamed to emit()")]
     pub fn dispatch<E>(&self, event: E) -> EmitFuture
@@ -402,6 +427,44 @@ where
             correlation_id,
             event_type: event_type.clone(),
             payload: payload.clone(),
+            hops: 0,
+            retry_count: 0,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        self.store.publish(queued).await?;
+
+        Ok(ProcessHandle {
+            correlation_id,
+            event_id,
+        })
+    }
+
+    async fn publish_output(&self, output: crate::handler::EventOutput) -> Result<ProcessHandle> {
+        self.effects.register_codec(output.codec.clone());
+
+        let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
+            anyhow::anyhow!("Failed to serialize event {}", output.event_type)
+        })?;
+
+        let event_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
+
+        info!(
+            "Publishing event output: type={}, correlation_id={}",
+            output.event_type, correlation_id
+        );
+
+        let queued = QueuedEvent {
+            id: 0,
+            event_id,
+            parent_id: None,
+            correlation_id,
+            event_type: output.event_type,
+            payload,
             hops: 0,
             retry_count: 0,
             batch_id: None,
