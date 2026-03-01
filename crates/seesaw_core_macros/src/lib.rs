@@ -543,27 +543,63 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
 
     let mut wrappers = Vec::new();
     let mut deps_ty: Option<Type> = None;
+    let mut inferred_fns = Vec::new();
 
     for item in items.iter() {
         let Item::Fn(item_fn) = item else {
             continue;
         };
-        if !has_attr_any(&item_fn.attrs, &["handle", "handler"]) {
-            continue;
+
+        let has_handle_attr = has_attr_any(&item_fn.attrs, &["handle", "handler"]);
+
+        if has_handle_attr {
+            // Explicit #[handle(...)]: standalone proc macro handles expansion
+            let wrapper_ident = format_ident!("__seesaw_effect_{}", item_fn.sig.ident);
+            wrappers.push(wrapper_ident);
+        } else if item_fn.sig.asyncness.is_some() {
+            // Bare async fn: infer on = EventType from signature
+            let wrapper_ident = format_ident!("__seesaw_effect_{}", item_fn.sig.ident);
+            wrappers.push(wrapper_ident);
+
+            // Build default EffectArgs with on inferred from the event param
+            let fn_name = item_fn.sig.ident.to_string();
+            let (ctx_idx, _) = find_effect_context(&item_fn.sig)?;
+            let params = collect_params(&item_fn.sig)?;
+            let non_ctx_params: Vec<&ParamInfo> = params
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, p)| if idx == ctx_idx { None } else { Some(p) })
+                .collect();
+
+            if non_ctx_params.len() != 1 {
+                return Err(syn::Error::new_spanned(
+                    &item_fn.sig.inputs,
+                    "bare handler function requires exactly one event parameter plus Context",
+                ));
+            }
+
+            let event_ty = &non_ctx_params[0].ty;
+            let event_path: Path = syn::parse2(quote! { #event_ty })?;
+
+            let mut args = EffectArgs::default();
+            args.on = Some(OnSpec::EventType(event_path));
+            args.id = Some(fn_name);
+
+            let expanded = expand_effect(Ok(args), item_fn.clone())?;
+            inferred_fns.push((item_fn.sig.ident.to_string(), expanded));
         }
 
-        let wrapper_ident = format_ident!("__seesaw_effect_{}", item_fn.sig.ident);
-        wrappers.push(wrapper_ident);
-
-        let (_, deps) = find_effect_context(&item_fn.sig)?;
-        match &deps_ty {
-            None => deps_ty = Some(deps),
-            Some(existing_deps) => {
-                if type_key(existing_deps) != type_key(&deps) {
-                    return Err(syn::Error::new_spanned(
-                        &item_fn.sig,
-                        "all #[handler] handlers in an #[handlers] module must use the same Context<Deps>",
-                    ));
+        // Track deps type from all handler functions
+        if let Ok((_, deps)) = find_effect_context(&item_fn.sig) {
+            match &deps_ty {
+                None => deps_ty = Some(deps),
+                Some(existing_deps) => {
+                    if type_key(existing_deps) != type_key(&deps) {
+                        return Err(syn::Error::new_spanned(
+                            &item_fn.sig,
+                            "all handlers in a #[handles] module must use the same Context<Deps>",
+                        ));
+                    }
                 }
             }
         }
@@ -572,9 +608,21 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     if wrappers.is_empty() {
         return Err(syn::Error::new_spanned(
             module,
-            "#[handlers] module must contain at least one #[handler] function",
+            "#[handles] module must contain at least one handler function",
         ));
     }
+
+    // Remove bare functions that were expanded (they live outside the module now)
+    let inferred_names: Vec<&str> = inferred_fns.iter().map(|(n, _)| n.as_str()).collect();
+    items.retain(|item| {
+        if let Item::Fn(item_fn) = item {
+            !inferred_names.contains(&item_fn.sig.ident.to_string().as_str())
+        } else {
+            true
+        }
+    });
+
+    let inferred_tokens: Vec<&TokenStream2> = inferred_fns.iter().map(|(_, t)| t).collect();
 
     let deps_ty = deps_ty.expect("checked above");
     let handles_fn: ItemFn = parse_quote! {
@@ -590,7 +638,11 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     items.push(Item::Fn(handles_fn));
     items.push(Item::Fn(handlers_fn));
 
-    Ok(quote! { #module })
+    let expanded = quote! { #module };
+    Ok(quote! {
+        #expanded
+        #(#inferred_tokens)*
+    })
 }
 
 fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectArgs> {

@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{aggregator, aggregators, handle, handles, AnyEvent, Context, Emit, ErrorContext};
+use seesaw_core::{aggregator, aggregators, events, handle, handles, AnyEvent, Context, Emit, ErrorContext, Events};
 use seesaw_core::{Aggregate, Apply};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -482,4 +482,52 @@ fn effects_module_registration_works() {
         event_logger.can_handle(TypeId::of::<PaymentRequested>()),
         "on_any handler should match PaymentRequested"
     );
+}
+
+// ── Bare handler inference tests ──────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TaskCreated {
+    task_id: Uuid,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TaskFinished {
+    task_id: Uuid,
+}
+
+#[handles]
+mod bare_handlers {
+    use super::*;
+
+    // No #[handle] — inferred from event param type
+    async fn on_task_created(event: TaskCreated, _ctx: Context<Deps>) -> Result<Events> {
+        Ok(events![TaskFinished {
+            task_id: event.task_id,
+        }])
+    }
+
+    // Explicit #[handle] still works alongside bare fns
+    #[handle(on = TaskFinished, id = "log_finished")]
+    async fn log_finished(_event: TaskFinished, _ctx: Context<Deps>) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bare_handler_inference_works() {
+    let effects = bare_handlers::handles();
+    assert_eq!(effects.len(), 2);
+
+    let inferred = effects
+        .iter()
+        .find(|e| e.id == "on_task_created")
+        .expect("bare fn should produce handler with fn name as id");
+    assert!(inferred.can_handle(TypeId::of::<TaskCreated>()));
+
+    let explicit = effects
+        .iter()
+        .find(|e| e.id == "log_finished")
+        .expect("explicit #[handle] should still work");
+    assert!(explicit.can_handle(TypeId::of::<TaskFinished>()));
 }
