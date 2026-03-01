@@ -338,6 +338,57 @@ fn aggregator_id_fn_apply_works() {
     assert!(state.started);
 }
 
+// ── Singleton aggregator tests ─────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct RunStats {
+    event_count: u32,
+}
+
+impl Aggregate for RunStats {
+    fn aggregate_type() -> &'static str {
+        "RunStats"
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StepCompleted {
+    name: String,
+}
+
+#[aggregators]
+mod singleton_aggregators {
+    use super::*;
+
+    #[aggregator(singleton)]
+    fn on_step(stats: &mut RunStats, _event: StepCompleted) {
+        stats.event_count += 1;
+    }
+}
+
+#[test]
+fn singleton_aggregator_produces_vec() {
+    let aggs = singleton_aggregators::aggregators();
+    assert_eq!(aggs.len(), 1);
+    assert_eq!(aggs[0].aggregate_type, "RunStats");
+}
+
+#[test]
+fn singleton_aggregator_apply_works() {
+    let mut stats = RunStats::default();
+    assert_eq!(stats.event_count, 0);
+
+    stats.apply(StepCompleted {
+        name: "fetch".into(),
+    });
+    assert_eq!(stats.event_count, 1);
+
+    stats.apply(StepCompleted {
+        name: "transform".into(),
+    });
+    assert_eq!(stats.event_count, 2);
+}
+
 // ── Handler macro tests ────────────────────────────────────────────────
 
 #[test]

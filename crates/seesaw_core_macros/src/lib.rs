@@ -1462,11 +1462,18 @@ enum IdAccess {
     Field(Ident),
     /// `e.method()` — for enum events with an accessor method.
     Method(Ident),
+    /// Singleton — uses `Uuid::nil()` as a constant ID.
+    Singleton,
 }
 
 /// Parse `id = "field"` or `id_fn = "method"` from `#[aggregator(...)]`.
 fn parse_aggregator_id_access(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<IdAccess> {
     for meta in metas {
+        if let Meta::Path(path) = meta {
+            if path.is_ident("singleton") {
+                return Ok(IdAccess::Singleton);
+            }
+        }
         if let Meta::NameValue(nv) = meta {
             if nv.path.is_ident("id") {
                 if let Expr::Lit(expr_lit) = &nv.value {
@@ -1500,7 +1507,7 @@ fn parse_aggregator_id_access(metas: &Punctuated<Meta, Token![,]>) -> syn::Resul
     }
     Err(syn::Error::new(
         proc_macro2::Span::call_site(),
-        "#[aggregator] requires `id = \"field\"` or `id_fn = \"method\"` to specify how to extract the aggregate ID from the event",
+        "#[aggregator] requires `singleton`, `id = \"field\"`, or `id_fn = \"method\"` to specify how to extract the aggregate ID from the event",
     ))
 }
 
@@ -1585,6 +1592,7 @@ fn expand_aggregator(
     let id_expr = match &id_access {
         IdAccess::Field(ident) => quote! { e.#ident },
         IdAccess::Method(ident) => quote! { e.#ident() },
+        IdAccess::Singleton => quote! { ::uuid::Uuid::nil() },
     };
 
     Ok(quote! {

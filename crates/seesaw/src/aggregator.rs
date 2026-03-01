@@ -388,6 +388,22 @@ impl AggregatorRegistry {
         (prev, next)
     }
 
+    /// Get the (prev, next) transition for a singleton aggregate (uses `Uuid::nil()`).
+    pub fn get_singleton<A>(&self) -> (A, A)
+    where
+        A: Aggregate + 'static,
+    {
+        self.get_transition::<A>(Uuid::nil())
+    }
+
+    /// Get the (prev, next) transition for a singleton aggregate as `Arc<A>`.
+    pub fn get_singleton_arc<A>(&self) -> (Arc<A>, Arc<A>)
+    where
+        A: Aggregate + 'static,
+    {
+        self.get_transition_arc::<A>(Uuid::nil())
+    }
+
     // ── EventStore integration helpers ──────────────────────────────
 
     /// Check if the DashMap has state for a given aggregate key.
