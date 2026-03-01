@@ -16,6 +16,7 @@ use crate::event_store::{
     event_type_short_name, ConcurrencyError, EventStore, NewEvent, SnapshotStore,
 };
 use crate::handler::{Context, Handler};
+use crate::handler::context::{DirectRunner, SideEffectRunner};
 use crate::handler_registry::HandlerRegistry;
 use crate::runtime::{DirectRuntime, Runtime};
 use crate::job_executor::{HandlerStatus, JobExecutor};
@@ -40,6 +41,7 @@ where
     aggregators: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
     runtime: Arc<dyn Runtime>,
+    side_effect_runner: Arc<dyn SideEffectRunner>,
     event_store: Option<Arc<dyn EventStore>>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_every: Option<u64>,
@@ -58,6 +60,7 @@ where
             aggregators: Arc::new(AggregatorRegistry::new()),
             upcasters: Arc::new(UpcasterRegistry::new()),
             runtime: Arc::new(DirectRuntime::new()),
+            side_effect_runner: Arc::new(DirectRunner),
             event_store: None,
             snapshot_store: None,
             snapshot_every: None,
@@ -72,6 +75,15 @@ where
     /// Set a custom runtime (e.g. RestateRuntime for durable execution).
     pub fn with_runtime<R: Runtime + 'static>(mut self, runtime: R) -> Self {
         self.runtime = Arc::new(runtime);
+        self
+    }
+
+    /// Set a custom side-effect runner for journaled `ctx.run()` execution.
+    ///
+    /// Durable runtimes (e.g. Restate) provide runners that journal side-effect
+    /// results. The default `DirectRunner` executes closures inline with no journaling.
+    pub fn with_side_effect_runner<R: SideEffectRunner + 'static>(mut self, runner: R) -> Self {
+        self.side_effect_runner = Arc::new(runner);
         self
     }
 
@@ -290,6 +302,7 @@ where
             self.effects.clone(),
             self.aggregators.clone(),
             self.upcasters.clone(),
+            self.side_effect_runner.clone(),
         );
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
@@ -952,6 +965,7 @@ where
             aggregators: self.aggregators.clone(),
             upcasters: self.upcasters.clone(),
             runtime: self.runtime.clone(),
+            side_effect_runner: self.side_effect_runner.clone(),
             event_store: self.event_store.clone(),
             snapshot_store: self.snapshot_store.clone(),
             snapshot_every: self.snapshot_every,

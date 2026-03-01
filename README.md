@@ -204,6 +204,16 @@ handler::on::<FailEvent>()
 ### Observe all events
 
 ```rust
+// Macro style
+#[handler(on_any, id = "audit_log")]
+async fn audit_log(event: AnyEvent, ctx: Context<Deps>) -> Result<()> {
+    if let Some(order) = event.downcast::<OrderPlaced>() {
+        println!("Order placed: {:?}", order.order_id);
+    }
+    Ok(())
+}
+
+// Builder style
 handler::on_any()
     .id("audit_log")
     .then(|event: AnyEvent, ctx: Context<Deps>| async move {
@@ -298,19 +308,25 @@ On cold start, the engine loads the latest snapshot and replays only events afte
 | `with_snapshot_store` only | Manual snapshots via `save_snapshot()` |
 | `with_snapshot_store` + `snapshot_every(N)` | Auto-checkpoint every N events |
 
-### Replay context flag
+### Replay-safe side effects
 
-During replay, handlers should skip side effects. Check `ctx.is_replay()`:
+Use `ctx.run()` for side effects that should be skipped during replay. With durable runtimes (Restate), results are journaled and replayed automatically:
 
 ```rust
 #[handler(on = OrderPlaced, id = "ship_order")]
 async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
-    if !ctx.is_replay() {
-        ctx.deps().shipping_api.ship(event.order_id).await?;
-    }
-    Ok(OrderShipped { order_id: event.order_id })
+    let tracking_id: String = ctx.run(|| async {
+        ctx.deps().shipping_api.ship(event.order_id).await
+    }).await?;
+
+    Ok(OrderShipped { order_id: event.order_id, tracking_id })
 }
 ```
+
+- **DirectRuntime (default):** Executes the closure inline, returns the result directly.
+- **Durable runtime (Restate):** Journals the result. On replay, skips execution and returns the journaled value.
+
+The return type must implement `Serialize + DeserializeOwned`. Custom runners implement the `SideEffectRunner` trait.
 
 ## Restate Integration
 
@@ -402,7 +418,7 @@ ctx.event_id            // Current event's unique ID
 ctx.correlation_id      // Workflow grouping ID
 ctx.parent_event_id     // Parent event for causal tracking
 ctx.idempotency_key()   // Deterministic key for deduplication
-ctx.is_replay()         // true during event replay (skip side effects)
+ctx.run(|| async { })   // Replay-safe side effect execution (journaled with Restate)
 ```
 
 ## Examples

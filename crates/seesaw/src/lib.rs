@@ -65,6 +65,7 @@ pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Events, Handler, HandlerContext,
     HandlerError, IntoEvents, JoinMode,
 };
+pub use handler::context::{DirectRunner, SideEffectRunner};
 
 /// The universal return macro for all handlers.
 ///

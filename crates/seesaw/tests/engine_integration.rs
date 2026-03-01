@@ -462,6 +462,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
     Ok(())
 }
 
+#[allow(deprecated)]
 #[tokio::test]
 async fn context_is_replay_defaults_to_false() -> Result<()> {
     let saw_replay = Arc::new(Mutex::new(None));
@@ -485,6 +486,39 @@ async fn context_is_replay_defaults_to_false() -> Result<()> {
         .await?;
 
     assert_eq!(*saw_replay.lock(), Some(false));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ctx_run_executes_side_effect_in_handler() -> Result<()> {
+    let captured = Arc::new(Mutex::new(None::<String>));
+    let cap = captured.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(move |event: Arc<Ping>, ctx: Context<Deps>| {
+            let cap = cap.clone();
+            async move {
+                let result: String = ctx
+                    .run(move || async move { Ok(format!("processed-{}", event.msg)) })
+                    .await?;
+                *cap.lock() = Some(result);
+                Ok(events![])
+            }
+        }),
+    );
+
+    engine
+        .emit(Ping {
+            msg: "hello".into(),
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(
+        *captured.lock(),
+        Some("processed-hello".to_string()),
+        "ctx.run() should execute and return the side effect result"
+    );
     Ok(())
 }
 
