@@ -162,6 +162,16 @@ impl Events {
         self.outputs.extend(other.outputs);
     }
 
+    /// Returns the number of events in the collection.
+    pub fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Returns true if the collection contains no events.
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
     /// Add all items from an iterator as individual events (fan-out).
     pub fn batch<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(items: impl IntoIterator<Item = E>) -> Self {
         Self {
