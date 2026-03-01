@@ -129,6 +129,7 @@ impl OnSpec {
 #[derive(Default)]
 struct EffectArgs {
     on: Option<OnSpec>,
+    on_any: bool,
     extract: Vec<Ident>,
     filter: Option<Path>,
     accumulate: bool,
@@ -222,22 +223,68 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         ));
     }
 
-    // Enforce explicit 'queued' attribute when using background-only features
-    if effect_requires_background(&args) && !args.queued && !is_accumulate {
-        let features = collect_background_features(&args);
-        return Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
-            format!(
-                "handlers with {} must explicitly include 'queued' attribute to indicate background execution",
-                features.join(" and ")
-            ),
-        ));
+    // ── on_any early branch ──────────────────────────────────────────
+    if args.on_any {
+        if args.on.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "on_any and on = ... are mutually exclusive",
+            ));
+        }
+        if !args.extract.is_empty()
+            || args.filter.is_some()
+            || args.accumulate
+            || args.join
+            || args.transition.is_some()
+            || args.aggregate.is_some()
+        {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "on_any cannot be combined with extract, filter, accumulate, join, transition, or aggregate",
+            ));
+        }
+
+        let (ctx_idx, deps_ty) = find_effect_context(&input_fn.sig)?;
+        let params = collect_params(&input_fn.sig)?;
+        let non_ctx_params: Vec<ParamInfo> = params
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, param)| if idx == ctx_idx { None } else { Some(param) })
+            .collect();
+
+        if non_ctx_params.len() != 1 {
+            return Err(syn::Error::new_spanned(
+                &input_fn.sig.inputs,
+                "on_any handler requires exactly one AnyEvent parameter plus Context",
+            ));
+        }
+
+        let event_ident = &non_ctx_params[0].ident;
+        let input_builder = quote! { ::seesaw_core::on_any() };
+        let builder = apply_on_any_config(input_builder, &args, &fn_ident);
+
+        let chain = quote! {
+            #builder
+                .then::<#deps_ty, _, _>(|#event_ident, __seesaw_ctx| async move {
+                    let __result = #fn_ident(#event_ident, __seesaw_ctx).await?;
+                    Ok(#convert_result)
+                })
+        };
+
+        return Ok(quote! {
+            #input_fn
+
+            #[doc(hidden)]
+            pub fn #wrapper_ident() -> ::seesaw_core::Handler<#deps_ty> {
+                #chain
+            }
+        });
     }
 
     let on = args.on.clone().ok_or_else(|| {
         syn::Error::new(
             proc_macro2::Span::call_site(),
-            "#[handler] requires on = EventType or on = [Enum::Variant, ...]",
+            "#[handler] requires on = EventType, on = [Enum::Variant, ...], or on_any",
         )
     })?;
     let on_event_type = on.event_type()?;
@@ -585,13 +632,18 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 }
                 args.projection = true;
             }
-            Meta::Path(path) if path.is_ident("queued") => {
-                if args.queued {
+            Meta::Path(path) if path.is_ident("on_any") => {
+                if args.on_any {
                     return Err(syn::Error::new_spanned(
                         path,
-                        "queued specified more than once",
+                        "on_any specified more than once",
                     ));
                 }
+                args.on_any = true;
+            }
+            Meta::Path(path) if path.is_ident("queued") => {
+                // Accepted for backward compat, but no longer required.
+                // Background execution is inferred from retry/timeout/delay/priority.
                 args.queued = true;
             }
             Meta::NameValue(nv) if nv.path.is_ident("id") => {
@@ -919,7 +971,13 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     }
 
     if args.queued {
-        builder = quote! { #builder .queued() };
+        builder = quote! {
+            {
+                #[allow(deprecated)]
+                let __b = #builder .queued();
+                __b
+            }
+        };
     }
 
     if let Some(retry) = args.retry {
@@ -959,6 +1017,26 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     builder
 }
 
+/// Config subset valid for `on_any()` builders (id, projection only).
+fn apply_on_any_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) -> TokenStream2 {
+    let mut builder = base;
+
+    if let Some(id) = args.id.as_ref().cloned().or_else(|| {
+        args.group
+            .as_ref()
+            .map(|group| format!("{group}::{}", fn_ident))
+    }) {
+        let id_lit = syn::LitStr::new(&id, fn_ident.span());
+        builder = quote! { #builder .id(#id_lit) };
+    }
+
+    if args.projection {
+        builder = quote! { #builder .projection() };
+    }
+
+    builder
+}
+
 fn effect_requires_stable_id(args: &EffectArgs) -> bool {
     args.queued
         || args.accumulate
@@ -969,36 +1047,7 @@ fn effect_requires_stable_id(args: &EffectArgs) -> bool {
         || args.timeout_ms.is_some()
         || args.window_timeout_secs.is_some()
         || args.window_timeout_ms.is_some()
-        || args.priority.is_some()
         || args.retry.unwrap_or(1) > 1
-}
-
-/// Check if handler requires background execution (excluding explicit queued/accumulate)
-fn effect_requires_background(args: &EffectArgs) -> bool {
-    args.retry.unwrap_or(1) > 1
-        || args.timeout_secs.is_some()
-        || args.timeout_ms.is_some()
-        || args.delay_secs.is_some()
-        || args.delay_ms.is_some()
-        || args.priority.is_some()
-}
-
-/// Collect list of background-only features for error message
-fn collect_background_features(args: &EffectArgs) -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if args.retry.unwrap_or(1) > 1 {
-        features.push("retry > 1");
-    }
-    if args.timeout_secs.is_some() || args.timeout_ms.is_some() {
-        features.push("timeout");
-    }
-    if args.delay_secs.is_some() || args.delay_ms.is_some() {
-        features.push("delay");
-    }
-    if args.priority.is_some() {
-        features.push("priority");
-    }
-    features
 }
 
 fn has_attr(attrs: &[Attribute], name: &str) -> bool {
@@ -1112,26 +1161,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_effect_args_supports_queued_flag() {
+    fn parse_effect_args_accepts_queued_for_backward_compat() {
         let metas = parse_effect_meta_list(quote!(on = MyEvent, queued));
-        let args = parse_effect_args(&metas).expect("queued should parse");
-        assert!(args.queued);
+        let args = parse_effect_args(&metas).expect("queued should parse (backward compat)");
         assert!(matches!(args.on, Some(OnSpec::EventType(_))));
-    }
-
-    #[test]
-    fn parse_effect_args_rejects_duplicate_queued_flag() {
-        let metas = parse_effect_meta_list(quote!(on = MyEvent, queued, queued));
-        let error = parse_effect_args(&metas)
-            .err()
-            .expect("duplicate queued should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("queued specified more than once"),
-            "unexpected error: {}",
-            error
-        );
     }
 
     #[test]
@@ -1142,9 +1175,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_effect_config_emits_queued_builder_call() {
+    fn apply_effect_config_does_not_emit_queued_builder_call() {
         let args = EffectArgs {
-            queued: true,
+            retry: Some(3),
             ..EffectArgs::default()
         };
         let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
@@ -1155,8 +1188,13 @@ mod tests {
         );
         let configured_text = configured.to_string();
         assert!(
-            configured_text.contains(". queued ()"),
-            "queued builder call should be emitted, got: {}",
+            !configured_text.contains(". queued ()"),
+            "queued builder call should not be emitted, got: {}",
+            configured_text
+        );
+        assert!(
+            configured_text.contains(". retry (3u32)"),
+            "retry builder call should be emitted, got: {}",
             configured_text
         );
     }
@@ -1236,6 +1274,24 @@ mod tests {
             assert!(args.filter.is_some());
             assert!(!args.extract.is_empty());
         }
+    }
+
+    #[test]
+    fn parse_effect_args_supports_on_any_flag() {
+        let metas = parse_effect_meta_list(quote!(on_any, id = "logger"));
+        let args = parse_effect_args(&metas).expect("on_any should parse");
+        assert!(args.on_any);
+        assert!(args.on.is_none());
+        assert_eq!(args.id.as_deref(), Some("logger"));
+    }
+
+    #[test]
+    fn parse_effect_args_rejects_on_any_with_on() {
+        // Both parse fine individually, but expand_effect validates mutual exclusivity
+        let metas = parse_effect_meta_list(quote!(on_any, on = MyEvent));
+        let args = parse_effect_args(&metas).expect("parsing should succeed");
+        assert!(args.on_any);
+        assert!(args.on.is_some());
     }
 }
 

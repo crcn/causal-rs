@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{aggregator, aggregators, handle, handles, Context, Emit, ErrorContext};
+use seesaw_core::{aggregator, aggregators, handle, handles, AnyEvent, Context, Emit, ErrorContext};
 use seesaw_core::{Aggregate, Apply};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -85,7 +85,6 @@ mod order_effects {
     #[handle(
         on = PaymentRequested,
         id = "charge_payment",
-        queued,
         retry = 3,
         timeout_secs = 30,
         priority = 1
@@ -105,7 +104,6 @@ mod order_effects {
     #[handle(
         on = PaymentRequested,
         id = "run_search",
-        queued,
         retry = 3,
         dlq_terminal = build_payment_failure
     )]
@@ -130,8 +128,8 @@ mod order_effects {
         }
     }
 
-    #[handle(on = OrderPlaced, queued, id = "queued_observer")]
-    async fn queued_observer(
+    #[handle(on = OrderPlaced, queued, id = "bg_observer")]
+    async fn bg_observer(
         _event: OrderPlaced,
         _ctx: Context<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
@@ -142,9 +140,9 @@ mod order_effects {
         on = PaymentRequested,
         queued,
         retry = 1,
-        id = "queued_retry_one"
+        id = "bg_retry_one"
     )]
-    async fn queued_retry_one(
+    async fn bg_retry_one(
         event: PaymentRequested,
         _ctx: Context<Deps>,
     ) -> Result<PaymentCharged> {
@@ -206,6 +204,14 @@ mod order_effects {
         _ctx: Context<Deps>,
     ) -> Result<Emit<AnalyticsEvent>> {
         Ok(Emit::None)
+    }
+
+    #[handle(on_any, id = "event_logger")]
+    async fn log_all_events(
+        _event: AnyEvent,
+        _ctx: Context<Deps>,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -278,7 +284,7 @@ fn aggregator_apply_trait_generated() {
 #[test]
 fn effects_module_registration_works() {
     let effects = order_effects::handles();
-    assert_eq!(effects.len(), 10);
+    assert_eq!(effects.len(), 11);
     assert!(effects
         .iter()
         .any(|effect| effect.can_handle(TypeId::of::<OrderPlaced>())));
@@ -298,22 +304,22 @@ fn effects_module_registration_works() {
         "default effect should remain inline"
     );
 
-    let queued_observer = effects
+    let bg_observer = effects
         .iter()
-        .find(|effect| effect.id == "queued_observer")
-        .expect("queued_observer effect should exist");
+        .find(|effect| effect.id == "bg_observer")
+        .expect("bg_observer effect should exist");
     assert!(
-        !queued_observer.is_inline(),
-        "queued attribute should force queued execution"
+        !bg_observer.is_inline(),
+        "queued attribute should force background execution"
     );
 
-    let queued_retry_one = effects
+    let bg_retry_one = effects
         .iter()
-        .find(|effect| effect.id == "queued_retry_one")
-        .expect("queued_retry_one effect should exist");
+        .find(|effect| effect.id == "bg_retry_one")
+        .expect("bg_retry_one effect should exist");
     assert!(
-        !queued_retry_one.is_inline(),
-        "queued attribute should force queued execution even when retry = 1"
+        !bg_retry_one.is_inline(),
+        "queued attribute should force background execution even when retry = 1"
     );
 
     let ship_high_value = effects
@@ -341,5 +347,19 @@ fn effects_module_registration_works() {
     assert!(
         !ship_order.is_projection(),
         "regular handler should not be a projection"
+    );
+
+    let event_logger = effects
+        .iter()
+        .find(|effect| effect.id == "event_logger")
+        .expect("event_logger on_any handler should exist");
+    // on_any handlers match all event types
+    assert!(
+        event_logger.can_handle(TypeId::of::<OrderPlaced>()),
+        "on_any handler should match OrderPlaced"
+    );
+    assert!(
+        event_logger.can_handle(TypeId::of::<PaymentRequested>()),
+        "on_any handler should match PaymentRequested"
     );
 }
