@@ -72,6 +72,16 @@ where
         &self.deps
     }
 
+    /// Read aggregate state by ID. Returns `A::default()` if no state exists.
+    pub fn aggregate<A: Aggregate + 'static>(&self, id: Uuid) -> A {
+        self.aggregators.get_transition::<A>(id).1
+    }
+
+    /// Read singleton aggregate state. Returns `A::default()` if no state exists.
+    pub fn singleton<A: Aggregate + 'static>(&self) -> A {
+        self.aggregators.get_singleton::<A>().1
+    }
+
     /// Set a custom runtime (e.g. RestateRuntime for durable execution).
     pub fn with_runtime<R: Runtime + 'static>(mut self, runtime: R) -> Self {
         self.runtime = Arc::new(runtime);
