@@ -13,6 +13,25 @@ use seesaw_core::{events, handler, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Helper to build a NewEvent with sensible defaults for tests.
+fn new_event(
+    event_type: &str,
+    payload: serde_json::Value,
+    aggregate_type: Option<&str>,
+    aggregate_id: Option<Uuid>,
+) -> NewEvent {
+    NewEvent {
+        event_id: Uuid::new_v4(),
+        parent_id: None,
+        correlation_id: Uuid::new_v4(),
+        event_type: event_type.to_string(),
+        payload,
+        created_at: chrono::Utc::now(),
+        aggregate_type: aggregate_type.map(|s| s.to_string()),
+        aggregate_id,
+    }
+}
+
 #[derive(Clone)]
 struct Deps;
 
@@ -584,7 +603,7 @@ async fn upcaster_transforms_old_event_for_handler() -> Result<()> {
 #[tokio::test]
 async fn upcaster_chain_in_aggregate_replay() {
     use seesaw_core::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
-    use seesaw_core::event_store::{EventStore, MemoryEventStore, NewEvent};
+    use seesaw_core::event_store::{EventStore, MemoryEventStore};
     use seesaw_core::upcaster::{Upcaster, UpcasterRegistry};
 
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -641,16 +660,12 @@ async fn upcaster_chain_in_aggregate_replay() {
     let order_id = Uuid::new_v4();
 
     store
-        .append_events(
-            "Order",
-            order_id,
-            0,
-            vec![NewEvent {
-                event_type: "OrderPlacedV3".to_string(),
-                payload: serde_json::json!({"order_id": order_id, "total": 250}),
-                schema_version: 0,
-            }],
-        )
+        .append(new_event(
+            "OrderPlacedV3",
+            serde_json::json!({"order_id": order_id, "total": 250}),
+            Some("Order"),
+            Some(order_id),
+        ))
         .await
         .unwrap();
 
@@ -658,7 +673,7 @@ async fn upcaster_chain_in_aggregate_replay() {
     let mut aggregators = AggregatorRegistry::new();
     aggregators.register(Aggregator::new::<OrderPlacedV3, Order, _>(|e| e.order_id));
 
-    let events = store.load_events(order_id).await.unwrap();
+    let events = store.load_stream("Order", order_id).await.unwrap();
     let event_pairs: Vec<(&str, &serde_json::Value)> = events
         .iter()
         .map(|e| (e.event_type.as_str(), &e.payload))
@@ -914,18 +929,18 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
         .await?;
 
     // Both events should be persisted to the Order stream
-    let events = event_store.load_events(order_id).await?;
+    let events = event_store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].event_type, "OrderCreated");
-    assert_eq!(events[0].aggregate_type, "Order");
+    assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
     assert_eq!(events[1].event_type, "OrderConfirmed");
-    assert_eq!(events[1].aggregate_type, "Order");
-    assert_eq!(events[1].version, 2);
+    assert_eq!(events[1].aggregate_type.as_deref(), Some("Order"));
+    assert_eq!(events[1].version.unwrap(), 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn events_not_matching_aggregator_not_persisted() -> Result<()> {
+async fn events_without_aggregator_not_in_stream() -> Result<()> {
     let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
 
     // Ping has no aggregator registered
@@ -942,9 +957,10 @@ async fn events_not_matching_aggregator_not_persisted() -> Result<()> {
         .settled()
         .await?;
 
-    // No events should be in the store (Ping has no aggregator)
-    // We can't query by type easily, but let's use a known UUID
-    let events = event_store.load_events(Uuid::new_v4()).await?;
+    // Events are persisted to the global log but not loadable via load_stream
+    // since Ping has no aggregator (no aggregate_type/aggregate_id).
+    // Querying any random stream should return empty.
+    let events = event_store.load_stream("Ping", Uuid::new_v4()).await?;
     assert!(events.is_empty());
     Ok(())
 }
@@ -1024,23 +1040,20 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
 
     // Pre-populate events directly in store (simulating previous engine run)
     event_store
-        .append_events(
-            "Order",
-            order_id,
-            0,
-            vec![
-                NewEvent {
-                    event_type: "OrderCreated".to_string(),
-                    payload: serde_json::json!({"order_id": order_id, "total": 100}),
-                    schema_version: 0,
-                },
-                NewEvent {
-                    event_type: "OrderConfirmed".to_string(),
-                    payload: serde_json::json!({"order_id": order_id}),
-                    schema_version: 0,
-                },
-            ],
-        )
+        .append(new_event(
+            "OrderCreated",
+            serde_json::json!({"order_id": order_id, "total": 100}),
+            Some("Order"),
+            Some(order_id),
+        ))
+        .await?;
+    event_store
+        .append(new_event(
+            "OrderConfirmed",
+            serde_json::json!({"order_id": order_id}),
+            Some("Order"),
+            Some(order_id),
+        ))
         .await?;
 
     // New engine with empty DashMap — transition guard must work
@@ -1084,30 +1097,22 @@ async fn snapshot_acceleration() -> Result<()> {
     let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
     let order_id = Uuid::new_v4();
 
-    // Pre-populate: 5 events in store
+    // Pre-populate: 2 events in store
     event_store
-        .append_events(
-            "Order",
-            order_id,
-            0,
-            vec![NewEvent {
-                event_type: "OrderCreated".to_string(),
-                payload: serde_json::json!({"order_id": order_id, "total": 500}),
-                schema_version: 0,
-            }],
-        )
+        .append(new_event(
+            "OrderCreated",
+            serde_json::json!({"order_id": order_id, "total": 500}),
+            Some("Order"),
+            Some(order_id),
+        ))
         .await?;
     event_store
-        .append_events(
-            "Order",
-            order_id,
-            1,
-            vec![NewEvent {
-                event_type: "OrderConfirmed".to_string(),
-                payload: serde_json::json!({"order_id": order_id}),
-                schema_version: 0,
-            }],
-        )
+        .append(new_event(
+            "OrderConfirmed",
+            serde_json::json!({"order_id": order_id}),
+            Some("Order"),
+            Some(order_id),
+        ))
         .await?;
 
     // Save snapshot at version 1 (after OrderCreated, before OrderConfirmed)
@@ -1183,13 +1188,13 @@ async fn rapid_fire_events_same_aggregate() -> Result<()> {
             .await?;
     }
 
-    let events = event_store.load_events(order_id).await?;
+    let events = event_store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 50, "all 50 events should be persisted");
-    assert_eq!(events.last().unwrap().version, 50);
+    assert_eq!(events.last().unwrap().version.unwrap(), 50);
 
     // Verify versions are sequential
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e.version, (i + 1) as u64);
+        assert_eq!(e.version.unwrap(), (i + 1) as u64);
     }
     Ok(())
 }
@@ -1224,13 +1229,13 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
         .settled()
         .await?;
 
-    let order_events = event_store.load_events(order_id).await?;
-    let customer_events = event_store.load_events(customer_id).await?;
+    let order_events = event_store.load_stream("Order", order_id).await?;
+    let customer_events = event_store.load_stream("Customer", customer_id).await?;
 
     assert_eq!(order_events.len(), 1, "OrderCreated in Order stream");
     assert_eq!(customer_events.len(), 1, "CustomerOrderPlaced in Customer stream");
-    assert_eq!(order_events[0].aggregate_type, "Order");
-    assert_eq!(customer_events[0].aggregate_type, "Customer");
+    assert_eq!(order_events[0].aggregate_type.as_deref(), Some("Order"));
+    assert_eq!(customer_events[0].aggregate_type.as_deref(), Some("Customer"));
     Ok(())
 }
 
@@ -1243,9 +1248,9 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
     // Events V1-V10 in store
     for i in 0..10 {
         let event_type = if i == 0 {
-            "OrderCreated".to_string()
+            "OrderCreated"
         } else {
-            "OrderConfirmed".to_string()
+            "OrderConfirmed"
         };
         let payload = if i == 0 {
             serde_json::json!({"order_id": order_id, "total": 100})
@@ -1253,16 +1258,12 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
             serde_json::json!({"order_id": order_id})
         };
         event_store
-            .append_events(
-                "Order",
-                order_id,
-                i as u64,
-                vec![NewEvent {
-                    event_type,
-                    payload,
-                    schema_version: 0,
-                }],
-            )
+            .append(new_event(
+                event_type,
+                payload,
+                Some("Order"),
+                Some(order_id),
+            ))
             .await?;
     }
 
@@ -1321,23 +1322,20 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
 
     // Events in store but NO snapshot
     event_store
-        .append_events(
-            "Order",
-            order_id,
-            0,
-            vec![
-                NewEvent {
-                    event_type: "OrderCreated".to_string(),
-                    payload: serde_json::json!({"order_id": order_id, "total": 100}),
-                    schema_version: 0,
-                },
-                NewEvent {
-                    event_type: "OrderConfirmed".to_string(),
-                    payload: serde_json::json!({"order_id": order_id}),
-                    schema_version: 0,
-                },
-            ],
-        )
+        .append(new_event(
+            "OrderCreated",
+            serde_json::json!({"order_id": order_id, "total": 100}),
+            Some("Order"),
+            Some(order_id),
+        ))
+        .await?;
+    event_store
+        .append(new_event(
+            "OrderConfirmed",
+            serde_json::json!({"order_id": order_id}),
+            Some("Order"),
+            Some(order_id),
+        ))
         .await?;
 
     let fired = Arc::new(AtomicUsize::new(0));
@@ -1414,63 +1412,12 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
     assert_eq!(confirmed_count.load(Ordering::SeqCst), 1);
 
     // Verify event store has correct sequential versions
-    let events = event_store.load_events(order_id).await?;
+    let events = event_store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].version, 1);
+    assert_eq!(events[0].version.unwrap(), 1);
     assert_eq!(events[0].event_type, "OrderCreated");
-    assert_eq!(events[1].version, 2);
+    assert_eq!(events[1].version.unwrap(), 2);
     assert_eq!(events[1].event_type, "OrderConfirmed");
-    Ok(())
-}
-
-#[tokio::test]
-async fn concurrency_error_treated_as_idempotent() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let order_id = Uuid::new_v4();
-
-    // Pre-persist an event (simulating Restate re-delivery)
-    event_store
-        .append_events(
-            "Order",
-            order_id,
-            0,
-            vec![NewEvent {
-                event_type: "OrderCreated".to_string(),
-                payload: serde_json::json!({"order_id": order_id, "total": 100}),
-                schema_version: 0,
-            }],
-        )
-        .await?;
-
-    let fired = Arc::new(AtomicUsize::new(0));
-    let f = fired.clone();
-
-    let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
-        .with_handler(handler::on::<OrderCreated>().then(
-            move |_event: Arc<OrderCreated>, _ctx: Context<Deps>| {
-                let f = f.clone();
-                async move {
-                    f.fetch_add(1, Ordering::SeqCst);
-                    Ok(events![])
-                }
-            },
-        ));
-
-    // This will hydrate (loads the pre-persisted event → version=1),
-    // then try to persist at version=1, but version=1 already exists → ConcurrencyError.
-    // Should be treated as idempotent success, not an error.
-    let result = engine
-        .emit(OrderCreated {
-            order_id,
-            total: 100,
-        })
-        .settled()
-        .await;
-
-    assert!(result.is_ok(), "ConcurrencyError should be treated as idempotent");
-    assert_eq!(fired.load(Ordering::SeqCst), 1, "handler should still fire");
     Ok(())
 }
 
@@ -1505,16 +1452,16 @@ async fn mixed_aggregate_types_independent_streams() -> Result<()> {
         .settled()
         .await?;
 
-    let order_events = event_store.load_events(order_id).await?;
-    let customer_events = event_store.load_events(customer_id).await?;
+    let order_events = event_store.load_stream("Order", order_id).await?;
+    let customer_events = event_store.load_stream("Customer", customer_id).await?;
 
     assert_eq!(order_events.len(), 2, "Order stream: Created + Confirmed");
     assert_eq!(customer_events.len(), 1, "Customer stream: OrderPlaced");
 
     // Verify each stream has correct sequential versions
-    assert_eq!(order_events[0].version, 1);
-    assert_eq!(order_events[1].version, 2);
-    assert_eq!(customer_events[0].version, 1);
+    assert_eq!(order_events[0].version.unwrap(), 1);
+    assert_eq!(order_events[1].version.unwrap(), 2);
+    assert_eq!(customer_events[0].version.unwrap(), 1);
     Ok(())
 }
 
@@ -1567,30 +1514,22 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
 
     // Pre-populate 1000 events: 1 OrderCreated + 999 OrderConfirmed
     event_store
-        .append_events(
-            "Order",
-            order_id,
-            0,
-            vec![NewEvent {
-                event_type: "OrderCreated".to_string(),
-                payload: serde_json::json!({"order_id": order_id, "total": 42}),
-                schema_version: 0,
-            }],
-        )
+        .append(new_event(
+            "OrderCreated",
+            serde_json::json!({"order_id": order_id, "total": 42}),
+            Some("Order"),
+            Some(order_id),
+        ))
         .await?;
 
-    for i in 1..1000u64 {
+    for _i in 1..1000u64 {
         event_store
-            .append_events(
-                "Order",
-                order_id,
-                i,
-                vec![NewEvent {
-                    event_type: "OrderConfirmed".to_string(),
-                    payload: serde_json::json!({"order_id": order_id}),
-                    schema_version: 0,
-                }],
-            )
+            .append(new_event(
+                "OrderConfirmed",
+                serde_json::json!({"order_id": order_id}),
+                Some("Order"),
+                Some(order_id),
+            ))
             .await?;
     }
 
@@ -1824,16 +1763,12 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
     // Pre-populate 50 events in store
     for i in 0..50 {
         event_store
-            .append_events(
-                "Order",
-                order_id,
-                i as u64,
-                vec![NewEvent {
-                    event_type: "OrderCreated".to_string(),
-                    payload: serde_json::json!({"order_id": order_id, "total": (i + 1) * 10}),
-                    schema_version: 0,
-                }],
-            )
+            .append(new_event(
+                "OrderCreated",
+                serde_json::json!({"order_id": order_id, "total": (i + 1) * 10}),
+                Some("Order"),
+                Some(order_id),
+            ))
             .await?;
     }
 

@@ -1,9 +1,8 @@
-//! Persistent event store for event-sourced aggregates.
+//! Persistent event store — global event log with optional aggregate metadata.
 //!
 //! Separate from `MemoryStore` (the settle-loop queue) — `EventStore` is the
-//! persistent event log for replay and aggregate reconstruction.
+//! persistent event log for replay, projections, and aggregate reconstruction.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,41 +21,47 @@ use crate::aggregator::{Aggregate, AggregatorRegistry};
 /// A persisted event loaded from the store.
 #[derive(Debug, Clone)]
 pub struct PersistedEvent {
-    /// Global ordering for cross-aggregate projections.
+    /// Global ordering position.
     pub position: u64,
-    /// Per-aggregate stream version (1-based).
-    pub version: u64,
-    /// The aggregate type string.
-    pub aggregate_type: String,
-    /// The aggregate instance ID.
-    pub aggregate_id: Uuid,
+    /// Unique event ID.
+    pub event_id: Uuid,
+    /// Parent event that caused this event (None for root events).
+    pub parent_id: Option<Uuid>,
+    /// Correlation ID linking the full causal tree.
+    pub correlation_id: Uuid,
     /// Short stable event type name (e.g. "OrderPlaced").
     pub event_type: String,
     /// JSON payload.
     pub payload: serde_json::Value,
-    /// Schema version for upcaster chain (0 = original/current).
-    pub schema_version: u32,
     /// When the event was persisted.
     pub created_at: DateTime<Utc>,
+    /// Aggregate type (only present for aggregate-scoped events).
+    pub aggregate_type: Option<String>,
+    /// Aggregate instance ID (only present for aggregate-scoped events).
+    pub aggregate_id: Option<Uuid>,
+    /// Per-aggregate stream version (only present for aggregate-scoped events).
+    pub version: Option<u64>,
 }
 
-/// A new event to be appended to a stream.
+/// A new event to be appended to the global log.
 #[derive(Debug, Clone)]
 pub struct NewEvent {
+    /// Unique event ID.
+    pub event_id: Uuid,
+    /// Parent event that caused this event (None for root events).
+    pub parent_id: Option<Uuid>,
+    /// Correlation ID linking the full causal tree.
+    pub correlation_id: Uuid,
     /// Short stable event type name (e.g. "OrderPlaced").
     pub event_type: String,
     /// JSON payload.
     pub payload: serde_json::Value,
-    /// Schema version for upcaster chain (0 = original/current).
-    pub schema_version: u32,
-}
-
-/// Concurrency conflict when appending events.
-#[derive(Debug, thiserror::Error)]
-#[error("concurrency conflict: expected version {expected}, but stream is at version {actual}")]
-pub struct ConcurrencyError {
-    pub expected: u64,
-    pub actual: u64,
+    /// When the event was created.
+    pub created_at: DateTime<Utc>,
+    /// Aggregate type (set by engine when aggregators match).
+    pub aggregate_type: Option<String>,
+    /// Aggregate instance ID (set by engine when aggregators match).
+    pub aggregate_id: Option<Uuid>,
 }
 
 /// Wrapper that pairs aggregate state with its stream version.
@@ -77,34 +82,30 @@ pub fn event_type_short_name(full: &str) -> &str {
 
 // ── EventStore trait ───────────────────────────────────────────────
 
-/// Persistent event log for event-sourced aggregates.
+/// Persistent event log for all events.
 ///
-/// Separate from the settle-loop queue. Implementations persist events
-/// durably and support replay for aggregate reconstruction.
+/// Every event is appended to the global log. Events with aggregate metadata
+/// can be loaded as streams for aggregate hydration.
 pub trait EventStore: Send + Sync {
-    /// Load all events for an aggregate by its globally-unique ID.
-    fn load_events(
+    /// Append a single event to the global log. Returns global position.
+    fn append(
         &self,
-        aggregate_id: Uuid,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
+        event: NewEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>>;
 
-    /// Append events to an aggregate stream.
-    ///
-    /// Returns the new stream version after appending.
-    /// Fails with `ConcurrencyError` if `expected_version` doesn't match.
-    fn append_events(
+    /// Load events for an aggregate stream (for hydration).
+    fn load_stream(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        expected_version: u64,
-        events: Vec<NewEvent>,
-    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
 
-    /// Load events from a specific version (for snapshot + partial replay).
-    fn load_events_from(
+    /// Load events from after a specific position (for snapshot + partial replay).
+    fn load_stream_from(
         &self,
+        aggregate_type: &str,
         aggregate_id: Uuid,
-        from_version: u64,
+        after_position: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
 }
 
@@ -112,14 +113,14 @@ pub trait EventStore: Send + Sync {
 
 /// In-memory `EventStore` for testing.
 pub struct MemoryEventStore {
-    streams: Mutex<HashMap<Uuid, Vec<PersistedEvent>>>,
+    global_log: Mutex<Vec<PersistedEvent>>,
     global_position: AtomicU64,
 }
 
 impl MemoryEventStore {
     pub fn new() -> Self {
         Self {
-            streams: Mutex::new(HashMap::new()),
+            global_log: Mutex::new(Vec::new()),
             global_position: AtomicU64::new(1),
         }
     }
@@ -132,69 +133,72 @@ impl Default for MemoryEventStore {
 }
 
 impl EventStore for MemoryEventStore {
-    fn load_events(
+    fn append(
         &self,
-        aggregate_id: Uuid,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>> {
-        let streams = self.streams.lock().unwrap();
-        let events = streams.get(&aggregate_id).cloned().unwrap_or_default();
-        Box::pin(std::future::ready(Ok(events)))
+        event: NewEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
+        let mut log = self.global_log.lock().unwrap();
+        let position = self.global_position.fetch_add(1, Ordering::SeqCst);
+
+        // Compute per-aggregate version if aggregate metadata is present
+        let version = if let (Some(ref agg_type), Some(agg_id)) = (&event.aggregate_type, event.aggregate_id) {
+            let count = log.iter().filter(|e| {
+                e.aggregate_type.as_deref() == Some(agg_type) && e.aggregate_id == Some(agg_id)
+            }).count() as u64;
+            Some(count + 1)
+        } else {
+            None
+        };
+
+        log.push(PersistedEvent {
+            position,
+            event_id: event.event_id,
+            parent_id: event.parent_id,
+            correlation_id: event.correlation_id,
+            event_type: event.event_type,
+            payload: event.payload,
+            created_at: event.created_at,
+            aggregate_type: event.aggregate_type,
+            aggregate_id: event.aggregate_id,
+            version,
+        });
+
+        Box::pin(std::future::ready(Ok(position)))
     }
 
-    fn append_events(
+    fn load_stream(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        expected_version: u64,
-        events: Vec<NewEvent>,
-    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
-        let mut streams = self.streams.lock().unwrap();
-        let stream = streams.entry(aggregate_id).or_default();
-
-        let current_version = stream.last().map(|e| e.version).unwrap_or(0);
-        if current_version != expected_version {
-            return Box::pin(std::future::ready(Err(ConcurrencyError {
-                expected: expected_version,
-                actual: current_version,
-            }
-            .into())));
-        }
-
-        let mut version = current_version;
-        for new_event in events {
-            version += 1;
-            let position = self.global_position.fetch_add(1, Ordering::SeqCst);
-            stream.push(PersistedEvent {
-                position,
-                version,
-                aggregate_type: aggregate_type.to_string(),
-                aggregate_id,
-                event_type: new_event.event_type,
-                payload: new_event.payload,
-                schema_version: new_event.schema_version,
-                created_at: Utc::now(),
-            });
-        }
-
-        Box::pin(std::future::ready(Ok(version)))
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>> {
+        let log = self.global_log.lock().unwrap();
+        let events: Vec<PersistedEvent> = log
+            .iter()
+            .filter(|e| {
+                e.aggregate_type.as_deref() == Some(aggregate_type)
+                    && e.aggregate_id == Some(aggregate_id)
+            })
+            .cloned()
+            .collect();
+        Box::pin(std::future::ready(Ok(events)))
     }
 
-    fn load_events_from(
+    fn load_stream_from(
         &self,
+        aggregate_type: &str,
         aggregate_id: Uuid,
-        from_version: u64,
+        after_position: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>> {
-        let streams = self.streams.lock().unwrap();
-        let events = streams
-            .get(&aggregate_id)
-            .map(|stream| {
-                stream
-                    .iter()
-                    .filter(|e| e.version >= from_version)
-                    .cloned()
-                    .collect()
+        let log = self.global_log.lock().unwrap();
+        let events: Vec<PersistedEvent> = log
+            .iter()
+            .filter(|e| {
+                e.aggregate_type.as_deref() == Some(aggregate_type)
+                    && e.aggregate_id == Some(aggregate_id)
+                    && e.position > after_position
             })
-            .unwrap_or_default();
+            .cloned()
+            .collect();
         Box::pin(std::future::ready(Ok(events)))
     }
 }
@@ -204,11 +208,10 @@ impl EventStore for MemoryEventStore {
 /// Persist an event to the event store.
 ///
 /// Uses the short type name (e.g. `"OrderPlaced"`) for durable storage.
-/// Returns the new stream version after appending.
+/// Returns the global position after appending.
 pub async fn persist_event<E, A>(
     store: &dyn EventStore,
     aggregate_id: Uuid,
-    expected_version: u64,
     event: &E,
 ) -> Result<u64>
 where
@@ -219,16 +222,16 @@ where
     let payload = serde_json::to_value(event)?;
 
     store
-        .append_events(
-            A::aggregate_type(),
-            aggregate_id,
-            expected_version,
-            vec![NewEvent {
-                event_type,
-                payload,
-                schema_version: 0,
-            }],
-        )
+        .append(NewEvent {
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type,
+            payload,
+            created_at: Utc::now(),
+            aggregate_type: Some(A::aggregate_type().to_string()),
+            aggregate_id: Some(aggregate_id),
+        })
         .await
 }
 
@@ -350,121 +353,90 @@ mod tests {
         assert_eq!(event_type_short_name("a::b::c::Foo"), "Foo");
     }
 
+    fn make_new_event(event_type: &str, payload: serde_json::Value) -> NewEvent {
+        NewEvent {
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            payload,
+            created_at: Utc::now(),
+            aggregate_type: None,
+            aggregate_id: None,
+        }
+    }
+
+    fn make_aggregate_event(
+        event_type: &str,
+        payload: serde_json::Value,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+    ) -> NewEvent {
+        NewEvent {
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            payload,
+            created_at: Utc::now(),
+            aggregate_type: Some(aggregate_type.to_string()),
+            aggregate_id: Some(aggregate_id),
+        }
+    }
+
     #[tokio::test]
     async fn empty_stream_returns_empty() {
         let store = MemoryEventStore::new();
-        let events = store.load_events(Uuid::new_v4()).await.unwrap();
+        let events = store.load_stream("Order", Uuid::new_v4()).await.unwrap();
         assert!(events.is_empty());
     }
 
     #[tokio::test]
-    async fn append_and_load_events() {
+    async fn append_and_load_aggregate_events() {
         let store = MemoryEventStore::new();
         let id = Uuid::new_v4();
 
-        let version = store
-            .append_events(
-                "Order",
-                id,
-                0,
-                vec![
-                    NewEvent {
-                        event_type: "OrderPlaced".to_string(),
-                        payload: serde_json::json!({"total": 100}),
-                        schema_version: 0,
-                    },
-                    NewEvent {
-                        event_type: "OrderShipped".to_string(),
-                        payload: serde_json::json!({"tracking": "ABC"}),
-                        schema_version: 0,
-                    },
-                ],
-            )
-            .await
-            .unwrap();
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({"total": 100}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderShipped", serde_json::json!({"tracking": "ABC"}), "Order", id)).await.unwrap();
 
-        assert_eq!(version, 2);
-
-        let events = store.load_events(id).await.unwrap();
+        let events = store.load_stream("Order", id).await.unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].version, 1);
+        assert_eq!(events[0].version, Some(1));
         assert_eq!(events[0].event_type, "OrderPlaced");
-        assert_eq!(events[1].version, 2);
+        assert_eq!(events[1].version, Some(2));
         assert_eq!(events[1].event_type, "OrderShipped");
-        assert_eq!(events[0].aggregate_type, "Order");
+        assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
     }
 
     #[tokio::test]
-    async fn concurrency_conflict() {
+    async fn non_aggregate_event_is_persisted() {
         let store = MemoryEventStore::new();
-        let id = Uuid::new_v4();
 
-        store
-            .append_events(
-                "Order",
-                id,
-                0,
-                vec![NewEvent {
-                    event_type: "OrderPlaced".to_string(),
-                    payload: serde_json::json!({}),
-                    schema_version: 0,
-                }],
-            )
-            .await
-            .unwrap();
+        let pos = store.append(make_new_event("SystemStarted", serde_json::json!({"node": "a"}))).await.unwrap();
+        assert!(pos > 0);
 
-        // Try to append at wrong version
-        let result = store
-            .append_events(
-                "Order",
-                id,
-                0, // should be 1
-                vec![NewEvent {
-                    event_type: "OrderShipped".to_string(),
-                    payload: serde_json::json!({}),
-                    schema_version: 0,
-                }],
-            )
-            .await;
+        // Not loadable via load_stream (no aggregate)
+        let events = store.load_stream("System", Uuid::new_v4()).await.unwrap();
+        assert!(events.is_empty());
 
-        let err = result.unwrap_err();
-        let concurrency_err = err.downcast_ref::<ConcurrencyError>().unwrap();
-        assert_eq!(concurrency_err.expected, 0);
-        assert_eq!(concurrency_err.actual, 1);
+        // But it's in the global log
+        let log = store.global_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].event_type, "SystemStarted");
+        assert!(log[0].aggregate_type.is_none());
+        assert!(log[0].version.is_none());
     }
 
     #[tokio::test]
-    async fn load_events_from_version() {
+    async fn load_stream_from_filters_by_position() {
         let store = MemoryEventStore::new();
         let id = Uuid::new_v4();
 
-        store
-            .append_events(
-                "Order",
-                id,
-                0,
-                vec![
-                    NewEvent {
-                        event_type: "OrderPlaced".to_string(),
-                        payload: serde_json::json!({}),
-                        schema_version: 0,
-                    },
-                    NewEvent {
-                        event_type: "OrderShipped".to_string(),
-                        payload: serde_json::json!({}),
-                        schema_version: 0,
-                    },
-                    NewEvent {
-                        event_type: "OrderDelivered".to_string(),
-                        payload: serde_json::json!({}),
-                        schema_version: 0,
-                    },
-                ],
-            )
-            .await
-            .unwrap();
+        let pos1 = store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderShipped", serde_json::json!({}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderDelivered", serde_json::json!({}), "Order", id)).await.unwrap();
 
-        let events = store.load_events_from(id, 2).await.unwrap();
+        let events = store.load_stream_from("Order", id, pos1).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "OrderShipped");
         assert_eq!(events[1].event_type, "OrderDelivered");
@@ -476,36 +448,11 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
 
-        store
-            .append_events(
-                "Order",
-                id1,
-                0,
-                vec![NewEvent {
-                    event_type: "OrderPlaced".to_string(),
-                    payload: serde_json::json!({}),
-                    schema_version: 0,
-                }],
-            )
-            .await
-            .unwrap();
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
+        store.append(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
 
-        store
-            .append_events(
-                "User",
-                id2,
-                0,
-                vec![NewEvent {
-                    event_type: "UserCreated".to_string(),
-                    payload: serde_json::json!({}),
-                    schema_version: 0,
-                }],
-            )
-            .await
-            .unwrap();
-
-        let events1 = store.load_events(id1).await.unwrap();
-        let events2 = store.load_events(id2).await.unwrap();
+        let events1 = store.load_stream("Order", id1).await.unwrap();
+        let events2 = store.load_stream("User", id2).await.unwrap();
         assert_eq!(events1.len(), 1);
         assert_eq!(events2.len(), 1);
         assert_eq!(events1[0].event_type, "OrderPlaced");
@@ -518,36 +465,11 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
 
-        store
-            .append_events(
-                "Order",
-                id1,
-                0,
-                vec![NewEvent {
-                    event_type: "OrderPlaced".to_string(),
-                    payload: serde_json::json!({}),
-                    schema_version: 0,
-                }],
-            )
-            .await
-            .unwrap();
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
+        store.append(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
 
-        store
-            .append_events(
-                "User",
-                id2,
-                0,
-                vec![NewEvent {
-                    event_type: "UserCreated".to_string(),
-                    payload: serde_json::json!({}),
-                    schema_version: 0,
-                }],
-            )
-            .await
-            .unwrap();
-
-        let events1 = store.load_events(id1).await.unwrap();
-        let events2 = store.load_events(id2).await.unwrap();
+        let events1 = store.load_stream("Order", id1).await.unwrap();
+        let events2 = store.load_stream("User", id2).await.unwrap();
 
         // Positions should be globally unique and ordered
         assert!(events2[0].position > events1[0].position);
@@ -574,21 +496,46 @@ mod tests {
         let store = MemoryEventStore::new();
         let order_id = Uuid::new_v4();
 
-        let version = persist_event::<OrderPlaced, Order>(
+        let position = persist_event::<OrderPlaced, Order>(
             &store,
             order_id,
-            0,
             &OrderPlaced { total: 100 },
         )
         .await
         .unwrap();
 
-        assert_eq!(version, 1);
+        assert!(position > 0);
 
-        let events = store.load_events(order_id).await.unwrap();
+        let events = store.load_stream("Order", order_id).await.unwrap();
         assert_eq!(events.len(), 1);
-        // Should use short name, not full module path
         assert_eq!(events[0].event_type, "OrderPlaced");
-        assert_eq!(events[0].aggregate_type, "Order");
+        assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
+    }
+
+    #[tokio::test]
+    async fn causal_metadata_round_trips() {
+        let store = MemoryEventStore::new();
+        let event_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
+
+        store
+            .append(NewEvent {
+                event_id,
+                parent_id: Some(parent_id),
+                correlation_id,
+                event_type: "TestEvent".to_string(),
+                payload: serde_json::json!({}),
+                created_at: Utc::now(),
+                aggregate_type: Some("Test".to_string()),
+                aggregate_id: Some(Uuid::new_v4()),
+            })
+            .await
+            .unwrap();
+
+        let log = store.global_log.lock().unwrap();
+        assert_eq!(log[0].event_id, event_id);
+        assert_eq!(log[0].parent_id, Some(parent_id));
+        assert_eq!(log[0].correlation_id, correlation_id);
     }
 }

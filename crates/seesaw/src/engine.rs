@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_store::{
-    event_type_short_name, ConcurrencyError, EventStore, NewEvent, SnapshotStore,
+    event_type_short_name, EventStore, NewEvent, SnapshotStore,
 };
 use crate::handler::{Context, Handler};
 use crate::handler::context::{DirectRunner, SideEffectRunner};
@@ -324,12 +324,12 @@ where
             while let Some(event) = self.store.poll_next().await? {
                 processed_any = true;
 
-                // Hydrate cold aggregates + auto-persist before state mutation.
+                // Persist every event + hydrate cold aggregates before state mutation.
                 // The settle loop processes events sequentially (single-writer),
                 // so multiple events targeting the same aggregate in one batch
                 // are safe — each sees the version left by the previous one.
                 if self.event_store.is_some() {
-                    self.hydrate_and_persist(&event).await?;
+                    self.persist_and_hydrate(&event).await?;
                 }
 
                 // Apply event to live aggregator state before handlers run
@@ -541,70 +541,57 @@ where
 
     // --- Internal ---
 
-    /// Hydrate cold aggregates from EventStore and auto-persist the event.
+    /// Hydrate cold aggregates, then persist every event to the global log.
     ///
-    /// For each aggregator matching this event type:
-    /// 1. If DashMap is cold, hydrate from EventStore (with snapshot acceleration)
-    /// 2. Auto-persist the event to the aggregate's stream
-    async fn hydrate_and_persist(&self, event: &QueuedEvent) -> Result<()> {
+    /// 1. For each matching aggregator, hydrate cold aggregates from EventStore
+    /// 2. Always append the event (with aggregate metadata if aggregators match)
+    async fn persist_and_hydrate(&self, event: &QueuedEvent) -> Result<()> {
         let event_store = self.event_store.as_ref().unwrap();
+        let short_name = event_type_short_name(&event.event_type);
 
+        // Find matching aggregators to set aggregate metadata
         let matching = self.aggregators.find_by_event_type(&event.event_type);
-        if matching.is_empty() {
-            return Ok(()); // No aggregators care about this event — not persisted
-        }
 
-        for agg in matching {
-            let aggregate_id = match agg.extract_id_from_json(&event.payload) {
+        // Determine aggregate metadata from the first matching aggregator
+        let (aggregate_type, aggregate_id) = matching.iter().find_map(|agg| {
+            agg.extract_id_from_json(&event.payload)
+                .map(|id| (agg.aggregate_type.clone(), id))
+        }).map(|(t, id)| (Some(t), Some(id))).unwrap_or((None, None));
+
+        // Step 1: Hydrate cold aggregates BEFORE appending (so we don't load
+        // the event we're about to append)
+        for agg in &matching {
+            let agg_id = match agg.extract_id_from_json(&event.payload) {
                 Some(id) => id,
                 None => continue,
             };
 
-            let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
+            let key = format!("{}:{}", agg.aggregate_type, agg_id);
 
-            // Step 1: Hydrate if cold
             if !self.aggregators.has_state(&key) {
                 self.hydrate_aggregate(
                     event_store.as_ref(),
                     &agg.aggregate_type,
-                    aggregate_id,
+                    agg_id,
                     &key,
                 )
                 .await?;
             }
-
-            // Step 2: Auto-persist
-            let current_version = self.aggregators.get_version(&key);
-            let short_name = event_type_short_name(&event.event_type);
-
-            match event_store
-                .append_events(
-                    &agg.aggregate_type,
-                    aggregate_id,
-                    current_version,
-                    vec![NewEvent {
-                        event_type: short_name.to_string(),
-                        payload: event.payload.clone(),
-                        schema_version: 0,
-                    }],
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    // ConcurrencyError: treat as idempotent success
-                    // (Restate replay may re-deliver already-persisted events)
-                    if e.downcast_ref::<ConcurrencyError>().is_some() {
-                        tracing::debug!(
-                            key,
-                            "ConcurrencyError during auto-persist, treating as idempotent"
-                        );
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
         }
+
+        // Step 2: Always append to global log
+        event_store
+            .append(NewEvent {
+                event_id: event.event_id,
+                parent_id: event.parent_id,
+                correlation_id: event.correlation_id,
+                event_type: short_name.to_string(),
+                payload: event.payload.clone(),
+                created_at: event.created_at,
+                aggregate_type,
+                aggregate_id,
+            })
+            .await?;
 
         Ok(())
     }
@@ -627,9 +614,9 @@ where
                 if let Some(agg) = agg {
                     let mut state = agg.deserialize_state(snapshot.state)?;
 
-                    // Load remaining events after snapshot
+                    // Load remaining events after snapshot position
                     let remaining = event_store
-                        .load_events_from(aggregate_id, snapshot.version + 1)
+                        .load_stream_from(aggregate_type, aggregate_id, snapshot.version)
                         .await?;
 
                     if !remaining.is_empty() {
@@ -655,7 +642,7 @@ where
         }
 
         // No snapshot — full replay
-        let events = event_store.load_events(aggregate_id).await?;
+        let events = event_store.load_stream(aggregate_type, aggregate_id).await?;
         if events.is_empty() {
             return Ok(());
         }
@@ -665,7 +652,7 @@ where
             .map(|e| (e.event_type.as_str(), &e.payload))
             .collect();
 
-        let last_version = events.last().unwrap().version;
+        let last_version = events.last().unwrap().version.unwrap_or(events.len() as u64);
 
         if let Some(state) = self.aggregators.replay_events(
             aggregate_type,
