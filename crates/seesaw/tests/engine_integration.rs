@@ -29,6 +29,7 @@ fn new_event(
         created_at: chrono::Utc::now(),
         aggregate_type: aggregate_type.map(|s| s.to_string()),
         aggregate_id,
+        metadata: serde_json::Map::new(),
     }
 }
 
@@ -962,6 +963,85 @@ async fn events_without_aggregator_not_in_stream() -> Result<()> {
     // Querying any random stream should return empty.
     let events = event_store.load_stream("Ping", Uuid::new_v4()).await?;
     assert!(events.is_empty());
+    Ok(())
+}
+
+// -- Event metadata tests --
+
+#[tokio::test]
+async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
+    let event_store = Arc::new(MemoryEventStore::new());
+    let order_id = Uuid::new_v4();
+
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone() as Arc<dyn EventStore>)
+        .with_event_metadata(serde_json::json!({
+            "run_id": "scrape-abc123",
+            "schema_v": 1
+        }))
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
+
+    engine
+        .emit(OrderCreated {
+            order_id,
+            total: 100,
+        })
+        .settled()
+        .await?;
+
+    let events = event_store.load_stream("Order", order_id).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].metadata["run_id"], "scrape-abc123");
+    assert_eq!(events[0].metadata["schema_v"], 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_metadata_on_non_aggregate_events() -> Result<()> {
+    let event_store = Arc::new(MemoryEventStore::new());
+
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone() as Arc<dyn EventStore>)
+        .with_event_metadata(serde_json::json!({
+            "run_id": "run-xyz"
+        }))
+        .with_handler(handler::on::<Ping>().then(
+            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
+        ));
+
+    engine
+        .emit(Ping {
+            msg: "hello".into(),
+        })
+        .settled()
+        .await?;
+
+    // Check global log directly since Ping has no aggregator
+    let log = event_store.global_log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].metadata["run_id"], "run-xyz");
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_metadata_produces_empty_map() -> Result<()> {
+    let event_store = Arc::new(MemoryEventStore::new());
+    let order_id = Uuid::new_v4();
+
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone() as Arc<dyn EventStore>)
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
+
+    engine
+        .emit(OrderCreated {
+            order_id,
+            total: 100,
+        })
+        .settled()
+        .await?;
+
+    let events = event_store.load_stream("Order", order_id).await?;
+    assert!(events[0].metadata.is_empty());
     Ok(())
 }
 

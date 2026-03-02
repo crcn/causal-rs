@@ -45,7 +45,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.15"
+seesaw_core = "0.16"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -293,18 +293,18 @@ Seesaw includes a persistent event store for event-sourced aggregates, separate 
 
 ```rust
 pub trait EventStore: Send + Sync {
-    fn load_events(&self, aggregate_id: Uuid) -> /* Future<Vec<PersistedEvent>> */;
-    fn append_events(&self, aggregate_type: &str, aggregate_id: Uuid,
-        expected_version: u64, events: Vec<NewEvent>) -> /* Future<u64> */;
-    fn load_events_from(&self, aggregate_id: Uuid, from_version: u64) -> /* ... */;
+    fn append(&self, event: NewEvent) -> /* Future<u64> */;
+    fn load_stream(&self, aggregate_type: &str, aggregate_id: Uuid) -> /* Future<Vec<PersistedEvent>> */;
+    fn load_stream_from(&self, aggregate_type: &str, aggregate_id: Uuid,
+        after_position: u64) -> /* ... */;
 }
 ```
 
-Three methods: load all events, append with optimistic concurrency, and load from a version (for snapshot + partial replay).
+Three methods: append a single event to the global log, load an aggregate stream, and load from a position (for snapshot + partial replay). Every event is persisted — not just those with aggregators.
 
 ### Auto-persist and hydration
 
-When an `EventStore` is configured, the engine automatically persists events and hydrates aggregates on cold access — no manual loading needed:
+When an `EventStore` is configured, the engine persists **every** event to the global log and hydrates aggregates on cold access — no manual loading needed:
 
 ```rust
 use seesaw_core::event_store::MemoryEventStore;
@@ -316,12 +316,29 @@ let engine = Engine::new(deps)
     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
     .with_handler(on_order_placed());
 
-// Events matching aggregators are auto-persisted.
+// All events are persisted. Aggregate-scoped events get aggregate_type/aggregate_id.
 // On restart, aggregates hydrate from the EventStore automatically.
 engine.emit(OrderPlaced { order_id, total: 100 }).settled().await?;
 ```
 
 `persist_event` is available for manual persistence with short type names (e.g. `"OrderPlaced"` not `"my_crate::events::OrderPlaced"`) so refactoring modules never breaks replay.
+
+### Event metadata
+
+Stamp application-level context on every persisted event with `with_event_metadata`. Metadata travels with the event through the `EventStore`, letting adapters pull fields like `run_id` or `schema_v` without holding state:
+
+```rust
+let engine = Engine::new(deps)
+    .with_event_store(event_store)
+    .with_event_metadata(serde_json::json!({
+        "run_id": "scrape-abc123",
+        "schema_v": 1,
+        "actor": "bot-7"
+    }))
+    .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id);
+```
+
+Metadata is available on both `NewEvent` and `PersistedEvent` as a `serde_json::Map<String, serde_json::Value>`. Without `with_event_metadata`, the map is empty.
 
 ### Snapshots
 

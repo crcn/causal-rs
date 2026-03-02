@@ -41,6 +41,8 @@ pub struct PersistedEvent {
     pub aggregate_id: Option<Uuid>,
     /// Per-aggregate stream version (only present for aggregate-scoped events).
     pub version: Option<u64>,
+    /// Application-level metadata (e.g. run_id, schema_v, actor).
+    pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A new event to be appended to the global log.
@@ -62,6 +64,8 @@ pub struct NewEvent {
     pub aggregate_type: Option<String>,
     /// Aggregate instance ID (set by engine when aggregators match).
     pub aggregate_id: Option<Uuid>,
+    /// Application-level metadata (e.g. run_id, schema_v, actor).
+    pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Wrapper that pairs aggregate state with its stream version.
@@ -113,7 +117,8 @@ pub trait EventStore: Send + Sync {
 
 /// In-memory `EventStore` for testing.
 pub struct MemoryEventStore {
-    global_log: Mutex<Vec<PersistedEvent>>,
+    /// The global event log. Public for test assertions.
+    pub global_log: Mutex<Vec<PersistedEvent>>,
     global_position: AtomicU64,
 }
 
@@ -161,6 +166,7 @@ impl EventStore for MemoryEventStore {
             aggregate_type: event.aggregate_type,
             aggregate_id: event.aggregate_id,
             version,
+            metadata: event.metadata,
         });
 
         Box::pin(std::future::ready(Ok(position)))
@@ -231,6 +237,7 @@ where
             created_at: Utc::now(),
             aggregate_type: Some(A::aggregate_type().to_string()),
             aggregate_id: Some(aggregate_id),
+            metadata: serde_json::Map::new(),
         })
         .await
 }
@@ -363,6 +370,7 @@ mod tests {
             created_at: Utc::now(),
             aggregate_type: None,
             aggregate_id: None,
+            metadata: serde_json::Map::new(),
         }
     }
 
@@ -381,6 +389,7 @@ mod tests {
             created_at: Utc::now(),
             aggregate_type: Some(aggregate_type.to_string()),
             aggregate_id: Some(aggregate_id),
+            metadata: serde_json::Map::new(),
         }
     }
 
@@ -529,6 +538,7 @@ mod tests {
                 created_at: Utc::now(),
                 aggregate_type: Some("Test".to_string()),
                 aggregate_id: Some(Uuid::new_v4()),
+                metadata: serde_json::Map::new(),
             })
             .await
             .unwrap();
@@ -537,5 +547,48 @@ mod tests {
         assert_eq!(log[0].event_id, event_id);
         assert_eq!(log[0].parent_id, Some(parent_id));
         assert_eq!(log[0].correlation_id, correlation_id);
+    }
+
+    #[tokio::test]
+    async fn metadata_round_trips() {
+        let store = MemoryEventStore::new();
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("run_id".to_string(), serde_json::json!("scrape-abc123"));
+        metadata.insert("schema_v".to_string(), serde_json::json!(1));
+        metadata.insert("actor".to_string(), serde_json::json!("bot-7"));
+
+        let id = Uuid::new_v4();
+        store
+            .append(NewEvent {
+                event_id: Uuid::new_v4(),
+                parent_id: None,
+                correlation_id: Uuid::new_v4(),
+                event_type: "OrderPlaced".to_string(),
+                payload: serde_json::json!({"total": 100}),
+                created_at: Utc::now(),
+                aggregate_type: Some("Order".to_string()),
+                aggregate_id: Some(id),
+                metadata: metadata.clone(),
+            })
+            .await
+            .unwrap();
+
+        let events = store.load_stream("Order", id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metadata, metadata);
+        assert_eq!(events[0].metadata["run_id"], "scrape-abc123");
+        assert_eq!(events[0].metadata["schema_v"], 1);
+        assert_eq!(events[0].metadata["actor"], "bot-7");
+    }
+
+    #[tokio::test]
+    async fn empty_metadata_round_trips() {
+        let store = MemoryEventStore::new();
+        let id = Uuid::new_v4();
+
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
+
+        let events = store.load_stream("Order", id).await.unwrap();
+        assert!(events[0].metadata.is_empty());
     }
 }

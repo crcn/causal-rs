@@ -45,6 +45,7 @@ where
     event_store: Option<Arc<dyn EventStore>>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_every: Option<u64>,
+    event_metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<D> Engine<D>
@@ -64,6 +65,7 @@ where
             event_store: None,
             snapshot_store: None,
             snapshot_every: None,
+            event_metadata: serde_json::Map::new(),
         }
     }
 
@@ -121,6 +123,29 @@ where
     /// snapshots are saved automatically during the settle loop.
     pub fn snapshot_every(mut self, events: u64) -> Self {
         self.snapshot_every = Some(events);
+        self
+    }
+
+    /// Set metadata to stamp on every persisted event.
+    ///
+    /// Metadata travels with the event through the EventStore, letting
+    /// adapters pull application-level context (e.g. `run_id`, `schema_v`,
+    /// `actor`) without holding state themselves.
+    ///
+    /// ```ignore
+    /// let engine = Engine::new(deps)
+    ///     .with_event_store(event_store)
+    ///     .with_event_metadata(serde_json::json!({
+    ///         "run_id": "scrape-abc123",
+    ///         "schema_v": 1
+    ///     }));
+    /// ```
+    pub fn with_event_metadata(mut self, metadata: serde_json::Value) -> Self {
+        if let serde_json::Value::Object(map) = metadata {
+            self.event_metadata = map;
+        } else {
+            panic!("with_event_metadata expects a JSON object");
+        }
         self
     }
 
@@ -590,6 +615,7 @@ where
                 created_at: event.created_at,
                 aggregate_type,
                 aggregate_id,
+                metadata: self.event_metadata.clone(),
             })
             .await?;
 
@@ -966,6 +992,7 @@ where
             event_store: self.event_store.clone(),
             snapshot_store: self.snapshot_store.clone(),
             snapshot_every: self.snapshot_every,
+            event_metadata: self.event_metadata.clone(),
         }
     }
 }
