@@ -297,10 +297,11 @@ pub trait EventStore: Send + Sync {
     fn load_stream(&self, aggregate_type: &str, aggregate_id: Uuid) -> /* Future<Vec<PersistedEvent>> */;
     fn load_stream_from(&self, aggregate_type: &str, aggregate_id: Uuid,
         after_position: u64) -> /* ... */;
+    fn load_global_from(&self, after_position: u64, limit: usize) -> /* Future<Vec<PersistedEvent>> */;
 }
 ```
 
-Three methods: append a single event to the global log, load an aggregate stream, and load from a position (for snapshot + partial replay). Every event is persisted — not just those with aggregators.
+Four methods: append a single event (idempotent by `event_id`), load an aggregate stream, load from a position (for snapshot + partial replay), and tail the global log. Every event is persisted — not just those with aggregators.
 
 ### Auto-persist and hydration
 
@@ -484,6 +485,27 @@ cargo run --example simple-order
 - **[simple-order](examples/simple-order)** — Order processing workflow
 - **[http-fetcher](examples/http-fetcher)** — HTTP request pipeline with fan-out
 - **[ai-summarizer](examples/ai-summarizer)** — AI text summarization with Claude
+
+## Multi-Node Sync
+
+Three primitives enable syncing events between seesaw instances:
+
+1. **Idempotent append** — `EventStore::append` deduplicates by `event_id`. Appending the same event twice returns the existing position without inserting.
+
+2. **Global log tailing** — `EventStore::load_global_from(after_position, limit)` returns events after a given position, enabling a follower node to poll for new events.
+
+3. **Aggregate invalidation** — `Engine::invalidate_aggregate::<A>(id)` evicts cached aggregate state, forcing re-hydration from the EventStore on the next settle loop.
+
+**Sync flow:**
+
+```
+Node B polls Node A:  load_global_from(cursor, 100)
+                      ↓
+For each event:       append(event)          ← idempotent, safe to re-apply
+                      invalidate_aggregate   ← evict stale cache
+                      ↓
+Next settle loop:     hydrates from EventStore (includes foreign events)
+```
 
 ## Architecture
 

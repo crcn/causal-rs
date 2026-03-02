@@ -452,6 +452,15 @@ impl AggregatorRegistry {
         self.state.get(key).map(|entry| entry.state.clone())
     }
 
+    /// Remove cached state for an aggregate, forcing re-hydration on next access.
+    ///
+    /// Used for multi-node sync: after ingesting foreign events, invalidate
+    /// the aggregate so the next settle loop hydrates fresh from the EventStore.
+    pub fn remove_state(&self, key: &str) {
+        self.state.remove(key);
+        self.state.remove(&format!("{}:prev", key));
+    }
+
     /// Find the first aggregator registered for a given aggregate type string.
     ///
     /// Used to access `deserialize_state` / `default_state` during hydration.

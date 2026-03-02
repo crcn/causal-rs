@@ -84,6 +84,15 @@ where
         self.aggregators.get_singleton_arc::<A>().1
     }
 
+    /// Invalidate cached aggregate state, forcing re-hydration from the EventStore.
+    ///
+    /// Use after ingesting foreign events (e.g. from another node) so the
+    /// next settle loop rebuilds the aggregate from the persistent log.
+    pub fn invalidate_aggregate<A: Aggregate>(&self, id: Uuid) {
+        let key = format!("{}:{}", A::aggregate_type(), id);
+        self.aggregators.remove_state(&key);
+    }
+
     /// Set a custom runtime (e.g. RestateRuntime for durable execution).
     pub fn with_runtime<R: Runtime + 'static>(mut self, runtime: R) -> Self {
         self.runtime = Arc::new(runtime);

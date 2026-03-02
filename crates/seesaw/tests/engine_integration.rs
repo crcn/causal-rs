@@ -1884,3 +1884,73 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
 
     Ok(())
 }
+
+// -- Multi-node sync tests --
+
+#[tokio::test]
+async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
+    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+
+    let engine = Engine::new(Deps)
+        .with_event_store(event_store.clone())
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
+        .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
+        .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id);
+
+    let order_id = Uuid::new_v4();
+
+    // Emit an event through the engine — aggregate state is "created"
+    engine
+        .emit(OrderCreated {
+            order_id,
+            total: 42,
+        })
+        .settled()
+        .await?;
+
+    let state = engine.aggregate::<Order>(order_id);
+    assert_eq!(state.status, "created");
+
+    // Simulate a foreign node appending an event directly to the store
+    event_store
+        .append(NewEvent {
+            event_id: Uuid::new_v4(),
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: "OrderConfirmed".to_string(),
+            payload: serde_json::to_value(&OrderConfirmed { order_id })?,
+            created_at: chrono::Utc::now(),
+            aggregate_type: Some("Order".to_string()),
+            aggregate_id: Some(order_id),
+            metadata: serde_json::Map::new(),
+        })
+        .await?;
+
+    // State still shows "created" because the cache hasn't been invalidated
+    let state = engine.aggregate::<Order>(order_id);
+    assert_eq!(state.status, "created");
+
+    // Invalidate the aggregate cache
+    engine.invalidate_aggregate::<Order>(order_id);
+
+    // Emit another event — triggers hydration from EventStore (which now
+    // includes the foreign OrderConfirmed), then applies OrderShipped
+    engine
+        .emit(OrderShipped { order_id })
+        .settled()
+        .await?;
+
+    let state = engine.aggregate::<Order>(order_id);
+    assert_eq!(state.status, "shipped");
+    // Verify the foreign event was picked up: total should still be 42
+    assert_eq!(state.total, 42);
+
+    // Verify the EventStore has all three events
+    let events = event_store.load_stream("Order", order_id).await?;
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].event_type, "OrderCreated");
+    assert_eq!(events[1].event_type, "OrderConfirmed");
+    assert_eq!(events[2].event_type, "OrderShipped");
+
+    Ok(())
+}

@@ -90,8 +90,16 @@ pub fn event_type_short_name(full: &str) -> &str {
 ///
 /// Every event is appended to the global log. Events with aggregate metadata
 /// can be loaded as streams for aggregate hydration.
+///
+/// **Idempotency contract:** If an event with the same `event_id` already
+/// exists, `append` returns its existing position without inserting a
+/// duplicate. This enables safe cross-node sync where the same event may
+/// arrive more than once.
 pub trait EventStore: Send + Sync {
     /// Append a single event to the global log. Returns global position.
+    ///
+    /// Idempotent: if an event with the same `event_id` already exists,
+    /// returns the existing position without inserting.
     fn append(
         &self,
         event: NewEvent,
@@ -110,6 +118,16 @@ pub trait EventStore: Send + Sync {
         aggregate_type: &str,
         aggregate_id: Uuid,
         after_position: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
+
+    /// Load events from the global log after a given position.
+    ///
+    /// Returns up to `limit` events with `position > after_position`,
+    /// ordered by position. Used for tailing the global log across nodes.
+    fn load_global_from(
+        &self,
+        after_position: u64,
+        limit: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
 }
 
@@ -143,6 +161,12 @@ impl EventStore for MemoryEventStore {
         event: NewEvent,
     ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
         let mut log = self.global_log.lock().unwrap();
+
+        // Idempotency: if event_id already exists, return existing position
+        if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
+            return Box::pin(std::future::ready(Ok(existing.position)));
+        }
+
         let position = self.global_position.fetch_add(1, Ordering::SeqCst);
 
         // Compute per-aggregate version if aggregate metadata is present
@@ -203,6 +227,21 @@ impl EventStore for MemoryEventStore {
                     && e.aggregate_id == Some(aggregate_id)
                     && e.position > after_position
             })
+            .cloned()
+            .collect();
+        Box::pin(std::future::ready(Ok(events)))
+    }
+
+    fn load_global_from(
+        &self,
+        after_position: u64,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>> {
+        let log = self.global_log.lock().unwrap();
+        let events: Vec<PersistedEvent> = log
+            .iter()
+            .filter(|e| e.position > after_position)
+            .take(limit)
             .cloned()
             .collect();
         Box::pin(std::future::ready(Ok(events)))
@@ -590,5 +629,79 @@ mod tests {
 
         let events = store.load_stream("Order", id).await.unwrap();
         assert!(events[0].metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idempotent_append_returns_existing_position() {
+        let store = MemoryEventStore::new();
+        let event_id = Uuid::new_v4();
+
+        let event1 = NewEvent {
+            event_id,
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: "TestEvent".to_string(),
+            payload: serde_json::json!({"v": 1}),
+            created_at: Utc::now(),
+            aggregate_type: None,
+            aggregate_id: None,
+            metadata: serde_json::Map::new(),
+        };
+        let event2 = NewEvent {
+            event_id, // same event_id
+            parent_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: "TestEvent".to_string(),
+            payload: serde_json::json!({"v": 2}),
+            created_at: Utc::now(),
+            aggregate_type: None,
+            aggregate_id: None,
+            metadata: serde_json::Map::new(),
+        };
+
+        let pos1 = store.append(event1).await.unwrap();
+        let pos2 = store.append(event2).await.unwrap();
+
+        assert_eq!(pos1, pos2);
+        let log = store.global_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_global_from_returns_events_after_position() {
+        let store = MemoryEventStore::new();
+
+        let mut positions = Vec::new();
+        for i in 0..5 {
+            let pos = store.append(make_new_event(&format!("Event{}", i), serde_json::json!({"i": i}))).await.unwrap();
+            positions.push(pos);
+        }
+
+        let events = store.load_global_from(positions[1], 2).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].position, positions[2]);
+        assert_eq!(events[1].position, positions[3]);
+    }
+
+    #[tokio::test]
+    async fn load_global_from_respects_limit() {
+        let store = MemoryEventStore::new();
+
+        for i in 0..10 {
+            store.append(make_new_event(&format!("Event{}", i), serde_json::json!({}))).await.unwrap();
+        }
+
+        let events = store.load_global_from(0, 3).await.unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn load_global_from_empty_when_caught_up() {
+        let store = MemoryEventStore::new();
+
+        let pos = store.append(make_new_event("Event", serde_json::json!({}))).await.unwrap();
+
+        let events = store.load_global_from(pos, 10).await.unwrap();
+        assert!(events.is_empty());
     }
 }
