@@ -79,39 +79,50 @@ pub enum JoinMode {
 }
 
 /// Output from an effect handler that returns an event.
+///
+/// The payload is eagerly serialized at creation time, making `EventOutput`
+/// trivially journalable (e.g. for durable execution runtimes like Restate).
 #[derive(Clone)]
 pub struct EventOutput {
     /// The TypeId of the event type.
     pub type_id: TypeId,
     /// Fully-qualified Rust type name of the event.
     pub event_type: String,
-    /// The type-erased event value.
-    pub value: Arc<dyn Any + Send + Sync>,
-    /// Serializer captured at emit-time (avoids codec registry lookup).
-    pub(crate) encode: Arc<dyn Fn(&dyn Any) -> Option<serde_json::Value> + Send + Sync>,
-    /// Codec captured at emit-time for automatic registration.
-    pub(crate) codec: Arc<EventCodec>,
+    /// Eagerly-serialized event payload.
+    pub payload: serde_json::Value,
+    /// Codec for automatic registration (None for replayed/reconstructed outputs).
+    pub(crate) codec: Option<Arc<EventCodec>>,
 }
 
 impl EventOutput {
     /// Create a new EventOutput from a typed event.
     pub fn new<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(event: E) -> Self {
+        let payload = serde_json::to_value(&event).expect("Event must be serializable");
         Self {
             type_id: TypeId::of::<E>(),
             event_type: std::any::type_name::<E>().to_string(),
-            value: Arc::new(event),
-            encode: Arc::new(|any| {
-                any.downcast_ref::<E>()
-                    .and_then(|e| serde_json::to_value(e).ok())
-            }),
-            codec: Arc::new(EventCodec {
+            payload,
+            codec: Some(Arc::new(EventCodec {
                 event_type: std::any::type_name::<E>().to_string(),
                 type_id: TypeId::of::<E>(),
                 decode: Arc::new(|payload| {
                     let event: E = serde_json::from_value(payload.clone())?;
                     Ok(Arc::new(event))
                 }),
-            }),
+            })),
+        }
+    }
+
+    /// Reconstruct an EventOutput from a serialized form (e.g. from a durable execution journal).
+    ///
+    /// The reconstructed output has no codec — codec registration is only needed on first
+    /// execution, not on replay.
+    pub fn from_serialized(event_type: String, payload: serde_json::Value) -> Self {
+        Self {
+            type_id: TypeId::of::<()>(),
+            event_type,
+            payload,
+            codec: None,
         }
     }
 }

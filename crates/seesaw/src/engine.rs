@@ -759,11 +759,11 @@ where
     }
 
     async fn publish_output(&self, output: crate::handler::EventOutput) -> Result<ProcessHandle> {
-        self.effects.register_codec(output.codec.clone());
+        if let Some(codec) = &output.codec {
+            self.effects.register_codec(codec.clone());
+        }
 
-        let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
-            anyhow::anyhow!("Failed to serialize event {}", output.event_type)
-        })?;
+        let payload = output.payload;
 
         let event_id = Uuid::new_v4();
         let correlation_id = Uuid::new_v4();

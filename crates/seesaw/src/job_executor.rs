@@ -555,11 +555,11 @@ where
 
         for (emitted_index, output) in drained.into_iter().enumerate() {
             // Auto-register codec so the event can be decoded in the next dispatch cycle
-            self.effects.register_codec(output.codec.clone());
+            if let Some(codec) = &output.codec {
+                self.effects.register_codec(codec.clone());
+            }
 
-            let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
-                anyhow::anyhow!("Failed to serialize emitted event {}", output.event_type)
-            })?;
+            let payload = output.payload;
 
             let event_id = Uuid::new_v5(
                 &NAMESPACE_SEESAW,
@@ -673,11 +673,11 @@ where
         let mut result = Vec::with_capacity(emitted_count);
         for (emitted_index, output) in emitted.into_iter().enumerate() {
             // Auto-register codec so the event can be decoded in the next dispatch cycle
-            self.effects.register_codec(output.codec.clone());
+            if let Some(codec) = &output.codec {
+                self.effects.register_codec(codec.clone());
+            }
 
-            let payload = (output.encode)(output.value.as_ref()).ok_or_else(|| {
-                anyhow::anyhow!("Failed to serialize emitted event {}", output.event_type)
-            })?;
+            let payload = output.payload;
 
             let (batch_id, batch_index, batch_size) = if let Some(inherited) = inherited_batch {
                 (Some(inherited.0), Some(inherited.1), Some(inherited.2))

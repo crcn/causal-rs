@@ -62,8 +62,8 @@ pub use upcaster::{Upcaster, UpcasterRegistry};
 // Re-export main types
 pub use engine::Engine;
 pub use handler::{
-    AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, Events, Handler, HandlerContext,
-    HandlerError, IntoEvents, JoinMode,
+    AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events, Handler,
+    HandlerContext, HandlerError, IntoEvents, JoinMode,
 };
 pub use handler::context::{DirectRunner, SideEffectRunner};
 
