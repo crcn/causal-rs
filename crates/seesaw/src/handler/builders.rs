@@ -272,6 +272,7 @@ where
                 batch_id: None,
                 batch_index: None,
                 batch_size: None,
+                handler_id: None,
             })
         }));
         self

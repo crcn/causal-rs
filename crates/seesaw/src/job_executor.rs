@@ -601,6 +601,7 @@ where
                 batch_id,
                 batch_index,
                 batch_size,
+                handler_id: Some(effect.id.clone()),
                 created_at,
             });
         }
@@ -696,6 +697,7 @@ where
                 batch_id,
                 batch_index,
                 batch_size,
+                handler_id: Some(execution.handler_id.clone()),
             });
         }
 

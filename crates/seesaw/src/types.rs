@@ -35,6 +35,8 @@ pub struct QueuedEvent {
     pub batch_index: Option<i32>,
     /// Total number of items in the batch.
     pub batch_size: Option<i32>,
+    /// Handler that produced this event (None for root/initial events).
+    pub handler_id: Option<String>,
     /// When event was created
     pub created_at: DateTime<Utc>,
 }
@@ -52,6 +54,8 @@ pub struct EmittedEvent {
     pub batch_index: Option<i32>,
     /// Total number of items in the batch.
     pub batch_size: Option<i32>,
+    /// Handler that produced this event.
+    pub handler_id: Option<String>,
 }
 
 /// Captured inline effect failure to persist in DLQ at commit time.

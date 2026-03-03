@@ -614,6 +614,14 @@ where
         }
 
         // Step 2: Always append to global log
+        let mut metadata = self.event_metadata.clone();
+        if let Some(ref hid) = event.handler_id {
+            metadata.insert(
+                "handler_id".to_string(),
+                serde_json::Value::String(hid.clone()),
+            );
+        }
+
         event_store
             .append(NewEvent {
                 event_id: event.event_id,
@@ -624,7 +632,7 @@ where
                 created_at: event.created_at,
                 aggregate_type,
                 aggregate_id,
-                metadata: self.event_metadata.clone(),
+                metadata,
             })
             .await?;
 
@@ -738,6 +746,7 @@ where
             batch_id: None,
             batch_index: None,
             batch_size: None,
+            handler_id: None,
             created_at: chrono::Utc::now(),
         };
 
@@ -776,6 +785,7 @@ where
             batch_id: None,
             batch_index: None,
             batch_size: None,
+            handler_id: None,
             created_at: chrono::Utc::now(),
         };
 

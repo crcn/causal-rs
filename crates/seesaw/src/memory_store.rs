@@ -225,6 +225,7 @@ impl MemoryStore {
                 batch_id: emitted.batch_id,
                 batch_index: emitted.batch_index,
                 batch_size: emitted.batch_size,
+                handler_id: emitted.handler_id,
                 created_at: Utc::now(),
             };
 
@@ -308,6 +309,7 @@ impl MemoryStore {
                 batch_id: emitted.batch_id,
                 batch_index: emitted.batch_index,
                 batch_size: emitted.batch_size,
+                handler_id: emitted.handler_id,
                 created_at: Utc::now(),
             };
 
