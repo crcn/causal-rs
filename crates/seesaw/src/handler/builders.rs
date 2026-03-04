@@ -290,14 +290,6 @@ where
         self
     }
 
-    /// Force queued execution (default: inline).
-    #[deprecated(note = "queued execution is now inferred from retry, timeout, delay, or priority")]
-    pub fn queued(mut self) -> Self {
-        self.queued = true;
-        self.codec = EventType::queue_codec();
-        self
-    }
-
     /// Add a delay before execution (triggers queued execution).
     pub fn delayed(mut self, duration: Duration) -> Self {
         self.delay = Some(duration);
@@ -315,11 +307,12 @@ where
     }
 
     /// Set maximum retry attempts (default: 1 = no retry).
+    ///
+    /// Triggers queued execution. Use `.retry(1)` to force queued
+    /// execution without retries.
     pub fn retry(mut self, attempts: u32) -> Self {
         self.max_attempts = attempts;
-        if attempts > 1 {
-            self.queued = true;
-        }
+        self.queued = true;
         self.codec = EventType::queue_codec();
         self
     }

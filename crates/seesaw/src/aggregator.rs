@@ -155,7 +155,7 @@ impl Aggregator {
 #[derive(Clone)]
 struct StateEntry {
     state: Arc<dyn Any + Send + Sync>,
-    /// Stream version from the EventStore (0 = never persisted / unknown).
+    /// Stream version from the Store (0 = never persisted / unknown).
     version: u64,
     /// Version at which last snapshot was taken (0 = never).
     snapshot_at_version: u64,
@@ -404,7 +404,7 @@ impl AggregatorRegistry {
         self.get_transition_arc::<A>(Uuid::nil())
     }
 
-    // ── EventStore integration helpers ──────────────────────────────
+    // ── Store integration helpers ──────────────────────────────
 
     /// Check if the DashMap has state for a given aggregate key.
     pub fn has_state(&self, key: &str) -> bool {
@@ -413,7 +413,7 @@ impl AggregatorRegistry {
 
     /// Inject hydrated state + version into the DashMap.
     ///
-    /// Used during cold-start hydration from the EventStore.
+    /// Used during cold-start hydration from the Store.
     pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: u64, snapshot_at_version: u64) {
         self.state.insert(key.to_string(), StateEntry { state, version, snapshot_at_version });
     }
@@ -455,7 +455,7 @@ impl AggregatorRegistry {
     /// Remove cached state for an aggregate, forcing re-hydration on next access.
     ///
     /// Used for multi-node sync: after ingesting foreign events, invalidate
-    /// the aggregate so the next settle loop hydrates fresh from the EventStore.
+    /// the aggregate so the next settle loop hydrates fresh from the Store.
     pub fn remove_state(&self, key: &str) {
         self.state.remove(key);
         self.state.remove(&format!("{}:prev", key));

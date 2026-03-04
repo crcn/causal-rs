@@ -54,10 +54,6 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
 pub use types::{NewEvent, PersistedEvent, Snapshot};
 
-// Deprecated re-exports for backward compatibility
-#[allow(deprecated)]
-pub use event_store::{EventStore, MemoryEventStore, MemorySnapshotStore, SnapshotStore};
-
 // Re-export store trait and in-memory implementation
 pub use store::Store;
 pub use memory_store::MemoryStore;
@@ -109,15 +105,7 @@ macro_rules! events {
     }};
 }
 
-/// Deprecated — use [`events!`] instead.
-#[deprecated(since = "0.15.1", note = "renamed to `events![]`")]
-#[macro_export]
-macro_rules! emit {
-    ($($tt:tt)*) => { $crate::events![$($tt)*] };
-}
 pub use job_executor::{HandlerExecutionResult, HandlerStatus, JobExecutor, JoinClaim};
-#[allow(deprecated)]
-pub use process::DispatchFuture;
 pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
     EffectCompletion, EffectDlq, EmittedEvent, EventProcessingCommit, EventWorkerConfig,

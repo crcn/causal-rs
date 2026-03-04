@@ -45,7 +45,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.16"
+seesaw_core = "0.18"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -287,38 +287,38 @@ let engine = Engine::new(deps).with_handlers(order_handlers::handles());
 
 ## Event Sourcing
 
-Seesaw includes a persistent event store for event-sourced aggregates, separate from the in-memory settle loop.
+Event persistence, aggregate hydration, and snapshots are built into the unified `Store` trait. The same store that drives the settle loop also persists events — no dual-write risk.
 
-### EventStore trait
+### Store trait (persistence methods)
+
+The `Store` trait includes optional event persistence methods with default no-ops. Override them to enable durable event sourcing:
 
 ```rust
-pub trait EventStore: Send + Sync {
-    fn append(&self, event: NewEvent) -> /* Future<u64> */;
-    fn load_stream(&self, aggregate_type: &str, aggregate_id: Uuid) -> /* Future<Vec<PersistedEvent>> */;
-    fn load_stream_from(&self, aggregate_type: &str, aggregate_id: Uuid,
-        after_position: u64) -> /* ... */;
-    fn load_global_from(&self, after_position: u64, limit: usize) -> /* Future<Vec<PersistedEvent>> */;
-}
+// These have default no-op implementations — override for persistence.
+async fn append_event(&self, event: NewEvent) -> Result<u64>;
+async fn load_stream(&self, aggregate_type: &str, aggregate_id: Uuid) -> Result<Vec<PersistedEvent>>;
+async fn load_stream_from(&self, agg_type: &str, agg_id: Uuid, after: u64) -> Result<Vec<PersistedEvent>>;
+async fn load_global_from(&self, after_position: u64, limit: usize) -> Result<Vec<PersistedEvent>>;
+async fn load_snapshot(&self, aggregate_type: &str, aggregate_id: Uuid) -> Result<Option<Snapshot>>;
+async fn save_snapshot(&self, snapshot: Snapshot) -> Result<()>;
 ```
 
-Four methods: append a single event (idempotent by `event_id`), load an aggregate stream, load from a position (for snapshot + partial replay), and tail the global log. Every event is persisted — not just those with aggregators.
+Append is idempotent by `event_id`. Every event is persisted — not just those with aggregators.
 
 ### Auto-persist and hydration
 
-When an `EventStore` is configured, the engine persists **every** event to the global log and hydrates aggregates on cold access — no manual loading needed:
+Configure a store with persistence enabled and the engine persists **every** event to the global log and hydrates aggregates on cold access:
 
 ```rust
-use seesaw_core::event_store::MemoryEventStore;
-
-let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+use seesaw_core::MemoryStore;
 
 let engine = Engine::new(deps)
-    .with_event_store(event_store)
+    .with_store(MemoryStore::with_persistence())
     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
     .with_handler(on_order_placed());
 
 // All events are persisted. Aggregate-scoped events get aggregate_type/aggregate_id.
-// On restart, aggregates hydrate from the EventStore automatically.
+// On restart, aggregates hydrate from the Store automatically.
 engine.emit(OrderPlaced { order_id, total: 100 }).settled().await?;
 ```
 
@@ -326,11 +326,11 @@ engine.emit(OrderPlaced { order_id, total: 100 }).settled().await?;
 
 ### Event metadata
 
-Stamp application-level context on every persisted event with `with_event_metadata`. Metadata travels with the event through the `EventStore`, letting adapters pull fields like `run_id` or `schema_v` without holding state:
+Stamp application-level context on every persisted event with `with_event_metadata`. Metadata travels with the event through the Store, letting adapters pull fields like `run_id` or `schema_v` without holding state:
 
 ```rust
 let engine = Engine::new(deps)
-    .with_event_store(event_store)
+    .with_store(MemoryStore::with_persistence())
     .with_event_metadata(serde_json::json!({
         "run_id": "scrape-abc123",
         "schema_v": 1,
@@ -349,9 +349,8 @@ Snapshots accelerate cold-start hydration by saving aggregate state at a point-i
 
 ```rust
 let engine = Engine::new(deps)
-    .with_event_store(event_store)
-    .with_snapshot_store(snapshot_store)
-    .snapshot_every(100)  // auto-checkpoint every 100 events
+    .with_store(my_store)
+    .snapshot_every(100)
     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id);
 ```
 
@@ -359,9 +358,9 @@ On cold start, the engine loads the latest snapshot and replays only events afte
 
 | Configuration | Behavior |
 |---|---|
-| No snapshot store | No snapshots |
-| `with_snapshot_store` only | Manual snapshots via `save_snapshot()` |
-| `with_snapshot_store` + `snapshot_every(N)` | Auto-checkpoint every N events |
+| Default store (no persistence overrides) | No persistence, no snapshots |
+| Store with persistence | Events persisted, manual snapshots via `save_snapshot()` |
+| Store with persistence + `snapshot_every(N)` | Auto-checkpoint every N events |
 
 ### Replay-safe side effects
 
@@ -460,7 +459,7 @@ impl OrderWorkflow for OrderWorkflowImpl {
 | Exactly-once effects | Idempotency keys | Restate journal |
 | Delayed execution | Seesaw delay queue | Restate timers |
 
-**What doesn't change:** `#[handler]`, `Engine`, `events![]`, `.extract()`, `.transition()`, `.accumulate()`, `Aggregate`, `EventStore`. User code is backend-agnostic.
+**What doesn't change:** `#[handler]`, `Engine`, `events![]`, `.extract()`, `.transition()`, `.accumulate()`, `Aggregate`, `Store`. User code is backend-agnostic.
 
 ## Context API
 
@@ -490,21 +489,21 @@ cargo run --example simple-order
 
 Three primitives enable syncing events between seesaw instances:
 
-1. **Idempotent append** — `EventStore::append` deduplicates by `event_id`. Appending the same event twice returns the existing position without inserting.
+1. **Idempotent append** — `Store::append_event` deduplicates by `event_id`. Appending the same event twice returns the existing position without inserting.
 
-2. **Global log tailing** — `EventStore::load_global_from(after_position, limit)` returns events after a given position, enabling a follower node to poll for new events.
+2. **Global log tailing** — `Store::load_global_from(after_position, limit)` returns events after a given position, enabling a follower node to poll for new events.
 
-3. **Aggregate invalidation** — `Engine::invalidate_aggregate::<A>(id)` evicts cached aggregate state, forcing re-hydration from the EventStore on the next settle loop.
+3. **Aggregate invalidation** — `Engine::invalidate_aggregate::<A>(id)` evicts cached aggregate state, forcing re-hydration from the Store on the next settle loop.
 
 **Sync flow:**
 
 ```
 Node B polls Node A:  load_global_from(cursor, 100)
                       ↓
-For each event:       append(event)          ← idempotent, safe to re-apply
+For each event:       append_event(event)    ← idempotent, safe to re-apply
                       invalidate_aggregate   ← evict stale cache
                       ↓
-Next settle loop:     hydrates from EventStore (includes foreign events)
+Next settle loop:     hydrates from Store (includes foreign events)
 ```
 
 ## Architecture
@@ -513,7 +512,7 @@ Next settle loop:     hydrates from EventStore (includes foreign events)
 Engine (routing, composition, settle loop)
   ├── Handlers (filter → extract → transition guard → execute → emit)
   ├── Aggregators (event folding, state transitions)
-  ├── EventStore (persistent event log, aggregate replay)
+  ├── Store (event/effect queue + persistent event log + snapshots)
   └── Runtime (pluggable execution backend)
         ├── DirectRuntime (default: in-memory, pass-through)
         └── RestateRuntime (durable: journaled, crash-safe)

@@ -95,10 +95,6 @@ impl Future for EmitFuture {
     }
 }
 
-/// Deprecated: use `EmitFuture` instead.
-#[deprecated(note = "renamed to EmitFuture")]
-pub type DispatchFuture = EmitFuture;
-
 /// Future for synchronous settlement.
 ///
 /// Two phases:

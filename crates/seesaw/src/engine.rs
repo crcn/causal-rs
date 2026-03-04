@@ -319,15 +319,6 @@ where
         EmitFuture::new(publish, settle)
     }
 
-    /// Deprecated: use `emit()` instead.
-    #[deprecated(note = "renamed to emit()")]
-    pub fn dispatch<E>(&self, event: E) -> EmitFuture
-    where
-        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
-    {
-        self.emit(event)
-    }
-
     /// Drive all pending events and effects to completion.
     pub async fn settle(&self) -> Result<()> {
         let executor = JobExecutor::new(

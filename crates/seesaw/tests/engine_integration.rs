@@ -177,10 +177,9 @@ async fn queued_handler_executes() -> Result<()> {
     let counter_clone = counter.clone();
 
     let engine = Engine::new(Deps).with_handler(
-        #[allow(deprecated)]
         handler::on::<Ping>()
             .id("queued_ping")
-            .queued()
+            .retry(1)
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                 let c = counter_clone.clone();
                 async move {
@@ -207,10 +206,9 @@ async fn emit_requires_settled() -> Result<()> {
     let counter_clone = counter.clone();
 
     let engine = Engine::new(Deps).with_handler(
-        #[allow(deprecated)]
         handler::on::<Ping>()
             .id("queued_fire_forget")
-            .queued()
+            .retry(1)
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                 let c = counter_clone.clone();
                 async move {
@@ -303,10 +301,8 @@ async fn dlq_terminal_event_published() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
-            #[allow(deprecated)]
             handler::on::<FailEvent>()
                 .id("always_fail")
-                .queued()
                 .retry(1)
                 .on_failure(|_event: Arc<FailEvent>, info: seesaw_core::ErrorContext| {
                     FailedTerminal {
@@ -402,10 +398,9 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
-            #[allow(deprecated)]
             handler::on::<EventA>()
                 .id("emit_b_queued")
-                .queued()
+                .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
                     Ok(events![EventB {
                         value: event.value + 1,
@@ -439,10 +434,8 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
-            #[allow(deprecated)]
             handler::on::<FailEvent>()
                 .id("always_fail_corr")
-                .queued()
                 .retry(1)
                 .on_failure(|_event: Arc<FailEvent>, info: seesaw_core::ErrorContext| {
                     FailedTerminal {
@@ -476,33 +469,6 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
         seen, handle.correlation_id,
         "DLQ terminal event must carry the original correlation_id"
     );
-    Ok(())
-}
-
-#[allow(deprecated)]
-#[tokio::test]
-async fn context_is_replay_defaults_to_false() -> Result<()> {
-    let saw_replay = Arc::new(Mutex::new(None));
-    let sr = saw_replay.clone();
-
-    let engine = Engine::new(Deps).with_handler(
-        handler::on::<Ping>().then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
-            let sr = sr.clone();
-            async move {
-                *sr.lock() = Some(ctx.is_replay());
-                Ok(events![])
-            }
-        }),
-    );
-
-    engine
-        .emit(Ping {
-            msg: "hello".into(),
-        })
-        .settled()
-        .await?;
-
-    assert_eq!(*saw_replay.lock(), Some(false));
     Ok(())
 }
 
@@ -601,8 +567,6 @@ async fn upcaster_transforms_old_event_for_handler() -> Result<()> {
 #[tokio::test]
 async fn upcaster_chain_in_aggregate_replay() {
     use seesaw_core::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
-    #[allow(deprecated)]
-    use seesaw_core::event_store::{EventStore, MemoryEventStore};
     use seesaw_core::upcaster::{Upcaster, UpcasterRegistry};
 
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -655,11 +619,11 @@ async fn upcaster_chain_in_aggregate_replay() {
     });
 
     // Store a v1-schema event (no currency, no region)
-    let store = MemoryEventStore::new();
+    let store = MemoryStore::with_persistence();
     let order_id = Uuid::new_v4();
 
     store
-        .append(new_event(
+        .append_event(new_event(
             "OrderPlacedV3",
             serde_json::json!({"order_id": order_id, "total": 250}),
             Some("Order"),
@@ -711,10 +675,9 @@ async fn settled_timeout_succeeds_when_fast() -> Result<()> {
 #[tokio::test]
 async fn settled_timeout_errors_when_slow() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
-        #[allow(deprecated)]
         handler::on::<Ping>()
             .id("slow_handler")
-            .queued()
+            .retry(1)
             .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 Ok(events![])
@@ -795,7 +758,7 @@ async fn backoff_retries_handler_with_exponential_delay() -> Result<()> {
 // EVENT STORE INTEGRATION
 // ═══════════════════════════════════════════════════════════
 
-// -- Shared aggregate types for EventStore tests --
+// -- Shared aggregate types for event persistence tests --
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Order {
@@ -873,7 +836,7 @@ impl Apply<CustomerOrderPlaced> for Customer {
 
 #[tokio::test]
 async fn engine_without_event_store_identical_behavior() -> Result<()> {
-    // Engine without EventStore should work identically to before
+    // Engine without persistence should work identically
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
@@ -1974,7 +1937,6 @@ async fn on_dlq_emits_event_on_handler_failure() -> Result<()> {
         .with_handler(
             handler::on::<FailEvent>()
                 .id("always_fail_dlq")
-                .queued()
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("boom"))
@@ -2015,7 +1977,6 @@ async fn on_dlq_receives_correct_info() -> Result<()> {
         .with_handler(
             handler::on::<FailEvent>()
                 .id("check_info_handler")
-                .queued()
                 .retry(2)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("detailed error"))
@@ -2046,10 +2007,8 @@ async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
             error: info.error,
         })
         .with_handler(
-            #[allow(deprecated)]
             handler::on::<FailEvent>()
                 .id("has_on_failure")
-                .queued()
                 .retry(1)
                 .on_failure(|_event: Arc<FailEvent>, info: seesaw_core::ErrorContext| {
                     HandlerSpecificFailure { error: info.error }
@@ -2103,7 +2062,6 @@ async fn on_dlq_fires_on_timeout() -> Result<()> {
         .with_handler(
             handler::on::<FailEvent>()
                 .id("timeout_handler")
-                .queued()
                 .retry(1)
                 .timeout(std::time::Duration::from_millis(10))
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2135,7 +2093,6 @@ async fn on_dlq_preserves_correlation_id() -> Result<()> {
         .with_handler(
             handler::on::<FailEvent>()
                 .id("corr_fail")
-                .queued()
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("fail"))
@@ -2180,7 +2137,7 @@ async fn on_dlq_not_called_on_success() -> Result<()> {
         .with_handler(
             handler::on::<Ping>()
                 .id("success_handler")
-                .queued()
+                .retry(1)
                 .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                     Ok(events![])
                 }),
@@ -2198,7 +2155,6 @@ async fn engine_without_on_dlq_unchanged() -> Result<()> {
         .with_handler(
             handler::on::<FailEvent>()
                 .id("no_dlq_handler")
-                .queued()
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("fail"))
@@ -2217,7 +2173,7 @@ async fn custom_correlation_id_on_process_handle() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<Ping>()
             .id("noop")
-            .queued()
+            .retry(1)
             .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 
@@ -2241,7 +2197,7 @@ async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
         .with_handler(
             handler::on::<EventA>()
                 .id("a_to_b")
-                .queued()
+                .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
                     Ok(events![EventB { value: event.value }])
                 }),
@@ -2249,7 +2205,7 @@ async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
         .with_handler(
             handler::on::<EventB>()
                 .id("observe_b")
-                .queued()
+                .retry(1)
                 .then(
                     move |_event: Arc<EventB>, ctx: Context<Deps>| {
                         let sc = sc.clone();
@@ -2282,7 +2238,7 @@ async fn omitted_correlation_id_auto_generates() -> Result<()> {
     let engine = Engine::new(Deps).with_handler(
         handler::on::<Ping>()
             .id("noop")
-            .queued()
+            .retry(1)
             .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 

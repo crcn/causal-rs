@@ -154,10 +154,9 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
-            #[allow(deprecated)]
             handler::on::<EventA>()
                 .id("emit_b")
-                .queued()
+                .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
                     Ok(events![EventB {
                         value: event.value + 1,
@@ -1276,10 +1275,9 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
 
     let engine = Engine::new(Deps)
         .with_handler(
-            #[allow(deprecated)]
             handler::on::<EventA>()
                 .id("emit_b_queued")
-                .queued()
+                .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
                     Ok(events![EventB {
                         value: event.value * 2,
@@ -1551,10 +1549,9 @@ async fn fanout_map_fanin_batch_metadata_propagates() -> Result<()> {
         )
         // Handler B: map each FanItem → MappedItem (1:1)
         .with_handler(
-            #[allow(deprecated)]
             handler::on::<FanItem>()
                 .id("map_b")
-                .queued()
+                .retry(1)
                 .then(move |event: Arc<FanItem>, _ctx: Context<Deps>| {
                     let b = b_count.clone();
                     async move {

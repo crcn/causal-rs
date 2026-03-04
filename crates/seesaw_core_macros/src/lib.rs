@@ -1029,13 +1029,7 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     }
 
     if args.queued {
-        builder = quote! {
-            {
-                #[allow(deprecated)]
-                let __b = #builder .queued();
-                __b
-            }
-        };
+        builder = quote! { #builder .retry(1) };
     }
 
     if let Some(retry) = args.retry {
