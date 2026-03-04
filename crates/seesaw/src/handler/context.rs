@@ -1,7 +1,6 @@
 //! Effect context and related types.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -9,42 +8,10 @@ use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
 
-/// Executes side-effect closures with optional journaling.
-///
-/// Implementations determine how results are captured:
-/// - [`DirectRunner`]: executes inline, no journaling
-/// - Restate backend: journals result, replays from journal
-pub trait SideEffectRunner: Send + Sync {
-    /// Run a side effect, optionally journaling the result.
-    ///
-    /// The future produces a serialized `serde_json::Value` on success.
-    /// Implementations may execute the future directly (DirectRunner) or
-    /// journal the result for replay (durable runtimes).
-    fn run_side_effect(
-        &self,
-        f: Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send>>,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send>>;
-}
-
-/// Default runner — executes side effects directly with no journaling.
-pub struct DirectRunner;
-
-impl SideEffectRunner for DirectRunner {
-    fn run_side_effect(
-        &self,
-        f: Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send>>,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send>> {
-        f
-    }
-}
-
 /// Trait for handler context types.
 ///
 /// This trait allows different backend implementations to provide
 /// their own context types while maintaining a common interface.
-///
-/// The default implementation is `Context<D>`, but backends like
-/// Restate can provide enhanced contexts with additional operations.
 pub trait HandlerContext<D>: Clone + Send + Sync + 'static
 where
     D: Send + Sync + 'static,
@@ -92,8 +59,6 @@ where
     pub(crate) is_replay: bool,
     /// Aggregator registry for transition guard replay.
     pub(crate) aggregator_registry: Option<Arc<AggregatorRegistry>>,
-    /// Side-effect runner for journaled execution.
-    pub(crate) side_effect_runner: Arc<dyn SideEffectRunner>,
 }
 
 impl<D> Clone for Context<D>
@@ -110,7 +75,6 @@ where
             deps: self.deps.clone(),
             is_replay: self.is_replay,
             aggregator_registry: self.aggregator_registry.clone(),
-            side_effect_runner: self.side_effect_runner.clone(),
         }
     }
 }
@@ -136,7 +100,6 @@ where
             deps,
             is_replay: false,
             aggregator_registry: None,
-            side_effect_runner: Arc::new(DirectRunner),
         }
     }
 
@@ -153,15 +116,6 @@ where
     #[allow(dead_code)]
     pub(crate) fn with_replay(mut self, is_replay: bool) -> Self {
         self.is_replay = is_replay;
-        self
-    }
-
-    /// Attach a side-effect runner for journaled execution.
-    pub(crate) fn with_side_effect_runner(
-        mut self,
-        runner: Arc<dyn SideEffectRunner>,
-    ) -> Self {
-        self.side_effect_runner = runner;
         self
     }
 
@@ -230,14 +184,12 @@ where
         self.is_replay
     }
 
-    /// Execute a side-effect closure with replay safety.
+    /// Execute a side-effect closure.
     ///
-    /// - **DirectRunner (default):** Executes inline, returns result directly.
-    /// - **Durable runtime (Restate):** Journals the result. On replay,
-    ///   skips execution and returns the journaled value.
+    /// Convenience wrapper that executes the closure directly and returns the result.
     ///
-    /// The return type must implement `Serialize + DeserializeOwned` so
-    /// durable runtimes can persist the result.
+    /// The return type must implement `Serialize + DeserializeOwned` to keep
+    /// the API contract stable for callers.
     ///
     /// ```rust,ignore
     /// let tracking_id: String = ctx.run(|| async {
@@ -250,19 +202,7 @@ where
         Fut: Future<Output = Result<T>> + Send + 'static,
         T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
     {
-        let fut = async move {
-            let result = f().await?;
-            let json = serde_json::to_value(&result)?;
-            Ok(json)
-        };
-
-        let json = self
-            .side_effect_runner
-            .run_side_effect(Box::pin(fut))
-            .await?;
-
-        let result: T = serde_json::from_value(json)?;
-        Ok(result)
+        f().await
     }
 }
 

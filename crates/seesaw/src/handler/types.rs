@@ -90,7 +90,7 @@ pub enum JoinMode {
 /// Output from an effect handler that returns an event.
 ///
 /// The payload is eagerly serialized at creation time, making `EventOutput`
-/// trivially journalable (e.g. for durable execution runtimes like Restate).
+/// trivially journalable for durable execution.
 #[derive(Clone)]
 pub struct EventOutput {
     /// The TypeId of the event type.
@@ -400,7 +400,7 @@ where
 
     /// Create the handler future without awaiting it.
     ///
-    /// Returns a `'static` future suitable for wrapping in a `Runtime`.
+    /// Returns a `'static` future suitable for direct execution.
     pub fn make_handler_future(
         &self,
         value: Arc<dyn Any + Send + Sync>,

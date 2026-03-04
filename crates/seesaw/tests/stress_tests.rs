@@ -966,67 +966,6 @@ async fn emit_option_some_produces_event() -> Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════
-// CUSTOM RUNTIME
-// ═══════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn custom_runtime_wraps_execution() -> Result<()> {
-    use std::future::Future;
-    use std::pin::Pin;
-
-    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let calls_clone = calls.clone();
-
-    struct SpyRuntime {
-        calls: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl seesaw_core::Runtime for SpyRuntime {
-        fn run(
-            &self,
-            handler_id: &str,
-            execution: Pin<
-                Box<
-                    dyn Future<
-                            Output = Result<Vec<seesaw_core::handler::EventOutput>>,
-                        > + Send,
-                >,
-            >,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<Vec<seesaw_core::handler::EventOutput>>,
-                    > + Send,
-            >,
-        > {
-            self.calls.lock().push(handler_id.to_string());
-            execution
-        }
-    }
-
-    let runtime = SpyRuntime {
-        calls: calls_clone,
-    };
-
-    let engine = Engine::new(Deps)
-        .with_runtime(runtime)
-        .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
-        ));
-
-    engine
-        .emit(Ping {
-            msg: "spy".into(),
-        })
-        .settled()
-        .await?;
-
-    let calls = calls.lock();
-    assert!(calls.len() >= 1, "runtime.run() should be called");
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════
 // MULTI-DISPATCH (independent workflows)
 // ═══════════════════════════════════════════════════════════
 
