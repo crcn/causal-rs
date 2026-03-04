@@ -2251,3 +2251,96 @@ async fn omitted_correlation_id_auto_generates() -> Result<()> {
     assert_ne!(handle.correlation_id, Uuid::nil(), "Should auto-generate a non-nil correlation_id");
     Ok(())
 }
+
+// -- Cancellation tests --
+
+#[tokio::test]
+async fn cancel_prevents_event_processing() -> Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(events![])
+            }
+        }),
+    );
+
+    // Emit without settling, then cancel before settle
+    let handle = engine.emit(Ping { msg: "hello".into() }).await?;
+    engine.cancel(handle.correlation_id).await?;
+    engine.settle().await?;
+
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "handler should not fire for cancelled workflow");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_dlqs_pending_effects() -> Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    // Use a queued (non-inline) handler so the effect goes through poll_next_effect
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>()
+            .id("cancel_dlq_handler")
+            .retry(1)
+            .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+                let c = counter_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+    );
+
+    // Emit (publishes event), then cancel, then settle
+    let handle = engine.emit(Ping { msg: "hello".into() }).await?;
+    engine.cancel(handle.correlation_id).await?;
+    engine.settle().await?;
+
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "queued handler should not fire for cancelled workflow");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_is_idempotent() -> Result<()> {
+    let engine = Engine::new(Deps);
+    let id = Uuid::new_v4();
+
+    // Cancel twice — no error
+    engine.cancel(id).await?;
+    engine.cancel(id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_does_not_affect_other_correlations() -> Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(events![])
+            }
+        }),
+    );
+
+    // Emit two workflows
+    let handle_a = engine.emit(Ping { msg: "a".into() }).await?;
+    let _handle_b = engine.emit(Ping { msg: "b".into() }).await?;
+
+    // Cancel only workflow A
+    engine.cancel(handle_a.correlation_id).await?;
+    engine.settle().await?;
+
+    // Only workflow B should have fired
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "only non-cancelled workflow should fire");
+    Ok(())
+}

@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +43,10 @@ pub struct MemoryStore {
     snapshots: Arc<DashMap<(String, Uuid), Snapshot>>,
     /// Whether event persistence is enabled.
     persistence_enabled: bool,
+    /// Cancelled correlation IDs with timestamp for TTL eviction.
+    cancelled: Arc<DashMap<Uuid, Instant>>,
+    /// TTL for cancelled entries (default 1 hour).
+    cancel_ttl: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +77,8 @@ impl MemoryStore {
             global_position: Arc::new(AtomicU64::new(1)),
             snapshots: Arc::new(DashMap::new()),
             persistence_enabled: false,
+            cancelled: Arc::new(DashMap::new()),
+            cancel_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -513,5 +520,25 @@ impl Store for MemoryStore {
         let key = (snapshot.aggregate_type.clone(), snapshot.aggregate_id);
         self.snapshots.insert(key, snapshot);
         Ok(())
+    }
+
+    async fn cancel_correlation(&self, correlation_id: Uuid) -> Result<()> {
+        self.cancelled.insert(correlation_id, Instant::now());
+        Ok(())
+    }
+
+    async fn is_cancelled(&self, correlation_id: Uuid) -> Result<bool> {
+        match self.cancelled.get(&correlation_id) {
+            Some(entry) => {
+                if entry.value().elapsed() > self.cancel_ttl {
+                    drop(entry);
+                    self.cancelled.remove(&correlation_id);
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }
+            None => Ok(false),
+        }
     }
 }

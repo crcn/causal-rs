@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::event_store::event_type_short_name;
-use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
+use crate::handler::{Cancellable, Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::types::{
     EmittedEvent, EventCommit, EventWorkerConfig, HandlerWorkerConfig,
@@ -34,6 +34,7 @@ where
     aggregator_registry: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
     global_dlq_mapper: Option<GlobalDlqMapper>,
+    cancellable: Option<Arc<dyn Cancellable>>,
 }
 
 impl<D> JobExecutor<D>
@@ -47,6 +48,7 @@ where
         aggregator_registry: Arc<AggregatorRegistry>,
         upcasters: Arc<UpcasterRegistry>,
         global_dlq_mapper: Option<GlobalDlqMapper>,
+        cancellable: Option<Arc<dyn Cancellable>>,
     ) -> Self {
         Self {
             deps,
@@ -54,6 +56,7 @@ where
             aggregator_registry,
             upcasters,
             global_dlq_mapper,
+            cancellable,
         }
     }
 
@@ -155,15 +158,13 @@ where
                 format!("{}-{}", event.event_id, projection.id).as_bytes(),
             )
             .to_string();
-            let ctx = Context::new(
+            let ctx = self.make_context(
                 projection.id.clone(),
                 idempotency_key,
                 event.correlation_id,
                 event.event_id,
                 event.parent_id,
-                self.deps.clone(),
-            )
-            .with_aggregator_registry(self.aggregator_registry.clone());
+            );
 
             if let Err(error) = (projection.handler)(any_event, ctx).await {
                 let error_string = error.to_string();
@@ -279,15 +280,13 @@ where
         )
         .to_string();
 
-        let ctx = Context::new(
+        let ctx = self.make_context(
             effect.id.clone(),
             idempotency_key,
             execution.correlation_id,
             execution.event_id,
             execution.parent_event_id,
-            self.deps.clone(),
-        )
-        .with_aggregator_registry(self.aggregator_registry.clone());
+        );
 
         // 2. Handle join/accumulation (if configured)
         let join_claim = if effect.join_mode == Some(JoinMode::SameBatch) {
@@ -434,15 +433,13 @@ where
                 continue;
             }
 
-            let ctx = Context::new(
+            let ctx = self.make_context(
                 effect.id.clone(),
                 format!("startup::{}", effect.id),
                 Uuid::nil(),
                 Uuid::nil(),
                 None,
-                self.deps.clone(),
-            )
-            .with_aggregator_registry(self.aggregator_registry.clone());
+            );
 
             effect
                 .call_started(ctx)
@@ -458,6 +455,30 @@ where
     }
 
     // --- Private helpers ---
+
+    fn make_context(
+        &self,
+        handler_id: String,
+        idempotency_key: String,
+        correlation_id: Uuid,
+        event_id: Uuid,
+        parent_event_id: Option<Uuid>,
+    ) -> Context<D> {
+        let ctx = Context::new(
+            handler_id,
+            idempotency_key,
+            correlation_id,
+            event_id,
+            parent_event_id,
+            self.deps.clone(),
+        )
+        .with_aggregator_registry(self.aggregator_registry.clone());
+        if let Some(ref cancellable) = self.cancellable {
+            ctx.with_cancellable(cancellable.clone())
+        } else {
+            ctx
+        }
+    }
 
     fn decode_event(
         &self,
@@ -500,15 +521,13 @@ where
         )
         .to_string();
 
-        let ctx = Context::new(
+        let ctx = self.make_context(
             effect.id.clone(),
             idempotency_key,
             source_event.correlation_id,
             source_event.event_id,
             source_event.parent_id,
-            self.deps.clone(),
-        )
-        .with_aggregator_registry(self.aggregator_registry.clone());
+        );
 
         let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
         let drained = handler_fut.await?;

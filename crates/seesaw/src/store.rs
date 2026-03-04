@@ -195,4 +195,20 @@ pub trait Store: Send + Sync {
     async fn save_snapshot(&self, _snapshot: Snapshot) -> Result<()> {
         Ok(())
     }
+
+    // ── Cancellation (optional) ───────────────────────────────────
+
+    /// Mark a correlation ID as cancelled.
+    ///
+    /// Best-effort "stop-at-next-checkpoint": handlers already mid-execution
+    /// will complete, but their output events will be rejected. Side effects
+    /// (API calls, emails) from in-flight handlers cannot be undone.
+    async fn cancel_correlation(&self, _correlation_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check whether a correlation ID has been cancelled.
+    async fn is_cancelled(&self, _correlation_id: Uuid) -> Result<bool> {
+        Ok(false)
+    }
 }

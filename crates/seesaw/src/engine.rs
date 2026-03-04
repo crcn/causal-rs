@@ -10,9 +10,11 @@ use uuid::Uuid;
 use anyhow::Result;
 use tracing::info;
 
+use async_trait::async_trait;
+
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_store::event_type_short_name;
-use crate::handler::{Context, GlobalDlqMapper, Handler, Projection};
+use crate::handler::{Cancellable, Context, GlobalDlqMapper, Handler, Projection};
 use crate::handler_registry::HandlerRegistry;
 use crate::job_executor::{EffectStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
@@ -24,6 +26,18 @@ use crate::types::{
     NAMESPACE_SEESAW,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
+
+/// Adapter that delegates cancellation checks to the Store.
+struct StoreCancellable {
+    store: Arc<dyn Store>,
+}
+
+#[async_trait]
+impl Cancellable for StoreCancellable {
+    async fn is_cancelled(&self, id: Uuid) -> bool {
+        self.store.is_cancelled(id).await.unwrap_or(false)
+    }
+}
 
 /// Store-agnostic Engine with built-in settle loop.
 ///
@@ -331,14 +345,27 @@ where
         EmitFuture::new(publish, settle)
     }
 
+    /// Cancel a running workflow by correlation ID.
+    ///
+    /// Best-effort "stop-at-next-checkpoint": handlers already mid-execution
+    /// will complete, but their output events will be rejected. Side effects
+    /// (API calls, emails) from in-flight handlers cannot be undone.
+    pub async fn cancel(&self, correlation_id: Uuid) -> Result<()> {
+        self.store.cancel_correlation(correlation_id).await
+    }
+
     /// Drive all pending events and effects to completion.
     pub async fn settle(&self) -> Result<()> {
+        let cancellable: Arc<dyn Cancellable> = Arc::new(StoreCancellable {
+            store: self.store.clone(),
+        });
         let executor = JobExecutor::new(
             self.deps.clone(),
             self.effects.clone(),
             self.aggregators.clone(),
             self.upcasters.clone(),
             self.global_dlq_mapper.clone(),
+            Some(cancellable.clone()),
         );
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
@@ -352,6 +379,20 @@ where
             // Drain event queue
             while let Some(event) = self.store.poll_next().await? {
                 processed_any = true;
+
+                // Cancellation checkpoint 1: reject cancelled events before
+                // persisting to the event log or mutating aggregate state.
+                if self.store.is_cancelled(event.correlation_id).await? {
+                    self.store
+                        .complete_event(EventOutcome::Rejected {
+                            event_row_id: event.id,
+                            event_id: event.event_id,
+                            error: "cancelled".to_string(),
+                            reason: "cancelled".to_string(),
+                        })
+                        .await?;
+                    continue;
+                }
 
                 // Persist every event + hydrate cold aggregates before state mutation.
                 // Default Store no-ops make this safe for MemoryStore.
@@ -392,6 +433,26 @@ where
 
             if !executions.is_empty() {
                 processed_any = true;
+
+                // Cancellation checkpoint 2: DLQ cancelled effects before execution.
+                let mut active_executions = Vec::new();
+                for execution in executions {
+                    if self.store.is_cancelled(execution.correlation_id).await? {
+                        self.store
+                            .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                                event_id: execution.event_id,
+                                handler_id: execution.handler_id.clone(),
+                                error: "cancelled".to_string(),
+                                reason: "cancelled".to_string(),
+                                attempts: execution.attempts,
+                                events_to_publish: Vec::new(),
+                            }))
+                            .await?;
+                    } else {
+                        active_executions.push(execution);
+                    }
+                }
+                let executions = active_executions;
 
                 let effect_futures: Vec<_> = executions
                     .iter()
@@ -508,6 +569,7 @@ where
                                         &handler_id,
                                         &execution_clone,
                                         join_claim.batch_id,
+                                        Some(cancellable.clone()),
                                     )
                                     .await?;
                                 } else {
@@ -964,6 +1026,7 @@ where
         handler_id: &str,
         execution: &QueuedEffect,
         batch_id: Uuid,
+        cancellable: Option<Arc<dyn Cancellable>>,
     ) -> Result<()> {
         let batch_index = execution.batch_index.unwrap_or(0);
         let batch_size = execution.batch_size.unwrap_or(1);
@@ -1010,7 +1073,7 @@ where
                     )
                     .to_string();
 
-                    let ctx = Context::new(
+                    let mut ctx = Context::new(
                         handler_id.to_string(),
                         idempotency_key,
                         execution.correlation_id,
@@ -1019,6 +1082,9 @@ where
                         self.deps.clone(),
                     )
                     .with_aggregator_registry(self.aggregators.clone());
+                    if let Some(ref cancellable) = cancellable {
+                        ctx = ctx.with_cancellable(cancellable.clone());
+                    }
 
                     match effect.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {
