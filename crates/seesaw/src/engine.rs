@@ -340,6 +340,11 @@ where
         self.store.cancel_correlation(correlation_id).await
     }
 
+    /// Return a summary of pending work for a correlation ID.
+    pub async fn status(&self, correlation_id: Uuid) -> Result<crate::types::QueueStatus> {
+        self.store.queue_status(correlation_id).await
+    }
+
     /// Drive all pending events and effects to completion.
     pub async fn settle(&self) -> Result<()> {
         let executor = JobExecutor::new(
@@ -895,6 +900,7 @@ where
         Ok(ProcessHandle {
             correlation_id,
             event_id,
+            store: Some(self.store.clone()),
         })
     }
 
@@ -938,6 +944,7 @@ where
         Ok(ProcessHandle {
             correlation_id,
             event_id,
+            store: Some(self.store.clone()),
         })
     }
 

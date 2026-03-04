@@ -2396,3 +2396,99 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
     );
     Ok(())
 }
+
+// ── QueueStatus + ProcessHandle workflow tests ──────────────────
+
+#[tokio::test]
+async fn queue_status_empty_after_settle() -> Result<()> {
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    );
+
+    let handle = engine
+        .emit(Ping {
+            msg: "hi".into(),
+        })
+        .settled()
+        .await?;
+
+    let status = handle.status().await?;
+    assert_eq!(status.pending_events, 0);
+    assert_eq!(status.pending_effects, 0);
+    assert_eq!(status.dead_lettered, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn queue_status_shows_pending_before_settle() -> Result<()> {
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    );
+
+    // Emit without settling — event should be pending
+    let handle = engine
+        .emit(Ping {
+            msg: "hi".into(),
+        })
+        .await?;
+
+    let status = handle.status().await?;
+    assert!(
+        status.pending_events > 0,
+        "expected pending events before settle, got {}",
+        status.pending_events
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_handle_cancel_works() -> Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(events![])
+            }
+        }),
+    );
+
+    let handle = engine
+        .emit(Ping {
+            msg: "cancel me".into(),
+        })
+        .await?;
+
+    handle.cancel().await?;
+    engine.settle().await?;
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "handler should not fire after cancel via ProcessHandle"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_status_delegates_to_store() -> Result<()> {
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    );
+
+    let handle = engine
+        .emit(Ping {
+            msg: "hi".into(),
+        })
+        .await?;
+
+    let status = engine.status(handle.correlation_id).await?;
+    assert!(
+        status.pending_events > 0,
+        "engine.status() should show pending events"
+    );
+    Ok(())
+}

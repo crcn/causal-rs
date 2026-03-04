@@ -340,6 +340,14 @@ pub struct Snapshot {
     pub created_at: DateTime<Utc>,
 }
 
+/// Summary of pending work for a correlation ID.
+#[derive(Debug, Clone, Default)]
+pub struct QueueStatus {
+    pub pending_events: usize,
+    pub pending_effects: usize,
+    pub dead_lettered: usize,
+}
+
 // Helper to format event for logging
 impl fmt::Display for QueuedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

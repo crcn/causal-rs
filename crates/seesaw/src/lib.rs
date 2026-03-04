@@ -52,7 +52,7 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 
 // Re-export event store helpers and types
 pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
-pub use types::{NewEvent, PersistedEvent, Snapshot};
+pub use types::{NewEvent, PersistedEvent, QueueStatus, Snapshot};
 
 // Re-export store trait and in-memory implementation
 pub use store::Store;

@@ -536,6 +536,27 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    async fn queue_status(&self, correlation_id: Uuid) -> Result<QueueStatus> {
+        let pending_events = self
+            .events
+            .get(&correlation_id)
+            .map(|q| q.len())
+            .unwrap_or(0);
+
+        let pending_effects = self
+            .effects
+            .lock()
+            .iter()
+            .filter(|e| e.correlation_id == correlation_id)
+            .count();
+
+        Ok(QueueStatus {
+            pending_events,
+            pending_effects,
+            dead_lettered: 0,
+        })
+    }
+
     async fn is_cancelled(&self, correlation_id: Uuid) -> Result<bool> {
         match self.cancelled.get(&correlation_id) {
             Some(entry) => {

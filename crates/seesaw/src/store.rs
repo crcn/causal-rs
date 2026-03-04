@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::types::{
     EffectResolution, EventOutcome, ExpiredJoinWindow, JoinAppendParams,
-    JoinEntry, NewEvent, PersistedEvent, QueuedEvent, QueuedEffect, Snapshot,
+    JoinEntry, NewEvent, PersistedEvent, QueueStatus, QueuedEvent, QueuedEffect, Snapshot,
 };
 
 /// Pluggable backend for the Engine's event and effect queues.
@@ -210,5 +210,15 @@ pub trait Store: Send + Sync {
     /// Check whether a correlation ID has been cancelled.
     async fn is_cancelled(&self, _correlation_id: Uuid) -> Result<bool> {
         Ok(false)
+    }
+
+    // ── Queue status (optional) ──────────────────────────────────
+
+    /// Return a summary of pending work for a correlation ID.
+    ///
+    /// Default returns zeros (backward-compatible with stores that don't
+    /// track queue depth).
+    async fn queue_status(&self, _correlation_id: Uuid) -> Result<QueueStatus> {
+        Ok(QueueStatus::default())
     }
 }

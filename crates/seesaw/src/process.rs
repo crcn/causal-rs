@@ -1,16 +1,48 @@
 //! Emit future and process handle for event submission.
 
 use anyhow::Result;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::store::Store;
+use crate::types::QueueStatus;
+
 /// Handle returned after an event is published.
-#[derive(Debug)]
 pub struct ProcessHandle {
     pub correlation_id: Uuid,
     pub event_id: Uuid,
+    pub(crate) store: Option<Arc<dyn Store>>,
+}
+
+impl fmt::Debug for ProcessHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessHandle")
+            .field("correlation_id", &self.correlation_id)
+            .field("event_id", &self.event_id)
+            .finish()
+    }
+}
+
+impl ProcessHandle {
+    /// Return a summary of pending work for this workflow.
+    pub async fn status(&self) -> Result<QueueStatus> {
+        match &self.store {
+            Some(store) => store.queue_status(self.correlation_id).await,
+            None => anyhow::bail!("ProcessHandle has no store reference"),
+        }
+    }
+
+    /// Cancel this workflow (best-effort stop-at-next-checkpoint).
+    pub async fn cancel(&self) -> Result<()> {
+        match &self.store {
+            Some(store) => store.cancel_correlation(self.correlation_id).await,
+            None => anyhow::bail!("ProcessHandle has no store reference"),
+        }
+    }
 }
 
 /// Type-erased async closure: Option<Uuid> → Result<ProcessHandle>
