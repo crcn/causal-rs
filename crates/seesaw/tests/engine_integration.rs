@@ -636,7 +636,7 @@ async fn upcaster_chain_in_aggregate_replay() {
     let mut aggregators = AggregatorRegistry::new();
     aggregators.register(Aggregator::new::<OrderPlacedV3, Order, _>(|e| e.order_id));
 
-    let events = store.load_stream("Order", order_id).await.unwrap();
+    let events = store.load_stream("Order", order_id, None).await.unwrap();
     let event_pairs: Vec<(&str, &serde_json::Value)> = events
         .iter()
         .map(|e| (e.event_type.as_str(), &e.payload))
@@ -891,7 +891,7 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
         .await?;
 
     // Both events should be persisted to the Order stream
-    let events = store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].event_type, "OrderCreated");
     assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
@@ -922,7 +922,7 @@ async fn events_without_aggregator_not_in_stream() -> Result<()> {
     // Events are persisted to the global log but not loadable via load_stream
     // since Ping has no aggregator (no aggregate_type/aggregate_id).
     // Querying any random stream should return empty.
-    let events = store.load_stream("Ping", Uuid::new_v4()).await?;
+    let events = store.load_stream("Ping", Uuid::new_v4(), None).await?;
     assert!(events.is_empty());
     Ok(())
 }
@@ -950,7 +950,7 @@ async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
         .settled()
         .await?;
 
-    let events = store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].metadata["run_id"], "scrape-abc123");
     assert_eq!(events[0].metadata["schema_v"], 1);
@@ -1001,7 +1001,7 @@ async fn no_metadata_produces_empty_map() -> Result<()> {
         .settled()
         .await?;
 
-    let events = store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id, None).await?;
     assert!(events[0].metadata.is_empty());
     Ok(())
 }
@@ -1227,7 +1227,7 @@ async fn rapid_fire_events_same_aggregate() -> Result<()> {
             .await?;
     }
 
-    let events = store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 50, "all 50 events should be persisted");
     assert_eq!(events.last().unwrap().version.unwrap(), 50);
 
@@ -1268,8 +1268,8 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
         .settled()
         .await?;
 
-    let order_events = store.load_stream("Order", order_id).await?;
-    let customer_events = store.load_stream("Customer", customer_id).await?;
+    let order_events = store.load_stream("Order", order_id, None).await?;
+    let customer_events = store.load_stream("Customer", customer_id, None).await?;
 
     assert_eq!(order_events.len(), 1, "OrderCreated in Order stream");
     assert_eq!(customer_events.len(), 1, "CustomerOrderPlaced in Customer stream");
@@ -1447,7 +1447,7 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
     assert_eq!(confirmed_count.load(Ordering::SeqCst), 1);
 
     // Verify event store has correct sequential versions
-    let events = store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].version.unwrap(), 1);
     assert_eq!(events[0].event_type, "OrderCreated");
@@ -1487,8 +1487,8 @@ async fn mixed_aggregate_types_independent_streams() -> Result<()> {
         .settled()
         .await?;
 
-    let order_events = store.load_stream("Order", order_id).await?;
-    let customer_events = store.load_stream("Customer", customer_id).await?;
+    let order_events = store.load_stream("Order", order_id, None).await?;
+    let customer_events = store.load_stream("Customer", customer_id, None).await?;
 
     assert_eq!(order_events.len(), 2, "Order stream: Created + Confirmed");
     assert_eq!(customer_events.len(), 1, "Customer stream: OrderPlaced");
@@ -1891,7 +1891,7 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
     assert_eq!(state.total, 42);
 
     // Verify the store has all three events
-    let events = store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].event_type, "OrderCreated");
     assert_eq!(events[1].event_type, "OrderConfirmed");

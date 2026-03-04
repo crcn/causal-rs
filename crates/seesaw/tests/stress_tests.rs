@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use seesaw_core::{events, handler, Aggregate, Apply, Context, Engine, Events};
+use seesaw_core::{events, handler, project, Aggregate, AnyEvent, Apply, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1626,11 +1626,6 @@ struct OrderCreated {
     customer: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OrderProjected {
-    order_id: String,
-}
-
 #[tokio::test]
 async fn projection_handler_runs_before_regular_handlers() -> Result<()> {
     let store = Arc::new(dashmap::DashMap::new());
@@ -1641,18 +1636,18 @@ async fn projection_handler_runs_before_regular_handlers() -> Result<()> {
     let rs = reader_saw_projection.clone();
 
     let engine = Engine::new(deps)
-        // Projection handler: writes to the store FIRST
-        .with_handler(
-            handler::on::<OrderCreated>()
-                .id("order_projection")
-                .projection()
-                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+        // Projection: writes to the store FIRST
+        .with_projection(
+            project("order_projection")
+                .then(move |event: AnyEvent, ctx: Context<ProjectionDeps>| {
                     async move {
-                        ctx.deps().store.insert(
-                            event.order_id.clone(),
-                            event.customer.clone(),
-                        );
-                        Ok(events![])
+                        if let Some(event) = event.downcast_ref::<OrderCreated>() {
+                            ctx.deps().store.insert(
+                                event.order_id.clone(),
+                                event.customer.clone(),
+                            );
+                        }
+                        Ok(())
                     }
                 }),
         )
@@ -1700,36 +1695,36 @@ async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Res
 
     let engine = Engine::new(deps)
         // Projection 1
-        .with_handler(
-            handler::on::<OrderCreated>()
-                .id("projection_1")
-                .projection()
-                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+        .with_projection(
+            project("projection_1")
+                .then(move |event: AnyEvent, ctx: Context<ProjectionDeps>| {
                     let eo = eo1.clone();
                     async move {
-                        ctx.deps().store.insert(
-                            event.order_id.clone(),
-                            event.customer.clone(),
-                        );
+                        if let Some(event) = event.downcast_ref::<OrderCreated>() {
+                            ctx.deps().store.insert(
+                                event.order_id.clone(),
+                                event.customer.clone(),
+                            );
+                        }
                         eo.lock().push("projection_1".into());
-                        Ok(events![])
+                        Ok(())
                     }
                 }),
         )
         // Projection 2
-        .with_handler(
-            handler::on::<OrderCreated>()
-                .id("projection_2")
-                .projection()
-                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
+        .with_projection(
+            project("projection_2")
+                .then(move |event: AnyEvent, ctx: Context<ProjectionDeps>| {
                     let eo = eo2.clone();
                     async move {
-                        ctx.deps().store.insert(
-                            format!("{}_index", event.order_id),
-                            "indexed".into(),
-                        );
+                        if let Some(event) = event.downcast_ref::<OrderCreated>() {
+                            ctx.deps().store.insert(
+                                format!("{}_index", event.order_id),
+                                "indexed".into(),
+                            );
+                        }
                         eo.lock().push("projection_2".into());
-                        Ok(events![])
+                        Ok(())
                     }
                 }),
         )
@@ -1793,7 +1788,7 @@ async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Res
 }
 
 #[tokio::test]
-async fn projection_handler_can_emit_events() -> Result<()> {
+async fn projection_performs_side_effects() -> Result<()> {
     let store = Arc::new(dashmap::DashMap::new());
     let deps = ProjectionDeps { store: store.clone() };
 
@@ -1801,28 +1796,19 @@ async fn projection_handler_can_emit_events() -> Result<()> {
     let pc = projected_count.clone();
 
     let engine = Engine::new(deps)
-        .with_handler(
-            handler::on::<OrderCreated>()
-                .projection()
-                .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
-                    async move {
-                        ctx.deps().store.insert(
-                            event.order_id.clone(),
-                            event.customer.clone(),
-                        );
-                        Ok(events![OrderProjected {
-                            order_id: event.order_id.clone(),
-                        }])
-                    }
-                }),
-        )
-        .with_handler(
-            handler::on::<OrderProjected>()
-                .then(move |_event: Arc<OrderProjected>, _ctx: Context<ProjectionDeps>| {
+        .with_projection(
+            project("order_projection")
+                .then(move |event: AnyEvent, ctx: Context<ProjectionDeps>| {
                     let pc = pc.clone();
                     async move {
-                        pc.fetch_add(1, Ordering::SeqCst);
-                        Ok(events![])
+                        if let Some(event) = event.downcast_ref::<OrderCreated>() {
+                            ctx.deps().store.insert(
+                                event.order_id.clone(),
+                                event.customer.clone(),
+                            );
+                            pc.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(())
                     }
                 }),
         );
@@ -1838,7 +1824,7 @@ async fn projection_handler_can_emit_events() -> Result<()> {
     assert_eq!(
         projected_count.load(Ordering::SeqCst),
         1,
-        "projection-emitted event should be handled"
+        "projection should have executed its side effect"
     );
     assert!(store.get("order-3").is_some());
     Ok(())

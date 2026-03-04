@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{aggregator, aggregators, events, handle, handles, AnyEvent, Context, Emit, ErrorContext, Events};
+use seesaw_core::{aggregator, aggregators, events, handle, handles, projection, AnyEvent, Context, Emit, ErrorContext, Events};
 use seesaw_core::{Aggregate, Apply};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -198,12 +198,12 @@ mod order_effects {
         })
     }
 
-    #[handle(on = OrderPlaced, projection, id = "order_read_model")]
+    #[projection(id = "order_read_model")]
     async fn update_read_model(
-        _event: OrderPlaced,
+        _event: AnyEvent,
         _ctx: Context<Deps>,
-    ) -> Result<Emit<AnalyticsEvent>> {
-        Ok(Emit::None)
+    ) -> Result<()> {
+        Ok(())
     }
 
     #[handle(on_any, id = "event_logger")]
@@ -404,7 +404,7 @@ fn singleton_aggregator_apply_works() {
 #[test]
 fn effects_module_registration_works() {
     let effects = order_effects::handles();
-    assert_eq!(effects.len(), 11);
+    assert_eq!(effects.len(), 10); // was 11 before projection moved out
     assert!(effects
         .iter()
         .any(|effect| effect.can_handle(TypeId::of::<OrderPlaced>())));
@@ -451,23 +451,10 @@ fn effects_module_registration_works() {
         "filter handler should handle HighValueOrder events"
     );
 
-    let projection = effects
-        .iter()
-        .find(|effect| effect.id == "order_read_model")
-        .expect("order_read_model projection should exist");
-    assert!(
-        projection.is_projection(),
-        "projection attribute should mark handler as projection"
-    );
-    assert!(
-        projection.is_inline(),
-        "projection handler should remain inline"
-    );
-
-    assert!(
-        !ship_order.is_projection(),
-        "regular handler should not be a projection"
-    );
+    // Projection is now in a separate projections() collection
+    let projections = order_effects::projections();
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].id, "order_read_model");
 
     let event_logger = effects
         .iter()

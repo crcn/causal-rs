@@ -25,12 +25,12 @@ pub struct MemoryStore {
     /// Event queue (FIFO per correlation_id)
     events: Arc<DashMap<Uuid, VecDeque<QueuedEvent>>>,
     /// Effect executions queue
-    effects: Arc<Mutex<VecDeque<QueuedHandlerExecution>>>,
+    effects: Arc<Mutex<VecDeque<QueuedEffect>>>,
     /// Completed effects (for idempotency)
     completed_effects: Arc<DashMap<(Uuid, String), serde_json::Value>>,
     /// In-flight effects: populated by poll_next_effect, consumed by
-    /// fail_effect to reconstruct the execution for re-enqueueing.
-    in_flight: Arc<DashMap<(Uuid, String), QueuedHandlerExecution>>,
+    /// resolve_effect(Retry) to reconstruct the execution for re-enqueueing.
+    in_flight: Arc<DashMap<(Uuid, String), QueuedEffect>>,
     /// Durable-ish join windows for same-batch fan-in (in-memory only).
     join_windows: Arc<Mutex<HashMap<(String, Uuid, Uuid), MemoryJoinWindow>>>,
     // ── Event persistence ────────────────────────────────────────
@@ -107,7 +107,7 @@ impl MemoryStore {
         hops: i32,
         join_window_timeout_seconds: Option<i32>,
     ) -> Result<()> {
-        let execution = QueuedHandlerExecution {
+        let execution = QueuedEffect {
             event_id,
             handler_id,
             correlation_id,
@@ -152,69 +152,70 @@ impl Store for MemoryStore {
         Ok(None)
     }
 
-    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
-        for intent in commit.queued_effect_intents {
-            self.insert_effect_intent(
-                commit.event_id,
-                intent.handler_id,
-                commit.correlation_id,
-                commit.event_type.clone(),
-                commit.event_payload.clone(),
-                intent.parent_event_id,
-                intent.batch_id,
-                intent.batch_index,
-                intent.batch_size,
-                intent.execute_at,
-                intent.timeout_seconds,
-                intent.max_attempts,
-                intent.priority,
-                intent.hops,
-                intent.join_window_timeout_seconds,
-            )
-            .await?;
-        }
+    async fn complete_event(&self, result: EventOutcome) -> Result<()> {
+        match result {
+            EventOutcome::Processed(commit) => {
+                for intent in commit.queued_effect_intents {
+                    self.insert_effect_intent(
+                        commit.event_id,
+                        intent.handler_id,
+                        commit.correlation_id,
+                        commit.event_type.clone(),
+                        commit.event_payload.clone(),
+                        intent.parent_event_id,
+                        intent.batch_id,
+                        intent.batch_index,
+                        intent.batch_size,
+                        intent.execute_at,
+                        intent.timeout_seconds,
+                        intent.max_attempts,
+                        intent.priority,
+                        intent.hops,
+                        intent.join_window_timeout_seconds,
+                    )
+                    .await?;
+                }
 
-        for event in commit.emitted_events {
-            self.publish(event).await?;
-        }
+                for event in commit.emitted_events {
+                    self.publish(event).await?;
+                }
 
-        for failure in commit.inline_effect_failures {
-            self.dlq_effect(EffectDlq {
-                event_id: commit.event_id,
-                handler_id: failure.handler_id,
-                error: failure.error,
-                reason: failure.reason,
-                attempts: failure.attempts,
-                events_to_publish: Vec::new(),
-            })
-            .await?;
-        }
+                for failure in commit.inline_effect_failures {
+                    self.resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                        event_id: commit.event_id,
+                        handler_id: failure.handler_id,
+                        error: failure.error,
+                        reason: failure.reason,
+                        attempts: failure.attempts,
+                        events_to_publish: Vec::new(),
+                    }))
+                    .await?;
+                }
 
-        // ack is implicit for in-memory (event already dequeued)
+                // ack is implicit for in-memory (event already dequeued)
+            }
+            EventOutcome::Rejected {
+                event_id,
+                error,
+                reason,
+                ..
+            } => {
+                // DLQ + ack in one step (ack is implicit for in-memory)
+                eprintln!(
+                    "Event rejected to DLQ: {} - {} ({})",
+                    event_id, error, reason
+                );
+            }
+        }
         Ok(())
     }
 
-    async fn reject_event(
-        &self,
-        _event_row_id: i64,
-        event_id: Uuid,
-        error: String,
-        reason: String,
-    ) -> Result<()> {
-        // DLQ + ack in one step (ack is implicit for in-memory)
-        eprintln!(
-            "Event rejected to DLQ: {} - {} ({})",
-            event_id, error, reason
-        );
-        Ok(())
-    }
-
-    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
+    async fn poll_next_effect(&self) -> Result<Option<QueuedEffect>> {
         let mut queue = self.effects.lock();
         let now = Utc::now();
         if let Some(pos) = queue.iter().position(|e| e.execute_at <= now) {
             let execution = queue.remove(pos).unwrap();
-            // Track in-flight so fail_effect can reconstruct for re-enqueueing
+            // Track in-flight so resolve_effect(Retry) can reconstruct for re-enqueueing
             self.in_flight.insert(
                 (execution.event_id, execution.handler_id.clone()),
                 execution.clone(),
@@ -230,68 +231,56 @@ impl Store for MemoryStore {
         Ok(queue.iter().map(|e| e.execute_at).min())
     }
 
-    async fn complete_effect(&self, completion: EffectCompletion) -> Result<()> {
-        // Remove from in-flight tracking
-        self.in_flight
-            .remove(&(completion.event_id, completion.handler_id.clone()));
-
-        self.completed_effects
-            .insert((completion.event_id, completion.handler_id), completion.result);
-
-        for event in completion.events_to_publish {
-            self.publish(event).await?;
+    async fn resolve_effect(&self, resolution: EffectResolution) -> Result<()> {
+        match resolution {
+            EffectResolution::Complete(completion) => {
+                self.in_flight
+                    .remove(&(completion.event_id, completion.handler_id.clone()));
+                self.completed_effects
+                    .insert((completion.event_id, completion.handler_id), completion.result);
+                for event in completion.events_to_publish {
+                    self.publish(event).await?;
+                }
+            }
+            EffectResolution::Retry {
+                event_id,
+                handler_id,
+                error,
+                new_attempts,
+                next_execute_at,
+            } => {
+                tracing::warn!(
+                    "Handler retry: {}:{} - {} (attempt {})",
+                    event_id,
+                    handler_id,
+                    error,
+                    new_attempts
+                );
+                let key = (event_id, handler_id.clone());
+                if let Some((_, mut execution)) = self.in_flight.remove(&key) {
+                    execution.attempts = new_attempts;
+                    execution.execute_at = next_execute_at;
+                    let mut queue = self.effects.lock();
+                    queue.push_back(execution);
+                } else {
+                    tracing::warn!(
+                        "resolve_effect(Retry): no in-flight execution found for {}:{} — retry will be lost",
+                        key.0, handler_id
+                    );
+                }
+            }
+            EffectResolution::DeadLetter(dlq) => {
+                self.in_flight
+                    .remove(&(dlq.event_id, dlq.handler_id.clone()));
+                eprintln!(
+                    "Handler sent to DLQ: {}:{} - {} (attempts: {})",
+                    dlq.event_id, dlq.handler_id, dlq.error, dlq.attempts
+                );
+                for event in dlq.events_to_publish {
+                    self.publish(event).await?;
+                }
+            }
         }
-
-        Ok(())
-    }
-
-    async fn fail_effect(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        error: String,
-        new_attempts: i32,
-        next_execute_at: DateTime<Utc>,
-    ) -> Result<()> {
-        tracing::warn!(
-            "Handler retry: {}:{} - {} (attempt {})",
-            event_id,
-            handler_id,
-            error,
-            new_attempts
-        );
-
-        // Reconstruct from in-flight tracking (populated by poll_next_effect)
-        let key = (event_id, handler_id.clone());
-        if let Some((_, mut execution)) = self.in_flight.remove(&key) {
-            execution.attempts = new_attempts;
-            execution.execute_at = next_execute_at;
-            let mut queue = self.effects.lock();
-            queue.push_back(execution);
-        } else {
-            tracing::warn!(
-                "fail_effect: no in-flight execution found for {}:{} — retry will be lost",
-                key.0, handler_id
-            );
-        }
-
-        Ok(())
-    }
-
-    async fn dlq_effect(&self, dlq: EffectDlq) -> Result<()> {
-        // Remove from in-flight tracking
-        self.in_flight
-            .remove(&(dlq.event_id, dlq.handler_id.clone()));
-
-        eprintln!(
-            "Handler sent to DLQ: {}:{} - {} (attempts: {})",
-            dlq.event_id, dlq.handler_id, dlq.error, dlq.attempts
-        );
-
-        for event in dlq.events_to_publish {
-            self.publish(event).await?;
-        }
-
         Ok(())
     }
 
@@ -480,32 +469,16 @@ impl Store for MemoryStore {
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
+        after_position: Option<u64>,
     ) -> Result<Vec<PersistedEvent>> {
         let log = self.global_log.lock();
+        let min_pos = after_position.unwrap_or(0);
         let events = log
             .iter()
             .filter(|e| {
                 e.aggregate_type.as_deref() == Some(aggregate_type)
                     && e.aggregate_id == Some(aggregate_id)
-            })
-            .cloned()
-            .collect();
-        Ok(events)
-    }
-
-    async fn load_stream_from(
-        &self,
-        aggregate_type: &str,
-        aggregate_id: Uuid,
-        after_position: u64,
-    ) -> Result<Vec<PersistedEvent>> {
-        let log = self.global_log.lock();
-        let events = log
-            .iter()
-            .filter(|e| {
-                e.aggregate_type.as_deref() == Some(aggregate_type)
-                    && e.aggregate_id == Some(aggregate_id)
-                    && e.position > after_position
+                    && (after_position.is_none() || e.position > min_pos)
             })
             .cloned()
             .collect();

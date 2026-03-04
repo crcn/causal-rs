@@ -1,18 +1,19 @@
-//! Effect registry for storing and starting effects.
+//! Handler registry for storing and managing handlers.
 
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::event_codec::EventCodec;
-use crate::handler::Handler;
+use crate::handler::{Handler, Projection};
 
-/// Registry for storing effects.
+/// Registry for storing handlers.
 pub struct HandlerRegistry<D>
 where
     D: Send + Sync + 'static,
 {
-    effects: RwLock<Vec<Handler<D>>>,
+    handlers: RwLock<Vec<Handler<D>>>,
+    projections: RwLock<Vec<Projection<D>>>,
     /// Standalone codecs registered independently of handlers (e.g. from aggregators).
     standalone_codecs: RwLock<Vec<Arc<EventCodec>>>,
 }
@@ -23,7 +24,8 @@ where
 {
     fn default() -> Self {
         Self {
-            effects: RwLock::new(Vec::new()),
+            handlers: RwLock::new(Vec::new()),
+            projections: RwLock::new(Vec::new()),
             standalone_codecs: RwLock::new(Vec::new()),
         }
     }
@@ -33,10 +35,11 @@ impl<D> HandlerRegistry<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Create a new empty effect registry.
+    /// Create a new empty handler registry.
     pub fn new() -> Self {
         Self {
-            effects: RwLock::new(Vec::new()),
+            handlers: RwLock::new(Vec::new()),
+            projections: RwLock::new(Vec::new()),
             standalone_codecs: RwLock::new(Vec::new()),
         }
     }
@@ -52,7 +55,7 @@ where
         self.standalone_codecs.write().push(codec);
     }
 
-    /// Register an effect.
+    /// Register a handler.
     pub fn register(&self, effect: Handler<D>) {
         if effect.id.trim().is_empty() {
             panic!("Handler ID cannot be empty");
@@ -65,21 +68,48 @@ where
             );
         }
 
-        let mut effects = self.effects.write();
+        let mut effects = self.handlers.write();
         if effects.iter().any(|existing| existing.id == effect.id) {
             panic!("Duplicate effect id '{}'", effect.id);
         }
         effects.push(effect);
     }
 
-    /// Get all registered effects (cloned).
-    pub(crate) fn all(&self) -> Vec<Handler<D>> {
-        self.effects.read().iter().cloned().collect()
+    /// Register a projection.
+    pub fn register_projection(&self, projection: Projection<D>) {
+        if projection.id.trim().is_empty() {
+            panic!("Projection ID cannot be empty");
+        }
+
+        // Check uniqueness across both handlers and projections
+        let effects = self.handlers.read();
+        if effects.iter().any(|existing| existing.id == projection.id) {
+            panic!("Duplicate id '{}' (conflicts with a handler)", projection.id);
+        }
+        drop(effects);
+
+        let mut projections = self.projections.write();
+        if projections.iter().any(|existing| existing.id == projection.id) {
+            panic!("Duplicate projection id '{}'", projection.id);
+        }
+        projections.push(projection);
     }
 
-    /// Find effect by stable ID.
+    /// Get all registered projections, sorted by priority (lower = first).
+    pub(crate) fn projections(&self) -> Vec<Projection<D>> {
+        let mut projections: Vec<_> = self.projections.read().iter().cloned().collect();
+        projections.sort_by_key(|p| p.priority.unwrap_or(i32::MAX));
+        projections
+    }
+
+    /// Get all registered handlers (cloned).
+    pub(crate) fn all(&self) -> Vec<Handler<D>> {
+        self.handlers.read().iter().cloned().collect()
+    }
+
+    /// Find handler by stable ID.
     pub(crate) fn find_by_id(&self, effect_id: &str) -> Option<Handler<D>> {
-        self.effects
+        self.handlers
             .read()
             .iter()
             .find(|effect| effect.id == effect_id)
@@ -88,7 +118,7 @@ where
 
     /// Find queue codec by event type name.
     pub(crate) fn find_codec_by_event_type(&self, event_type: &str) -> Option<Arc<EventCodec>> {
-        for effect in self.effects.read().iter() {
+        for effect in self.handlers.read().iter() {
             for codec in effect.codecs() {
                 if codec.event_type == event_type {
                     return Some(codec.clone());
@@ -142,7 +172,7 @@ mod tests {
 
         registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
 
-        assert_eq!(registry.effects.read().len(), 1);
+        assert_eq!(registry.handlers.read().len(), 1);
     }
 
     #[tokio::test]
@@ -152,7 +182,7 @@ mod tests {
         registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
         registry.register(handler::on::<EventB>().then(|_, _| async { Ok(crate::Events::new()) }));
 
-        assert_eq!(registry.effects.read().len(), 2);
+        assert_eq!(registry.handlers.read().len(), 2);
     }
 
     #[tokio::test]
@@ -161,7 +191,7 @@ mod tests {
 
         registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
 
-        let effects = registry.effects.read();
+        let effects = registry.handlers.read();
         assert!(effects[0].can_handle(TypeId::of::<EventA>()));
         assert!(!effects[0].can_handle(TypeId::of::<EventB>()));
     }
@@ -193,10 +223,10 @@ mod tests {
             })
         );
 
-        assert_eq!(registry.effects.read().len(), 2);
+        assert_eq!(registry.handlers.read().len(), 2);
 
         // Each can handle its respective event type
-        let effects = registry.effects.read();
+        let effects = registry.handlers.read();
         assert!(effects.iter().any(|e| e.can_handle(TypeId::of::<EventA>())));
         assert!(effects.iter().any(|e| e.can_handle(TypeId::of::<EventB>())));
     }

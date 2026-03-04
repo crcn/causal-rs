@@ -140,7 +140,7 @@ mod tests {
     #[tokio::test]
     async fn empty_stream_returns_empty() {
         let store = MemoryStore::with_persistence();
-        let events = store.load_stream("Order", Uuid::new_v4()).await.unwrap();
+        let events = store.load_stream("Order", Uuid::new_v4(), None).await.unwrap();
         assert!(events.is_empty());
     }
 
@@ -152,7 +152,7 @@ mod tests {
         store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({"total": 100}), "Order", id)).await.unwrap();
         store.append_event(make_aggregate_event("OrderShipped", serde_json::json!({"tracking": "ABC"}), "Order", id)).await.unwrap();
 
-        let events = store.load_stream("Order", id).await.unwrap();
+        let events = store.load_stream("Order", id, None).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].version, Some(1));
         assert_eq!(events[0].event_type, "OrderPlaced");
@@ -169,7 +169,7 @@ mod tests {
         assert!(pos > 0);
 
         // Not loadable via load_stream (no aggregate)
-        let events = store.load_stream("System", Uuid::new_v4()).await.unwrap();
+        let events = store.load_stream("System", Uuid::new_v4(), None).await.unwrap();
         assert!(events.is_empty());
 
         // But it's in the global log
@@ -189,7 +189,7 @@ mod tests {
         store.append_event(make_aggregate_event("OrderShipped", serde_json::json!({}), "Order", id)).await.unwrap();
         store.append_event(make_aggregate_event("OrderDelivered", serde_json::json!({}), "Order", id)).await.unwrap();
 
-        let events = store.load_stream_from("Order", id, pos1).await.unwrap();
+        let events = store.load_stream("Order", id, Some(pos1)).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "OrderShipped");
         assert_eq!(events[1].event_type, "OrderDelivered");
@@ -204,8 +204,8 @@ mod tests {
         store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
         store.append_event(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
 
-        let events1 = store.load_stream("Order", id1).await.unwrap();
-        let events2 = store.load_stream("User", id2).await.unwrap();
+        let events1 = store.load_stream("Order", id1, None).await.unwrap();
+        let events2 = store.load_stream("User", id2, None).await.unwrap();
         assert_eq!(events1.len(), 1);
         assert_eq!(events2.len(), 1);
         assert_eq!(events1[0].event_type, "OrderPlaced");
@@ -221,8 +221,8 @@ mod tests {
         store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
         store.append_event(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
 
-        let events1 = store.load_stream("Order", id1).await.unwrap();
-        let events2 = store.load_stream("User", id2).await.unwrap();
+        let events1 = store.load_stream("Order", id1, None).await.unwrap();
+        let events2 = store.load_stream("User", id2, None).await.unwrap();
 
         assert!(events2[0].position > events1[0].position);
     }
@@ -279,7 +279,7 @@ mod tests {
             .await
             .unwrap();
 
-        let events = store.load_stream("Order", id).await.unwrap();
+        let events = store.load_stream("Order", id, None).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].metadata, metadata);
         assert_eq!(events[0].metadata["run_id"], "scrape-abc123");
@@ -294,7 +294,7 @@ mod tests {
 
         store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
 
-        let events = store.load_stream("Order", id).await.unwrap();
+        let events = store.load_stream("Order", id, None).await.unwrap();
         assert!(events[0].metadata.is_empty());
     }
 

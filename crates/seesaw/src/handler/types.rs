@@ -277,6 +277,38 @@ impl AnyEvent {
     }
 }
 
+/// A projection handler — receives ALL events, returns `Result<()>`, runs sequentially.
+///
+/// Projections are fundamentally different from effects:
+/// - They receive all events (no type routing)
+/// - They return `Result<()>` (no emitted events)
+/// - They run sequentially before other handlers
+/// - They have no retry/timeout/delay/join semantics
+pub struct Projection<D>
+where
+    D: Send + Sync + 'static,
+{
+    /// Human-readable identifier.
+    pub id: String,
+    /// The projection handler — receives ALL events as AnyEvent.
+    pub(crate) handler: Arc<dyn Fn(AnyEvent, Context<D>) -> BoxFuture<Result<()>> + Send + Sync>,
+    /// Execution priority (lower = runs first).
+    pub(crate) priority: Option<i32>,
+}
+
+impl<D> Clone for Projection<D>
+where
+    D: Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            handler: self.handler.clone(),
+            priority: self.priority,
+        }
+    }
+}
+
 /// An effect handler - no traits, just data with closures.
 pub struct Handler<D>
 where
@@ -328,8 +360,6 @@ where
     pub(crate) dlq_terminal_mapper: Option<DlqTerminalMapper>,
 
     // Execution configuration (determines inline vs queued)
-    /// Mark as projection handler (runs before all other handlers, sequentially).
-    pub(crate) projection: bool,
     /// Force queued execution (default: false = inline)
     pub(crate) queued: bool,
     /// Delay before execution (triggers queued)
@@ -359,7 +389,6 @@ where
             join_batch_handler: self.join_batch_handler.clone(),
             join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper: self.dlq_terminal_mapper.clone(),
-            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -426,11 +455,6 @@ where
     /// Internal queue codec metadata.
     pub(crate) fn codecs(&self) -> &[std::sync::Arc<EventCodec>] {
         &self.codecs
-    }
-
-    /// Check if this is a projection handler (runs before other handlers).
-    pub fn is_projection(&self) -> bool {
-        self.projection
     }
 
     /// Check if this effect should execute inline.

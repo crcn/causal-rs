@@ -15,8 +15,8 @@ use crate::event_store::event_type_short_name;
 use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::types::{
-    EmittedEvent, EventProcessingCommit, EventWorkerConfig, HandlerWorkerConfig,
-    InlineHandlerFailure, QueuedEvent, QueuedHandlerExecution, QueuedHandlerIntent,
+    EmittedEvent, EventCommit, EventWorkerConfig, HandlerWorkerConfig,
+    InlineFailure, QueuedEvent, QueuedEffect, EffectIntent,
     NAMESPACE_SEESAW,
 };
 use crate::upcaster::UpcasterRegistry;
@@ -65,7 +65,7 @@ where
         &self,
         event: &QueuedEvent,
         config: &EventWorkerConfig,
-    ) -> Result<EventProcessingCommit> {
+    ) -> Result<EventCommit> {
         info!(
             "Processing event: type={}, workflow={}, hops={}",
             event.event_type, event.correlation_id, event.hops
@@ -122,7 +122,7 @@ where
                 .map(|d| d.as_secs() as i32)
                 .unwrap_or(30)
                 .max(1);
-            queued_effect_intents.push(QueuedHandlerIntent {
+            queued_effect_intents.push(EffectIntent {
                 handler_id: effect.id.clone(),
                 parent_event_id: Some(event.event_id),
                 batch_id: event.batch_id,
@@ -140,42 +140,50 @@ where
             });
         }
 
-        // 6a. Execute projection handlers sequentially (before other handlers)
+        // 6a. Execute projections sequentially (before other handlers)
         let mut inline_effect_failures = Vec::new();
         let mut emitted_events = Vec::new();
 
-        let mut projection_effects: Vec<_> = matching_effects
-            .iter()
-            .filter(|effect| effect.is_inline() && effect.is_projection())
-            .collect();
-        projection_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
+        let projections = self.effects.projections();
+        for projection in &projections {
+            let any_event = crate::handler::AnyEvent {
+                value: typed_event.clone(),
+                type_id: event_type_id,
+            };
+            let idempotency_key = Uuid::new_v5(
+                &NAMESPACE_SEESAW,
+                format!("{}-{}", event.event_id, projection.id).as_bytes(),
+            )
+            .to_string();
+            let ctx = Context::new(
+                projection.id.clone(),
+                idempotency_key,
+                event.correlation_id,
+                event.event_id,
+                event.parent_id,
+                self.deps.clone(),
+            )
+            .with_aggregator_registry(self.aggregator_registry.clone());
 
-        for effect in &projection_effects {
-            match self
-                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config)
-                .await
-            {
-                Ok(mut emitted) => emitted_events.append(&mut emitted),
-                Err(error) => {
-                    let error_string = error.to_string();
-                    warn!(
-                        "Projection handler failed: event_id={}, effect_id={}, error={}",
-                        event.event_id, effect.id, error_string
-                    );
-                    inline_effect_failures.push(InlineHandlerFailure {
-                        handler_id: effect.id.clone(),
-                        error: error_string,
-                        reason: "projection_failed".to_string(),
-                        attempts: event.retry_count.saturating_add(1),
-                    });
-                }
+            if let Err(error) = (projection.handler)(any_event, ctx).await {
+                let error_string = error.to_string();
+                warn!(
+                    "Projection handler failed: event_id={}, projection_id={}, error={}",
+                    event.event_id, projection.id, error_string
+                );
+                inline_effect_failures.push(InlineFailure {
+                    handler_id: projection.id.clone(),
+                    error: error_string,
+                    reason: "projection_failed".to_string(),
+                    attempts: event.retry_count.saturating_add(1),
+                });
             }
         }
 
         // 6b. Execute regular inline handlers in parallel
         let mut inline_effects: Vec<_> = matching_effects
             .iter()
-            .filter(|effect| effect.is_inline() && !effect.is_projection())
+            .filter(|effect| effect.is_inline())
             .collect();
         inline_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
 
@@ -197,7 +205,7 @@ where
                         "Inline effect failed and will be persisted to DLQ: event_id={}, effect_id={}, error={}",
                         event.event_id, effect.id, error_string
                     );
-                    inline_effect_failures.push(InlineHandlerFailure {
+                    inline_effect_failures.push(InlineFailure {
                         handler_id: effect.id.clone(),
                         error: error_string,
                         reason: "inline_failed".to_string(),
@@ -208,7 +216,7 @@ where
         }
 
         // 7. Return commit payload
-        Ok(EventProcessingCommit {
+        Ok(EventCommit {
             event_row_id: event.id,
             event_id: event.event_id,
             correlation_id: event.correlation_id,
@@ -225,9 +233,9 @@ where
     /// Extracted from HandlerWorker::process_next_effect().
     pub async fn execute_handler(
         &self,
-        execution: QueuedHandlerExecution,
+        execution: QueuedEffect,
         config: &HandlerWorkerConfig,
-    ) -> Result<HandlerExecutionResult> {
+    ) -> Result<EffectResult> {
         info!(
             "Processing effect: effect_id={}, workflow={}, priority={}, attempt={}/{}",
             execution.handler_id,
@@ -244,14 +252,14 @@ where
                 execution.handler_id
             );
             warn!("{}", error);
-            return Ok(HandlerExecutionResult {
+            return Ok(EffectResult {
                 status: if execution.attempts >= execution.max_attempts {
-                    HandlerStatus::Failed {
+                    EffectStatus::Failed {
                         error: error.clone(),
                         attempts: execution.attempts,
                     }
                 } else {
-                    HandlerStatus::Retry {
+                    EffectStatus::Retry {
                         error,
                         attempts: execution.attempts,
                     }
@@ -297,8 +305,8 @@ where
         // The actual join logic will be handled by the backend (PostgresBackend)
         if effect.join_mode.is_some() {
             // Return special status indicating join coordination is needed
-            return Ok(HandlerExecutionResult {
-                status: HandlerStatus::JoinWaiting,
+            return Ok(EffectResult {
+                status: EffectStatus::JoinWaiting,
                 emitted_events: Vec::new(),
                 result: serde_json::json!({ "status": "join_waiting" }),
                 join_claim,
@@ -327,8 +335,8 @@ where
                 )?;
 
                 info!("Handler completed successfully: {}", execution.handler_id);
-                Ok(HandlerExecutionResult {
-                    status: HandlerStatus::Success,
+                Ok(EffectResult {
+                    status: EffectStatus::Success,
                     emitted_events,
                     result: serde_json::json!({ "status": "ok" }),
                     join_claim: None,
@@ -341,12 +349,12 @@ where
                 );
 
                 let status = if execution.attempts >= execution.max_attempts {
-                    HandlerStatus::Failed {
+                    EffectStatus::Failed {
                         error: e.to_string(),
                         attempts: execution.attempts,
                     }
                 } else {
-                    HandlerStatus::Retry {
+                    EffectStatus::Retry {
                         error: e.to_string(),
                         attempts: execution.attempts,
                     }
@@ -369,7 +377,7 @@ where
                         Vec::new()
                     };
 
-                Ok(HandlerExecutionResult {
+                Ok(EffectResult {
                     status,
                     emitted_events,
                     result: serde_json::json!({}),
@@ -382,12 +390,12 @@ where
                 let timeout_error = "Handler execution timed out".to_string();
 
                 let status = if execution.attempts >= execution.max_attempts {
-                    HandlerStatus::Failed {
+                    EffectStatus::Failed {
                         error: timeout_error.clone(),
                         attempts: execution.attempts,
                     }
                 } else {
-                    HandlerStatus::Retry {
+                    EffectStatus::Retry {
                         error: timeout_error.clone(),
                         attempts: execution.attempts,
                     }
@@ -409,7 +417,7 @@ where
                     Vec::new()
                 };
 
-                Ok(HandlerExecutionResult {
+                Ok(EffectResult {
                     status,
                     emitted_events,
                     result: serde_json::json!({}),
@@ -622,7 +630,7 @@ where
     pub(crate) fn serialize_emitted_events(
         &self,
         emitted: Vec<EventOutput>,
-        execution: &QueuedHandlerExecution,
+        execution: &QueuedEffect,
         max_batch_size: usize,
     ) -> Result<Vec<EmittedEvent>> {
         let emitted_count = emitted.len();
@@ -719,7 +727,7 @@ where
         effect: &Handler<D>,
         source_event: Arc<dyn Any + Send + Sync>,
         source_type_id: TypeId,
-        execution: &QueuedHandlerExecution,
+        execution: &QueuedEffect,
         reason: &str,
         error: String,
     ) -> Result<Vec<EmittedEvent>> {
@@ -771,18 +779,18 @@ where
     }
 }
 
-/// Result of handler execution.
+/// Result of effect execution.
 #[derive(Debug)]
-pub struct HandlerExecutionResult {
-    pub status: HandlerStatus,
+pub struct EffectResult {
+    pub status: EffectStatus,
     pub emitted_events: Vec<EmittedEvent>,
     pub result: serde_json::Value,
     pub join_claim: Option<JoinClaim>,
 }
 
-/// Handler execution status.
+/// Effect execution status.
 #[derive(Debug)]
-pub enum HandlerStatus {
+pub enum EffectStatus {
     Success,
     Failed { error: String, attempts: i32 },
     Retry { error: String, attempts: i32 },

@@ -8,33 +8,6 @@ use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
 
-/// Trait for handler context types.
-///
-/// This trait allows different backend implementations to provide
-/// their own context types while maintaining a common interface.
-pub trait HandlerContext<D>: Clone + Send + Sync + 'static
-where
-    D: Send + Sync + 'static,
-{
-    /// Get the handler ID (human-readable identifier).
-    fn handler_id(&self) -> &str;
-
-    /// Get the idempotency key for external API calls.
-    fn idempotency_key(&self) -> &str;
-
-    /// Get the correlation ID for workflow grouping.
-    fn correlation_id(&self) -> Uuid;
-
-    /// Get the current event ID.
-    fn event_id(&self) -> Uuid;
-
-    /// Get the parent event ID (for causal tracking).
-    fn parent_event_id(&self) -> Option<Uuid>;
-
-    /// Get shared dependencies.
-    fn deps(&self) -> &D;
-}
-
 /// Context passed to effect handlers.
 pub struct Context<D>
 where
@@ -179,35 +152,6 @@ where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
     {
         f().await
-    }
-}
-
-impl<D> HandlerContext<D> for Context<D>
-where
-    D: Send + Sync + 'static,
-{
-    fn handler_id(&self) -> &str {
-        &self.handler_id
-    }
-
-    fn idempotency_key(&self) -> &str {
-        &self.idempotency_key
-    }
-
-    fn correlation_id(&self) -> Uuid {
-        self.correlation_id
-    }
-
-    fn event_id(&self) -> Uuid {
-        self.event_id
-    }
-
-    fn parent_event_id(&self) -> Option<Uuid> {
-        self.parent_event_id
-    }
-
-    fn deps(&self) -> &D {
-        &self.deps
     }
 }
 

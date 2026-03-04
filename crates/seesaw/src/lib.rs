@@ -65,7 +65,7 @@ pub use upcaster::{Upcaster, UpcasterRegistry};
 pub use engine::Engine;
 pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events, Handler,
-    HandlerContext, HandlerError, IntoEvents, JoinMode,
+    HandlerError, IntoEvents, JoinMode, Projection,
 };
 
 /// The universal return macro for all handlers.
@@ -105,17 +105,19 @@ macro_rules! events {
     }};
 }
 
-pub use job_executor::{HandlerExecutionResult, HandlerStatus, JobExecutor, JoinClaim};
+pub use job_executor::{EffectResult, EffectStatus, JobExecutor, JoinClaim};
 pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
-    EffectCompletion, EffectDlq, EmittedEvent, EventProcessingCommit, EventWorkerConfig,
-    ExpiredJoinWindow, HandlerWorkerConfig, InlineHandlerFailure, JoinAppendParams, JoinEntry,
-    QueuedEvent, QueuedHandlerExecution, QueuedHandlerIntent, NAMESPACE_SEESAW,
+    EffectCompletion, EffectDlq, EffectIntent, EmittedEvent, EventCommit, EventWorkerConfig,
+    ExpiredJoinWindow, HandlerWorkerConfig, InlineFailure, JoinAppendParams, JoinEntry,
+    QueuedEffect, QueuedEvent, NAMESPACE_SEESAW,
 };
 
 // Top-level builder functions
-pub use handler::{on, on_any};
+pub use handler::{on, on_any, project};
 
 #[cfg(feature = "macros")]
-pub use seesaw_core_macros::{aggregator, aggregators, handle, handler, handlers, handles};
+pub use seesaw_core_macros::{
+    aggregator, aggregators, handle, handler, handlers, handles, projection,
+};
 

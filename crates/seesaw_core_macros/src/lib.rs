@@ -95,6 +95,32 @@ pub fn aggregators(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Marks a function as a projection — receives all events as `AnyEvent`, returns `Result<()>`.
+///
+/// ```ignore
+/// #[projection]
+/// async fn audit_log(event: AnyEvent, ctx: Context<Deps>) -> Result<()> {
+///     if let Some(order) = event.downcast_ref::<OrderPlaced>() {
+///         // update read model
+///     }
+///     Ok(())
+/// }
+///
+/// // With custom id:
+/// #[projection(id = "custom_name")]
+/// async fn audit_log(event: AnyEvent, ctx: Context<Deps>) -> Result<()> { Ok(()) }
+/// ```
+#[proc_macro_attribute]
+pub fn projection(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let metas = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    match expand_projection(&metas, input_fn) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 #[derive(Clone)]
 enum OnSpec {
     EventType(Path),
@@ -140,7 +166,6 @@ struct EffectArgs {
     filter: Option<Path>,
     accumulate: bool,
     join: bool,
-    projection: bool,
     queued: bool,
     id: Option<String>,
     dlq_terminal: Option<Path>,
@@ -542,6 +567,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     };
 
     let mut wrappers = Vec::new();
+    let mut projection_wrappers = Vec::new();
     let mut deps_ty: Option<Type> = None;
     let mut inferred_fns = Vec::new();
 
@@ -551,8 +577,13 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         };
 
         let has_handle_attr = has_attr_any(&item_fn.attrs, &["handle", "handler"]);
+        let has_projection_attr = has_attr(&item_fn.attrs, "projection");
 
-        if has_handle_attr {
+        if has_projection_attr {
+            // Explicit #[projection(...)]: standalone proc macro handles expansion
+            let wrapper_ident = format_ident!("__seesaw_projection_{}", item_fn.sig.ident);
+            projection_wrappers.push(wrapper_ident);
+        } else if has_handle_attr {
             // Explicit #[handle(...)]: standalone proc macro handles expansion
             let wrapper_ident = format_ident!("__seesaw_effect_{}", item_fn.sig.ident);
             wrappers.push(wrapper_ident);
@@ -605,10 +636,10 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         }
     }
 
-    if wrappers.is_empty() {
+    if wrappers.is_empty() && projection_wrappers.is_empty() {
         return Err(syn::Error::new_spanned(
             module,
-            "#[handles] module must contain at least one handler function",
+            "#[handles] module must contain at least one handler or projection function",
         ));
     }
 
@@ -637,6 +668,15 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     };
     items.push(Item::Fn(handles_fn));
     items.push(Item::Fn(handlers_fn));
+
+    if !projection_wrappers.is_empty() {
+        let projections_fn: ItemFn = parse_quote! {
+            pub fn projections() -> ::std::vec::Vec<::seesaw_core::Projection<#deps_ty>> {
+                ::std::vec![#(#projection_wrappers()),*]
+            }
+        };
+        items.push(Item::Fn(projections_fn));
+    }
 
     let expanded = quote! { #module };
     Ok(quote! {
@@ -682,13 +722,7 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 args.join = true;
             }
             Meta::Path(path) if path.is_ident("projection") => {
-                if args.projection {
-                    return Err(syn::Error::new_spanned(
-                        path,
-                        "projection specified more than once",
-                    ));
-                }
-                args.projection = true;
+                return Err(syn::Error::new_spanned(path, "#[handler(projection)] is removed in v0.20.0. Use #[projection] instead."));
             }
             Meta::Path(path) if path.is_ident("on_any") => {
                 if args.on_any {
@@ -1024,10 +1058,6 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
         };
     }
 
-    if args.projection {
-        builder = quote! { #builder .projection() };
-    }
-
     if args.queued {
         builder = quote! { #builder .retry(1) };
     }
@@ -1082,11 +1112,91 @@ fn apply_on_any_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
         builder = quote! { #builder .id(#id_lit) };
     }
 
-    if args.projection {
-        builder = quote! { #builder .projection() };
+    builder
+}
+
+fn expand_projection(
+    metas: &Punctuated<Meta, Token![,]>,
+    input_fn: ItemFn,
+) -> syn::Result<TokenStream2> {
+    if input_fn.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            &input_fn.sig.fn_token,
+            "#[projection] requires an async function",
+        ));
     }
 
-    builder
+    // Parse optional id = "..." and priority = N
+    let mut id: Option<String> = None;
+    let mut priority: Option<i32> = None;
+    for meta in metas {
+        match meta {
+            Meta::NameValue(nv) if nv.path.is_ident("id") => {
+                id = Some(parse_string_lit(&nv.value)?);
+            }
+            Meta::NameValue(nv) if nv.path.is_ident("priority") => {
+                if let Expr::Lit(lit) = &nv.value {
+                    if let Lit::Int(int_lit) = &lit.lit {
+                        priority = Some(int_lit.base10_parse()?);
+                    } else {
+                        return Err(syn::Error::new_spanned(&nv.value, "expected integer literal"));
+                    }
+                } else {
+                    return Err(syn::Error::new_spanned(&nv.value, "expected integer literal"));
+                }
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "#[projection] only supports id = \"...\" and priority = N",
+                ));
+            }
+        }
+    }
+
+    let fn_ident = input_fn.sig.ident.clone();
+    let wrapper_ident = format_ident!("__seesaw_projection_{}", fn_ident);
+
+    let (ctx_idx, deps_ty) = find_effect_context(&input_fn.sig)?;
+    let params = collect_params(&input_fn.sig)?;
+    let non_ctx_params: Vec<ParamInfo> = params
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, param)| if idx == ctx_idx { None } else { Some(param) })
+        .collect();
+
+    if non_ctx_params.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &input_fn.sig.inputs,
+            "#[projection] handler requires exactly one AnyEvent parameter plus Context",
+        ));
+    }
+
+    let event_ident = &non_ctx_params[0].ident;
+
+    let id_str = id.unwrap_or_else(|| fn_ident.to_string());
+    let id_lit = syn::LitStr::new(&id_str, fn_ident.span());
+
+    let mut builder = quote! { ::seesaw_core::project(#id_lit) };
+
+    if let Some(p) = priority {
+        builder = quote! { #builder .priority(#p) };
+    }
+
+    let chain = quote! {
+        #builder.then::<#deps_ty, _, _>(|#event_ident, __seesaw_ctx| async move {
+            #fn_ident(#event_ident, __seesaw_ctx).await
+        })
+    };
+
+    Ok(quote! {
+        #input_fn
+
+        #[doc(hidden)]
+        pub fn #wrapper_ident() -> ::seesaw_core::Projection<#deps_ty> {
+            #chain
+        }
+    })
 }
 
 fn effect_requires_stable_id(args: &EffectArgs) -> bool {

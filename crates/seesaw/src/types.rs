@@ -60,7 +60,7 @@ pub struct EmittedEvent {
 
 /// Captured inline effect failure to persist in DLQ at commit time.
 #[derive(Debug, Clone)]
-pub struct InlineHandlerFailure {
+pub struct InlineFailure {
     pub handler_id: String,
     pub error: String,
     pub reason: String,
@@ -69,7 +69,7 @@ pub struct InlineHandlerFailure {
 
 /// Atomic event processing commit payload.
 #[derive(Debug)]
-pub struct EventProcessingCommit {
+pub struct EventCommit {
     /// Source queue row to acknowledge.
     pub event_row_id: i64,
     /// Source event identifiers.
@@ -78,16 +78,16 @@ pub struct EventProcessingCommit {
     pub event_type: String,
     pub event_payload: serde_json::Value,
     /// Queued effect intents to persist.
-    pub queued_effect_intents: Vec<QueuedHandlerIntent>,
+    pub queued_effect_intents: Vec<EffectIntent>,
     /// Inline effect failures to persist to DLQ.
-    pub inline_effect_failures: Vec<InlineHandlerFailure>,
+    pub inline_effect_failures: Vec<InlineFailure>,
     /// Inline emitted events to publish.
     pub emitted_events: Vec<QueuedEvent>,
 }
 
 /// Persisted intent for a queued effect execution.
 #[derive(Debug, Clone)]
-pub struct QueuedHandlerIntent {
+pub struct EffectIntent {
     /// Stable effect identifier.
     pub handler_id: String,
     /// Parent event for causality tracking.
@@ -133,7 +133,7 @@ pub struct ExpiredJoinWindow {
 
 /// Queued effect execution from store
 #[derive(Debug, Clone)]
-pub struct QueuedHandlerExecution {
+pub struct QueuedEffect {
     pub event_id: Uuid,
     pub handler_id: String,
     pub correlation_id: Uuid,
@@ -226,6 +226,43 @@ pub struct EffectDlq {
     pub events_to_publish: Vec<QueuedEvent>,
 }
 
+/// Unified effect resolution outcome.
+///
+/// Replaces the three separate `complete_effect`, `fail_effect`, `dlq_effect`
+/// Store methods with a single `resolve_effect(EffectResolution)` call.
+#[derive(Debug)]
+pub enum EffectResolution {
+    /// Effect completed successfully.
+    Complete(EffectCompletion),
+    /// Effect failed but can be retried.
+    Retry {
+        event_id: Uuid,
+        handler_id: String,
+        error: String,
+        new_attempts: i32,
+        next_execute_at: DateTime<Utc>,
+    },
+    /// Effect exhausted retries — send to dead letter queue.
+    DeadLetter(EffectDlq),
+}
+
+/// Unified event processing outcome.
+///
+/// Replaces the separate `commit_event_processing` and `reject_event`
+/// Store methods with a single `complete_event(EventOutcome)` call.
+#[derive(Debug)]
+pub enum EventOutcome {
+    /// Event processed successfully — commit effects, emitted events, and DLQ inline failures.
+    Processed(EventCommit),
+    /// Event rejected — send to DLQ and ack.
+    Rejected {
+        event_row_id: i64,
+        event_id: Uuid,
+        error: String,
+        reason: String,
+    },
+}
+
 /// Parameters for appending to a join window and optionally claiming it.
 #[derive(Debug)]
 pub struct JoinAppendParams {
@@ -314,7 +351,7 @@ impl fmt::Display for QueuedEvent {
     }
 }
 
-impl fmt::Display for QueuedHandlerExecution {
+impl fmt::Display for QueuedEffect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,

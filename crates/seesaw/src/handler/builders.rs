@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::context::Context;
-use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Handler, JoinMode};
+use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Handler, JoinMode, Projection};
 use crate::event_codec::EventCodec;
 
 #[track_caller]
@@ -82,7 +82,6 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
     filter: Filter,
     started: Started,
     id: Option<String>,
-    projection: bool,
     queued: bool,
     delay: Option<Duration>,
     timeout: Option<Duration>,
@@ -104,7 +103,6 @@ where
         filter: NoFilter,
         started: NoStarted,
         id: None,
-        projection: false,
         queued: false,
         delay: None,
         timeout: None,
@@ -124,7 +122,6 @@ pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
         filter: NoFilter,
         started: NoStarted,
         id: None,
-        projection: false,
         queued: false,
         delay: None,
         timeout: None,
@@ -135,6 +132,54 @@ pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
         codec: None,
         dlq_terminal_mapper: None,
         _marker: PhantomData,
+    }
+}
+
+/// Create a projection that receives all events.
+///
+/// Projections run sequentially before all other handlers, ensuring
+/// read models are up-to-date when regular handlers execute.
+///
+/// ```ignore
+/// project("audit_log").then(|event: AnyEvent, ctx| async move {
+///     if let Some(order) = event.downcast_ref::<OrderPlaced>() {
+///         // update read model
+///     }
+///     Ok(())
+/// })
+/// ```
+pub fn project(id: impl Into<String>) -> ProjectionBuilder {
+    ProjectionBuilder {
+        id: id.into(),
+        priority: None,
+    }
+}
+
+/// Builder for projection handlers.
+pub struct ProjectionBuilder {
+    id: String,
+    priority: Option<i32>,
+}
+
+impl ProjectionBuilder {
+    /// Set execution priority (lower = runs first).
+    pub fn priority(mut self, priority: i32) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Set the projection handler (terminal operation).
+    pub fn then<D, H, Fut>(self, handler: H) -> Projection<D>
+    where
+        D: Send + Sync + 'static,
+        H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        Projection {
+            id: self.id,
+            handler: Arc::new(move |event, ctx| Box::pin(handler(event, ctx))),
+            priority: self.priority,
+        }
     }
 }
 
@@ -151,7 +196,6 @@ where
             filter: WithFilter(predicate),
             started: self.started,
             id: self.id,
-            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -178,7 +222,6 @@ where
             filter: WithFilterMap(extractor, PhantomData),
             started: self.started,
             id: self.id,
-            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -208,7 +251,6 @@ impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
             filter: self.filter,
             started: WithStarted(started, PhantomData),
             id: self.id,
-            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -227,15 +269,6 @@ impl<EventType, Filter, Started> HandlerBuilder<EventType, Filter, Started> {
     /// Set a custom ID for this effect (default: auto-generated).
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
-        self
-    }
-
-    /// Mark as a projection handler.
-    ///
-    /// Projection handlers run sequentially *before* all other handlers,
-    /// ensuring read models are up-to-date when regular handlers execute.
-    pub fn projection(mut self) -> Self {
-        self.projection = true;
         self
     }
 }
@@ -424,7 +457,6 @@ where
             })),
             join_window_timeout: self.inner.join_window,
             dlq_terminal_mapper: self.inner.dlq_terminal_mapper.take(),
-            projection: self.inner.projection,
             queued: true,
             delay: self.inner.delay,
             timeout: self.inner.timeout,
@@ -554,7 +586,6 @@ where
             join_batch_handler: None,
             join_window_timeout: self.join_window,
             dlq_terminal_mapper,
-            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -593,7 +624,6 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
             join_batch_handler: None,
             join_window_timeout: self.join_window,
             dlq_terminal_mapper: None,
-            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -639,7 +669,6 @@ where
             join_batch_handler: None,
             join_window_timeout: self.join_window,
             dlq_terminal_mapper: None,
-            projection: self.projection,
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
@@ -690,7 +719,6 @@ where
                 filter: NoFilter,
                 started: self.started,
                 id: self.id,
-                projection: self.projection,
                 queued: self.queued,
                 delay: self.delay,
                 timeout: self.timeout,
@@ -781,7 +809,6 @@ where
             join_batch_handler: None,
             join_window_timeout: self.inner.join_window,
             dlq_terminal_mapper: self.inner.dlq_terminal_mapper,
-            projection: self.inner.projection,
             queued: self.inner.queued,
             delay: self.inner.delay,
             timeout: self.inner.timeout,

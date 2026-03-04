@@ -13,8 +13,8 @@
 //! ```text
 //!                  ┌──────────────────────────┐
 //!                  │         pending           │
-//!                  │  (commit_event_processing │
-//!                  │   inserts the intent)     │
+//!                  │  (complete_event inserts   │
+//!                  │   the intent)              │
 //!                  └────────────┬─────────────┘
 //!                               │ poll_next_effect
 //!                               ▼
@@ -23,7 +23,7 @@
 //!                  │  (claimed by Engine)      │
 //!                  └──┬────────┬────────┬─────┘
 //!                     │        │        │
-//!          complete_effect  fail_effect  dlq_effect
+//!          resolve_effect(Complete/Retry/DeadLetter)
 //!                     │        │        │
 //!                     ▼        ▼        ▼
 //!               ┌──────────┐ ┌────┐ ┌──────────────┐
@@ -43,8 +43,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::types::{
-    EffectCompletion, EffectDlq, EventProcessingCommit, ExpiredJoinWindow, JoinAppendParams,
-    JoinEntry, NewEvent, PersistedEvent, QueuedEvent, QueuedHandlerExecution, Snapshot,
+    EffectResolution, EventOutcome, ExpiredJoinWindow, JoinAppendParams,
+    JoinEntry, NewEvent, PersistedEvent, QueuedEvent, QueuedEffect, Snapshot,
 };
 
 /// Pluggable backend for the Engine's event and effect queues.
@@ -66,21 +66,12 @@ pub trait Store: Send + Sync {
     /// Claim the next ready event (FIFO per correlation_id).
     async fn poll_next(&self) -> Result<Option<QueuedEvent>>;
 
-    /// Atomically commit event processing results: ack the source event,
-    /// persist effect intents, publish inline-emitted events, and DLQ
-    /// inline failures.
+    /// Complete event processing — either commit results or reject to DLQ.
     ///
-    /// Effect intents inserted here start in the **pending** state.
-    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()>;
-
-    /// Reject an event: send it to the DLQ and ack in one atomic step.
-    async fn reject_event(
-        &self,
-        event_row_id: i64,
-        event_id: Uuid,
-        error: String,
-        reason: String,
-    ) -> Result<()>;
+    /// - `Processed`: ack source event, persist effect intents (pending state),
+    ///   publish inline-emitted events, DLQ inline failures.
+    /// - `Rejected`: send to DLQ and ack in one atomic step.
+    async fn complete_event(&self, result: EventOutcome) -> Result<()>;
 
     // ── Effect queue ─────────────────────────────────────────────────
 
@@ -93,24 +84,7 @@ pub trait Store: Send + Sync {
     /// resolution method, the Store is responsible for reclaiming the
     /// effect (e.g. via a visibility timeout that resets status back to
     /// pending).
-    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>>;
-
-    /// Claim up to `limit` ready effect executions.
-    ///
-    /// Each claimed effect transitions from **pending** → **running**.
-    ///
-    /// Default implementation calls [`poll_next_effect`](Store::poll_next_effect)
-    /// in a loop. Postgres can override with `SELECT ... LIMIT N FOR UPDATE SKIP LOCKED`.
-    async fn poll_next_effects(&self, limit: usize) -> Result<Vec<QueuedHandlerExecution>> {
-        let mut batch = Vec::with_capacity(limit);
-        for _ in 0..limit {
-            match self.poll_next_effect().await? {
-                Some(exec) => batch.push(exec),
-                None => break,
-            }
-        }
-        Ok(batch)
-    }
+    async fn poll_next_effect(&self) -> Result<Option<QueuedEffect>>;
 
     /// Returns the earliest `execute_at` of any **pending** effect, if any.
     ///
@@ -118,37 +92,22 @@ pub trait Store: Send + Sync {
     /// instead of exiting prematurely when only future-dated effects remain.
     async fn earliest_pending_effect_at(&self) -> Result<Option<DateTime<Utc>>>;
 
-    // ── Effect outcomes ──────────────────────────────────────────────
-    //
-    // Each of these resolves a **running** effect. Exactly one must be
-    // called for every execution returned by `poll_next_effect`.
+    // ── Effect resolution ─────────────────────────────────────────────
 
-    /// Resolve a **running** effect as **completed**.
+    /// Resolve a **running** effect.
     ///
-    /// Publishes any emitted events atomically with the status change.
-    async fn complete_effect(&self, completion: EffectCompletion) -> Result<()>;
+    /// This is the single exit point for every claimed effect:
+    /// - `Complete`: mark done, publish emitted events
+    /// - `Retry`: reset to pending with new attempt count and schedule
+    /// - `DeadLetter`: mark dead-lettered, publish terminal events
+    async fn resolve_effect(&self, resolution: EffectResolution) -> Result<()>;
 
-    /// Resolve a **running** effect back to **pending** for retry.
-    ///
-    /// Backoff computation stays in the Engine; the Store just persists
-    /// the new attempt count and schedule.
-    ///
-    /// `new_attempts` is the value to **set** on the execution (not an increment).
-    /// The Engine computes `previous_attempts + 1` before calling this method.
-    async fn fail_effect(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        error: String,
-        new_attempts: i32,
-        next_execute_at: DateTime<Utc>,
-    ) -> Result<()>;
-
-    /// Resolve a **running** effect as **dead-lettered**.
-    ///
-    /// Publishes any terminal events (from `on_failure`/`on_dlq` mappers)
-    /// atomically with the status change.
-    async fn dlq_effect(&self, dlq: EffectDlq) -> Result<()>;
+    /// Reclaim effects that have been in "running" state longer than their timeout.
+    /// Called at the start of each settle loop iteration.
+    /// Default: no-op (suitable for in-memory stores where crash = data loss anyway).
+    async fn reclaim_stale(&self) -> Result<()> {
+        Ok(())
+    }
 
     // ── Join windows ─────────────────────────────────────────────────
 
@@ -195,20 +154,14 @@ pub trait Store: Send + Sync {
     }
 
     /// Load events for an aggregate stream (for hydration).
+    ///
+    /// Pass `after_position: Some(pos)` for snapshot + partial replay,
+    /// or `None` for full replay.
     async fn load_stream(
         &self,
         _aggregate_type: &str,
         _aggregate_id: Uuid,
-    ) -> Result<Vec<PersistedEvent>> {
-        Ok(Vec::new())
-    }
-
-    /// Load events from after a specific position (for snapshot + partial replay).
-    async fn load_stream_from(
-        &self,
-        _aggregate_type: &str,
-        _aggregate_id: Uuid,
-        _after_position: u64,
+        _after_position: Option<u64>,
     ) -> Result<Vec<PersistedEvent>> {
         Ok(Vec::new())
     }
