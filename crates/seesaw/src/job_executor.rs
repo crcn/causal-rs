@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::event_store::event_type_short_name;
-use crate::handler::{Cancellable, Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
+use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::types::{
     EmittedEvent, EventCommit, EventWorkerConfig, HandlerWorkerConfig,
@@ -34,7 +34,6 @@ where
     aggregator_registry: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
     global_dlq_mapper: Option<GlobalDlqMapper>,
-    cancellable: Option<Arc<dyn Cancellable>>,
 }
 
 impl<D> JobExecutor<D>
@@ -48,7 +47,6 @@ where
         aggregator_registry: Arc<AggregatorRegistry>,
         upcasters: Arc<UpcasterRegistry>,
         global_dlq_mapper: Option<GlobalDlqMapper>,
-        cancellable: Option<Arc<dyn Cancellable>>,
     ) -> Self {
         Self {
             deps,
@@ -56,7 +54,6 @@ where
             aggregator_registry,
             upcasters,
             global_dlq_mapper,
-            cancellable,
         }
     }
 
@@ -464,7 +461,7 @@ where
         event_id: Uuid,
         parent_event_id: Option<Uuid>,
     ) -> Context<D> {
-        let ctx = Context::new(
+        Context::new(
             handler_id,
             idempotency_key,
             correlation_id,
@@ -472,12 +469,7 @@ where
             parent_event_id,
             self.deps.clone(),
         )
-        .with_aggregator_registry(self.aggregator_registry.clone());
-        if let Some(ref cancellable) = self.cancellable {
-            ctx.with_cancellable(cancellable.clone())
-        } else {
-            ctx
-        }
+        .with_aggregator_registry(self.aggregator_registry.clone())
     }
 
     fn decode_event(

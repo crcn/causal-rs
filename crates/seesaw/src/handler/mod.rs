@@ -39,7 +39,7 @@ mod error_event;
 mod types;
 
 pub use builders::{on, on_any, project, ProjectionBuilder, TransitionHandlerBuilder};
-pub use context::{Cancellable, Context};
+pub use context::Context;
 pub use error_event::HandlerError;
 pub use types::{
     AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Events,

@@ -64,8 +64,8 @@ pub use upcaster::{Upcaster, UpcasterRegistry};
 // Re-export main types
 pub use engine::Engine;
 pub use handler::{
-    AnyEvent, Cancellable, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events,
-    Handler, HandlerError, IntoEvents, JoinMode, Projection,
+    AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events, Handler,
+    HandlerError, IntoEvents, JoinMode, Projection,
 };
 
 /// The universal return macro for all handlers.

@@ -2344,3 +2344,55 @@ async fn cancel_does_not_affect_other_correlations() -> Result<()> {
     assert_eq!(counter.load(Ordering::SeqCst), 1, "only non-cancelled workflow should fire");
     Ok(())
 }
+
+#[tokio::test]
+async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
+    /// Child event emitted by the Ping handler.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Pong;
+
+    let pong_counter = Arc::new(AtomicUsize::new(0));
+    let pong_clone = pong_counter.clone();
+
+    let store = Arc::new(MemoryStore::new());
+    let store_for_handler = store.clone();
+
+    let engine = Engine::new(Deps)
+        .with_store(store)
+        // Ping handler: emits Pong, then cancels own correlation via the store
+        .with_handler(
+            handler::on::<Ping>().then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
+                let s = store_for_handler.clone();
+                let cid = ctx.correlation_id;
+                async move {
+                    // Cancel the workflow from within the handler.
+                    // The emitted Pong will be queued but should be rejected
+                    // on the next settle loop iteration.
+                    s.cancel_correlation(cid).await.unwrap();
+                    Ok(events![Pong])
+                }
+            }),
+        )
+        // Pong handler: should never fire because workflow is cancelled
+        .with_handler(
+            handler::on::<Pong>().then(move |_event: Arc<Pong>, _ctx: Context<Deps>| {
+                let c = pong_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+        );
+
+    engine
+        .emit(Ping { msg: "trigger".into() })
+        .settled()
+        .await?;
+
+    assert_eq!(
+        pong_counter.load(Ordering::SeqCst),
+        0,
+        "downstream Pong handler should not fire after mid-settle cancel"
+    );
+    Ok(())
+}

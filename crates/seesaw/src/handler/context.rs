@@ -4,16 +4,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Result;
-use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
-
-/// Trait for checking cancellation status. Implemented by store wrappers.
-#[async_trait]
-pub trait Cancellable: Send + Sync {
-    async fn is_cancelled(&self, id: Uuid) -> bool;
-}
 
 /// Context passed to effect handlers.
 pub struct Context<D>
@@ -33,8 +26,6 @@ where
     pub(crate) deps: Arc<D>,
     /// Aggregator registry for transition guard replay.
     pub(crate) aggregator_registry: Option<Arc<AggregatorRegistry>>,
-    /// Cancellation checker (set by engine).
-    pub(crate) cancellable: Option<Arc<dyn Cancellable>>,
 }
 
 impl<D> Clone for Context<D>
@@ -50,7 +41,6 @@ where
             parent_event_id: self.parent_event_id,
             deps: self.deps.clone(),
             aggregator_registry: self.aggregator_registry.clone(),
-            cancellable: self.cancellable.clone(),
         }
     }
 }
@@ -75,23 +65,6 @@ where
             parent_event_id,
             deps,
             aggregator_registry: None,
-            cancellable: None,
-        }
-    }
-
-    /// Attach a cancellation checker (used by the engine).
-    pub(crate) fn with_cancellable(mut self, cancellable: Arc<dyn Cancellable>) -> Self {
-        self.cancellable = Some(cancellable);
-        self
-    }
-
-    /// Check whether this workflow has been cancelled.
-    ///
-    /// Returns `false` if no cancellation checker is configured.
-    pub async fn is_cancelled(&self) -> bool {
-        match &self.cancellable {
-            Some(c) => c.is_cancelled(self.correlation_id).await,
-            None => false,
         }
     }
 

@@ -90,6 +90,15 @@ impl MemoryStore {
         }
     }
 
+    /// Set the TTL for cancelled correlation entries.
+    ///
+    /// Entries older than this duration are lazily evicted on the next
+    /// `is_cancelled` check. Defaults to 1 hour.
+    pub fn with_cancel_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.cancel_ttl = ttl;
+        self
+    }
+
     /// Access the global event log (for test assertions).
     pub fn global_log(&self) -> &Mutex<Vec<PersistedEvent>> {
         &self.global_log

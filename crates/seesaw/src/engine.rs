@@ -10,11 +10,9 @@ use uuid::Uuid;
 use anyhow::Result;
 use tracing::info;
 
-use async_trait::async_trait;
-
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_store::event_type_short_name;
-use crate::handler::{Cancellable, Context, GlobalDlqMapper, Handler, Projection};
+use crate::handler::{Context, GlobalDlqMapper, Handler, Projection};
 use crate::handler_registry::HandlerRegistry;
 use crate::job_executor::{EffectStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
@@ -26,18 +24,6 @@ use crate::types::{
     NAMESPACE_SEESAW,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
-
-/// Adapter that delegates cancellation checks to the Store.
-struct StoreCancellable {
-    store: Arc<dyn Store>,
-}
-
-#[async_trait]
-impl Cancellable for StoreCancellable {
-    async fn is_cancelled(&self, id: Uuid) -> bool {
-        self.store.is_cancelled(id).await.unwrap_or(false)
-    }
-}
 
 /// Store-agnostic Engine with built-in settle loop.
 ///
@@ -356,16 +342,12 @@ where
 
     /// Drive all pending events and effects to completion.
     pub async fn settle(&self) -> Result<()> {
-        let cancellable: Arc<dyn Cancellable> = Arc::new(StoreCancellable {
-            store: self.store.clone(),
-        });
         let executor = JobExecutor::new(
             self.deps.clone(),
             self.effects.clone(),
             self.aggregators.clone(),
             self.upcasters.clone(),
             self.global_dlq_mapper.clone(),
-            Some(cancellable.clone()),
         );
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
@@ -376,13 +358,28 @@ where
             // Reclaim stale effects (running longer than timeout)
             self.store.reclaim_stale().await?;
 
-            // Drain event queue
+            // Drain event queue (cache cancellation status per correlation_id)
+            let mut cancelled_cache = std::collections::HashSet::new();
             while let Some(event) = self.store.poll_next().await? {
                 processed_any = true;
 
                 // Cancellation checkpoint 1: reject cancelled events before
                 // persisting to the event log or mutating aggregate state.
-                if self.store.is_cancelled(event.correlation_id).await? {
+                let is_cancelled = if cancelled_cache.contains(&event.correlation_id) {
+                    true
+                } else if self.store.is_cancelled(event.correlation_id).await? {
+                    cancelled_cache.insert(event.correlation_id);
+                    true
+                } else {
+                    false
+                };
+                if is_cancelled {
+                    info!(
+                        correlation_id = %event.correlation_id,
+                        event_id = %event.event_id,
+                        event_type = %event.event_type,
+                        "Rejecting event: workflow cancelled",
+                    );
                     self.store
                         .complete_event(EventOutcome::Rejected {
                             event_row_id: event.id,
@@ -434,10 +431,28 @@ where
             if !executions.is_empty() {
                 processed_any = true;
 
-                // Cancellation checkpoint 2: DLQ cancelled effects before execution.
+                // Cancellation checkpoint 2: batch-check unique correlation IDs,
+                // then DLQ cancelled effects before execution.
+                let unique_ids: std::collections::HashSet<Uuid> =
+                    executions.iter().map(|e| e.correlation_id).collect();
+                let mut cancelled_ids = std::collections::HashSet::new();
+                for id in unique_ids {
+                    if cancelled_cache.contains(&id)
+                        || self.store.is_cancelled(id).await?
+                    {
+                        cancelled_ids.insert(id);
+                    }
+                }
+
                 let mut active_executions = Vec::new();
                 for execution in executions {
-                    if self.store.is_cancelled(execution.correlation_id).await? {
+                    if cancelled_ids.contains(&execution.correlation_id) {
+                        info!(
+                            correlation_id = %execution.correlation_id,
+                            event_id = %execution.event_id,
+                            handler_id = %execution.handler_id,
+                            "DLQ effect: workflow cancelled",
+                        );
                         self.store
                             .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
                                 event_id: execution.event_id,
@@ -569,7 +584,6 @@ where
                                         &handler_id,
                                         &execution_clone,
                                         join_claim.batch_id,
-                                        Some(cancellable.clone()),
                                     )
                                     .await?;
                                 } else {
@@ -1026,7 +1040,6 @@ where
         handler_id: &str,
         execution: &QueuedEffect,
         batch_id: Uuid,
-        cancellable: Option<Arc<dyn Cancellable>>,
     ) -> Result<()> {
         let batch_index = execution.batch_index.unwrap_or(0);
         let batch_size = execution.batch_size.unwrap_or(1);
@@ -1073,7 +1086,7 @@ where
                     )
                     .to_string();
 
-                    let mut ctx = Context::new(
+                    let ctx = Context::new(
                         handler_id.to_string(),
                         idempotency_key,
                         execution.correlation_id,
@@ -1082,9 +1095,6 @@ where
                         self.deps.clone(),
                     )
                     .with_aggregator_registry(self.aggregators.clone());
-                    if let Some(ref cancellable) = cancellable {
-                        ctx = ctx.with_cancellable(cancellable.clone());
-                    }
 
                     match effect.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {
