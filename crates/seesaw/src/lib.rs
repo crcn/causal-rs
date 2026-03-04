@@ -43,20 +43,24 @@ pub mod types;
 mod engine;
 mod event_codec;
 mod handler_registry;
-pub(crate) mod memory_store;
+pub mod memory_store;
 mod process;
 pub mod upcaster;
 
 // Re-export aggregator types
 pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 
-// Re-export event store types
-pub use event_store::{
-    MemorySnapshotStore, Snapshot, SnapshotStore, save_snapshot,
-};
+// Re-export event store helpers and types
+pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
+pub use types::{NewEvent, PersistedEvent, Snapshot};
 
-// Re-export store trait
+// Deprecated re-exports for backward compatibility
+#[allow(deprecated)]
+pub use event_store::{EventStore, MemoryEventStore, MemorySnapshotStore, SnapshotStore};
+
+// Re-export store trait and in-memory implementation
 pub use store::Store;
+pub use memory_store::MemoryStore;
 
 // Re-export upcaster types
 pub use upcaster::{Upcaster, UpcasterRegistry};

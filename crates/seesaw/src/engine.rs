@@ -11,7 +11,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
-use crate::event_store::{event_type_short_name, EventStore, NewEvent, SnapshotStore};
+use crate::event_store::event_type_short_name;
 use crate::handler::{Context, GlobalDlqMapper, Handler};
 use crate::handler_registry::HandlerRegistry;
 use crate::job_executor::{HandlerStatus, JobExecutor};
@@ -20,7 +20,7 @@ use crate::process::{EmitFuture, ProcessHandle};
 use crate::store::Store;
 use crate::types::{
     EffectCompletion, EffectDlq, EmittedEvent, EventWorkerConfig, HandlerWorkerConfig,
-    JoinAppendParams, QueuedEvent, QueuedHandlerExecution, NAMESPACE_SEESAW,
+    JoinAppendParams, NewEvent, QueuedEvent, QueuedHandlerExecution, Snapshot, NAMESPACE_SEESAW,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
 
@@ -40,8 +40,6 @@ where
     effects: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
-    event_store: Option<Arc<dyn EventStore>>,
-    snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_every: Option<u64>,
     event_metadata: serde_json::Map<String, serde_json::Value>,
     global_dlq_mapper: Option<GlobalDlqMapper>,
@@ -62,8 +60,6 @@ where
             effects: Arc::new(HandlerRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
             upcasters: Arc::new(UpcasterRegistry::new()),
-            event_store: None,
-            snapshot_store: None,
             snapshot_every: None,
             event_metadata: serde_json::Map::new(),
             global_dlq_mapper: None,
@@ -85,31 +81,13 @@ where
         self.aggregators.get_singleton_arc::<A>().1
     }
 
-    /// Invalidate cached aggregate state, forcing re-hydration from the EventStore.
+    /// Invalidate cached aggregate state, forcing re-hydration from the Store.
     ///
     /// Use after ingesting foreign events (e.g. from another node) so the
     /// next settle loop rebuilds the aggregate from the persistent log.
     pub fn invalidate_aggregate<A: Aggregate>(&self, id: Uuid) {
         let key = format!("{}:{}", A::aggregate_type(), id);
         self.aggregators.remove_state(&key);
-    }
-
-    /// Set a persistent event store for auto-persist and cold-start hydration.
-    ///
-    /// When set, events matching registered aggregators are automatically
-    /// persisted, and aggregates are hydrated from the store on cold access.
-    pub fn with_event_store(mut self, store: Arc<dyn EventStore>) -> Self {
-        self.event_store = Some(store);
-        self
-    }
-
-    /// Set a snapshot store for hydration acceleration.
-    ///
-    /// Optional optimization — without it, cold-start hydration replays
-    /// all events from the EventStore.
-    pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
-        self.snapshot_store = Some(store);
-        self
     }
 
     /// Enable auto-checkpoint snapshots every N events.
@@ -123,13 +101,13 @@ where
 
     /// Set metadata to stamp on every persisted event.
     ///
-    /// Metadata travels with the event through the EventStore, letting
+    /// Metadata travels with the event through the Store, letting
     /// adapters pull application-level context (e.g. `run_id`, `schema_v`,
     /// `actor`) without holding state themselves.
     ///
     /// ```ignore
     /// let engine = Engine::new(deps)
-    ///     .with_event_store(event_store)
+    ///     .with_store(my_store)
     ///     .with_event_metadata(serde_json::json!({
     ///         "run_id": "scrape-abc123",
     ///         "schema_v": 1
@@ -370,19 +348,15 @@ where
                 processed_any = true;
 
                 // Persist every event + hydrate cold aggregates before state mutation.
-                if self.event_store.is_some() {
-                    self.persist_and_hydrate(&event).await?;
-                }
+                // Default Store no-ops make this safe for MemoryStore.
+                self.persist_and_hydrate(&event).await?;
 
                 // Apply event to live aggregator state before handlers run
                 self.apply_to_aggregators(&event);
 
                 // Auto-checkpoint snapshots if configured
-                if let (Some(snapshot_store), Some(threshold)) =
-                    (&self.snapshot_store, self.snapshot_every)
-                {
-                    self.maybe_auto_snapshot(&event, snapshot_store.as_ref(), threshold)
-                        .await?;
+                if let Some(threshold) = self.snapshot_every {
+                    self.maybe_auto_snapshot(&event, threshold).await?;
                 }
 
                 match executor.execute_event(&event, &event_config).await {
@@ -656,10 +630,9 @@ where
 
     /// Hydrate cold aggregates, then persist every event to the global log.
     ///
-    /// 1. For each matching aggregator, hydrate cold aggregates from EventStore
+    /// 1. For each matching aggregator, hydrate cold aggregates from Store
     /// 2. Always append the event (with aggregate metadata if aggregators match)
     async fn persist_and_hydrate(&self, event: &QueuedEvent) -> Result<()> {
-        let event_store = self.event_store.as_ref().unwrap();
         let short_name = event_type_short_name(&event.event_type);
 
         // Find matching aggregators to set aggregate metadata
@@ -683,7 +656,6 @@ where
 
             if !self.aggregators.has_state(&key) {
                 self.hydrate_aggregate(
-                    event_store.as_ref(),
                     &agg.aggregate_type,
                     agg_id,
                     &key,
@@ -701,8 +673,8 @@ where
             );
         }
 
-        event_store
-            .append(NewEvent {
+        self.store
+            .append_event(NewEvent {
                 event_id: event.event_id,
                 parent_id: event.parent_id,
                 correlation_id: event.correlation_id,
@@ -718,53 +690,55 @@ where
         Ok(())
     }
 
-    /// Hydrate a single aggregate from EventStore (with optional snapshot acceleration).
+    /// Hydrate a single aggregate from Store (with optional snapshot acceleration).
     async fn hydrate_aggregate(
         &self,
-        event_store: &dyn EventStore,
         aggregate_type: &str,
         aggregate_id: Uuid,
         key: &str,
     ) -> Result<()> {
-        // Try snapshot store first
-        if let Some(snapshot_store) = &self.snapshot_store {
-            if let Some(snapshot) = snapshot_store
-                .load_snapshot(aggregate_type, aggregate_id)
-                .await?
-            {
-                let agg = self.aggregators.find_first_by_aggregate_type(aggregate_type);
-                if let Some(agg) = agg {
-                    let mut state = agg.deserialize_state(snapshot.state)?;
+        // Try snapshot first
+        if let Some(snapshot) = self
+            .store
+            .load_snapshot(aggregate_type, aggregate_id)
+            .await?
+        {
+            let agg = self.aggregators.find_first_by_aggregate_type(aggregate_type);
+            if let Some(agg) = agg {
+                let mut state = agg.deserialize_state(snapshot.state)?;
 
-                    // Load remaining events after snapshot position
-                    let remaining = event_store
-                        .load_stream_from(aggregate_type, aggregate_id, snapshot.version)
-                        .await?;
+                // Load remaining events after snapshot position
+                let remaining = self
+                    .store
+                    .load_stream_from(aggregate_type, aggregate_id, snapshot.version)
+                    .await?;
 
-                    if !remaining.is_empty() {
-                        let event_pairs: Vec<(&str, &serde_json::Value)> = remaining
-                            .iter()
-                            .map(|e| (e.event_type.as_str(), &e.payload))
-                            .collect();
+                if !remaining.is_empty() {
+                    let event_pairs: Vec<(&str, &serde_json::Value)> = remaining
+                        .iter()
+                        .map(|e| (e.event_type.as_str(), &e.payload))
+                        .collect();
 
-                        self.aggregators.replay_events_onto(
-                            aggregate_type,
-                            state.as_mut(),
-                            &event_pairs,
-                            &self.upcasters,
-                        )?;
-                    }
-
-                    let final_version = snapshot.version + remaining.len() as u64;
-                    self.aggregators
-                        .set_state(key, Arc::from(state), final_version, snapshot.version);
-                    return Ok(());
+                    self.aggregators.replay_events_onto(
+                        aggregate_type,
+                        state.as_mut(),
+                        &event_pairs,
+                        &self.upcasters,
+                    )?;
                 }
+
+                let final_version = snapshot.version + remaining.len() as u64;
+                self.aggregators
+                    .set_state(key, Arc::from(state), final_version, snapshot.version);
+                return Ok(());
             }
         }
 
         // No snapshot — full replay
-        let events = event_store.load_stream(aggregate_type, aggregate_id).await?;
+        let events = self
+            .store
+            .load_stream(aggregate_type, aggregate_id)
+            .await?;
         if events.is_empty() {
             return Ok(());
         }
@@ -888,7 +862,6 @@ where
     async fn maybe_auto_snapshot(
         &self,
         event: &QueuedEvent,
-        snapshot_store: &dyn SnapshotStore,
         threshold: u64,
     ) -> Result<()> {
         let matching = self.aggregators.find_by_event_type(&event.event_type);
@@ -911,8 +884,8 @@ where
 
                 let state_json = agg.serialize_state(state_ref.as_ref())?;
 
-                snapshot_store
-                    .save_snapshot(crate::event_store::Snapshot {
+                self.store
+                    .save_snapshot(Snapshot {
                         aggregate_type: agg.aggregate_type.clone(),
                         aggregate_id,
                         version,
@@ -1151,8 +1124,6 @@ where
             effects: self.effects.clone(),
             aggregators: self.aggregators.clone(),
             upcasters: self.upcasters.clone(),
-            event_store: self.event_store.clone(),
-            snapshot_store: self.snapshot_store.clone(),
             snapshot_every: self.snapshot_every,
             event_metadata: self.event_metadata.clone(),
             global_dlq_mapper: self.global_dlq_mapper.clone(),

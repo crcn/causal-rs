@@ -6,10 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use seesaw_core::aggregator::{Aggregate, Apply};
-use seesaw_core::event_store::{
-    EventStore, MemoryEventStore, MemorySnapshotStore, NewEvent, Snapshot, SnapshotStore,
-};
-use seesaw_core::{events, handler, Context, Engine, Events};
+use seesaw_core::{events, handler, Context, Engine, Events, MemoryStore, NewEvent, Snapshot, Store};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -604,6 +601,7 @@ async fn upcaster_transforms_old_event_for_handler() -> Result<()> {
 #[tokio::test]
 async fn upcaster_chain_in_aggregate_replay() {
     use seesaw_core::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
+    #[allow(deprecated)]
     use seesaw_core::event_store::{EventStore, MemoryEventStore};
     use seesaw_core::upcaster::{Upcaster, UpcasterRegistry};
 
@@ -906,11 +904,11 @@ async fn engine_without_event_store_identical_behavior() -> Result<()> {
 
 #[tokio::test]
 async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_handler(handler::on::<OrderCreated>().then(
@@ -930,7 +928,7 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
         .await?;
 
     // Both events should be persisted to the Order stream
-    let events = event_store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].event_type, "OrderCreated");
     assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
@@ -942,11 +940,11 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
 
 #[tokio::test]
 async fn events_without_aggregator_not_in_stream() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
 
     // Ping has no aggregator registered
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
@@ -961,7 +959,7 @@ async fn events_without_aggregator_not_in_stream() -> Result<()> {
     // Events are persisted to the global log but not loadable via load_stream
     // since Ping has no aggregator (no aggregate_type/aggregate_id).
     // Querying any random stream should return empty.
-    let events = event_store.load_stream("Ping", Uuid::new_v4()).await?;
+    let events = store.load_stream("Ping", Uuid::new_v4()).await?;
     assert!(events.is_empty());
     Ok(())
 }
@@ -970,11 +968,11 @@ async fn events_without_aggregator_not_in_stream() -> Result<()> {
 
 #[tokio::test]
 async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
-    let event_store = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone() as Arc<dyn EventStore>)
+        .with_store(store.clone())
         .with_event_metadata(serde_json::json!({
             "run_id": "scrape-abc123",
             "schema_v": 1
@@ -989,7 +987,7 @@ async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
         .settled()
         .await?;
 
-    let events = event_store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].metadata["run_id"], "scrape-abc123");
     assert_eq!(events[0].metadata["schema_v"], 1);
@@ -998,10 +996,10 @@ async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
 
 #[tokio::test]
 async fn event_metadata_on_non_aggregate_events() -> Result<()> {
-    let event_store = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone() as Arc<dyn EventStore>)
+        .with_store(store.clone())
         .with_event_metadata(serde_json::json!({
             "run_id": "run-xyz"
         }))
@@ -1017,7 +1015,7 @@ async fn event_metadata_on_non_aggregate_events() -> Result<()> {
         .await?;
 
     // Check global log directly since Ping has no aggregator
-    let log = event_store.global_log.lock().unwrap();
+    let log = store.global_log().lock();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].metadata["run_id"], "run-xyz");
     Ok(())
@@ -1025,11 +1023,11 @@ async fn event_metadata_on_non_aggregate_events() -> Result<()> {
 
 #[tokio::test]
 async fn no_metadata_produces_empty_map() -> Result<()> {
-    let event_store = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone() as Arc<dyn EventStore>)
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
     engine
@@ -1040,7 +1038,7 @@ async fn no_metadata_produces_empty_map() -> Result<()> {
         .settled()
         .await?;
 
-    let events = event_store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id).await?;
     assert!(events[0].metadata.is_empty());
     Ok(())
 }
@@ -1049,13 +1047,13 @@ async fn no_metadata_produces_empty_map() -> Result<()> {
 
 #[tokio::test]
 async fn cold_start_hydration() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // Phase 1: Build engine, emit events, populate store
     {
         let engine = Engine::new(Deps)
-            .with_event_store(event_store.clone())
+            .with_store(store.clone())
             .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
             .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
 
@@ -1072,12 +1070,12 @@ async fn cold_start_hydration() -> Result<()> {
             .await?;
     }
 
-    // Phase 2: New engine (simulating restart) with same EventStore
+    // Phase 2: New engine (simulating restart) with same store
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
     let engine2 = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
@@ -1115,20 +1113,20 @@ async fn cold_start_hydration() -> Result<()> {
 #[tokio::test]
 async fn transition_guard_works_after_cold_start() -> Result<()> {
     // THE critical scenario: guard checks prev state after restart
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // Pre-populate events directly in store (simulating previous engine run)
-    event_store
-        .append(new_event(
+    store
+        .append_event(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 100}),
             Some("Order"),
             Some(order_id),
         ))
         .await?;
-    event_store
-        .append(new_event(
+    store
+        .append_event(new_event(
             "OrderConfirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
@@ -1141,7 +1139,7 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
     let f = fired.clone();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
@@ -1173,21 +1171,20 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
 
 #[tokio::test]
 async fn snapshot_acceleration() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // Pre-populate: 2 events in store
-    event_store
-        .append(new_event(
+    store
+        .append_event(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 500}),
             Some("Order"),
             Some(order_id),
         ))
         .await?;
-    event_store
-        .append(new_event(
+    store
+        .append_event(new_event(
             "OrderConfirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
@@ -1196,7 +1193,7 @@ async fn snapshot_acceleration() -> Result<()> {
         .await?;
 
     // Save snapshot at version 1 (after OrderCreated, before OrderConfirmed)
-    snapshot_store
+    store
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
@@ -1206,13 +1203,12 @@ async fn snapshot_acceleration() -> Result<()> {
         })
         .await?;
 
-    // New engine with snapshot store — should load snapshot + replay from v2
+    // New engine with store — should load snapshot + replay from v2
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
@@ -1250,11 +1246,11 @@ async fn snapshot_acceleration() -> Result<()> {
 
 #[tokio::test]
 async fn rapid_fire_events_same_aggregate() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
     // Fire 50 events in quick succession
@@ -1268,7 +1264,7 @@ async fn rapid_fire_events_same_aggregate() -> Result<()> {
             .await?;
     }
 
-    let events = event_store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 50, "all 50 events should be persisted");
     assert_eq!(events.last().unwrap().version.unwrap(), 50);
 
@@ -1284,12 +1280,12 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
     // An event type that maps to BOTH Order and Customer aggregates
     // We use separate events for each aggregate type
 
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<CustomerOrderPlaced, Customer, _>(|e| e.customer_id)
         .with_handler(handler::on::<OrderCreated>().then(
@@ -1309,8 +1305,8 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
         .settled()
         .await?;
 
-    let order_events = event_store.load_stream("Order", order_id).await?;
-    let customer_events = event_store.load_stream("Customer", customer_id).await?;
+    let order_events = store.load_stream("Order", order_id).await?;
+    let customer_events = store.load_stream("Customer", customer_id).await?;
 
     assert_eq!(order_events.len(), 1, "OrderCreated in Order stream");
     assert_eq!(customer_events.len(), 1, "CustomerOrderPlaced in Customer stream");
@@ -1321,8 +1317,7 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
 
 #[tokio::test]
 async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // Events V1-V10 in store
@@ -1337,8 +1332,8 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
         } else {
             serde_json::json!({"order_id": order_id})
         };
-        event_store
-            .append(new_event(
+        store
+            .append_event(new_event(
                 event_type,
                 payload,
                 Some("Order"),
@@ -1348,7 +1343,7 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
     }
 
     // Snapshot at V5 (stale — V6-V10 are not covered)
-    snapshot_store
+    store
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
@@ -1363,8 +1358,7 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
     let f = fired.clone();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
@@ -1396,21 +1390,20 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
 
 #[tokio::test]
 async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // Events in store but NO snapshot
-    event_store
-        .append(new_event(
+    store
+        .append_event(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 100}),
             Some("Order"),
             Some(order_id),
         ))
         .await?;
-    event_store
-        .append(new_event(
+    store
+        .append_event(new_event(
             "OrderConfirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
@@ -1422,8 +1415,7 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
     let f = fired.clone();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone()) // configured but empty
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
@@ -1455,14 +1447,14 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
 
 #[tokio::test]
 async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let confirmed_count = Arc::new(AtomicUsize::new(0));
     let cc = confirmed_count.clone();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_handler(handler::on::<OrderConfirmed>().then(
@@ -1492,7 +1484,7 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
     assert_eq!(confirmed_count.load(Ordering::SeqCst), 1);
 
     // Verify event store has correct sequential versions
-    let events = event_store.load_stream("Order", order_id).await?;
+    let events = store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].version.unwrap(), 1);
     assert_eq!(events[0].event_type, "OrderCreated");
@@ -1503,12 +1495,12 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
 
 #[tokio::test]
 async fn mixed_aggregate_types_independent_streams() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<CustomerOrderPlaced, Customer, _>(|e| e.customer_id);
@@ -1532,8 +1524,8 @@ async fn mixed_aggregate_types_independent_streams() -> Result<()> {
         .settled()
         .await?;
 
-    let order_events = event_store.load_stream("Order", order_id).await?;
-    let customer_events = event_store.load_stream("Customer", customer_id).await?;
+    let order_events = store.load_stream("Order", order_id).await?;
+    let customer_events = store.load_stream("Customer", customer_id).await?;
 
     assert_eq!(order_events.len(), 2, "Order stream: Created + Confirmed");
     assert_eq!(customer_events.len(), 1, "Customer stream: OrderPlaced");
@@ -1548,14 +1540,14 @@ async fn mixed_aggregate_types_independent_streams() -> Result<()> {
 #[tokio::test]
 async fn empty_aggregate_access_returns_default() -> Result<()> {
     // Transition guard on an aggregate with zero history
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_handler(
             handler::on::<OrderCreated>()
@@ -1589,12 +1581,12 @@ async fn empty_aggregate_access_returns_default() -> Result<()> {
 
 #[tokio::test]
 async fn large_event_replay_produces_correct_state() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // Pre-populate 1000 events: 1 OrderCreated + 999 OrderConfirmed
-    event_store
-        .append(new_event(
+    store
+        .append_event(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 42}),
             Some("Order"),
@@ -1603,8 +1595,8 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
         .await?;
 
     for _i in 1..1000u64 {
-        event_store
-            .append(new_event(
+        store
+            .append_event(new_event(
                 "OrderConfirmed",
                 serde_json::json!({"order_id": order_id}),
                 Some("Order"),
@@ -1618,7 +1610,7 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
     let f = fired.clone();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
@@ -1650,12 +1642,11 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
 
 #[tokio::test]
 async fn save_snapshot_helper_works() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
 
@@ -1672,7 +1663,7 @@ async fn save_snapshot_helper_works() -> Result<()> {
         .await?;
 
     // Manually save a snapshot and verify round-trip
-    snapshot_store
+    store
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
@@ -1683,7 +1674,7 @@ async fn save_snapshot_helper_works() -> Result<()> {
         .await?;
 
     // Verify it loads back
-    let loaded = snapshot_store
+    let loaded = store
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist");
@@ -1695,13 +1686,11 @@ async fn save_snapshot_helper_works() -> Result<()> {
 
 #[tokio::test]
 async fn auto_snapshot_every_n_events() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone())
+        .with_store(store.clone())
         .snapshot_every(5)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
@@ -1715,7 +1704,7 @@ async fn auto_snapshot_every_n_events() -> Result<()> {
     }
 
     // Should have snapshot at version 5
-    let snap = snapshot_store
+    let snap = store
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist at V5");
@@ -1730,7 +1719,7 @@ async fn auto_snapshot_every_n_events() -> Result<()> {
     }
 
     // Should have snapshot at version 10
-    let snap = snapshot_store
+    let snap = store
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist at V10");
@@ -1741,14 +1730,12 @@ async fn auto_snapshot_every_n_events() -> Result<()> {
 
 #[tokio::test]
 async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // First engine: emit 10 events with auto-snapshot every 5
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone())
+        .with_store(store.clone())
         .snapshot_every(5)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
@@ -1760,7 +1747,7 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
     }
 
     // Verify snapshot at V10
-    let snap = snapshot_store
+    let snap = store
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist");
@@ -1768,8 +1755,7 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
 
     // New engine (cold start) — should hydrate from snapshot at V10
     let engine2 = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone())
+        .with_store(store.clone())
         .snapshot_every(5)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
@@ -1808,14 +1794,12 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
 
 #[tokio::test]
 async fn no_snapshot_without_threshold() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
-    // snapshot_store but NO snapshot_every
+    // store with persistence but NO snapshot_every
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
     for _ in 0..10 {
@@ -1826,7 +1810,7 @@ async fn no_snapshot_without_threshold() -> Result<()> {
     }
 
     // No snapshot should exist
-    let snap = snapshot_store
+    let snap = store
         .load_snapshot("Order", order_id)
         .await?;
     assert!(snap.is_none(), "no snapshot should be saved without snapshot_every");
@@ -1836,14 +1820,13 @@ async fn no_snapshot_without_threshold() -> Result<()> {
 
 #[tokio::test]
 async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
-    let snapshot_store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
     // Pre-populate 50 events in store
     for i in 0..50 {
-        event_store
-            .append(new_event(
+        store
+            .append_event(new_event(
                 "OrderCreated",
                 serde_json::json!({"order_id": order_id, "total": (i + 1) * 10}),
                 Some("Order"),
@@ -1853,7 +1836,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
     }
 
     // Pre-populate snapshot at V50
-    snapshot_store
+    store
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
@@ -1865,8 +1848,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
 
     // New engine with snapshot_every(100) — threshold NOT met (only 1 event since snapshot)
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
-        .with_snapshot_store(snapshot_store.clone())
+        .with_store(store.clone())
         .snapshot_every(100)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
@@ -1876,7 +1858,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
         .await?;
 
     // Snapshot should still be at V50 (not re-saved at V51)
-    let snap = snapshot_store
+    let snap = store
         .load_snapshot("Order", order_id)
         .await?
         .expect("original snapshot should still exist");
@@ -1889,10 +1871,10 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
 
 #[tokio::test]
 async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
-    let event_store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store = Arc::new(MemoryStore::with_persistence());
 
     let engine = Engine::new(Deps)
-        .with_event_store(event_store.clone())
+        .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id);
@@ -1912,8 +1894,8 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
     assert_eq!(state.status, "created");
 
     // Simulate a foreign node appending an event directly to the store
-    event_store
-        .append(NewEvent {
+    store
+        .append_event(NewEvent {
             event_id: Uuid::new_v4(),
             parent_id: None,
             correlation_id: Uuid::new_v4(),
@@ -1933,7 +1915,7 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
     // Invalidate the aggregate cache
     engine.invalidate_aggregate::<Order>(order_id);
 
-    // Emit another event — triggers hydration from EventStore (which now
+    // Emit another event — triggers hydration from store (which now
     // includes the foreign OrderConfirmed), then applies OrderShipped
     engine
         .emit(OrderShipped { order_id })
@@ -1945,8 +1927,8 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
     // Verify the foreign event was picked up: total should still be 42
     assert_eq!(state.total, 42);
 
-    // Verify the EventStore has all three events
-    let events = event_store.load_stream("Order", order_id).await?;
+    // Verify the store has all three events
+    let events = store.load_stream("Order", order_id).await?;
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].event_type, "OrderCreated");
     assert_eq!(events[1].event_type, "OrderConfirmed");

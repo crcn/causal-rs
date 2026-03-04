@@ -11,12 +11,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::store::Store;
 use crate::types::*;
 
 /// In-memory queue store for the Engine's settle loop.
+///
+/// Includes optional event persistence and snapshot support for testing
+/// and simple use cases. The event log and snapshots are kept in-memory.
 #[derive(Clone)]
-pub(crate) struct MemoryStore {
+pub struct MemoryStore {
     /// Event queue (FIFO per correlation_id)
     events: Arc<DashMap<Uuid, VecDeque<QueuedEvent>>>,
     /// Effect executions queue
@@ -28,6 +33,15 @@ pub(crate) struct MemoryStore {
     in_flight: Arc<DashMap<(Uuid, String), QueuedHandlerExecution>>,
     /// Durable-ish join windows for same-batch fan-in (in-memory only).
     join_windows: Arc<Mutex<HashMap<(String, Uuid, Uuid), MemoryJoinWindow>>>,
+    // ── Event persistence ────────────────────────────────────────
+    /// Global event log for event persistence.
+    global_log: Arc<Mutex<Vec<PersistedEvent>>>,
+    /// Global position counter for event ordering.
+    global_position: Arc<AtomicU64>,
+    /// Snapshot store keyed by (aggregate_type, aggregate_id).
+    snapshots: Arc<DashMap<(String, Uuid), Snapshot>>,
+    /// Whether event persistence is enabled.
+    persistence_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +68,24 @@ impl MemoryStore {
             completed_effects: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
             join_windows: Arc::new(Mutex::new(HashMap::new())),
+            global_log: Arc::new(Mutex::new(Vec::new())),
+            global_position: Arc::new(AtomicU64::new(1)),
+            snapshots: Arc::new(DashMap::new()),
+            persistence_enabled: false,
         }
+    }
+
+    /// Create a MemoryStore with event persistence and snapshots enabled.
+    pub fn with_persistence() -> Self {
+        Self {
+            persistence_enabled: true,
+            ..Self::new()
+        }
+    }
+
+    /// Access the global event log (for test assertions).
+    pub fn global_log(&self) -> &Mutex<Vec<PersistedEvent>> {
+        &self.global_log
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -394,5 +425,120 @@ impl Store for MemoryStore {
         }
 
         Ok(expired)
+    }
+
+    // ── Event persistence overrides ──────────────────────────────
+
+    async fn append_event(&self, event: NewEvent) -> Result<u64> {
+        if !self.persistence_enabled {
+            return Ok(0);
+        }
+
+        let mut log = self.global_log.lock();
+
+        // Idempotency: if event_id already exists, return existing position
+        if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
+            return Ok(existing.position);
+        }
+
+        let position = self.global_position.fetch_add(1, Ordering::SeqCst);
+
+        // Compute per-aggregate version if aggregate metadata is present
+        let version = if let (Some(ref agg_type), Some(agg_id)) =
+            (&event.aggregate_type, event.aggregate_id)
+        {
+            let count = log
+                .iter()
+                .filter(|e| {
+                    e.aggregate_type.as_deref() == Some(agg_type)
+                        && e.aggregate_id == Some(agg_id)
+                })
+                .count() as u64;
+            Some(count + 1)
+        } else {
+            None
+        };
+
+        log.push(PersistedEvent {
+            position,
+            event_id: event.event_id,
+            parent_id: event.parent_id,
+            correlation_id: event.correlation_id,
+            event_type: event.event_type,
+            payload: event.payload,
+            created_at: event.created_at,
+            aggregate_type: event.aggregate_type,
+            aggregate_id: event.aggregate_id,
+            version,
+            metadata: event.metadata,
+        });
+
+        Ok(position)
+    }
+
+    async fn load_stream(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+    ) -> Result<Vec<PersistedEvent>> {
+        let log = self.global_log.lock();
+        let events = log
+            .iter()
+            .filter(|e| {
+                e.aggregate_type.as_deref() == Some(aggregate_type)
+                    && e.aggregate_id == Some(aggregate_id)
+            })
+            .cloned()
+            .collect();
+        Ok(events)
+    }
+
+    async fn load_stream_from(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+        after_position: u64,
+    ) -> Result<Vec<PersistedEvent>> {
+        let log = self.global_log.lock();
+        let events = log
+            .iter()
+            .filter(|e| {
+                e.aggregate_type.as_deref() == Some(aggregate_type)
+                    && e.aggregate_id == Some(aggregate_id)
+                    && e.position > after_position
+            })
+            .cloned()
+            .collect();
+        Ok(events)
+    }
+
+    async fn load_global_from(
+        &self,
+        after_position: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistedEvent>> {
+        let log = self.global_log.lock();
+        let events = log
+            .iter()
+            .filter(|e| e.position > after_position)
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(events)
+    }
+
+    async fn load_snapshot(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+    ) -> Result<Option<Snapshot>> {
+        let key = (aggregate_type.to_string(), aggregate_id);
+        Ok(self.snapshots.get(&key).map(|v| v.value().clone()))
+    }
+
+    async fn save_snapshot(&self, snapshot: Snapshot) -> Result<()> {
+        let key = (snapshot.aggregate_type.clone(), snapshot.aggregate_id);
+        self.snapshots.insert(key, snapshot);
+        Ok(())
     }
 }

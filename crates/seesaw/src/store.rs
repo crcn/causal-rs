@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::types::{
     EffectCompletion, EffectDlq, EventProcessingCommit, ExpiredJoinWindow, JoinAppendParams,
-    JoinEntry, QueuedEvent, QueuedHandlerExecution,
+    JoinEntry, NewEvent, PersistedEvent, QueuedEvent, QueuedHandlerExecution, Snapshot,
 };
 
 /// Pluggable backend for the Engine's event and effect queues.
@@ -179,4 +179,67 @@ pub trait Store: Send + Sync {
     /// Expire open join windows whose timeout has passed. Returns metadata
     /// for each expired window so the Engine can DLQ the source events.
     async fn expire_join_windows(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredJoinWindow>>;
+
+    // ── Event persistence (optional) ──────────────────────────────
+    //
+    // Override to enable durable event log, aggregate hydration, and
+    // cross-node sync. Default no-ops make simple in-memory stores
+    // work without implementing persistence.
+
+    /// Append a single event to the global log. Returns global position.
+    ///
+    /// **Idempotency contract:** If an event with the same `event_id`
+    /// already exists, return the existing position without inserting.
+    async fn append_event(&self, _event: NewEvent) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Load events for an aggregate stream (for hydration).
+    async fn load_stream(
+        &self,
+        _aggregate_type: &str,
+        _aggregate_id: Uuid,
+    ) -> Result<Vec<PersistedEvent>> {
+        Ok(Vec::new())
+    }
+
+    /// Load events from after a specific position (for snapshot + partial replay).
+    async fn load_stream_from(
+        &self,
+        _aggregate_type: &str,
+        _aggregate_id: Uuid,
+        _after_position: u64,
+    ) -> Result<Vec<PersistedEvent>> {
+        Ok(Vec::new())
+    }
+
+    /// Load events from the global log after a given position.
+    ///
+    /// Returns up to `limit` events with `position > after_position`,
+    /// ordered by position. Used for tailing the global log across nodes.
+    async fn load_global_from(
+        &self,
+        _after_position: u64,
+        _limit: usize,
+    ) -> Result<Vec<PersistedEvent>> {
+        Ok(Vec::new())
+    }
+
+    // ── Snapshots (optional) ──────────────────────────────────────
+    //
+    // Override to accelerate cold-start hydration.
+
+    /// Load the latest snapshot for an aggregate.
+    async fn load_snapshot(
+        &self,
+        _aggregate_type: &str,
+        _aggregate_id: Uuid,
+    ) -> Result<Option<Snapshot>> {
+        Ok(None)
+    }
+
+    /// Save a snapshot of aggregate state.
+    async fn save_snapshot(&self, _snapshot: Snapshot) -> Result<()> {
+        Ok(())
+    }
 }

@@ -1,7 +1,9 @@
-//! Persistent event store — global event log with optional aggregate metadata.
+//! Event-sourcing helpers, deprecated standalone stores, and aggregate utilities.
 //!
-//! Separate from `MemoryStore` (the settle-loop queue) — `EventStore` is the
-//! persistent event log for replay, projections, and aggregate reconstruction.
+//! The [`Store`](crate::store::Store) trait now includes event persistence and
+//! snapshot methods directly. This module retains helper functions, the
+//! `Versioned<A>` wrapper, and deprecated in-memory store implementations for
+//! backward compatibility.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -11,62 +13,12 @@ use std::sync::Mutex;
 use dashmap::DashMap;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use uuid::Uuid;
 
 use crate::aggregator::{Aggregate, AggregatorRegistry};
-
-// ── Types ──────────────────────────────────────────────────────────
-
-/// A persisted event loaded from the store.
-#[derive(Debug, Clone)]
-pub struct PersistedEvent {
-    /// Global ordering position.
-    pub position: u64,
-    /// Unique event ID.
-    pub event_id: Uuid,
-    /// Parent event that caused this event (None for root events).
-    pub parent_id: Option<Uuid>,
-    /// Correlation ID linking the full causal tree.
-    pub correlation_id: Uuid,
-    /// Short stable event type name (e.g. "OrderPlaced").
-    pub event_type: String,
-    /// JSON payload.
-    pub payload: serde_json::Value,
-    /// When the event was persisted.
-    pub created_at: DateTime<Utc>,
-    /// Aggregate type (only present for aggregate-scoped events).
-    pub aggregate_type: Option<String>,
-    /// Aggregate instance ID (only present for aggregate-scoped events).
-    pub aggregate_id: Option<Uuid>,
-    /// Per-aggregate stream version (only present for aggregate-scoped events).
-    pub version: Option<u64>,
-    /// Application-level metadata (e.g. run_id, schema_v, actor).
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
-
-/// A new event to be appended to the global log.
-#[derive(Debug, Clone)]
-pub struct NewEvent {
-    /// Unique event ID.
-    pub event_id: Uuid,
-    /// Parent event that caused this event (None for root events).
-    pub parent_id: Option<Uuid>,
-    /// Correlation ID linking the full causal tree.
-    pub correlation_id: Uuid,
-    /// Short stable event type name (e.g. "OrderPlaced").
-    pub event_type: String,
-    /// JSON payload.
-    pub payload: serde_json::Value,
-    /// When the event was created.
-    pub created_at: DateTime<Utc>,
-    /// Aggregate type (set by engine when aggregators match).
-    pub aggregate_type: Option<String>,
-    /// Aggregate instance ID (set by engine when aggregators match).
-    pub aggregate_id: Option<Uuid>,
-    /// Application-level metadata (e.g. run_id, schema_v, actor).
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
+use crate::store::Store;
+use crate::types::{NewEvent, PersistedEvent, Snapshot};
 
 /// Wrapper that pairs aggregate state with its stream version.
 #[derive(Debug, Clone)]
@@ -84,35 +36,26 @@ pub fn event_type_short_name(full: &str) -> &str {
     full.rsplit("::").next().unwrap_or(full)
 }
 
-// ── EventStore trait ───────────────────────────────────────────────
+// ── Deprecated EventStore trait ───────────────────────────────────
 
 /// Persistent event log for all events.
 ///
-/// Every event is appended to the global log. Events with aggregate metadata
-/// can be loaded as streams for aggregate hydration.
-///
-/// **Idempotency contract:** If an event with the same `event_id` already
-/// exists, `append` returns its existing position without inserting a
-/// duplicate. This enables safe cross-node sync where the same event may
-/// arrive more than once.
+/// **Deprecated:** Use [`Store`](crate::store::Store) instead, which now
+/// includes `append_event`, `load_stream`, `load_stream_from`, and
+/// `load_global_from` methods with default no-op implementations.
+#[deprecated(since = "0.18.0", note = "Use the unified Store trait instead")]
 pub trait EventStore: Send + Sync {
-    /// Append a single event to the global log. Returns global position.
-    ///
-    /// Idempotent: if an event with the same `event_id` already exists,
-    /// returns the existing position without inserting.
     fn append(
         &self,
         event: NewEvent,
     ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>>;
 
-    /// Load events for an aggregate stream (for hydration).
     fn load_stream(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
 
-    /// Load events from after a specific position (for snapshot + partial replay).
     fn load_stream_from(
         &self,
         aggregate_type: &str,
@@ -120,10 +63,6 @@ pub trait EventStore: Send + Sync {
         after_position: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
 
-    /// Load events from the global log after a given position.
-    ///
-    /// Returns up to `limit` events with `position > after_position`,
-    /// ordered by position. Used for tailing the global log across nodes.
     fn load_global_from(
         &self,
         after_position: u64,
@@ -131,15 +70,20 @@ pub trait EventStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>>> + Send + '_>>;
 }
 
-// ── MemoryEventStore ───────────────────────────────────────────────
+// ── Deprecated MemoryEventStore ───────────────────────────────────
 
-/// In-memory `EventStore` for testing.
+/// In-memory event store for testing.
+///
+/// **Deprecated:** Use a `Store` implementation with `append_event`/`load_stream`
+/// overrides instead.
+#[deprecated(since = "0.18.0", note = "Use a Store implementation with event persistence methods instead")]
 pub struct MemoryEventStore {
     /// The global event log. Public for test assertions.
     pub global_log: Mutex<Vec<PersistedEvent>>,
     global_position: AtomicU64,
 }
 
+#[allow(deprecated)]
 impl MemoryEventStore {
     pub fn new() -> Self {
         Self {
@@ -149,12 +93,14 @@ impl MemoryEventStore {
     }
 }
 
+#[allow(deprecated)]
 impl Default for MemoryEventStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[allow(deprecated)]
 impl EventStore for MemoryEventStore {
     fn append(
         &self,
@@ -250,12 +196,12 @@ impl EventStore for MemoryEventStore {
 
 // ── Standalone functions ───────────────────────────────────────────
 
-/// Persist an event to the event store.
+/// Persist an event to the store.
 ///
 /// Uses the short type name (e.g. `"OrderPlaced"`) for durable storage.
 /// Returns the global position after appending.
 pub async fn persist_event<E, A>(
-    store: &dyn EventStore,
+    store: &dyn Store,
     aggregate_id: Uuid,
     event: &E,
 ) -> Result<u64>
@@ -267,7 +213,7 @@ where
     let payload = serde_json::to_value(event)?;
 
     store
-        .append(NewEvent {
+        .append_event(NewEvent {
             event_id: Uuid::new_v4(),
             parent_id: None,
             correlation_id: Uuid::new_v4(),
@@ -281,42 +227,37 @@ where
         .await
 }
 
-// ── Snapshot types ──────────────────────────────────────────────────
-
-/// A serialized snapshot of aggregate state at a specific stream version.
-#[derive(Debug, Clone)]
-pub struct Snapshot {
-    pub aggregate_type: String,
-    pub aggregate_id: Uuid,
-    pub version: u64,
-    pub state: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-}
+// ── Deprecated SnapshotStore trait ─────────────────────────────────
 
 /// Persistent store for aggregate snapshots.
 ///
-/// Optional optimization — without it, cold-start hydration replays
-/// all events from the EventStore.
+/// **Deprecated:** Use [`Store`](crate::store::Store) instead, which now
+/// includes `load_snapshot` and `save_snapshot` methods with default no-op
+/// implementations.
+#[deprecated(since = "0.18.0", note = "Use the unified Store trait instead")]
 pub trait SnapshotStore: Send + Sync {
-    /// Load the latest snapshot for an aggregate.
     fn load_snapshot(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Snapshot>>> + Send + '_>>;
 
-    /// Save a snapshot of aggregate state.
     fn save_snapshot(
         &self,
         snapshot: Snapshot,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
-/// In-memory `SnapshotStore` for testing.
+/// In-memory snapshot store for testing.
+///
+/// **Deprecated:** Use a `Store` implementation with `load_snapshot`/`save_snapshot`
+/// overrides instead.
+#[deprecated(since = "0.18.0", note = "Use a Store implementation with snapshot methods instead")]
 pub struct MemorySnapshotStore {
     snapshots: DashMap<(String, Uuid), Snapshot>,
 }
 
+#[allow(deprecated)]
 impl MemorySnapshotStore {
     pub fn new() -> Self {
         Self {
@@ -325,12 +266,14 @@ impl MemorySnapshotStore {
     }
 }
 
+#[allow(deprecated)]
 impl Default for MemorySnapshotStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[allow(deprecated)]
 impl SnapshotStore for MemorySnapshotStore {
     fn load_snapshot(
         &self,
@@ -355,9 +298,9 @@ impl SnapshotStore for MemorySnapshotStore {
 /// Save a snapshot of aggregate state from the AggregatorRegistry.
 ///
 /// Serializes the current in-memory state of aggregate `A` at `id` and
-/// persists it to the snapshot store for future hydration acceleration.
+/// persists it to the store for future hydration acceleration.
 pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::DeserializeOwned>(
-    snapshot_store: &dyn SnapshotStore,
+    store: &dyn Store,
     aggregators: &AggregatorRegistry,
     id: Uuid,
 ) -> Result<()> {
@@ -375,7 +318,7 @@ pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::Deserial
 
     let state_json = agg.serialize_state(state_ref.as_ref())?;
 
-    snapshot_store
+    store
         .save_snapshot(Snapshot {
             aggregate_type: A::aggregate_type().to_string(),
             aggregate_id: id,
@@ -389,6 +332,7 @@ pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::Deserial
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -523,42 +467,7 @@ mod tests {
         assert!(events2[0].position > events1[0].position);
     }
 
-    #[tokio::test]
-    async fn persist_event_appends_to_store() {
-        use crate::aggregator::Aggregate;
-
-        #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-        struct Order;
-
-        impl Aggregate for Order {
-            fn aggregate_type() -> &'static str {
-                "Order"
-            }
-        }
-
-        #[derive(serde::Serialize)]
-        struct OrderPlaced {
-            total: u64,
-        }
-
-        let store = MemoryEventStore::new();
-        let order_id = Uuid::new_v4();
-
-        let position = persist_event::<OrderPlaced, Order>(
-            &store,
-            order_id,
-            &OrderPlaced { total: 100 },
-        )
-        .await
-        .unwrap();
-
-        assert!(position > 0);
-
-        let events = store.load_stream("Order", order_id).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "OrderPlaced");
-        assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
-    }
+    // persist_event test moved to integration tests (now requires full Store impl)
 
     #[tokio::test]
     async fn causal_metadata_round_trips() {

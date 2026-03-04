@@ -241,6 +241,68 @@ pub struct JoinAppendParams {
     pub join_window_timeout_seconds: Option<i32>,
 }
 
+// ── Event persistence types ───────────────────────────────────────
+
+/// A persisted event loaded from the store.
+#[derive(Debug, Clone)]
+pub struct PersistedEvent {
+    /// Global ordering position.
+    pub position: u64,
+    /// Unique event ID.
+    pub event_id: Uuid,
+    /// Parent event that caused this event (None for root events).
+    pub parent_id: Option<Uuid>,
+    /// Correlation ID linking the full causal tree.
+    pub correlation_id: Uuid,
+    /// Short stable event type name (e.g. "OrderPlaced").
+    pub event_type: String,
+    /// JSON payload.
+    pub payload: serde_json::Value,
+    /// When the event was persisted.
+    pub created_at: DateTime<Utc>,
+    /// Aggregate type (only present for aggregate-scoped events).
+    pub aggregate_type: Option<String>,
+    /// Aggregate instance ID (only present for aggregate-scoped events).
+    pub aggregate_id: Option<Uuid>,
+    /// Per-aggregate stream version (only present for aggregate-scoped events).
+    pub version: Option<u64>,
+    /// Application-level metadata (e.g. run_id, schema_v, actor).
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A new event to be appended to the global log.
+#[derive(Debug, Clone)]
+pub struct NewEvent {
+    /// Unique event ID.
+    pub event_id: Uuid,
+    /// Parent event that caused this event (None for root events).
+    pub parent_id: Option<Uuid>,
+    /// Correlation ID linking the full causal tree.
+    pub correlation_id: Uuid,
+    /// Short stable event type name (e.g. "OrderPlaced").
+    pub event_type: String,
+    /// JSON payload.
+    pub payload: serde_json::Value,
+    /// When the event was created.
+    pub created_at: DateTime<Utc>,
+    /// Aggregate type (set by engine when aggregators match).
+    pub aggregate_type: Option<String>,
+    /// Aggregate instance ID (set by engine when aggregators match).
+    pub aggregate_id: Option<Uuid>,
+    /// Application-level metadata (e.g. run_id, schema_v, actor).
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A serialized snapshot of aggregate state at a specific stream version.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub aggregate_type: String,
+    pub aggregate_id: Uuid,
+    pub version: u64,
+    pub state: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 // Helper to format event for logging
 impl fmt::Display for QueuedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
