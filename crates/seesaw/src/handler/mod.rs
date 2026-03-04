@@ -42,6 +42,6 @@ pub use builders::{on, on_any, TransitionHandlerBuilder};
 pub use context::{Context, HandlerContext};
 pub use error_event::HandlerError;
 pub use types::{
-    AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Events, Handler,
-    IntoEvents, JoinMode,
+    AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Events,
+    GlobalDlqMapper, Handler, IntoEvents, JoinMode,
 };

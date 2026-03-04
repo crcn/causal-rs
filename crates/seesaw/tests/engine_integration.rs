@@ -1954,3 +1954,276 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
 
     Ok(())
 }
+
+// -- on_dlq tests --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HandlerDlq {
+    handler_id: String,
+    source_event_type: String,
+    error: String,
+    reason: String,
+    attempts: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GlobalDlqEvent {
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HandlerSpecificFailure {
+    error: String,
+}
+
+#[tokio::test]
+async fn on_dlq_emits_event_on_handler_failure() -> Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+
+    let engine = Engine::new(Deps)
+        .on_dlq(|info: seesaw_core::DlqTerminalInfo| HandlerDlq {
+            handler_id: info.handler_id,
+            source_event_type: info.source_event_type,
+            error: info.error,
+            reason: info.reason,
+            attempts: info.attempts,
+        })
+        .with_handler(
+            handler::on::<FailEvent>()
+                .id("always_fail_dlq")
+                .queued()
+                .retry(1)
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    Err::<Events, _>(anyhow::anyhow!("boom"))
+                }),
+        )
+        .with_handler(handler::on::<HandlerDlq>().then(
+            move |_event: Arc<HandlerDlq>, _ctx: Context<Deps>| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            },
+        ));
+
+    engine.emit(FailEvent { attempt: 0 }).settled().await?;
+
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "on_dlq event should be handled");
+    Ok(())
+}
+
+#[tokio::test]
+async fn on_dlq_receives_correct_info() -> Result<()> {
+    let captured: Arc<Mutex<Option<seesaw_core::DlqTerminalInfo>>> = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+
+    let engine = Engine::new(Deps)
+        .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
+            *cap.lock() = Some(info.clone());
+            HandlerDlq {
+                handler_id: info.handler_id,
+                source_event_type: info.source_event_type,
+                error: info.error,
+                reason: info.reason,
+                attempts: info.attempts,
+            }
+        })
+        .with_handler(
+            handler::on::<FailEvent>()
+                .id("check_info_handler")
+                .queued()
+                .retry(2)
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    Err::<Events, _>(anyhow::anyhow!("detailed error"))
+                }),
+        );
+
+    engine.emit(FailEvent { attempt: 0 }).settled().await?;
+
+    let info = captured.lock().take().expect("on_dlq should have been called");
+    assert_eq!(info.handler_id, "check_info_handler");
+    assert_eq!(info.source_event_type, "FailEvent");
+    assert!(!info.source_event_id.is_nil(), "source_event_id should be a valid UUID");
+    assert!(info.error.contains("detailed error"));
+    assert_eq!(info.reason, "failed");
+    assert_eq!(info.attempts, info.max_attempts);
+    Ok(())
+}
+
+#[tokio::test]
+async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
+    let specific_counter = Arc::new(AtomicUsize::new(0));
+    let global_counter = Arc::new(AtomicUsize::new(0));
+    let sc = specific_counter.clone();
+    let gc = global_counter.clone();
+
+    let engine = Engine::new(Deps)
+        .on_dlq(|info: seesaw_core::DlqTerminalInfo| GlobalDlqEvent {
+            error: info.error,
+        })
+        .with_handler(
+            #[allow(deprecated)]
+            handler::on::<FailEvent>()
+                .id("has_on_failure")
+                .queued()
+                .retry(1)
+                .on_failure(|_event: Arc<FailEvent>, info: seesaw_core::ErrorContext| {
+                    HandlerSpecificFailure { error: info.error }
+                })
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    Err::<Events, _>(anyhow::anyhow!("fail"))
+                }),
+        )
+        .with_handler(handler::on::<HandlerSpecificFailure>().then(
+            move |_event: Arc<HandlerSpecificFailure>, _ctx: Context<Deps>| {
+                let sc = sc.clone();
+                async move {
+                    sc.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            },
+        ))
+        .with_handler(handler::on::<GlobalDlqEvent>().then(
+            move |_event: Arc<GlobalDlqEvent>, _ctx: Context<Deps>| {
+                let gc = gc.clone();
+                async move {
+                    gc.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            },
+        ));
+
+    engine.emit(FailEvent { attempt: 0 }).settled().await?;
+
+    assert_eq!(specific_counter.load(Ordering::SeqCst), 1, "per-handler on_failure should fire");
+    assert_eq!(global_counter.load(Ordering::SeqCst), 0, "global on_dlq should NOT fire when on_failure is present");
+    Ok(())
+}
+
+#[tokio::test]
+async fn on_dlq_fires_on_timeout() -> Result<()> {
+    let captured_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cr = captured_reason.clone();
+
+    let engine = Engine::new(Deps)
+        .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
+            *cr.lock() = Some(info.reason.clone());
+            HandlerDlq {
+                handler_id: info.handler_id,
+                source_event_type: info.source_event_type,
+                error: info.error,
+                reason: info.reason,
+                attempts: info.attempts,
+            }
+        })
+        .with_handler(
+            handler::on::<FailEvent>()
+                .id("timeout_handler")
+                .queued()
+                .retry(1)
+                .timeout(std::time::Duration::from_millis(10))
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok(events![])
+                }),
+        );
+
+    engine.emit(FailEvent { attempt: 0 }).settled().await?;
+
+    let reason = captured_reason.lock().take().expect("on_dlq should have been called for timeout");
+    assert_eq!(reason, "timeout");
+    Ok(())
+}
+
+#[tokio::test]
+async fn on_dlq_preserves_correlation_id() -> Result<()> {
+    let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+    let sc = seen_correlation.clone();
+
+    let engine = Engine::new(Deps)
+        .on_dlq(|info: seesaw_core::DlqTerminalInfo| HandlerDlq {
+            handler_id: info.handler_id,
+            source_event_type: info.source_event_type,
+            error: info.error,
+            reason: info.reason,
+            attempts: info.attempts,
+        })
+        .with_handler(
+            handler::on::<FailEvent>()
+                .id("corr_fail")
+                .queued()
+                .retry(1)
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    Err::<Events, _>(anyhow::anyhow!("fail"))
+                }),
+        )
+        .with_handler(handler::on::<HandlerDlq>().then(
+            move |_event: Arc<HandlerDlq>, ctx: Context<Deps>| {
+                let sc = sc.clone();
+                async move {
+                    *sc.lock() = Some(ctx.correlation_id);
+                    Ok(events![])
+                }
+            },
+        ));
+
+    let handle = engine.emit(FailEvent { attempt: 0 }).settled().await?;
+
+    let seen = seen_correlation.lock().expect("HandlerDlq handler should have run");
+    assert_eq!(
+        seen, handle.correlation_id,
+        "DLQ event must carry the original correlation_id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn on_dlq_not_called_on_success() -> Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+
+    let engine = Engine::new(Deps)
+        .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
+            c.fetch_add(1, Ordering::SeqCst);
+            HandlerDlq {
+                handler_id: info.handler_id,
+                source_event_type: info.source_event_type,
+                error: info.error,
+                reason: info.reason,
+                attempts: info.attempts,
+            }
+        })
+        .with_handler(
+            handler::on::<Ping>()
+                .id("success_handler")
+                .queued()
+                .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
+                    Ok(events![])
+                }),
+        );
+
+    engine.emit(Ping { msg: "ok".into() }).settled().await?;
+
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "on_dlq should not fire on success");
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_without_on_dlq_unchanged() -> Result<()> {
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<FailEvent>()
+                .id("no_dlq_handler")
+                .queued()
+                .retry(1)
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    Err::<Events, _>(anyhow::anyhow!("fail"))
+                }),
+        );
+
+    // Should complete without error even with no on_dlq configured
+    engine.emit(FailEvent { attempt: 0 }).settled().await?;
+    Ok(())
+}

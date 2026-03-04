@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Error, Result};
+use uuid::Uuid;
 
 use super::context::Context;
 use crate::event_codec::EventCodec;
@@ -20,11 +21,19 @@ pub type ErrorHandler<D> = Arc<dyn Fn(Error, TypeId, Context<D>) -> BoxFuture<()
 /// Metadata passed to DLQ terminal mappers when an effect exhausts retries.
 #[derive(Debug, Clone)]
 pub struct DlqTerminalInfo {
+    pub handler_id: String,
+    pub source_event_type: String,
+    pub source_event_id: Uuid,
     pub error: String,
     pub reason: String,
     pub attempts: i32,
     pub max_attempts: i32,
 }
+
+/// Global DLQ mapper that converts any handler DLQ into a domain event.
+pub type GlobalDlqMapper = Arc<
+    dyn Fn(DlqTerminalInfo) -> Result<crate::EmittedEvent> + Send + Sync,
+>;
 
 /// Alias for DLQ terminal mapper metadata used by macro APIs.
 pub type ErrorContext = DlqTerminalInfo;

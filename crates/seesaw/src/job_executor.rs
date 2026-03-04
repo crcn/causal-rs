@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::event_store::event_type_short_name;
-use crate::handler::{Context, DlqTerminalInfo, EventOutput, Handler, JoinMode};
+use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
 use crate::runtime::Runtime;
 use crate::types::{
@@ -34,6 +34,7 @@ where
     aggregator_registry: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
     side_effect_runner: Arc<dyn crate::handler::context::SideEffectRunner>,
+    global_dlq_mapper: Option<GlobalDlqMapper>,
 }
 
 impl<D> JobExecutor<D>
@@ -47,6 +48,7 @@ where
         aggregator_registry: Arc<AggregatorRegistry>,
         upcasters: Arc<UpcasterRegistry>,
         side_effect_runner: Arc<dyn crate::handler::context::SideEffectRunner>,
+        global_dlq_mapper: Option<GlobalDlqMapper>,
     ) -> Self {
         Self {
             deps,
@@ -54,6 +56,7 @@ where
             aggregator_registry,
             upcasters,
             side_effect_runner,
+            global_dlq_mapper,
         }
     }
 
@@ -359,7 +362,9 @@ where
 
                 // Try to build DLQ terminal event
                 let emitted_events =
-                    if execution.attempts >= execution.max_attempts && effect.dlq_terminal_mapper.is_some() {
+                    if execution.attempts >= execution.max_attempts
+                        && (effect.dlq_terminal_mapper.is_some() || self.global_dlq_mapper.is_some())
+                    {
                         self.build_dlq_terminal_event(
                             &effect,
                             typed_event,
@@ -382,21 +387,39 @@ where
             Err(_) => {
                 warn!("Handler timed out: {}", execution.handler_id);
 
+                let timeout_error = "Handler execution timed out".to_string();
+
                 let status = if execution.attempts >= execution.max_attempts {
                     HandlerStatus::Failed {
-                        error: "Handler execution timed out".to_string(),
+                        error: timeout_error.clone(),
                         attempts: execution.attempts,
                     }
                 } else {
                     HandlerStatus::Retry {
-                        error: "Handler execution timed out".to_string(),
+                        error: timeout_error.clone(),
                         attempts: execution.attempts,
                     }
                 };
 
+                // Try to build DLQ terminal event for timeout
+                let emitted_events = if execution.attempts >= execution.max_attempts
+                    && (effect.dlq_terminal_mapper.is_some() || self.global_dlq_mapper.is_some())
+                {
+                    self.build_dlq_terminal_event(
+                        &effect,
+                        typed_event,
+                        type_id,
+                        &execution,
+                        "timeout",
+                        timeout_error,
+                    )?
+                } else {
+                    Vec::new()
+                };
+
                 Ok(HandlerExecutionResult {
                     status,
-                    emitted_events: Vec::new(),
+                    emitted_events,
                     result: serde_json::json!({}),
                     join_claim: None,
                 })
@@ -714,6 +737,19 @@ where
         error: String,
     ) -> Result<Vec<EmittedEvent>> {
         let Some(mapper) = effect.dlq_terminal_mapper.as_ref() else {
+            // Global fallback
+            if let Some(global) = self.global_dlq_mapper.as_ref() {
+                let emitted = global(DlqTerminalInfo {
+                    handler_id: execution.handler_id.clone(),
+                    source_event_type: event_type_short_name(&execution.event_type).to_string(),
+                    source_event_id: execution.event_id,
+                    error,
+                    reason: reason.to_string(),
+                    attempts: execution.attempts,
+                    max_attempts: execution.max_attempts,
+                })?;
+                return Ok(vec![emitted]);
+            }
             return Ok(Vec::new());
         };
 
@@ -721,6 +757,9 @@ where
             source_event,
             source_type_id,
             DlqTerminalInfo {
+                handler_id: execution.handler_id.clone(),
+                source_event_type: event_type_short_name(&execution.event_type).to_string(),
+                source_event_id: execution.event_id,
                 error,
                 reason: reason.to_string(),
                 attempts: execution.attempts,

@@ -15,7 +15,7 @@ use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_store::{
     event_type_short_name, EventStore, NewEvent, SnapshotStore,
 };
-use crate::handler::{Context, Handler};
+use crate::handler::{Context, GlobalDlqMapper, Handler};
 use crate::handler::context::{DirectRunner, SideEffectRunner};
 use crate::handler_registry::HandlerRegistry;
 use crate::runtime::{DirectRuntime, Runtime};
@@ -46,6 +46,7 @@ where
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_every: Option<u64>,
     event_metadata: serde_json::Map<String, serde_json::Value>,
+    global_dlq_mapper: Option<GlobalDlqMapper>,
 }
 
 impl<D> Engine<D>
@@ -66,6 +67,7 @@ where
             snapshot_store: None,
             snapshot_every: None,
             event_metadata: serde_json::Map::new(),
+            global_dlq_mapper: None,
         }
     }
 
@@ -155,6 +157,40 @@ where
         } else {
             panic!("with_event_metadata expects a JSON object");
         }
+        self
+    }
+
+    /// Register a global DLQ callback that fires when any handler exhausts retries.
+    ///
+    /// The callback receives [`DlqTerminalInfo`] with handler and event metadata,
+    /// and returns a serializable event that gets dispatched into the causal chain.
+    ///
+    /// Per-handler `on_failure` takes precedence when present.
+    ///
+    /// ```ignore
+    /// let engine = Engine::new(deps)
+    ///     .on_dlq(|info: DlqTerminalInfo| HandlerFailed {
+    ///         handler_id: info.handler_id.clone(),
+    ///         error: info.error.clone(),
+    ///     });
+    /// ```
+    pub fn on_dlq<E, F>(mut self, mapper: F) -> Self
+    where
+        E: serde::Serialize + Send + Sync + 'static,
+        F: Fn(crate::handler::DlqTerminalInfo) -> E + Send + Sync + 'static,
+    {
+        let event_type = std::any::type_name::<E>().to_string();
+        self.global_dlq_mapper = Some(Arc::new(move |info| {
+            let event = mapper(info);
+            Ok(crate::EmittedEvent {
+                event_type: event_type.clone(),
+                payload: serde_json::to_value(&event)?,
+                batch_id: None,
+                batch_index: None,
+                batch_size: None,
+                handler_id: None,
+            })
+        }));
         self
     }
 
@@ -347,6 +383,7 @@ where
             self.aggregators.clone(),
             self.upcasters.clone(),
             self.side_effect_runner.clone(),
+            self.global_dlq_mapper.clone(),
         );
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
@@ -508,15 +545,35 @@ where
                                     .await?;
                             }
                             HandlerStatus::Timeout => {
-                                self.store
-                                    .dlq_effect(
-                                        event_id,
-                                        handler_id,
-                                        "timeout".to_string(),
-                                        "timeout".to_string(),
-                                        0,
-                                    )
-                                    .await?;
+                                let dlq_events = self.build_global_dlq_event(
+                                    &execution_clone,
+                                    "Handler execution timed out".to_string(),
+                                    "timeout",
+                                );
+                                if let Some(emitted_events) = dlq_events {
+                                    self.store
+                                        .dlq_effect_with_events(
+                                            event_id,
+                                            handler_id,
+                                            "timeout".to_string(),
+                                            "timeout".to_string(),
+                                            0,
+                                            emitted_events,
+                                            execution_clone.correlation_id,
+                                            execution_clone.hops,
+                                        )
+                                        .await?;
+                                } else {
+                                    self.store
+                                        .dlq_effect(
+                                            event_id,
+                                            handler_id,
+                                            "timeout".to_string(),
+                                            "timeout".to_string(),
+                                            0,
+                                        )
+                                        .await?;
+                                }
                             }
                             HandlerStatus::JoinWaiting => {
                                 // Wire join/accumulate coordination
@@ -541,15 +598,36 @@ where
                             }
                         },
                         Err(e) => {
-                            self.store
-                                .dlq_effect(
-                                    event_id,
-                                    handler_id,
-                                    e.to_string(),
-                                    "settle_handler_error".to_string(),
-                                    0,
-                                )
-                                .await?;
+                            let error_str = e.to_string();
+                            let dlq_events = self.build_global_dlq_event(
+                                &execution_clone,
+                                error_str.clone(),
+                                "settle_handler_error",
+                            );
+                            if let Some(emitted_events) = dlq_events {
+                                self.store
+                                    .dlq_effect_with_events(
+                                        event_id,
+                                        handler_id,
+                                        error_str,
+                                        "settle_handler_error".to_string(),
+                                        0,
+                                        emitted_events,
+                                        execution_clone.correlation_id,
+                                        execution_clone.hops,
+                                    )
+                                    .await?;
+                            } else {
+                                self.store
+                                    .dlq_effect(
+                                        event_id,
+                                        handler_id,
+                                        error_str,
+                                        "settle_handler_error".to_string(),
+                                        0,
+                                    )
+                                    .await?;
+                            }
                         }
                     }
                 }
@@ -574,6 +652,33 @@ where
     }
 
     // --- Internal ---
+
+    /// Try to build a DLQ event using the global mapper.
+    /// Returns None if no global mapper is configured or if the mapper errors.
+    fn build_global_dlq_event(
+        &self,
+        execution: &QueuedHandlerExecution,
+        error: String,
+        reason: &str,
+    ) -> Option<Vec<crate::types::EmittedEvent>> {
+        let global = self.global_dlq_mapper.as_ref()?;
+        let info = crate::handler::DlqTerminalInfo {
+            handler_id: execution.handler_id.clone(),
+            source_event_type: event_type_short_name(&execution.event_type).to_string(),
+            source_event_id: execution.event_id,
+            error,
+            reason: reason.to_string(),
+            attempts: execution.attempts,
+            max_attempts: execution.max_attempts,
+        };
+        match global(info) {
+            Ok(emitted) => Some(vec![emitted]),
+            Err(e) => {
+                tracing::warn!("global on_dlq mapper failed: {}", e);
+                None
+            }
+        }
+    }
 
     /// Hydrate cold aggregates, then persist every event to the global log.
     ///
@@ -950,23 +1055,44 @@ where
                                 .await?;
                         }
                         Err(e) => {
+                            let error_str = e.to_string();
                             self.store
                                 .join_same_batch_release(
                                     handler_id.to_string(),
                                     execution.correlation_id,
                                     batch_id,
-                                    e.to_string(),
+                                    error_str.clone(),
                                 )
                                 .await?;
-                            self.store
-                                .dlq_effect(
-                                    event_id,
-                                    handler_id.to_string(),
-                                    e.to_string(),
-                                    "join_handler_error".to_string(),
-                                    0,
-                                )
-                                .await?;
+                            let dlq_events = self.build_global_dlq_event(
+                                execution,
+                                error_str.clone(),
+                                "join_handler_error",
+                            );
+                            if let Some(emitted_events) = dlq_events {
+                                self.store
+                                    .dlq_effect_with_events(
+                                        event_id,
+                                        handler_id.to_string(),
+                                        error_str,
+                                        "join_handler_error".to_string(),
+                                        0,
+                                        emitted_events,
+                                        execution.correlation_id,
+                                        execution.hops,
+                                    )
+                                    .await?;
+                            } else {
+                                self.store
+                                    .dlq_effect(
+                                        event_id,
+                                        handler_id.to_string(),
+                                        error_str,
+                                        "join_handler_error".to_string(),
+                                        0,
+                                    )
+                                    .await?;
+                            }
                         }
                     }
                 } else {
@@ -1012,6 +1138,7 @@ where
             snapshot_store: self.snapshot_store.clone(),
             snapshot_every: self.snapshot_every,
             event_metadata: self.event_metadata.clone(),
+            global_dlq_mapper: self.global_dlq_mapper.clone(),
         }
     }
 }
