@@ -1,8 +1,7 @@
-//! In-memory Engine with built-in settle loop.
+//! Store-agnostic Engine with built-in settle loop.
 //!
-//! Engine<D> publishes events to an internal MemoryStore and settles
-//! the full causal tree synchronously. For durable execution, plug in
-//! a `Runtime` (e.g. RestateRuntime).
+//! Engine<D> publishes events to a pluggable [`Store`](crate::store::Store)
+//! backend and settles the full causal tree synchronously.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -12,36 +11,35 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
-use crate::event_store::{
-    event_type_short_name, EventStore, NewEvent, SnapshotStore,
-};
+use crate::event_store::{event_type_short_name, EventStore, NewEvent, SnapshotStore};
 use crate::handler::{Context, GlobalDlqMapper, Handler};
-use crate::handler::context::{DirectRunner, SideEffectRunner};
 use crate::handler_registry::HandlerRegistry;
-use crate::runtime::{DirectRuntime, Runtime};
 use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
-use crate::process::{EmitFuture, ProcessHandle, SettleWithRuntimeFn};
+use crate::process::{EmitFuture, ProcessHandle};
+use crate::store::Store;
 use crate::types::{
-    EventWorkerConfig, HandlerWorkerConfig, QueuedEvent, QueuedHandlerExecution, NAMESPACE_SEESAW,
+    EffectCompletion, EffectDlq, EmittedEvent, EventWorkerConfig, HandlerWorkerConfig,
+    JoinAppendParams, QueuedEvent, QueuedHandlerExecution, NAMESPACE_SEESAW,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
 
-/// In-memory Engine with built-in settle loop.
+/// Store-agnostic Engine with built-in settle loop.
 ///
-/// Publishes events to an internal queue and drives them to completion
-/// using `JobExecutor` + `Runtime`.
+/// Publishes events to a pluggable [`Store`] backend (defaults to an
+/// in-memory store) and drives them to completion using `JobExecutor`.
+///
+/// Supply a custom store via [`with_store`](Engine::with_store) for
+/// durability, crash recovery, or distributed workers.
 pub struct Engine<D>
 where
     D: Send + Sync + 'static,
 {
-    store: MemoryStore,
+    store: Arc<dyn Store>,
     deps: Arc<D>,
     effects: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
-    runtime: Arc<dyn Runtime>,
-    side_effect_runner: Arc<dyn SideEffectRunner>,
     event_store: Option<Arc<dyn EventStore>>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_every: Option<u64>,
@@ -54,15 +52,16 @@ where
     D: Send + Sync + 'static,
 {
     /// Create new engine with dependencies.
+    ///
+    /// Defaults to an in-memory store. Use [`with_store`](Engine::with_store)
+    /// to supply a Postgres or other durable backend.
     pub fn new(deps: D) -> Self {
         Self {
-            store: MemoryStore::new(),
+            store: Arc::new(MemoryStore::new()),
             deps: Arc::new(deps),
             effects: Arc::new(HandlerRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
             upcasters: Arc::new(UpcasterRegistry::new()),
-            runtime: Arc::new(DirectRuntime::new()),
-            side_effect_runner: Arc::new(DirectRunner),
             event_store: None,
             snapshot_store: None,
             snapshot_every: None,
@@ -93,21 +92,6 @@ where
     pub fn invalidate_aggregate<A: Aggregate>(&self, id: Uuid) {
         let key = format!("{}:{}", A::aggregate_type(), id);
         self.aggregators.remove_state(&key);
-    }
-
-    /// Set a custom runtime (e.g. RestateRuntime for durable execution).
-    pub fn with_runtime<R: Runtime + 'static>(mut self, runtime: R) -> Self {
-        self.runtime = Arc::new(runtime);
-        self
-    }
-
-    /// Set a custom side-effect runner for journaled `ctx.run()` execution.
-    ///
-    /// Durable runtimes (e.g. Restate) provide runners that journal side-effect
-    /// results. The default `DirectRunner` executes closures inline with no journaling.
-    pub fn with_side_effect_runner<R: SideEffectRunner + 'static>(mut self, runner: R) -> Self {
-        self.side_effect_runner = Arc::new(runner);
-        self
     }
 
     /// Set a persistent event store for auto-persist and cold-start hydration.
@@ -157,6 +141,19 @@ where
         } else {
             panic!("with_event_metadata expects a JSON object");
         }
+        self
+    }
+
+    /// Supply a custom store backend.
+    ///
+    /// Replaces the default in-memory store with the provided implementation.
+    ///
+    /// ```ignore
+    /// let engine = Engine::new(deps)
+    ///     .with_store(Arc::new(PostgresStore::new(pool)));
+    /// ```
+    pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
+        self.store = store;
         self
     }
 
@@ -307,7 +304,6 @@ where
     {
         let engine = self.clone();
         let engine2 = self.clone();
-        let engine3 = self.clone();
 
         let publish: crate::process::PublishFn = Box::new(move || {
             Box::pin(async move { engine.publish_event(event).await })
@@ -317,11 +313,7 @@ where
             Box::pin(async move { engine2.settle().await })
         });
 
-        let settle_with: SettleWithRuntimeFn = Box::new(move |runtime| {
-            Box::pin(async move { engine3.settle_with(runtime).await })
-        });
-
-        EmitFuture::new(publish, settle, settle_with)
+        EmitFuture::new(publish, settle)
     }
 
     /// Emit a type-erased `EventOutput` directly.
@@ -337,7 +329,6 @@ where
     pub fn emit_output(&self, output: crate::handler::EventOutput) -> EmitFuture {
         let engine = self.clone();
         let engine2 = self.clone();
-        let engine3 = self.clone();
 
         let publish: crate::process::PublishFn = Box::new(move || {
             Box::pin(async move { engine.publish_output(output).await })
@@ -347,11 +338,7 @@ where
             Box::pin(async move { engine2.settle().await })
         });
 
-        let settle_with: SettleWithRuntimeFn = Box::new(move |runtime| {
-            Box::pin(async move { engine3.settle_with(runtime).await })
-        });
-
-        EmitFuture::new(publish, settle, settle_with)
+        EmitFuture::new(publish, settle)
     }
 
     /// Deprecated: use `emit()` instead.
@@ -365,24 +352,11 @@ where
 
     /// Drive all pending events and effects to completion.
     pub async fn settle(&self) -> Result<()> {
-        self.settle_inner(&*self.runtime).await
-    }
-
-    /// Drive all pending events and effects to completion using a borrowed runtime.
-    ///
-    /// This allows using borrowed runtimes (e.g. Restate's `WorkflowContext<'ctx>`)
-    /// that can't be stored in `Arc<dyn Runtime>`.
-    pub async fn settle_with(&self, runtime: &dyn Runtime) -> Result<()> {
-        self.settle_inner(runtime).await
-    }
-
-    async fn settle_inner(&self, runtime: &dyn Runtime) -> Result<()> {
         let executor = JobExecutor::new(
             self.deps.clone(),
             self.effects.clone(),
             self.aggregators.clone(),
             self.upcasters.clone(),
-            self.side_effect_runner.clone(),
             self.global_dlq_mapper.clone(),
         );
         let event_config = EventWorkerConfig::default();
@@ -396,9 +370,6 @@ where
                 processed_any = true;
 
                 // Persist every event + hydrate cold aggregates before state mutation.
-                // The settle loop processes events sequentially (single-writer),
-                // so multiple events targeting the same aggregate in one batch
-                // are safe — each sees the version left by the previous one.
                 if self.event_store.is_some() {
                     self.persist_and_hydrate(&event).await?;
                 }
@@ -407,49 +378,27 @@ where
                 self.apply_to_aggregators(&event);
 
                 // Auto-checkpoint snapshots if configured
-                if let (Some(snapshot_store), Some(threshold)) = (&self.snapshot_store, self.snapshot_every) {
-                    self.maybe_auto_snapshot(&event, snapshot_store.as_ref(), threshold).await?;
+                if let (Some(snapshot_store), Some(threshold)) =
+                    (&self.snapshot_store, self.snapshot_every)
+                {
+                    self.maybe_auto_snapshot(&event, snapshot_store.as_ref(), threshold)
+                        .await?;
                 }
 
-                match executor
-                    .execute_event(&event, &event_config, runtime)
-                    .await
-                {
+                match executor.execute_event(&event, &event_config).await {
                     Ok(commit) => {
-                        // Convert job_executor commit to memory_store commit
-                        let store_commit = crate::types::EventProcessingCommit {
-                            event_row_id: commit.event_row_id,
-                            event_id: commit.event_id,
-                            correlation_id: commit.correlation_id,
-                            event_type: commit.event_type,
-                            event_payload: commit.event_payload,
-                            queued_effect_intents: commit.queued_effect_intents,
-                            inline_effect_failures: commit
-                                .inline_effect_failures
-                                .into_iter()
-                                .map(|f| crate::types::InlineHandlerFailure {
-                                    handler_id: f.handler_id,
-                                    error: f.error,
-                                    reason: f.reason,
-                                    attempts: f.attempts,
-                                })
-                                .collect(),
-                            emitted_events: commit.emitted_events,
-                        };
-                        self.store.commit_event_processing(store_commit).await?;
+                        self.store.commit_event_processing(commit).await?;
                     }
                     Err(e) => {
-                        // DLQ the event and continue
+                        // Reject the event (DLQ + ack atomically)
                         self.store
-                            .dlq_effect(
+                            .reject_event(
+                                event.id,
                                 event.event_id,
-                                "__settle_event_error__".to_string(),
                                 e.to_string(),
                                 "settle_error".to_string(),
-                                event.retry_count,
                             )
                             .await?;
-                        self.store.ack(event.id).await?;
                     }
                 }
             }
@@ -466,70 +415,69 @@ where
                 let effect_futures: Vec<_> = executions
                     .iter()
                     .map(|execution| {
-                        executor.execute_handler(execution.clone(), &handler_config, runtime)
+                        executor.execute_handler(execution.clone(), &handler_config)
                     })
                     .collect();
 
                 let effect_results = futures::future::join_all(effect_futures).await;
 
-                for (exec_result, execution_clone) in effect_results.into_iter().zip(executions) {
+                for (exec_result, execution_clone) in
+                    effect_results.into_iter().zip(executions)
+                {
                     let event_id = execution_clone.event_id;
                     let handler_id = execution_clone.handler_id.clone();
 
                     match exec_result {
                         Ok(result) => match result.status {
                             HandlerStatus::Success => {
-                                if result.emitted_events.is_empty() {
-                                    self.store
-                                        .complete_effect(event_id, handler_id, result.result)
-                                        .await?;
-                                } else {
-                                    self.store
-                                        .complete_effect_with_events(
-                                            event_id,
-                                            handler_id,
-                                            result.result,
-                                            result.emitted_events,
-                                            execution_clone.correlation_id,
-                                            execution_clone.hops,
-                                        )
-                                        .await?;
-                                }
+                                let events_to_publish = Self::build_queued_events(
+                                    result.emitted_events,
+                                    event_id,
+                                    &handler_id,
+                                    execution_clone.correlation_id,
+                                    execution_clone.hops,
+                                    "",
+                                );
+                                self.store
+                                    .complete_effect(EffectCompletion {
+                                        event_id,
+                                        handler_id,
+                                        result: result.result,
+                                        events_to_publish,
+                                    })
+                                    .await?;
                             }
                             HandlerStatus::Failed { error, attempts } => {
-                                if result.emitted_events.is_empty() {
-                                    self.store
-                                        .dlq_effect(
-                                            event_id,
-                                            handler_id,
-                                            error,
-                                            "failed".to_string(),
-                                            attempts,
-                                        )
-                                        .await?;
-                                } else {
-                                    self.store
-                                        .dlq_effect_with_events(
-                                            event_id,
-                                            handler_id,
-                                            error,
-                                            "failed".to_string(),
-                                            attempts,
-                                            result.emitted_events,
-                                            execution_clone.correlation_id,
-                                            execution_clone.hops,
-                                        )
-                                        .await?;
-                                }
+                                let events_to_publish = Self::build_queued_events(
+                                    result.emitted_events,
+                                    event_id,
+                                    &handler_id,
+                                    execution_clone.correlation_id,
+                                    execution_clone.hops,
+                                    "-dlq",
+                                );
+                                self.store
+                                    .dlq_effect(EffectDlq {
+                                        event_id,
+                                        handler_id,
+                                        error,
+                                        reason: "failed".to_string(),
+                                        attempts,
+                                        events_to_publish,
+                                    })
+                                    .await?;
                             }
                             HandlerStatus::Retry { error, attempts } => {
-                                // Apply exponential backoff if configured
-                                let mut retried = execution_clone;
-                                if let Some(effect) = executor.effects().find_by_id(&handler_id) {
+                                // Compute backoff schedule in Engine
+                                let mut next_execute_at = chrono::Utc::now();
+                                if let Some(effect) =
+                                    executor.effects().find_by_id(&handler_id)
+                                {
                                     if let Some(base) = effect.backoff {
-                                        let multiplier = 2u64.saturating_pow(attempts.max(1) as u32 - 1);
+                                        let multiplier =
+                                            2u64.saturating_pow(attempts.max(1) as u32 - 1);
                                         let delay = base.saturating_mul(multiplier as u32);
-                                        retried.execute_at = chrono::Utc::now()
+                                        next_execute_at = chrono::Utc::now()
                                             + chrono::Duration::from_std(delay)
                                                 .unwrap_or(chrono::Duration::seconds(60));
                                     }
@@ -539,44 +487,39 @@ where
                                         event_id,
                                         handler_id,
                                         error,
-                                        attempts,
-                                        retried,
+                                        attempts + 1,
+                                        next_execute_at,
                                     )
                                     .await?;
                             }
                             HandlerStatus::Timeout => {
-                                let dlq_events = self.build_global_dlq_event(
-                                    &execution_clone,
-                                    "Handler execution timed out".to_string(),
-                                    "timeout",
+                                let dlq_events = self
+                                    .build_global_dlq_event(
+                                        &execution_clone,
+                                        "Handler execution timed out".to_string(),
+                                        "timeout",
+                                    )
+                                    .unwrap_or_default();
+                                let events_to_publish = Self::build_queued_events(
+                                    dlq_events,
+                                    event_id,
+                                    &handler_id,
+                                    execution_clone.correlation_id,
+                                    execution_clone.hops,
+                                    "-dlq",
                                 );
-                                if let Some(emitted_events) = dlq_events {
-                                    self.store
-                                        .dlq_effect_with_events(
-                                            event_id,
-                                            handler_id,
-                                            "timeout".to_string(),
-                                            "timeout".to_string(),
-                                            0,
-                                            emitted_events,
-                                            execution_clone.correlation_id,
-                                            execution_clone.hops,
-                                        )
-                                        .await?;
-                                } else {
-                                    self.store
-                                        .dlq_effect(
-                                            event_id,
-                                            handler_id,
-                                            "timeout".to_string(),
-                                            "timeout".to_string(),
-                                            0,
-                                        )
-                                        .await?;
-                                }
+                                self.store
+                                    .dlq_effect(EffectDlq {
+                                        event_id,
+                                        handler_id,
+                                        error: "timeout".to_string(),
+                                        reason: "timeout".to_string(),
+                                        attempts: 0,
+                                        events_to_publish,
+                                    })
+                                    .await?;
                             }
                             HandlerStatus::JoinWaiting => {
-                                // Wire join/accumulate coordination
                                 if let Some(join_claim) = result.join_claim {
                                     self.handle_join_waiting(
                                         &executor,
@@ -588,47 +531,78 @@ where
                                     .await?;
                                 } else {
                                     self.store
-                                        .complete_effect(
+                                        .complete_effect(EffectCompletion {
                                             event_id,
                                             handler_id,
-                                            serde_json::json!({ "status": "join_waiting" }),
-                                        )
+                                            result: serde_json::json!({ "status": "join_waiting" }),
+                                            events_to_publish: Vec::new(),
+                                        })
                                         .await?;
                                 }
                             }
                         },
                         Err(e) => {
                             let error_str = e.to_string();
-                            let dlq_events = self.build_global_dlq_event(
-                                &execution_clone,
-                                error_str.clone(),
-                                "settle_handler_error",
+                            let dlq_events = self
+                                .build_global_dlq_event(
+                                    &execution_clone,
+                                    error_str.clone(),
+                                    "settle_handler_error",
+                                )
+                                .unwrap_or_default();
+                            let events_to_publish = Self::build_queued_events(
+                                dlq_events,
+                                event_id,
+                                &handler_id,
+                                execution_clone.correlation_id,
+                                execution_clone.hops,
+                                "-dlq",
                             );
-                            if let Some(emitted_events) = dlq_events {
-                                self.store
-                                    .dlq_effect_with_events(
-                                        event_id,
-                                        handler_id,
-                                        error_str,
-                                        "settle_handler_error".to_string(),
-                                        0,
-                                        emitted_events,
-                                        execution_clone.correlation_id,
-                                        execution_clone.hops,
-                                    )
-                                    .await?;
-                            } else {
-                                self.store
-                                    .dlq_effect(
-                                        event_id,
-                                        handler_id,
-                                        error_str,
-                                        "settle_handler_error".to_string(),
-                                        0,
-                                    )
-                                    .await?;
-                            }
+                            self.store
+                                .dlq_effect(EffectDlq {
+                                    event_id,
+                                    handler_id,
+                                    error: error_str,
+                                    reason: "settle_handler_error".to_string(),
+                                    attempts: 0,
+                                    events_to_publish,
+                                })
+                                .await?;
                         }
+                    }
+                }
+            }
+
+            // Expire timed-out join windows and DLQ each one
+            let expired_windows = self.store.expire_join_windows(chrono::Utc::now()).await?;
+            if !expired_windows.is_empty() {
+                processed_any = true;
+                for window in expired_windows {
+                    tracing::warn!(
+                        "Join window expired: handler={}, correlation={}, batch={}, events={}",
+                        window.join_handler_id,
+                        window.correlation_id,
+                        window.batch_id,
+                        window.source_event_ids.len()
+                    );
+
+                    // DLQ each source event in the expired window
+                    for source_event_id in &window.source_event_ids {
+                        self.store
+                            .dlq_effect(EffectDlq {
+                                event_id: *source_event_id,
+                                handler_id: window.join_handler_id.clone(),
+                                error: format!(
+                                    "join window expired: received {}/{} items for batch {}",
+                                    window.source_event_ids.len(),
+                                    window.source_event_ids.len(), // we don't have target count here
+                                    window.batch_id,
+                                ),
+                                reason: "join_window_expired".to_string(),
+                                attempts: 0,
+                                events_to_publish: Vec::new(),
+                            })
+                            .await?;
                     }
                 }
             }
@@ -636,7 +610,7 @@ where
             if !processed_any {
                 // Check if there are future-dated effects (from backoff or delay).
                 // If so, sleep until the earliest one becomes ready instead of exiting.
-                if let Some(earliest) = self.store.earliest_pending_effect_at() {
+                if let Some(earliest) = self.store.earliest_pending_effect_at().await? {
                     let now = chrono::Utc::now();
                     if earliest > now {
                         let wait = (earliest - now).to_std().unwrap_or_default();
@@ -952,6 +926,49 @@ where
             .apply_event(&event.event_type, &event.payload);
     }
 
+    /// Build pre-assigned `QueuedEvent`s from `EmittedEvent`s (ID gen lifted into Engine).
+    ///
+    /// `id_infix` differentiates ID derivation namespaces: `""` for normal
+    /// effect output, `"-dlq"` for DLQ terminal events, etc.
+    fn build_queued_events(
+        emitted: Vec<EmittedEvent>,
+        event_id: Uuid,
+        handler_id: &str,
+        correlation_id: Uuid,
+        parent_hops: i32,
+        id_infix: &str,
+    ) -> Vec<QueuedEvent> {
+        emitted
+            .into_iter()
+            .enumerate()
+            .map(|(idx, e)| {
+                let new_event_id = Uuid::new_v5(
+                    &NAMESPACE_SEESAW,
+                    format!(
+                        "{}-{}{}-{}-{}",
+                        event_id, handler_id, id_infix, e.event_type, idx
+                    )
+                    .as_bytes(),
+                );
+                QueuedEvent {
+                    id: 0,
+                    event_id: new_event_id,
+                    parent_id: Some(event_id),
+                    correlation_id,
+                    event_type: e.event_type,
+                    payload: e.payload,
+                    hops: parent_hops + 1,
+                    retry_count: 0,
+                    batch_id: e.batch_id,
+                    batch_index: e.batch_index,
+                    batch_size: e.batch_size,
+                    handler_id: e.handler_id,
+                    created_at: chrono::Utc::now(),
+                }
+            })
+            .collect()
+    }
+
     async fn handle_join_waiting(
         &self,
         executor: &JobExecutor<D>,
@@ -966,18 +983,18 @@ where
 
         let entries = self
             .store
-            .join_same_batch_append_and_maybe_claim(
-                handler_id.to_string(),
-                execution.correlation_id,
-                event_id,
-                execution.event_type.clone(),
-                execution.event_payload.clone(),
-                execution.execute_at,
+            .join_append_and_maybe_claim(JoinAppendParams {
+                join_handler_id: handler_id.to_string(),
+                correlation_id: execution.correlation_id,
+                source_event_id: event_id,
+                source_event_type: execution.event_type.clone(),
+                source_payload: execution.event_payload.clone(),
+                source_created_at: execution.execute_at,
                 batch_id,
                 batch_index,
                 batch_size,
-                join_window_timeout,
-            )
+                join_window_timeout_seconds: join_window_timeout,
+            })
             .await?;
 
         match entries {
@@ -1017,7 +1034,6 @@ where
 
                     match effect.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {
-                            // Serialize emitted events
                             let handler_config = HandlerWorkerConfig::default();
                             let emitted_events = executor.serialize_emitted_events(
                                 outputs,
@@ -1025,29 +1041,26 @@ where
                                 handler_config.max_batch_size,
                             )?;
 
-                            if emitted_events.is_empty() {
-                                self.store
-                                    .complete_effect(
-                                        event_id,
-                                        handler_id.to_string(),
-                                        serde_json::json!({ "status": "join_completed" }),
-                                    )
-                                    .await?;
-                            } else {
-                                self.store
-                                    .complete_effect_with_events(
-                                        event_id,
-                                        handler_id.to_string(),
-                                        serde_json::json!({ "status": "join_completed" }),
-                                        emitted_events,
-                                        execution.correlation_id,
-                                        execution.hops,
-                                    )
-                                    .await?;
-                            }
+                            let events_to_publish = Self::build_queued_events(
+                                emitted_events,
+                                event_id,
+                                handler_id,
+                                execution.correlation_id,
+                                execution.hops,
+                                "",
+                            );
 
                             self.store
-                                .join_same_batch_complete(
+                                .complete_effect(EffectCompletion {
+                                    event_id,
+                                    handler_id: handler_id.to_string(),
+                                    result: serde_json::json!({ "status": "join_completed" }),
+                                    events_to_publish,
+                                })
+                                .await?;
+
+                            self.store
+                                .join_complete(
                                     handler_id.to_string(),
                                     execution.correlation_id,
                                     batch_id,
@@ -1057,62 +1070,60 @@ where
                         Err(e) => {
                             let error_str = e.to_string();
                             self.store
-                                .join_same_batch_release(
+                                .join_release(
                                     handler_id.to_string(),
                                     execution.correlation_id,
                                     batch_id,
                                     error_str.clone(),
                                 )
                                 .await?;
-                            let dlq_events = self.build_global_dlq_event(
-                                execution,
-                                error_str.clone(),
-                                "join_handler_error",
+                            let dlq_events = self
+                                .build_global_dlq_event(
+                                    execution,
+                                    error_str.clone(),
+                                    "join_handler_error",
+                                )
+                                .unwrap_or_default();
+                            let events_to_publish = Self::build_queued_events(
+                                dlq_events,
+                                event_id,
+                                handler_id,
+                                execution.correlation_id,
+                                execution.hops,
+                                "-dlq",
                             );
-                            if let Some(emitted_events) = dlq_events {
-                                self.store
-                                    .dlq_effect_with_events(
-                                        event_id,
-                                        handler_id.to_string(),
-                                        error_str,
-                                        "join_handler_error".to_string(),
-                                        0,
-                                        emitted_events,
-                                        execution.correlation_id,
-                                        execution.hops,
-                                    )
-                                    .await?;
-                            } else {
-                                self.store
-                                    .dlq_effect(
-                                        event_id,
-                                        handler_id.to_string(),
-                                        error_str,
-                                        "join_handler_error".to_string(),
-                                        0,
-                                    )
-                                    .await?;
-                            }
+                            self.store
+                                .dlq_effect(EffectDlq {
+                                    event_id,
+                                    handler_id: handler_id.to_string(),
+                                    error: error_str,
+                                    reason: "join_handler_error".to_string(),
+                                    attempts: 0,
+                                    events_to_publish,
+                                })
+                                .await?;
                         }
                     }
                 } else {
                     self.store
-                        .complete_effect(
+                        .complete_effect(EffectCompletion {
                             event_id,
-                            handler_id.to_string(),
-                            serde_json::json!({ "status": "join_handler_not_found" }),
-                        )
+                            handler_id: handler_id.to_string(),
+                            result: serde_json::json!({ "status": "join_handler_not_found" }),
+                            events_to_publish: Vec::new(),
+                        })
                         .await?;
                 }
             }
             None => {
                 // Still waiting for more items — mark complete (no-op)
                 self.store
-                    .complete_effect(
+                    .complete_effect(EffectCompletion {
                         event_id,
-                        handler_id.to_string(),
-                        serde_json::json!({ "status": "join_waiting" }),
-                    )
+                        handler_id: handler_id.to_string(),
+                        result: serde_json::json!({ "status": "join_waiting" }),
+                        events_to_publish: Vec::new(),
+                    })
                     .await?;
             }
         }
@@ -1132,8 +1143,6 @@ where
             effects: self.effects.clone(),
             aggregators: self.aggregators.clone(),
             upcasters: self.upcasters.clone(),
-            runtime: self.runtime.clone(),
-            side_effect_runner: self.side_effect_runner.clone(),
             event_store: self.event_store.clone(),
             snapshot_store: self.snapshot_store.clone(),
             snapshot_every: self.snapshot_every,

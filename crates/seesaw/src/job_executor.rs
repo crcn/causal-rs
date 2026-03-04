@@ -14,10 +14,10 @@ use crate::aggregator::AggregatorRegistry;
 use crate::event_store::event_type_short_name;
 use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
-use crate::runtime::Runtime;
 use crate::types::{
-    EmittedEvent, EventWorkerConfig, HandlerWorkerConfig, QueuedEvent,
-    QueuedHandlerExecution, QueuedHandlerIntent, NAMESPACE_SEESAW,
+    EmittedEvent, EventProcessingCommit, EventWorkerConfig, HandlerWorkerConfig,
+    InlineHandlerFailure, QueuedEvent, QueuedHandlerExecution, QueuedHandlerIntent,
+    NAMESPACE_SEESAW,
 };
 use crate::upcaster::UpcasterRegistry;
 
@@ -33,7 +33,6 @@ where
     effects: Arc<HandlerRegistry<D>>,
     aggregator_registry: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
-    side_effect_runner: Arc<dyn crate::handler::context::SideEffectRunner>,
     global_dlq_mapper: Option<GlobalDlqMapper>,
 }
 
@@ -47,7 +46,6 @@ where
         effects: Arc<HandlerRegistry<D>>,
         aggregator_registry: Arc<AggregatorRegistry>,
         upcasters: Arc<UpcasterRegistry>,
-        side_effect_runner: Arc<dyn crate::handler::context::SideEffectRunner>,
         global_dlq_mapper: Option<GlobalDlqMapper>,
     ) -> Self {
         Self {
@@ -55,7 +53,6 @@ where
             effects,
             aggregator_registry,
             upcasters,
-            side_effect_runner,
             global_dlq_mapper,
         }
     }
@@ -68,7 +65,6 @@ where
         &self,
         event: &QueuedEvent,
         config: &EventWorkerConfig,
-        runtime: &dyn Runtime,
     ) -> Result<EventProcessingCommit> {
         info!(
             "Processing event: type={}, workflow={}, hops={}",
@@ -156,7 +152,7 @@ where
 
         for effect in &projection_effects {
             match self
-                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runtime)
+                .run_inline_effect(effect, event, typed_event.clone(), event_type_id, config)
                 .await
             {
                 Ok(mut emitted) => emitted_events.append(&mut emitted),
@@ -186,7 +182,7 @@ where
         let inline_futures: Vec<_> = inline_effects
             .iter()
             .map(|effect| {
-                self.run_inline_effect(effect, event, typed_event.clone(), event_type_id, config, runtime)
+                self.run_inline_effect(effect, event, typed_event.clone(), event_type_id, config)
             })
             .collect();
 
@@ -231,7 +227,6 @@ where
         &self,
         execution: QueuedHandlerExecution,
         config: &HandlerWorkerConfig,
-        runtime: &dyn Runtime,
     ) -> Result<HandlerExecutionResult> {
         info!(
             "Processing effect: effect_id={}, workflow={}, priority={}, attempt={}/{}",
@@ -284,8 +279,7 @@ where
             execution.parent_event_id,
             self.deps.clone(),
         )
-        .with_aggregator_registry(self.aggregator_registry.clone())
-        .with_side_effect_runner(self.side_effect_runner.clone());
+        .with_aggregator_registry(self.aggregator_registry.clone());
 
         // 2. Handle join/accumulation (if configured)
         let join_claim = if effect.join_mode == Some(JoinMode::SameBatch) {
@@ -319,9 +313,7 @@ where
         };
 
         let handler_fut = effect.make_handler_future(typed_event.clone(), type_id, ctx.clone());
-        let result = timeout(timeout_duration, async {
-            runtime.run(&execution.handler_id, Box::pin(handler_fut)).await
-        })
+        let result = timeout(timeout_duration, handler_fut)
         .await;
 
         // 4. Handle execution result
@@ -427,7 +419,7 @@ where
         }
     }
 
-    /// Run startup handlers (from Runtime::start).
+    /// Run startup handlers.
     pub async fn run_startup_handlers(&self) -> Result<()> {
         for effect in self.effects.all() {
             if effect.started.is_none() {
@@ -442,8 +434,7 @@ where
                 None,
                 self.deps.clone(),
             )
-            .with_aggregator_registry(self.aggregator_registry.clone())
-        .with_side_effect_runner(self.side_effect_runner.clone());
+            .with_aggregator_registry(self.aggregator_registry.clone());
 
             effect
                 .call_started(ctx)
@@ -494,7 +485,6 @@ where
         typed_event: Arc<dyn Any + Send + Sync>,
         event_type_id: TypeId,
         config: &EventWorkerConfig,
-        runtime: &dyn Runtime,
     ) -> Result<Vec<QueuedEvent>> {
         let idempotency_key = Uuid::new_v5(
             &NAMESPACE_SEESAW,
@@ -510,13 +500,10 @@ where
             source_event.parent_id,
             self.deps.clone(),
         )
-        .with_aggregator_registry(self.aggregator_registry.clone())
-        .with_side_effect_runner(self.side_effect_runner.clone());
+        .with_aggregator_registry(self.aggregator_registry.clone());
 
         let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
-        let drained = runtime
-            .run(&effect.id, Box::pin(handler_fut))
-            .await?;
+        let drained = handler_fut.await?;
 
         let emitted_count = drained.len();
         if emitted_count > config.max_batch_size {
@@ -782,28 +769,6 @@ where
 
         Ok(vec![emitted])
     }
-}
-
-/// Result of event processing (for atomic commit).
-#[derive(Debug)]
-pub struct EventProcessingCommit {
-    pub event_row_id: i64,
-    pub event_id: Uuid,
-    pub correlation_id: Uuid,
-    pub event_type: String,
-    pub event_payload: serde_json::Value,
-    pub queued_effect_intents: Vec<QueuedHandlerIntent>,
-    pub inline_effect_failures: Vec<InlineHandlerFailure>,
-    pub emitted_events: Vec<QueuedEvent>,
-}
-
-/// Captured inline effect failure.
-#[derive(Debug, Clone)]
-pub struct InlineHandlerFailure {
-    pub handler_id: String,
-    pub error: String,
-    pub reason: String,
-    pub attempts: i32,
 }
 
 /// Result of handler execution.

@@ -11,6 +11,7 @@ macros = ["dep:seesaw_core_macros"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 futures.workspace = true

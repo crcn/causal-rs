@@ -3,14 +3,15 @@
 //! Provides event and effect queues used by the Engine's built-in settle loop.
 
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::store::Store;
 use crate::types::*;
 
 /// In-memory queue store for the Engine's settle loop.
@@ -18,12 +19,13 @@ use crate::types::*;
 pub(crate) struct MemoryStore {
     /// Event queue (FIFO per correlation_id)
     events: Arc<DashMap<Uuid, VecDeque<QueuedEvent>>>,
-    /// Global event sequence for IDs
-    event_seq: Arc<AtomicI64>,
     /// Effect executions queue
     effects: Arc<Mutex<VecDeque<QueuedHandlerExecution>>>,
     /// Completed effects (for idempotency)
     completed_effects: Arc<DashMap<(Uuid, String), serde_json::Value>>,
+    /// In-flight effects: populated by poll_next_effect, consumed by
+    /// fail_effect to reconstruct the execution for re-enqueueing.
+    in_flight: Arc<DashMap<(Uuid, String), QueuedHandlerExecution>>,
     /// Durable-ish join windows for same-batch fan-in (in-memory only).
     join_windows: Arc<Mutex<HashMap<(String, Uuid, Uuid), MemoryJoinWindow>>>,
 }
@@ -48,74 +50,11 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self {
             events: Arc::new(DashMap::new()),
-            event_seq: Arc::new(AtomicI64::new(1)),
             effects: Arc::new(Mutex::new(VecDeque::new())),
             completed_effects: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
             join_windows: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    pub async fn publish(&self, event: QueuedEvent) -> Result<()> {
-        let mut queue = self
-            .events
-            .entry(event.correlation_id)
-            .or_insert_with(VecDeque::new);
-        queue.push_back(event);
-        Ok(())
-    }
-
-    pub async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
-        for mut entry in self.events.iter_mut() {
-            if let Some(event) = entry.value_mut().pop_front() {
-                return Ok(Some(event));
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn ack(&self, _id: i64) -> Result<()> {
-        Ok(())
-    }
-
-    pub async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
-        for intent in commit.queued_effect_intents {
-            self.insert_effect_intent(
-                commit.event_id,
-                intent.handler_id,
-                commit.correlation_id,
-                commit.event_type.clone(),
-                commit.event_payload.clone(),
-                intent.parent_event_id,
-                intent.batch_id,
-                intent.batch_index,
-                intent.batch_size,
-                intent.execute_at,
-                intent.timeout_seconds,
-                intent.max_attempts,
-                intent.priority,
-                intent.hops,
-                intent.join_window_timeout_seconds,
-            )
-            .await?;
-        }
-
-        for event in commit.emitted_events {
-            self.publish(event).await?;
-        }
-
-        for failure in commit.inline_effect_failures {
-            self.dlq_effect(
-                commit.event_id,
-                failure.handler_id,
-                failure.error,
-                failure.reason,
-                failure.attempts,
-            )
-            .await?;
-        }
-
-        self.ack(commit.event_row_id).await?;
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -160,186 +99,188 @@ impl MemoryStore {
         queue.push_back(execution);
         Ok(())
     }
+}
 
-    pub async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
+#[async_trait]
+impl Store for MemoryStore {
+    async fn publish(&self, event: QueuedEvent) -> Result<()> {
+        let mut queue = self
+            .events
+            .entry(event.correlation_id)
+            .or_insert_with(VecDeque::new);
+        queue.push_back(event);
+        Ok(())
+    }
+
+    async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
+        for mut entry in self.events.iter_mut() {
+            if let Some(event) = entry.value_mut().pop_front() {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn commit_event_processing(&self, commit: EventProcessingCommit) -> Result<()> {
+        for intent in commit.queued_effect_intents {
+            self.insert_effect_intent(
+                commit.event_id,
+                intent.handler_id,
+                commit.correlation_id,
+                commit.event_type.clone(),
+                commit.event_payload.clone(),
+                intent.parent_event_id,
+                intent.batch_id,
+                intent.batch_index,
+                intent.batch_size,
+                intent.execute_at,
+                intent.timeout_seconds,
+                intent.max_attempts,
+                intent.priority,
+                intent.hops,
+                intent.join_window_timeout_seconds,
+            )
+            .await?;
+        }
+
+        for event in commit.emitted_events {
+            self.publish(event).await?;
+        }
+
+        for failure in commit.inline_effect_failures {
+            self.dlq_effect(EffectDlq {
+                event_id: commit.event_id,
+                handler_id: failure.handler_id,
+                error: failure.error,
+                reason: failure.reason,
+                attempts: failure.attempts,
+                events_to_publish: Vec::new(),
+            })
+            .await?;
+        }
+
+        // ack is implicit for in-memory (event already dequeued)
+        Ok(())
+    }
+
+    async fn reject_event(
+        &self,
+        _event_row_id: i64,
+        event_id: Uuid,
+        error: String,
+        reason: String,
+    ) -> Result<()> {
+        // DLQ + ack in one step (ack is implicit for in-memory)
+        eprintln!(
+            "Event rejected to DLQ: {} - {} ({})",
+            event_id, error, reason
+        );
+        Ok(())
+    }
+
+    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>> {
         let mut queue = self.effects.lock();
         let now = Utc::now();
         if let Some(pos) = queue.iter().position(|e| e.execute_at <= now) {
-            Ok(queue.remove(pos))
+            let execution = queue.remove(pos).unwrap();
+            // Track in-flight so fail_effect can reconstruct for re-enqueueing
+            self.in_flight.insert(
+                (execution.event_id, execution.handler_id.clone()),
+                execution.clone(),
+            );
+            Ok(Some(execution))
         } else {
             Ok(None)
         }
     }
 
-    /// Returns the earliest `execute_at` of any queued effect, if any exist.
-    ///
-    /// Used by the settle loop to sleep until the next effect becomes ready
-    /// instead of exiting prematurely when only future-dated effects remain.
-    pub fn earliest_pending_effect_at(&self) -> Option<DateTime<Utc>> {
+    async fn earliest_pending_effect_at(&self) -> Result<Option<DateTime<Utc>>> {
         let queue = self.effects.lock();
-        queue.iter().map(|e| e.execute_at).min()
+        Ok(queue.iter().map(|e| e.execute_at).min())
     }
 
-    pub async fn complete_effect(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        result: serde_json::Value,
-    ) -> Result<()> {
+    async fn complete_effect(&self, completion: EffectCompletion) -> Result<()> {
+        // Remove from in-flight tracking
+        self.in_flight
+            .remove(&(completion.event_id, completion.handler_id.clone()));
+
         self.completed_effects
-            .insert((event_id, handler_id), result);
-        Ok(())
-    }
+            .insert((completion.event_id, completion.handler_id), completion.result);
 
-    pub async fn complete_effect_with_events(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        result: serde_json::Value,
-        emitted_events: Vec<EmittedEvent>,
-        correlation_id: Uuid,
-        parent_hops: i32,
-    ) -> Result<()> {
-        self.complete_effect(event_id, handler_id.clone(), result)
-            .await?;
-
-        for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
-            let new_event_id = Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!(
-                    "{}-{}-{}-{}",
-                    event_id, handler_id, emitted.event_type, emitted_index
-                )
-                .as_bytes(),
-            );
-
-            let queued = QueuedEvent {
-                id: self.event_seq.fetch_add(1, Ordering::SeqCst),
-                event_id: new_event_id,
-                parent_id: Some(event_id),
-                correlation_id,
-                event_type: emitted.event_type,
-                payload: emitted.payload,
-                hops: parent_hops + 1,
-                retry_count: 0,
-                batch_id: emitted.batch_id,
-                batch_index: emitted.batch_index,
-                batch_size: emitted.batch_size,
-                handler_id: emitted.handler_id,
-                created_at: Utc::now(),
-            };
-
-            self.publish(queued).await?;
+        for event in completion.events_to_publish {
+            self.publish(event).await?;
         }
 
         Ok(())
     }
 
-    pub async fn fail_effect(
+    async fn fail_effect(
         &self,
         event_id: Uuid,
         handler_id: String,
         error: String,
-        attempts: i32,
-        execution: QueuedHandlerExecution,
+        new_attempts: i32,
+        next_execute_at: DateTime<Utc>,
     ) -> Result<()> {
         tracing::warn!(
             "Handler retry: {}:{} - {} (attempt {})",
             event_id,
             handler_id,
             error,
-            attempts
+            new_attempts
         );
-        let mut retried = execution;
-        retried.attempts = attempts + 1;
-        let mut queue = self.effects.lock();
-        queue.push_back(retried);
-        Ok(())
-    }
 
-    pub async fn dlq_effect(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        error: String,
-        _reason: String,
-        attempts: i32,
-    ) -> Result<()> {
-        eprintln!(
-            "Handler sent to DLQ: {}:{} - {} (attempts: {})",
-            event_id, handler_id, error, attempts
-        );
-        Ok(())
-    }
-
-    pub async fn dlq_effect_with_events(
-        &self,
-        event_id: Uuid,
-        handler_id: String,
-        error: String,
-        reason: String,
-        attempts: i32,
-        emitted_events: Vec<EmittedEvent>,
-        correlation_id: Uuid,
-        parent_hops: i32,
-    ) -> Result<()> {
-        self.dlq_effect(event_id, handler_id.clone(), error, reason, attempts)
-            .await?;
-
-        // Publish terminal events from on_failure mapper
-        for (emitted_index, emitted) in emitted_events.into_iter().enumerate() {
-            let new_event_id = Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!(
-                    "{}-{}-dlq-{}-{}",
-                    event_id, handler_id, emitted.event_type, emitted_index
-                )
-                .as_bytes(),
+        // Reconstruct from in-flight tracking (populated by poll_next_effect)
+        let key = (event_id, handler_id.clone());
+        if let Some((_, mut execution)) = self.in_flight.remove(&key) {
+            execution.attempts = new_attempts;
+            execution.execute_at = next_execute_at;
+            let mut queue = self.effects.lock();
+            queue.push_back(execution);
+        } else {
+            tracing::warn!(
+                "fail_effect: no in-flight execution found for {}:{} — retry will be lost",
+                key.0, handler_id
             );
-
-            let queued = QueuedEvent {
-                id: self.event_seq.fetch_add(1, Ordering::SeqCst),
-                event_id: new_event_id,
-                parent_id: Some(event_id),
-                correlation_id,
-                event_type: emitted.event_type,
-                payload: emitted.payload,
-                hops: parent_hops + 1,
-                retry_count: 0,
-                batch_id: emitted.batch_id,
-                batch_index: emitted.batch_index,
-                batch_size: emitted.batch_size,
-                handler_id: emitted.handler_id,
-                created_at: Utc::now(),
-            };
-
-            self.publish(queued).await?;
         }
 
         Ok(())
     }
 
-    pub async fn join_same_batch_append_and_maybe_claim(
+    async fn dlq_effect(&self, dlq: EffectDlq) -> Result<()> {
+        // Remove from in-flight tracking
+        self.in_flight
+            .remove(&(dlq.event_id, dlq.handler_id.clone()));
+
+        eprintln!(
+            "Handler sent to DLQ: {}:{} - {} (attempts: {})",
+            dlq.event_id, dlq.handler_id, dlq.error, dlq.attempts
+        );
+
+        for event in dlq.events_to_publish {
+            self.publish(event).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn join_append_and_maybe_claim(
         &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        source_event_id: Uuid,
-        source_event_type: String,
-        source_payload: serde_json::Value,
-        source_created_at: DateTime<Utc>,
-        batch_id: Uuid,
-        batch_index: i32,
-        batch_size: i32,
-        join_window_timeout_seconds: Option<i32>,
+        params: JoinAppendParams,
     ) -> Result<Option<Vec<JoinEntry>>> {
-        let key = (join_handler_id, correlation_id, batch_id);
+        let key = (
+            params.join_handler_id,
+            params.correlation_id,
+            params.batch_id,
+        );
         let mut windows = self.join_windows.lock();
         let window = windows.entry(key).or_insert_with(|| MemoryJoinWindow {
-            target_count: batch_size,
+            target_count: params.batch_size,
             status: MemoryJoinStatus::Open,
             source_event_ids: HashSet::new(),
             entries_by_index: HashMap::new(),
-            expires_at: join_window_timeout_seconds
+            expires_at: params
+                .join_window_timeout_seconds
                 .map(|seconds| Utc::now() + Duration::seconds(seconds as i64)),
         });
 
@@ -347,27 +288,28 @@ impl MemoryStore {
             return Ok(None);
         }
 
-        if window.target_count != batch_size {
-            window.target_count = batch_size;
+        if window.target_count != params.batch_size {
+            window.target_count = params.batch_size;
         }
         if window.expires_at.is_none() {
-            window.expires_at = join_window_timeout_seconds
+            window.expires_at = params
+                .join_window_timeout_seconds
                 .map(|seconds| Utc::now() + Duration::seconds(seconds as i64));
         }
 
-        let already_seen_source = !window.source_event_ids.insert(source_event_id);
+        let already_seen_source = !window.source_event_ids.insert(params.source_event_id);
         if !already_seen_source {
             window
                 .entries_by_index
-                .entry(batch_index)
+                .entry(params.batch_index)
                 .or_insert_with(|| JoinEntry {
-                    source_event_id,
-                    event_type: source_event_type,
-                    payload: source_payload,
-                    batch_id,
-                    batch_index,
-                    batch_size,
-                    created_at: source_created_at,
+                    source_event_id: params.source_event_id,
+                    event_type: params.source_event_type,
+                    payload: params.source_payload,
+                    batch_id: params.batch_id,
+                    batch_index: params.batch_index,
+                    batch_size: params.batch_size,
+                    created_at: params.source_created_at,
                 });
         }
 
@@ -386,7 +328,7 @@ impl MemoryStore {
         Ok(None)
     }
 
-    pub async fn join_same_batch_complete(
+    async fn join_complete(
         &self,
         join_handler_id: String,
         correlation_id: Uuid,
@@ -400,7 +342,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub async fn join_same_batch_release(
+    async fn join_release(
         &self,
         join_handler_id: String,
         correlation_id: Uuid,
@@ -416,7 +358,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub async fn expire_same_batch_windows(
+    async fn expire_join_windows(
         &self,
         now: DateTime<Utc>,
     ) -> Result<Vec<ExpiredJoinWindow>> {
@@ -435,7 +377,8 @@ impl MemoryStore {
                 continue;
             }
 
-            let mut source_event_ids = window.source_event_ids.iter().copied().collect::<Vec<_>>();
+            let mut source_event_ids =
+                window.source_event_ids.iter().copied().collect::<Vec<_>>();
             source_event_ids.sort();
             expired.push(ExpiredJoinWindow {
                 join_handler_id: key.0.clone(),

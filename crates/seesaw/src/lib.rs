@@ -36,14 +36,13 @@ extern crate self as seesaw_core;
 pub mod aggregator;
 pub mod event_store;
 pub mod handler;
-pub mod runtime;
 pub mod job_executor;
+pub mod store;
 pub mod types;
 
 mod engine;
 mod event_codec;
 mod handler_registry;
-#[allow(dead_code)]
 pub(crate) mod memory_store;
 mod process;
 pub mod upcaster;
@@ -56,6 +55,9 @@ pub use event_store::{
     MemorySnapshotStore, Snapshot, SnapshotStore, save_snapshot,
 };
 
+// Re-export store trait
+pub use store::Store;
+
 // Re-export upcaster types
 pub use upcaster::{Upcaster, UpcasterRegistry};
 
@@ -65,7 +67,6 @@ pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events, Handler,
     HandlerContext, HandlerError, IntoEvents, JoinMode,
 };
-pub use handler::context::{DirectRunner, SideEffectRunner};
 
 /// The universal return macro for all handlers.
 ///
@@ -110,19 +111,14 @@ macro_rules! events {
 macro_rules! emit {
     ($($tt:tt)*) => { $crate::events![$($tt)*] };
 }
-pub use runtime::{DirectRuntime, Runtime};
-pub use job_executor::{
-    EventProcessingCommit as JobEventProcessingCommit, HandlerExecutionResult, HandlerStatus,
-    InlineHandlerFailure as JobInlineHandlerFailure, JobExecutor, JoinClaim,
-};
+pub use job_executor::{HandlerExecutionResult, HandlerStatus, JobExecutor, JoinClaim};
 #[allow(deprecated)]
 pub use process::DispatchFuture;
-pub use process::{EmitFuture, ProcessHandle, SettleFuture, SettleWithFuture};
+pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
-    EmittedEvent, EventProcessingCommit, EventWorkerConfig, ExpiredJoinWindow,
-    HandlerWorkerConfig, InlineHandlerFailure, JoinEntry, QueuedEvent,
-    QueuedHandlerExecution, QueuedHandlerIntent,
-    NAMESPACE_SEESAW,
+    EffectCompletion, EffectDlq, EmittedEvent, EventProcessingCommit, EventWorkerConfig,
+    ExpiredJoinWindow, HandlerWorkerConfig, InlineHandlerFailure, JoinAppendParams, JoinEntry,
+    QueuedEvent, QueuedHandlerExecution, QueuedHandlerIntent, NAMESPACE_SEESAW,
 };
 
 // Top-level builder functions
