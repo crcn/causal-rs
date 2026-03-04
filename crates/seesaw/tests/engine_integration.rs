@@ -2227,3 +2227,89 @@ async fn engine_without_on_dlq_unchanged() -> Result<()> {
     engine.emit(FailEvent { attempt: 0 }).settled().await?;
     Ok(())
 }
+
+// -- correlation_id builder tests --
+
+#[tokio::test]
+async fn custom_correlation_id_on_process_handle() -> Result<()> {
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>()
+            .id("noop")
+            .queued()
+            .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    );
+
+    let my_id = Uuid::new_v4();
+    let handle = engine
+        .emit(Ping { msg: "hi".into() })
+        .correlation_id(my_id)
+        .settled()
+        .await?;
+
+    assert_eq!(handle.correlation_id, my_id, "ProcessHandle must carry the custom correlation_id");
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
+    let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+    let sc = seen_correlation.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<EventA>()
+                .id("a_to_b")
+                .queued()
+                .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
+                    Ok(events![EventB { value: event.value }])
+                }),
+        )
+        .with_handler(
+            handler::on::<EventB>()
+                .id("observe_b")
+                .queued()
+                .then(
+                    move |_event: Arc<EventB>, ctx: Context<Deps>| {
+                        let sc = sc.clone();
+                        async move {
+                            *sc.lock() = Some(ctx.correlation_id);
+                            Ok(events![])
+                        }
+                    },
+                ),
+        );
+
+    let my_id = Uuid::new_v4();
+    let handle = engine
+        .emit(EventA { value: 1 })
+        .correlation_id(my_id)
+        .settled()
+        .await?;
+
+    assert_eq!(handle.correlation_id, my_id);
+    let seen = seen_correlation.lock().expect("EventB handler should have run");
+    assert_eq!(
+        seen, my_id,
+        "Child event must inherit the custom correlation_id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn omitted_correlation_id_auto_generates() -> Result<()> {
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<Ping>()
+            .id("noop")
+            .queued()
+            .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    );
+
+    let handle = engine
+        .emit(Ping { msg: "hi".into() })
+        .settled()
+        .await?;
+
+    // Just verify it's a valid UUID (not nil)
+    assert_ne!(handle.correlation_id, Uuid::nil(), "Should auto-generate a non-nil correlation_id");
+    Ok(())
+}

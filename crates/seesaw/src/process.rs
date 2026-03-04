@@ -13,9 +13,10 @@ pub struct ProcessHandle {
     pub event_id: Uuid,
 }
 
-/// Type-erased async closure: () → Result<ProcessHandle>
-pub(crate) type PublishFn =
-    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<ProcessHandle>> + Send>> + Send>;
+/// Type-erased async closure: Option<Uuid> → Result<ProcessHandle>
+pub(crate) type PublishFn = Box<
+    dyn FnOnce(Option<Uuid>) -> Pin<Box<dyn Future<Output = Result<ProcessHandle>> + Send>> + Send,
+>;
 
 /// Type-erased async closure: () → Result<()>
 pub(crate) type SettleFn =
@@ -28,6 +29,7 @@ pub(crate) type SettleFn =
 pub struct EmitFuture {
     publish: Option<PublishFn>,
     settle: Option<SettleFn>,
+    correlation_id: Option<Uuid>,
     task: Option<Pin<Box<dyn Future<Output = Result<ProcessHandle>> + Send>>>,
 }
 
@@ -39,8 +41,21 @@ impl EmitFuture {
         Self {
             publish: Some(publish),
             settle: Some(settle),
+            correlation_id: None,
             task: None,
         }
+    }
+
+    /// Override the auto-generated correlation ID with a custom one.
+    ///
+    /// Useful for tying an engine emit to an external trace or request ID.
+    ///
+    /// ```ignore
+    /// engine.emit(event).correlation_id(my_uuid).settled().await?;
+    /// ```
+    pub fn correlation_id(mut self, id: Uuid) -> Self {
+        self.correlation_id = Some(id);
+        self
     }
 
     /// Settle: publish event, then drive the entire causal tree to completion.
@@ -51,6 +66,7 @@ impl EmitFuture {
         SettleFuture {
             publish: self.publish,
             settle: self.settle,
+            correlation_id: self.correlation_id,
             timeout_duration: None,
             task: None,
         }
@@ -71,7 +87,8 @@ impl Future for EmitFuture {
                 .publish
                 .take()
                 .expect("EmitFuture polled after completion");
-            this.task = Some(publish());
+            let correlation_id = this.correlation_id;
+            this.task = Some(publish(correlation_id));
         }
 
         this.task.as_mut().unwrap().as_mut().poll(cx)
@@ -92,6 +109,7 @@ pub type DispatchFuture = EmitFuture;
 pub struct SettleFuture {
     publish: Option<PublishFn>,
     settle: Option<SettleFn>,
+    correlation_id: Option<Uuid>,
     timeout_duration: Option<Duration>,
     task: Option<Pin<Box<dyn Future<Output = Result<ProcessHandle>> + Send>>>,
 }
@@ -134,8 +152,9 @@ impl Future for SettleFuture {
                 .take()
                 .expect("SettleFuture polled after completion");
             let timeout_duration = this.timeout_duration;
+            let correlation_id = this.correlation_id;
             this.task = Some(Box::pin(async move {
-                let handle = publish().await?;
+                let handle = publish(correlation_id).await?;
                 if let Some(duration) = timeout_duration {
                     tokio::time::timeout(duration, settle())
                         .await

@@ -305,8 +305,8 @@ where
         let engine = self.clone();
         let engine2 = self.clone();
 
-        let publish: crate::process::PublishFn = Box::new(move || {
-            Box::pin(async move { engine.publish_event(event).await })
+        let publish: crate::process::PublishFn = Box::new(move |correlation_id| {
+            Box::pin(async move { engine.publish_event(event, correlation_id).await })
         });
 
         let settle: crate::process::SettleFn = Box::new(move || {
@@ -330,8 +330,8 @@ where
         let engine = self.clone();
         let engine2 = self.clone();
 
-        let publish: crate::process::PublishFn = Box::new(move || {
-            Box::pin(async move { engine.publish_output(output).await })
+        let publish: crate::process::PublishFn = Box::new(move |correlation_id| {
+            Box::pin(async move { engine.publish_output(output, correlation_id).await })
         });
 
         let settle: crate::process::SettleFn = Box::new(move || {
@@ -788,7 +788,11 @@ where
         Ok(())
     }
 
-    async fn publish_event<E>(&self, event: E) -> Result<ProcessHandle>
+    async fn publish_event<E>(
+        &self,
+        event: E,
+        correlation_id_override: Option<Uuid>,
+    ) -> Result<ProcessHandle>
     where
         E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
@@ -804,7 +808,7 @@ where
         self.effects.register_codec(codec);
 
         let event_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
+        let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
         let event_type = std::any::type_name::<E>().to_string();
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
 
@@ -837,7 +841,11 @@ where
         })
     }
 
-    async fn publish_output(&self, output: crate::handler::EventOutput) -> Result<ProcessHandle> {
+    async fn publish_output(
+        &self,
+        output: crate::handler::EventOutput,
+        correlation_id_override: Option<Uuid>,
+    ) -> Result<ProcessHandle> {
         if let Some(codec) = &output.codec {
             self.effects.register_codec(codec.clone());
         }
@@ -845,7 +853,7 @@ where
         let payload = output.payload;
 
         let event_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
+        let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
 
         info!(
             "Publishing event output: type={}, correlation_id={}",
