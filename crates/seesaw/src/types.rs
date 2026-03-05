@@ -1,7 +1,9 @@
 //! Core data types for seesaw event processing.
 
 use chrono::{DateTime, Utc};
+use std::any::Any;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -70,6 +72,9 @@ pub struct QueuedEvent {
     pub handler_id: Option<String>,
     /// When event was created
     pub created_at: DateTime<Utc>,
+    /// Original typed event, available only during the live dispatch cycle.
+    /// `None` on replay/hydration from store — handlers fall back to JSON deserialization.
+    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// Event emitted by a handler (for atomic insertion)
@@ -87,6 +92,8 @@ pub struct EmittedEvent {
     pub batch_size: Option<i32>,
     /// Handler that produced this event.
     pub handler_id: Option<String>,
+    /// Original typed event (live dispatch only).
+    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// Captured projection failure to persist in DLQ at commit time.

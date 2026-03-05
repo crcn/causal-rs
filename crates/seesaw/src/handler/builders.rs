@@ -306,6 +306,7 @@ where
                 batch_index: None,
                 batch_size: None,
                 handler_id: None,
+                ephemeral: None,
             })
         }));
         self

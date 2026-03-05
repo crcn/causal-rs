@@ -98,8 +98,8 @@ where
             ));
         }
 
-        // 3. Decode event via codec
-        let (typed_event, event_type_id) = self.decode_event(&event.event_type, &event.payload)?;
+        // 3. Decode event via codec (prefer ephemeral sidecar if present)
+        let (typed_event, event_type_id) = self.decode_event(&event.event_type, &event.payload, event.ephemeral.as_ref())?;
 
         // 4. Route to matching handlers
         let matching_handlers: Vec<_> = self
@@ -234,7 +234,7 @@ where
         };
 
         let (typed_event, type_id) =
-            self.decode_event(&execution.event_type, &execution.event_payload)?;
+            self.decode_event(&execution.event_type, &execution.event_payload, None)?;
 
         let idempotency_key = Uuid::new_v5(
             &NAMESPACE_SEESAW,
@@ -451,7 +451,19 @@ where
         &self,
         event_type: &str,
         payload: &serde_json::Value,
+        ephemeral: Option<&Arc<dyn Any + Send + Sync>>,
     ) -> Result<(Arc<dyn Any + Send + Sync>, TypeId)> {
+        // Fast path: if the ephemeral sidecar is present and a codec is registered,
+        // use the original typed event directly (preserves #[serde(skip)] fields).
+        if let Some(typed) = ephemeral {
+            if let Some(codec) = self.handlers.find_codec_by_event_type(event_type) {
+                if (*typed).type_id() == codec.type_id {
+                    return Ok((Arc::clone(typed), codec.type_id));
+                }
+            }
+        }
+
+        // Slow path: deserialize from JSON (replay, hydration, or no ephemeral).
         // Apply upcasters before decoding (schema_version=0 for now — events
         // without a persisted version get the full upcaster chain as a no-op
         // when no upcasters are registered).
@@ -563,6 +575,7 @@ where
                 batch_index,
                 batch_size,
                 handler_id: Some(execution.handler_id.clone()),
+                ephemeral: output.ephemeral,
             });
         }
 

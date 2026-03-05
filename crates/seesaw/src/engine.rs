@@ -165,6 +165,7 @@ where
                 batch_index: None,
                 batch_size: None,
                 handler_id: None,
+                ephemeral: None,
             })
         }));
         self
@@ -881,6 +882,7 @@ where
         let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
         let event_type = std::any::type_name::<E>().to_string();
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
+        let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(event);
 
         info!(
             "Publishing event: type={}, correlation_id={}",
@@ -901,6 +903,7 @@ where
             batch_size: None,
             handler_id: None,
             created_at: chrono::Utc::now(),
+            ephemeral: Some(ephemeral),
         };
 
         self.store.publish(queued).await?;
@@ -945,6 +948,7 @@ where
             batch_size: None,
             handler_id: None,
             created_at: chrono::Utc::now(),
+            ephemeral: output.ephemeral,
         };
 
         self.store.publish(queued).await?;
@@ -1043,6 +1047,7 @@ where
                     batch_size: e.batch_size,
                     handler_id: e.handler_id,
                     created_at: chrono::Utc::now(),
+                    ephemeral: e.ephemeral,
                 }
             })
             .collect()

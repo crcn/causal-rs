@@ -101,12 +101,15 @@ pub struct EventOutput {
     pub payload: serde_json::Value,
     /// Codec for automatic registration (None for replayed/reconstructed outputs).
     pub(crate) codec: Option<Arc<EventCodec>>,
+    /// Original typed event (live dispatch only).
+    pub ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl EventOutput {
     /// Create a new EventOutput from a typed event.
     pub fn new<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(event: E) -> Self {
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
+        let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(event);
         Self {
             type_id: TypeId::of::<E>(),
             event_type: std::any::type_name::<E>().to_string(),
@@ -119,6 +122,7 @@ impl EventOutput {
                     Ok(Arc::new(event))
                 }),
             })),
+            ephemeral: Some(ephemeral),
         }
     }
 
@@ -132,6 +136,7 @@ impl EventOutput {
             event_type,
             payload,
             codec: None,
+            ephemeral: None,
         }
     }
 }
