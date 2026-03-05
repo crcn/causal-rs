@@ -389,6 +389,40 @@ async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipp
 
 The return type must implement `Serialize + DeserializeOwned`. Store implementations provide the journal backend — the built-in `MemoryStore` includes a working implementation, and Postgres stores can use the same transaction for journal writes.
 
+### Ephemeral sidecar (live dispatch optimization)
+
+When an event is published or emitted, seesaw stashes the original typed object alongside the JSON payload. During the **live dispatch cycle**, handlers receive this original object directly — preserving `#[serde(skip)]` fields that would be lost through serialization.
+
+On **replay or hydration** (e.g. after a crash), the ephemeral is `None` and handlers fall back to JSON deserialization. Skipped fields get their `Default` values, which is correct by design since durable state is the record of truth.
+
+This is useful when events carry transient, non-serializable data (parsed structs, pre-computed results, file handles) that downstream handlers need during the same dispatch cycle but that shouldn't be persisted:
+
+```rust
+#[derive(Clone, Serialize, Deserialize)]
+struct PageScraped {
+    url: String,
+    raw_html: String,
+
+    /// Pre-parsed batches — available during live dispatch, empty on replay.
+    #[serde(skip)]
+    extracted_batches: Vec<Batch>,
+}
+
+// The scrape handler emits PageScraped with extracted_batches populated.
+// The downstream dedup handler receives the original typed event (with batches intact)
+// during live dispatch — no need to re-parse or stash in shared state.
+```
+
+**Semantics:**
+
+| Path | Source | `#[serde(skip)]` fields |
+|------|--------|------------------------|
+| Live dispatch | Original typed object | Preserved |
+| Replay / hydration | JSON deserialization | `Default` values |
+| Store persistence | JSON payload only | Not persisted |
+
+No code changes are needed to benefit — this is automatic for all events published via `engine.emit()` or returned from handlers via `events![]`.
+
 ## Durable Execution
 
 Seesaw provides durable execution natively through its `Store` trait:
