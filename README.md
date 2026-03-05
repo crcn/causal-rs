@@ -45,7 +45,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.18"
+seesaw_core = "0.21"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -399,7 +399,7 @@ Seesaw provides durable execution natively through its `Store` trait:
 | Side effect journaling | In-memory (lost on crash) | Durable (survives crash) |
 | Aggregate state | In-memory DashMap | Hydrated from event log |
 | Crash recovery | State lost | Replay from journal + event log |
-| Effect retries | In-memory queue | Persistent queue with reclaim |
+| Handler retries | In-memory queue | Persistent queue with reclaim |
 
 All durability features are built into the `Store` trait with default no-ops, so `MemoryStore` works out of the box for development and testing. Swap in a Postgres store for production durability — no code changes needed.
 
@@ -414,8 +414,36 @@ ctx.event_id            // Current event's unique ID
 ctx.correlation_id      // Workflow grouping ID
 ctx.parent_event_id     // Parent event for causal tracking
 ctx.idempotency_key()   // Deterministic key for deduplication
-ctx.run(|| async { })   // Replay-safe side effect execution (journaled with Restate)
+ctx.run(|| async { })   // Replay-safe side effect execution (journaled)
+ctx.logger              // Structured logging (see below)
 ```
+
+### Structured Logging
+
+Handlers can emit structured log entries via `ctx.logger`. Entries are captured during execution and drained into `HandlerCompletion` / `HandlerDlq`, so Store implementations can persist them keyed by `(event_id, handler_id)`.
+
+```rust
+#[handler(on = OrderPlaced, id = "ship_order")]
+async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+    ctx.logger.info("Starting shipment");
+    ctx.logger.debug_with("Order details", &serde_json::json!({
+        "order_id": event.order_id,
+        "total": event.total,
+    }));
+
+    let tracking_id: String = ctx.run(|| async {
+        ctx.deps().shipping_api.ship(event.order_id).await
+    }).await?;
+
+    ctx.logger.info_with("Shipment created", &serde_json::json!({
+        "tracking_id": &tracking_id,
+    }));
+
+    Ok(OrderShipped { order_id: event.order_id, tracking_id })
+}
+```
+
+Available methods: `debug`, `debug_with`, `info`, `info_with`, `warn`, `warn_with`. The `_with` variants accept any `Serialize` value as structured data.
 
 ## Examples
 
@@ -454,10 +482,7 @@ Next settle loop:     hydrates from Store (includes foreign events)
 Engine (routing, composition, settle loop)
   ├── Handlers (filter → extract → transition guard → execute → emit)
   ├── Aggregators (event folding, state transitions)
-  ├── Store (event/effect queue + persistent event log + snapshots)
-  └── Runtime (pluggable execution backend)
-        ├── DirectRuntime (default: in-memory, pass-through)
-        └── RestateRuntime (durable: journaled, crash-safe)
+  └── Store (event/handler queue + persistent event log + snapshots + journal)
 ```
 
 ## License
