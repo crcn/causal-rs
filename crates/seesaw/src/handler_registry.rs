@@ -56,23 +56,23 @@ where
     }
 
     /// Register a handler.
-    pub fn register(&self, effect: Handler<D>) {
-        if effect.id.trim().is_empty() {
+    pub fn register(&self, handler: Handler<D>) {
+        if handler.id.trim().is_empty() {
             panic!("Handler ID cannot be empty");
         }
 
-        if !effect.is_inline() && looks_like_auto_generated_id(&effect.id) {
+        if !handler.is_default() && looks_like_auto_generated_id(&handler.id) {
             panic!(
                 "Background handler '{}' must declare an explicit stable id (for example .id(\"...\") or #[handler(id = \"...\")])",
-                effect.id
+                handler.id
             );
         }
 
-        let mut effects = self.handlers.write();
-        if effects.iter().any(|existing| existing.id == effect.id) {
-            panic!("Duplicate effect id '{}'", effect.id);
+        let mut handlers = self.handlers.write();
+        if handlers.iter().any(|existing| existing.id == handler.id) {
+            panic!("Duplicate handler id '{}'", handler.id);
         }
-        effects.push(effect);
+        handlers.push(handler);
     }
 
     /// Register a projection.
@@ -82,11 +82,11 @@ where
         }
 
         // Check uniqueness across both handlers and projections
-        let effects = self.handlers.read();
-        if effects.iter().any(|existing| existing.id == projection.id) {
+        let handlers = self.handlers.read();
+        if handlers.iter().any(|existing| existing.id == projection.id) {
             panic!("Duplicate id '{}' (conflicts with a handler)", projection.id);
         }
-        drop(effects);
+        drop(handlers);
 
         let mut projections = self.projections.write();
         if projections.iter().any(|existing| existing.id == projection.id) {
@@ -108,18 +108,18 @@ where
     }
 
     /// Find handler by stable ID.
-    pub(crate) fn find_by_id(&self, effect_id: &str) -> Option<Handler<D>> {
+    pub(crate) fn find_by_id(&self, handler_id: &str) -> Option<Handler<D>> {
         self.handlers
             .read()
             .iter()
-            .find(|effect| effect.id == effect_id)
+            .find(|h| h.id == handler_id)
             .cloned()
     }
 
     /// Find queue codec by event type name.
     pub(crate) fn find_codec_by_event_type(&self, event_type: &str) -> Option<Arc<EventCodec>> {
-        for effect in self.handlers.read().iter() {
-            for codec in effect.codecs() {
+        for handler in self.handlers.read().iter() {
+            for codec in handler.codecs() {
                 if codec.event_type == event_type {
                     return Some(codec.clone());
                 }
@@ -167,7 +167,7 @@ mod tests {
     struct TestDeps;
 
     #[tokio::test]
-    async fn test_handler_registry_registers_effects() {
+    async fn test_handler_registry_registers_handlers() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
 
         registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_effects() {
+    async fn test_multiple_handlers() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
 
         registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
@@ -186,18 +186,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_effect_can_handle() {
+    async fn test_handler_can_handle() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
 
         registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
 
-        let effects = registry.handlers.read();
-        assert!(effects[0].can_handle(TypeId::of::<EventA>()));
-        assert!(!effects[0].can_handle(TypeId::of::<EventB>()));
+        let handlers = registry.handlers.read();
+        assert!(handlers[0].can_handle(TypeId::of::<EventA>()));
+        assert!(!handlers[0].can_handle(TypeId::of::<EventB>()));
     }
 
     #[tokio::test]
-    async fn test_group_effect() {
+    async fn test_group_handler() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -226,14 +226,14 @@ mod tests {
         assert_eq!(registry.handlers.read().len(), 2);
 
         // Each can handle its respective event type
-        let effects = registry.handlers.read();
-        assert!(effects.iter().any(|e| e.can_handle(TypeId::of::<EventA>())));
-        assert!(effects.iter().any(|e| e.can_handle(TypeId::of::<EventB>())));
+        let handlers = registry.handlers.read();
+        assert!(handlers.iter().any(|h| h.can_handle(TypeId::of::<EventA>())));
+        assert!(handlers.iter().any(|h| h.can_handle(TypeId::of::<EventB>())));
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Duplicate effect id 'duplicate'")]
-    async fn test_register_rejects_duplicate_effect_ids() {
+    #[should_panic(expected = "Duplicate handler id 'duplicate'")]
+    async fn test_register_rejects_duplicate_handler_ids() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
 
         registry.register(
@@ -250,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     #[should_panic(expected = "Background handler")]
-    async fn test_register_rejects_generated_id_for_queued_effect() {
+    async fn test_register_rejects_generated_id_for_queued_handler() {
         let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
         registry.register(
             handler::on::<EventA>()

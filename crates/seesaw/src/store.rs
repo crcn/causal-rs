@@ -1,11 +1,11 @@
 //! Pluggable backend trait for the Engine's settle loop.
 //!
-//! The [`Store`] trait abstracts event and effect queue operations so that
+//! The [`Store`] trait abstracts event and handler queue operations so that
 //! the Engine can run against different backends (in-memory, Postgres, etc.).
 //!
-//! # Effect lifecycle
+//! # Handler lifecycle
 //!
-//! Each effect execution follows a state machine driven by the Engine's
+//! Each handler execution follows a state machine driven by the Engine's
 //! calls into the Store. Implementations are free to track these states
 //! (e.g. as a `status` column) for observability, health checks, or
 //! distributed reclaim logic.
@@ -16,14 +16,14 @@
 //!                  │  (complete_event inserts   │
 //!                  │   the intent)              │
 //!                  └────────────┬─────────────┘
-//!                               │ poll_next_effect
+//!                               │ poll_next_handler
 //!                               ▼
 //!                  ┌──────────────────────────┐
 //!                  │         running           │
 //!                  │  (claimed by Engine)      │
 //!                  └──┬────────┬────────┬─────┘
 //!                     │        │        │
-//!          resolve_effect(Complete/Retry/DeadLetter)
+//!        resolve_handler(Complete/Retry/DeadLetter)
 //!                     │        │        │
 //!                     ▼        ▼        ▼
 //!               ┌──────────┐ ┌────┐ ┌──────────────┐
@@ -43,18 +43,19 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::types::{
-    EffectResolution, EventOutcome, ExpiredJoinWindow, JoinAppendParams,
-    JoinEntry, NewEvent, PersistedEvent, QueueStatus, QueuedEvent, QueuedEffect, Snapshot,
+    EventOutcome, ExpiredJoinWindow, HandlerResolution, JoinAppendParams,
+    JoinEntry, JournalEntry, NewEvent, PersistedEvent, QueueStatus, QueuedEvent, QueuedHandler,
+    Snapshot,
 };
 
-/// Pluggable backend for the Engine's event and effect queues.
+/// Pluggable backend for the Engine's event and handler queues.
 ///
 /// Implementations must be `Send + Sync` so the Engine can be shared
 /// across tasks. All methods are async and fallible — a Postgres
 /// implementation can surface connection errors instead of silently
 /// dropping work.
 ///
-/// See the [module-level docs](crate::store) for the effect lifecycle
+/// See the [module-level docs](crate::store) for the handler lifecycle
 /// state machine.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -68,41 +69,44 @@ pub trait Store: Send + Sync {
 
     /// Complete event processing — either commit results or reject to DLQ.
     ///
-    /// - `Processed`: ack source event, persist effect intents (pending state),
-    ///   publish inline-emitted events, DLQ inline failures.
+    /// - `Processed`: ack source event, persist handler intents (pending state),
+    ///   DLQ projection failures.
     /// - `Rejected`: send to DLQ and ack in one atomic step.
     async fn complete_event(&self, result: EventOutcome) -> Result<()>;
 
-    // ── Effect queue ─────────────────────────────────────────────────
+    // ── Handler queue ─────────────────────────────────────────────────
 
-    /// Claim the next ready effect execution.
+    /// Claim the next ready handler execution.
     ///
-    /// Transitions the effect from **pending** → **running**.
+    /// Transitions the handler from **pending** → **running**.
     ///
     /// For Postgres this is typically `SELECT ... FOR UPDATE SKIP LOCKED`
     /// with a status flip. If the worker crashes before calling a
     /// resolution method, the Store is responsible for reclaiming the
-    /// effect (e.g. via a visibility timeout that resets status back to
+    /// handler (e.g. via a visibility timeout that resets status back to
     /// pending).
-    async fn poll_next_effect(&self) -> Result<Option<QueuedEffect>>;
+    async fn poll_next_handler(&self) -> Result<Option<QueuedHandler>>;
 
-    /// Returns the earliest `execute_at` of any **pending** effect, if any.
+    /// Returns the earliest `execute_at` of any **pending** handler, if any.
     ///
-    /// Used by the settle loop to sleep until the next effect becomes ready
-    /// instead of exiting prematurely when only future-dated effects remain.
-    async fn earliest_pending_effect_at(&self) -> Result<Option<DateTime<Utc>>>;
+    /// Used by the settle loop to sleep until the next handler becomes ready
+    /// instead of exiting prematurely when only future-dated handlers remain.
+    async fn earliest_pending_handler_at(&self) -> Result<Option<DateTime<Utc>>>;
 
-    // ── Effect resolution ─────────────────────────────────────────────
+    // ── Handler resolution ─────────────────────────────────────────────
 
-    /// Resolve a **running** effect.
+    /// Resolve a **running** handler.
     ///
-    /// This is the single exit point for every claimed effect:
-    /// - `Complete`: mark done, publish emitted events
+    /// This is the single exit point for every claimed handler:
+    /// - `Complete`: mark done, publish emitted events, clear journal entries
     /// - `Retry`: reset to pending with new attempt count and schedule
     /// - `DeadLetter`: mark dead-lettered, publish terminal events
-    async fn resolve_effect(&self, resolution: EffectResolution) -> Result<()>;
+    ///
+    /// On `Complete`, implementations should clear journal entries for the
+    /// handler's `(handler_id, event_id)` atomically with the completion.
+    async fn resolve_handler(&self, resolution: HandlerResolution) -> Result<()>;
 
-    /// Reclaim effects that have been in "running" state longer than their timeout.
+    /// Reclaim handlers that have been in "running" state longer than their timeout.
     /// Called at the start of each settle loop iteration.
     /// Default: no-op (suitable for in-memory stores where crash = data loss anyway).
     async fn reclaim_stale(&self) -> Result<()> {
@@ -210,6 +214,41 @@ pub trait Store: Send + Sync {
     /// Check whether a correlation ID has been cancelled.
     async fn is_cancelled(&self, _correlation_id: Uuid) -> Result<bool> {
         Ok(false)
+    }
+
+    // ── Handler journaling (optional) ─────────────────────────────
+    //
+    // Override to enable `ctx.run()` replay on retry. Journal entries
+    // record the serialized result of each `ctx.run()` call so that
+    // retried handlers can skip already-completed steps.
+
+    /// Load all journal entries for a handler execution.
+    async fn load_journal(
+        &self,
+        _handler_id: &str,
+        _event_id: Uuid,
+    ) -> Result<Vec<JournalEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// Append a single journal entry (one `ctx.run()` result).
+    async fn append_journal(
+        &self,
+        _handler_id: &str,
+        _event_id: Uuid,
+        _seq: u32,
+        _value: serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear journal entries after successful handler completion.
+    async fn clear_journal(
+        &self,
+        _handler_id: &str,
+        _event_id: Uuid,
+    ) -> Result<()> {
+        Ok(())
     }
 
     // ── Queue status (optional) ──────────────────────────────────

@@ -14,10 +14,10 @@ use crate::aggregator::AggregatorRegistry;
 use crate::event_store::event_type_short_name;
 use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
 use crate::handler_registry::HandlerRegistry;
+use crate::store::Store;
 use crate::types::{
-    EmittedEvent, EventCommit, EventWorkerConfig, HandlerWorkerConfig,
-    InlineFailure, QueuedEvent, QueuedEffect, EffectIntent,
-    NAMESPACE_SEESAW,
+    EmittedEvent, EventCommit, EventWorkerConfig, HandlerIntent, HandlerWorkerConfig,
+    ProjectionFailure, QueuedEvent, QueuedHandler, NAMESPACE_SEESAW,
 };
 use crate::upcaster::UpcasterRegistry;
 
@@ -30,7 +30,8 @@ where
     D: Send + Sync + 'static,
 {
     deps: Arc<D>,
-    effects: Arc<HandlerRegistry<D>>,
+    store: Arc<dyn Store>,
+    handlers: Arc<HandlerRegistry<D>>,
     aggregator_registry: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
     global_dlq_mapper: Option<GlobalDlqMapper>,
@@ -43,24 +44,26 @@ where
     /// Create a new job executor.
     pub fn new(
         deps: Arc<D>,
-        effects: Arc<HandlerRegistry<D>>,
+        store: Arc<dyn Store>,
+        handlers: Arc<HandlerRegistry<D>>,
         aggregator_registry: Arc<AggregatorRegistry>,
         upcasters: Arc<UpcasterRegistry>,
         global_dlq_mapper: Option<GlobalDlqMapper>,
     ) -> Self {
         Self {
             deps,
-            effects,
+            store,
+            handlers,
             aggregator_registry,
             upcasters,
             global_dlq_mapper,
         }
     }
 
-    /// Execute event processing (inline handlers + queue intents).
+    /// Execute event processing: create handler intents and run projections.
     ///
-    /// Extracted from EventWorker::process_claimed_event().
-    /// Returns commit payload for atomic transaction.
+    /// All matching handlers become queued handler intents. Only projections
+    /// (observers) run inline during event processing.
     pub async fn execute_event(
         &self,
         event: &QueuedEvent,
@@ -84,10 +87,10 @@ where
         }
 
         // 2. Check retry limit
-        if event.retry_count >= config.max_inline_retry_attempts {
+        if event.retry_count >= config.max_event_retry_attempts {
             warn!(
                 "Event exceeded max retry attempts ({}), will DLQ: event_id={}",
-                config.max_inline_retry_attempts, event.event_id
+                config.max_event_retry_attempts, event.event_id
             );
             return Err(anyhow::anyhow!(
                 "Event failed after {} retry attempts",
@@ -99,52 +102,51 @@ where
         let (typed_event, event_type_id) = self.decode_event(&event.event_type, &event.payload)?;
 
         // 4. Route to matching handlers
-        let matching_effects: Vec<_> = self
-            .effects
+        let matching_handlers: Vec<_> = self
+            .handlers
             .all()
             .into_iter()
-            .filter(|effect| effect.can_handle(event_type_id))
+            .filter(|h| h.can_handle(event_type_id))
             .collect();
 
-        // 5. Create queued handler intents (for queued handlers)
-        let mut queued_effect_intents = Vec::new();
-        for effect in matching_effects.iter().filter(|effect| !effect.is_inline()) {
-            let execute_at = match effect.delay {
+        // 5. Create queued handler intents for ALL matching handlers
+        let mut queued_handler_intents = Vec::new();
+        for handler in &matching_handlers {
+            let execute_at = match handler.delay {
                 Some(delay) => {
                     chrono::Utc::now()
                         + chrono::Duration::from_std(delay)
-                            .map_err(|_| anyhow::anyhow!("invalid queued effect delay"))?
+                            .map_err(|_| anyhow::anyhow!("invalid handler delay"))?
                 }
                 None => chrono::Utc::now(),
             };
-            let timeout_seconds = effect
+            let timeout_seconds = handler
                 .timeout
                 .map(|d| d.as_secs() as i32)
                 .unwrap_or(30)
                 .max(1);
-            queued_effect_intents.push(EffectIntent {
-                handler_id: effect.id.clone(),
-                parent_event_id: Some(event.event_id),
+            queued_handler_intents.push(HandlerIntent {
+                handler_id: handler.id.clone(),
+                parent_event_id: event.parent_id,
                 batch_id: event.batch_id,
                 batch_index: event.batch_index,
                 batch_size: event.batch_size,
                 execute_at,
                 timeout_seconds,
-                max_attempts: effect.max_attempts as i32,
-                priority: effect.priority.unwrap_or(10),
+                max_attempts: handler.max_attempts as i32,
+                priority: handler.priority.unwrap_or(10),
                 hops: event.hops,
-                join_window_timeout_seconds: effect
+                join_window_timeout_seconds: handler
                     .join_window_timeout
                     .map(|d| d.as_secs() as i32)
                     .map(|seconds| seconds.max(1)),
             });
         }
 
-        // 6a. Execute projections sequentially (before other handlers)
-        let mut inline_effect_failures = Vec::new();
-        let mut emitted_events = Vec::new();
+        // 6. Execute projections sequentially (projections are observers, not handlers)
+        let mut projection_failures = Vec::new();
 
-        let projections = self.effects.projections();
+        let projections = self.handlers.projections();
         for projection in &projections {
             let any_event = crate::handler::AnyEvent {
                 value: typed_event.clone(),
@@ -169,47 +171,12 @@ where
                     "Projection handler failed: event_id={}, projection_id={}, error={}",
                     event.event_id, projection.id, error_string
                 );
-                inline_effect_failures.push(InlineFailure {
+                projection_failures.push(ProjectionFailure {
                     handler_id: projection.id.clone(),
                     error: error_string,
                     reason: "projection_failed".to_string(),
                     attempts: event.retry_count.saturating_add(1),
                 });
-            }
-        }
-
-        // 6b. Execute regular inline handlers in parallel
-        let mut inline_effects: Vec<_> = matching_effects
-            .iter()
-            .filter(|effect| effect.is_inline())
-            .collect();
-        inline_effects.sort_by_key(|e| e.priority.unwrap_or(i32::MAX));
-
-        let inline_futures: Vec<_> = inline_effects
-            .iter()
-            .map(|effect| {
-                self.run_inline_effect(effect, event, typed_event.clone(), event_type_id, config)
-            })
-            .collect();
-
-        let inline_results = futures::future::join_all(inline_futures).await;
-
-        for (result, effect) in inline_results.into_iter().zip(inline_effects.iter()) {
-            match result {
-                Ok(mut emitted) => emitted_events.append(&mut emitted),
-                Err(error) => {
-                    let error_string = error.to_string();
-                    warn!(
-                        "Inline effect failed and will be persisted to DLQ: event_id={}, effect_id={}, error={}",
-                        event.event_id, effect.id, error_string
-                    );
-                    inline_effect_failures.push(InlineFailure {
-                        handler_id: effect.id.clone(),
-                        error: error_string,
-                        reason: "inline_failed".to_string(),
-                        attempts: event.retry_count.saturating_add(1),
-                    });
-                }
             }
         }
 
@@ -220,22 +187,19 @@ where
             correlation_id: event.correlation_id,
             event_type: event.event_type.clone(),
             event_payload: event.payload.clone(),
-            queued_effect_intents,
-            inline_effect_failures,
-            emitted_events,
+            queued_handler_intents,
+            projection_failures,
         })
     }
 
-    /// Execute handler (queued effect).
-    ///
-    /// Extracted from HandlerWorker::process_next_effect().
+    /// Execute a queued handler.
     pub async fn execute_handler(
         &self,
-        execution: QueuedEffect,
+        execution: QueuedHandler,
         config: &HandlerWorkerConfig,
-    ) -> Result<EffectResult> {
+    ) -> Result<HandlerResult> {
         info!(
-            "Processing effect: effect_id={}, workflow={}, priority={}, attempt={}/{}",
+            "Processing handler: handler_id={}, workflow={}, priority={}, attempt={}/{}",
             execution.handler_id,
             execution.correlation_id,
             execution.priority,
@@ -244,20 +208,20 @@ where
         );
 
         // 1. Find handler by ID
-        let Some(effect) = self.effects.find_by_id(&execution.handler_id) else {
+        let Some(handler) = self.handlers.find_by_id(&execution.handler_id) else {
             let error = format!(
-                "No effect handler registered for id '{}'",
+                "No handler registered for id '{}'",
                 execution.handler_id
             );
             warn!("{}", error);
-            return Ok(EffectResult {
+            return Ok(HandlerResult {
                 status: if execution.attempts >= execution.max_attempts {
-                    EffectStatus::Failed {
+                    HandlerStatus::Failed {
                         error: error.clone(),
                         attempts: execution.attempts,
                     }
                 } else {
-                    EffectStatus::Retry {
+                    HandlerStatus::Retry {
                         error,
                         attempts: execution.attempts,
                     }
@@ -265,6 +229,7 @@ where
                 emitted_events: Vec::new(),
                 result: serde_json::json!({}),
                 join_claim: None,
+                log_entries: Vec::new(),
             });
         };
 
@@ -277,16 +242,23 @@ where
         )
         .to_string();
 
-        let ctx = self.make_context(
-            effect.id.clone(),
-            idempotency_key,
-            execution.correlation_id,
-            execution.event_id,
-            execution.parent_event_id,
-        );
+        let journal_entries = self
+            .store
+            .load_journal(&handler.id, execution.event_id)
+            .await?;
+
+        let ctx = self
+            .make_context(
+                handler.id.clone(),
+                idempotency_key,
+                execution.correlation_id,
+                execution.event_id,
+                execution.parent_event_id,
+            )
+            .with_journal(self.store.clone(), journal_entries);
 
         // 2. Handle join/accumulation (if configured)
-        let join_claim = if effect.join_mode == Some(JoinMode::SameBatch) {
+        let join_claim = if handler.join_mode == Some(JoinMode::SameBatch) {
             Some(JoinClaim {
                 batch_id: execution.batch_id.ok_or_else(|| {
                     anyhow::anyhow!("join().same_batch() requires batch_id metadata")
@@ -299,13 +271,14 @@ where
 
         // For now, we'll return a placeholder result that indicates join is needed
         // The actual join logic will be handled by the backend (PostgresBackend)
-        if effect.join_mode.is_some() {
+        if handler.join_mode.is_some() {
             // Return special status indicating join coordination is needed
-            return Ok(EffectResult {
-                status: EffectStatus::JoinWaiting,
+            return Ok(HandlerResult {
+                status: HandlerStatus::JoinWaiting,
                 emitted_events: Vec::new(),
                 result: serde_json::json!({ "status": "join_waiting" }),
                 join_claim,
+                log_entries: ctx.logger.drain(),
             });
         }
 
@@ -316,7 +289,7 @@ where
             config.default_timeout
         };
 
-        let handler_fut = effect.make_handler_future(typed_event.clone(), type_id, ctx.clone());
+        let handler_fut = handler.make_handler_future(typed_event.clone(), type_id, ctx.clone());
         let result = timeout(timeout_duration, handler_fut)
         .await;
 
@@ -331,11 +304,12 @@ where
                 )?;
 
                 info!("Handler completed successfully: {}", execution.handler_id);
-                Ok(EffectResult {
-                    status: EffectStatus::Success,
+                Ok(HandlerResult {
+                    status: HandlerStatus::Success,
                     emitted_events,
                     result: serde_json::json!({ "status": "ok" }),
                     join_claim: None,
+                    log_entries: ctx.logger.drain(),
                 })
             }
             Ok(Err(e)) => {
@@ -345,12 +319,12 @@ where
                 );
 
                 let status = if execution.attempts >= execution.max_attempts {
-                    EffectStatus::Failed {
+                    HandlerStatus::Failed {
                         error: e.to_string(),
                         attempts: execution.attempts,
                     }
                 } else {
-                    EffectStatus::Retry {
+                    HandlerStatus::Retry {
                         error: e.to_string(),
                         attempts: execution.attempts,
                     }
@@ -359,10 +333,10 @@ where
                 // Try to build DLQ terminal event
                 let emitted_events =
                     if execution.attempts >= execution.max_attempts
-                        && (effect.dlq_terminal_mapper.is_some() || self.global_dlq_mapper.is_some())
+                        && (handler.dlq_terminal_mapper.is_some() || self.global_dlq_mapper.is_some())
                     {
                         self.build_dlq_terminal_event(
-                            &effect,
+                            &handler,
                             typed_event,
                             type_id,
                             &execution,
@@ -373,11 +347,12 @@ where
                         Vec::new()
                     };
 
-                Ok(EffectResult {
+                Ok(HandlerResult {
                     status,
                     emitted_events,
                     result: serde_json::json!({}),
                     join_claim: None,
+                    log_entries: ctx.logger.drain(),
                 })
             }
             Err(_) => {
@@ -386,12 +361,12 @@ where
                 let timeout_error = "Handler execution timed out".to_string();
 
                 let status = if execution.attempts >= execution.max_attempts {
-                    EffectStatus::Failed {
+                    HandlerStatus::Failed {
                         error: timeout_error.clone(),
                         attempts: execution.attempts,
                     }
                 } else {
-                    EffectStatus::Retry {
+                    HandlerStatus::Retry {
                         error: timeout_error.clone(),
                         attempts: execution.attempts,
                     }
@@ -399,10 +374,10 @@ where
 
                 // Try to build DLQ terminal event for timeout
                 let emitted_events = if execution.attempts >= execution.max_attempts
-                    && (effect.dlq_terminal_mapper.is_some() || self.global_dlq_mapper.is_some())
+                    && (handler.dlq_terminal_mapper.is_some() || self.global_dlq_mapper.is_some())
                 {
                     self.build_dlq_terminal_event(
-                        &effect,
+                        &handler,
                         typed_event,
                         type_id,
                         &execution,
@@ -413,11 +388,12 @@ where
                     Vec::new()
                 };
 
-                Ok(EffectResult {
+                Ok(HandlerResult {
                     status,
                     emitted_events,
                     result: serde_json::json!({}),
                     join_claim: None,
+                    log_entries: ctx.logger.drain(),
                 })
             }
         }
@@ -425,30 +401,29 @@ where
 
     /// Run startup handlers.
     pub async fn run_startup_handlers(&self) -> Result<()> {
-        for effect in self.effects.all() {
-            if effect.started.is_none() {
+        for h in self.handlers.all() {
+            if h.started.is_none() {
                 continue;
             }
 
             let ctx = self.make_context(
-                effect.id.clone(),
-                format!("startup::{}", effect.id),
+                h.id.clone(),
+                format!("startup::{}", h.id),
                 Uuid::nil(),
                 Uuid::nil(),
                 None,
             );
 
-            effect
-                .call_started(ctx)
+            h.call_started(ctx)
                 .await
-                .map_err(|e| anyhow::anyhow!("startup handler for effect '{}' failed: {}", effect.id, e))?;
+                .map_err(|e| anyhow::anyhow!("startup handler '{}' failed: {}", h.id, e))?;
         }
         Ok(())
     }
 
-    /// Get effects reference (for Engine accessor).
-    pub fn effects(&self) -> &Arc<HandlerRegistry<D>> {
-        &self.effects
+    /// Get handler registry reference.
+    pub fn handler_registry(&self) -> &Arc<HandlerRegistry<D>> {
+        &self.handlers
     }
 
     // --- Private helpers ---
@@ -483,7 +458,7 @@ where
         let short_name = event_type_short_name(event_type);
         let upcasted = self.upcasters.upcast(short_name, 0, payload.clone())?;
 
-        let codec = self.effects.find_codec_by_event_type(event_type);
+        let codec = self.handlers.find_codec_by_event_type(event_type);
 
         if let Some(codec) = codec {
             let typed = (codec.decode)(&upcasted)?;
@@ -499,155 +474,16 @@ where
         }
     }
 
-    async fn run_inline_effect(
-        &self,
-        effect: &Handler<D>,
-        source_event: &QueuedEvent,
-        typed_event: Arc<dyn Any + Send + Sync>,
-        event_type_id: TypeId,
-        config: &EventWorkerConfig,
-    ) -> Result<Vec<QueuedEvent>> {
-        let idempotency_key = Uuid::new_v5(
-            &NAMESPACE_SEESAW,
-            format!("{}-{}", source_event.event_id, effect.id).as_bytes(),
-        )
-        .to_string();
-
-        let ctx = self.make_context(
-            effect.id.clone(),
-            idempotency_key,
-            source_event.correlation_id,
-            source_event.event_id,
-            source_event.parent_id,
-        );
-
-        let handler_fut = effect.make_handler_future(typed_event, event_type_id, ctx.clone());
-        let drained = handler_fut.await?;
-
-        let emitted_count = drained.len();
-        if emitted_count > config.max_batch_size {
-            anyhow::bail!(
-                "inline effect '{}' emitted {} events, exceeding max_batch_size {}",
-                effect.id,
-                emitted_count,
-                config.max_batch_size
-            );
-        }
-
-        if emitted_count > i32::MAX as usize {
-            anyhow::bail!(
-                "inline effect '{}' emitted {} events, exceeding i32 batch metadata capacity",
-                effect.id,
-                emitted_count
-            );
-        }
-
-        // Batch metadata logic (same as original)
-        let inherited_batch = if emitted_count == 1 {
-            match (
-                source_event.batch_id,
-                source_event.batch_index,
-                source_event.batch_size,
-            ) {
-                (Some(batch_id), Some(batch_index), Some(batch_size)) => {
-                    if batch_size <= 0
-                        || batch_index < 0
-                        || batch_index >= batch_size
-                        || batch_size as usize > config.max_batch_size
-                    {
-                        anyhow::bail!(
-                            "invalid inherited batch metadata: id={} index={} size={} max_batch_size={}",
-                            batch_id,
-                            batch_index,
-                            batch_size,
-                            config.max_batch_size
-                        );
-                    }
-                    Some((batch_id, batch_index, batch_size))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let emitted_batch_id = if emitted_count > 1 {
-            Some(Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!("{}-{}-batch", source_event.event_id, effect.id).as_bytes(),
-            ))
-        } else {
-            None
-        };
-
-        let mut emitted_events = Vec::with_capacity(emitted_count);
-
-        for (emitted_index, output) in drained.into_iter().enumerate() {
-            // Auto-register codec so the event can be decoded in the next dispatch cycle
-            if let Some(codec) = &output.codec {
-                self.effects.register_codec(codec.clone());
-            }
-
-            let payload = output.payload;
-
-            let event_id = Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!(
-                    "{}-{}-{}-{}",
-                    source_event.event_id, effect.id, output.event_type, emitted_index
-                )
-                .as_bytes(),
-            );
-
-            let created_at = source_event
-                .created_at
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight UTC should always be valid")
-                .and_utc();
-
-            let (batch_id, batch_index, batch_size) = if let Some(inherited) = inherited_batch {
-                (Some(inherited.0), Some(inherited.1), Some(inherited.2))
-            } else if emitted_count > 1 {
-                (
-                    emitted_batch_id,
-                    Some(emitted_index as i32),
-                    Some(emitted_count as i32),
-                )
-            } else {
-                (None, None, None)
-            };
-
-            emitted_events.push(QueuedEvent {
-                id: 0,
-                event_id,
-                parent_id: Some(source_event.event_id),
-                correlation_id: source_event.correlation_id,
-                event_type: output.event_type,
-                payload,
-                hops: source_event.hops + 1,
-                retry_count: 0,
-                batch_id,
-                batch_index,
-                batch_size,
-                handler_id: Some(effect.id.clone()),
-                created_at,
-            });
-        }
-
-        Ok(emitted_events)
-    }
-
     pub(crate) fn serialize_emitted_events(
         &self,
         emitted: Vec<EventOutput>,
-        execution: &QueuedEffect,
+        execution: &QueuedHandler,
         max_batch_size: usize,
     ) -> Result<Vec<EmittedEvent>> {
         let emitted_count = emitted.len();
         if emitted_count > max_batch_size {
             anyhow::bail!(
-                "effect '{}' emitted {} events, exceeding max_batch_size {}",
+                "handler '{}' emitted {} events, exceeding max_batch_size {}",
                 execution.handler_id,
                 emitted_count,
                 max_batch_size
@@ -656,7 +492,7 @@ where
 
         if emitted_count > i32::MAX as usize {
             anyhow::bail!(
-                "effect '{}' emitted {} events, exceeding i32 batch metadata capacity",
+                "handler '{}' emitted {} events, exceeding i32 batch metadata capacity",
                 execution.handler_id,
                 emitted_count
             );
@@ -703,7 +539,7 @@ where
         for (emitted_index, output) in emitted.into_iter().enumerate() {
             // Auto-register codec so the event can be decoded in the next dispatch cycle
             if let Some(codec) = &output.codec {
-                self.effects.register_codec(codec.clone());
+                self.handlers.register_codec(codec.clone());
             }
 
             let payload = output.payload;
@@ -735,14 +571,14 @@ where
 
     fn build_dlq_terminal_event(
         &self,
-        effect: &Handler<D>,
+        handler: &Handler<D>,
         source_event: Arc<dyn Any + Send + Sync>,
         source_type_id: TypeId,
-        execution: &QueuedEffect,
+        execution: &QueuedHandler,
         reason: &str,
         error: String,
     ) -> Result<Vec<EmittedEvent>> {
-        let Some(mapper) = effect.dlq_terminal_mapper.as_ref() else {
+        let Some(mapper) = handler.dlq_terminal_mapper.as_ref() else {
             // Global fallback
             if let Some(global) = self.global_dlq_mapper.as_ref() {
                 let emitted = global(DlqTerminalInfo {
@@ -790,18 +626,20 @@ where
     }
 }
 
-/// Result of effect execution.
+/// Result of handler execution.
 #[derive(Debug)]
-pub struct EffectResult {
-    pub status: EffectStatus,
+pub struct HandlerResult {
+    pub status: HandlerStatus,
     pub emitted_events: Vec<EmittedEvent>,
     pub result: serde_json::Value,
     pub join_claim: Option<JoinClaim>,
+    /// Log entries captured during handler execution.
+    pub log_entries: Vec<crate::types::LogEntry>,
 }
 
-/// Effect execution status.
+/// Handler execution status.
 #[derive(Debug)]
-pub enum EffectStatus {
+pub enum HandlerStatus {
     Success,
     Failed { error: String, attempts: i32 },
     Retry { error: String, attempts: i32 },

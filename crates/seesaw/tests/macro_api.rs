@@ -417,28 +417,28 @@ fn effects_module_registration_works() {
 
     let ship_order = effects
         .iter()
-        .find(|effect| effect.id == "ship_order")
-        .expect("ship_order effect should exist");
+        .find(|h| h.id == "ship_order")
+        .expect("ship_order handler should exist");
     assert!(
-        ship_order.is_inline(),
-        "default effect should remain inline"
+        ship_order.is_default(),
+        "default handler should have default execution"
     );
 
     let bg_observer = effects
         .iter()
-        .find(|effect| effect.id == "bg_observer")
-        .expect("bg_observer effect should exist");
+        .find(|h| h.id == "bg_observer")
+        .expect("bg_observer handler should exist");
     assert!(
-        !bg_observer.is_inline(),
+        !bg_observer.is_default(),
         "queued attribute should force background execution"
     );
 
     let bg_retry_one = effects
         .iter()
-        .find(|effect| effect.id == "bg_retry_one")
-        .expect("bg_retry_one effect should exist");
+        .find(|h| h.id == "bg_retry_one")
+        .expect("bg_retry_one handler should exist");
     assert!(
-        !bg_retry_one.is_inline(),
+        !bg_retry_one.is_default(),
         "queued attribute should force background execution even when retry = 1"
     );
 

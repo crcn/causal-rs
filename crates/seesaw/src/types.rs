@@ -5,6 +5,37 @@ use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
 
+// ── Handler logging ──────────────────────────────────────────────
+
+/// Log level for handler log entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogLevel::Debug => write!(f, "DEBUG"),
+            LogLevel::Info => write!(f, "INFO"),
+            LogLevel::Warn => write!(f, "WARN"),
+        }
+    }
+}
+
+/// A structured log entry captured during handler execution.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub level: LogLevel,
+    pub message: String,
+    pub data: Option<serde_json::Value>,
+    pub timestamp: DateTime<Utc>,
+}
+
+// ── Constants ────────────────────────────────────────────────────
+
 /// UUID v5 namespace for deterministic event ID generation
 /// Used to prevent duplicate events on crash+retry
 /// This is a custom namespace UUID (derived from URL namespace)
@@ -27,7 +58,7 @@ pub struct QueuedEvent {
     pub payload: serde_json::Value,
     /// Hop count (for infinite loop detection)
     pub hops: i32,
-    /// Retry count (for inline effect failure tracking)
+    /// Retry count (for event-level failure tracking)
     pub retry_count: i32,
     /// Batch identifier for same-batch fan-in semantics.
     pub batch_id: Option<Uuid>,
@@ -41,7 +72,7 @@ pub struct QueuedEvent {
     pub created_at: DateTime<Utc>,
 }
 
-/// Event emitted by an effect (for atomic insertion)
+/// Event emitted by a handler (for atomic insertion)
 #[derive(Debug, Clone)]
 pub struct EmittedEvent {
     /// Event type name (for deterministic ID generation)
@@ -58,9 +89,9 @@ pub struct EmittedEvent {
     pub handler_id: Option<String>,
 }
 
-/// Captured inline effect failure to persist in DLQ at commit time.
+/// Captured projection failure to persist in DLQ at commit time.
 #[derive(Debug, Clone)]
-pub struct InlineFailure {
+pub struct ProjectionFailure {
     pub handler_id: String,
     pub error: String,
     pub reason: String,
@@ -77,18 +108,16 @@ pub struct EventCommit {
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
-    /// Queued effect intents to persist.
-    pub queued_effect_intents: Vec<EffectIntent>,
-    /// Inline effect failures to persist to DLQ.
-    pub inline_effect_failures: Vec<InlineFailure>,
-    /// Inline emitted events to publish.
-    pub emitted_events: Vec<QueuedEvent>,
+    /// Queued handler intents to persist.
+    pub queued_handler_intents: Vec<HandlerIntent>,
+    /// Projection failures to persist to DLQ.
+    pub projection_failures: Vec<ProjectionFailure>,
 }
 
-/// Persisted intent for a queued effect execution.
+/// Persisted intent for a queued handler execution.
 #[derive(Debug, Clone)]
-pub struct EffectIntent {
-    /// Stable effect identifier.
+pub struct HandlerIntent {
+    /// Stable handler identifier.
     pub handler_id: String,
     /// Parent event for causality tracking.
     pub parent_event_id: Option<Uuid>,
@@ -96,11 +125,11 @@ pub struct EffectIntent {
     pub batch_id: Option<Uuid>,
     pub batch_index: Option<i32>,
     pub batch_size: Option<i32>,
-    /// Earliest time this effect can execute.
+    /// Earliest time this handler can execute.
     pub execute_at: DateTime<Utc>,
-    /// Per-effect timeout in seconds.
+    /// Per-handler timeout in seconds.
     pub timeout_seconds: i32,
-    /// Max retry attempts for this effect.
+    /// Max retry attempts for this handler.
     pub max_attempts: i32,
     /// Queue priority (lower = higher priority).
     pub priority: i32,
@@ -131,9 +160,9 @@ pub struct ExpiredJoinWindow {
     pub source_event_ids: Vec<Uuid>,
 }
 
-/// Queued effect execution from store
+/// Queued handler execution from store
 #[derive(Debug, Clone)]
-pub struct QueuedEffect {
+pub struct QueuedHandler {
     pub event_id: Uuid,
     pub handler_id: String,
     pub correlation_id: Uuid,
@@ -159,10 +188,10 @@ pub struct EventWorkerConfig {
     pub poll_interval: Duration,
     /// Maximum hop count before DLQ (infinite loop detection).
     pub max_hops: i32,
-    /// Maximum number of events an effect may emit in one batch.
+    /// Maximum number of events a handler may emit in one batch.
     pub max_batch_size: usize,
-    /// Maximum retry count for event-level failures in inline processing path.
-    pub max_inline_retry_attempts: i32,
+    /// Maximum retry count for event-level failures.
+    pub max_event_retry_attempts: i32,
 }
 
 impl Default for EventWorkerConfig {
@@ -171,7 +200,7 @@ impl Default for EventWorkerConfig {
             poll_interval: Duration::from_millis(100),
             max_hops: 50,
             max_batch_size: 10_000,
-            max_inline_retry_attempts: 3,
+            max_event_retry_attempts: 3,
         }
     }
 }
@@ -179,11 +208,11 @@ impl Default for EventWorkerConfig {
 /// Handler worker configuration.
 #[derive(Debug, Clone)]
 pub struct HandlerWorkerConfig {
-    /// Polling interval when no effects available.
+    /// Polling interval when no handlers available.
     pub poll_interval: Duration,
-    /// Default timeout for effect execution.
+    /// Default timeout for handler execution.
     pub default_timeout: Duration,
-    /// Maximum number of events an effect may emit in one batch.
+    /// Maximum number of events a handler may emit in one batch.
     pub max_batch_size: usize,
 }
 
@@ -197,26 +226,28 @@ impl Default for HandlerWorkerConfig {
     }
 }
 
-/// Atomic effect completion payload.
+/// Atomic handler completion payload.
 ///
-/// Bundles the effect result and any events to publish into a single
+/// Bundles the handler result and any events to publish into a single
 /// call so Store implementations can commit atomically.
 #[derive(Debug)]
-pub struct EffectCompletion {
+pub struct HandlerCompletion {
     pub event_id: Uuid,
     pub handler_id: String,
     pub result: serde_json::Value,
     /// Pre-built queued events with deterministic IDs (generated by Engine).
     pub events_to_publish: Vec<QueuedEvent>,
+    /// Log entries captured during handler execution.
+    pub log_entries: Vec<LogEntry>,
 }
 
 /// Atomic DLQ + terminal-event payload.
 ///
-/// When an effect exhausts retries (or is rejected), the Engine bundles
+/// When a handler exhausts retries (or is rejected), the Engine bundles
 /// the DLQ metadata and any terminal events from `on_failure`/`on_dlq`
 /// into this struct so the Store can persist both atomically.
 #[derive(Debug)]
-pub struct EffectDlq {
+pub struct HandlerDlq {
     pub event_id: Uuid,
     pub handler_id: String,
     pub error: String,
@@ -224,17 +255,19 @@ pub struct EffectDlq {
     pub attempts: i32,
     /// Terminal events from on_failure/on_dlq mappers (pre-built with IDs).
     pub events_to_publish: Vec<QueuedEvent>,
+    /// Log entries captured during handler execution.
+    pub log_entries: Vec<LogEntry>,
 }
 
-/// Unified effect resolution outcome.
+/// Unified handler resolution outcome.
 ///
-/// Replaces the three separate `complete_effect`, `fail_effect`, `dlq_effect`
-/// Store methods with a single `resolve_effect(EffectResolution)` call.
+/// Replaces the three separate `complete_handler`, `fail_handler`, `dlq_handler`
+/// Store methods with a single `resolve_handler(HandlerResolution)` call.
 #[derive(Debug)]
-pub enum EffectResolution {
-    /// Effect completed successfully.
-    Complete(EffectCompletion),
-    /// Effect failed but can be retried.
+pub enum HandlerResolution {
+    /// Handler completed successfully.
+    Complete(HandlerCompletion),
+    /// Handler failed but can be retried.
     Retry {
         event_id: Uuid,
         handler_id: String,
@@ -242,8 +275,8 @@ pub enum EffectResolution {
         new_attempts: i32,
         next_execute_at: DateTime<Utc>,
     },
-    /// Effect exhausted retries — send to dead letter queue.
-    DeadLetter(EffectDlq),
+    /// Handler exhausted retries — send to dead letter queue.
+    DeadLetter(HandlerDlq),
 }
 
 /// Unified event processing outcome.
@@ -252,7 +285,7 @@ pub enum EffectResolution {
 /// Store methods with a single `complete_event(EventOutcome)` call.
 #[derive(Debug)]
 pub enum EventOutcome {
-    /// Event processed successfully — commit effects, emitted events, and DLQ inline failures.
+    /// Event processed successfully — commit handler intents and DLQ projection failures.
     Processed(EventCommit),
     /// Event rejected — send to DLQ and ack.
     Rejected {
@@ -340,11 +373,18 @@ pub struct Snapshot {
     pub created_at: DateTime<Utc>,
 }
 
+/// A single journaled result from `ctx.run()`.
+#[derive(Debug, Clone)]
+pub struct JournalEntry {
+    pub seq: u32,
+    pub value: serde_json::Value,
+}
+
 /// Summary of pending work for a correlation ID.
 #[derive(Debug, Clone, Default)]
 pub struct QueueStatus {
     pub pending_events: usize,
-    pub pending_effects: usize,
+    pub pending_handlers: usize,
     pub dead_lettered: usize,
 }
 
@@ -359,11 +399,11 @@ impl fmt::Display for QueuedEvent {
     }
 }
 
-impl fmt::Display for QueuedEffect {
+impl fmt::Display for QueuedHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Handler(event_id={}, effect_id={}, correlation_id={}, priority={}, attempts={}/{})",
+            "Handler(event_id={}, handler_id={}, correlation_id={}, priority={}, attempts={}/{})",
             self.event_id,
             self.handler_id,
             self.correlation_id,

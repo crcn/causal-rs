@@ -14,14 +14,14 @@ use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_store::event_type_short_name;
 use crate::handler::{Context, GlobalDlqMapper, Handler, Projection};
 use crate::handler_registry::HandlerRegistry;
-use crate::job_executor::{EffectStatus, JobExecutor};
+use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
 use crate::process::{EmitFuture, ProcessHandle};
 use crate::store::Store;
 use crate::types::{
-    EffectCompletion, EffectDlq, EffectResolution, EmittedEvent, EventOutcome, EventWorkerConfig,
-    HandlerWorkerConfig, JoinAppendParams, NewEvent, QueuedEvent, QueuedEffect, Snapshot,
-    NAMESPACE_SEESAW,
+    EmittedEvent, EventOutcome, EventWorkerConfig, HandlerCompletion, HandlerDlq,
+    HandlerResolution, HandlerWorkerConfig, JoinAppendParams, NewEvent, QueuedEvent, QueuedHandler,
+    Snapshot, NAMESPACE_SEESAW,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
 
@@ -38,7 +38,7 @@ where
 {
     store: Arc<dyn Store>,
     deps: Arc<D>,
-    effects: Arc<HandlerRegistry<D>>,
+    handlers: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
     snapshot_every: Option<u64>,
@@ -58,7 +58,7 @@ where
         Self {
             store: Arc::new(MemoryStore::new()),
             deps: Arc::new(deps),
-            effects: Arc::new(HandlerRegistry::new()),
+            handlers: Arc::new(HandlerRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
             upcasters: Arc::new(UpcasterRegistry::new()),
             snapshot_every: None,
@@ -172,7 +172,7 @@ where
 
     /// Register a handler.
     pub fn with_handler(mut self, handler: Handler<D>) -> Self {
-        Arc::get_mut(&mut self.effects)
+        Arc::get_mut(&mut self.handlers)
             .expect("Cannot add handler after cloning")
             .register(handler);
         self
@@ -183,7 +183,7 @@ where
     /// Projections receive ALL events, return `Result<()>`, and run
     /// sequentially before other handlers.
     pub fn with_projection(mut self, projection: Projection<D>) -> Self {
-        Arc::get_mut(&mut self.effects)
+        Arc::get_mut(&mut self.handlers)
             .expect("Cannot add projection after cloning")
             .register_projection(projection);
         self
@@ -194,7 +194,7 @@ where
     where
         I: IntoIterator<Item = Handler<D>>,
     {
-        let registry = Arc::get_mut(&mut self.effects).expect("Cannot add handlers after cloning");
+        let registry = Arc::get_mut(&mut self.handlers).expect("Cannot add handlers after cloning");
         for handler in handlers {
             registry.register(handler);
         }
@@ -225,7 +225,7 @@ where
                 Ok(Arc::new(event))
             }),
         });
-        Arc::get_mut(&mut self.effects)
+        Arc::get_mut(&mut self.handlers)
             .expect("Cannot add aggregator after cloning")
             .register_codec(codec);
 
@@ -345,11 +345,12 @@ where
         self.store.queue_status(correlation_id).await
     }
 
-    /// Drive all pending events and effects to completion.
+    /// Drive all pending events and handlers to completion.
     pub async fn settle(&self) -> Result<()> {
         let executor = JobExecutor::new(
             self.deps.clone(),
-            self.effects.clone(),
+            self.store.clone(),
+            self.handlers.clone(),
             self.aggregators.clone(),
             self.upcasters.clone(),
             self.global_dlq_mapper.clone(),
@@ -360,7 +361,7 @@ where
         loop {
             let mut processed_any = false;
 
-            // Reclaim stale effects (running longer than timeout)
+            // Reclaim stale handlers (running longer than timeout)
             self.store.reclaim_stale().await?;
 
             // Drain event queue (cache cancellation status per correlation_id)
@@ -427,9 +428,9 @@ where
                 }
             }
 
-            // Drain all ready effects and run them in parallel
+            // Drain all ready handlers and run them in parallel
             let mut executions = Vec::new();
-            while let Some(execution) = self.store.poll_next_effect().await? {
+            while let Some(execution) = self.store.poll_next_handler().await? {
                 executions.push(execution);
             }
 
@@ -437,7 +438,7 @@ where
                 processed_any = true;
 
                 // Cancellation checkpoint 2: batch-check unique correlation IDs,
-                // then DLQ cancelled effects before execution.
+                // then DLQ cancelled handlers before execution.
                 let unique_ids: std::collections::HashSet<Uuid> =
                     executions.iter().map(|e| e.correlation_id).collect();
                 let mut cancelled_ids = std::collections::HashSet::new();
@@ -456,16 +457,17 @@ where
                             correlation_id = %execution.correlation_id,
                             event_id = %execution.event_id,
                             handler_id = %execution.handler_id,
-                            "DLQ effect: workflow cancelled",
+                            "DLQ handler: workflow cancelled",
                         );
                         self.store
-                            .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                            .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
                                 event_id: execution.event_id,
                                 handler_id: execution.handler_id.clone(),
                                 error: "cancelled".to_string(),
                                 reason: "cancelled".to_string(),
                                 attempts: execution.attempts,
                                 events_to_publish: Vec::new(),
+                                log_entries: Vec::new(),
                             }))
                             .await?;
                     } else {
@@ -474,24 +476,24 @@ where
                 }
                 let executions = active_executions;
 
-                let effect_futures: Vec<_> = executions
+                let handler_futures: Vec<_> = executions
                     .iter()
                     .map(|execution| {
                         executor.execute_handler(execution.clone(), &handler_config)
                     })
                     .collect();
 
-                let effect_results = futures::future::join_all(effect_futures).await;
+                let handler_results = futures::future::join_all(handler_futures).await;
 
                 for (exec_result, execution_clone) in
-                    effect_results.into_iter().zip(executions)
+                    handler_results.into_iter().zip(executions)
                 {
                     let event_id = execution_clone.event_id;
                     let handler_id = execution_clone.handler_id.clone();
 
                     match exec_result {
                         Ok(result) => match result.status {
-                            EffectStatus::Success => {
+                            HandlerStatus::Success => {
                                 let events_to_publish = Self::build_queued_events(
                                     result.emitted_events,
                                     event_id,
@@ -501,15 +503,16 @@ where
                                     "",
                                 );
                                 self.store
-                                    .resolve_effect(EffectResolution::Complete(EffectCompletion {
+                                    .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
                                         event_id,
                                         handler_id,
                                         result: result.result,
                                         events_to_publish,
+                                        log_entries: result.log_entries,
                                     }))
                                     .await?;
                             }
-                            EffectStatus::Failed { error, attempts } => {
+                            HandlerStatus::Failed { error, attempts } => {
                                 let events_to_publish = Self::build_queued_events(
                                     result.emitted_events,
                                     event_id,
@@ -519,23 +522,24 @@ where
                                     "-dlq",
                                 );
                                 self.store
-                                    .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                                    .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
                                         event_id,
                                         handler_id,
                                         error,
                                         reason: "failed".to_string(),
                                         attempts,
                                         events_to_publish,
+                                        log_entries: result.log_entries,
                                     }))
                                     .await?;
                             }
-                            EffectStatus::Retry { error, attempts } => {
+                            HandlerStatus::Retry { error, attempts } => {
                                 // Compute backoff schedule in Engine
                                 let mut next_execute_at = chrono::Utc::now();
-                                if let Some(effect) =
-                                    executor.effects().find_by_id(&handler_id)
+                                if let Some(h) =
+                                    executor.handler_registry().find_by_id(&handler_id)
                                 {
-                                    if let Some(base) = effect.backoff {
+                                    if let Some(base) = h.backoff {
                                         let multiplier =
                                             2u64.saturating_pow(attempts.max(1) as u32 - 1);
                                         let delay = base.saturating_mul(multiplier as u32);
@@ -545,7 +549,7 @@ where
                                     }
                                 }
                                 self.store
-                                    .resolve_effect(EffectResolution::Retry {
+                                    .resolve_handler(HandlerResolution::Retry {
                                         event_id,
                                         handler_id,
                                         error,
@@ -554,7 +558,7 @@ where
                                     })
                                     .await?;
                             }
-                            EffectStatus::Timeout => {
+                            HandlerStatus::Timeout => {
                                 let dlq_events = self
                                     .build_global_dlq_event(
                                         &execution_clone,
@@ -571,17 +575,18 @@ where
                                     "-dlq",
                                 );
                                 self.store
-                                    .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                                    .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
                                         event_id,
                                         handler_id,
                                         error: "timeout".to_string(),
                                         reason: "timeout".to_string(),
                                         attempts: 0,
                                         events_to_publish,
+                                        log_entries: result.log_entries,
                                     }))
                                     .await?;
                             }
-                            EffectStatus::JoinWaiting => {
+                            HandlerStatus::JoinWaiting => {
                                 if let Some(join_claim) = result.join_claim {
                                     self.handle_join_waiting(
                                         &executor,
@@ -593,11 +598,12 @@ where
                                     .await?;
                                 } else {
                                     self.store
-                                        .resolve_effect(EffectResolution::Complete(EffectCompletion {
+                                        .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
                                             event_id,
                                             handler_id,
                                             result: serde_json::json!({ "status": "join_waiting" }),
                                             events_to_publish: Vec::new(),
+                                            log_entries: result.log_entries,
                                         }))
                                         .await?;
                                 }
@@ -621,13 +627,14 @@ where
                                 "-dlq",
                             );
                             self.store
-                                .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                                .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
                                     event_id,
                                     handler_id,
                                     error: error_str,
                                     reason: "settle_handler_error".to_string(),
                                     attempts: 0,
                                     events_to_publish,
+                                    log_entries: Vec::new(),
                                 }))
                                 .await?;
                         }
@@ -651,7 +658,7 @@ where
                     // DLQ each source event in the expired window
                     for source_event_id in &window.source_event_ids {
                         self.store
-                            .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                            .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
                                 event_id: *source_event_id,
                                 handler_id: window.join_handler_id.clone(),
                                 error: format!(
@@ -663,6 +670,7 @@ where
                                 reason: "join_window_expired".to_string(),
                                 attempts: 0,
                                 events_to_publish: Vec::new(),
+                                log_entries: Vec::new(),
                             }))
                             .await?;
                     }
@@ -670,9 +678,9 @@ where
             }
 
             if !processed_any {
-                // Check if there are future-dated effects (from backoff or delay).
+                // Check if there are future-dated handlers (from backoff or delay).
                 // If so, sleep until the earliest one becomes ready instead of exiting.
-                if let Some(earliest) = self.store.earliest_pending_effect_at().await? {
+                if let Some(earliest) = self.store.earliest_pending_handler_at().await? {
                     let now = chrono::Utc::now();
                     if earliest > now {
                         let wait = (earliest - now).to_std().unwrap_or_default();
@@ -693,7 +701,7 @@ where
     /// Returns None if no global mapper is configured or if the mapper errors.
     fn build_global_dlq_event(
         &self,
-        execution: &QueuedEffect,
+        execution: &QueuedHandler,
         error: String,
         reason: &str,
     ) -> Option<Vec<crate::types::EmittedEvent>> {
@@ -867,7 +875,7 @@ where
                 Ok(Arc::new(event))
             }),
         });
-        self.effects.register_codec(codec);
+        self.handlers.register_codec(codec);
 
         let event_id = Uuid::new_v4();
         let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
@@ -910,7 +918,7 @@ where
         correlation_id_override: Option<Uuid>,
     ) -> Result<ProcessHandle> {
         if let Some(codec) = &output.codec {
-            self.effects.register_codec(codec.clone());
+            self.handlers.register_codec(codec.clone());
         }
 
         let payload = output.payload;
@@ -1000,7 +1008,7 @@ where
     /// Build pre-assigned `QueuedEvent`s from `EmittedEvent`s (ID gen lifted into Engine).
     ///
     /// `id_infix` differentiates ID derivation namespaces: `""` for normal
-    /// effect output, `"-dlq"` for DLQ terminal events, etc.
+    /// handler output, `"-dlq"` for DLQ terminal events, etc.
     fn build_queued_events(
         emitted: Vec<EmittedEvent>,
         event_id: Uuid,
@@ -1045,7 +1053,7 @@ where
         executor: &JobExecutor<D>,
         event_id: Uuid,
         handler_id: &str,
-        execution: &QueuedEffect,
+        execution: &QueuedHandler,
         batch_id: Uuid,
     ) -> Result<()> {
         let batch_index = execution.batch_index.unwrap_or(0);
@@ -1071,13 +1079,13 @@ where
         match entries {
             Some(entries) => {
                 // All items arrived — decode and call join batch handler
-                let effect = executor.effects().find_by_id(handler_id);
-                if let Some(effect) = effect {
+                let join_handler = executor.handler_registry().find_by_id(handler_id);
+                if let Some(join_handler) = join_handler {
                     let mut typed_values: Vec<Arc<dyn Any + Send + Sync>> =
                         Vec::with_capacity(entries.len());
                     for entry in &entries {
                         let codec = executor
-                            .effects()
+                            .handler_registry()
                             .find_codec_by_event_type(&entry.event_type);
                         if let Some(codec) = codec {
                             let decoded = (codec.decode)(&entry.payload)?;
@@ -1103,7 +1111,7 @@ where
                     )
                     .with_aggregator_registry(self.aggregators.clone());
 
-                    match effect.call_join_batch_handler(typed_values, ctx).await {
+                    match join_handler.call_join_batch_handler(typed_values, ctx).await {
                         Ok(outputs) => {
                             let handler_config = HandlerWorkerConfig::default();
                             let emitted_events = executor.serialize_emitted_events(
@@ -1122,11 +1130,12 @@ where
                             );
 
                             self.store
-                                .resolve_effect(EffectResolution::Complete(EffectCompletion {
+                                .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
                                     event_id,
                                     handler_id: handler_id.to_string(),
                                     result: serde_json::json!({ "status": "join_completed" }),
                                     events_to_publish,
+                                    log_entries: Vec::new(),
                                 }))
                                 .await?;
 
@@ -1164,24 +1173,26 @@ where
                                 "-dlq",
                             );
                             self.store
-                                .resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                                .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
                                     event_id,
                                     handler_id: handler_id.to_string(),
                                     error: error_str,
                                     reason: "join_handler_error".to_string(),
                                     attempts: 0,
                                     events_to_publish,
+                                    log_entries: Vec::new(),
                                 }))
                                 .await?;
                         }
                     }
                 } else {
                     self.store
-                        .resolve_effect(EffectResolution::Complete(EffectCompletion {
+                        .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
                             event_id,
                             handler_id: handler_id.to_string(),
                             result: serde_json::json!({ "status": "join_handler_not_found" }),
                             events_to_publish: Vec::new(),
+                            log_entries: Vec::new(),
                         }))
                         .await?;
                 }
@@ -1189,11 +1200,12 @@ where
             None => {
                 // Still waiting for more items — mark complete (no-op)
                 self.store
-                    .resolve_effect(EffectResolution::Complete(EffectCompletion {
+                    .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
                         event_id,
                         handler_id: handler_id.to_string(),
                         result: serde_json::json!({ "status": "join_waiting" }),
                         events_to_publish: Vec::new(),
+                        log_entries: Vec::new(),
                     }))
                     .await?;
             }
@@ -1211,7 +1223,7 @@ where
         Self {
             store: self.store.clone(),
             deps: self.deps.clone(),
-            effects: self.effects.clone(),
+            handlers: self.handlers.clone(),
             aggregators: self.aggregators.clone(),
             upcasters: self.upcasters.clone(),
             snapshot_every: self.snapshot_every,

@@ -65,7 +65,7 @@ pub use upcaster::{Upcaster, UpcasterRegistry};
 pub use engine::Engine;
 pub use handler::{
     AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events, Handler,
-    HandlerError, IntoEvents, JoinMode, Projection,
+    HandlerError, IntoEvents, JoinMode, Logger, Projection,
 };
 
 /// The universal return macro for all handlers.
@@ -105,12 +105,13 @@ macro_rules! events {
     }};
 }
 
-pub use job_executor::{EffectResult, EffectStatus, JobExecutor, JoinClaim};
+pub use job_executor::{HandlerResult, HandlerStatus, JobExecutor, JoinClaim};
 pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
-    EffectCompletion, EffectDlq, EffectIntent, EmittedEvent, EventCommit, EventWorkerConfig,
-    ExpiredJoinWindow, HandlerWorkerConfig, InlineFailure, JoinAppendParams, JoinEntry,
-    QueuedEffect, QueuedEvent, NAMESPACE_SEESAW,
+    EmittedEvent, EventCommit, EventWorkerConfig, ExpiredJoinWindow, HandlerCompletion,
+    HandlerDlq, HandlerIntent, HandlerResolution, HandlerWorkerConfig, JoinAppendParams,
+    JoinEntry, JournalEntry, LogEntry, LogLevel, ProjectionFailure, QueuedEvent, QueuedHandler,
+    NAMESPACE_SEESAW,
 };
 
 // Top-level builder functions

@@ -9,28 +9,6 @@ topic: a-plus-gaps
 
 After implementing upcasters (v0.15.10), evaluated what's needed to bring seesaw from "good library" to "A+ production framework."
 
-## Restate Evaluation
-
-The architecture is well-designed. Seesaw and Restate have clean separation of concerns:
-
-| Layer | Seesaw | Restate |
-|-------|--------|---------|
-| Event routing | Yes | No |
-| Handler DSL / composition | Yes | No |
-| Aggregates / ES primitives | Yes | No |
-| Durable execution | No | Yes |
-| Exactly-once side effects | No (idempotency keys) | Yes (journal) |
-| Crash recovery / replay | No | Yes |
-| Delayed timers | Basic (in-memory) | Native |
-| Retry with backoff | Basic | Native |
-
-The `Runtime` trait is the right seam. Small-handler decomposition IS the journaling granularity Restate wants.
-
-**What's missing for Restate story to be real:**
-1. No actual `RestateRuntime` implementation exists
-2. `Runtime` trait is too narrow — can't express `ctx.sleep()`, `ctx.awakeable()`, virtual object state
-3. No runnable Restate example
-
 ## Gaps (Priority Order)
 
 ### 1. `replay_events` must require `&UpcasterRegistry` (bug fix)

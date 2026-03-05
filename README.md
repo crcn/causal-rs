@@ -2,7 +2,7 @@
 
 **Event-driven orchestration for Rust.**
 
-Seesaw is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, and event sourcing — and plugs into [Restate](https://restate.dev/) for durable execution with zero code changes.
+Seesaw is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, event sourcing, and journaled side effects.
 
 ```rust
 use seesaw_core::{aggregators, handles, events, Context, Engine, Events};
@@ -362,13 +362,14 @@ On cold start, the engine loads the latest snapshot and replays only events afte
 | Store with persistence | Events persisted, manual snapshots via `save_snapshot()` |
 | Store with persistence + `snapshot_every(N)` | Auto-checkpoint every N events |
 
-### Replay-safe side effects
+### Journaled side effects
 
-Use `ctx.run()` for side effects that should be skipped during replay. With durable runtimes (Restate), results are journaled and replayed automatically:
+`ctx.run()` journals closure results in the Store. On retry, completed steps are replayed from the journal instead of re-executing:
 
 ```rust
 #[handler(on = OrderPlaced, id = "ship_order")]
 async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
+    // Journaled: if this handler retries, the shipping API call won't re-execute
     let tracking_id: String = ctx.run(|| async {
         ctx.deps().shipping_api.ship(event.order_id).await
     }).await?;
@@ -377,89 +378,30 @@ async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipp
 }
 ```
 
-- **DirectRuntime (default):** Executes the closure inline, returns the result directly.
-- **Durable runtime (Restate):** Journals the result. On replay, skips execution and returns the journaled value.
+**How it works:**
+- Each `run()` call gets a sequence number within the handler execution
+- On first execution, the closure runs and its result is persisted to the Store
+- On retry (after crash or error), journaled results are replayed — the closure is skipped
+- Journal entries are cleared atomically when the handler completes successfully
+- Errors are not journaled — they propagate normally and trigger the retry/DLQ path
 
-The return type must implement `Serialize + DeserializeOwned`. Custom runners implement the `SideEffectRunner` trait.
+**Determinism contract:** Code between `run()` calls must be deterministic. The same input event must produce the same sequence of `run()` calls. Non-determinism (random values, wall clock reads) between `run()` calls will break replay.
 
-## Restate Integration
+The return type must implement `Serialize + DeserializeOwned`. Store implementations provide the journal backend — the built-in `MemoryStore` includes a working implementation, and Postgres stores can use the same transaction for journal writes.
 
-Seesaw's `Runtime` trait is the integration point for durable execution. Implement it to run inside [Restate](https://restate.dev/) — each handler invocation becomes a journal entry, and aggregate state persists in Restate's K/V store. User code stays identical.
+## Durable Execution
 
-```
-Your code:    #[handler] async fn ship_order(...)
-Seesaw:       route event → match handler → extract fields → check transition guard
-Restate:      journal the invocation, replay on crash, persist K/V state
-```
+Seesaw provides durable execution natively through its `Store` trait:
 
-### Runtime trait
+| Concern | MemoryStore (default) | Postgres Store |
+|---------|----------------------|----------------|
+| Handler execution | Direct call | Direct call |
+| Side effect journaling | In-memory (lost on crash) | Durable (survives crash) |
+| Aggregate state | In-memory DashMap | Hydrated from event log |
+| Crash recovery | State lost | Replay from journal + event log |
+| Effect retries | In-memory queue | Persistent queue with reclaim |
 
-```rust
-pub trait Runtime: Send + Sync {
-    fn run(&self, handler_id: &str, execution: Pin<Box<dyn Future<...> + Send>>)
-        -> Pin<Box<dyn Future<...> + Send>>;
-    fn get_state(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>>;
-    fn set_state(&self, key: &str, value: Arc<dyn Any + Send + Sync>);
-}
-```
-
-### RestateRuntime
-
-```rust
-struct RestateRuntime<'a> {
-    ctx: &'a restate_sdk::Context<'a>,
-}
-
-impl Runtime for RestateRuntime<'_> {
-    fn run(
-        &self,
-        _handler_id: &str,
-        execution: Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<EventOutput>>> + Send>> {
-        let ctx = self.ctx;
-        Box::pin(async move { ctx.run(|| execution).await })
-    }
-
-    fn get_state(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
-        let json: serde_json::Value = self.ctx.get(key).await.ok().flatten()?;
-        Some(Arc::new(json))
-    }
-
-    fn set_state(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
-        if let Some(json) = value.downcast_ref::<serde_json::Value>() {
-            self.ctx.set(key, json.clone());
-        }
-    }
-}
-```
-
-Use it inside a Restate workflow:
-
-```rust
-impl OrderWorkflow for OrderWorkflowImpl {
-    async fn run(&self, ctx: &mut WorkflowContext, input: OrderPlaced) -> Result<()> {
-        let engine = Engine::new(deps)
-            .with_runtime(RestateRuntime { ctx })
-            .with_handler(ship_order())
-            .with_handler(notify_shipped());
-
-        engine.emit(input).settled().await?;
-        Ok(())
-    }
-}
-```
-
-### What changes with Restate
-
-| Concern | DirectRuntime (default) | RestateRuntime |
-|---------|------------------------|----------------|
-| Handler execution | Direct call | Journaled via `ctx.run()` |
-| Aggregate state | In-memory DashMap | Restate K/V store |
-| Crash recovery | State lost | Replay from journal |
-| Exactly-once effects | Idempotency keys | Restate journal |
-| Delayed execution | Seesaw delay queue | Restate timers |
-
-**What doesn't change:** `#[handler]`, `Engine`, `events![]`, `.extract()`, `.transition()`, `.accumulate()`, `Aggregate`, `Store`. User code is backend-agnostic.
+All durability features are built into the `Store` trait with default no-ops, so `MemoryStore` works out of the box for development and testing. Swap in a Postgres store for production durability — no code changes needed.
 
 ## Context API
 

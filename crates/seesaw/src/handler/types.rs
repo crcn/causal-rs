@@ -1,4 +1,4 @@
-//! Core effect types.
+//! Core handler types.
 
 use std::any::{Any, TypeId};
 use std::future::Future;
@@ -12,13 +12,13 @@ use uuid::Uuid;
 use super::context::Context;
 use crate::event_codec::EventCodec;
 
-/// Error handler called when an effect returns an error.
+/// Error handler called when a handler returns an error.
 ///
 /// The handler receives the error, event type that caused it, and context.
 /// It can emit failure events or log the error. The chain continues regardless.
 pub type ErrorHandler<D> = Arc<dyn Fn(Error, TypeId, Context<D>) -> BoxFuture<()> + Send + Sync>;
 
-/// Metadata passed to DLQ terminal mappers when an effect exhausts retries.
+/// Metadata passed to DLQ terminal mappers when a handler exhausts retries.
 #[derive(Debug, Clone)]
 pub struct DlqTerminalInfo {
     pub handler_id: String,
@@ -38,17 +38,17 @@ pub type GlobalDlqMapper = Arc<
 /// Alias for DLQ terminal mapper metadata used by macro APIs.
 pub type ErrorContext = DlqTerminalInfo;
 
-/// Optional mapper that converts exhausted effect failures into terminal events.
+/// Optional mapper that converts exhausted handler failures into terminal events.
 pub type DlqTerminalMapper = Arc<
     dyn Fn(Arc<dyn Any + Send + Sync>, TypeId, DlqTerminalInfo) -> Result<crate::EmittedEvent>
         + Send
         + Sync,
 >;
 
-/// A boxed future for async effect handlers.
+/// A boxed future for async handlers.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// Event emission result from effect handlers.
+/// Event emission result from handlers.
 #[derive(Debug, Clone)]
 pub enum Emit<E> {
     None,
@@ -81,13 +81,13 @@ impl<E> From<Option<E>> for Emit<E> {
     }
 }
 
-/// Join mode for queued batch fan-in effects.
+/// Join mode for queued batch fan-in handlers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinMode {
     SameBatch,
 }
 
-/// Output from an effect handler that returns an event.
+/// Output from a handler that returns an event.
 ///
 /// The payload is eagerly serialized at creation time, making `EventOutput`
 /// trivially journalable for durable execution.
@@ -251,7 +251,7 @@ impl std::fmt::Debug for EventOutput {
     }
 }
 
-/// Payload for effects that receive all events (type-erased).
+/// Payload for handlers that receive all events (type-erased).
 #[derive(Clone)]
 pub struct AnyEvent {
     /// The type-erased event value.
@@ -279,7 +279,7 @@ impl AnyEvent {
 
 /// A projection handler — receives ALL events, returns `Result<()>`, runs sequentially.
 ///
-/// Projections are fundamentally different from effects:
+/// Projections are fundamentally different from handlers:
 /// - They receive all events (no type routing)
 /// - They return `Result<()>` (no emitted events)
 /// - They run sequentially before other handlers
@@ -309,18 +309,18 @@ where
     }
 }
 
-/// An effect handler - no traits, just data with closures.
+/// A handler — no traits, just data with closures.
 pub struct Handler<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Human-readable identifier for this effect.
+    /// Human-readable identifier for this handler.
     pub id: String,
 
     /// Queue codec metadata for typed event handling/serialization.
     pub(crate) codecs: Vec<std::sync::Arc<EventCodec>>,
 
-    /// Determines if this effect handles the given event type.
+    /// Determines if this handler handles the given event type.
     pub(crate) can_handle: Arc<dyn Fn(TypeId) -> bool + Send + Sync>,
 
     /// Called once when the store is activated.
@@ -337,7 +337,7 @@ where
             + Sync,
     >,
 
-    /// Optional join mode - when set, effect executions are accumulated and
+    /// Optional join mode — when set, handler executions are accumulated and
     /// flushed in durable windows before invoking `join_batch_handler`.
     pub(crate) join_mode: Option<JoinMode>,
 
@@ -359,14 +359,14 @@ where
     /// Optional mapper for creating terminal events when an execution moves to DLQ.
     pub(crate) dlq_terminal_mapper: Option<DlqTerminalMapper>,
 
-    // Execution configuration (determines inline vs queued)
-    /// Force queued execution (default: false = inline)
+    // Execution configuration
+    /// Force background execution (default: false = default priority)
     pub(crate) queued: bool,
-    /// Delay before execution (triggers queued)
+    /// Delay before execution
     pub(crate) delay: Option<Duration>,
-    /// Execution timeout (triggers queued)
+    /// Execution timeout
     pub(crate) timeout: Option<Duration>,
-    /// Maximum retry attempts (default: 1 = no retry = inline)
+    /// Maximum retry attempts (default: 1 = no retry)
     pub(crate) max_attempts: u32,
     /// Exponential backoff base duration for retries.
     pub(crate) backoff: Option<Duration>,
@@ -403,7 +403,7 @@ impl<D> Handler<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Check if this effect handles the given event type.
+    /// Check if this handler handles the given event type.
     pub fn can_handle(&self, type_id: TypeId) -> bool {
         (self.can_handle)(type_id)
     }
@@ -457,8 +457,8 @@ where
         &self.codecs
     }
 
-    /// Check if this effect should execute inline.
-    pub fn is_inline(&self) -> bool {
+    /// Check if this handler uses default execution (no explicit background config).
+    pub fn is_default(&self) -> bool {
         !self.queued
             && self.delay.is_none()
             && self.timeout.is_none()

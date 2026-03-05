@@ -1,6 +1,6 @@
 //! In-memory queue store for seesaw Engine.
 //!
-//! Provides event and effect queues used by the Engine's built-in settle loop.
+//! Provides event and handler queues used by the Engine's built-in settle loop.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,13 +25,13 @@ use crate::types::*;
 pub struct MemoryStore {
     /// Event queue (FIFO per correlation_id)
     events: Arc<DashMap<Uuid, VecDeque<QueuedEvent>>>,
-    /// Effect executions queue
-    effects: Arc<Mutex<VecDeque<QueuedEffect>>>,
-    /// Completed effects (for idempotency)
-    completed_effects: Arc<DashMap<(Uuid, String), serde_json::Value>>,
-    /// In-flight effects: populated by poll_next_effect, consumed by
-    /// resolve_effect(Retry) to reconstruct the execution for re-enqueueing.
-    in_flight: Arc<DashMap<(Uuid, String), QueuedEffect>>,
+    /// Handler executions queue
+    handler_queue: Arc<Mutex<VecDeque<QueuedHandler>>>,
+    /// Completed handlers (for idempotency)
+    completed_handlers: Arc<DashMap<(Uuid, String), serde_json::Value>>,
+    /// In-flight handlers: populated by poll_next_handler, consumed by
+    /// resolve_handler(Retry) to reconstruct the execution for re-enqueueing.
+    in_flight: Arc<DashMap<(Uuid, String), QueuedHandler>>,
     /// Durable-ish join windows for same-batch fan-in (in-memory only).
     join_windows: Arc<Mutex<HashMap<(String, Uuid, Uuid), MemoryJoinWindow>>>,
     // ── Event persistence ────────────────────────────────────────
@@ -47,6 +47,8 @@ pub struct MemoryStore {
     cancelled: Arc<DashMap<Uuid, Instant>>,
     /// TTL for cancelled entries (default 1 hour).
     cancel_ttl: std::time::Duration,
+    /// Journal entries keyed by (handler_id, event_id).
+    journal: Arc<DashMap<(String, Uuid), Vec<JournalEntry>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,8 +71,8 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self {
             events: Arc::new(DashMap::new()),
-            effects: Arc::new(Mutex::new(VecDeque::new())),
-            completed_effects: Arc::new(DashMap::new()),
+            handler_queue: Arc::new(Mutex::new(VecDeque::new())),
+            completed_handlers: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
             join_windows: Arc::new(Mutex::new(HashMap::new())),
             global_log: Arc::new(Mutex::new(Vec::new())),
@@ -79,6 +81,7 @@ impl MemoryStore {
             persistence_enabled: false,
             cancelled: Arc::new(DashMap::new()),
             cancel_ttl: std::time::Duration::from_secs(3600),
+            journal: Arc::new(DashMap::new()),
         }
     }
 
@@ -99,13 +102,18 @@ impl MemoryStore {
         self
     }
 
+    /// Insert a queued handler directly (for test setup).
+    pub async fn publish_handler_for_test(&self, handler: QueuedHandler) {
+        self.handler_queue.lock().push_back(handler);
+    }
+
     /// Access the global event log (for test assertions).
     pub fn global_log(&self) -> &Mutex<Vec<PersistedEvent>> {
         &self.global_log
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn insert_effect_intent(
+    async fn insert_handler_intent(
         &self,
         event_id: Uuid,
         handler_id: String,
@@ -123,7 +131,7 @@ impl MemoryStore {
         hops: i32,
         join_window_timeout_seconds: Option<i32>,
     ) -> Result<()> {
-        let execution = QueuedEffect {
+        let execution = QueuedHandler {
             event_id,
             handler_id,
             correlation_id,
@@ -142,7 +150,7 @@ impl MemoryStore {
             join_window_timeout_seconds,
         };
 
-        let mut queue = self.effects.lock();
+        let mut queue = self.handler_queue.lock();
         queue.push_back(execution);
         Ok(())
     }
@@ -171,8 +179,8 @@ impl Store for MemoryStore {
     async fn complete_event(&self, result: EventOutcome) -> Result<()> {
         match result {
             EventOutcome::Processed(commit) => {
-                for intent in commit.queued_effect_intents {
-                    self.insert_effect_intent(
+                for intent in commit.queued_handler_intents {
+                    self.insert_handler_intent(
                         commit.event_id,
                         intent.handler_id,
                         commit.correlation_id,
@@ -192,18 +200,15 @@ impl Store for MemoryStore {
                     .await?;
                 }
 
-                for event in commit.emitted_events {
-                    self.publish(event).await?;
-                }
-
-                for failure in commit.inline_effect_failures {
-                    self.resolve_effect(EffectResolution::DeadLetter(EffectDlq {
+                for failure in commit.projection_failures {
+                    self.resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
                         event_id: commit.event_id,
                         handler_id: failure.handler_id,
                         error: failure.error,
                         reason: failure.reason,
                         attempts: failure.attempts,
                         events_to_publish: Vec::new(),
+                        log_entries: Vec::new(),
                     }))
                     .await?;
                 }
@@ -226,10 +231,17 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn poll_next_effect(&self) -> Result<Option<QueuedEffect>> {
-        let mut queue = self.effects.lock();
+    async fn poll_next_handler(&self) -> Result<Option<QueuedHandler>> {
+        let mut queue = self.handler_queue.lock();
         let now = Utc::now();
-        if let Some(pos) = queue.iter().position(|e| e.execute_at <= now) {
+        // Find the ready handler with highest priority (lowest number)
+        if let Some(pos) = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.execute_at <= now)
+            .min_by_key(|(_, e)| e.priority)
+            .map(|(i, _)| i)
+        {
             let execution = queue.remove(pos).unwrap();
             // Track in-flight so resolve_effect(Retry) can reconstruct for re-enqueueing
             self.in_flight.insert(
@@ -242,23 +254,25 @@ impl Store for MemoryStore {
         }
     }
 
-    async fn earliest_pending_effect_at(&self) -> Result<Option<DateTime<Utc>>> {
-        let queue = self.effects.lock();
+    async fn earliest_pending_handler_at(&self) -> Result<Option<DateTime<Utc>>> {
+        let queue = self.handler_queue.lock();
         Ok(queue.iter().map(|e| e.execute_at).min())
     }
 
-    async fn resolve_effect(&self, resolution: EffectResolution) -> Result<()> {
+    async fn resolve_handler(&self, resolution: HandlerResolution) -> Result<()> {
         match resolution {
-            EffectResolution::Complete(completion) => {
+            HandlerResolution::Complete(completion) => {
                 self.in_flight
                     .remove(&(completion.event_id, completion.handler_id.clone()));
-                self.completed_effects
+                self.clear_journal(&completion.handler_id, completion.event_id)
+                    .await?;
+                self.completed_handlers
                     .insert((completion.event_id, completion.handler_id), completion.result);
                 for event in completion.events_to_publish {
                     self.publish(event).await?;
                 }
             }
-            EffectResolution::Retry {
+            HandlerResolution::Retry {
                 event_id,
                 handler_id,
                 error,
@@ -276,16 +290,16 @@ impl Store for MemoryStore {
                 if let Some((_, mut execution)) = self.in_flight.remove(&key) {
                     execution.attempts = new_attempts;
                     execution.execute_at = next_execute_at;
-                    let mut queue = self.effects.lock();
+                    let mut queue = self.handler_queue.lock();
                     queue.push_back(execution);
                 } else {
                     tracing::warn!(
-                        "resolve_effect(Retry): no in-flight execution found for {}:{} — retry will be lost",
+                        "resolve_handler(Retry): no in-flight execution found for {}:{} — retry will be lost",
                         key.0, handler_id
                     );
                 }
             }
-            EffectResolution::DeadLetter(dlq) => {
+            HandlerResolution::DeadLetter(dlq) => {
                 self.in_flight
                     .remove(&(dlq.event_id, dlq.handler_id.clone()));
                 eprintln!(
@@ -543,8 +557,8 @@ impl Store for MemoryStore {
             .map(|q| q.len())
             .unwrap_or(0);
 
-        let pending_effects = self
-            .effects
+        let pending_handlers = self
+            .handler_queue
             .lock()
             .iter()
             .filter(|e| e.correlation_id == correlation_id)
@@ -552,7 +566,7 @@ impl Store for MemoryStore {
 
         Ok(QueueStatus {
             pending_events,
-            pending_effects,
+            pending_handlers,
             dead_lettered: 0,
         })
     }
@@ -570,5 +584,41 @@ impl Store for MemoryStore {
             }
             None => Ok(false),
         }
+    }
+
+    // ── Handler journaling ────────────────────────────────────────
+
+    async fn load_journal(
+        &self,
+        handler_id: &str,
+        event_id: Uuid,
+    ) -> Result<Vec<JournalEntry>> {
+        let key = (handler_id.to_string(), event_id);
+        Ok(self.journal.get(&key).map(|v| v.clone()).unwrap_or_default())
+    }
+
+    async fn append_journal(
+        &self,
+        handler_id: &str,
+        event_id: Uuid,
+        seq: u32,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        let key = (handler_id.to_string(), event_id);
+        self.journal
+            .entry(key)
+            .or_default()
+            .push(JournalEntry { seq, value });
+        Ok(())
+    }
+
+    async fn clear_journal(
+        &self,
+        handler_id: &str,
+        event_id: Uuid,
+    ) -> Result<()> {
+        let key = (handler_id.to_string(), event_id);
+        self.journal.remove(&key);
+        Ok(())
     }
 }

@@ -92,7 +92,7 @@ impl EmitFuture {
 
     /// Settle: publish event, then drive the entire causal tree to completion.
     ///
-    /// Returns after all inline and queued handlers (and their emitted events)
+    /// Returns after all handlers (and their emitted events)
     /// have been fully processed.
     pub fn settled(self) -> SettleFuture {
         SettleFuture {

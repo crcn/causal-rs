@@ -1,4 +1,4 @@
-//! Effect builder functions and types.
+//! Handler builder functions and types.
 
 use std::any::TypeId;
 use std::future::Future;
@@ -13,7 +13,7 @@ use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Handler, JoinMo
 use crate::event_codec::EventCodec;
 
 #[track_caller]
-fn default_effect_id(prefix: &str) -> String {
+fn default_handler_id(prefix: &str) -> String {
     let location = std::panic::Location::caller();
     format!(
         "{prefix}@{}:{}:{}",
@@ -23,10 +23,10 @@ fn default_effect_id(prefix: &str) -> String {
     )
 }
 
-/// Marker for typed event effects (`on::<E>()`).
+/// Marker for typed event handlers (`on::<E>()`).
 pub struct Typed<E>(PhantomData<E>);
 
-/// Marker for any event effects (`on_any()`).
+/// Marker for any event handlers (`on_any()`).
 pub struct Untyped;
 
 /// Marker for no filter.
@@ -77,7 +77,7 @@ where
     }
 }
 
-/// A unified builder for effects using a compile-time type-phase pattern.
+/// A unified builder for handlers using a compile-time type-phase pattern.
 pub struct HandlerBuilder<EventType, Filter, Started> {
     filter: Filter,
     started: Started,
@@ -94,7 +94,7 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
     _marker: PhantomData<EventType>,
 }
 
-/// Create an effect that handles a specific event type.
+/// Create a handler for a specific event type.
 pub fn on<E>() -> HandlerBuilder<Typed<E>, NoFilter, NoStarted>
 where
     E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
@@ -116,7 +116,7 @@ where
     }
 }
 
-/// Create an effect that handles all events (observer pattern).
+/// Create a handler for all events (observer pattern).
 pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
     HandlerBuilder {
         filter: NoFilter,
@@ -266,7 +266,7 @@ impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
 }
 
 impl<EventType, Filter, Started> HandlerBuilder<EventType, Filter, Started> {
-    /// Set a custom ID for this effect (default: auto-generated).
+    /// Set a custom ID for this handler (default: auto-generated).
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
@@ -323,7 +323,7 @@ where
         self
     }
 
-    /// Add a delay before execution (triggers queued execution).
+    /// Add a delay before execution.
     pub fn delayed(mut self, duration: Duration) -> Self {
         self.delay = Some(duration);
         self.queued = true;
@@ -331,7 +331,7 @@ where
         self
     }
 
-    /// Set execution timeout (triggers queued execution).
+    /// Set execution timeout.
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
         self.queued = true;
@@ -341,8 +341,8 @@ where
 
     /// Set maximum retry attempts (default: 1 = no retry).
     ///
-    /// Triggers queued execution. Use `.retry(1)` to force queued
-    /// execution without retries.
+    /// Use `.retry(1)` to explicitly mark a handler as background
+    /// without retries.
     pub fn retry(mut self, attempts: u32) -> Self {
         self.max_attempts = attempts;
         self.queued = true;
@@ -365,15 +365,14 @@ where
 
     /// Set execution priority (lower = higher priority).
     ///
-    /// For inline handlers, lower priority runs first.
-    /// For queued handlers, lower priority is polled first.
+    /// Handlers with lower priority are polled first.
     pub fn priority(mut self, level: i32) -> Self {
         self.priority = Some(level);
         self
     }
 }
 
-/// Builder for durable same-batch join effects.
+/// Builder for durable same-batch join handlers.
 pub struct JoinHandlerBuilder<E, Started> {
     inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
     mode: JoinMode,
@@ -383,7 +382,7 @@ impl<E, Started> HandlerBuilder<Typed<E>, NoFilter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
-    /// Configure this effect as a durable accumulation effect.
+    /// Configure this handler as a durable accumulation handler.
     pub fn accumulate(self) -> JoinHandlerBuilder<E, Started> {
         JoinHandlerBuilder {
             inner: self,
@@ -423,7 +422,7 @@ where
             .inner
             .id
             .take()
-            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
+            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
         let join_mode = self.mode;
         let input_codec = self
             .inner
@@ -555,13 +554,13 @@ where
     {
         let target = TypeId::of::<E>();
         let filter = self.filter;
-        // Always register input codec so Engine::decode_event works for both inline and queued handlers
+        // Always register input codec so Engine::decode_event works for all handlers
         let input_codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
         let dlq_terminal_mapper = self.dlq_terminal_mapper;
 
         let id = self
             .id
-            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
+            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
 
         Handler {
             id,
@@ -605,7 +604,7 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
         H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Events>> + Send + 'static,
     {
-        let id = self.id.unwrap_or_else(|| default_effect_id("effect_any"));
+        let id = self.id.unwrap_or_else(|| default_handler_id("handler_any"));
 
         Handler {
             id,
@@ -649,7 +648,7 @@ where
     {
         let id = self
             .id
-            .unwrap_or_else(|| default_effect_id("effect_any_started"));
+            .unwrap_or_else(|| default_handler_id("handler_any_started"));
         let started = self.started.0;
 
         Handler {
@@ -768,7 +767,7 @@ where
         let id = self
             .inner
             .id
-            .unwrap_or_else(|| default_effect_id(std::any::type_name::<E>()));
+            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
 
         let codec = self.inner.codec;
 
@@ -834,7 +833,7 @@ mod tests {
 
     #[test]
     fn filter_does_not_force_queued_execution() {
-        let effect = on::<QueueEvent>()
+        let handler = on::<QueueEvent>()
             .id("filter_probe")
             .filter(|event| event.value > 0)
             .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move {
@@ -842,8 +841,8 @@ mod tests {
             });
 
         assert!(
-            effect.is_inline(),
-            "filter() should not change inline/queued execution mode"
+            handler.is_default(),
+            "filter() should not change handler execution mode"
         );
     }
 }

@@ -117,7 +117,7 @@ impl Apply<OrderShipped> for Order {
 // ═══════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn parent_event_id_set_on_inline_chain() -> Result<()> {
+async fn parent_event_id_set_on_handler_chain() -> Result<()> {
     let seen_parent: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sp = seen_parent.clone();
 
@@ -529,7 +529,7 @@ async fn extract_returns_none_skips_handler() -> Result<()> {
 // ═══════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn inline_handlers_execute_in_priority_order() -> Result<()> {
+async fn handlers_execute_in_priority_order() -> Result<()> {
     let execution_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let eo1 = execution_order.clone();
     let eo2 = execution_order.clone();
@@ -746,7 +746,7 @@ async fn hops_increment_through_chain() -> Result<()> {
 // ═══════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn inline_handler_error_does_not_stop_other_handlers() -> Result<()> {
+async fn handler_error_does_not_stop_other_handlers() -> Result<()> {
     let success_counter = Arc::new(AtomicUsize::new(0));
     let sc = success_counter.clone();
 
