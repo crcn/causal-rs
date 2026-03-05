@@ -199,6 +199,11 @@ impl Events {
         }
     }
 
+    /// Iterate over the event outputs by reference.
+    pub fn iter(&self) -> impl Iterator<Item = &EventOutput> {
+        self.outputs.iter()
+    }
+
     /// Convert into the internal `Vec<EventOutput>`.
     pub fn into_outputs(self) -> Vec<EventOutput> {
         self.outputs
