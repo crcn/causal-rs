@@ -130,6 +130,7 @@ impl MemoryStore {
         priority: i32,
         hops: i32,
         join_window_timeout_seconds: Option<i32>,
+        ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<()> {
         let execution = QueuedHandler {
             event_id,
@@ -148,6 +149,7 @@ impl MemoryStore {
             hops,
             attempts: 0,
             join_window_timeout_seconds,
+            ephemeral,
         };
 
         let mut queue = self.handler_queue.lock();
@@ -196,6 +198,7 @@ impl Store for MemoryStore {
                         intent.priority,
                         intent.hops,
                         intent.join_window_timeout_seconds,
+                        commit.ephemeral.clone(),
                     )
                     .await?;
                 }

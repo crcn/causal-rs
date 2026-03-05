@@ -971,6 +971,7 @@ mod tests {
             hops: 0,
             attempts: 1,
             join_window_timeout_seconds: None,
+            ephemeral: None,
         };
         // Insert directly into handler queue, then poll to put in-flight
         store.publish_handler_for_test(queued).await;

@@ -189,6 +189,7 @@ where
             event_payload: event.payload.clone(),
             queued_handler_intents,
             projection_failures,
+            ephemeral: event.ephemeral.clone(),
         })
     }
 
@@ -234,7 +235,7 @@ where
         };
 
         let (typed_event, type_id) =
-            self.decode_event(&execution.event_type, &execution.event_payload, None)?;
+            self.decode_event(&execution.event_type, &execution.event_payload, execution.ephemeral.as_ref())?;
 
         let idempotency_key = Uuid::new_v5(
             &NAMESPACE_SEESAW,
@@ -455,10 +456,13 @@ where
     ) -> Result<(Arc<dyn Any + Send + Sync>, TypeId)> {
         // Fast path: if the ephemeral sidecar is present and a codec is registered,
         // use the original typed event directly (preserves #[serde(skip)] fields).
+        // Skip when upcasters exist — the ephemeral holds the pre-upcasted shape.
         if let Some(typed) = ephemeral {
-            if let Some(codec) = self.handlers.find_codec_by_event_type(event_type) {
-                if (*typed).type_id() == codec.type_id {
-                    return Ok((Arc::clone(typed), codec.type_id));
+            if self.upcasters.is_empty() {
+                if let Some(codec) = self.handlers.find_codec_by_event_type(event_type) {
+                    if (**typed).type_id() == codec.type_id {
+                        return Ok((Arc::clone(typed), codec.type_id));
+                    }
                 }
             }
         }

@@ -3099,3 +3099,395 @@ async fn journal_cleared_after_successful_handler() -> Result<()> {
     );
     Ok(())
 }
+
+// ── Ephemeral sidecar tests ──────────────────────────────────────────
+
+/// Event with a #[serde(skip)] field — will be Default on JSON round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EventWithSkip {
+    id: i32,
+    #[serde(skip)]
+    transient: Vec<String>,
+}
+
+/// Core scenario: handler receives the original typed event with #[serde(skip)] fields preserved.
+#[tokio::test]
+async fn ephemeral_preserves_serde_skip_fields() -> Result<()> {
+    let received = Arc::new(Mutex::new(None::<(i32, usize)>));
+    let received_clone = received.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<EventWithSkip>()
+            .id("check_skip")
+            .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
+                let r = received_clone.clone();
+                async move {
+                    *r.lock() = Some((event.id, event.transient.len()));
+                    Ok(events![])
+                }
+            }),
+    );
+
+    engine
+        .emit(EventWithSkip {
+            id: 42,
+            transient: vec!["a".into(), "b".into(), "c".into()],
+        })
+        .settled()
+        .await?;
+
+    let (id, len) = received.lock().unwrap();
+    assert_eq!(id, 42);
+    assert_eq!(len, 3, "ephemeral should preserve #[serde(skip)] fields during live dispatch");
+    Ok(())
+}
+
+/// Ephemeral flows through a handler chain: A → handler → B → handler.
+/// The child event (B) emitted by the first handler should also have its ephemeral preserved.
+#[tokio::test]
+async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Step1 {
+        value: i32,
+        #[serde(skip)]
+        extra: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Step2 {
+        value: i32,
+        #[serde(skip)]
+        computed: String,
+    }
+
+    let final_received = Arc::new(Mutex::new(None::<(i32, String)>));
+    let final_clone = final_received.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<Step1>()
+                .id("step1_handler")
+                .then(|event: Arc<Step1>, _ctx: Context<Deps>| async move {
+                    // Verify step1 ephemeral works
+                    assert_eq!(event.extra, vec![1, 2, 3]);
+                    Ok(events![Step2 {
+                        value: event.value * 2,
+                        computed: "from_step1".to_string(),
+                    }])
+                }),
+        )
+        .with_handler(
+            handler::on::<Step2>()
+                .id("step2_handler")
+                .then(move |event: Arc<Step2>, _ctx: Context<Deps>| {
+                    let r = final_clone.clone();
+                    async move {
+                        *r.lock() = Some((event.value, event.computed.clone()));
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(Step1 {
+            value: 5,
+            extra: vec![1, 2, 3],
+        })
+        .settled()
+        .await?;
+
+    let (value, computed) = final_received.lock().clone().unwrap();
+    assert_eq!(value, 10);
+    assert_eq!(computed, "from_step1", "child event ephemeral should be preserved");
+    Ok(())
+}
+
+/// Multiple handlers on the same event all see the ephemeral.
+#[tokio::test]
+async fn ephemeral_shared_across_multiple_handlers() -> Result<()> {
+    let seen_a = Arc::new(Mutex::new(None::<usize>));
+    let seen_b = Arc::new(Mutex::new(None::<usize>));
+    let seen_a_clone = seen_a.clone();
+    let seen_b_clone = seen_b.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<EventWithSkip>()
+                .id("handler_a")
+                .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
+                    let r = seen_a_clone.clone();
+                    async move {
+                        *r.lock() = Some(event.transient.len());
+                        Ok(events![])
+                    }
+                }),
+        )
+        .with_handler(
+            handler::on::<EventWithSkip>()
+                .id("handler_b")
+                .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
+                    let r = seen_b_clone.clone();
+                    async move {
+                        *r.lock() = Some(event.transient.len());
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(EventWithSkip {
+            id: 1,
+            transient: vec!["x".into(), "y".into()],
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(*seen_a.lock(), Some(2));
+    assert_eq!(*seen_b.lock(), Some(2));
+    Ok(())
+}
+
+/// Fan-out batch: each item in the batch preserves ephemeral independently.
+#[tokio::test]
+async fn ephemeral_preserved_in_batch_fanout() -> Result<()> {
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Trigger {
+        count: usize,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BatchChild {
+        index: usize,
+        #[serde(skip)]
+        secret: String,
+    }
+
+    let secrets = Arc::new(Mutex::new(Vec::<String>::new()));
+    let secrets_clone = secrets.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<Trigger>()
+                .id("fan_out")
+                .then(|event: Arc<Trigger>, _ctx: Context<Deps>| async move {
+                    Ok(events![..(0..event.count).map(|i| BatchChild {
+                        index: i,
+                        secret: format!("secret_{}", i),
+                    })])
+                }),
+        )
+        .with_handler(
+            handler::on::<BatchChild>()
+                .id("collect")
+                .then(move |event: Arc<BatchChild>, _ctx: Context<Deps>| {
+                    let s = secrets_clone.clone();
+                    async move {
+                        s.lock().push(event.secret.clone());
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(Trigger { count: 3 })
+        .settled()
+        .await?;
+
+    let mut collected = secrets.lock().clone();
+    collected.sort();
+    assert_eq!(collected, vec!["secret_0", "secret_1", "secret_2"]);
+    Ok(())
+}
+
+/// on_any handler receives the ephemeral via downcast.
+#[tokio::test]
+async fn ephemeral_available_via_on_any_handler() -> Result<()> {
+    use seesaw_core::handler::AnyEvent;
+
+    let received_len = Arc::new(AtomicUsize::new(0));
+    let received_clone = received_len.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on_any()
+            .id("any_check")
+            .then(move |event: AnyEvent, _ctx: Context<Deps>| {
+                let r = received_clone.clone();
+                async move {
+                    if let Some(e) = event.downcast::<EventWithSkip>() {
+                        r.store(e.transient.len(), Ordering::SeqCst);
+                    }
+                    Ok(events![])
+                }
+            }),
+    );
+
+    engine
+        .emit(EventWithSkip {
+            id: 99,
+            transient: vec!["one".into(), "two".into()],
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(received_len.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+/// Projection (inline observer) also sees the ephemeral via AnyEvent downcast.
+#[tokio::test]
+async fn ephemeral_available_in_projection() -> Result<()> {
+    use seesaw_core::handler::{project, AnyEvent};
+
+    let projection_len = Arc::new(AtomicUsize::new(0));
+    let projection_clone = projection_len.clone();
+
+    let engine = Engine::new(Deps).with_projection(
+        project("proj_check")
+            .then(move |event: AnyEvent, _ctx: Context<Deps>| {
+                let r = projection_clone.clone();
+                async move {
+                    if let Some(e) = event.downcast::<EventWithSkip>() {
+                        r.store(e.transient.len(), Ordering::SeqCst);
+                    }
+                    Ok(())
+                }
+            }),
+    );
+
+    engine
+        .emit(EventWithSkip {
+            id: 7,
+            transient: vec!["a".into()],
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(projection_len.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+/// Ephemeral works with emit_output (EventOutput path).
+#[tokio::test]
+async fn ephemeral_via_emit_output() -> Result<()> {
+    use seesaw_core::handler::EventOutput;
+
+    let received = Arc::new(Mutex::new(None::<usize>));
+    let received_clone = received.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<EventWithSkip>()
+            .id("output_check")
+            .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
+                let r = received_clone.clone();
+                async move {
+                    *r.lock() = Some(event.transient.len());
+                    Ok(events![])
+                }
+            }),
+    );
+
+    engine
+        .emit_output(EventOutput::new(EventWithSkip {
+            id: 50,
+            transient: vec!["q".into(), "w".into(), "e".into(), "r".into()],
+        }))
+        .settled()
+        .await?;
+
+    assert_eq!(*received.lock(), Some(4));
+    Ok(())
+}
+
+/// DLQ on_failure handler still works — ephemeral doesn't interfere with error path.
+#[tokio::test]
+async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct FailSkip {
+        id: i32,
+        #[serde(skip)]
+        transient: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct FailedSkip {
+        error: String,
+    }
+
+    let dlq_received = Arc::new(Mutex::new(None::<String>));
+    let dlq_clone = dlq_received.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handler(
+            handler::on::<FailSkip>()
+                .id("always_fail")
+                .retry(1)
+                .on_failure(|_event, info: seesaw_core::handler::ErrorContext| FailedSkip {
+                    error: info.error,
+                })
+                .then(|_event: Arc<FailSkip>, _ctx: Context<Deps>| async move {
+                    anyhow::bail!("intentional failure")
+                }),
+        )
+        .with_handler(
+            handler::on::<FailedSkip>()
+                .id("catch_failure")
+                .then(move |event: Arc<FailedSkip>, _ctx: Context<Deps>| {
+                    let r = dlq_clone.clone();
+                    async move {
+                        *r.lock() = Some(event.error.clone());
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(FailSkip {
+            id: 1,
+            transient: "will_be_lost".into(),
+        })
+        .settled()
+        .await?;
+
+    assert!(dlq_received.lock().is_some(), "DLQ terminal event should fire");
+    Ok(())
+}
+
+/// Extract handler receives ephemeral-derived data correctly.
+#[tokio::test]
+async fn ephemeral_with_extract_handler() -> Result<()> {
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct ExtractEvent {
+        id: i32,
+        name: String,
+        #[serde(skip)]
+        secret_data: Vec<u8>,
+    }
+
+    let received_id = Arc::new(AtomicI32::new(0));
+    let received_clone = received_id.clone();
+
+    let engine = Engine::new(Deps).with_handler(
+        handler::on::<ExtractEvent>()
+            .id("extract_check")
+            .extract(|e: &ExtractEvent| Some(e.id))
+            .then(move |id: i32, _ctx: Context<Deps>| {
+                let r = received_clone.clone();
+                async move {
+                    r.store(id, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+    );
+
+    engine
+        .emit(ExtractEvent {
+            id: 77,
+            name: "test".into(),
+            secret_data: vec![1, 2, 3],
+        })
+        .settled()
+        .await?;
+
+    assert_eq!(received_id.load(Ordering::SeqCst), 77);
+    Ok(())
+}

@@ -119,6 +119,8 @@ pub struct EventCommit {
     pub queued_handler_intents: Vec<HandlerIntent>,
     /// Projection failures to persist to DLQ.
     pub projection_failures: Vec<ProjectionFailure>,
+    /// Original typed event (live dispatch only, shared across all handler intents).
+    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// Persisted intent for a queued handler execution.
@@ -186,6 +188,8 @@ pub struct QueuedHandler {
     pub hops: i32,
     pub attempts: i32,
     pub join_window_timeout_seconds: Option<i32>,
+    /// Original typed event (live dispatch only).
+    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// Event worker configuration.
