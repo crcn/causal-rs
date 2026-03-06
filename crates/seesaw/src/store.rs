@@ -268,4 +268,26 @@ pub trait Store: Send + Sync {
     async fn queue_status(&self, _correlation_id: Uuid) -> Result<QueueStatus> {
         Ok(QueueStatus::default())
     }
+
+    // ── Handler descriptions (optional) ─────────────────────────────
+
+    /// Upsert handler gate descriptions for a correlation.
+    ///
+    /// Merges `descriptions` into any existing entries for `correlation_id`.
+    /// Each key is a handler ID, each value is the serialized describe output.
+    async fn set_handler_descriptions(
+        &self,
+        _correlation_id: Uuid,
+        _descriptions: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read all handler gate descriptions for a correlation.
+    async fn get_handler_descriptions(
+        &self,
+        _correlation_id: Uuid,
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+        Ok(std::collections::HashMap::new())
+    }
 }

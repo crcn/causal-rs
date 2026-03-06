@@ -121,6 +121,8 @@ pub struct EventCommit {
     pub projection_failures: Vec<ProjectionFailure>,
     /// Original typed event (live dispatch only, shared across all handler intents).
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
+    /// Handler gate descriptions (handler_id → serialized describe output).
+    pub handler_descriptions: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Persisted intent for a queued handler execution.

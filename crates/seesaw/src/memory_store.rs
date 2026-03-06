@@ -49,6 +49,8 @@ pub struct MemoryStore {
     cancel_ttl: std::time::Duration,
     /// Journal entries keyed by (handler_id, event_id).
     journal: Arc<DashMap<(String, Uuid), Vec<JournalEntry>>>,
+    /// Handler gate descriptions keyed by correlation_id.
+    handler_descriptions: Arc<DashMap<Uuid, HashMap<String, serde_json::Value>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,7 @@ impl MemoryStore {
             cancelled: Arc::new(DashMap::new()),
             cancel_ttl: std::time::Duration::from_secs(3600),
             journal: Arc::new(DashMap::new()),
+            handler_descriptions: Arc::new(DashMap::new()),
         }
     }
 
@@ -626,5 +629,26 @@ impl Store for MemoryStore {
         let key = (handler_id.to_string(), event_id);
         self.journal.remove(&key);
         Ok(())
+    }
+
+    async fn set_handler_descriptions(
+        &self,
+        correlation_id: Uuid,
+        descriptions: HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let mut entry = self.handler_descriptions.entry(correlation_id).or_default();
+        entry.extend(descriptions);
+        Ok(())
+    }
+
+    async fn get_handler_descriptions(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<HashMap<String, serde_json::Value>> {
+        Ok(self
+            .handler_descriptions
+            .get(&correlation_id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default())
     }
 }

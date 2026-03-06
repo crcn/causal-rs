@@ -109,7 +109,35 @@ where
             .filter(|h| h.can_handle(event_type_id))
             .collect();
 
-        // 5. Create queued handler intents for ALL matching handlers
+        // 5. Call describe() on matching handlers that have it
+        let mut handler_descriptions = std::collections::HashMap::new();
+        for handler in &matching_handlers {
+            if handler.has_describe() {
+                let ctx = self.make_context(
+                    handler.id.clone(),
+                    format!("describe::{}", handler.id),
+                    event.correlation_id,
+                    event.event_id,
+                    event.parent_id,
+                );
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.call_describe(&ctx)
+                })) {
+                    Ok(Some(value)) => {
+                        handler_descriptions.insert(handler.id.clone(), value);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        tracing::warn!(
+                            handler_id = %handler.id,
+                            "describe() panicked, skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 6. Create queued handler intents for ALL matching handlers
         let mut queued_handler_intents = Vec::new();
         for handler in &matching_handlers {
             let execute_at = match handler.delay {
@@ -190,6 +218,7 @@ where
             queued_handler_intents,
             projection_failures,
             ephemeral: event.ephemeral.clone(),
+            handler_descriptions,
         })
     }
 

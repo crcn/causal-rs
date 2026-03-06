@@ -382,6 +382,8 @@ where
     pub(crate) backoff: Option<Duration>,
     /// Execution priority (lower = higher priority).
     pub(crate) priority: Option<i32>,
+    /// Optional introspection closure for flow visualization.
+    pub(crate) describe: Option<Arc<dyn Fn(&Context<D>) -> serde_json::Value + Send + Sync>>,
 }
 
 impl<D> Clone for Handler<D>
@@ -405,6 +407,7 @@ where
             max_attempts: self.max_attempts,
             backoff: self.backoff,
             priority: self.priority,
+            describe: self.describe.clone(),
         }
     }
 }
@@ -465,6 +468,16 @@ where
     /// Internal queue codec metadata.
     pub(crate) fn codecs(&self) -> &[std::sync::Arc<EventCodec>] {
         &self.codecs
+    }
+
+    /// Check if this handler has a describe closure.
+    pub fn has_describe(&self) -> bool {
+        self.describe.is_some()
+    }
+
+    /// Call the describe closure if present.
+    pub fn call_describe(&self, ctx: &Context<D>) -> Option<serde_json::Value> {
+        self.describe.as_ref().map(|f| f(ctx))
     }
 
     /// Check if this handler uses default execution (no explicit background config).

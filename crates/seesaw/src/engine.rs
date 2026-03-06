@@ -412,6 +412,22 @@ where
 
                 match executor.execute_event(&event, &event_config).await {
                     Ok(commit) => {
+                        if !commit.handler_descriptions.is_empty() {
+                            if let Err(e) = self
+                                .store
+                                .set_handler_descriptions(
+                                    commit.correlation_id,
+                                    commit.handler_descriptions.clone(),
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    correlation_id = %commit.correlation_id,
+                                    "Failed to persist handler descriptions: {}",
+                                    e
+                                );
+                            }
+                        }
                         self.store
                             .complete_event(EventOutcome::Processed(commit))
                             .await?;

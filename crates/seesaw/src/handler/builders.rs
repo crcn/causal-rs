@@ -37,9 +37,10 @@ pub struct NoFilter;
 /// Created by calling `.filter(predicate)` on a `HandlerBuilder`.
 /// The predicate receives both the event and the handler [`Context`],
 /// giving access to aggregate state, deps, etc.
-pub struct FilteredHandlerBuilder<E, Started, D, G> {
+pub struct FilteredHandlerBuilder<E, Started, D: Send + Sync + 'static, G> {
     inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
     filter_fn: G,
+    describe_fn: Option<Arc<dyn Fn(&super::context::Context<D>) -> serde_json::Value + Send + Sync>>,
     _deps: PhantomData<D>,
 }
 
@@ -219,6 +220,7 @@ where
         FilteredHandlerBuilder {
             inner: self,
             filter_fn: predicate,
+            describe_fn: None,
             _deps: PhantomData,
         }
     }
@@ -477,6 +479,7 @@ where
             max_attempts: self.inner.max_attempts.max(1),
             backoff: self.inner.backoff,
             priority: self.inner.priority,
+            describe: None,
         }
     }
 }
@@ -592,6 +595,7 @@ where
             max_attempts: self.max_attempts,
             backoff: self.backoff,
             priority: self.priority,
+            describe: None,
         }
     }
 }
@@ -630,6 +634,7 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
             max_attempts: self.max_attempts,
             backoff: self.backoff,
             priority: self.priority,
+            describe: None,
         }
     }
 }
@@ -675,6 +680,7 @@ where
             max_attempts: self.max_attempts,
             backoff: self.backoff,
             priority: self.priority,
+            describe: None,
         }
     }
 }
@@ -684,10 +690,41 @@ where
 impl<E, Started, D, G> FilteredHandlerBuilder<E, Started, D, G>
 where
     E: Clone + Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
     /// Set a custom ID for this handler.
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.inner.id = Some(id.into());
+        self
+    }
+
+    /// Add an introspection closure for flow visualization.
+    ///
+    /// The closure receives the handler [`Context`] and returns a typed struct
+    /// that seesaw serializes to JSON. The output is persisted to the Store
+    /// per `(correlation_id, handler_id)` so external UIs can render gate progress.
+    ///
+    /// ```ignore
+    /// on::<SynthesisRoleCompleted>()
+    ///     .id("lifecycle:finalize")
+    ///     .filter(|event, ctx: &Context<Deps>| { /* ... */ })
+    ///     .describe(|ctx: &Context<Deps>| FinalizeGate {
+    ///         completed: completed_roles,
+    ///         remaining: remaining_roles,
+    ///     })
+    ///     .then(|event, ctx| async move { Ok(events![]) })
+    /// ```
+    pub fn describe<T, Desc>(mut self, f: Desc) -> Self
+    where
+        T: serde::Serialize + Send + Sync + 'static,
+        Desc: Fn(&Context<D>) -> T + Send + Sync + 'static,
+    {
+        self.describe_fn = Some(Arc::new(move |ctx| {
+            serde_json::to_value(f(ctx)).unwrap_or_else(|e| {
+                tracing::warn!("describe serialization failed: {}", e);
+                serde_json::Value::Null
+            })
+        }));
         self
     }
 }
@@ -748,6 +785,7 @@ where
             max_attempts: self.inner.max_attempts,
             backoff: self.inner.backoff,
             priority: self.inner.priority,
+            describe: self.describe_fn,
         }
     }
 }
@@ -888,6 +926,7 @@ where
             max_attempts: self.inner.max_attempts,
             backoff: self.inner.backoff,
             priority: self.inner.priority,
+            describe: None,
         }
     }
 }
