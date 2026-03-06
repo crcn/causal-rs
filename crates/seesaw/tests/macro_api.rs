@@ -67,7 +67,7 @@ struct HighValueShipped {
     order_id: Uuid,
 }
 
-fn is_high_value(event: &HighValueOrder) -> bool {
+fn is_high_value(event: &HighValueOrder, _ctx: &Context<Deps>) -> bool {
     event.total > 500.0
 }
 

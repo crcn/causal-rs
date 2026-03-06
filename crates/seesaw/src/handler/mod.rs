@@ -38,7 +38,7 @@ pub mod context;
 mod error_event;
 mod types;
 
-pub use builders::{on, on_any, project, ProjectionBuilder, TransitionHandlerBuilder};
+pub use builders::{on, on_any, project, FilteredHandlerBuilder, ProjectionBuilder, TransitionHandlerBuilder};
 pub use context::{Context, Logger};
 pub use error_event::HandlerError;
 pub use types::{

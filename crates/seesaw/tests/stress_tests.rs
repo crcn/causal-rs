@@ -469,7 +469,7 @@ async fn filter_blocks_non_matching_events() -> Result<()> {
 
     let engine = Engine::new(Deps).with_handler(
         handler::on::<EventA>()
-            .filter(|e| e.value > 10)
+            .filter(|e, _ctx: &Context<Deps>| e.value > 10)
             .then(move |_event: Arc<EventA>, _ctx: Context<Deps>| {
                 let c = c.clone();
                 async move {

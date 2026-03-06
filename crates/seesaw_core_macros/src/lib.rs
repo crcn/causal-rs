@@ -539,12 +539,24 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         }
 
         let event_ident = &event_param.ident;
-        quote! {
-            #builder
-                .then::<#deps_ty, ::std::sync::Arc<#on_event_type>, _, _>(|#event_ident, __seesaw_ctx| async move {
-                    let __result = #fn_ident((#event_ident).as_ref().clone(), __seesaw_ctx).await?;
-                    Ok(#convert_result)
-                })
+        if args.filter.is_some() {
+            // FilteredHandlerBuilder::then — D is inferred from the filter fn,
+            // so use closure param type annotations instead of turbofish.
+            quote! {
+                #builder
+                    .then(|#event_ident: ::std::sync::Arc<#on_event_type>, __seesaw_ctx: ::seesaw_core::Context<#deps_ty>| async move {
+                        let __result = #fn_ident((#event_ident).as_ref().clone(), __seesaw_ctx).await?;
+                        Ok(#convert_result)
+                    })
+            }
+        } else {
+            quote! {
+                #builder
+                    .then::<#deps_ty, ::std::sync::Arc<#on_event_type>, _, _>(|#event_ident, __seesaw_ctx| async move {
+                        let __result = #fn_ident((#event_ident).as_ref().clone(), __seesaw_ctx).await?;
+                        Ok(#convert_result)
+                    })
+            }
         }
     };
 

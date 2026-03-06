@@ -17,7 +17,7 @@ struct MyOutput {
     id: Uuid,
 }
 
-fn my_filter(event: &MyEvent) -> bool {
+fn my_filter(event: &MyEvent, _ctx: &Context<Deps>) -> bool {
     event.value > 100
 }
 

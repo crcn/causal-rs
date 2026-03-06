@@ -13,9 +13,3 @@ warning: unused import: `anyhow::Result`
   |     ^^^^^^^^^^^^^^
   |
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: unused import: `Context`
- --> tests/compile_fail/filter_extract_exclusive.rs:2:28
-  |
-2 | use seesaw_core::{handler, Context};
-  |                            ^^^^^^^

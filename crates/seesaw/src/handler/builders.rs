@@ -32,8 +32,16 @@ pub struct Untyped;
 /// Marker for no filter.
 pub struct NoFilter;
 
-/// Marker for having a filter predicate.
-pub struct WithFilter<F>(F);
+/// Builder for handlers with a context-aware filter predicate.
+///
+/// Created by calling `.filter(predicate)` on a `HandlerBuilder`.
+/// The predicate receives both the event and the handler [`Context`],
+/// giving access to aggregate state, deps, etc.
+pub struct FilteredHandlerBuilder<E, Started, D, G> {
+    inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
+    filter_fn: G,
+    _deps: PhantomData<D>,
+}
 
 /// Marker for having a filter_map predicate.
 pub struct WithFilterMap<F, T>(F, PhantomData<T>);
@@ -187,25 +195,31 @@ impl<E, Started> HandlerBuilder<Typed<E>, NoFilter, Started>
 where
     E: Send + Sync + 'static,
 {
-    /// Add a filter predicate that must pass for the handler to run.
-    pub fn filter<F>(self, predicate: F) -> HandlerBuilder<Typed<E>, WithFilter<F>, Started>
+    /// Add a context-aware filter predicate that must pass for the handler to run.
+    ///
+    /// Unlike `.extract()` (which transforms the event), `.filter()` gates
+    /// execution based on both the event and the handler [`Context`] — giving
+    /// access to aggregate state, deps, etc.
+    ///
+    /// ```ignore
+    /// on::<ScrapeRoleCompleted>()
+    ///     .id("actor_extraction")
+    ///     .retry(3)
+    ///     .filter(|event, ctx: &Context<Deps>| {
+    ///         let (_, state) = ctx.singleton::<PipelineState>();
+    ///         state.completed_scrape_roles.is_superset(&response_roles())
+    ///     })
+    ///     .then(|event, ctx| async move { Ok(events![]) })
+    /// ```
+    pub fn filter<D, F>(self, predicate: F) -> FilteredHandlerBuilder<E, Started, D, F>
     where
-        F: Fn(&E) -> bool + Send + Sync + 'static,
+        D: Send + Sync + 'static,
+        F: Fn(&E, &Context<D>) -> bool + Send + Sync + 'static,
     {
-        HandlerBuilder {
-            filter: WithFilter(predicate),
-            started: self.started,
-            id: self.id,
-            queued: self.queued,
-            delay: self.delay,
-            timeout: self.timeout,
-            join_window: self.join_window,
-            max_attempts: self.max_attempts,
-            backoff: self.backoff,
-            priority: self.priority,
-            codec: self.codec,
-            dlq_terminal_mapper: self.dlq_terminal_mapper,
-            _marker: PhantomData,
+        FilteredHandlerBuilder {
+            inner: self,
+            filter_fn: predicate,
+            _deps: PhantomData,
         }
     }
 
@@ -478,20 +492,6 @@ impl<E: Clone + Send + Sync + 'static> Extractor<E, Arc<E>> for NoFilter {
     }
 }
 
-impl<E, F> Extractor<E, Arc<E>> for WithFilter<F>
-where
-    E: Clone + Send + Sync + 'static,
-    F: Fn(&E) -> bool + Send + Sync + 'static,
-{
-    fn extract(&self, event: &E) -> Option<Arc<E>> {
-        if (self.0)(event) {
-            Some(Arc::new(event.clone()))
-        } else {
-            None
-        }
-    }
-}
-
 impl<E, F, T> Extractor<E, T> for WithFilterMap<F, T>
 where
     E: Send + Sync + 'static,
@@ -679,6 +679,79 @@ where
     }
 }
 
+// ── Filtered handler builder ─────────────────────────────────────────────
+
+impl<E, Started, D, G> FilteredHandlerBuilder<E, Started, D, G>
+where
+    E: Clone + Send + Sync + 'static,
+{
+    /// Set a custom ID for this handler.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.inner.id = Some(id.into());
+        self
+    }
+}
+
+impl<E, Started, D, G> FilteredHandlerBuilder<E, Started, D, G>
+where
+    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    D: Send + Sync + 'static,
+    G: Fn(&E, &Context<D>) -> bool + Send + Sync + 'static,
+{
+    /// Set the handler (terminal operation). Return `events![]` from the handler.
+    ///
+    /// The filter predicate runs first — if it returns `false`, the handler
+    /// body is skipped and an empty `events![]` is returned.
+    #[track_caller]
+    #[allow(private_bounds)]
+    pub fn then<H, Fut>(self, handler: H) -> Handler<D>
+    where
+        Started: StartedHandler<D>,
+        H: Fn(Arc<E>, Context<D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Events>> + Send + 'static,
+    {
+        let target = TypeId::of::<E>();
+        let filter_fn = Arc::new(self.filter_fn);
+        let input_codec = self.inner.codec.unwrap_or_else(typed_event_codec::<E>);
+        let dlq_terminal_mapper = self.inner.dlq_terminal_mapper;
+
+        let id = self
+            .inner
+            .id
+            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
+
+        Handler {
+            id,
+            codecs: vec![input_codec],
+            can_handle: Arc::new(move |t| t == target),
+            started: self.inner.started.into_started(),
+            handler: Arc::new(move |value, _, ctx| {
+                let typed = value.downcast::<E>().expect("type checked by can_handle");
+
+                if !filter_fn(&typed, &ctx) {
+                    return Box::pin(async { Ok(Vec::new()) });
+                }
+
+                let fut = handler(typed, ctx);
+                Box::pin(async move {
+                    let events: Events = fut.await?;
+                    Ok(events.into_outputs())
+                })
+            }),
+            join_mode: None,
+            join_batch_handler: None,
+            join_window_timeout: self.inner.join_window,
+            dlq_terminal_mapper,
+            queued: self.inner.queued,
+            delay: self.inner.delay,
+            timeout: self.inner.timeout,
+            max_attempts: self.inner.max_attempts,
+            backoff: self.inner.backoff,
+            priority: self.inner.priority,
+        }
+    }
+}
+
 // ── Transition guard builder ─────────────────────────────────────────────
 
 use crate::aggregator::Aggregate;
@@ -836,7 +909,7 @@ mod tests {
     fn filter_does_not_force_queued_execution() {
         let handler = on::<QueueEvent>()
             .id("filter_probe")
-            .filter(|event| event.value > 0)
+            .filter(|event, _ctx: &Context<Deps>| event.value > 0)
             .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move {
                 Ok(crate::events![])
             });
