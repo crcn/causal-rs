@@ -151,7 +151,7 @@ where
             let timeout_seconds = handler
                 .timeout
                 .map(|d| d.as_secs() as i32)
-                .unwrap_or(30)
+                .unwrap_or(300)
                 .max(1);
             queued_handler_intents.push(HandlerIntent {
                 handler_id: handler.id.clone(),
