@@ -29,16 +29,14 @@ pub(crate) struct JournalState {
 ///
 /// Entries are drained by the engine after execution and attached to the
 /// `HandlerCompletion` for Store implementations to persist.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Logger {
     entries: Arc<Mutex<Vec<LogEntry>>>,
 }
 
 impl Logger {
-    fn new() -> Self {
-        Self {
-            entries: Arc::new(Mutex::new(Vec::new())),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Log a debug message.
