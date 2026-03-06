@@ -180,6 +180,7 @@ struct EffectArgs {
     group: Option<String>,
     aggregate: Option<Path>,
     transition: Option<syn::ExprClosure>,
+    describe: Option<Path>,
 }
 
 struct ParamInfo {
@@ -244,6 +245,12 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "filter and extract are mutually exclusive (both consume the filter type-state slot)",
+        ));
+    }
+    if args.describe.is_some() && args.filter.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "describe requires filter (describe is only available on FilteredHandlerBuilder)",
         ));
     }
     let is_accumulate = args.accumulate || args.join;
@@ -804,6 +811,10 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 ensure_unset(&args.filter, nv, "filter")?;
                 args.filter = Some(parse_path_expr(&nv.value, "filter")?);
             }
+            Meta::NameValue(nv) if nv.path.is_ident("describe") => {
+                ensure_unset(&args.describe, nv, "describe")?;
+                args.describe = Some(parse_path_expr(&nv.value, "describe")?);
+            }
             Meta::NameValue(nv) if nv.path.is_ident("transition") => {
                 if args.transition.is_some() {
                     return Err(syn::Error::new_spanned(
@@ -1106,6 +1117,9 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     }
     if let Some(filter_fn) = &args.filter {
         builder = quote! { #builder .filter(#filter_fn) };
+    }
+    if let Some(describe_fn) = &args.describe {
+        builder = quote! { #builder .describe(#describe_fn) };
     }
 
     builder
