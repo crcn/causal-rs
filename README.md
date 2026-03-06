@@ -45,7 +45,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.21"
+seesaw_core = "0.22"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -180,14 +180,49 @@ mod pipeline_aggregators {
 
 ### Filter and extract
 
+Filters receive both the event and `Context`, so you can gate on aggregate state, deps, or any context-available data:
+
 ```rust
-// Filter — skip events that don't match
+// Filter with context access — gate on aggregate state
+fn is_pipeline_ready(event: &ScrapeCompleted, ctx: &Context<Deps>) -> bool {
+    let (_, state) = ctx.singleton::<PipelineState>();
+    state.completed_roles.is_superset(&required_roles())
+}
+
+#[handler(on = ScrapeCompleted, filter = is_pipeline_ready, id = "enrich")]
+async fn enrich(event: ScrapeCompleted, ctx: Context<Deps>) -> Result<Events> {
+    Ok(events![EnrichmentStarted { id: event.id }])
+}
+
+// Simple event-only filter
+fn is_high_value(event: &OrderPlaced, _ctx: &Context<Deps>) -> bool {
+    event.total > 500.0
+}
+
 #[handler(on = OrderPlaced, filter = is_high_value, id = "ship_high_value")]
 async fn ship_high_value(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
     Ok(OrderShipped { order_id: event.order_id })
 }
+```
 
-// Extract — pull fields from enum variants
+Builder style:
+
+```rust
+handler::on::<ScrapeCompleted>()
+    .id("enrich")
+    .retry(3)
+    .filter(|event, ctx: &Context<Deps>| {
+        let (_, state) = ctx.singleton::<PipelineState>();
+        state.completed_roles.is_superset(&required_roles())
+    })
+    .then(|event, ctx| async move {
+        Ok(events![EnrichmentStarted { id: event.id }])
+    })
+```
+
+Extract — pull fields from enum variants:
+
+```rust
 #[handler(on = [CrawlEvent::Ingested, CrawlEvent::Regenerated], extract(website_id, job_id), id = "enqueue")]
 async fn enqueue(website_id: Uuid, job_id: Uuid, ctx: Context<Deps>) -> Result<EnqueuedEvent> {
     Ok(EnqueuedEvent { website_id })
