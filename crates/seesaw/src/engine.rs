@@ -804,7 +804,7 @@ where
             if let Some(agg) = agg {
                 let mut state = agg.deserialize_state(snapshot.state)?;
 
-                // Load remaining events after snapshot position
+                // Load remaining events after snapshot version
                 let remaining = self
                     .store
                     .load_stream(aggregate_type, aggregate_id, Some(snapshot.version))

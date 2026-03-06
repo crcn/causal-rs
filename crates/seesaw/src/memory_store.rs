@@ -451,16 +451,19 @@ impl Store for MemoryStore {
 
     // ── Event persistence overrides ──────────────────────────────
 
-    async fn append_event(&self, event: NewEvent) -> Result<u64> {
+    async fn append_event(&self, event: NewEvent) -> Result<AppendResult> {
         if !self.persistence_enabled {
-            return Ok(0);
+            return Ok(AppendResult { position: 0, version: None });
         }
 
         let mut log = self.global_log.lock();
 
-        // Idempotency: if event_id already exists, return existing position
+        // Idempotency: if event_id already exists, return existing result
         if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
-            return Ok(existing.position);
+            return Ok(AppendResult {
+                position: existing.position,
+                version: existing.version,
+            });
         }
 
         let position = self.global_position.fetch_add(1, Ordering::SeqCst);
@@ -495,23 +498,23 @@ impl Store for MemoryStore {
             metadata: event.metadata,
         });
 
-        Ok(position)
+        Ok(AppendResult { position, version })
     }
 
     async fn load_stream(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        after_position: Option<u64>,
+        after_version: Option<u64>,
     ) -> Result<Vec<PersistedEvent>> {
         let log = self.global_log.lock();
-        let min_pos = after_position.unwrap_or(0);
+        let min_version = after_version.unwrap_or(0);
         let events = log
             .iter()
             .filter(|e| {
                 e.aggregate_type.as_deref() == Some(aggregate_type)
                     && e.aggregate_id == Some(aggregate_id)
-                    && (after_position.is_none() || e.position > min_pos)
+                    && (after_version.is_none() || e.version.unwrap_or(0) > min_version)
             })
             .cloned()
             .collect();

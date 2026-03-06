@@ -324,10 +324,26 @@ pub struct JoinAppendParams {
 
 // ── Event persistence types ───────────────────────────────────────
 
+/// Result of appending an event to the global log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendResult {
+    /// Opaque global ordering cursor. Monotonically increasing; gaps between
+    /// values are allowed. Consumers must treat this as an opaque cursor for
+    /// [`Store::load_global_from`](crate::store::Store::load_global_from) and
+    /// should not perform arithmetic or assume a gapless sequence.
+    pub position: u64,
+    /// Per-aggregate stream version at the time of append. `None` for events
+    /// that are not scoped to an aggregate.
+    pub version: Option<u64>,
+}
+
 /// A persisted event loaded from the store.
 #[derive(Debug, Clone)]
 pub struct PersistedEvent {
-    /// Global ordering position.
+    /// Opaque global ordering cursor. Monotonically increasing; gaps between
+    /// values are allowed. Used only for
+    /// [`Store::load_global_from`](crate::store::Store::load_global_from)
+    /// cursor tracking — no arithmetic should be performed on this value.
     pub position: u64,
     /// Unique event ID.
     pub event_id: Uuid,

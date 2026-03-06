@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::aggregator::{Aggregate, AggregatorRegistry};
 use crate::store::Store;
-use crate::types::{NewEvent, Snapshot};
+use crate::types::{AppendResult, NewEvent, Snapshot};
 
 /// Wrapper that pairs aggregate state with its stream version.
 #[derive(Debug, Clone)]
@@ -29,12 +29,12 @@ pub fn event_type_short_name(full: &str) -> &str {
 /// Persist an event to the store.
 ///
 /// Uses the short type name (e.g. `"OrderPlaced"`) for durable storage.
-/// Returns the global position after appending.
+/// Returns the [`AppendResult`] with global position and stream version.
 pub async fn persist_event<E, A>(
     store: &dyn Store,
     aggregate_id: Uuid,
     event: &E,
-) -> Result<u64>
+) -> Result<AppendResult>
 where
     E: serde::Serialize + 'static,
     A: Aggregate,
@@ -165,8 +165,8 @@ mod tests {
     async fn non_aggregate_event_is_persisted() {
         let store = MemoryStore::with_persistence();
 
-        let pos = store.append_event(make_new_event("SystemStarted", serde_json::json!({"node": "a"}))).await.unwrap();
-        assert!(pos > 0);
+        let result = store.append_event(make_new_event("SystemStarted", serde_json::json!({"node": "a"}))).await.unwrap();
+        assert!(result.position > 0);
 
         // Not loadable via load_stream (no aggregate)
         let events = store.load_stream("System", Uuid::new_v4(), None).await.unwrap();
@@ -181,15 +181,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_stream_from_filters_by_position() {
+    async fn load_stream_from_filters_by_version() {
         let store = MemoryStore::with_persistence();
         let id = Uuid::new_v4();
 
-        let pos1 = store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
+        let result1 = store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
         store.append_event(make_aggregate_event("OrderShipped", serde_json::json!({}), "Order", id)).await.unwrap();
         store.append_event(make_aggregate_event("OrderDelivered", serde_json::json!({}), "Order", id)).await.unwrap();
 
-        let events = store.load_stream("Order", id, Some(pos1)).await.unwrap();
+        // Filter by stream version (not global position)
+        let events = store.load_stream("Order", id, Some(result1.version.unwrap())).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "OrderShipped");
         assert_eq!(events[1].event_type, "OrderDelivered");
@@ -326,10 +327,10 @@ mod tests {
             metadata: serde_json::Map::new(),
         };
 
-        let pos1 = store.append_event(event1).await.unwrap();
-        let pos2 = store.append_event(event2).await.unwrap();
+        let result1 = store.append_event(event1).await.unwrap();
+        let result2 = store.append_event(event2).await.unwrap();
 
-        assert_eq!(pos1, pos2);
+        assert_eq!(result1, result2);
         let log = store.global_log().lock();
         assert_eq!(log.len(), 1);
     }
@@ -340,8 +341,8 @@ mod tests {
 
         let mut positions = Vec::new();
         for i in 0..5 {
-            let pos = store.append_event(make_new_event(&format!("Event{}", i), serde_json::json!({"i": i}))).await.unwrap();
-            positions.push(pos);
+            let result = store.append_event(make_new_event(&format!("Event{}", i), serde_json::json!({"i": i}))).await.unwrap();
+            positions.push(result.position);
         }
 
         let events = store.load_global_from(positions[1], 2).await.unwrap();
@@ -366,9 +367,9 @@ mod tests {
     async fn load_global_from_empty_when_caught_up() {
         let store = MemoryStore::with_persistence();
 
-        let pos = store.append_event(make_new_event("Event", serde_json::json!({}))).await.unwrap();
+        let result = store.append_event(make_new_event("Event", serde_json::json!({}))).await.unwrap();
 
-        let events = store.load_global_from(pos, 10).await.unwrap();
+        let events = store.load_global_from(result.position, 10).await.unwrap();
         assert!(events.is_empty());
     }
 }

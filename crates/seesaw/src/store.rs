@@ -43,7 +43,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::types::{
-    EventOutcome, ExpiredJoinWindow, HandlerResolution, JoinAppendParams,
+    AppendResult, EventOutcome, ExpiredJoinWindow, HandlerResolution, JoinAppendParams,
     JoinEntry, JournalEntry, NewEvent, PersistedEvent, QueueStatus, QueuedEvent, QueuedHandler,
     Snapshot,
 };
@@ -149,23 +149,31 @@ pub trait Store: Send + Sync {
     // cross-node sync. Default no-ops make simple in-memory stores
     // work without implementing persistence.
 
-    /// Append a single event to the global log. Returns global position.
+    /// Append a single event to the global log.
     ///
-    /// **Idempotency contract:** If an event with the same `event_id`
-    /// already exists, return the existing position without inserting.
-    async fn append_event(&self, _event: NewEvent) -> Result<u64> {
-        Ok(0)
+    /// **Total idempotency contract:** If `append_event` is called with an
+    /// `event_id` that has been successfully persisted at any point in the
+    /// past, the store MUST return an equivalent [`AppendResult`] and MUST NOT
+    /// create a duplicate entry, regardless of the time elapsed or the
+    /// backend's native deduplication window. Implementations backed by stores
+    /// with limited dedup windows (e.g. KurrentDB's ~1 minute EventId cache)
+    /// must enforce this guarantee via an external mechanism such as a dedup
+    /// index.
+    async fn append_event(&self, _event: NewEvent) -> Result<AppendResult> {
+        Ok(AppendResult { position: 0, version: None })
     }
 
     /// Load events for an aggregate stream (for hydration).
     ///
-    /// Pass `after_position: Some(pos)` for snapshot + partial replay,
-    /// or `None` for full replay.
+    /// Pass `after_version: Some(v)` to load only events with a stream
+    /// version greater than `v` (for snapshot + partial replay), or `None`
+    /// for full replay. The value is a **stream-local version**, not a
+    /// global position.
     async fn load_stream(
         &self,
         _aggregate_type: &str,
         _aggregate_id: Uuid,
-        _after_position: Option<u64>,
+        _after_version: Option<u64>,
     ) -> Result<Vec<PersistedEvent>> {
         Ok(Vec::new())
     }
