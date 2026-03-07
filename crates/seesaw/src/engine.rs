@@ -493,6 +493,25 @@ where
                 }
                 let executions = active_executions;
 
+                // Hydrate cold aggregates before handler execution.
+                // On resume (no events in the queue), aggregates are never
+                // populated by persist_and_hydrate, so handlers would see
+                // default state. Fix: inspect each handler's event payload
+                // to find matching aggregators and hydrate from the store.
+                for execution in &executions {
+                    let matching = self.aggregators.find_by_event_type(&execution.event_type);
+                    for agg in &matching {
+                        let agg_id = match agg.extract_id_from_json(&execution.event_payload) {
+                            Some(id) => id,
+                            None => continue,
+                        };
+                        let key = format!("{}:{}", agg.aggregate_type, agg_id);
+                        if !self.aggregators.has_state(&key) {
+                            self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key).await?;
+                        }
+                    }
+                }
+
                 let handler_futures: Vec<_> = executions
                     .iter()
                     .map(|execution| {

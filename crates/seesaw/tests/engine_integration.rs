@@ -3491,3 +3491,95 @@ async fn ephemeral_with_extract_handler() -> Result<()> {
     assert_eq!(received_id.load(Ordering::SeqCst), 77);
     Ok(())
 }
+
+// -- Resume hydration tests --
+
+#[tokio::test]
+async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
+    // Simulate a "resume after crash" scenario:
+    //   1. Events are already persisted in the store
+    //   2. A handler is sitting in the handler queue (as if reclaimed)
+    //   3. A fresh engine (cold aggregates) calls settle()
+    //   4. The handler should see hydrated aggregate state, not defaults
+
+    let store = Arc::new(MemoryStore::with_persistence());
+    let order_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let event_id = Uuid::new_v4();
+
+    // Step 1: Pre-populate the event store (as if the event was already processed)
+    store
+        .append_event(new_event(
+            "OrderCreated",
+            serde_json::json!({"order_id": order_id, "total": 250}),
+            Some("Order"),
+            Some(order_id),
+        ))
+        .await?;
+
+    // Step 2: Inject a handler directly into the queue (simulating reclaim after crash)
+    use seesaw_core::types::QueuedHandler;
+    let event_type = std::any::type_name::<OrderCreated>().to_string();
+    store
+        .publish_handler_for_test(QueuedHandler {
+            event_id,
+            handler_id: "check_order_state".to_string(),
+            correlation_id,
+            event_type,
+            event_payload: serde_json::json!({"order_id": order_id, "total": 250}),
+            parent_event_id: None,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            execute_at: chrono::Utc::now(),
+            timeout_seconds: 30,
+            max_attempts: 1,
+            priority: 10,
+            hops: 0,
+            attempts: 1,
+            join_window_timeout_seconds: None,
+            ephemeral: None,
+        })
+        .await;
+
+    // Step 3: Build a fresh engine with cold aggregates
+    let observed_status = Arc::new(Mutex::new(String::new()));
+    let observed_total = Arc::new(AtomicUsize::new(0));
+    let os = observed_status.clone();
+    let ot = observed_total.clone();
+
+    let engine = Engine::new(Deps)
+        .with_store(store.clone())
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
+        .with_handler(
+            handler::on::<OrderCreated>()
+                .id("check_order_state")
+                .then(move |event: Arc<OrderCreated>, ctx: Context<Deps>| {
+                    let os = os.clone();
+                    let ot = ot.clone();
+                    async move {
+                        let (_, state) = ctx.aggregate::<Order>(event.order_id);
+                        *os.lock() = state.status.clone();
+                        ot.store(state.total as usize, Ordering::SeqCst);
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    // Step 4: Settle — this should hydrate aggregates before running the reclaimed handler
+    engine.settle().await?;
+
+    // Step 5: Assert the handler saw the real aggregate state, not defaults
+    assert_eq!(
+        *observed_status.lock(),
+        "created",
+        "handler should see hydrated aggregate status, not default empty string"
+    );
+    assert_eq!(
+        observed_total.load(Ordering::SeqCst),
+        250,
+        "handler should see hydrated aggregate total, not default 0"
+    );
+
+    Ok(())
+}
