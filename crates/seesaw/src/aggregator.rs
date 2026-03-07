@@ -461,6 +461,16 @@ impl AggregatorRegistry {
         self.state.remove(&format!("{}:prev", key));
     }
 
+    /// Return all unique aggregate type names registered.
+    pub fn unique_aggregate_types(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        self.aggregators
+            .iter()
+            .map(|a| a.aggregate_type.as_str())
+            .filter(|t| seen.insert(*t))
+            .collect()
+    }
+
     /// Find the first aggregator registered for a given aggregate type string.
     ///
     /// Used to access `deserialize_state` / `default_state` during hydration.

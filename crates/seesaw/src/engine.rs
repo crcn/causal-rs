@@ -497,8 +497,24 @@ where
                 // Hydrate cold aggregates before handler execution.
                 // On resume (no events in the queue), aggregates are never
                 // populated by persist_and_hydrate, so handlers would see
-                // default state. Fix: inspect each handler's event payload
-                // to find matching aggregators and hydrate from the store.
+                // default state.
+                //
+                // We hydrate ALL registered aggregate types (not just those
+                // matching the handler's event type) because handler filters
+                // can read any aggregate — e.g. a singleton updated by a
+                // completely different event type.
+                //
+                // For each aggregate type we hydrate:
+                // 1. Singletons (Uuid::nil) — always checked
+                // 2. Instance IDs extracted from handler event payloads
+                for aggregate_type in self.aggregators.unique_aggregate_types() {
+                    // Always hydrate singletons
+                    let singleton_key = format!("{}:{}", aggregate_type, Uuid::nil());
+                    if !self.aggregators.has_state(&singleton_key) {
+                        self.hydrate_aggregate(aggregate_type, Uuid::nil(), &singleton_key).await?;
+                    }
+                }
+                // Also hydrate instance aggregates matching handler event payloads
                 for execution in &executions {
                     let matching = self.aggregators.find_by_event_type(&execution.event_type);
                     for agg in &matching {

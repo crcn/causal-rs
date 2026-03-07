@@ -3634,3 +3634,131 @@ async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
 
     Ok(())
 }
+
+// -- Singleton hydration across event types --
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct PipelineState {
+    source_plan: Option<String>,
+    scrape_done: bool,
+}
+
+impl Aggregate for PipelineState {
+    fn aggregate_type() -> &'static str {
+        "PipelineState"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourcesPrepared {
+    plan: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScrapeCompleted;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpansionTriggered;
+
+impl Apply<SourcesPrepared> for PipelineState {
+    fn apply(&mut self, event: SourcesPrepared) {
+        self.source_plan = Some(event.plan);
+    }
+}
+
+impl Apply<ScrapeCompleted> for PipelineState {
+    fn apply(&mut self, _event: ScrapeCompleted) {
+        self.scrape_done = true;
+    }
+}
+
+#[tokio::test]
+async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()> {
+    // Reproduces: handler triggered by ScrapeCompleted has a filter that
+    // reads PipelineState.source_plan (set by SourcesPrepared). On resume,
+    // only the ScrapeCompleted aggregator gets hydrated, so source_plan
+    // is None and the filter returns false.
+    let store = Arc::new(MemoryStore::with_persistence());
+    let correlation_id = Uuid::new_v4();
+
+    // Step 1: Pre-populate store with both events already persisted
+    store
+        .append_event(new_event(
+            "SourcesPrepared",
+            serde_json::json!({"plan": "social"}),
+            Some("PipelineState"),
+            Some(Uuid::nil()),
+        ))
+        .await?;
+    store
+        .append_event(new_event(
+            "ScrapeCompleted",
+            serde_json::json!(null),
+            Some("PipelineState"),
+            Some(Uuid::nil()),
+        ))
+        .await?;
+
+    // Step 2: Inject a handler into the queue (simulating resume/reclaim)
+    let event_type = std::any::type_name::<ScrapeCompleted>().to_string();
+    store
+        .publish_handler_for_test(seesaw_core::types::QueuedHandler {
+            event_id: Uuid::new_v4(),
+            handler_id: "expand_sources".to_string(),
+            correlation_id,
+            event_type,
+            event_payload: serde_json::json!(null),
+            parent_event_id: None,
+            batch_id: None,
+            batch_index: None,
+            batch_size: None,
+            execute_at: chrono::Utc::now(),
+            timeout_seconds: 30,
+            max_attempts: 1,
+            priority: 10,
+            hops: 0,
+            attempts: 1,
+            join_window_timeout_seconds: None,
+            ephemeral: None,
+        })
+        .await;
+
+    // Step 3: Fresh engine — handler filter reads singleton state set by
+    // a DIFFERENT event type than the one that triggered it
+    let fired = Arc::new(AtomicUsize::new(0));
+    let f = fired.clone();
+
+    let engine = Engine::new(Deps)
+        .with_store(store.clone())
+        // Only SourcesPrepared has an aggregator — ScrapeCompleted does NOT
+        // register an aggregator for PipelineState. The handler triggered by
+        // ScrapeCompleted reads the singleton in its filter.
+        .with_aggregator::<SourcesPrepared, PipelineState, _>(|_| Uuid::nil())
+        .with_handler(
+            handler::on::<ScrapeCompleted>()
+                .id("expand_sources")
+                .filter(move |_event, ctx: &Context<Deps>| {
+                    let (_, state) = ctx.singleton::<PipelineState>();
+                    // This filter checks state set by SourcesPrepared, not ScrapeCompleted
+                    state.source_plan.is_some()
+                })
+                .then(move |_event: Arc<ScrapeCompleted>, _ctx: Context<Deps>| {
+                    let f = f.clone();
+                    async move {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    // Step 4: Settle — should hydrate ALL singleton aggregators, not just ScrapeCompleted's
+    engine.settle().await?;
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "handler filter should see fully hydrated singleton (source_plan + scrape_done)"
+    );
+
+    Ok(())
+}
