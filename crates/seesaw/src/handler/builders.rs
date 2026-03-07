@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::context::Context;
-use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Handler, JoinMode, Projection};
+use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Handler, Projection};
 use crate::event_codec::EventCodec;
 
 #[track_caller]
@@ -94,7 +94,6 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
     queued: bool,
     delay: Option<Duration>,
     timeout: Option<Duration>,
-    join_window: Option<Duration>,
     max_attempts: u32,
     backoff: Option<Duration>,
     priority: Option<i32>,
@@ -115,7 +114,7 @@ where
         queued: false,
         delay: None,
         timeout: None,
-        join_window: None,
+
         max_attempts: 1,
         backoff: None,
         priority: None,
@@ -134,7 +133,7 @@ pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
         queued: false,
         delay: None,
         timeout: None,
-        join_window: None,
+
         max_attempts: 1,
         backoff: None,
         priority: None,
@@ -241,7 +240,7 @@ where
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
-            join_window: self.join_window,
+
             max_attempts: self.max_attempts,
             backoff: self.backoff,
             priority: self.priority,
@@ -270,7 +269,7 @@ impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
             queued: self.queued,
             delay: self.delay,
             timeout: self.timeout,
-            join_window: self.join_window,
+
             max_attempts: self.max_attempts,
             backoff: self.backoff,
             priority: self.priority,
@@ -334,12 +333,6 @@ impl<EventType, Filter, Started> HandlerBuilder<EventType, Filter, Started>
 where
     EventType: QueueCodecProvider,
 {
-    /// Set a timeout for accumulation windows.
-    pub fn window(mut self, duration: Duration) -> Self {
-        self.join_window = Some(duration);
-        self
-    }
-
     /// Add a delay before execution.
     pub fn delayed(mut self, duration: Duration) -> Self {
         self.delay = Some(duration);
@@ -386,101 +379,6 @@ where
     pub fn priority(mut self, level: i32) -> Self {
         self.priority = Some(level);
         self
-    }
-}
-
-/// Builder for durable same-batch join handlers.
-pub struct JoinHandlerBuilder<E, Started> {
-    inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
-    mode: JoinMode,
-}
-
-impl<E, Started> HandlerBuilder<Typed<E>, NoFilter, Started>
-where
-    E: Clone + Send + Sync + 'static,
-{
-    /// Configure this handler as a durable accumulation handler.
-    pub fn accumulate(self) -> JoinHandlerBuilder<E, Started> {
-        JoinHandlerBuilder {
-            inner: self,
-            mode: JoinMode::SameBatch,
-        }
-    }
-}
-
-impl<E, Started> JoinHandlerBuilder<E, Started>
-where
-    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
-{
-    /// Join terminal events that share the same `(correlation_id, batch_id)`.
-    pub fn same_batch(mut self) -> Self {
-        self.mode = JoinMode::SameBatch;
-        self
-    }
-
-    /// Set a timeout for this accumulation window.
-    pub fn window(mut self, duration: Duration) -> Self {
-        self.inner.join_window = Some(duration);
-        self
-    }
-
-    /// Set the handler for joined batch execution. Return `events![]` from the handler.
-    #[track_caller]
-    #[allow(private_bounds)]
-    pub fn then<D, H, Fut>(mut self, handler: H) -> Handler<D>
-    where
-        D: Send + Sync + 'static,
-        Started: StartedHandler<D>,
-        H: Fn(Vec<E>, Context<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Events>> + Send + 'static,
-    {
-        let target = TypeId::of::<E>();
-        let id = self
-            .inner
-            .id
-            .take()
-            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
-        let join_mode = self.mode;
-        let input_codec = self
-            .inner
-            .codec
-            .take()
-            .unwrap_or_else(typed_event_codec::<E>);
-
-        Handler {
-            id,
-            codecs: vec![input_codec],
-            can_handle: Arc::new(move |t| t == target),
-            started: self.inner.started.into_started(),
-            handler: Arc::new(move |_, _, _| Box::pin(async { Ok(Vec::new()) })),
-            join_mode: Some(join_mode),
-            join_batch_handler: Some(Arc::new(move |values, ctx| {
-                let mut typed = Vec::with_capacity(values.len());
-                for value in values {
-                    let Ok(downcasted) = value.downcast::<E>() else {
-                        return Box::pin(async {
-                            Err(anyhow::anyhow!("join batch item downcast failed"))
-                        });
-                    };
-                    typed.push((*downcasted).clone());
-                }
-
-                let fut = handler(typed, ctx);
-                Box::pin(async move {
-                    let events: Events = fut.await?;
-                    Ok(events.into_outputs())
-                })
-            })),
-            join_window_timeout: self.inner.join_window,
-            dlq_terminal_mapper: self.inner.dlq_terminal_mapper.take(),
-            queued: true,
-            delay: self.inner.delay,
-            timeout: self.inner.timeout,
-            max_attempts: self.inner.max_attempts.max(1),
-            backoff: self.inner.backoff,
-            priority: self.inner.priority,
-            describe: None,
-        }
     }
 }
 
@@ -585,9 +483,7 @@ where
                     None => Box::pin(async { Ok(Vec::new()) }),
                 }
             }),
-            join_mode: None,
-            join_batch_handler: None,
-            join_window_timeout: self.join_window,
+
             dlq_terminal_mapper,
             queued: self.queued,
             delay: self.delay,
@@ -624,9 +520,7 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
                     Ok(events.into_outputs())
                 })
             }),
-            join_mode: None,
-            join_batch_handler: None,
-            join_window_timeout: self.join_window,
+
             dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
@@ -670,9 +564,7 @@ where
                     Ok(events.into_outputs())
                 })
             }),
-            join_mode: None,
-            join_batch_handler: None,
-            join_window_timeout: self.join_window,
+
             dlq_terminal_mapper: None,
             queued: self.queued,
             delay: self.delay,
@@ -775,9 +667,7 @@ where
                     Ok(events.into_outputs())
                 })
             }),
-            join_mode: None,
-            join_batch_handler: None,
-            join_window_timeout: self.inner.join_window,
+
             dlq_terminal_mapper,
             queued: self.inner.queued,
             delay: self.inner.delay,
@@ -833,7 +723,7 @@ where
                 queued: self.queued,
                 delay: self.delay,
                 timeout: self.timeout,
-                join_window: self.join_window,
+    
                 max_attempts: self.max_attempts,
                 backoff: self.backoff,
                 priority: self.priority,
@@ -916,9 +806,7 @@ where
                     None => Box::pin(async { Ok(Vec::new()) }),
                 }
             }),
-            join_mode: None,
-            join_batch_handler: None,
-            join_window_timeout: self.inner.join_window,
+
             dlq_terminal_mapper: self.inner.dlq_terminal_mapper,
             queued: self.inner.queued,
             delay: self.inner.delay,

@@ -3,7 +3,6 @@
 //! Engine<D> publishes events to a pluggable [`Store`](crate::store::Store)
 //! backend and settles the full causal tree synchronously.
 
-use std::any::Any;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -12,7 +11,7 @@ use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_store::event_type_short_name;
-use crate::handler::{Context, GlobalDlqMapper, Handler, Projection};
+use crate::handler::{GlobalDlqMapper, Handler, Projection};
 use crate::handler_registry::HandlerRegistry;
 use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
@@ -20,7 +19,7 @@ use crate::process::{EmitFuture, ProcessHandle};
 use crate::store::Store;
 use crate::types::{
     EmittedEvent, EventOutcome, EventWorkerConfig, HandlerCompletion, HandlerDlq,
-    HandlerResolution, HandlerWorkerConfig, JoinAppendParams, NewEvent, QueuedEvent, QueuedHandler,
+    HandlerResolution, HandlerWorkerConfig, NewEvent, QueuedEvent, QueuedHandler,
     Snapshot, NAMESPACE_SEESAW,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
@@ -639,28 +638,6 @@ where
                                     }))
                                     .await?;
                             }
-                            HandlerStatus::JoinWaiting => {
-                                if let Some(join_claim) = result.join_claim {
-                                    self.handle_join_waiting(
-                                        &executor,
-                                        event_id,
-                                        &handler_id,
-                                        &execution_clone,
-                                        join_claim.batch_id,
-                                    )
-                                    .await?;
-                                } else {
-                                    self.store
-                                        .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
-                                            event_id,
-                                            handler_id,
-                                            result: serde_json::json!({ "status": "join_waiting" }),
-                                            events_to_publish: Vec::new(),
-                                            log_entries: result.log_entries,
-                                        }))
-                                        .await?;
-                                }
-                            }
                         },
                         Err(e) => {
                             let error_str = e.to_string();
@@ -691,41 +668,6 @@ where
                                 }))
                                 .await?;
                         }
-                    }
-                }
-            }
-
-            // Expire timed-out join windows and DLQ each one
-            let expired_windows = self.store.expire_join_windows(chrono::Utc::now()).await?;
-            if !expired_windows.is_empty() {
-                processed_any = true;
-                for window in expired_windows {
-                    tracing::warn!(
-                        "Join window expired: handler={}, correlation={}, batch={}, events={}",
-                        window.join_handler_id,
-                        window.correlation_id,
-                        window.batch_id,
-                        window.source_event_ids.len()
-                    );
-
-                    // DLQ each source event in the expired window
-                    for source_event_id in &window.source_event_ids {
-                        self.store
-                            .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
-                                event_id: *source_event_id,
-                                handler_id: window.join_handler_id.clone(),
-                                error: format!(
-                                    "join window expired: received {}/{} items for batch {}",
-                                    window.source_event_ids.len(),
-                                    window.source_event_ids.len(), // we don't have target count here
-                                    window.batch_id,
-                                ),
-                                reason: "join_window_expired".to_string(),
-                                attempts: 0,
-                                events_to_publish: Vec::new(),
-                                log_entries: Vec::new(),
-                            }))
-                            .await?;
                     }
                 }
             }
@@ -1110,171 +1052,6 @@ where
             .collect()
     }
 
-    async fn handle_join_waiting(
-        &self,
-        executor: &JobExecutor<D>,
-        event_id: Uuid,
-        handler_id: &str,
-        execution: &QueuedHandler,
-        batch_id: Uuid,
-    ) -> Result<()> {
-        let batch_index = execution.batch_index.unwrap_or(0);
-        let batch_size = execution.batch_size.unwrap_or(1);
-        let join_window_timeout = execution.join_window_timeout_seconds;
-
-        let entries = self
-            .store
-            .join_append_and_maybe_claim(JoinAppendParams {
-                join_handler_id: handler_id.to_string(),
-                correlation_id: execution.correlation_id,
-                source_event_id: event_id,
-                source_event_type: execution.event_type.clone(),
-                source_payload: execution.event_payload.clone(),
-                source_created_at: execution.execute_at,
-                batch_id,
-                batch_index,
-                batch_size,
-                join_window_timeout_seconds: join_window_timeout,
-            })
-            .await?;
-
-        match entries {
-            Some(entries) => {
-                // All items arrived — decode and call join batch handler
-                let join_handler = executor.handler_registry().find_by_id(handler_id);
-                if let Some(join_handler) = join_handler {
-                    let mut typed_values: Vec<Arc<dyn Any + Send + Sync>> =
-                        Vec::with_capacity(entries.len());
-                    for entry in &entries {
-                        let codec = executor
-                            .handler_registry()
-                            .find_codec_by_event_type(&entry.event_type);
-                        if let Some(codec) = codec {
-                            let decoded = (codec.decode)(&entry.payload)?;
-                            typed_values.push(decoded);
-                        } else {
-                            typed_values.push(Arc::new(entry.payload.clone()));
-                        }
-                    }
-
-                    let idempotency_key = Uuid::new_v5(
-                        &NAMESPACE_SEESAW,
-                        format!("{}-{}-join", batch_id, handler_id).as_bytes(),
-                    )
-                    .to_string();
-
-                    let ctx = Context::new(
-                        handler_id.to_string(),
-                        idempotency_key,
-                        execution.correlation_id,
-                        event_id,
-                        execution.parent_event_id,
-                        self.deps.clone(),
-                    )
-                    .with_aggregator_registry(self.aggregators.clone());
-
-                    match join_handler.call_join_batch_handler(typed_values, ctx).await {
-                        Ok(outputs) => {
-                            let handler_config = HandlerWorkerConfig::default();
-                            let emitted_events = executor.serialize_emitted_events(
-                                outputs,
-                                execution,
-                                handler_config.max_batch_size,
-                            )?;
-
-                            let events_to_publish = Self::build_queued_events(
-                                emitted_events,
-                                event_id,
-                                handler_id,
-                                execution.correlation_id,
-                                execution.hops,
-                                "",
-                            );
-
-                            self.store
-                                .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
-                                    event_id,
-                                    handler_id: handler_id.to_string(),
-                                    result: serde_json::json!({ "status": "join_completed" }),
-                                    events_to_publish,
-                                    log_entries: Vec::new(),
-                                }))
-                                .await?;
-
-                            self.store
-                                .join_complete(
-                                    handler_id.to_string(),
-                                    execution.correlation_id,
-                                    batch_id,
-                                )
-                                .await?;
-                        }
-                        Err(e) => {
-                            let error_str = e.to_string();
-                            self.store
-                                .join_release(
-                                    handler_id.to_string(),
-                                    execution.correlation_id,
-                                    batch_id,
-                                    error_str.clone(),
-                                )
-                                .await?;
-                            let dlq_events = self
-                                .build_global_dlq_event(
-                                    execution,
-                                    error_str.clone(),
-                                    "join_handler_error",
-                                )
-                                .unwrap_or_default();
-                            let events_to_publish = Self::build_queued_events(
-                                dlq_events,
-                                event_id,
-                                handler_id,
-                                execution.correlation_id,
-                                execution.hops,
-                                "-dlq",
-                            );
-                            self.store
-                                .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
-                                    event_id,
-                                    handler_id: handler_id.to_string(),
-                                    error: error_str,
-                                    reason: "join_handler_error".to_string(),
-                                    attempts: 0,
-                                    events_to_publish,
-                                    log_entries: Vec::new(),
-                                }))
-                                .await?;
-                        }
-                    }
-                } else {
-                    self.store
-                        .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
-                            event_id,
-                            handler_id: handler_id.to_string(),
-                            result: serde_json::json!({ "status": "join_handler_not_found" }),
-                            events_to_publish: Vec::new(),
-                            log_entries: Vec::new(),
-                        }))
-                        .await?;
-                }
-            }
-            None => {
-                // Still waiting for more items — mark complete (no-op)
-                self.store
-                    .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
-                        event_id,
-                        handler_id: handler_id.to_string(),
-                        result: serde_json::json!({ "status": "join_waiting" }),
-                        events_to_publish: Vec::new(),
-                        log_entries: Vec::new(),
-                    }))
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl<D> Clone for Engine<D>

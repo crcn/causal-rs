@@ -43,9 +43,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::types::{
-    AppendResult, EventOutcome, ExpiredJoinWindow, HandlerResolution, JoinAppendParams,
-    JoinEntry, JournalEntry, NewEvent, PersistedEvent, QueueStatus, QueuedEvent, QueuedHandler,
-    Snapshot,
+    AppendResult, EventOutcome, HandlerResolution, JournalEntry, NewEvent, PersistedEvent,
+    QueueStatus, QueuedEvent, QueuedHandler, Snapshot,
 };
 
 /// Pluggable backend for the Engine's event and handler queues.
@@ -112,36 +111,6 @@ pub trait Store: Send + Sync {
     async fn reclaim_stale(&self) -> Result<()> {
         Ok(())
     }
-
-    // ── Join windows ─────────────────────────────────────────────────
-
-    /// Append an entry to a join window. If the window is now complete,
-    /// atomically claim it and return the ordered entries.
-    async fn join_append_and_maybe_claim(
-        &self,
-        params: JoinAppendParams,
-    ) -> Result<Option<Vec<JoinEntry>>>;
-
-    /// Mark a join window as completed (all processing done).
-    async fn join_complete(
-        &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        batch_id: Uuid,
-    ) -> Result<()>;
-
-    /// Release a claimed join window back to Open state (on handler error).
-    async fn join_release(
-        &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        batch_id: Uuid,
-        error: String,
-    ) -> Result<()>;
-
-    /// Expire open join windows whose timeout has passed. Returns metadata
-    /// for each expired window so the Engine can DLQ the source events.
-    async fn expire_join_windows(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredJoinWindow>>;
 
     // ── Event persistence (optional) ──────────────────────────────
     //

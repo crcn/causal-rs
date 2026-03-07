@@ -241,7 +241,7 @@ where
     /// Execute a side-effect closure with journaling.
     ///
     /// When a journal is wired (durable store), the result is persisted
-    /// so that retried effects can skip already-completed steps. Without
+    /// so that retried handlers can skip already-completed steps. Without
     /// a journal the closure executes directly (passthrough).
     ///
     /// ```rust,ignore
@@ -968,7 +968,6 @@ mod tests {
             priority: 10,
             hops: 0,
             attempts: 1,
-            join_window_timeout_seconds: None,
             ephemeral: None,
         };
         // Insert directly into handler queue, then poll to put in-flight

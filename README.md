@@ -45,7 +45,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.22"
+seesaw_core = "0.23"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -238,20 +238,6 @@ async fn charge(event: PaymentRequested, ctx: Context<Deps>) -> Result<PaymentCh
         ctx.deps().stripe.charge(event.order_id).await
     }).await?;
     Ok(PaymentCharged { order_id: event.order_id })
-}
-```
-
-### Batch accumulation
-
-Fan-out events and collect them back with `accumulate`:
-
-```rust
-#[handler(on = RowValidated, accumulate, id = "bulk_insert", window_timeout_secs = 5)]
-async fn bulk_insert(batch: Vec<RowValidated>, ctx: Context<Deps>) -> Result<BatchInserted> {
-    ctx.run(|| async {
-        ctx.deps().db.bulk_insert(&batch).await
-    }).await?;
-    Ok(BatchInserted { count: batch.len() })
 }
 ```
 

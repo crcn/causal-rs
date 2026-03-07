@@ -43,5 +43,5 @@ pub use context::{Context, Logger};
 pub use error_event::HandlerError;
 pub use types::{
     AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Events,
-    GlobalDlqMapper, Handler, IntoEvents, JoinMode, Projection,
+    GlobalDlqMapper, Handler, IntoEvents, Projection,
 };

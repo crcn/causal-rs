@@ -62,7 +62,7 @@ pub struct QueuedEvent {
     pub hops: i32,
     /// Retry count (for event-level failure tracking)
     pub retry_count: i32,
-    /// Batch identifier for same-batch fan-in semantics.
+    /// Batch identifier for fan-out grouping.
     pub batch_id: Option<Uuid>,
     /// Position inside a batch (0-based).
     pub batch_index: Option<i32>,
@@ -84,7 +84,7 @@ pub struct EmittedEvent {
     pub event_type: String,
     /// Event payload (JSON)
     pub payload: serde_json::Value,
-    /// Batch identifier for same-batch fan-in semantics.
+    /// Batch identifier for fan-out grouping.
     pub batch_id: Option<Uuid>,
     /// Position inside a batch (0-based).
     pub batch_index: Option<i32>,
@@ -146,29 +146,6 @@ pub struct HandlerIntent {
     pub priority: i32,
     /// Hop count inherited from source event (for infinite loop detection).
     pub hops: i32,
-    /// Optional timeout for same-batch accumulation windows.
-    pub join_window_timeout_seconds: Option<i32>,
-}
-
-/// Persisted join entry used for durable same-batch fan-in.
-#[derive(Debug, Clone)]
-pub struct JoinEntry {
-    pub source_event_id: Uuid,
-    pub event_type: String,
-    pub payload: serde_json::Value,
-    pub batch_id: Uuid,
-    pub batch_index: i32,
-    pub batch_size: i32,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Expired same-batch accumulation window metadata.
-#[derive(Debug, Clone)]
-pub struct ExpiredJoinWindow {
-    pub join_handler_id: String,
-    pub correlation_id: Uuid,
-    pub batch_id: Uuid,
-    pub source_event_ids: Vec<Uuid>,
 }
 
 /// Queued handler execution from store
@@ -189,7 +166,6 @@ pub struct QueuedHandler {
     pub priority: i32,
     pub hops: i32,
     pub attempts: i32,
-    pub join_window_timeout_seconds: Option<i32>,
     /// Original typed event (live dispatch only).
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -307,21 +283,6 @@ pub enum EventOutcome {
         error: String,
         reason: String,
     },
-}
-
-/// Parameters for appending to a join window and optionally claiming it.
-#[derive(Debug)]
-pub struct JoinAppendParams {
-    pub join_handler_id: String,
-    pub correlation_id: Uuid,
-    pub source_event_id: Uuid,
-    pub source_event_type: String,
-    pub source_payload: serde_json::Value,
-    pub source_created_at: DateTime<Utc>,
-    pub batch_id: Uuid,
-    pub batch_index: i32,
-    pub batch_size: i32,
-    pub join_window_timeout_seconds: Option<i32>,
 }
 
 // ── Event persistence types ───────────────────────────────────────

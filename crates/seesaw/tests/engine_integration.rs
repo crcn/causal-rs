@@ -338,60 +338,6 @@ async fn dlq_terminal_event_published() -> Result<()> {
 }
 
 #[tokio::test]
-async fn accumulate_batch() -> Result<()> {
-    let result_counter = Arc::new(AtomicUsize::new(0));
-    let batch_size_seen = Arc::new(AtomicUsize::new(0));
-    let rc = result_counter.clone();
-    let bs = batch_size_seen.clone();
-
-    // A handler emits a batch which sets batch metadata automatically.
-    // The accumulate handler collects all items in the batch.
-    let engine = Engine::new(Deps)
-        .with_handler(handler::on::<Ping>().then(
-            |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
-                Ok(events![..vec![
-                    BatchItem { index: 0 },
-                    BatchItem { index: 1 },
-                    BatchItem { index: 2 },
-                ]])
-            },
-        ))
-        .with_handler(
-            handler::on::<BatchItem>()
-                .id("batch_accumulator")
-                .accumulate()
-                .then(move |batch: Vec<BatchItem>, _ctx: Context<Deps>| {
-                    let rc = rc.clone();
-                    let bs = bs.clone();
-                    async move {
-                        bs.store(batch.len(), Ordering::SeqCst);
-                        rc.fetch_add(1, Ordering::SeqCst);
-                        Ok(events![BatchResult { count: batch.len() }])
-                    }
-                }),
-        );
-
-    engine
-        .emit(Ping {
-            msg: "trigger".into(),
-        })
-        .settled()
-        .await?;
-
-    assert_eq!(
-        result_counter.load(Ordering::SeqCst),
-        1,
-        "batch handler should fire exactly once"
-    );
-    assert_eq!(
-        batch_size_seen.load(Ordering::SeqCst),
-        3,
-        "batch should contain all 3 items"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn correlation_preserved_through_queued_chain() -> Result<()> {
     let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sc = seen_correlation.clone();
@@ -3537,7 +3483,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
             priority: 10,
             hops: 0,
             attempts: 1,
-            join_window_timeout_seconds: None,
+
             ephemeral: None,
         })
         .await;
@@ -3718,7 +3664,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
             priority: 10,
             hops: 0,
             attempts: 1,
-            join_window_timeout_seconds: None,
+
             ephemeral: None,
         })
         .await;

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::event_store::event_type_short_name;
-use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler, JoinMode};
+use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler};
 use crate::handler_registry::HandlerRegistry;
 use crate::store::Store;
 use crate::types::{
@@ -164,10 +164,6 @@ where
                 max_attempts: handler.max_attempts as i32,
                 priority: handler.priority.unwrap_or(10),
                 hops: event.hops,
-                join_window_timeout_seconds: handler
-                    .join_window_timeout
-                    .map(|d| d.as_secs() as i32)
-                    .map(|seconds| seconds.max(1)),
             });
         }
 
@@ -258,7 +254,7 @@ where
                 },
                 emitted_events: Vec::new(),
                 result: serde_json::json!({}),
-                join_claim: None,
+
                 log_entries: Vec::new(),
             });
         };
@@ -287,32 +283,7 @@ where
             )
             .with_journal(self.store.clone(), journal_entries);
 
-        // 2. Handle join/accumulation (if configured)
-        let join_claim = if handler.join_mode == Some(JoinMode::SameBatch) {
-            Some(JoinClaim {
-                batch_id: execution.batch_id.ok_or_else(|| {
-                    anyhow::anyhow!("join().same_batch() requires batch_id metadata")
-                })?,
-                needs_release: true,
-            })
-        } else {
-            None
-        };
-
-        // For now, we'll return a placeholder result that indicates join is needed
-        // The actual join logic will be handled by the backend (PostgresBackend)
-        if handler.join_mode.is_some() {
-            // Return special status indicating join coordination is needed
-            return Ok(HandlerResult {
-                status: HandlerStatus::JoinWaiting,
-                emitted_events: Vec::new(),
-                result: serde_json::json!({ "status": "join_waiting" }),
-                join_claim,
-                log_entries: ctx.logger.drain(),
-            });
-        }
-
-        // 3. Execute with timeout
+        // 2. Execute with timeout
         let timeout_duration = if execution.timeout_seconds > 0 {
             std::time::Duration::from_secs(execution.timeout_seconds as u64)
         } else {
@@ -338,7 +309,7 @@ where
                     status: HandlerStatus::Success,
                     emitted_events,
                     result: serde_json::json!({ "status": "ok" }),
-                    join_claim: None,
+    
                     log_entries: ctx.logger.drain(),
                 })
             }
@@ -381,7 +352,7 @@ where
                     status,
                     emitted_events,
                     result: serde_json::json!({}),
-                    join_claim: None,
+    
                     log_entries: ctx.logger.drain(),
                 })
             }
@@ -422,7 +393,7 @@ where
                     status,
                     emitted_events,
                     result: serde_json::json!({}),
-                    join_claim: None,
+    
                     log_entries: ctx.logger.drain(),
                 })
             }
@@ -686,7 +657,6 @@ pub struct HandlerResult {
     pub status: HandlerStatus,
     pub emitted_events: Vec<EmittedEvent>,
     pub result: serde_json::Value,
-    pub join_claim: Option<JoinClaim>,
     /// Log entries captured during handler execution.
     pub log_entries: Vec<crate::types::LogEntry>,
 }
@@ -698,12 +668,4 @@ pub enum HandlerStatus {
     Failed { error: String, attempts: i32 },
     Retry { error: String, attempts: i32 },
     Timeout,
-    JoinWaiting,
-}
-
-/// Join claim metadata (for release on failure).
-#[derive(Debug)]
-pub struct JoinClaim {
-    pub batch_id: Uuid,
-    pub needs_release: bool,
 }

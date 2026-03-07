@@ -81,12 +81,6 @@ impl<E> From<Option<E>> for Emit<E> {
     }
 }
 
-/// Join mode for queued batch fan-in handlers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinMode {
-    SameBatch,
-}
-
 /// Output from a handler that returns an event.
 ///
 /// The payload is eagerly serialized at creation time, making `EventOutput`
@@ -293,7 +287,7 @@ impl AnyEvent {
 /// - They receive all events (no type routing)
 /// - They return `Result<()>` (no emitted events)
 /// - They run sequentially before other handlers
-/// - They have no retry/timeout/delay/join semantics
+/// - They have no retry/timeout/delay semantics
 pub struct Projection<D>
 where
     D: Send + Sync + 'static,
@@ -347,25 +341,6 @@ where
             + Sync,
     >,
 
-    /// Optional join mode — when set, handler executions are accumulated and
-    /// flushed in durable windows before invoking `join_batch_handler`.
-    pub(crate) join_mode: Option<JoinMode>,
-
-    /// Optional batch handler for join modes.
-    pub(crate) join_batch_handler: Option<
-        Arc<
-            dyn Fn(
-                    Vec<Arc<dyn Any + Send + Sync>>,
-                    Context<D>,
-                ) -> BoxFuture<Result<Vec<EventOutput>>>
-                + Send
-                + Sync,
-        >,
-    >,
-
-    /// Optional timeout for same-batch accumulation windows.
-    pub(crate) join_window_timeout: Option<Duration>,
-
     /// Optional mapper for creating terminal events when an execution moves to DLQ.
     pub(crate) dlq_terminal_mapper: Option<DlqTerminalMapper>,
 
@@ -397,9 +372,6 @@ where
             can_handle: self.can_handle.clone(),
             started: self.started.clone(),
             handler: self.handler.clone(),
-            join_mode: self.join_mode,
-            join_batch_handler: self.join_batch_handler.clone(),
-            join_window_timeout: self.join_window_timeout,
             dlq_terminal_mapper: self.dlq_terminal_mapper.clone(),
             queued: self.queued,
             delay: self.delay,
@@ -450,19 +422,6 @@ where
         ctx: Context<D>,
     ) -> BoxFuture<Result<Vec<EventOutput>>> {
         (self.handler)(value, type_id, ctx)
-    }
-
-    /// Call the join batch handler if configured.
-    pub async fn call_join_batch_handler(
-        &self,
-        values: Vec<Arc<dyn Any + Send + Sync>>,
-        ctx: Context<D>,
-    ) -> Result<Vec<EventOutput>> {
-        if let Some(handler) = &self.join_batch_handler {
-            handler(values, ctx).await
-        } else {
-            Ok(Vec::new())
-        }
     }
 
     /// Internal queue codec metadata.

@@ -33,16 +33,6 @@ struct PaymentCharged {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct RowValidated {
-    row_id: Uuid,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct BatchInserted {
-    count: usize,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
 enum CrawlEvent {
     Ingested { website_id: Uuid, job_id: Uuid },
     Regenerated { website_id: Uuid, job_id: Uuid },
@@ -152,19 +142,6 @@ mod order_effects {
             error: None,
             attempts: 0,
         })
-    }
-
-    #[handle(
-        on = RowValidated,
-        accumulate,
-        window_timeout_secs = 60,
-        id = "bulk_insert"
-    )]
-    async fn bulk_insert(
-        batch: Vec<RowValidated>,
-        _ctx: Context<Deps>,
-    ) -> Result<BatchInserted> {
-        Ok(BatchInserted { count: batch.len() })
     }
 
     #[handle(
@@ -404,7 +381,7 @@ fn singleton_aggregator_apply_works() {
 #[test]
 fn effects_module_registration_works() {
     let effects = order_effects::handles();
-    assert_eq!(effects.len(), 10); // was 11 before projection moved out
+    assert_eq!(effects.len(), 9); // was 10 before accumulate removed
     assert!(effects
         .iter()
         .any(|effect| effect.can_handle(TypeId::of::<OrderPlaced>())));

@@ -4,10 +4,10 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
@@ -32,8 +32,6 @@ pub struct MemoryStore {
     /// In-flight handlers: populated by poll_next_handler, consumed by
     /// resolve_handler(Retry) to reconstruct the execution for re-enqueueing.
     in_flight: Arc<DashMap<(Uuid, String), QueuedHandler>>,
-    /// Durable-ish join windows for same-batch fan-in (in-memory only).
-    join_windows: Arc<Mutex<HashMap<(String, Uuid, Uuid), MemoryJoinWindow>>>,
     // ── Event persistence ────────────────────────────────────────
     /// Global event log for event persistence.
     global_log: Arc<Mutex<Vec<PersistedEvent>>>,
@@ -53,22 +51,6 @@ pub struct MemoryStore {
     handler_descriptions: Arc<DashMap<Uuid, HashMap<String, serde_json::Value>>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryJoinStatus {
-    Open,
-    Processing,
-    Completed,
-}
-
-#[derive(Debug, Clone)]
-struct MemoryJoinWindow {
-    target_count: i32,
-    status: MemoryJoinStatus,
-    source_event_ids: HashSet<Uuid>,
-    entries_by_index: HashMap<i32, JoinEntry>,
-    expires_at: Option<DateTime<Utc>>,
-}
-
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
@@ -76,7 +58,6 @@ impl MemoryStore {
             handler_queue: Arc::new(Mutex::new(VecDeque::new())),
             completed_handlers: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
-            join_windows: Arc::new(Mutex::new(HashMap::new())),
             global_log: Arc::new(Mutex::new(Vec::new())),
             global_position: Arc::new(AtomicU64::new(1)),
             snapshots: Arc::new(DashMap::new()),
@@ -132,7 +113,6 @@ impl MemoryStore {
         max_attempts: i32,
         priority: i32,
         hops: i32,
-        join_window_timeout_seconds: Option<i32>,
         ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<()> {
         let execution = QueuedHandler {
@@ -151,7 +131,6 @@ impl MemoryStore {
             priority,
             hops,
             attempts: 0,
-            join_window_timeout_seconds,
             ephemeral,
         };
 
@@ -200,7 +179,6 @@ impl Store for MemoryStore {
                         intent.max_attempts,
                         intent.priority,
                         intent.hops,
-                        intent.join_window_timeout_seconds,
                         commit.ephemeral.clone(),
                     )
                     .await?;
@@ -318,138 +296,6 @@ impl Store for MemoryStore {
             }
         }
         Ok(())
-    }
-
-    async fn join_append_and_maybe_claim(
-        &self,
-        params: JoinAppendParams,
-    ) -> Result<Option<Vec<JoinEntry>>> {
-        let key = (
-            params.join_handler_id,
-            params.correlation_id,
-            params.batch_id,
-        );
-        let mut windows = self.join_windows.lock();
-        let window = windows.entry(key).or_insert_with(|| MemoryJoinWindow {
-            target_count: params.batch_size,
-            status: MemoryJoinStatus::Open,
-            source_event_ids: HashSet::new(),
-            entries_by_index: HashMap::new(),
-            expires_at: params
-                .join_window_timeout_seconds
-                .map(|seconds| Utc::now() + Duration::seconds(seconds as i64)),
-        });
-
-        if window.status == MemoryJoinStatus::Completed {
-            return Ok(None);
-        }
-
-        if window.target_count != params.batch_size {
-            window.target_count = params.batch_size;
-        }
-        if window.expires_at.is_none() {
-            window.expires_at = params
-                .join_window_timeout_seconds
-                .map(|seconds| Utc::now() + Duration::seconds(seconds as i64));
-        }
-
-        let already_seen_source = !window.source_event_ids.insert(params.source_event_id);
-        if !already_seen_source {
-            window
-                .entries_by_index
-                .entry(params.batch_index)
-                .or_insert_with(|| JoinEntry {
-                    source_event_id: params.source_event_id,
-                    event_type: params.source_event_type,
-                    payload: params.source_payload,
-                    batch_id: params.batch_id,
-                    batch_index: params.batch_index,
-                    batch_size: params.batch_size,
-                    created_at: params.source_created_at,
-                });
-        }
-
-        let ready = window.entries_by_index.len() as i32 >= window.target_count;
-        if ready && window.status == MemoryJoinStatus::Open {
-            window.status = MemoryJoinStatus::Processing;
-            let mut ordered = window
-                .entries_by_index
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            ordered.sort_by_key(|entry| entry.batch_index);
-            return Ok(Some(ordered));
-        }
-
-        Ok(None)
-    }
-
-    async fn join_complete(
-        &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        batch_id: Uuid,
-    ) -> Result<()> {
-        let key = (join_handler_id, correlation_id, batch_id);
-        if let Some(window) = self.join_windows.lock().get_mut(&key) {
-            window.status = MemoryJoinStatus::Completed;
-        }
-        self.join_windows.lock().remove(&key);
-        Ok(())
-    }
-
-    async fn join_release(
-        &self,
-        join_handler_id: String,
-        correlation_id: Uuid,
-        batch_id: Uuid,
-        _error: String,
-    ) -> Result<()> {
-        let key = (join_handler_id, correlation_id, batch_id);
-        if let Some(window) = self.join_windows.lock().get_mut(&key) {
-            if window.status == MemoryJoinStatus::Processing {
-                window.status = MemoryJoinStatus::Open;
-            }
-        }
-        Ok(())
-    }
-
-    async fn expire_join_windows(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<ExpiredJoinWindow>> {
-        let mut windows = self.join_windows.lock();
-        let mut expired = Vec::new();
-        let mut expired_keys = Vec::new();
-
-        for (key, window) in windows.iter() {
-            if window.status != MemoryJoinStatus::Open {
-                continue;
-            }
-            let Some(expires_at) = window.expires_at else {
-                continue;
-            };
-            if expires_at > now {
-                continue;
-            }
-
-            let mut source_event_ids =
-                window.source_event_ids.iter().copied().collect::<Vec<_>>();
-            source_event_ids.sort();
-            expired.push(ExpiredJoinWindow {
-                join_handler_id: key.0.clone(),
-                correlation_id: key.1,
-                batch_id: key.2,
-                source_event_ids,
-            });
-            expired_keys.push(key.clone());
-        }
-
-        for key in expired_keys {
-            windows.remove(&key);
-        }
-
-        Ok(expired)
     }
 
     // ── Event persistence overrides ──────────────────────────────

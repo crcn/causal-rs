@@ -164,16 +164,12 @@ struct EffectArgs {
     on_any: bool,
     extract: Vec<Ident>,
     filter: Option<Path>,
-    accumulate: bool,
-    join: bool,
     queued: bool,
     id: Option<String>,
     dlq_terminal: Option<Path>,
     retry: Option<u32>,
     timeout_secs: Option<u64>,
     timeout_ms: Option<u64>,
-    window_timeout_secs: Option<u64>,
-    window_timeout_ms: Option<u64>,
     delay_secs: Option<u64>,
     delay_ms: Option<u64>,
     priority: Option<i32>,
@@ -235,12 +231,6 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             "cannot specify both delay_secs and delay_ms",
         ));
     }
-    if args.window_timeout_secs.is_some() && args.window_timeout_ms.is_some() {
-        return Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "cannot specify both window_timeout_secs and window_timeout_ms",
-        ));
-    }
     if args.filter.is_some() && !args.extract.is_empty() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -253,7 +243,6 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             "describe requires filter (describe is only available on FilteredHandlerBuilder)",
         ));
     }
-    let is_accumulate = args.accumulate || args.join;
     if effect_requires_stable_id(&args) && args.id.is_none() && args.group.is_none() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -271,14 +260,12 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         }
         if !args.extract.is_empty()
             || args.filter.is_some()
-            || args.accumulate
-            || args.join
             || args.transition.is_some()
             || args.aggregate.is_some()
         {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "on_any cannot be combined with extract, filter, accumulate, join, transition, or aggregate",
+                "on_any cannot be combined with extract, filter, transition, or aggregate",
             ));
         }
 
@@ -396,50 +383,6 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
                 .transition::<#aggregate_ty, _>(#transition_closure)
                 .then::<#deps_ty, _, _>(|#param_ident, __seesaw_ctx| async move {
                     let __result = #fn_ident(#param_ident, __seesaw_ctx).await?;
-                    Ok(#convert_result)
-                })
-        }
-    } else if is_accumulate {
-        if !args.extract.is_empty() {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "accumulate and extract(...) cannot be used together",
-            ));
-        }
-        if !matches!(on, OnSpec::EventType(_)) {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "accumulate requires on = EventType (not on = [...])",
-            ));
-        }
-        if non_ctx_params.len() != 1 {
-            return Err(syn::Error::new_spanned(
-                &input_fn.sig.inputs,
-                "accumulate requires exactly one non-context parameter of type Vec<T>",
-            ));
-        }
-
-        let batch_param = &non_ctx_params[0];
-        let batch_ty = vec_inner_type(&batch_param.ty).ok_or_else(|| {
-            syn::Error::new_spanned(
-                &batch_param.ty,
-                "accumulate requires first parameter to be Vec<T> where on = T",
-            )
-        })?;
-
-        if type_key(batch_ty) != path_key(&on_event_type) {
-            return Err(syn::Error::new_spanned(
-                &batch_param.ty,
-                "accumulate requires first parameter type Vec<T> to match on = T",
-            ));
-        }
-
-        let batch_ident = &batch_param.ident;
-        quote! {
-            #builder
-                .accumulate()
-                .then::<#deps_ty, _, _>(|#batch_ident, __seesaw_ctx| async move {
-                    let __result = #fn_ident(#batch_ident, __seesaw_ctx).await?;
                     Ok(#convert_result)
                 })
         }
@@ -722,24 +665,6 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 }
                 args.extract = parse_extract_fields(list)?;
             }
-            Meta::Path(path) if path.is_ident("accumulate") => {
-                if args.accumulate || args.join {
-                    return Err(syn::Error::new_spanned(
-                        path,
-                        "accumulate specified more than once",
-                    ));
-                }
-                args.accumulate = true;
-            }
-            Meta::Path(path) if path.is_ident("join") => {
-                if args.accumulate || args.join {
-                    return Err(syn::Error::new_spanned(
-                        path,
-                        "accumulate specified more than once",
-                    ));
-                }
-                args.join = true;
-            }
             Meta::Path(path) if path.is_ident("projection") => {
                 return Err(syn::Error::new_spanned(path, "#[handler(projection)] is removed in v0.20.0. Use #[projection] instead."));
             }
@@ -776,16 +701,6 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
             Meta::NameValue(nv) if nv.path.is_ident("timeout_ms") => {
                 ensure_unset(&args.timeout_ms, nv, "timeout_ms")?;
                 args.timeout_ms = Some(parse_int_lit::<u64>(&nv.value, "timeout_ms")?);
-            }
-            Meta::NameValue(nv) if nv.path.is_ident("window_timeout_secs") => {
-                ensure_unset(&args.window_timeout_secs, nv, "window_timeout_secs")?;
-                args.window_timeout_secs =
-                    Some(parse_int_lit::<u64>(&nv.value, "window_timeout_secs")?);
-            }
-            Meta::NameValue(nv) if nv.path.is_ident("window_timeout_ms") => {
-                ensure_unset(&args.window_timeout_ms, nv, "window_timeout_ms")?;
-                args.window_timeout_ms =
-                    Some(parse_int_lit::<u64>(&nv.value, "window_timeout_ms")?);
             }
             Meta::NameValue(nv) if nv.path.is_ident("delay_secs") => {
                 ensure_unset(&args.delay_secs, nv, "delay_secs")?;
@@ -1025,25 +940,6 @@ fn collect_params(sig: &Signature) -> syn::Result<Vec<ParamInfo>> {
     Ok(params)
 }
 
-fn vec_inner_type(ty: &Type) -> Option<&Type> {
-    let Type::Path(type_path) = ty else {
-        return None;
-    };
-    let last = type_path.path.segments.last()?;
-    if last.ident != "Vec" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &last.arguments else {
-        return None;
-    };
-    for arg in &args.args {
-        if let GenericArgument::Type(inner) = arg {
-            return Some(inner);
-        }
-    }
-    None
-}
-
 fn variant_base_path(path: &Path) -> syn::Result<Path> {
     if path.segments.len() < 2 {
         return Err(syn::Error::new_spanned(
@@ -1093,18 +989,6 @@ fn apply_effect_config(base: TokenStream2, args: &EffectArgs, fn_ident: &Ident) 
     }
     if let Some(timeout_ms) = args.timeout_ms {
         builder = quote! { #builder .timeout(::std::time::Duration::from_millis(#timeout_ms)) };
-    }
-    if let Some(window_timeout_secs) = args.window_timeout_secs {
-        builder = quote! {
-            #builder
-                .window(::std::time::Duration::from_secs(#window_timeout_secs))
-        };
-    }
-    if let Some(window_timeout_ms) = args.window_timeout_ms {
-        builder = quote! {
-            #builder
-                .window(::std::time::Duration::from_millis(#window_timeout_ms))
-        };
     }
     if let Some(delay_secs) = args.delay_secs {
         builder = quote! { #builder .delayed(::std::time::Duration::from_secs(#delay_secs)) };
@@ -1227,14 +1111,10 @@ fn expand_projection(
 
 fn effect_requires_stable_id(args: &EffectArgs) -> bool {
     args.queued
-        || args.accumulate
-        || args.join
         || args.delay_secs.is_some()
         || args.delay_ms.is_some()
         || args.timeout_secs.is_some()
         || args.timeout_ms.is_some()
-        || args.window_timeout_secs.is_some()
-        || args.window_timeout_ms.is_some()
         || args.retry.unwrap_or(1) > 1
 }
 
@@ -1356,13 +1236,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_effect_args_supports_accumulate_flag() {
-        let metas = parse_effect_meta_list(quote!(on = MyEvent, accumulate));
-        let args = parse_effect_args(&metas).expect("accumulate should parse");
-        assert!(args.accumulate);
-    }
-
-    #[test]
     fn apply_effect_config_does_not_emit_queued_builder_call() {
         let args = EffectArgs {
             retry: Some(3),
@@ -1383,27 +1256,6 @@ mod tests {
         assert!(
             configured_text.contains(". retry (3u32)"),
             "retry builder call should be emitted, got: {}",
-            configured_text
-        );
-    }
-
-    #[test]
-    fn apply_effect_config_emits_window_timeout_builder_call() {
-        let args = EffectArgs {
-            window_timeout_secs: Some(60),
-            ..EffectArgs::default()
-        };
-        let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
-        let configured = apply_effect_config(
-            quote!(::seesaw_core::on::<MyEvent>()),
-            &args,
-            &handler_ident,
-        );
-        let configured_text = configured.to_string();
-        assert!(
-            configured_text.contains(". window (")
-                && configured_text.contains("Duration :: from_secs"),
-            "window builder call should be emitted, got: {}",
             configured_text
         );
     }
