@@ -2,6 +2,7 @@
 members = [
     "crates/seesaw",
     "crates/seesaw_core_macros",
+    "crates/seesaw_utils",
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
@@ -9,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.23.6"
+version = "0.23.7"
 edition = "2021"
 license = "MIT"
 authors = ["Crispin Read <crispin@crispinread.com>"]
