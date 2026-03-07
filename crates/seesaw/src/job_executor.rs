@@ -627,7 +627,7 @@ where
         let Some(mapper) = handler.dlq_terminal_mapper.as_ref() else {
             // Global fallback
             if let Some(global) = self.global_dlq_mapper.as_ref() {
-                let emitted = global(DlqTerminalInfo {
+                let mut emitted = global(DlqTerminalInfo {
                     handler_id: execution.handler_id.clone(),
                     source_event_type: event_type_short_name(&execution.event_type).to_string(),
                     source_event_id: execution.event_id,
@@ -636,6 +636,9 @@ where
                     attempts: execution.attempts,
                     max_attempts: execution.max_attempts,
                 })?;
+                if emitted.handler_id.is_none() {
+                    emitted.handler_id = Some(execution.handler_id.clone());
+                }
                 return Ok(vec![emitted]);
             }
             return Ok(Vec::new());
@@ -654,6 +657,11 @@ where
                 max_attempts: execution.max_attempts,
             },
         )?;
+
+        // Ensure handler_id is set for causal tracking
+        if emitted.handler_id.is_none() {
+            emitted.handler_id = Some(execution.handler_id.clone());
+        }
 
         // Inherit batch metadata if not set
         if emitted.batch_id.is_none()

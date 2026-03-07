@@ -3583,3 +3583,54 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
+    // DLQ terminal events should have handler_id metadata set to the
+    // handler that failed, so causal flow graphs can wire the edge.
+    let store = Arc::new(MemoryStore::with_persistence());
+
+    let engine = Engine::new(Deps)
+        .with_store(store.clone())
+        .on_dlq(|info: seesaw_core::DlqTerminalInfo| GlobalDlqEvent {
+            error: info.error,
+        })
+        .with_handler(
+            handler::on::<FailEvent>()
+                .id("failing_handler")
+                .retry(1)
+                .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
+                    Err::<Events, _>(anyhow::anyhow!("boom"))
+                }),
+        )
+        .with_handler(
+            handler::on::<GlobalDlqEvent>()
+                .id("dlq_sink")
+                .then(|_event: Arc<GlobalDlqEvent>, _ctx: Context<Deps>| async move {
+                    Ok(events![])
+                }),
+        );
+
+    engine.emit(FailEvent { attempt: 0 }).settled().await?;
+
+    // Find the persisted GlobalDlqEvent in the global log
+    let log = store.global_log().lock();
+    let dlq_event = log
+        .iter()
+        .find(|e| e.event_type == "GlobalDlqEvent")
+        .expect("GlobalDlqEvent should be persisted");
+
+    assert_eq!(
+        dlq_event.metadata.get("handler_id").and_then(|v| v.as_str()),
+        Some("failing_handler"),
+        "DLQ event metadata should carry the failed handler's ID"
+    );
+
+    // Also verify parent_id is set (causal link to the source event)
+    assert!(
+        dlq_event.parent_id.is_some(),
+        "DLQ event should have a parent_id linking to the source event"
+    );
+
+    Ok(())
+}

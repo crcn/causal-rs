@@ -157,6 +157,7 @@ where
     {
         let event_type = std::any::type_name::<E>().to_string();
         self.global_dlq_mapper = Some(Arc::new(move |info| {
+            let failed_handler_id = info.handler_id.clone();
             let event = mapper(info);
             Ok(crate::EmittedEvent {
                 event_type: event_type.clone(),
@@ -164,7 +165,7 @@ where
                 batch_id: None,
                 batch_index: None,
                 batch_size: None,
-                handler_id: None,
+                handler_id: Some(failed_handler_id),
                 ephemeral: None,
             })
         }));
@@ -752,7 +753,12 @@ where
             max_attempts: execution.max_attempts,
         };
         match global(info) {
-            Ok(emitted) => Some(vec![emitted]),
+            Ok(mut emitted) => {
+                if emitted.handler_id.is_none() {
+                    emitted.handler_id = Some(execution.handler_id.clone());
+                }
+                Some(vec![emitted])
+            }
             Err(e) => {
                 tracing::warn!("global on_dlq mapper failed: {}", e);
                 None
