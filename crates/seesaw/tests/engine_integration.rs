@@ -3831,3 +3831,83 @@ async fn multi_type_handler_with_filter_fires_on_both_types() -> Result<()> {
 
     Ok(())
 }
+
+// ── Describe timing tests ─────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct ProgressTracker {
+    completed_steps: u32,
+}
+
+impl Aggregate for ProgressTracker {
+    fn aggregate_type() -> &'static str {
+        "ProgressTracker"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StepStarted;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StepDone;
+
+impl Apply<StepStarted> for ProgressTracker {
+    fn apply(&mut self, _event: StepStarted) {
+        self.completed_steps += 1;
+    }
+}
+
+impl Apply<StepDone> for ProgressTracker {
+    fn apply(&mut self, _event: StepDone) {
+        self.completed_steps += 1;
+    }
+}
+
+#[tokio::test]
+async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
+    // Regression: describe() runs during execute_event (before handlers run),
+    // so it captures stale aggregate state. After a handler completes and
+    // emits events that update aggregates, describe should be re-run so the
+    // stored description reflects the latest state.
+    let store = Arc::new(MemoryStore::new());
+    let store_clone = store.clone();
+
+    let engine = Engine::new(Deps)
+        .with_store(store.clone() as Arc<dyn Store>)
+        .with_aggregator::<StepStarted, ProgressTracker, _>(|_| Uuid::nil())
+        .with_aggregator::<StepDone, ProgressTracker, _>(|_| Uuid::nil())
+        .with_handler(
+            handler::on::<StepStarted>()
+                .id("process_step")
+                .filter(|_event: &StepStarted, _ctx: &Context<Deps>| true)
+                .describe(|ctx: &Context<Deps>| {
+                    let (_, state) = ctx.singleton::<ProgressTracker>();
+                    serde_json::json!({ "completed_steps": state.completed_steps })
+                })
+                .then(|_event: Arc<StepStarted>, _ctx: Context<Deps>| async move {
+                    Ok(events![StepDone])
+                }),
+        );
+
+    let handle = engine.emit(StepStarted).settled().await?;
+    let correlation_id = handle.correlation_id;
+
+    // After settling: StepStarted was applied (count=1), handler emitted StepDone
+    // which was also applied (count=2). The stored description should show count=2.
+    let descriptions = store_clone
+        .get_handler_descriptions(correlation_id)
+        .await?;
+
+    let desc = descriptions
+        .get("process_step")
+        .expect("describe should have been stored for process_step");
+
+    assert_eq!(
+        desc["completed_steps"], 2,
+        "describe should reflect post-handler aggregate state (count=2), \
+         but got {}. This means describe only captured pre-handler state.",
+        desc["completed_steps"]
+    );
+
+    Ok(())
+}

@@ -109,9 +109,15 @@ where
             .filter(|h| h.can_handle(event_type_id))
             .collect();
 
-        // 5. Call describe() on matching handlers that have it
+        // 5. Call describe() on ALL handlers that have it (not just matching ones).
+        //
+        // Every event in a correlation may update aggregate state, so we
+        // re-run describe for every handler with a describe closure. This
+        // ensures that when handler A emits EventB (which updates aggregates),
+        // handler A's description is refreshed when EventB is processed —
+        // even though handler A doesn't match EventB.
         let mut handler_descriptions = std::collections::HashMap::new();
-        for handler in &matching_handlers {
+        for handler in self.handlers.all() {
             if handler.has_describe() {
                 let ctx = self.make_context(
                     handler.id.clone(),
