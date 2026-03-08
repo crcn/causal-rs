@@ -206,8 +206,8 @@ where
     ///     .id("actor_extraction")
     ///     .retry(3)
     ///     .filter(|event, ctx: &Context<Deps>| {
-    ///         let (_, state) = ctx.singleton::<PipelineState>();
-    ///         state.completed_scrape_roles.is_superset(&response_roles())
+    ///         let state = ctx.aggregate::<PipelineState>();
+    ///         state.curr.completed_scrape_roles.is_superset(&response_roles())
     ///     })
     ///     .then(|event, ctx| async move { Ok(events![]) })
     /// ```

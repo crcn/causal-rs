@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use parking_lot::Mutex;
 
-use crate::aggregator::AggregatorRegistry;
+use crate::aggregator::{Aggregate, AggregatorRegistry};
 use crate::store::Store;
 use crate::types::{JournalEntry, LogEntry, LogLevel};
 
@@ -86,6 +86,16 @@ impl Logger {
 
 fn to_value_opt(data: &impl serde::Serialize) -> Option<serde_json::Value> {
     serde_json::to_value(data).ok()
+}
+
+/// Aggregate state with named fields for clarity.
+///
+/// Returned by [`Context::aggregate`] and [`Context::aggregate_of`].
+pub struct AggregateState<A> {
+    /// State before the current event was applied.
+    pub prev: Arc<A>,
+    /// Current state (after the current event was applied).
+    pub curr: Arc<A>,
 }
 
 /// Context passed to handlers.
@@ -187,30 +197,34 @@ where
         self.aggregator_registry.as_deref()
     }
 
-    /// Get the (prev, next) transition for an aggregate by ID.
+    /// Get aggregate state for a singleton (keyed by `Uuid::nil()`).
     ///
-    /// Returns `(Arc::new(A::default()), Arc::new(A::default()))` if no state exists.
-    pub fn aggregate<A>(&self, id: Uuid) -> (Arc<A>, Arc<A>)
+    /// Returns default state if no events have been applied.
+    pub fn aggregate<A>(&self) -> AggregateState<A>
     where
-        A: crate::Aggregate + 'static,
+        A: Aggregate + 'static,
     {
-        self.aggregator_registry
+        let (prev, curr) = self
+            .aggregator_registry
             .as_ref()
             .expect("aggregate() requires an aggregator registry")
-            .get_transition_arc::<A>(id)
+            .get_singleton_arc::<A>();
+        AggregateState { prev, curr }
     }
 
-    /// Get the (prev, next) transition for a singleton aggregate.
+    /// Get aggregate state for a specific instance by ID.
     ///
-    /// Returns `(Arc::new(A::default()), Arc::new(A::default()))` if no state exists.
-    pub fn singleton<A>(&self) -> (Arc<A>, Arc<A>)
+    /// Returns default state if no events have been applied for this ID.
+    pub fn aggregate_of<A>(&self, id: Uuid) -> AggregateState<A>
     where
-        A: crate::Aggregate + 'static,
+        A: Aggregate + 'static,
     {
-        self.aggregator_registry
+        let (prev, curr) = self
+            .aggregator_registry
             .as_ref()
-            .expect("singleton() requires an aggregator registry")
-            .get_singleton_arc::<A>()
+            .expect("aggregate_of() requires an aggregator registry")
+            .get_transition_arc::<A>(id);
+        AggregateState { prev, curr }
     }
 
     /// Get the handler ID (human-readable identifier).

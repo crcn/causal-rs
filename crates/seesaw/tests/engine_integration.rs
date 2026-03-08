@@ -3504,7 +3504,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
                     let os = os.clone();
                     let ot = ot.clone();
                     async move {
-                        let (_, state) = ctx.aggregate::<Order>(event.order_id);
+                        let state = ctx.aggregate_of::<Order>(event.order_id).curr;
                         *os.lock() = state.status.clone();
                         ot.store(state.total as usize, Ordering::SeqCst);
                         Ok(events![])
@@ -3684,9 +3684,9 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
             handler::on::<ScrapeCompleted>()
                 .id("expand_sources")
                 .filter(move |_event, ctx: &Context<Deps>| {
-                    let (_, state) = ctx.singleton::<PipelineState>();
+                    let state = ctx.aggregate::<PipelineState>();
                     // This filter checks state set by SourcesPrepared, not ScrapeCompleted
-                    state.source_plan.is_some()
+                    state.curr.source_plan.is_some()
                 })
                 .then(move |_event: Arc<ScrapeCompleted>, _ctx: Context<Deps>| {
                     let f = f.clone();
@@ -3881,8 +3881,8 @@ async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
                 .id("process_step")
                 .filter(|_event: &StepStarted, _ctx: &Context<Deps>| true)
                 .describe(|ctx: &Context<Deps>| {
-                    let (_, state) = ctx.singleton::<ProgressTracker>();
-                    serde_json::json!({ "completed_steps": state.completed_steps })
+                    let state = ctx.aggregate::<ProgressTracker>();
+                    serde_json::json!({ "completed_steps": state.curr.completed_steps })
                 })
                 .then(|_event: Arc<StepStarted>, _ctx: Context<Deps>| async move {
                     Ok(events![StepDone])

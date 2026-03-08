@@ -39,7 +39,7 @@ mod error_event;
 mod types;
 
 pub use builders::{on, on_any, project, FilteredHandlerBuilder, ProjectionBuilder, TransitionHandlerBuilder};
-pub use context::{Context, Logger};
+pub use context::{AggregateState, Context, Logger};
 pub use error_event::HandlerError;
 pub use types::{
     AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Events,
