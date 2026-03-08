@@ -125,6 +125,9 @@ pub fn projection(attr: TokenStream, item: TokenStream) -> TokenStream {
 enum OnSpec {
     EventType(Path),
     Variants(Vec<Path>),
+    /// Multiple distinct event types: `on = [TypeA, TypeB]`.
+    /// Handler takes `AnyEvent`, generates one registration per type.
+    MultiType(Vec<Path>),
 }
 
 impl OnSpec {
@@ -154,6 +157,10 @@ impl OnSpec {
 
                 Ok(base)
             }
+            OnSpec::MultiType(_) => Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "multi-type on = [...] has no single event type",
+            )),
         }
     }
 }
@@ -312,6 +319,12 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             "#[handler] requires on = EventType, on = [Enum::Variant, ...], or on_any",
         )
     })?;
+
+    // ── multi-type early branch ──────────────────────────────────────
+    if let OnSpec::MultiType(ref types) = on {
+        return expand_multi_type_effect(&args, &input_fn, types, &return_kind);
+    }
+
     let on_event_type = on.event_type()?;
 
     let (ctx_idx, deps_ty) = find_effect_context(&input_fn.sig)?;
@@ -375,6 +388,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
                     })
                 }
             }
+            OnSpec::MultiType(_) => unreachable!("multi-type validated earlier"),
         };
 
         quote! {
@@ -442,6 +456,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
                     })
                 }
             }
+            OnSpec::MultiType(_) => unreachable!("multi-type validated earlier"),
         };
 
         if fields.len() == 1 {
@@ -520,6 +535,154 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
     })
 }
 
+/// Expand a `#[handle(on = [TypeA, TypeB])]` into multiple handler registrations.
+///
+/// Each type gets its own `on::<T>()` registration, all sharing the same handler id.
+/// The user function takes `AnyEvent` — the typed event is wrapped automatically.
+/// Filter functions (if any) receive only `&Context<D>` since the event type varies.
+fn expand_multi_type_effect(
+    args: &EffectArgs,
+    input_fn: &ItemFn,
+    types: &[Path],
+    return_kind: &ReturnKind,
+) -> syn::Result<TokenStream2> {
+    let fn_ident = &input_fn.sig.ident;
+    let wrapper_ident = format_ident!("__seesaw_effect_{}", fn_ident);
+    let convert_result = result_to_events(return_kind);
+
+    // Validate: extract/transition/aggregate/describe not supported with multi-type
+    if !args.extract.is_empty() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "extract is not supported with multi-type on = [TypeA, TypeB]",
+        ));
+    }
+    if args.aggregate.is_some() || args.transition.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "aggregate/transition is not supported with multi-type on = [TypeA, TypeB]",
+        ));
+    }
+    if args.describe.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "describe is not supported with multi-type on = [TypeA, TypeB]",
+        ));
+    }
+
+    let (ctx_idx, deps_ty) = find_effect_context(&input_fn.sig)?;
+    let params = collect_params(&input_fn.sig)?;
+    let non_ctx_params: Vec<ParamInfo> = params
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, param)| if idx == ctx_idx { None } else { Some(param) })
+        .collect();
+
+    if non_ctx_params.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &input_fn.sig.inputs,
+            "multi-type handler requires exactly one AnyEvent parameter plus Context",
+        ));
+    }
+
+    let event_ident = &non_ctx_params[0].ident;
+
+    // Build config without filter/describe (handled per-type below)
+    let args_no_filter = EffectArgs {
+        on: args.on.clone(),
+        on_any: args.on_any,
+        extract: args.extract.clone(),
+        filter: None,
+        queued: args.queued,
+        id: args.id.clone(),
+        dlq_terminal: args.dlq_terminal.clone(),
+        retry: args.retry,
+        timeout_secs: args.timeout_secs,
+        timeout_ms: args.timeout_ms,
+        delay_secs: args.delay_secs,
+        delay_ms: args.delay_ms,
+        priority: args.priority,
+        group: args.group.clone(),
+        aggregate: args.aggregate.clone(),
+        transition: None, // already validated as None
+        describe: None,
+    };
+
+    // Generate one handler per type, each with a unique suffixed ID
+    let handler_exprs: Vec<TokenStream2> = types
+        .iter()
+        .map(|event_type| {
+            // Suffix the handler id with the type name for uniqueness
+            let type_suffix = event_type.segments.last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let mut per_type_args = EffectArgs {
+                on: args_no_filter.on.clone(),
+                on_any: args_no_filter.on_any,
+                extract: args_no_filter.extract.clone(),
+                filter: None,
+                queued: args_no_filter.queued,
+                id: args_no_filter.id.as_ref().map(|id| format!("{id}::{type_suffix}")),
+                dlq_terminal: args_no_filter.dlq_terminal.clone(),
+                retry: args_no_filter.retry,
+                timeout_secs: args_no_filter.timeout_secs,
+                timeout_ms: args_no_filter.timeout_ms,
+                delay_secs: args_no_filter.delay_secs,
+                delay_ms: args_no_filter.delay_ms,
+                priority: args_no_filter.priority,
+                group: args_no_filter.group.clone(),
+                aggregate: None,
+                transition: None,
+                describe: None,
+            };
+            // If no explicit id, generate from fn name + type
+            if per_type_args.id.is_none() && per_type_args.group.is_none() {
+                per_type_args.id = Some(format!("{}::{}", fn_ident, type_suffix));
+            }
+
+            let base_builder = quote! { ::seesaw_core::on::<#event_type>() };
+            let builder = apply_effect_config(base_builder, &per_type_args, fn_ident);
+
+            if let Some(filter_fn) = &args.filter {
+                // Filter takes only &Context<D> — wrap it for the typed filter signature
+                quote! {
+                    #builder
+                        .filter(|_: &#event_type, __seesaw_ctx: &::seesaw_core::Context<#deps_ty>| #filter_fn(__seesaw_ctx))
+                        .then(|#event_ident: ::std::sync::Arc<#event_type>, __seesaw_ctx: ::seesaw_core::Context<#deps_ty>| async move {
+                            let #event_ident = ::seesaw_core::AnyEvent {
+                                value: #event_ident as ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>,
+                                type_id: ::std::any::TypeId::of::<#event_type>(),
+                            };
+                            let __result = #fn_ident(#event_ident, __seesaw_ctx).await?;
+                            Ok(#convert_result)
+                        })
+                }
+            } else {
+                quote! {
+                    #builder
+                        .then::<#deps_ty, ::std::sync::Arc<#event_type>, _, _>(|#event_ident, __seesaw_ctx| async move {
+                            let #event_ident = ::seesaw_core::AnyEvent {
+                                value: #event_ident as ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>,
+                                type_id: ::std::any::TypeId::of::<#event_type>(),
+                            };
+                            let __result = #fn_ident(#event_ident, __seesaw_ctx).await?;
+                            Ok(#convert_result)
+                        })
+                }
+            }
+        })
+        .collect();
+
+    Ok(quote! {
+        #input_fn
+
+        #[doc(hidden)]
+        pub fn #wrapper_ident() -> ::std::vec::Vec<::seesaw_core::Handler<#deps_ty>> {
+            ::std::vec![#(#handler_exprs),*]
+        }
+    })
+}
+
 fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     let Some((_, items)) = &mut module.content else {
         return Err(syn::Error::new_spanned(
@@ -529,6 +692,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     };
 
     let mut wrappers = Vec::new();
+    let mut multi_wrappers = Vec::new(); // multi-type handlers returning Vec<Handler<D>>
     let mut projection_wrappers = Vec::new();
     let mut deps_ty: Option<Type> = None;
     let mut inferred_fns = Vec::new();
@@ -548,7 +712,11 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         } else if has_handle_attr {
             // Explicit #[handle(...)]: standalone proc macro handles expansion
             let wrapper_ident = format_ident!("__seesaw_effect_{}", item_fn.sig.ident);
-            wrappers.push(wrapper_ident);
+            if is_multi_type_handle(&item_fn.attrs) {
+                multi_wrappers.push(wrapper_ident);
+            } else {
+                wrappers.push(wrapper_ident);
+            }
         } else if item_fn.sig.asyncness.is_some() {
             // Bare async fn: infer on = EventType from signature
             let wrapper_ident = format_ident!("__seesaw_effect_{}", item_fn.sig.ident);
@@ -598,7 +766,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         }
     }
 
-    if wrappers.is_empty() && projection_wrappers.is_empty() {
+    if wrappers.is_empty() && multi_wrappers.is_empty() && projection_wrappers.is_empty() {
         return Err(syn::Error::new_spanned(
             module,
             "#[handles] module must contain at least one handler or projection function",
@@ -618,9 +786,19 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     let inferred_tokens: Vec<&TokenStream2> = inferred_fns.iter().map(|(_, t)| t).collect();
 
     let deps_ty = deps_ty.expect("checked above");
-    let handles_fn: ItemFn = parse_quote! {
-        pub fn handles() -> ::std::vec::Vec<::seesaw_core::Handler<#deps_ty>> {
-            ::std::vec![#(#wrappers()),*]
+    let handles_fn: ItemFn = if multi_wrappers.is_empty() {
+        parse_quote! {
+            pub fn handles() -> ::std::vec::Vec<::seesaw_core::Handler<#deps_ty>> {
+                ::std::vec![#(#wrappers()),*]
+            }
+        }
+    } else {
+        parse_quote! {
+            pub fn handles() -> ::std::vec::Vec<::seesaw_core::Handler<#deps_ty>> {
+                let mut __h = ::std::vec![#(#wrappers()),*];
+                #(__h.extend(#multi_wrappers());)*
+                __h
+            }
         }
     };
     let handlers_fn: ItemFn = parse_quote! {
@@ -755,7 +933,15 @@ fn parse_on_expr(expr: &Expr) -> syn::Result<OnSpec> {
     let expr = strip_expr_groups(expr);
     match expr {
         Expr::Path(expr_path) => Ok(OnSpec::EventType(expr_path.path.clone())),
-        Expr::Array(expr_array) => Ok(OnSpec::Variants(parse_path_array(expr_array)?)),
+        Expr::Array(expr_array) => {
+            let paths = parse_path_array(expr_array)?;
+            // Determine if these are enum variants (same base) or distinct types
+            if are_enum_variants(&paths) {
+                Ok(OnSpec::Variants(paths))
+            } else {
+                Ok(OnSpec::MultiType(paths))
+            }
+        }
         Expr::Binary(binary) if matches!(binary.op, syn::BinOp::BitOr(_)) => {
             let left = parse_on_expr(&binary.left)?;
             let right = parse_on_expr(&binary.right)?;
@@ -773,9 +959,25 @@ fn parse_on_expr(expr: &Expr) -> syn::Result<OnSpec> {
         }
         _ => Err(syn::Error::new_spanned(
             expr,
-            "expected on = EventType or on = [Enum::Variant, ...]",
+            "expected on = EventType, on = [Enum::Variant, ...], or on = [TypeA, TypeB]",
         )),
     }
+}
+
+/// Check if all paths are enum variants sharing the same base type.
+fn are_enum_variants(paths: &[Path]) -> bool {
+    if paths.is_empty() || !paths.iter().all(|p| p.segments.len() >= 2) {
+        return false;
+    }
+    let Ok(first_base) = variant_base_path(&paths[0]) else {
+        return false;
+    };
+    let base_key = path_key(&first_base);
+    paths.iter().skip(1).all(|p| {
+        variant_base_path(p)
+            .map(|b| path_key(&b) == base_key)
+            .unwrap_or(false)
+    })
 }
 
 fn parse_path_array(array: &syn::ExprArray) -> syn::Result<Vec<Path>> {
@@ -787,7 +989,7 @@ fn parse_path_array(array: &syn::ExprArray) -> syn::Result<Vec<Path>> {
             _ => {
                 return Err(syn::Error::new_spanned(
                     element,
-                    "on = [...] expects paths like Enum::Variant",
+                    "on = [...] expects type paths",
                 ));
             }
         }
@@ -1124,6 +1326,28 @@ fn has_attr(attrs: &[Attribute], name: &str) -> bool {
 
 fn has_attr_any(attrs: &[Attribute], names: &[&str]) -> bool {
     names.iter().any(|name| has_attr(attrs, name))
+}
+
+/// Check if a `#[handle]` attribute uses multi-type `on = [TypeA, TypeB]`.
+fn is_multi_type_handle(attrs: &[Attribute]) -> bool {
+    for attr in attrs {
+        if attr.path().is_ident("handle") || attr.path().is_ident("handler") {
+            if let Ok(metas) = attr.parse_args_with(
+                Punctuated::<Meta, Token![,]>::parse_terminated,
+            ) {
+                for meta in &metas {
+                    if let Meta::NameValue(nv) = meta {
+                        if nv.path.is_ident("on") {
+                            if let Ok(OnSpec::MultiType(_)) = parse_on_expr(&nv.value) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn path_key(path: &Path) -> String {

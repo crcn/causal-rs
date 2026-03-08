@@ -3708,3 +3708,126 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
 
     Ok(())
 }
+
+// ── Multi-type handler integration tests ─────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReviewDone {
+    concern_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NoSignals {
+    concern_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Enriched {
+    concern_id: Uuid,
+    source: String,
+}
+
+#[tokio::test]
+async fn multi_type_handler_fires_on_both_event_types() -> Result<()> {
+    let fired = Arc::new(AtomicUsize::new(0));
+    let sources: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let fired_c = fired.clone();
+    let sources_c = sources.clone();
+
+    let engine = Engine::new(Deps)
+        .with_handlers(vec![
+            // Register one handler for ReviewDone
+            handler::on::<ReviewDone>()
+                .id("enrich::ReviewDone")
+                .then(move |_event: Arc<ReviewDone>, _ctx: Context<Deps>| {
+                    let f = fired_c.clone();
+                    let s = sources_c.clone();
+                    async move {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        s.lock().push("review".into());
+                        Ok(events![])
+                    }
+                }),
+            // Register same logical handler for NoSignals
+            handler::on::<NoSignals>()
+                .id("enrich::NoSignals")
+                .then({
+                    let fired = fired.clone();
+                    let sources = sources.clone();
+                    move |_event: Arc<NoSignals>, _ctx: Context<Deps>| {
+                        let f = fired.clone();
+                        let s = sources.clone();
+                        async move {
+                            f.fetch_add(1, Ordering::SeqCst);
+                            s.lock().push("no_signals".into());
+                            Ok(events![])
+                        }
+                    }
+                }),
+        ]);
+
+    // Fire ReviewDone
+    engine.emit(ReviewDone { concern_id: Uuid::new_v4() }).settled().await?;
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert_eq!(sources.lock()[0], "review");
+
+    // Fire NoSignals
+    engine.emit(NoSignals { concern_id: Uuid::new_v4() }).settled().await?;
+    assert_eq!(fired.load(Ordering::SeqCst), 2);
+    assert_eq!(sources.lock()[1], "no_signals");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_type_handler_with_filter_fires_on_both_types() -> Result<()> {
+    let fired = Arc::new(AtomicUsize::new(0));
+    let sources: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let fired_c = fired.clone();
+    let sources_c = sources.clone();
+    let fired_c2 = fired.clone();
+    let sources_c2 = sources.clone();
+
+    // Simulate a context-only filter (always returns true here)
+    let engine = Engine::new(Deps)
+        .with_handlers(vec![
+            handler::on::<ReviewDone>()
+                .id("enrich_filtered::ReviewDone")
+                .filter(|_event: &ReviewDone, _ctx: &Context<Deps>| true)
+                .then(move |_event: Arc<ReviewDone>, _ctx: Context<Deps>| {
+                    let f = fired_c.clone();
+                    let s = sources_c.clone();
+                    async move {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        s.lock().push("review".into());
+                        Ok(events![])
+                    }
+                }),
+            handler::on::<NoSignals>()
+                .id("enrich_filtered::NoSignals")
+                .filter(|_event: &NoSignals, _ctx: &Context<Deps>| true)
+                .then(move |_event: Arc<NoSignals>, _ctx: Context<Deps>| {
+                    let f = fired_c2.clone();
+                    let s = sources_c2.clone();
+                    async move {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        s.lock().push("no_signals".into());
+                        Ok(events![])
+                    }
+                }),
+        ]);
+
+    engine.emit(ReviewDone { concern_id: Uuid::new_v4() }).settled().await?;
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+    engine.emit(NoSignals { concern_id: Uuid::new_v4() }).settled().await?;
+    assert_eq!(fired.load(Ordering::SeqCst), 2);
+
+    let s = sources.lock();
+    assert_eq!(s[0], "review");
+    assert_eq!(s[1], "no_signals");
+
+    Ok(())
+}

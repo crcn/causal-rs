@@ -495,3 +495,78 @@ fn bare_handler_inference_works() {
         .expect("explicit #[handle] should still work");
     assert!(explicit.can_handle(TypeId::of::<TaskFinished>()));
 }
+
+// ── Multi-type handler tests ─────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SystemEvent {
+    concern_id: Uuid,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SignalEvent {
+    concern_id: Uuid,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct EnrichmentResult {
+    concern_id: Uuid,
+}
+
+fn enrichment_pending(_ctx: &Context<Deps>) -> bool {
+    true
+}
+
+#[handles]
+mod multi_type_handlers {
+    use super::*;
+
+    #[handle(on = [SystemEvent, SignalEvent], filter = enrichment_pending, id = "extract_actors")]
+    async fn extract_actors(
+        _event: AnyEvent,
+        _ctx: Context<Deps>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[handle(on = [SystemEvent, SignalEvent], id = "extract_themes")]
+    async fn extract_themes(
+        _event: AnyEvent,
+        _ctx: Context<Deps>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn multi_type_handler_generates_registrations_per_type() {
+    let handlers = multi_type_handlers::handles();
+    // 2 types × 2 handlers = 4 registrations
+    assert_eq!(handlers.len(), 4);
+
+    // extract_actors generates suffixed IDs per type
+    let actor_sys = handlers
+        .iter()
+        .find(|h| h.id == "extract_actors::SystemEvent")
+        .expect("should have extract_actors::SystemEvent");
+    assert!(actor_sys.can_handle(TypeId::of::<SystemEvent>()));
+
+    let actor_sig = handlers
+        .iter()
+        .find(|h| h.id == "extract_actors::SignalEvent")
+        .expect("should have extract_actors::SignalEvent");
+    assert!(actor_sig.can_handle(TypeId::of::<SignalEvent>()));
+
+    // extract_themes also generates suffixed IDs
+    let theme_sys = handlers
+        .iter()
+        .find(|h| h.id == "extract_themes::SystemEvent")
+        .expect("should have extract_themes::SystemEvent");
+    assert!(theme_sys.can_handle(TypeId::of::<SystemEvent>()));
+
+    let theme_sig = handlers
+        .iter()
+        .find(|h| h.id == "extract_themes::SignalEvent")
+        .expect("should have extract_themes::SignalEvent");
+    assert!(theme_sig.can_handle(TypeId::of::<SignalEvent>()));
+}
