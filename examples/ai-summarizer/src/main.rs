@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
         api_key,
     };
 
-    let engine = Engine::new(deps).with_handler(
+    let engine = Engine::in_memory(deps).with_handler(
         handler::on::<SummaryEvent>()
             .id("summarize")
             .extract(|e| match e {

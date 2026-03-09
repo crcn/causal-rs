@@ -8,14 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::store::Store;
+use crate::handler_queue::HandlerQueue;
 use crate::types::QueueStatus;
 
 /// Handle returned after an event is published.
 pub struct ProcessHandle {
     pub correlation_id: Uuid,
     pub event_id: Uuid,
-    pub(crate) store: Option<Arc<dyn Store>>,
+    pub(crate) queue: Option<Arc<dyn HandlerQueue>>,
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -30,17 +30,17 @@ impl fmt::Debug for ProcessHandle {
 impl ProcessHandle {
     /// Return a summary of pending work for this workflow.
     pub async fn status(&self) -> Result<QueueStatus> {
-        match &self.store {
-            Some(store) => store.queue_status(self.correlation_id).await,
-            None => anyhow::bail!("ProcessHandle has no store reference"),
+        match &self.queue {
+            Some(queue) => queue.status(self.correlation_id).await,
+            None => anyhow::bail!("ProcessHandle has no queue reference"),
         }
     }
 
     /// Cancel this workflow (best-effort stop-at-next-checkpoint).
     pub async fn cancel(&self) -> Result<()> {
-        match &self.store {
-            Some(store) => store.cancel_correlation(self.correlation_id).await,
-            None => anyhow::bail!("ProcessHandle has no store reference"),
+        match &self.queue {
+            Some(queue) => queue.cancel(self.correlation_id).await,
+            None => anyhow::bail!("ProcessHandle has no queue reference"),
         }
     }
 }

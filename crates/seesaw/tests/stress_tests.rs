@@ -121,7 +121,7 @@ async fn parent_event_id_set_on_handler_chain() -> Result<()> {
     let seen_parent: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sp = seen_parent.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
@@ -152,7 +152,7 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
     let seen_parent: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sp = seen_parent.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<EventA>()
                 .id("emit_b")
@@ -188,7 +188,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
     let p2 = parents.clone();
     let p3 = parents.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
@@ -264,7 +264,7 @@ async fn aggregate_state_transitions_correctly() -> Result<()> {
 
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
         .with_handler(handler::on::<OrderPlaced>().then(
@@ -311,7 +311,7 @@ async fn transition_guard_blocks_duplicate_transition() -> Result<()> {
     let fc = fire_count.clone();
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
         .with_handler(
@@ -364,7 +364,7 @@ async fn transition_guard_does_not_fire_when_guard_returns_false() -> Result<()>
     let fc = fire_count.clone();
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
         .with_handler(
             handler::on::<OrderPlaced>()
@@ -407,7 +407,7 @@ async fn aggregate_state_isolated_between_ids() -> Result<()> {
     let order_a = Uuid::new_v4();
     let order_b = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
         .with_handler(
@@ -467,7 +467,7 @@ async fn filter_blocks_non_matching_events() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<EventA>()
             .filter(|e, _ctx: &Context<Deps>| e.value > 10)
             .then(move |_event: Arc<EventA>, _ctx: Context<Deps>| {
@@ -495,7 +495,7 @@ async fn extract_returns_none_skips_handler() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<EventA>()
             .extract(|e| {
                 if e.value > 0 {
@@ -535,7 +535,7 @@ async fn handlers_execute_in_priority_order() -> Result<()> {
     let eo2 = execution_order.clone();
     let eo3 = execution_order.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<Ping>()
                 .id("low_priority")
@@ -594,7 +594,7 @@ async fn idempotency_key_is_deterministic() -> Result<()> {
     let seen_keys: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sk = seen_keys.clone();
 
-    let engine = Engine::new(Deps).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(Deps).with_handler(handler::on::<Ping>().then(
         move |_event: Arc<Ping>, ctx: Context<Deps>| {
             let sk = sk.clone();
             async move {
@@ -631,7 +631,7 @@ async fn context_exposes_all_fields() -> Result<()> {
         Arc::new(Mutex::new(None));
     let cd = ctx_data.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("test_ctx")
             .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
@@ -677,7 +677,7 @@ async fn hops_limit_prevents_infinite_loop() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(handler::on::<EventA>().then(
+    let engine = Engine::in_memory(Deps).with_handler(handler::on::<EventA>().then(
         move |event: Arc<EventA>, _ctx: Context<Deps>| {
             let c = c.clone();
             async move {
@@ -708,7 +708,7 @@ async fn hops_increment_through_chain() -> Result<()> {
     let values_seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
     let vs = values_seen.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
@@ -750,7 +750,7 @@ async fn handler_error_does_not_stop_other_handlers() -> Result<()> {
     let success_counter = Arc::new(AtomicUsize::new(0));
     let sc = success_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<Ping>()
                 .id("failing_handler")
@@ -790,7 +790,7 @@ async fn queued_handler_exhausts_retries_then_dlqs() -> Result<()> {
     let attempt_counter = Arc::new(AtomicI32::new(0));
     let ac = attempt_counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<FailEvent>()
             .id("always_fail_retry3")
             .retry(3)
@@ -828,7 +828,7 @@ async fn emit_none_produces_no_events() -> Result<()> {
     let downstream_counter = Arc::new(AtomicUsize::new(0));
     let dc = downstream_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ))
@@ -862,7 +862,7 @@ async fn emit_option_none_produces_no_events() -> Result<()> {
     let downstream = Arc::new(AtomicUsize::new(0));
     let dc = downstream.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                 Ok(events![])
@@ -894,7 +894,7 @@ async fn emit_option_some_produces_event() -> Result<()> {
     let downstream = Arc::new(AtomicUsize::new(0));
     let dc = downstream.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                 Ok(events![EventA { value: 42 }])
@@ -930,7 +930,7 @@ async fn multiple_dispatches_have_independent_correlation_ids() -> Result<()> {
     let correlations: Arc<Mutex<Vec<Uuid>>> = Arc::new(Mutex::new(Vec::new()));
     let c = correlations.clone();
 
-    let engine = Engine::new(Deps).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(Deps).with_handler(handler::on::<Ping>().then(
         move |_event: Arc<Ping>, ctx: Context<Deps>| {
             let c = c.clone();
             async move {
@@ -974,7 +974,7 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
     let terminal_data: Arc<Mutex<Option<(String, i32)>>> = Arc::new(Mutex::new(None));
     let td = terminal_data.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<FailEvent>()
                 .id("fail_with_info")
@@ -1021,7 +1021,7 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
 
 #[tokio::test]
 async fn dispatch_event_with_no_handler_settles_cleanly() -> Result<()> {
-    let engine = Engine::new(Deps);
+    let engine = Engine::in_memory(Deps);
 
     // Dispatch an event that no handler listens to
     engine
@@ -1044,7 +1044,7 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
     let seen_types: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let st = seen_types.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on_any()
                 .id("logger")
@@ -1097,7 +1097,7 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
     let child_handled = Arc::new(AtomicUsize::new(0));
     let ch = child_handled.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         // Typed Ping handler so codec is registered
         .with_handler(handler::on::<Ping>().id("ping_noop").then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
@@ -1155,7 +1155,7 @@ async fn handler_with_init_compiles_and_handles_events() -> Result<()> {
     let handler_ran = Arc::new(AtomicUsize::new(0));
     let hr = handler_ran.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .init(move |_ctx: Context<Deps>| {
                 // Note: init is not called by Engine.settle()
@@ -1191,7 +1191,7 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("delayed_ping")
             .delayed(Duration::from_millis(10))
@@ -1230,7 +1230,7 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
     let b_counter = Arc::new(AtomicUsize::new(0));
     let bc = b_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<EventA>()
                 .id("emit_b_queued")
@@ -1275,7 +1275,7 @@ async fn handler_can_access_deps() -> Result<()> {
     let seen_value = Arc::new(AtomicI32::new(0));
     let sv = seen_value.clone();
 
-    let engine = Engine::new(AppDeps { value: 42 }).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(AppDeps { value: 42 }).with_handler(handler::on::<Ping>().then(
         move |_event: Arc<Ping>, ctx: Context<AppDeps>| {
             let sv = sv.clone();
             async move {
@@ -1302,7 +1302,7 @@ async fn handler_can_access_deps() -> Result<()> {
 
 #[tokio::test]
 async fn dispatch_returns_valid_process_handle() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(Deps).with_handler(handler::on::<Ping>().then(
         |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
     ));
 
@@ -1328,7 +1328,7 @@ async fn queued_handler_timeout_goes_to_dlq() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("timeout_handler")
             .timeout(Duration::from_millis(50))
@@ -1386,7 +1386,7 @@ async fn projection_handler_runs_before_regular_handlers() -> Result<()> {
     let reader_saw_projection = Arc::new(parking_lot::Mutex::new(false));
     let rs = reader_saw_projection.clone();
 
-    let engine = Engine::new(deps)
+    let engine = Engine::in_memory(deps)
         // Projection: writes to the store FIRST
         .with_projection(
             project("order_projection")
@@ -1444,7 +1444,7 @@ async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Res
     let eo3 = execution_order.clone();
     let eo4 = execution_order.clone();
 
-    let engine = Engine::new(deps)
+    let engine = Engine::in_memory(deps)
         // Projection 1
         .with_projection(
             project("projection_1")
@@ -1546,7 +1546,7 @@ async fn projection_performs_side_effects() -> Result<()> {
     let projected_count = Arc::new(AtomicUsize::new(0));
     let pc = projected_count.clone();
 
-    let engine = Engine::new(deps)
+    let engine = Engine::in_memory(deps)
         .with_projection(
             project("order_projection")
                 .then(move |event: AnyEvent, ctx: Context<ProjectionDeps>| {

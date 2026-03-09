@@ -794,7 +794,6 @@ where
                             })?;
 
                             let (prev, next) = registry.get_transition::<A>(aggregate_id);
-
                             if !guard(&prev, &next) {
                                 return Ok(Vec::new());
                             }

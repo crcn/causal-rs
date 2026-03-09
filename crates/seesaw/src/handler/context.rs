@@ -11,12 +11,12 @@ use uuid::Uuid;
 use parking_lot::Mutex;
 
 use crate::aggregator::{Aggregate, AggregatorRegistry};
-use crate::store::Store;
+use crate::handler_queue::HandlerQueue;
 use crate::types::{JournalEntry, LogEntry, LogLevel};
 
 /// Journaling state for `ctx.run()` replay.
 pub(crate) struct JournalState {
-    store: Arc<dyn Store>,
+    queue: Arc<dyn HandlerQueue>,
     handler_id: String,
     event_id: Uuid,
     /// Preloaded journal entries keyed by sequence number.
@@ -169,12 +169,12 @@ where
     /// Attach journal state for `ctx.run()` replay.
     pub(crate) fn with_journal(
         mut self,
-        store: Arc<dyn Store>,
+        queue: Arc<dyn HandlerQueue>,
         entries: Vec<JournalEntry>,
     ) -> Self {
         let map = entries.into_iter().map(|e| (e.seq, e.value)).collect();
         self.journal = Some(Arc::new(JournalState {
-            store,
+            queue,
             handler_id: self.handler_id.clone(),
             event_id: self.event_id,
             entries: map,
@@ -285,7 +285,7 @@ where
         // closure will re-execute. Use idempotency keys for external APIs.
         let result = f().await?;
         journal
-            .store
+            .queue
             .append_journal(
                 &journal.handler_id,
                 journal.event_id,
@@ -323,7 +323,7 @@ mod tests {
     }
 
     fn create_journaled_context(entries: Vec<JournalEntry>) -> Context<TestDeps> {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         create_test_context().with_journal(store, entries)
     }
 
@@ -441,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_persists_new_entries_to_store() {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         let _: String = ctx.run(|| async { Ok("first".into()) }).await.unwrap();
@@ -472,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_error_not_journaled_allows_retry() {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         // First run succeeds
@@ -582,7 +582,7 @@ mod tests {
     async fn journal_crash_retry_simulation() {
         // Simulate: effect runs 2 of 3 steps, then "crashes".
         // On retry, load journal from store, first 2 replay, third executes fresh.
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
 
         let call_counts = Arc::new([AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)]);
 
@@ -663,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_isolation_by_handler_id() {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
 
         // Handler A writes to journal
         let ctx_a = Context::new(
@@ -690,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_isolation_by_event_id() {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let event_1 = Uuid::from_u128(1);
         let event_2 = Uuid::from_u128(2);
 
@@ -718,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_cloned_context_shares_sequence_counter() {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
         let cloned = ctx.clone();
 
@@ -736,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_many_sequential_runs() {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         for i in 0..100u32 {
@@ -761,7 +761,7 @@ mod tests {
             })
             .collect();
 
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), entries);
 
         let call_count = Arc::new(AtomicI32::new(0));
@@ -797,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_error_midway_preserves_prior_entries() {
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         let _: String = ctx.run(|| async { Ok("ok1".into()) }).await.unwrap();
@@ -821,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn journal_error_then_retry_replays_and_continues() {
         // Simulate: 2 succeed, 3rd fails. Retry: 2 replay, 3rd succeeds.
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
 
         // --- First attempt ---
         {
@@ -878,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn journal_seq_counter_advances_even_on_error() {
         // If run() at seq=1 fails, the next run() should be seq=2, not seq=1
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         let _: String = ctx.run(|| async { Ok("seq0".into()) }).await.unwrap();
@@ -933,10 +933,10 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 2);
 
-        // resolve_handler(Complete) should clear journal atomically
+        // resolve(Complete) should clear journal atomically
         use crate::types::{HandlerCompletion, HandlerResolution};
         store
-            .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
+            .resolve(HandlerResolution::Complete(HandlerCompletion {
                 event_id: Uuid::from_u128(1),
                 handler_id: "handler_x".into(),
                 result: serde_json::json!({}),
@@ -984,12 +984,12 @@ mod tests {
             attempts: 1,
             ephemeral: None,
         };
-        // Insert directly into handler queue, then poll to put in-flight
+        // Insert directly into handler queue, then dequeue to put in-flight
         store.publish_handler_for_test(queued).await;
-        let _ = store.poll_next_handler().await.unwrap();
+        let _ = store.dequeue().await.unwrap();
 
         store
-            .resolve_handler(HandlerResolution::Retry {
+            .resolve(HandlerResolution::Retry {
                 event_id: Uuid::from_u128(2),
                 handler_id: "handler_y".into(),
                 error: "transient".into(),

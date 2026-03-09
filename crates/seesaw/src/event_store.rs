@@ -9,7 +9,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::aggregator::{Aggregate, AggregatorRegistry};
-use crate::store::Store;
+use crate::event_log::EventLog;
 use crate::types::{AppendResult, NewEvent, Snapshot};
 
 /// Wrapper that pairs aggregate state with its stream version.
@@ -31,7 +31,7 @@ pub fn event_type_short_name(full: &str) -> &str {
 /// Uses the short type name (e.g. `"OrderPlaced"`) for durable storage.
 /// Returns the [`AppendResult`] with global position and stream version.
 pub async fn persist_event<E, A>(
-    store: &dyn Store,
+    store: &dyn EventLog,
     aggregate_id: Uuid,
     event: &E,
 ) -> Result<AppendResult>
@@ -43,7 +43,7 @@ where
     let payload = serde_json::to_value(event)?;
 
     store
-        .append_event(NewEvent {
+        .append(NewEvent {
             event_id: Uuid::new_v4(),
             parent_id: None,
             correlation_id: Uuid::new_v4(),
@@ -63,7 +63,7 @@ where
 /// Serializes the current in-memory state of aggregate `A` at `id` and
 /// persists it to the store for future hydration acceleration.
 pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::DeserializeOwned>(
-    store: &dyn Store,
+    store: &dyn EventLog,
     aggregators: &AggregatorRegistry,
     id: Uuid,
 ) -> Result<()> {
@@ -95,8 +95,10 @@ pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::Deserial
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{event_type_short_name, NewEvent, Uuid};
     use crate::memory_store::MemoryStore;
+    use crate::store::Store;
+    use chrono::Utc;
 
     #[test]
     fn event_type_short_name_extracts_last_segment() {

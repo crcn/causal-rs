@@ -118,15 +118,20 @@ where
 
     /// Find queue codec by event type name.
     pub(crate) fn find_codec_by_event_type(&self, event_type: &str) -> Option<Arc<EventCodec>> {
+        let short = crate::event_store::event_type_short_name(event_type);
         for handler in self.handlers.read().iter() {
             for codec in handler.codecs() {
-                if codec.event_type == event_type {
+                if codec.event_type == event_type
+                    || crate::event_store::event_type_short_name(&codec.event_type) == short
+                {
                     return Some(codec.clone());
                 }
             }
         }
         for codec in self.standalone_codecs.read().iter() {
-            if codec.event_type == event_type {
+            if codec.event_type == event_type
+                || crate::event_store::event_type_short_name(&codec.event_type) == short
+            {
                 return Some(codec.clone());
             }
         }

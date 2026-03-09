@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
             .build()?,
     };
 
-    let engine = Engine::new(deps)
+    let engine = Engine::in_memory(deps)
         .with_handler(
             handler::on::<FetchEvent>()
                 .id("fetch_url")

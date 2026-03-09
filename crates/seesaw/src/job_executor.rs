@@ -13,11 +13,11 @@ use uuid::Uuid;
 use crate::aggregator::AggregatorRegistry;
 use crate::event_store::event_type_short_name;
 use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler};
+use crate::handler_queue::HandlerQueue;
 use crate::handler_registry::HandlerRegistry;
-use crate::store::Store;
 use crate::types::{
-    EmittedEvent, EventCommit, EventWorkerConfig, HandlerIntent, HandlerWorkerConfig,
-    ProjectionFailure, QueuedEvent, QueuedHandler, NAMESPACE_SEESAW,
+    EmittedEvent, EventWorkerConfig, HandlerIntent, HandlerWorkerConfig,
+    IntentCommit, PersistedEvent, ProjectionFailure, QueuedHandler, NAMESPACE_SEESAW,
 };
 use crate::upcaster::UpcasterRegistry;
 
@@ -30,7 +30,7 @@ where
     D: Send + Sync + 'static,
 {
     deps: Arc<D>,
-    store: Arc<dyn Store>,
+    queue: Arc<dyn HandlerQueue>,
     handlers: Arc<HandlerRegistry<D>>,
     aggregator_registry: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
@@ -44,7 +44,7 @@ where
     /// Create a new job executor.
     pub fn new(
         deps: Arc<D>,
-        store: Arc<dyn Store>,
+        queue: Arc<dyn HandlerQueue>,
         handlers: Arc<HandlerRegistry<D>>,
         aggregator_registry: Arc<AggregatorRegistry>,
         upcasters: Arc<UpcasterRegistry>,
@@ -52,7 +52,7 @@ where
     ) -> Self {
         Self {
             deps,
-            store,
+            queue,
             handlers,
             aggregator_registry,
             upcasters,
@@ -60,48 +60,26 @@ where
         }
     }
 
-    /// Execute event processing: create handler intents and run projections.
+    /// Process a persisted event: create handler intents and run projections.
     ///
     /// All matching handlers become queued handler intents. Only projections
     /// (observers) run inline during event processing.
-    pub async fn execute_event(
+    ///
+    /// Returns an [`IntentCommit`] that the caller enqueues via `HandlerQueue::enqueue`.
+    pub async fn process_event(
         &self,
-        event: &QueuedEvent,
-        config: &EventWorkerConfig,
-    ) -> Result<EventCommit> {
+        event: &PersistedEvent,
+        _config: &EventWorkerConfig,
+    ) -> Result<IntentCommit> {
         info!(
-            "Processing event: type={}, workflow={}, hops={}",
-            event.event_type, event.correlation_id, event.hops
+            "Processing event: type={}, correlation={}, position={}",
+            event.event_type, event.correlation_id, event.position
         );
 
-        // 1. Check max hops (infinite loop detection)
-        if event.hops >= config.max_hops {
-            warn!(
-                "Event exceeded max hops ({}), will DLQ: event_id={}",
-                config.max_hops, event.event_id
-            );
-            return Err(anyhow::anyhow!(
-                "Event exceeded maximum hop count ({}) - infinite loop detected",
-                config.max_hops
-            ));
-        }
-
-        // 2. Check retry limit
-        if event.retry_count >= config.max_event_retry_attempts {
-            warn!(
-                "Event exceeded max retry attempts ({}), will DLQ: event_id={}",
-                config.max_event_retry_attempts, event.event_id
-            );
-            return Err(anyhow::anyhow!(
-                "Event failed after {} retry attempts",
-                event.retry_count
-            ));
-        }
-
-        // 3. Decode event via codec (prefer ephemeral sidecar if present)
+        // 1. Decode event via codec (prefer ephemeral sidecar if present)
         let (typed_event, event_type_id) = self.decode_event(&event.event_type, &event.payload, event.ephemeral.as_ref())?;
 
-        // 4. Route to matching handlers
+        // 2. Route to matching handlers
         let matching_handlers: Vec<_> = self
             .handlers
             .all()
@@ -109,7 +87,7 @@ where
             .filter(|h| h.can_handle(event_type_id))
             .collect();
 
-        // 5. Call describe() on ALL handlers that have it (not just matching ones).
+        // 3. Call describe() on ALL handlers that have it (not just matching ones).
         //
         // Every event in a correlation may update aggregate state, so we
         // re-run describe for every handler with a describe closure. This
@@ -143,8 +121,21 @@ where
             }
         }
 
-        // 6. Create queued handler intents for ALL matching handlers
-        let mut queued_handler_intents = Vec::new();
+        // 4. Create queued handler intents for ALL matching handlers
+        let hops = event.metadata.get("_hops")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let batch_id = event.metadata.get("_batch_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let batch_index = event.metadata.get("_batch_index")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        let batch_size = event.metadata.get("_batch_size")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+
+        let mut handler_intents = Vec::new();
         for handler in &matching_handlers {
             let execute_at = match handler.delay {
                 Some(delay) => {
@@ -159,21 +150,21 @@ where
                 .map(|d| d.as_secs() as i32)
                 .unwrap_or(900)
                 .max(1);
-            queued_handler_intents.push(HandlerIntent {
+            handler_intents.push(HandlerIntent {
                 handler_id: handler.id.clone(),
                 parent_event_id: event.parent_id,
-                batch_id: event.batch_id,
-                batch_index: event.batch_index,
-                batch_size: event.batch_size,
+                batch_id,
+                batch_index,
+                batch_size,
                 execute_at,
                 timeout_seconds,
                 max_attempts: handler.max_attempts as i32,
                 priority: handler.priority.unwrap_or(10),
-                hops: event.hops,
+                hops,
             });
         }
 
-        // 6. Execute projections sequentially (projections are observers, not handlers)
+        // 5. Execute projections sequentially (projections are observers, not handlers)
         let mut projection_failures = Vec::new();
 
         let projections = self.handlers.projections();
@@ -205,22 +196,22 @@ where
                     handler_id: projection.id.clone(),
                     error: error_string,
                     reason: "projection_failed".to_string(),
-                    attempts: event.retry_count.saturating_add(1),
+                    attempts: 1,
                 });
             }
         }
 
-        // 7. Return commit payload
-        Ok(EventCommit {
-            event_row_id: event.id,
+        // 6. Return IntentCommit
+        Ok(IntentCommit {
             event_id: event.event_id,
             correlation_id: event.correlation_id,
             event_type: event.event_type.clone(),
             event_payload: event.payload.clone(),
-            queued_handler_intents,
+            checkpoint: event.position,
+            intents: handler_intents,
             projection_failures,
-            ephemeral: event.ephemeral.clone(),
             handler_descriptions,
+            park: None,
         })
     }
 
@@ -275,7 +266,7 @@ where
         .to_string();
 
         let journal_entries = self
-            .store
+            .queue
             .load_journal(&handler.id, execution.event_id)
             .await?;
 
@@ -287,7 +278,7 @@ where
                 execution.event_id,
                 execution.parent_event_id,
             )
-            .with_journal(self.store.clone(), journal_entries);
+            .with_journal(self.queue.clone(), journal_entries);
 
         // 2. Execute with timeout
         let timeout_duration = if execution.timeout_seconds > 0 {

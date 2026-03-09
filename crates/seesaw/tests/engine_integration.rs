@@ -79,7 +79,7 @@ async fn basic_handler_fires() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
@@ -105,7 +105,7 @@ async fn handler_emits_chain() -> Result<()> {
     let b_counter = Arc::new(AtomicUsize::new(0));
     let b_counter_clone = b_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(handler::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
@@ -136,7 +136,7 @@ async fn multiple_handlers_same_event() -> Result<()> {
     let ca = counter_a.clone();
     let cb = counter_b.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<Ping>()
                 .id("ping_handler_a")
@@ -177,7 +177,7 @@ async fn queued_handler_executes() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("queued_ping")
             .retry(1)
@@ -206,7 +206,7 @@ async fn emit_requires_settled() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("queued_fire_forget")
             .retry(1)
@@ -237,7 +237,7 @@ async fn emit_requires_settled() -> Result<()> {
 
 #[tokio::test]
 async fn handler_returns_nothing() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
             Ok(events![])
         }),
@@ -260,7 +260,7 @@ async fn retry_succeeds_on_second_attempt() -> Result<()> {
     let ac = attempt_counter.clone();
     let sc = success_counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<FailEvent>()
             .id("retry_handler")
             .retry(3)
@@ -300,7 +300,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
     let terminal_counter = Arc::new(AtomicUsize::new(0));
     let tc = terminal_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<FailEvent>()
                 .id("always_fail")
@@ -343,7 +343,7 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
     let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sc = seen_correlation.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<EventA>()
                 .id("emit_b_queued")
@@ -379,7 +379,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
     let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sc = seen_correlation.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<FailEvent>()
                 .id("always_fail_corr")
@@ -424,7 +424,7 @@ async fn ctx_run_executes_side_effect_in_handler() -> Result<()> {
     let captured = Arc::new(Mutex::new(None::<String>));
     let cap = captured.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(move |event: Arc<Ping>, ctx: Context<Deps>| {
             let cap = cap.clone();
             async move {
@@ -466,7 +466,7 @@ async fn upcaster_transforms_old_event_for_handler() -> Result<()> {
     let seen = Arc::new(Mutex::new(None));
     let seen_clone = seen.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         // Upcaster: v1 events lacked `currency`, default to "USD"
         .with_upcaster::<OrderPlaced, _>(1, |mut v| {
             v["currency"] = serde_json::json!("USD");
@@ -604,7 +604,7 @@ async fn upcaster_chain_in_aggregate_replay() {
 
 #[tokio::test]
 async fn settled_timeout_succeeds_when_fast() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
             Ok(events![])
         }),
@@ -621,7 +621,7 @@ async fn settled_timeout_succeeds_when_fast() -> Result<()> {
 
 #[tokio::test]
 async fn settled_timeout_errors_when_slow() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("slow_handler")
             .retry(1)
@@ -655,7 +655,7 @@ async fn backoff_retries_handler_with_exponential_delay() -> Result<()> {
     let attempt_times = Arc::new(Mutex::new(Vec::<std::time::Instant>::new()));
     let at = attempt_times.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("backoff_ping")
             .retry(3)
@@ -787,7 +787,7 @@ async fn engine_without_event_store_identical_behavior() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_handler(handler::on::<OrderCreated>().then(
             move |_event: Arc<OrderCreated>, _ctx: Context<Deps>| {
@@ -817,7 +817,7 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -853,7 +853,7 @@ async fn events_without_aggregator_not_in_stream() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
 
     // Ping has no aggregator registered
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_handler(handler::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
@@ -881,7 +881,7 @@ async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_event_metadata(serde_json::json!({
             "run_id": "scrape-abc123",
@@ -908,7 +908,7 @@ async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
 async fn event_metadata_on_non_aggregate_events() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_event_metadata(serde_json::json!({
             "run_id": "run-xyz"
@@ -936,7 +936,7 @@ async fn no_metadata_produces_empty_map() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
@@ -962,7 +962,7 @@ async fn cold_start_hydration() -> Result<()> {
 
     // Phase 1: Build engine, emit events, populate store
     {
-        let engine = Engine::new(Deps)
+        let engine = Engine::in_memory(Deps)
             .with_store(store.clone())
             .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
             .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
@@ -984,7 +984,7 @@ async fn cold_start_hydration() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine2 = Engine::new(Deps)
+    let engine2 = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1048,7 +1048,7 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1117,7 +1117,7 @@ async fn snapshot_acceleration() -> Result<()> {
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1159,7 +1159,7 @@ async fn rapid_fire_events_same_aggregate() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
@@ -1194,7 +1194,7 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<CustomerOrderPlaced, Customer, _>(|e| e.customer_id)
@@ -1267,7 +1267,7 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1324,7 +1324,7 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1363,7 +1363,7 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
     let confirmed_count = Arc::new(AtomicUsize::new(0));
     let cc = confirmed_count.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1409,7 +1409,7 @@ async fn mixed_aggregate_types_independent_streams() -> Result<()> {
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1456,7 +1456,7 @@ async fn empty_aggregate_access_returns_default() -> Result<()> {
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_handler(
@@ -1519,7 +1519,7 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1555,7 +1555,7 @@ async fn save_snapshot_helper_works() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id);
@@ -1599,7 +1599,7 @@ async fn auto_snapshot_every_n_events() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
     let order_id = Uuid::new_v4();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .snapshot_every(5)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
@@ -1644,7 +1644,7 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
     let order_id = Uuid::new_v4();
 
     // First engine: emit 10 events with auto-snapshot every 5
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .snapshot_every(5)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
@@ -1664,7 +1664,7 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
     assert_eq!(snap.version, 10);
 
     // New engine (cold start) — should hydrate from snapshot at V10
-    let engine2 = Engine::new(Deps)
+    let engine2 = Engine::in_memory(Deps)
         .with_store(store.clone())
         .snapshot_every(5)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
@@ -1708,7 +1708,7 @@ async fn no_snapshot_without_threshold() -> Result<()> {
     let order_id = Uuid::new_v4();
 
     // store with persistence but NO snapshot_every
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
 
@@ -1757,7 +1757,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
         .await?;
 
     // New engine with snapshot_every(100) — threshold NOT met (only 1 event since snapshot)
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .snapshot_every(100)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id);
@@ -1783,7 +1783,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
 async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
     let store = Arc::new(MemoryStore::with_persistence());
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
@@ -1874,7 +1874,7 @@ async fn on_dlq_emits_event_on_handler_failure() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(|info: seesaw_core::DlqTerminalInfo| HandlerDlq {
             handler_id: info.handler_id,
             source_event_type: info.source_event_type,
@@ -1911,7 +1911,7 @@ async fn on_dlq_receives_correct_info() -> Result<()> {
     let captured: Arc<Mutex<Option<seesaw_core::DlqTerminalInfo>>> = Arc::new(Mutex::new(None));
     let cap = captured.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             *cap.lock() = Some(info.clone());
             HandlerDlq {
@@ -1950,7 +1950,7 @@ async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
     let sc = specific_counter.clone();
     let gc = global_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(|info: seesaw_core::DlqTerminalInfo| GlobalDlqEvent {
             error: info.error,
         })
@@ -1996,7 +1996,7 @@ async fn on_dlq_fires_on_timeout() -> Result<()> {
     let captured_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cr = captured_reason.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             *cr.lock() = Some(info.reason.clone());
             HandlerDlq {
@@ -2030,7 +2030,7 @@ async fn on_dlq_preserves_correlation_id() -> Result<()> {
     let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sc = seen_correlation.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(|info: seesaw_core::DlqTerminalInfo| HandlerDlq {
             handler_id: info.handler_id,
             source_event_type: info.source_event_type,
@@ -2071,7 +2071,7 @@ async fn on_dlq_not_called_on_success() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             c.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
@@ -2099,7 +2099,7 @@ async fn on_dlq_not_called_on_success() -> Result<()> {
 
 #[tokio::test]
 async fn engine_without_on_dlq_unchanged() -> Result<()> {
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<FailEvent>()
                 .id("no_dlq_handler")
@@ -2118,7 +2118,7 @@ async fn engine_without_on_dlq_unchanged() -> Result<()> {
 
 #[tokio::test]
 async fn custom_correlation_id_on_process_handle() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("noop")
             .retry(1)
@@ -2141,7 +2141,7 @@ async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
     let seen_correlation: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let sc = seen_correlation.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<EventA>()
                 .id("a_to_b")
@@ -2183,7 +2183,7 @@ async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
 
 #[tokio::test]
 async fn omitted_correlation_id_auto_generates() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("noop")
             .retry(1)
@@ -2207,7 +2207,7 @@ async fn cancel_prevents_event_processing() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
@@ -2232,7 +2232,7 @@ async fn cancel_dlqs_pending_handlers() -> Result<()> {
     let counter_clone = counter.clone();
 
     // Use a queued handler so it goes through poll_next_handler
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>()
             .id("cancel_dlq_handler")
             .retry(1)
@@ -2256,7 +2256,7 @@ async fn cancel_dlqs_pending_handlers() -> Result<()> {
 
 #[tokio::test]
 async fn cancel_is_idempotent() -> Result<()> {
-    let engine = Engine::new(Deps);
+    let engine = Engine::in_memory(Deps);
     let id = Uuid::new_v4();
 
     // Cancel twice — no error
@@ -2270,7 +2270,7 @@ async fn cancel_does_not_affect_other_correlations() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
@@ -2305,7 +2305,7 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
     let store_for_handler = store.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store)
         // Ping handler: emits Pong, then cancels own correlation via the store
         .with_handler(
@@ -2349,7 +2349,7 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
 
 #[tokio::test]
 async fn queue_status_empty_after_settle() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 
@@ -2369,7 +2369,7 @@ async fn queue_status_empty_after_settle() -> Result<()> {
 
 #[tokio::test]
 async fn queue_status_shows_pending_before_settle() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 
@@ -2380,12 +2380,10 @@ async fn queue_status_shows_pending_before_settle() -> Result<()> {
         })
         .await?;
 
+    // In the checkpoint-based model, events go to the log (not a pending queue).
+    // After emit-without-settle, handler intents haven't been created yet.
     let status = handle.status().await?;
-    assert!(
-        status.pending_events > 0,
-        "expected pending events before settle, got {}",
-        status.pending_events
-    );
+    assert_eq!(status.pending_events, 0, "no event buffer in checkpoint model");
     Ok(())
 }
 
@@ -2394,7 +2392,7 @@ async fn process_handle_cancel_works() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
@@ -2423,7 +2421,7 @@ async fn process_handle_cancel_works() -> Result<()> {
 
 #[tokio::test]
 async fn engine_status_delegates_to_store() -> Result<()> {
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 
@@ -2433,11 +2431,10 @@ async fn engine_status_delegates_to_store() -> Result<()> {
         })
         .await?;
 
+    // In the checkpoint-based model, events go to the log (not a pending queue).
+    // After emit-without-settle, handler intents haven't been created yet.
     let status = engine.status(handle.correlation_id).await?;
-    assert!(
-        status.pending_events > 0,
-        "engine.status() should show pending events"
-    );
+    assert_eq!(status.pending_events, 0, "no event buffer in checkpoint model");
     Ok(())
 }
 
@@ -2448,7 +2445,7 @@ async fn on_dlq_fires_on_anyhow_bail() -> Result<()> {
     let captured_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ce = captured_error.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             *ce.lock() = Some(info.error.clone());
             HandlerDlq {
@@ -2491,7 +2488,7 @@ async fn on_dlq_fires_on_custom_error_type() -> Result<()> {
     let captured_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ce = captured_error.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             *ce.lock() = Some(info.error.clone());
             HandlerDlq {
@@ -2524,7 +2521,7 @@ async fn handler_panic_does_not_crash_engine() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<FailEvent>()
                 .id("panic_handler")
@@ -2565,7 +2562,7 @@ async fn on_dlq_fires_on_queued_handler_panic() -> Result<()> {
     let dlq_counter = Arc::new(AtomicUsize::new(0));
     let dc = dlq_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             dc.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
@@ -2609,7 +2606,7 @@ async fn projection_error_does_not_stop_other_handlers() -> Result<()> {
     let handler_counter = Arc::new(AtomicUsize::new(0));
     let hc = handler_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_projection(
             seesaw_core::project("failing_projection")
                 .then(|_event: seesaw_core::AnyEvent, _ctx: Context<Deps>| async move {
@@ -2645,7 +2642,7 @@ async fn projection_error_recorded_as_projection_failure() -> Result<()> {
     let second_projection_counter = Arc::new(AtomicUsize::new(0));
     let spc = second_projection_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_projection(
             seesaw_core::project("failing_projection")
                 .priority(1)
@@ -2678,7 +2675,7 @@ async fn projection_error_recorded_as_projection_failure() -> Result<()> {
 #[tokio::test]
 async fn on_dlq_mapper_error_does_not_crash_engine() -> Result<()> {
     // The on_dlq mapper itself panics — engine should still settle
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(|_info: seesaw_core::DlqTerminalInfo| -> HandlerDlq {
             panic!("mapper panic");
         })
@@ -2709,7 +2706,7 @@ async fn on_dlq_fires_for_each_failing_handler() -> Result<()> {
     let dlq_mapper_counter = Arc::new(AtomicUsize::new(0));
     let dmc = dlq_mapper_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             dmc.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
@@ -2752,7 +2749,7 @@ async fn on_failure_with_source_event_access() -> Result<()> {
     let captured: Arc<Mutex<Option<(i32, String)>>> = Arc::new(Mutex::new(None));
     let cap = captured.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<FailEvent>()
                 .id("source_access_handler")
@@ -2793,7 +2790,7 @@ async fn on_dlq_not_fired_when_retry_succeeds() -> Result<()> {
     let attempt_counter = Arc::new(AtomicI32::new(0));
     let ac = attempt_counter.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             dc.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
@@ -2841,7 +2838,7 @@ async fn on_dlq_fires_after_all_retries_exhausted() -> Result<()> {
     let captured_info: Arc<Mutex<Option<seesaw_core::DlqTerminalInfo>>> = Arc::new(Mutex::new(None));
     let ci = captured_info.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: seesaw_core::DlqTerminalInfo| {
             *ci.lock() = Some(info.clone());
             HandlerDlq {
@@ -2894,7 +2891,7 @@ async fn on_dlq_event_handler_failure_does_not_cascade() -> Result<()> {
         error: String,
     }
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .on_dlq(|info: seesaw_core::DlqTerminalInfo| DlqFailEvent {
             error: info.error,
         })
@@ -2973,7 +2970,7 @@ async fn journal_replays_completed_run_calls_on_retry() -> Result<()> {
     assert!(entries.is_empty());
 
     // Now test that ctx.run() inside a queued handler persists to journal
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_handler(
             handler::on::<Ping>()
@@ -3010,7 +3007,7 @@ async fn journal_replays_completed_run_calls_on_retry() -> Result<()> {
 async fn journal_cleared_after_successful_handler() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_handler(
             handler::on::<Ping>()
@@ -3064,7 +3061,7 @@ async fn ephemeral_preserves_serde_skip_fields() -> Result<()> {
     let received = Arc::new(Mutex::new(None::<(i32, usize)>));
     let received_clone = received.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<EventWithSkip>()
             .id("check_skip")
             .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
@@ -3111,7 +3108,7 @@ async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
     let final_received = Arc::new(Mutex::new(None::<(i32, String)>));
     let final_clone = final_received.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<Step1>()
                 .id("step1_handler")
@@ -3158,7 +3155,7 @@ async fn ephemeral_shared_across_multiple_handlers() -> Result<()> {
     let seen_a_clone = seen_a.clone();
     let seen_b_clone = seen_b.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<EventWithSkip>()
                 .id("handler_a")
@@ -3213,7 +3210,7 @@ async fn ephemeral_preserved_in_batch_fanout() -> Result<()> {
     let secrets = Arc::new(Mutex::new(Vec::<String>::new()));
     let secrets_clone = secrets.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<Trigger>()
                 .id("fan_out")
@@ -3255,7 +3252,7 @@ async fn ephemeral_available_via_on_any_handler() -> Result<()> {
     let received_len = Arc::new(AtomicUsize::new(0));
     let received_clone = received_len.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on_any()
             .id("any_check")
             .then(move |event: AnyEvent, _ctx: Context<Deps>| {
@@ -3289,7 +3286,7 @@ async fn ephemeral_available_in_projection() -> Result<()> {
     let projection_len = Arc::new(AtomicUsize::new(0));
     let projection_clone = projection_len.clone();
 
-    let engine = Engine::new(Deps).with_projection(
+    let engine = Engine::in_memory(Deps).with_projection(
         project("proj_check")
             .then(move |event: AnyEvent, _ctx: Context<Deps>| {
                 let r = projection_clone.clone();
@@ -3322,7 +3319,7 @@ async fn ephemeral_via_emit_output() -> Result<()> {
     let received = Arc::new(Mutex::new(None::<usize>));
     let received_clone = received.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<EventWithSkip>()
             .id("output_check")
             .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
@@ -3364,7 +3361,7 @@ async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
     let dlq_received = Arc::new(Mutex::new(None::<String>));
     let dlq_clone = dlq_received.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handler(
             handler::on::<FailSkip>()
                 .id("always_fail")
@@ -3414,7 +3411,7 @@ async fn ephemeral_with_extract_handler() -> Result<()> {
     let received_id = Arc::new(AtomicI32::new(0));
     let received_clone = received_id.clone();
 
-    let engine = Engine::new(Deps).with_handler(
+    let engine = Engine::in_memory(Deps).with_handler(
         handler::on::<ExtractEvent>()
             .id("extract_check")
             .extract(|e: &ExtractEvent| Some(e.id))
@@ -3496,7 +3493,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
     let os = observed_status.clone();
     let ot = observed_total.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_handler(
@@ -3538,7 +3535,7 @@ async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
     // handler that failed, so causal flow graphs can wire the edge.
     let store = Arc::new(MemoryStore::with_persistence());
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .on_dlq(|info: seesaw_core::DlqTerminalInfo| GlobalDlqEvent {
             error: info.error,
@@ -3647,6 +3644,10 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
         ))
         .await?;
 
+    // Mark events as already processed (checkpoint past both events).
+    // MemoryStore positions start at 1, so two events are at positions 1 and 2.
+    store.set_checkpoint(2);
+
     // Step 2: Inject a handler into the queue (simulating resume/reclaim)
     let event_type = std::any::type_name::<ScrapeCompleted>().to_string();
     store
@@ -3676,7 +3677,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         // Only SourcesPrepared has an aggregator — ScrapeCompleted does NOT
         // register an aggregator for PipelineState. The handler triggered by
@@ -3737,7 +3738,7 @@ async fn multi_type_handler_fires_on_both_event_types() -> Result<()> {
     let fired_c = fired.clone();
     let sources_c = sources.clone();
 
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handlers(vec![
             // Register one handler for ReviewDone
             handler::on::<ReviewDone>()
@@ -3793,7 +3794,7 @@ async fn multi_type_handler_with_filter_fires_on_both_types() -> Result<()> {
     let sources_c2 = sources.clone();
 
     // Simulate a context-only filter (always returns true here)
-    let engine = Engine::new(Deps)
+    let engine = Engine::in_memory(Deps)
         .with_handlers(vec![
             handler::on::<ReviewDone>()
                 .id("enrich_filtered::ReviewDone")
@@ -3874,8 +3875,8 @@ async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
     let store_clone = store.clone();
 
-    let engine = Engine::new(Deps)
-        .with_store(store.clone() as Arc<dyn Store>)
+    let engine = Engine::in_memory(Deps)
+        .with_store(store.clone())
         .with_aggregator::<StepStarted, ProgressTracker, _>(|_| Uuid::nil())
         .with_aggregator::<StepDone, ProgressTracker, _>(|_| Uuid::nil())
         .with_handler(

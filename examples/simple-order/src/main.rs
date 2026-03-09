@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         shipping_enabled: true,
     };
 
-    let engine = Engine::new(deps).with_handlers(order_handlers::handles());
+    let engine = Engine::in_memory(deps).with_handlers(order_handlers::handles());
 
     println!("Processing orders...\n");
 

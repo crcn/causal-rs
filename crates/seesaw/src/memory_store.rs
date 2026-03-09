@@ -96,6 +96,11 @@ impl MemoryStore {
         self.handler_queue.lock().push_back(handler);
     }
 
+    /// Set the checkpoint position directly (for test setup / resume simulation).
+    pub fn set_checkpoint(&self, position: u64) {
+        self.checkpoint.store(position, Ordering::SeqCst);
+    }
+
     /// Access the global event log (for test assertions).
     pub fn global_log(&self) -> &Mutex<Vec<PersistedEvent>> {
         &self.global_log

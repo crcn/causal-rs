@@ -1,7 +1,8 @@
 //! Store-agnostic Engine with built-in settle loop.
 //!
-//! Engine<D> publishes events to a pluggable [`Store`](crate::store::Store)
-//! backend and settles the full causal tree synchronously.
+//! Engine<D> reads events from an [`EventLog`](crate::event_log::EventLog),
+//! distributes handler work via a [`HandlerQueue`](crate::handler_queue::HandlerQueue),
+//! and settles the full causal tree synchronously.
 
 use std::sync::Arc;
 use uuid::Uuid;
@@ -10,32 +11,34 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
+use crate::event_log::EventLog;
 use crate::event_store::event_type_short_name;
 use crate::handler::{GlobalDlqMapper, Handler, Projection};
+use crate::handler_queue::HandlerQueue;
 use crate::handler_registry::HandlerRegistry;
 use crate::job_executor::{HandlerStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
 use crate::process::{EmitFuture, ProcessHandle};
-use crate::store::Store;
 use crate::types::{
-    EmittedEvent, EventOutcome, EventWorkerConfig, HandlerCompletion, HandlerDlq,
-    HandlerResolution, HandlerWorkerConfig, NewEvent, QueuedEvent, QueuedHandler,
-    Snapshot, NAMESPACE_SEESAW,
+    EmittedEvent, EventWorkerConfig, HandlerCompletion, HandlerDlq,
+    HandlerResolution, HandlerWorkerConfig, IntentCommit, NewEvent, PersistedEvent,
+    QueuedHandler, Snapshot, NAMESPACE_SEESAW,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
 
 /// Store-agnostic Engine with built-in settle loop.
 ///
-/// Publishes events to a pluggable [`Store`] backend (defaults to an
-/// in-memory store) and drives them to completion using `JobExecutor`.
+/// Reads events from an [`EventLog`], distributes handler work via a
+/// [`HandlerQueue`], and drives the full causal tree to completion.
 ///
-/// Supply a custom store via [`with_store`](Engine::with_store) for
-/// durability, crash recovery, or distributed workers.
+/// Supply custom implementations via [`new`](Engine::new), or use
+/// [`in_memory`](Engine::in_memory) for tests and simple use cases.
 pub struct Engine<D>
 where
     D: Send + Sync + 'static,
 {
-    store: Arc<dyn Store>,
+    log: Arc<dyn EventLog>,
+    queue: Arc<dyn HandlerQueue>,
     deps: Arc<D>,
     handlers: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
@@ -49,13 +52,15 @@ impl<D> Engine<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Create new engine with dependencies.
-    ///
-    /// Defaults to an in-memory store. Use [`with_store`](Engine::with_store)
-    /// to supply a Postgres or other durable backend.
-    pub fn new(deps: D) -> Self {
+    /// Create new engine with dependencies, event log, and handler queue.
+    pub fn new(
+        deps: D,
+        log: Arc<dyn EventLog>,
+        queue: Arc<dyn HandlerQueue>,
+    ) -> Self {
         Self {
-            store: Arc::new(MemoryStore::new()),
+            log,
+            queue,
             deps: Arc::new(deps),
             handlers: Arc::new(HandlerRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
@@ -64,6 +69,14 @@ where
             event_metadata: serde_json::Map::new(),
             global_dlq_mapper: None,
         }
+    }
+
+    /// Create an engine with in-memory event log and handler queue.
+    ///
+    /// Convenience constructor for tests and simple use cases.
+    pub fn in_memory(deps: D) -> Self {
+        let store = Arc::new(MemoryStore::new());
+        Self::new(deps, store.clone(), store)
     }
 
     /// Access the shared dependencies.
@@ -81,7 +94,7 @@ where
         self.aggregators.get_singleton_arc::<A>().1
     }
 
-    /// Invalidate cached aggregate state, forcing re-hydration from the Store.
+    /// Invalidate cached aggregate state, forcing re-hydration from the EventLog.
     ///
     /// Use after ingesting foreign events (e.g. from another node) so the
     /// next settle loop rebuilds the aggregate from the persistent log.
@@ -91,9 +104,6 @@ where
     }
 
     /// Enable auto-checkpoint snapshots every N events.
-    ///
-    /// Requires a snapshot store to be set. When both are configured,
-    /// snapshots are saved automatically during the settle loop.
     pub fn snapshot_every(mut self, events: u64) -> Self {
         self.snapshot_every = Some(events);
         self
@@ -101,13 +111,12 @@ where
 
     /// Set metadata to stamp on every persisted event.
     ///
-    /// Metadata travels with the event through the Store, letting
+    /// Metadata travels with the event through the EventLog, letting
     /// adapters pull application-level context (e.g. `run_id`, `schema_v`,
     /// `actor`) without holding state themselves.
     ///
     /// ```ignore
-    /// let engine = Engine::new(deps)
-    ///     .with_store(my_store)
+    /// let engine = Engine::in_memory(deps)
     ///     .with_event_metadata(serde_json::json!({
     ///         "run_id": "scrape-abc123",
     ///         "schema_v": 1
@@ -122,16 +131,13 @@ where
         self
     }
 
-    /// Supply a custom store backend.
+    /// Supply a custom store backend (legacy compatibility).
     ///
-    /// Replaces the default in-memory store with the provided implementation.
-    ///
-    /// ```ignore
-    /// let engine = Engine::new(deps)
-    ///     .with_store(Arc::new(PostgresStore::new(pool)));
-    /// ```
-    pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
-        self.store = store;
+    /// The store must implement both `EventLog` and `HandlerQueue`.
+    /// Prefer using `Engine::new(deps, log, queue)` for explicit control.
+    pub fn with_store(mut self, store: Arc<MemoryStore>) -> Self {
+        self.log = store.clone();
+        self.queue = store;
         self
     }
 
@@ -143,7 +149,7 @@ where
     /// Per-handler `on_failure` takes precedence when present.
     ///
     /// ```ignore
-    /// let engine = Engine::new(deps)
+    /// let engine = Engine::in_memory(deps)
     ///     .on_dlq(|info: DlqTerminalInfo| HandlerFailed {
     ///         handler_id: info.handler_id.clone(),
     ///         error: info.error.clone(),
@@ -207,7 +213,7 @@ where
     /// `extract_id` maps the event to the aggregate ID it belongs to.
     ///
     /// ```ignore
-    /// let engine = Engine::new(deps)
+    /// let engine = Engine::in_memory(deps)
     ///     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
     ///     .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id);
     /// ```
@@ -252,10 +258,9 @@ where
     /// Register an upcaster for event type `E`.
     ///
     /// Upcasters transform old event payloads to the current schema during decode.
-    /// Chain multiple upcasters to evolve through versions: v1 → v2 → v3 → current.
     ///
     /// ```ignore
-    /// let engine = Engine::new(deps)
+    /// let engine = Engine::in_memory(deps)
     ///     .with_upcaster::<OrderPlaced>(1, |mut v: serde_json::Value| {
     ///         v["currency"] = serde_json::json!("USD");
     ///         Ok(v)
@@ -333,24 +338,20 @@ where
     }
 
     /// Cancel a running workflow by correlation ID.
-    ///
-    /// Best-effort "stop-at-next-checkpoint": handlers already mid-execution
-    /// will complete, but their output events will be rejected. Side effects
-    /// (API calls, emails) from in-flight handlers cannot be undone.
     pub async fn cancel(&self, correlation_id: Uuid) -> Result<()> {
-        self.store.cancel_correlation(correlation_id).await
+        self.queue.cancel(correlation_id).await
     }
 
     /// Return a summary of pending work for a correlation ID.
     pub async fn status(&self, correlation_id: Uuid) -> Result<crate::types::QueueStatus> {
-        self.store.queue_status(correlation_id).await
+        self.queue.status(correlation_id).await
     }
 
     /// Drive all pending events and handlers to completion.
     pub async fn settle(&self) -> Result<()> {
         let executor = JobExecutor::new(
             self.deps.clone(),
-            self.store.clone(),
+            self.queue.clone(),
             self.handlers.clone(),
             self.aggregators.clone(),
             self.upcasters.clone(),
@@ -359,22 +360,36 @@ where
         let event_config = EventWorkerConfig::default();
         let handler_config = HandlerWorkerConfig::default();
 
+        // In-memory event retry counter (resets on process restart)
+        let mut event_attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        // Ephemeral cache: populated from PersistedEvent in Phase 1, injected in Phase 2
+        let mut ephemerals: std::collections::HashMap<Uuid, Arc<dyn std::any::Any + Send + Sync>> =
+            std::collections::HashMap::new();
+
         loop {
             let mut processed_any = false;
 
             // Reclaim stale handlers (running longer than timeout)
-            self.store.reclaim_stale().await?;
+            self.queue.reclaim_stale().await?;
 
-            // Drain event queue (cache cancellation status per correlation_id)
+            // ── Phase 1: Read new events from the log ──────────────────
+            let checkpoint = self.queue.checkpoint().await?;
+            let events = self.log.load_from(checkpoint, 1000).await?;
+
             let mut cancelled_cache = std::collections::HashSet::new();
-            while let Some(event) = self.store.poll_next().await? {
+
+            for event in events {
                 processed_any = true;
 
-                // Cancellation checkpoint 1: reject cancelled events before
-                // persisting to the event log or mutating aggregate state.
+                // Cache ephemeral for Phase 2
+                if let Some(eph) = &event.ephemeral {
+                    ephemerals.insert(event.event_id, eph.clone());
+                }
+
+                // Cancellation check
                 let is_cancelled = if cancelled_cache.contains(&event.correlation_id) {
                     true
-                } else if self.store.is_cancelled(event.correlation_id).await? {
+                } else if self.queue.is_cancelled(event.correlation_id).await? {
                     cancelled_cache.insert(event.correlation_id);
                     true
                 } else {
@@ -385,24 +400,55 @@ where
                         correlation_id = %event.correlation_id,
                         event_id = %event.event_id,
                         event_type = %event.event_type,
-                        "Rejecting event: workflow cancelled",
+                        "Skipping event: workflow cancelled",
                     );
-                    self.store
-                        .complete_event(EventOutcome::Rejected {
-                            event_row_id: event.id,
-                            event_id: event.event_id,
-                            error: "cancelled".to_string(),
-                            reason: "cancelled".to_string(),
-                        })
+                    self.queue
+                        .enqueue(IntentCommit::skip(&event))
                         .await?;
                     continue;
                 }
 
-                // Persist every event + hydrate cold aggregates before state mutation.
-                // Default Store no-ops make this safe for MemoryStore.
-                self.persist_and_hydrate(&event).await?;
+                // Hop check (from metadata)
+                let hops = event
+                    .metadata
+                    .get("_hops")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                if hops >= event_config.max_hops {
+                    self.queue
+                        .enqueue(IntentCommit::park(
+                            &event,
+                            format!(
+                                "Event exceeded maximum hop count ({}) - infinite loop detected",
+                                event_config.max_hops
+                            ),
+                        ))
+                        .await?;
+                    event_attempts.remove(&event.position);
+                    continue;
+                }
 
-                // Apply event to live aggregator state before handlers run
+                // Event-level retry counter
+                let attempts = event_attempts.entry(event.position).or_insert(0);
+                *attempts += 1;
+                if *attempts > event_config.max_event_retry_attempts as u32 {
+                    self.queue
+                        .enqueue(IntentCommit::park(
+                            &event,
+                            format!(
+                                "Event failed after {} retry attempts",
+                                event_config.max_event_retry_attempts
+                            ),
+                        ))
+                        .await?;
+                    event_attempts.remove(&event.position);
+                    continue;
+                }
+
+                // Hydrate cold aggregates before processing
+                self.hydrate_for_event(&event).await?;
+
+                // Apply event to live aggregator state
                 self.apply_to_aggregators(&event);
 
                 // Auto-checkpoint snapshots if configured
@@ -410,45 +456,25 @@ where
                     self.maybe_auto_snapshot(&event, threshold).await?;
                 }
 
-                match executor.execute_event(&event, &event_config).await {
+                // Process event: match handlers, run projections, build intents
+                match executor.process_event(&event, &event_config).await {
                     Ok(commit) => {
-                        if !commit.handler_descriptions.is_empty() {
-                            if let Err(e) = self
-                                .store
-                                .set_handler_descriptions(
-                                    commit.correlation_id,
-                                    commit.handler_descriptions.clone(),
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    correlation_id = %commit.correlation_id,
-                                    "Failed to persist handler descriptions: {}",
-                                    e
-                                );
-                            }
-                        }
-                        self.store
-                            .complete_event(EventOutcome::Processed(commit))
-                            .await?;
+                        self.queue.enqueue(commit).await?;
+                        event_attempts.remove(&event.position);
                     }
-                    Err(e) => {
-                        self.store
-                            .complete_event(EventOutcome::Rejected {
-                                event_row_id: event.id,
-                                event_id: event.event_id,
-                                error: e.to_string(),
-                                reason: "settle_error".to_string(),
-                            })
-                            .await?;
+                    Err(_e) => {
+                        // Error will be retried on next loop (retry counter tracks attempts)
+                        break;
                     }
                 }
             }
 
-            // Drain all ready handlers and run them in parallel
+            // ── Phase 2: Execute handlers ──────────────────────────────
             let mut executions = Vec::new();
-            while let Some(execution) = self.store.poll_next_handler().await? {
-                executions.push(execution);
+            while let Some(mut h) = self.queue.dequeue().await? {
+                // Inject ephemeral from cache
+                h.ephemeral = ephemerals.get(&h.event_id).cloned();
+                executions.push(h);
             }
 
             if !executions.is_empty() {
@@ -461,7 +487,7 @@ where
                 let mut cancelled_ids = std::collections::HashSet::new();
                 for id in unique_ids {
                     if cancelled_cache.contains(&id)
-                        || self.store.is_cancelled(id).await?
+                        || self.queue.is_cancelled(id).await?
                     {
                         cancelled_ids.insert(id);
                     }
@@ -476,8 +502,8 @@ where
                             handler_id = %execution.handler_id,
                             "DLQ handler: workflow cancelled",
                         );
-                        self.store
-                            .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
+                        self.queue
+                            .resolve(HandlerResolution::DeadLetter(HandlerDlq {
                                 event_id: execution.event_id,
                                 handler_id: execution.handler_id.clone(),
                                 error: "cancelled".to_string(),
@@ -493,27 +519,13 @@ where
                 }
                 let executions = active_executions;
 
-                // Hydrate cold aggregates before handler execution.
-                // On resume (no events in the queue), aggregates are never
-                // populated by persist_and_hydrate, so handlers would see
-                // default state.
-                //
-                // We hydrate ALL registered aggregate types (not just those
-                // matching the handler's event type) because handler filters
-                // can read any aggregate — e.g. a singleton updated by a
-                // completely different event type.
-                //
-                // For each aggregate type we hydrate:
-                // 1. Singletons (Uuid::nil) — always checked
-                // 2. Instance IDs extracted from handler event payloads
+                // Hydrate cold aggregates before handler execution
                 for aggregate_type in self.aggregators.unique_aggregate_types() {
-                    // Always hydrate singletons
                     let singleton_key = format!("{}:{}", aggregate_type, Uuid::nil());
                     if !self.aggregators.has_state(&singleton_key) {
-                        self.hydrate_aggregate(aggregate_type, Uuid::nil(), &singleton_key).await?;
+                        self.hydrate_aggregate(aggregate_type, Uuid::nil(), &singleton_key, u64::MAX).await?;
                     }
                 }
-                // Also hydrate instance aggregates matching handler event payloads
                 for execution in &executions {
                     let matching = self.aggregators.find_by_event_type(&execution.event_type);
                     for agg in &matching {
@@ -523,7 +535,7 @@ where
                         };
                         let key = format!("{}:{}", agg.aggregate_type, agg_id);
                         if !self.aggregators.has_state(&key) {
-                            self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key).await?;
+                            self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key, u64::MAX).await?;
                         }
                     }
                 }
@@ -546,47 +558,54 @@ where
                     match exec_result {
                         Ok(result) => match result.status {
                             HandlerStatus::Success => {
-                                let events_to_publish = Self::build_queued_events(
+                                // Append emitted events to the log FIRST
+                                let mut new_events = Self::build_new_events(
                                     result.emitted_events,
                                     event_id,
                                     &handler_id,
                                     execution_clone.correlation_id,
                                     execution_clone.hops,
                                     "",
+                                    &self.event_metadata,
                                 );
-                                self.store
-                                    .resolve_handler(HandlerResolution::Complete(HandlerCompletion {
+                                self.append_emitted_events(&mut new_events, &mut ephemerals)
+                                    .await?;
+                                // THEN resolve handler
+                                self.queue
+                                    .resolve(HandlerResolution::Complete(HandlerCompletion {
                                         event_id,
                                         handler_id,
                                         result: result.result,
-                                        events_to_publish,
+                                        events_to_publish: Vec::new(),
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
                             }
                             HandlerStatus::Failed { error, attempts } => {
-                                let events_to_publish = Self::build_queued_events(
+                                let mut dlq_events = Self::build_new_events(
                                     result.emitted_events,
                                     event_id,
                                     &handler_id,
                                     execution_clone.correlation_id,
                                     execution_clone.hops,
                                     "-dlq",
+                                    &self.event_metadata,
                                 );
-                                self.store
-                                    .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
+                                self.append_emitted_events(&mut dlq_events, &mut ephemerals)
+                                    .await?;
+                                self.queue
+                                    .resolve(HandlerResolution::DeadLetter(HandlerDlq {
                                         event_id,
                                         handler_id,
                                         error,
                                         reason: "failed".to_string(),
                                         attempts,
-                                        events_to_publish,
+                                        events_to_publish: Vec::new(),
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
                             }
                             HandlerStatus::Retry { error, attempts } => {
-                                // Compute backoff schedule in Engine
                                 let mut next_execute_at = chrono::Utc::now();
                                 if let Some(h) =
                                     executor.handler_registry().find_by_id(&handler_id)
@@ -600,8 +619,8 @@ where
                                                 .unwrap_or(chrono::Duration::seconds(60));
                                     }
                                 }
-                                self.store
-                                    .resolve_handler(HandlerResolution::Retry {
+                                self.queue
+                                    .resolve(HandlerResolution::Retry {
                                         event_id,
                                         handler_id,
                                         error,
@@ -611,29 +630,32 @@ where
                                     .await?;
                             }
                             HandlerStatus::Timeout => {
-                                let dlq_events = self
+                                let dlq_events_raw = self
                                     .build_global_dlq_event(
                                         &execution_clone,
                                         "Handler execution timed out".to_string(),
                                         "timeout",
                                     )
                                     .unwrap_or_default();
-                                let events_to_publish = Self::build_queued_events(
-                                    dlq_events,
+                                let mut dlq_events = Self::build_new_events(
+                                    dlq_events_raw,
                                     event_id,
                                     &handler_id,
                                     execution_clone.correlation_id,
                                     execution_clone.hops,
                                     "-dlq",
+                                    &self.event_metadata,
                                 );
-                                self.store
-                                    .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
+                                self.append_emitted_events(&mut dlq_events, &mut ephemerals)
+                                    .await?;
+                                self.queue
+                                    .resolve(HandlerResolution::DeadLetter(HandlerDlq {
                                         event_id,
                                         handler_id,
                                         error: "timeout".to_string(),
                                         reason: "timeout".to_string(),
                                         attempts: 0,
-                                        events_to_publish,
+                                        events_to_publish: Vec::new(),
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
@@ -641,29 +663,32 @@ where
                         },
                         Err(e) => {
                             let error_str = e.to_string();
-                            let dlq_events = self
+                            let dlq_events_raw = self
                                 .build_global_dlq_event(
                                     &execution_clone,
                                     error_str.clone(),
                                     "settle_handler_error",
                                 )
                                 .unwrap_or_default();
-                            let events_to_publish = Self::build_queued_events(
-                                dlq_events,
+                            let mut dlq_events = Self::build_new_events(
+                                dlq_events_raw,
                                 event_id,
                                 &handler_id,
                                 execution_clone.correlation_id,
                                 execution_clone.hops,
                                 "-dlq",
+                                &self.event_metadata,
                             );
-                            self.store
-                                .resolve_handler(HandlerResolution::DeadLetter(HandlerDlq {
+                            self.append_emitted_events(&mut dlq_events, &mut ephemerals)
+                                .await?;
+                            self.queue
+                                .resolve(HandlerResolution::DeadLetter(HandlerDlq {
                                     event_id,
                                     handler_id,
                                     error: error_str,
                                     reason: "settle_handler_error".to_string(),
                                     attempts: 0,
-                                    events_to_publish,
+                                    events_to_publish: Vec::new(),
                                     log_entries: Vec::new(),
                                 }))
                                 .await?;
@@ -672,10 +697,9 @@ where
                 }
             }
 
+            // ── Phase 3: Check if settled ──────────────────────────────
             if !processed_any {
-                // Check if there are future-dated handlers (from backoff or delay).
-                // If so, sleep until the earliest one becomes ready instead of exiting.
-                if let Some(earliest) = self.store.earliest_pending_handler_at().await? {
+                if let Some(earliest) = self.queue.earliest_pending_at().await? {
                     let now = chrono::Utc::now();
                     if earliest > now {
                         let wait = (earliest - now).to_std().unwrap_or_default();
@@ -693,7 +717,6 @@ where
     // --- Internal ---
 
     /// Try to build a DLQ event using the global mapper.
-    /// Returns None if no global mapper is configured or if the mapper errors.
     fn build_global_dlq_event(
         &self,
         execution: &QueuedHandler,
@@ -724,24 +747,13 @@ where
         }
     }
 
-    /// Hydrate cold aggregates, then persist every event to the global log.
+    /// Hydrate cold aggregates for a PersistedEvent before processing.
     ///
-    /// 1. For each matching aggregator, hydrate cold aggregates from Store
-    /// 2. Always append the event (with aggregate metadata if aggregators match)
-    async fn persist_and_hydrate(&self, event: &QueuedEvent) -> Result<()> {
-        let short_name = event_type_short_name(&event.event_type);
-
-        // Find matching aggregators to set aggregate metadata
+    /// Excludes the current event from hydration — it will be applied
+    /// separately by `apply_to_aggregators` to produce correct prev/next state.
+    async fn hydrate_for_event(&self, event: &PersistedEvent) -> Result<()> {
         let matching = self.aggregators.find_by_event_type(&event.event_type);
 
-        // Determine aggregate metadata from the first matching aggregator
-        let (aggregate_type, aggregate_id) = matching.iter().find_map(|agg| {
-            agg.extract_id_from_json(&event.payload)
-                .map(|id| (agg.aggregate_type.clone(), id))
-        }).map(|(t, id)| (Some(t), Some(id))).unwrap_or((None, None));
-
-        // Step 1: Hydrate cold aggregates BEFORE appending (so we don't load
-        // the event we're about to append)
         for agg in &matching {
             let agg_id = match agg.extract_id_from_json(&event.payload) {
                 Some(id) => id,
@@ -751,52 +763,27 @@ where
             let key = format!("{}:{}", agg.aggregate_type, agg_id);
 
             if !self.aggregators.has_state(&key) {
-                self.hydrate_aggregate(
-                    &agg.aggregate_type,
-                    agg_id,
-                    &key,
-                )
-                .await?;
+                self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key, event.position).await?;
             }
         }
-
-        // Step 2: Always append to global log
-        let mut metadata = self.event_metadata.clone();
-        if let Some(ref hid) = event.handler_id {
-            metadata.insert(
-                "handler_id".to_string(),
-                serde_json::Value::String(hid.clone()),
-            );
-        }
-
-        self.store
-            .append_event(NewEvent {
-                event_id: event.event_id,
-                parent_id: event.parent_id,
-                correlation_id: event.correlation_id,
-                event_type: short_name.to_string(),
-                payload: event.payload.clone(),
-                created_at: event.created_at,
-                aggregate_type,
-                aggregate_id,
-                metadata,
-                ephemeral: None,
-            })
-            .await?;
 
         Ok(())
     }
 
-    /// Hydrate a single aggregate from Store (with optional snapshot acceleration).
+    /// Hydrate a single aggregate from EventLog (with optional snapshot acceleration).
+    ///
+    /// `exclude_position` excludes events at or beyond this global position,
+    /// so the current event being processed isn't double-applied.
     async fn hydrate_aggregate(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
         key: &str,
+        exclude_position: u64,
     ) -> Result<()> {
         // Try snapshot first
         if let Some(snapshot) = self
-            .store
+            .log
             .load_snapshot(aggregate_type, aggregate_id)
             .await?
         {
@@ -804,11 +791,13 @@ where
             if let Some(agg) = agg {
                 let mut state = agg.deserialize_state(snapshot.state)?;
 
-                // Load remaining events after snapshot version
-                let remaining = self
-                    .store
+                let remaining: Vec<_> = self
+                    .log
                     .load_stream(aggregate_type, aggregate_id, Some(snapshot.version))
-                    .await?;
+                    .await?
+                    .into_iter()
+                    .filter(|e| e.position < exclude_position)
+                    .collect();
 
                 if !remaining.is_empty() {
                     let event_pairs: Vec<(&str, &serde_json::Value)> = remaining
@@ -831,11 +820,14 @@ where
             }
         }
 
-        // No snapshot — full replay
-        let events = self
-            .store
+        // No snapshot — full replay (excluding current event)
+        let events: Vec<_> = self
+            .log
             .load_stream(aggregate_type, aggregate_id, None)
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|e| e.position < exclude_position)
+            .collect();
         if events.is_empty() {
             return Ok(());
         }
@@ -881,6 +873,7 @@ where
         let event_id = Uuid::new_v4();
         let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
         let event_type = std::any::type_name::<E>().to_string();
+        let short_name = event_type_short_name(&event_type).to_string();
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(event);
 
@@ -889,29 +882,38 @@ where
             event_type, correlation_id
         );
 
-        let queued = QueuedEvent {
-            id: 0,
+        // Determine aggregate metadata from matching aggregators
+        let matching = self.aggregators.find_by_event_type(&event_type);
+        let (aggregate_type, aggregate_id) = matching
+            .iter()
+            .find_map(|agg| {
+                agg.extract_id_from_json(&payload)
+                    .map(|id| (agg.aggregate_type.clone(), id))
+            })
+            .map(|(t, id)| (Some(t), Some(id)))
+            .unwrap_or((None, None));
+
+        let metadata = self.event_metadata.clone();
+
+        let new_event = NewEvent {
             event_id,
             parent_id: None,
             correlation_id,
-            event_type: event_type.clone(),
-            payload: payload.clone(),
-            hops: 0,
-            retry_count: 0,
-            batch_id: None,
-            batch_index: None,
-            batch_size: None,
-            handler_id: None,
+            event_type: short_name,
+            payload,
             created_at: chrono::Utc::now(),
+            aggregate_type,
+            aggregate_id,
+            metadata,
             ephemeral: Some(ephemeral),
         };
 
-        self.store.publish(queued).await?;
+        self.log.append(new_event).await?;
 
         Ok(ProcessHandle {
             correlation_id,
             event_id,
-            store: Some(self.store.clone()),
+            queue: Some(self.queue.clone()),
         })
     }
 
@@ -924,46 +926,85 @@ where
             self.handlers.register_codec(codec.clone());
         }
 
-        let payload = output.payload;
-
         let event_id = Uuid::new_v4();
         let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
+        let short_name = event_type_short_name(&output.event_type).to_string();
 
         info!(
             "Publishing event output: type={}, correlation_id={}",
             output.event_type, correlation_id
         );
 
-        let queued = QueuedEvent {
-            id: 0,
+        // Determine aggregate metadata
+        let matching = self.aggregators.find_by_event_type(&output.event_type);
+        let (aggregate_type, aggregate_id) = matching
+            .iter()
+            .find_map(|agg| {
+                agg.extract_id_from_json(&output.payload)
+                    .map(|id| (agg.aggregate_type.clone(), id))
+            })
+            .map(|(t, id)| (Some(t), Some(id)))
+            .unwrap_or((None, None));
+
+        let metadata = self.event_metadata.clone();
+
+        let new_event = NewEvent {
             event_id,
             parent_id: None,
             correlation_id,
-            event_type: output.event_type,
-            payload,
-            hops: 0,
-            retry_count: 0,
-            batch_id: None,
-            batch_index: None,
-            batch_size: None,
-            handler_id: None,
+            event_type: short_name,
+            payload: output.payload,
             created_at: chrono::Utc::now(),
+            aggregate_type,
+            aggregate_id,
+            metadata,
             ephemeral: output.ephemeral,
         };
 
-        self.store.publish(queued).await?;
+        self.log.append(new_event).await?;
 
         Ok(ProcessHandle {
             correlation_id,
             event_id,
-            store: Some(self.store.clone()),
+            queue: Some(self.queue.clone()),
         })
+    }
+
+    /// Resolve aggregate metadata and append events to the EventLog.
+    ///
+    /// Returns the appended events with aggregate metadata populated.
+    async fn append_emitted_events(
+        &self,
+        new_events: &mut Vec<NewEvent>,
+        ephemerals: &mut std::collections::HashMap<Uuid, Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<()> {
+        for new_event in new_events.iter_mut() {
+            // Resolve aggregate metadata
+            let matching = self.aggregators.find_by_event_type(&new_event.event_type);
+            if let Some((agg_type, agg_id)) = matching
+                .iter()
+                .find_map(|agg| {
+                    agg.extract_id_from_json(&new_event.payload)
+                        .map(|id| (agg.aggregate_type.clone(), id))
+                })
+            {
+                new_event.aggregate_type = Some(agg_type);
+                new_event.aggregate_id = Some(agg_id);
+            }
+        }
+        for new_event in new_events.iter() {
+            self.log.append(new_event.clone()).await?;
+            if let Some(eph) = &new_event.ephemeral {
+                ephemerals.insert(new_event.event_id, eph.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Auto-snapshot aggregates if the event count since last snapshot exceeds the threshold.
     async fn maybe_auto_snapshot(
         &self,
-        event: &QueuedEvent,
+        event: &PersistedEvent,
         threshold: u64,
     ) -> Result<()> {
         let matching = self.aggregators.find_by_event_type(&event.event_type);
@@ -986,7 +1027,7 @@ where
 
                 let state_json = agg.serialize_state(state_ref.as_ref())?;
 
-                self.store
+                self.log
                     .save_snapshot(Snapshot {
                         aggregate_type: agg.aggregate_type.clone(),
                         aggregate_id,
@@ -1004,23 +1045,21 @@ where
     }
 
     /// Apply event to aggregator state.
-    fn apply_to_aggregators(&self, event: &QueuedEvent) {
+    fn apply_to_aggregators(&self, event: &PersistedEvent) {
         self.aggregators
             .apply_event(&event.event_type, &event.payload);
     }
 
-    /// Build pre-assigned `QueuedEvent`s from `EmittedEvent`s (ID gen lifted into Engine).
-    ///
-    /// `id_infix` differentiates ID derivation namespaces: `""` for normal
-    /// handler output, `"-dlq"` for DLQ terminal events, etc.
-    fn build_queued_events(
+    /// Build `NewEvent`s from `EmittedEvent`s with deterministic IDs and routing metadata.
+    fn build_new_events(
         emitted: Vec<EmittedEvent>,
         event_id: Uuid,
         handler_id: &str,
         correlation_id: Uuid,
         parent_hops: i32,
         id_infix: &str,
-    ) -> Vec<QueuedEvent> {
+        base_metadata: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<NewEvent> {
         emitted
             .into_iter()
             .enumerate()
@@ -1033,20 +1072,52 @@ where
                     )
                     .as_bytes(),
                 );
-                QueuedEvent {
-                    id: 0,
+
+                let mut metadata = base_metadata.clone();
+                // Routing metadata (underscore prefix)
+                metadata.insert(
+                    "_hops".to_string(),
+                    serde_json::Value::Number((parent_hops + 1).into()),
+                );
+                metadata.insert(
+                    "_handler_id".to_string(),
+                    serde_json::Value::String(handler_id.to_string()),
+                );
+                if let Some(batch_id) = e.batch_id {
+                    metadata.insert(
+                        "_batch_id".to_string(),
+                        serde_json::Value::String(batch_id.to_string()),
+                    );
+                }
+                if let Some(batch_index) = e.batch_index {
+                    metadata.insert(
+                        "_batch_index".to_string(),
+                        serde_json::Value::Number(batch_index.into()),
+                    );
+                }
+                if let Some(batch_size) = e.batch_size {
+                    metadata.insert(
+                        "_batch_size".to_string(),
+                        serde_json::Value::Number(batch_size.into()),
+                    );
+                }
+                if let Some(ref hid) = e.handler_id {
+                    metadata.insert(
+                        "handler_id".to_string(),
+                        serde_json::Value::String(hid.clone()),
+                    );
+                }
+
+                NewEvent {
                     event_id: new_event_id,
                     parent_id: Some(event_id),
                     correlation_id,
-                    event_type: e.event_type,
+                    event_type: event_type_short_name(&e.event_type).to_string(),
                     payload: e.payload,
-                    hops: parent_hops + 1,
-                    retry_count: 0,
-                    batch_id: e.batch_id,
-                    batch_index: e.batch_index,
-                    batch_size: e.batch_size,
-                    handler_id: e.handler_id,
                     created_at: chrono::Utc::now(),
+                    aggregate_type: None,
+                    aggregate_id: None,
+                    metadata,
                     ephemeral: e.ephemeral,
                 }
             })
@@ -1061,7 +1132,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            store: self.store.clone(),
+            log: self.log.clone(),
+            queue: self.queue.clone(),
             deps: self.deps.clone(),
             handlers: self.handlers.clone(),
             aggregators: self.aggregators.clone(),

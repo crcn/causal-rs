@@ -20,7 +20,7 @@
 //! struct UserWelcomed { name: String }
 //!
 //! // Create engine with handlers
-//! let engine = Engine::new(deps)
+//! let engine = Engine::in_memory(deps)
 //!     .with_handler(on::<UserCreated>().then(|event, _ctx| async move {
 //!         println!("User created: {}", event.name);
 //!         Ok(UserWelcomed { name: event.name.clone() })

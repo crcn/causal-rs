@@ -180,10 +180,17 @@ impl AggregatorRegistry {
     }
 
     /// Find all aggregators that handle the given event type string.
+    ///
+    /// Matches both full type paths and short names, so both
+    /// `"my_crate::OrderCreated"` and `"OrderCreated"` will match.
     pub fn find_by_event_type(&self, event_type: &str) -> Vec<&Aggregator> {
+        let short = crate::event_store::event_type_short_name(event_type);
         self.aggregators
             .iter()
-            .filter(|a| a.event_type == event_type)
+            .filter(|a| {
+                a.event_type == event_type
+                    || crate::event_store::event_type_short_name(&a.event_type) == short
+            })
             .collect()
     }
 
@@ -205,10 +212,14 @@ impl AggregatorRegistry {
         event_type: &str,
         payload: &serde_json::Value,
     ) {
+        let short = crate::event_store::event_type_short_name(event_type);
         let matching: Vec<&Aggregator> = self
             .aggregators
             .iter()
-            .filter(|a| a.event_type == event_type)
+            .filter(|a| {
+                a.event_type == event_type
+                    || crate::event_store::event_type_short_name(&a.event_type) == short
+            })
             .collect();
 
         for agg in matching {
