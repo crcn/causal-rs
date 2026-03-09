@@ -22,7 +22,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-seesaw_core_macros = { version = "0.25.0", path = "../seesaw_core_macros", optional = true }
+seesaw_core_macros = { version = "0.26.0", path = "../seesaw_core_macros", optional = true }
 
 [dev-dependencies]
 fastrand.workspace = true

@@ -53,7 +53,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.25"
+seesaw_core = "0.26"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
