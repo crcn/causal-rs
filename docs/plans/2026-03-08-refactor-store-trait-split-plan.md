@@ -536,29 +536,29 @@ Keep: all other existing re-exports
 
 ### Functional Requirements
 
-- [ ] `EventLog` trait defined with 5 methods (3 required, 2 optional)
-- [ ] `HandlerQueue` trait defined with 13 methods (8 required, 5 optional)
-- [ ] `MemoryStore` implements both `EventLog` and `HandlerQueue`
-- [ ] `Engine` holds `Arc<dyn EventLog>` + `Arc<dyn HandlerQueue>`
-- [ ] `Engine::in_memory(deps)` convenience constructor works
-- [ ] Settle loop uses checkpoint-based reading from EventLog
-- [ ] Handler results: engine appends emitted events to log, then resolves
-- [ ] Routing metadata (`_hops`, `_batch_id`, etc.) round-trips through metadata map
-- [ ] Ephemeral typed events preserved through MemoryStore path
-- [ ] `IntentCommit::park()` and `::skip()` advance checkpoint
-- [ ] All existing integration tests pass (updated for new API)
-- [ ] `Store` trait, `QueuedEvent`, `EventCommit`, `EventOutcome` removed
+- [x] `EventLog` trait defined with 5 methods (3 required, 2 optional)
+- [x] `HandlerQueue` trait defined with 13 methods (8 required, 5 optional)
+- [x] `MemoryStore` implements both `EventLog` and `HandlerQueue`
+- [x] `Engine` holds `Arc<dyn EventLog>` + `Arc<dyn HandlerQueue>`
+- [x] `Engine::in_memory(deps)` convenience constructor works
+- [x] Settle loop uses checkpoint-based reading from EventLog
+- [x] Handler results: engine appends emitted events to log, then resolves
+- [x] Routing metadata (`_hops`, `_batch_id`, etc.) round-trips through metadata map
+- [x] Ephemeral typed events preserved through MemoryStore path
+- [x] `IntentCommit::park()` and `::skip()` advance checkpoint
+- [x] All existing integration tests pass (updated for new API)
+- [ ] `Store` trait, `QueuedEvent`, `EventCommit`, `EventOutcome` removed (deferred — Store kept for backwards compat)
 
 ### Non-Functional Requirements
 
-- [ ] No new `unsafe` code
-- [ ] No performance regression for MemoryStore path (ephemeral cache)
-- [ ] Zero-copy event path maintained (no extra clones)
+- [x] No new `unsafe` code
+- [x] No performance regression for MemoryStore path (ephemeral cache)
+- [x] Zero-copy event path maintained (no extra clones)
 
 ### Quality Gates
 
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` clean
+- [x] `cargo test` passes (87 integration + 33 stress + 63 unit)
+- [x] `cargo clippy` clean (no new warnings)
 - [ ] `cargo doc` builds without warnings
 
 ## Rootsignal Adoption Checklist
