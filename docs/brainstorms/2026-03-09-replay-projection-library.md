@@ -45,7 +45,7 @@ In rootsignal, handlers read graph state projected by earlier events in the same
 ```rust
 // main.rs
 
-use seesaw_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource};
+use seesaw_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource, Mode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,8 +53,13 @@ async fn main() -> Result<()> {
     let log = PgEventLog::new(db.clone());
     let pointer = PgPointerStore::new(db.clone()).await?;
 
-    let version = pointer.load().await?;
-    let neo4j = GraphClient::connect(&neo4j_db_for(version)).await?;
+    // Neo4j database name is an app concern — env var, config, etc.
+    // The pointer tracks event log position, NOT which database to use.
+    let neo4j_db = env::var("NEO4J_DB").unwrap_or_else(|_| "projection".into());
+    if Mode::from_env() == Mode::Replay {
+        ensure_neo4j_db(&neo4j_db).await?;  // create if missing
+    }
+    let neo4j = GraphClient::connect(&neo4j_db).await?;
     let projections = Projections::new(neo4j, db.clone());
 
     // TailSource created by the app, passed via .tail()
@@ -69,9 +74,10 @@ async fn main() -> Result<()> {
 ```
 
 ```
-$ server                                  # live mode: catch up, tail
-$ REPLAY=1 server                         # replay: full read, health check, promote, exit
-$ REPLAY=1 REPLAY_TARGETS=neo4j server    # replay neo4j only
+$ server                                              # live mode: catch up, tail
+$ REPLAY=1 server                                     # replay into default DB, promote, exit
+$ NEO4J_DB=projection_v2 REPLAY=1 server              # replay into fresh DB (blue-green)
+$ REPLAY=1 REPLAY_TARGETS=neo4j server                # replay neo4j only
 ```
 
 One binary. One code path. No branching in app code.
@@ -117,7 +123,7 @@ impl Projections {
 
 ## The Pointer
 
-The pointer is the single API for versioning. Two columns: `active` (promoted) and `staged` (last replay).
+The pointer tracks event log position. Two columns: `active` (promoted) and `staged` (last replay). It does NOT track database names — that's an app concern.
 
 ### Schema
 
@@ -222,7 +228,7 @@ Library only. No binary.
 - Projection logic — must be idempotent
 - Health checks via `promote_if`
 - Target filtering via `REPLAY_TARGETS` (optional)
-- Database creation based on `pointer.load()` version
+- Database selection and creation (env var, config, etc. — NOT derived from pointer position)
 - Pointer management UI (CLI subcommand, admin endpoint, whatever)
 
 ## Design Decisions (Pressure-Tested)

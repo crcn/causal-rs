@@ -10,15 +10,10 @@ use chrono::{DateTime, Utc};
 /// (written during replay, promoted on success).
 #[async_trait]
 pub trait PointerStore: Send + Sync {
-    /// Load the current position.
-    ///
-    /// In replay mode (when `SEESAW_REPLAY_VERSION` env var is set),
-    /// returns the env var value. Otherwise returns the `active` position
-    /// from the database.
+    /// Load the current `active` position.
     async fn load(&self) -> Result<Option<u64>>;
 
-    /// Save position. In replay mode, writes to `staged`.
-    /// In live mode, writes to `active`.
+    /// Save position directly to `active`.
     async fn save(&self, position: u64) -> Result<()>;
 
     /// Write position to `staged` column only.
@@ -84,11 +79,6 @@ mod pg {
     #[async_trait]
     impl PointerStore for PgPointerStore {
         async fn load(&self) -> Result<Option<u64>> {
-            // Replay mode: use env var if set.
-            if let Ok(v) = std::env::var("SEESAW_REPLAY_VERSION") {
-                return Ok(v.parse().ok());
-            }
-            // Live mode: read active from database.
             let row: Option<(i64,)> =
                 sqlx::query_as("SELECT active FROM seesaw_replay_pointer WHERE id = 1")
                     .fetch_optional(&self.db)
@@ -97,9 +87,6 @@ mod pg {
         }
 
         async fn save(&self, position: u64) -> Result<()> {
-            if std::env::var("REPLAY").is_ok() {
-                return self.stage(position).await;
-            }
             sqlx::query(
                 "UPDATE seesaw_replay_pointer
                  SET active = $1, updated_at = now()
