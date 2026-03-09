@@ -55,8 +55,8 @@ async fn main() -> Result<()> {
 
     // The promoted pointer position doubles as the DB version.
     // Replay stages the final position → promote → active = 48050.
-    // Next live boot: pointer.load() returns 48050 → connects to neo4j.v48050.
-    let version = pointer.load().await?.unwrap_or(0);
+    // Next live boot: pointer.version() returns 48050 → connects to neo4j.v48050.
+    let version = pointer.version().await?.unwrap_or(0);
     let neo4j_db = format!("neo4j.v{version}");
     let neo4j = GraphClient::connect(&neo4j_db).await?;
     let projections = Projections::new(neo4j, db.clone());
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
 ```
 
 ```
-$ server                                  # live: pointer.load() → neo4j.v48050, catch up, tail
+$ server                                  # live: pointer.version() → neo4j.v48050, catch up, tail
 $ REPLAY=1 server                         # replay: full read, promote, exit
 $ REPLAY=1 REPLAY_TARGETS=neo4j server    # replay neo4j only
 ```
@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS seesaw_replay_pointer (
 ```rust
 #[async_trait]
 pub trait PointerStore: Send + Sync {
-    async fn load(&self) -> Result<Option<u64>>;
+    async fn version(&self) -> Result<Option<u64>>;
     async fn save(&self, position: u64) -> Result<()>;
     async fn stage(&self, position: u64) -> Result<()>;
     async fn promote(&self) -> Result<u64>;
@@ -226,7 +226,7 @@ Library only. No binary.
 - Projection logic — must be idempotent
 - Health checks via `promote_if`
 - Target filtering via `REPLAY_TARGETS` (optional)
-- Database selection derived from `pointer.load()` (e.g., `neo4j.v{position}`)
+- Database selection derived from `pointer.version()` (e.g., `neo4j.v{position}`)
 - Pointer management UI (CLI subcommand, admin endpoint, whatever)
 
 ## Design Decisions (Pressure-Tested)

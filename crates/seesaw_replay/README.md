@@ -50,7 +50,7 @@ Mode is detected from the `REPLAY` env var. Override with `.mode(Mode::Replay)` 
 Tracks position with two columns: `active` (promoted) and `staged` (last replay).
 
 ```rust
-pointer.load().await?;     // current active position
+pointer.version().await?;  // current active position (= DB version)
 pointer.status().await?;   // { active: 48000, staged: 50001 }
 pointer.promote().await?;  // staged -> active
 pointer.set(0).await?;     // reset for full rebuild

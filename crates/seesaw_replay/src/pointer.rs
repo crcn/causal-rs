@@ -10,8 +10,10 @@ use chrono::{DateTime, Utc};
 /// (written during replay, promoted on success).
 #[async_trait]
 pub trait PointerStore: Send + Sync {
-    /// Load the current `active` position.
-    async fn load(&self) -> Result<Option<u64>>;
+    /// Current version — the promoted `active` position.
+    ///
+    /// Use at boot to derive the database name (e.g., `neo4j.v{version}`).
+    async fn version(&self) -> Result<Option<u64>>;
 
     /// Save position directly to `active`.
     async fn save(&self, position: u64) -> Result<()>;
@@ -78,7 +80,7 @@ mod pg {
 
     #[async_trait]
     impl PointerStore for PgPointerStore {
-        async fn load(&self) -> Result<Option<u64>> {
+        async fn version(&self) -> Result<Option<u64>> {
             let row: Option<(i64,)> =
                 sqlx::query_as("SELECT active FROM seesaw_replay_pointer WHERE id = 1")
                     .fetch_optional(&self.db)

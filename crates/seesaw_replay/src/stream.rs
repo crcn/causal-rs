@@ -196,7 +196,7 @@ impl<'a> ProjectionStream<'a> {
         F: Fn(&PersistedEvent) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let mut position = self.pointer.load().await?.unwrap_or(0);
+        let mut position = self.pointer.version().await?.unwrap_or(0);
         tracing::info!(position, "live mode: catching up");
 
         // Catch up.

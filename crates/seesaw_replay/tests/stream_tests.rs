@@ -36,7 +36,7 @@ impl MemoryPointerStore {
 
 #[async_trait]
 impl PointerStore for MemoryPointerStore {
-    async fn load(&self) -> Result<Option<u64>> {
+    async fn version(&self) -> Result<Option<u64>> {
         let v = *self.active.lock().await;
         Ok(Some(v))
     }
@@ -430,8 +430,8 @@ async fn replay_checkpoint_interval_stages_periodically() {
 
     #[async_trait]
     impl PointerStore for SpyPointer {
-        async fn load(&self) -> Result<Option<u64>> {
-            self.inner.load().await
+        async fn version(&self) -> Result<Option<u64>> {
+            self.inner.version().await
         }
         async fn save(&self, position: u64) -> Result<()> {
             self.inner.save(position).await
