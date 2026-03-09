@@ -506,3 +506,132 @@ async fn replay_apply_receives_correct_event_data() {
         vec!["test:type_0", "test:type_1", "test:type_2"]
     );
 }
+
+// ── stream.version() tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn version_live_returns_active_position() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 50).await;
+
+    // Simulate a previous replay that promoted to position 50.
+    pointer.set(50).await.unwrap();
+
+    let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Live);
+    let version = stream.version().await.unwrap();
+
+    assert_eq!(version, 50);
+}
+
+#[tokio::test]
+async fn version_live_returns_zero_when_no_prior_replay() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+
+    let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Live);
+    let version = stream.version().await.unwrap();
+
+    assert_eq!(version, 0);
+}
+
+#[tokio::test]
+async fn version_replay_snapshots_latest_position() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 30).await;
+
+    let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
+    let version = stream.version().await.unwrap();
+
+    // Should return latest_position() from event log, not active.
+    assert_eq!(version, 30);
+}
+
+#[tokio::test]
+async fn version_replay_stages_the_target() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 25).await;
+
+    let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
+    let version = stream.version().await.unwrap();
+
+    assert_eq!(version, 25);
+    // Staged should hold the snapshot.
+    assert_eq!(pointer.staged_value().await, Some(25));
+    // Active should NOT have changed.
+    assert_eq!(pointer.active().await, 0);
+}
+
+#[tokio::test]
+async fn version_replay_empty_log_returns_zero() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+
+    let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
+    let version = stream.version().await.unwrap();
+
+    assert_eq!(version, 0);
+    assert_eq!(pointer.staged_value().await, Some(0));
+}
+
+#[tokio::test]
+async fn version_replay_matches_promoted_active_after_run() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 40).await;
+
+    let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
+    let version = stream.version().await.unwrap();
+
+    // Run the replay — should process all events and promote.
+    stream
+        .run(|_event| async { Ok(()) })
+        .await
+        .unwrap();
+
+    // After promotion, active == the version we got before run().
+    assert_eq!(pointer.active().await, version);
+    assert_eq!(version, 40);
+}
+
+#[tokio::test]
+async fn version_live_then_run_catches_up_from_version() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 20).await;
+
+    // Simulate prior replay promoted to position 10.
+    pointer.set(10).await.unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+
+    let stream = ProjectionStream::new(&log, &pointer)
+        .mode(Mode::Live)
+        .poll_interval(std::time::Duration::from_millis(50));
+
+    let version = stream.version().await.unwrap();
+    assert_eq!(version, 10);
+
+    // Live mode catches up from version (position 10).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        stream.run(|event| {
+            let seen = seen_clone.clone();
+            let pos = event.position;
+            async move {
+                seen.lock().await.push(pos);
+                Ok(())
+            }
+        }),
+    )
+    .await;
+
+    let positions = seen.lock().await;
+    // Should have processed events 11..=20 (after position 10).
+    assert_eq!(positions.len(), 10);
+    assert_eq!(positions[0], 11);
+    assert_eq!(positions[positions.len() - 1], 20);
+}
