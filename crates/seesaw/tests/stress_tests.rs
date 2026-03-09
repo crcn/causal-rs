@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use seesaw_core::{events, handler, project, Aggregate, AnyEvent, Apply, Context, Engine, Events};
+use seesaw_core::{event, events, handler, project, Aggregate, AnyEvent, Apply, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -20,47 +20,56 @@ struct Deps;
 
 // ── Event types ────────────────────────────────────────────
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ping {
     msg: String,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventA {
     value: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventB {
     value: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventC {
     value: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventD {
     value: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
     total: f64,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderShipped {
     order_id: Uuid,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FailEvent {
     attempt: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FailedTerminal {
     error: String,
@@ -1361,6 +1370,7 @@ struct ProjectionDeps {
     store: Arc<dashmap::DashMap<String, String>>,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
     order_id: String,

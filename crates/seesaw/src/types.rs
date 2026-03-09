@@ -47,8 +47,12 @@ pub const NAMESPACE_SEESAW: Uuid = Uuid::from_u128(0x6ba7b8109dad11d180b400c04fd
 /// Event emitted by a handler (for atomic insertion)
 #[derive(Debug, Clone)]
 pub struct EmittedEvent {
-    /// Event type name (for deterministic ID generation)
-    pub event_type: String,
+    /// Stable durable name from Event trait (e.g. "scrape:web_scrape_completed").
+    pub durable_name: String,
+    /// Event prefix for codec lookup (e.g. "scrape").
+    pub event_prefix: String,
+    /// Whether this event should be persisted to EventLog.
+    pub persistent: bool,
     /// Event payload (JSON)
     pub payload: serde_json::Value,
     /// Handler that produced this event.

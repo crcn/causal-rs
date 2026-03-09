@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use seesaw_core::aggregator::{Aggregate, Apply};
-use seesaw_core::{events, handler, Context, Engine, EventLog, Events, HandlerQueue, MemoryStore, NewEvent, Snapshot};
+use seesaw_core::{event, events, handler, Context, Engine, EventLog, Events, HandlerQueue, MemoryStore, NewEvent, Snapshot};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -36,26 +36,31 @@ struct Deps;
 
 // -- Event types --
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ping {
     msg: String,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventA {
     value: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventB {
     value: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FailEvent {
     attempt: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FailedTerminal {
     error: String,
@@ -445,6 +450,7 @@ async fn ctx_run_executes_side_effect_in_handler() -> Result<()> {
 // -- Upcaster tests --
 
 /// Event with the "current" schema (v2) that includes a currency field.
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     total: u64,
@@ -520,6 +526,7 @@ async fn upcaster_chain_in_aggregate_replay() {
     }
 
     /// Current schema (v3): has total, currency, region
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct OrderPlacedV3 {
         order_id: Uuid,
@@ -539,7 +546,7 @@ async fn upcaster_chain_in_aggregate_replay() {
     // Set up upcasters: v1→v2 adds currency, v2→v3 adds region
     let mut upcasters = UpcasterRegistry::new();
     upcasters.register(Upcaster {
-        event_type: "OrderPlacedV3".to_string(),
+        event_prefix: "order_placed_v3".to_string(),
         from_version: 1,
         transform: Arc::new(|mut v| {
             v["currency"] = serde_json::json!("USD");
@@ -547,7 +554,7 @@ async fn upcaster_chain_in_aggregate_replay() {
         }),
     });
     upcasters.register(Upcaster {
-        event_type: "OrderPlacedV3".to_string(),
+        event_prefix: "order_placed_v3".to_string(),
         from_version: 2,
         transform: Arc::new(|mut v| {
             v["region"] = serde_json::json!("US");
@@ -561,7 +568,7 @@ async fn upcaster_chain_in_aggregate_replay() {
 
     store
         .append(new_event(
-            "OrderPlacedV3",
+            "order_placed_v3",
             serde_json::json!({"order_id": order_id, "total": 250}),
             Some("Order"),
             Some(order_id),
@@ -709,17 +716,20 @@ impl Aggregate for Order {
     }
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
     order_id: Uuid,
     total: u64,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderConfirmed {
     order_id: Uuid,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderShipped {
     order_id: Uuid,
@@ -757,6 +767,7 @@ impl Aggregate for Customer {
     }
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CustomerOrderPlaced {
     customer_id: Uuid,
@@ -830,9 +841,9 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
     // Both events should be persisted to the Order stream
     let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_type, "OrderCreated");
+    assert_eq!(events[0].event_type, "order_created");
     assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
-    assert_eq!(events[1].event_type, "OrderConfirmed");
+    assert_eq!(events[1].event_type, "order_confirmed");
     assert_eq!(events[1].aggregate_type.as_deref(), Some("Order"));
     assert_eq!(events[1].version.unwrap(), 2);
     Ok(())
@@ -1019,7 +1030,7 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
     // Pre-populate events directly in store (simulating previous engine run)
     store
         .append(new_event(
-            "OrderCreated",
+            "order_created",
             serde_json::json!({"order_id": order_id, "total": 100}),
             Some("Order"),
             Some(order_id),
@@ -1027,7 +1038,7 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
         .await?;
     store
         .append(new_event(
-            "OrderConfirmed",
+            "order_confirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
             Some(order_id),
@@ -1077,7 +1088,7 @@ async fn snapshot_acceleration() -> Result<()> {
     // Pre-populate: 2 events in store
     store
         .append(new_event(
-            "OrderCreated",
+            "order_created",
             serde_json::json!({"order_id": order_id, "total": 500}),
             Some("Order"),
             Some(order_id),
@@ -1085,7 +1096,7 @@ async fn snapshot_acceleration() -> Result<()> {
         .await?;
     store
         .append(new_event(
-            "OrderConfirmed",
+            "order_confirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
             Some(order_id),
@@ -1223,9 +1234,9 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
     // Events V1-V10 in store
     for i in 0..10 {
         let event_type = if i == 0 {
-            "OrderCreated"
+            "order_created"
         } else {
-            "OrderConfirmed"
+            "order_confirmed"
         };
         let payload = if i == 0 {
             serde_json::json!({"order_id": order_id, "total": 100})
@@ -1296,7 +1307,7 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
     // Events in store but NO snapshot
     store
         .append(new_event(
-            "OrderCreated",
+            "order_created",
             serde_json::json!({"order_id": order_id, "total": 100}),
             Some("Order"),
             Some(order_id),
@@ -1304,7 +1315,7 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
         .await?;
     store
         .append(new_event(
-            "OrderConfirmed",
+            "order_confirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
             Some(order_id),
@@ -1387,9 +1398,9 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
     let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].version.unwrap(), 1);
-    assert_eq!(events[0].event_type, "OrderCreated");
+    assert_eq!(events[0].event_type, "order_created");
     assert_eq!(events[1].version.unwrap(), 2);
-    assert_eq!(events[1].event_type, "OrderConfirmed");
+    assert_eq!(events[1].event_type, "order_confirmed");
     Ok(())
 }
 
@@ -1487,7 +1498,7 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
     // Pre-populate 1000 events: 1 OrderCreated + 999 OrderConfirmed
     store
         .append(new_event(
-            "OrderCreated",
+            "order_created",
             serde_json::json!({"order_id": order_id, "total": 42}),
             Some("Order"),
             Some(order_id),
@@ -1497,7 +1508,7 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
     for _i in 1..1000u64 {
         store
             .append(new_event(
-                "OrderConfirmed",
+                "order_confirmed",
                 serde_json::json!({"order_id": order_id}),
                 Some("Order"),
                 Some(order_id),
@@ -1727,7 +1738,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
     for i in 0..50 {
         store
             .append(new_event(
-                "OrderCreated",
+                "order_created",
                 serde_json::json!({"order_id": order_id, "total": (i + 1) * 10}),
                 Some("Order"),
                 Some(order_id),
@@ -1799,7 +1810,7 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
             event_id: Uuid::new_v4(),
             parent_id: None,
             correlation_id: Uuid::new_v4(),
-            event_type: "OrderConfirmed".to_string(),
+            event_type: "order_confirmed".to_string(),
             payload: serde_json::to_value(&OrderConfirmed { order_id })?,
             created_at: chrono::Utc::now(),
             aggregate_type: Some("Order".to_string()),
@@ -1831,15 +1842,16 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
     // Verify the store has all three events
     let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 3);
-    assert_eq!(events[0].event_type, "OrderCreated");
-    assert_eq!(events[1].event_type, "OrderConfirmed");
-    assert_eq!(events[2].event_type, "OrderShipped");
+    assert_eq!(events[0].event_type, "order_created");
+    assert_eq!(events[1].event_type, "order_confirmed");
+    assert_eq!(events[2].event_type, "order_shipped");
 
     Ok(())
 }
 
 // -- on_dlq tests --
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HandlerDlq {
     handler_id: String,
@@ -1849,11 +1861,13 @@ struct HandlerDlq {
     attempts: i32,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GlobalDlqEvent {
     error: String,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HandlerSpecificFailure {
     error: String,
@@ -1925,7 +1939,7 @@ async fn on_dlq_receives_correct_info() -> Result<()> {
 
     let info = captured.lock().take().expect("on_dlq should have been called");
     assert_eq!(info.handler_id, "check_info_handler");
-    assert_eq!(info.source_event_type, "FailEvent");
+    assert_eq!(info.source_event_type, "fail_event");
     assert!(!info.source_event_id.is_nil(), "source_event_id should be a valid UUID");
     assert!(info.error.contains("detailed error"));
     assert_eq!(info.reason, "failed");
@@ -2286,6 +2300,7 @@ async fn cancel_does_not_affect_other_correlations() -> Result<()> {
 #[tokio::test]
 async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
     /// Child event emitted by the Ping handler.
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Pong;
 
@@ -2867,6 +2882,7 @@ async fn on_dlq_event_handler_failure_does_not_cascade() -> Result<()> {
     let dlq_handler_counter = Arc::new(AtomicUsize::new(0));
     let dhc = dlq_handler_counter.clone();
 
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct DlqFailEvent {
         error: String,
@@ -3029,6 +3045,7 @@ async fn journal_cleared_after_successful_handler() -> Result<()> {
 // ── Ephemeral sidecar tests ──────────────────────────────────────────
 
 /// Event with a #[serde(skip)] field — will be Default on JSON round-trip.
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventWithSkip {
     id: i32,
@@ -3072,6 +3089,7 @@ async fn ephemeral_preserves_serde_skip_fields() -> Result<()> {
 /// The child event (B) emitted by the first handler should also have its ephemeral preserved.
 #[tokio::test]
 async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Step1 {
         value: i32,
@@ -3079,6 +3097,7 @@ async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
         extra: Vec<u8>,
     }
 
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Step2 {
         value: i32,
@@ -3176,11 +3195,13 @@ async fn ephemeral_shared_across_multiple_handlers() -> Result<()> {
 /// Fan-out batch: each item in the batch preserves ephemeral independently.
 #[tokio::test]
 async fn ephemeral_preserved_in_batch_fanout() -> Result<()> {
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Trigger {
         count: usize,
     }
 
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct BatchChild {
         index: usize,
@@ -3327,6 +3348,7 @@ async fn ephemeral_via_emit_output() -> Result<()> {
 /// DLQ on_failure handler still works — ephemeral doesn't interfere with error path.
 #[tokio::test]
 async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct FailSkip {
         id: i32,
@@ -3334,6 +3356,7 @@ async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
         transient: String,
     }
 
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct FailedSkip {
         error: String,
@@ -3381,6 +3404,7 @@ async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
 /// Extract handler receives ephemeral-derived data correctly.
 #[tokio::test]
 async fn ephemeral_with_extract_handler() -> Result<()> {
+    #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct ExtractEvent {
         id: i32,
@@ -3436,7 +3460,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
     // Step 1: Pre-populate the event store (as if the event was already processed)
     store
         .append(new_event(
-            "OrderCreated",
+            "order_created",
             serde_json::json!({"order_id": order_id, "total": 250}),
             Some("Order"),
             Some(order_id),
@@ -3445,7 +3469,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
 
     // Step 2: Inject a handler directly into the queue (simulating reclaim after crash)
     use seesaw_core::types::QueuedHandler;
-    let event_type = std::any::type_name::<OrderCreated>().to_string();
+    let event_type = "order_created".to_string();
     store
         .publish_handler_for_test(QueuedHandler {
             event_id,
@@ -3540,7 +3564,7 @@ async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
     let log = store.global_log().lock();
     let dlq_event = log
         .iter()
-        .find(|e| e.event_type == "GlobalDlqEvent")
+        .find(|e| e.event_type == "global_dlq_event")
         .expect("GlobalDlqEvent should be persisted");
 
     assert_eq!(
@@ -3572,14 +3596,17 @@ impl Aggregate for PipelineState {
     }
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourcesPrepared {
     plan: String,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScrapeCompleted;
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExpansionTriggered;
 
@@ -3607,7 +3634,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     // Step 1: Pre-populate store with both events already persisted
     store
         .append(new_event(
-            "SourcesPrepared",
+            "sources_prepared",
             serde_json::json!({"plan": "social"}),
             Some("PipelineState"),
             Some(Uuid::nil()),
@@ -3615,7 +3642,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
         .await?;
     store
         .append(new_event(
-            "ScrapeCompleted",
+            "scrape_completed",
             serde_json::json!(null),
             Some("PipelineState"),
             Some(Uuid::nil()),
@@ -3627,7 +3654,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     store.set_checkpoint(2);
 
     // Step 2: Inject a handler into the queue (simulating resume/reclaim)
-    let event_type = std::any::type_name::<ScrapeCompleted>().to_string();
+    let event_type = "scrape_completed".to_string();
     store
         .publish_handler_for_test(seesaw_core::types::QueuedHandler {
             event_id: Uuid::new_v4(),
@@ -3689,16 +3716,19 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
 
 // ── Multi-type handler integration tests ─────────────────────────────
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReviewDone {
     concern_id: Uuid,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NoSignals {
     concern_id: Uuid,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Enriched {
     concern_id: Uuid,
@@ -3823,9 +3853,11 @@ impl Aggregate for ProgressTracker {
     }
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StepStarted;
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StepDone;
 

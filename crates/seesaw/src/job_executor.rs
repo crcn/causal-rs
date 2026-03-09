@@ -11,7 +11,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::aggregator::AggregatorRegistry;
-use crate::event_store::event_type_short_name;
 use crate::handler::{Context, DlqTerminalInfo, EventOutput, GlobalDlqMapper, Handler};
 use crate::handler_queue::HandlerQueue;
 use crate::handler_registry::HandlerRegistry;
@@ -442,7 +441,7 @@ where
         // Skip when upcasters exist — the ephemeral holds the pre-upcasted shape.
         if let Some(typed) = ephemeral {
             if self.upcasters.is_empty() {
-                if let Some(codec) = self.handlers.find_codec_by_event_type(event_type) {
+                if let Some(codec) = self.handlers.find_codec_by_durable_name(event_type) {
                     if (**typed).type_id() == codec.type_id {
                         return Ok((Arc::clone(typed), codec.type_id));
                     }
@@ -451,13 +450,10 @@ where
         }
 
         // Slow path: deserialize from JSON (replay, hydration, or no ephemeral).
-        // Apply upcasters before decoding (schema_version=0 for now — events
-        // without a persisted version get the full upcaster chain as a no-op
-        // when no upcasters are registered).
-        let short_name = event_type_short_name(event_type);
-        let upcasted = self.upcasters.upcast(short_name, 0, payload.clone())?;
+        // Apply upcasters before decoding.
+        let upcasted = self.upcasters.upcast(event_type, 0, payload.clone())?;
 
-        let codec = self.handlers.find_codec_by_event_type(event_type);
+        let codec = self.handlers.find_codec_by_durable_name(event_type);
 
         if let Some(codec) = codec {
             let typed = (codec.decode)(&upcasted)?;
@@ -486,7 +482,9 @@ where
             }
 
             result.push(EmittedEvent {
-                event_type: output.event_type,
+                durable_name: output.durable_name,
+                event_prefix: output.event_prefix,
+                persistent: output.persistent,
                 payload: output.payload,
                 handler_id: Some(execution.handler_id.clone()),
                 ephemeral: output.ephemeral,
@@ -510,7 +508,7 @@ where
             if let Some(global) = self.global_dlq_mapper.as_ref() {
                 let mut emitted = global(DlqTerminalInfo {
                     handler_id: execution.handler_id.clone(),
-                    source_event_type: event_type_short_name(&execution.event_type).to_string(),
+                    source_event_type: execution.event_type.clone(),
                     source_event_id: execution.event_id,
                     error,
                     reason: reason.to_string(),
@@ -530,7 +528,7 @@ where
             source_type_id,
             DlqTerminalInfo {
                 handler_id: execution.handler_id.clone(),
-                source_event_type: event_type_short_name(&execution.event_type).to_string(),
+                source_event_type: execution.event_type.clone(),
                 source_event_id: execution.event_id,
                 error,
                 reason: reason.to_string(),

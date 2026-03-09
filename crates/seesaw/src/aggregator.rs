@@ -10,7 +10,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::event_store::event_type_short_name;
+use crate::handler::extract_prefix;
 use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate + Apply traits ─────────────────────────────────────
@@ -41,8 +41,8 @@ pub trait Apply<E> {
 
 /// A type-erased aggregator that maps an event to an aggregate and applies it.
 pub struct Aggregator {
-    /// The Rust event type name (for matching dispatched events by string).
-    pub event_type: String,
+    /// The event prefix for matching (e.g. "scrape", "order_placed").
+    pub event_prefix: String,
     /// TypeId of the event for fast matching.
     pub event_type_id: TypeId,
     /// The aggregate type string.
@@ -68,16 +68,16 @@ impl Aggregator {
     /// `extract_id` maps the event to the aggregate ID it belongs to.
     pub fn new<E, A, F>(extract_id: F) -> Self
     where
-        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+        E: crate::event::Event,
         A: Aggregate + Apply<E> + serde::Serialize + serde::de::DeserializeOwned,
         F: Fn(&E) -> Uuid + Send + Sync + 'static,
     {
-        let event_type = std::any::type_name::<E>().to_string();
+        let event_prefix = E::event_prefix().to_string();
         let event_type_id = TypeId::of::<E>();
         let aggregate_type = A::aggregate_type().to_string();
 
         Self {
-            event_type,
+            event_prefix,
             event_type_id,
             aggregate_type,
             json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
@@ -179,18 +179,15 @@ impl AggregatorRegistry {
         self.aggregators.push(aggregator);
     }
 
-    /// Find all aggregators that handle the given event type string.
+    /// Find all aggregators that handle the given durable name.
     ///
-    /// Matches both full type paths and short names, so both
-    /// `"my_crate::OrderCreated"` and `"OrderCreated"` will match.
-    pub fn find_by_event_type(&self, event_type: &str) -> Vec<&Aggregator> {
-        let short = crate::event_store::event_type_short_name(event_type);
+    /// Extracts the prefix from the durable name and matches against
+    /// registered aggregator prefixes.
+    pub fn find_by_durable_name(&self, durable_name: &str) -> Vec<&Aggregator> {
+        let prefix = extract_prefix(durable_name);
         self.aggregators
             .iter()
-            .filter(|a| {
-                a.event_type == event_type
-                    || crate::event_store::event_type_short_name(&a.event_type) == short
-            })
+            .filter(|a| a.event_prefix == prefix)
             .collect()
     }
 
@@ -212,14 +209,11 @@ impl AggregatorRegistry {
         event_type: &str,
         payload: &serde_json::Value,
     ) {
-        let short = crate::event_store::event_type_short_name(event_type);
+        let prefix = extract_prefix(event_type);
         let matching: Vec<&Aggregator> = self
             .aggregators
             .iter()
-            .filter(|a| {
-                a.event_type == event_type
-                    || crate::event_store::event_type_short_name(&a.event_type) == short
-            })
+            .filter(|a| a.event_prefix == prefix)
             .collect();
 
         for agg in matching {
@@ -327,13 +321,14 @@ impl AggregatorRegistry {
             // Apply upcasters before deserialization (schema_version=0 as default)
             let upcasted_payload = upcasters.upcast(event_type, 0, (*payload).clone())?;
 
-            // Find aggregators where the short name matches
+            // Find aggregators where the prefix matches
+            let prefix = extract_prefix(event_type);
             let matching: Vec<&Aggregator> = self
                 .aggregators
                 .iter()
                 .filter(|a| {
                     a.aggregate_type == aggregate_type
-                        && event_type_short_name(&a.event_type) == *event_type
+                        && a.event_prefix == prefix
                 })
                 .collect();
 
@@ -505,12 +500,13 @@ impl AggregatorRegistry {
         for (event_type, payload) in events {
             let upcasted = upcasters.upcast(event_type, 0, (*payload).clone())?;
 
+            let prefix = extract_prefix(event_type);
             let matching: Vec<&Aggregator> = self
                 .aggregators
                 .iter()
                 .filter(|a| {
                     a.aggregate_type == aggregate_type
-                        && event_type_short_name(&a.event_type) == *event_type
+                        && a.event_prefix == prefix
                 })
                 .collect();
 

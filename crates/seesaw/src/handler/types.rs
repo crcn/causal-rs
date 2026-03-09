@@ -89,8 +89,14 @@ impl<E> From<Option<E>> for Emit<E> {
 pub struct EventOutput {
     /// The TypeId of the event type.
     pub type_id: TypeId,
-    /// Fully-qualified Rust type name of the event.
+    /// Fully-qualified Rust type name of the event (legacy, for Debug).
     pub event_type: String,
+    /// Stable durable name from Event trait (e.g. "scrape:web_scrape_completed").
+    pub durable_name: String,
+    /// Event prefix for codec/aggregator lookup (e.g. "scrape").
+    pub event_prefix: String,
+    /// Whether this event is persistent (vs ephemeral).
+    pub persistent: bool,
     /// Eagerly-serialized event payload.
     pub payload: serde_json::Value,
     /// Codec for automatic registration (None for replayed/reconstructed outputs).
@@ -100,16 +106,22 @@ pub struct EventOutput {
 }
 
 impl EventOutput {
-    /// Create a new EventOutput from a typed event.
-    pub fn new<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(event: E) -> Self {
+    /// Create a new EventOutput from a typed event implementing the Event trait.
+    pub fn new<E: crate::event::Event>(event: E) -> Self {
+        let durable_name = event.durable_name().to_string();
+        let event_prefix = E::event_prefix().to_string();
+        let persistent = !E::is_ephemeral();
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(event);
         Self {
             type_id: TypeId::of::<E>(),
             event_type: std::any::type_name::<E>().to_string(),
+            durable_name,
+            event_prefix: event_prefix.clone(),
+            persistent,
             payload,
             codec: Some(Arc::new(EventCodec {
-                event_type: std::any::type_name::<E>().to_string(),
+                event_prefix,
                 type_id: TypeId::of::<E>(),
                 decode: Arc::new(|payload| {
                     let event: E = serde_json::from_value(payload.clone())?;
@@ -127,12 +139,23 @@ impl EventOutput {
     pub fn from_serialized(event_type: String, payload: serde_json::Value) -> Self {
         Self {
             type_id: TypeId::of::<()>(),
+            durable_name: event_type.clone(),
+            event_prefix: extract_prefix(&event_type).to_string(),
+            persistent: true,
             event_type,
             payload,
             codec: None,
             ephemeral: None,
         }
     }
+}
+
+/// Extract the prefix from a durable name.
+///
+/// `"scrape:web_scrape_completed"` → `"scrape"`
+/// `"order_placed"` → `"order_placed"` (no colon = full name is the prefix)
+pub fn extract_prefix(durable_name: &str) -> &str {
+    durable_name.split(':').next().unwrap_or(durable_name)
 }
 
 /// The universal return type for all handlers.
@@ -166,13 +189,13 @@ impl Events {
     }
 
     /// Add a single event to the collection (builder-style, chainable).
-    pub fn add<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(mut self, event: E) -> Self {
+    pub fn add<E: crate::event::Event>(mut self, event: E) -> Self {
         self.outputs.push(EventOutput::new(event));
         self
     }
 
     /// Add a single event to the collection (Vec-style, in-place).
-    pub fn push<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(&mut self, event: E) {
+    pub fn push<E: crate::event::Event>(&mut self, event: E) {
         self.outputs.push(EventOutput::new(event));
     }
 
@@ -192,7 +215,7 @@ impl Events {
     }
 
     /// Add all items from an iterator as individual events (fan-out).
-    pub fn batch<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(items: impl IntoIterator<Item = E>) -> Self {
+    pub fn batch<E: crate::event::Event>(items: impl IntoIterator<Item = E>) -> Self {
         Self {
             outputs: items.into_iter().map(EventOutput::new).collect(),
         }
@@ -231,7 +254,7 @@ impl IntoEvents for () {
     }
 }
 
-impl<E: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static> IntoEvents for Emit<E> {
+impl<E: crate::event::Event> IntoEvents for Emit<E> {
     fn into_events(self) -> Events {
         if TypeId::of::<E>() == TypeId::of::<()>() {
             return Events::new();
@@ -487,7 +510,13 @@ mod tests {
 
     #[test]
     fn test_event_output_debug() {
-        let output = EventOutput::new(42i32);
+        #[seesaw_core_macros::event]
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct TestEvt {
+            val: i32,
+        }
+
+        let output = EventOutput::new(TestEvt { val: 42 });
         let debug_str = format!("{:?}", output);
         assert!(debug_str.contains("EventOutput"));
         assert!(debug_str.contains("event_type"));

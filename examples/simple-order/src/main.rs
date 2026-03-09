@@ -1,21 +1,24 @@
 //! Simple Order Processing Example
 
 use anyhow::Result;
-use seesaw_core::{handles, Context, Engine};
+use seesaw_core::{event, handles, Context, Engine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
     total: f64,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderShipped {
     order_id: Uuid,
 }
 
+#[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderDelivered {
     order_id: Uuid,

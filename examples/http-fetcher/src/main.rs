@@ -1,10 +1,12 @@
 //! HTTP Fetcher Example
 
 use anyhow::Result;
-use seesaw_core::{events, handler, Context, Engine};
+use seesaw_core::{event, events, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 
+#[event(prefix = "fetch")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 enum FetchEvent {
     FetchRequested {
         urls: Vec<String>,

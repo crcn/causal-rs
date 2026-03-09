@@ -12,7 +12,6 @@ use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_log::EventLog;
-use crate::event_store::event_type_short_name;
 use crate::handler::{GlobalDlqMapper, Handler, Projection};
 use crate::handler_queue::HandlerQueue;
 use crate::handler_registry::HandlerRegistry;
@@ -172,15 +171,16 @@ where
     /// ```
     pub fn on_dlq<E, F>(mut self, mapper: F) -> Self
     where
-        E: serde::Serialize + Send + Sync + 'static,
+        E: crate::event::Event,
         F: Fn(crate::handler::DlqTerminalInfo) -> E + Send + Sync + 'static,
     {
-        let event_type = std::any::type_name::<E>().to_string();
         self.global_dlq_mapper = Some(Arc::new(move |info| {
             let failed_handler_id = info.handler_id.clone();
             let event = mapper(info);
             Ok(crate::EmittedEvent {
-                event_type: event_type.clone(),
+                durable_name: event.durable_name().to_string(),
+                event_prefix: E::event_prefix().to_string(),
+                persistent: !E::is_ephemeral(),
                 payload: serde_json::to_value(&event)?,
                 handler_id: Some(failed_handler_id),
                 ephemeral: None,
@@ -231,13 +231,13 @@ where
     /// ```
     pub fn with_aggregator<E, A, F>(mut self, extract_id: F) -> Self
     where
-        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+        E: crate::event::Event,
         A: Aggregate + Apply<E> + serde::Serialize + serde::de::DeserializeOwned,
         F: Fn(&E) -> Uuid + Send + Sync + 'static,
     {
-        // Register event codec so emitted events of this type can be serialized
+        // Register event codec so emitted events of this type can be deserialized
         let codec = Arc::new(crate::event_codec::EventCodec {
-            event_type: std::any::type_name::<E>().to_string(),
+            event_prefix: E::event_prefix().to_string(),
             type_id: std::any::TypeId::of::<E>(),
             decode: Arc::new(|payload| {
                 let event: E = serde_json::from_value(payload.clone())?;
@@ -280,14 +280,13 @@ where
     /// ```
     pub fn with_upcaster<E, F>(mut self, from_version: u32, transform: F) -> Self
     where
-        E: 'static,
+        E: crate::event::Event,
         F: Fn(serde_json::Value) -> anyhow::Result<serde_json::Value> + Send + Sync + 'static,
     {
-        let short_name = event_type_short_name(std::any::type_name::<E>()).to_string();
         Arc::get_mut(&mut self.upcasters)
             .expect("Cannot add upcaster after cloning")
             .register(Upcaster {
-                event_type: short_name,
+                event_prefix: E::event_prefix().to_string(),
                 from_version,
                 transform: Arc::new(transform),
             });
@@ -308,7 +307,7 @@ where
     /// ```
     pub fn emit<E>(&self, event: E) -> EmitFuture
     where
-        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+        E: crate::event::Event,
     {
         let engine = self.clone();
         let engine2 = self.clone();
@@ -539,7 +538,7 @@ where
                     }
                 }
                 for execution in &executions {
-                    let matching = self.aggregators.find_by_event_type(&execution.event_type);
+                    let matching = self.aggregators.find_by_durable_name(&execution.event_type);
                     for agg in &matching {
                         let agg_id = match agg.extract_id_from_json(&execution.event_payload) {
                             Some(id) => id,
@@ -738,7 +737,7 @@ where
         let global = self.global_dlq_mapper.as_ref()?;
         let info = crate::handler::DlqTerminalInfo {
             handler_id: execution.handler_id.clone(),
-            source_event_type: event_type_short_name(&execution.event_type).to_string(),
+            source_event_type: execution.event_type.clone(),
             source_event_id: execution.event_id,
             error,
             reason: reason.to_string(),
@@ -764,7 +763,7 @@ where
     /// Excludes the current event from hydration — it will be applied
     /// separately by `apply_to_aggregators` to produce correct prev/next state.
     async fn hydrate_for_event(&self, event: &PersistedEvent) -> Result<()> {
-        let matching = self.aggregators.find_by_event_type(&event.event_type);
+        let matching = self.aggregators.find_by_durable_name(&event.event_type);
 
         for agg in &matching {
             let agg_id = match agg.extract_id_from_json(&event.payload) {
@@ -870,11 +869,11 @@ where
         correlation_id_override: Option<Uuid>,
     ) -> Result<ProcessHandle>
     where
-        E: Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+        E: crate::event::Event,
     {
         // Auto-register codec so the event can be decoded in the settle loop
         let codec = Arc::new(crate::event_codec::EventCodec {
-            event_type: std::any::type_name::<E>().to_string(),
+            event_prefix: E::event_prefix().to_string(),
             type_id: std::any::TypeId::of::<E>(),
             decode: Arc::new(|payload| {
                 let event: E = serde_json::from_value(payload.clone())?;
@@ -885,18 +884,17 @@ where
 
         let event_id = Uuid::new_v4();
         let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
-        let event_type = std::any::type_name::<E>().to_string();
-        let short_name = event_type_short_name(&event_type).to_string();
+        let durable_name = event.durable_name().to_string();
         let payload = serde_json::to_value(&event).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(event);
 
         info!(
             "Publishing event: type={}, correlation_id={}",
-            event_type, correlation_id
+            durable_name, correlation_id
         );
 
         // Determine aggregate metadata from matching aggregators
-        let matching = self.aggregators.find_by_event_type(&event_type);
+        let matching = self.aggregators.find_by_durable_name(&durable_name);
         let (aggregate_type, aggregate_id) = matching
             .iter()
             .find_map(|agg| {
@@ -912,7 +910,7 @@ where
             event_id,
             parent_id: None,
             correlation_id,
-            event_type: short_name,
+            event_type: durable_name,
             payload,
             created_at: chrono::Utc::now(),
             aggregate_type,
@@ -941,15 +939,14 @@ where
 
         let event_id = Uuid::new_v4();
         let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
-        let short_name = event_type_short_name(&output.event_type).to_string();
 
         info!(
             "Publishing event output: type={}, correlation_id={}",
-            output.event_type, correlation_id
+            output.durable_name, correlation_id
         );
 
         // Determine aggregate metadata
-        let matching = self.aggregators.find_by_event_type(&output.event_type);
+        let matching = self.aggregators.find_by_durable_name(&output.durable_name);
         let (aggregate_type, aggregate_id) = matching
             .iter()
             .find_map(|agg| {
@@ -965,7 +962,7 @@ where
             event_id,
             parent_id: None,
             correlation_id,
-            event_type: short_name,
+            event_type: output.durable_name,
             payload: output.payload,
             created_at: chrono::Utc::now(),
             aggregate_type,
@@ -993,7 +990,7 @@ where
     ) -> Result<()> {
         for new_event in new_events.iter_mut() {
             // Resolve aggregate metadata
-            let matching = self.aggregators.find_by_event_type(&new_event.event_type);
+            let matching = self.aggregators.find_by_durable_name(&new_event.event_type);
             if let Some((agg_type, agg_id)) = matching
                 .iter()
                 .find_map(|agg| {
@@ -1020,7 +1017,7 @@ where
         event: &PersistedEvent,
         threshold: u64,
     ) -> Result<()> {
-        let matching = self.aggregators.find_by_event_type(&event.event_type);
+        let matching = self.aggregators.find_by_durable_name(&event.event_type);
 
         for agg in matching {
             let aggregate_id = match agg.extract_id_from_json(&event.payload) {
@@ -1081,7 +1078,7 @@ where
                     &NAMESPACE_SEESAW,
                     format!(
                         "{}-{}{}-{}-{}",
-                        event_id, handler_id, id_infix, e.event_type, idx
+                        event_id, handler_id, id_infix, e.durable_name, idx
                     )
                     .as_bytes(),
                 );
@@ -1107,7 +1104,7 @@ where
                     event_id: new_event_id,
                     parent_id: Some(event_id),
                     correlation_id,
-                    event_type: event_type_short_name(&e.event_type).to_string(),
+                    event_type: e.durable_name,
                     payload: e.payload,
                     created_at: chrono::Utc::now(),
                     aggregate_type: None,

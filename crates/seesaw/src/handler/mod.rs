@@ -42,6 +42,6 @@ pub use builders::{on, on_any, project, FilteredHandlerBuilder, ProjectionBuilde
 pub use context::{AggregateState, Context, Logger};
 pub use error_event::HandlerError;
 pub use types::{
-    AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput, Events,
-    GlobalDlqMapper, Handler, IntoEvents, Projection,
+    extract_prefix, AnyEvent, DlqTerminalInfo, Emit, ErrorContext, ErrorHandler, EventOutput,
+    Events, GlobalDlqMapper, Handler, IntoEvents, Projection,
 };

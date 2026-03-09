@@ -116,22 +116,21 @@ where
             .cloned()
     }
 
-    /// Find queue codec by event type name.
-    pub(crate) fn find_codec_by_event_type(&self, event_type: &str) -> Option<Arc<EventCodec>> {
-        let short = crate::event_store::event_type_short_name(event_type);
+    /// Find queue codec by durable name (prefix-based lookup).
+    ///
+    /// Extracts the prefix from the durable name (e.g. "scrape" from
+    /// "scrape:web_scrape_completed") and matches against registered codecs.
+    pub(crate) fn find_codec_by_durable_name(&self, durable_name: &str) -> Option<Arc<EventCodec>> {
+        let prefix = crate::handler::extract_prefix(durable_name);
         for handler in self.handlers.read().iter() {
             for codec in handler.codecs() {
-                if codec.event_type == event_type
-                    || crate::event_store::event_type_short_name(&codec.event_type) == short
-                {
+                if codec.event_prefix == prefix {
                     return Some(codec.clone());
                 }
             }
         }
         for codec in self.standalone_codecs.read().iter() {
-            if codec.event_type == event_type
-                || crate::event_store::event_type_short_name(&codec.event_type) == short
-            {
+            if codec.event_prefix == prefix {
                 return Some(codec.clone());
             }
         }
@@ -162,9 +161,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    #[seesaw_core_macros::event]
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct EventA;
 
+    #[seesaw_core_macros::event]
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct EventB;
 

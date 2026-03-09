@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use seesaw_core::{aggregator, aggregators, events, handle, handles, projection, AnyEvent, Context, Emit, ErrorContext, Events};
+use seesaw_core::{aggregator, aggregators, event, events, handle, handles, projection, AnyEvent, Context, Emit, ErrorContext, Events};
 use seesaw_core::{Aggregate, Apply};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -9,21 +9,25 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct Deps;
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct OrderShipped {
     order_id: Uuid,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct PaymentRequested {
     order_id: Uuid,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct PaymentCharged {
     order_id: Uuid,
@@ -32,26 +36,32 @@ struct PaymentCharged {
     attempts: i32,
 }
 
+#[event(prefix = "crawl")]
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 enum CrawlEvent {
     Ingested { website_id: Uuid, job_id: Uuid },
     Regenerated { website_id: Uuid, job_id: Uuid },
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct ExtractEnqueued {
     website_id: Uuid,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct AnalyticsEvent;
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct HighValueOrder {
     order_id: Uuid,
     total: f64,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct HighValueShipped {
     order_id: Uuid,
@@ -258,7 +268,9 @@ fn aggregator_apply_trait_generated() {
 
 // ── Aggregator id_fn tests (enum events with method access) ───────────
 
+#[event(prefix = "pipeline")]
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 enum PipelineEvent {
     Started { run_id: Uuid },
     Completed { run_id: Uuid },
@@ -328,11 +340,13 @@ impl Aggregate for RunStats {
     }
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct StepCompleted {
     name: String,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct StepFailed {
     reason: String,
@@ -450,11 +464,13 @@ fn effects_module_registration_works() {
 
 // ── Bare handler inference tests ──────────────────────────────────────
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct TaskCreated {
     task_id: Uuid,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct TaskFinished {
     task_id: Uuid,
@@ -498,16 +514,19 @@ fn bare_handler_inference_works() {
 
 // ── Multi-type handler tests ─────────────────────────────────────────
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct SystemEvent {
     concern_id: Uuid,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct SignalEvent {
     concern_id: Uuid,
 }
 
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct EnrichmentResult {
     concern_id: Uuid,

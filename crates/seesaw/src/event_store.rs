@@ -27,7 +27,7 @@ pub fn event_type_short_name(full: &str) -> &str {
 
 /// Persist an event to the store.
 ///
-/// Uses the short type name (e.g. `"OrderPlaced"`) for durable storage.
+/// Uses the durable name from the Event trait for storage.
 /// Returns the [`AppendResult`] with global position and stream version.
 pub async fn persist_event<E, A>(
     store: &dyn EventLog,
@@ -35,10 +35,10 @@ pub async fn persist_event<E, A>(
     event: &E,
 ) -> Result<AppendResult>
 where
-    E: serde::Serialize + 'static,
+    E: crate::event::Event,
     A: Aggregate,
 {
-    let event_type = event_type_short_name(std::any::type_name::<E>()).to_string();
+    let event_type = event.durable_name().to_string();
     let payload = serde_json::to_value(event)?;
 
     store

@@ -14,12 +14,13 @@ use anyhow::Result;
 
 /// A single upcaster that transforms an event payload from one schema version to the next.
 pub struct Upcaster {
-    pub event_type: String,
+    /// Event prefix for matching (e.g. "scrape", "order_placed").
+    pub event_prefix: String,
     pub from_version: u32,
     pub transform: Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value> + Send + Sync>,
 }
 
-/// Registry of upcasters keyed by short event type name.
+/// Registry of upcasters keyed by event prefix.
 pub struct UpcasterRegistry {
     upcasters: HashMap<String, Vec<Upcaster>>,
 }
@@ -32,22 +33,23 @@ impl UpcasterRegistry {
     }
 
     pub fn register(&mut self, upcaster: Upcaster) {
-        let entry = self.upcasters.entry(upcaster.event_type.clone()).or_default();
+        let entry = self.upcasters.entry(upcaster.event_prefix.clone()).or_default();
         entry.push(upcaster);
         entry.sort_by_key(|u| u.from_version);
     }
 
     /// Apply upcasters in sequence from `schema_version` to current.
     ///
-    /// Applies all transforms where `from_version >= schema_version`.
-    /// Returns the payload unchanged if no upcasters match.
+    /// Extracts the prefix from `durable_name` for lookup. Applies all transforms
+    /// where `from_version >= schema_version`. Returns payload unchanged if no match.
     pub fn upcast(
         &self,
-        event_type: &str,
+        durable_name: &str,
         schema_version: u32,
         mut payload: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        if let Some(chain) = self.upcasters.get(event_type) {
+        let prefix = crate::handler::extract_prefix(durable_name);
+        if let Some(chain) = self.upcasters.get(prefix) {
             for upcaster in chain {
                 if upcaster.from_version >= schema_version {
                     payload = (upcaster.transform)(payload)?;
@@ -78,7 +80,7 @@ mod tests {
 
         // v1 → v2: add currency field
         registry.register(Upcaster {
-            event_type: "OrderPlaced".to_string(),
+            event_prefix: "order_placed".to_string(),
             from_version: 1,
             transform: Arc::new(|mut v| {
                 v["currency"] = serde_json::json!("USD");
@@ -88,7 +90,7 @@ mod tests {
 
         // v2 → v3: add region field
         registry.register(Upcaster {
-            event_type: "OrderPlaced".to_string(),
+            event_prefix: "order_placed".to_string(),
             from_version: 2,
             transform: Arc::new(|mut v| {
                 v["region"] = serde_json::json!("US");
@@ -98,14 +100,14 @@ mod tests {
 
         // Upcast from v1 should apply both transforms
         let payload = serde_json::json!({"total": 100});
-        let result = registry.upcast("OrderPlaced", 1, payload).unwrap();
+        let result = registry.upcast("order_placed", 1, payload).unwrap();
         assert_eq!(result["total"], 100);
         assert_eq!(result["currency"], "USD");
         assert_eq!(result["region"], "US");
 
         // Upcast from v2 should apply only v2→v3
         let payload = serde_json::json!({"total": 100, "currency": "EUR"});
-        let result = registry.upcast("OrderPlaced", 2, payload).unwrap();
+        let result = registry.upcast("order_placed", 2, payload).unwrap();
         assert_eq!(result["currency"], "EUR"); // not overwritten — already at v2
         assert_eq!(result["region"], "US");
     }
@@ -115,7 +117,7 @@ mod tests {
         let mut registry = UpcasterRegistry::new();
 
         registry.register(Upcaster {
-            event_type: "OrderPlaced".to_string(),
+            event_prefix: "order_placed".to_string(),
             from_version: 1,
             transform: Arc::new(|mut v| {
                 v["currency"] = serde_json::json!("USD");
@@ -125,7 +127,7 @@ mod tests {
 
         // schema_version=2 means already past the v1 upcaster
         let payload = serde_json::json!({"total": 100, "currency": "EUR"});
-        let result = registry.upcast("OrderPlaced", 2, payload.clone()).unwrap();
+        let result = registry.upcast("order_placed", 2, payload.clone()).unwrap();
         assert_eq!(result, payload);
     }
 
@@ -133,7 +135,7 @@ mod tests {
     fn upcast_noop_for_unknown_event() {
         let registry = UpcasterRegistry::new();
         let payload = serde_json::json!({"foo": "bar"});
-        let result = registry.upcast("UnknownEvent", 0, payload.clone()).unwrap();
+        let result = registry.upcast("unknown_event", 0, payload.clone()).unwrap();
         assert_eq!(result, payload);
     }
 
@@ -142,12 +144,12 @@ mod tests {
         let mut registry = UpcasterRegistry::new();
 
         registry.register(Upcaster {
-            event_type: "Bad".to_string(),
+            event_prefix: "bad".to_string(),
             from_version: 1,
             transform: Arc::new(|_| Err(anyhow::anyhow!("transform failed"))),
         });
 
-        let result = registry.upcast("Bad", 1, serde_json::json!({}));
+        let result = registry.upcast("bad", 1, serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("transform failed"));
     }

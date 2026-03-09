@@ -55,10 +55,10 @@ pub struct WithStarted<D, St>(St, PhantomData<D>);
 
 fn typed_event_codec<E>() -> Arc<EventCodec>
 where
-    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    E: crate::event::Event,
 {
     Arc::new(EventCodec {
-        event_type: std::any::type_name::<E>().to_string(),
+        event_prefix: E::event_prefix().to_string(),
         type_id: TypeId::of::<E>(),
         decode: Arc::new(|payload| {
             let event: E = serde_json::from_value(payload.clone())?;
@@ -79,7 +79,7 @@ impl QueueCodecProvider for Untyped {
 
 impl<E> QueueCodecProvider for Typed<E>
 where
-    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    E: crate::event::Event,
 {
     fn queue_codec() -> Option<Arc<EventCodec>> {
         Some(typed_event_codec::<E>())
@@ -105,7 +105,7 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
 /// Create a handler for a specific event type.
 pub fn on<E>() -> HandlerBuilder<Typed<E>, NoFilter, NoStarted>
 where
-    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    E: crate::event::Event,
 {
     HandlerBuilder {
         filter: NoFilter,
@@ -295,10 +295,9 @@ where
     /// Map exhausted retries/timeouts to a failure event.
     pub fn on_failure<O, M>(mut self, mapper: M) -> Self
     where
-        O: serde::Serialize + Send + Sync + 'static,
+        O: crate::event::Event,
         M: Fn(Arc<E>, DlqTerminalInfo) -> O + Send + Sync + 'static,
     {
-        let output_type = std::any::type_name::<O>().to_string();
         self.dlq_terminal_mapper = Some(Arc::new(move |source_any, source_type, info| {
             if source_type != TypeId::of::<E>() {
                 anyhow::bail!(
@@ -314,9 +313,12 @@ where
                 )
             })?;
 
+            let terminal_event = mapper(typed, info);
             Ok(crate::EmittedEvent {
-                event_type: output_type.clone(),
-                payload: serde_json::to_value(mapper(typed, info))?,
+                durable_name: terminal_event.durable_name().to_string(),
+                event_prefix: O::event_prefix().to_string(),
+                persistent: !O::is_ephemeral(),
+                payload: serde_json::to_value(terminal_event)?,
                 handler_id: None,
                 ephemeral: None,
             })
@@ -437,7 +439,7 @@ where
 
 impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
 where
-    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    E: crate::event::Event,
 {
     /// Set the handler (terminal operation). Return `events![]` from the handler.
     #[track_caller]
@@ -620,7 +622,7 @@ where
 
 impl<E, Started, D, G> FilteredHandlerBuilder<E, Started, D, G>
 where
-    E: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    E: crate::event::Event,
     D: Send + Sync + 'static,
     G: Fn(&E, &Context<D>) -> bool + Send + Sync + 'static,
 {
@@ -820,6 +822,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[seesaw_core_macros::event]
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct QueueEvent {
         value: i32,
