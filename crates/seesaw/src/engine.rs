@@ -975,7 +975,7 @@ where
     /// Returns the appended events with aggregate metadata populated.
     async fn append_emitted_events(
         &self,
-        new_events: &mut Vec<NewEvent>,
+        new_events: &mut [NewEvent],
         ephemerals: &mut std::collections::HashMap<Uuid, Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<()> {
         for new_event in new_events.iter_mut() {
