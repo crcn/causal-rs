@@ -4945,3 +4945,353 @@ async fn ephemeral_event_with_retry_handler() -> Result<()> {
 
     Ok(())
 }
+
+// ── Adversarial journal tests ────────────────────────────────────────
+
+/// Verify AtomicU32 counter correctness when ctx is cloned across spawned tasks.
+/// Two tasks sharing a cloned context should get unique sequence numbers.
+#[tokio::test]
+async fn journal_concurrent_ctx_run_from_spawned_tasks() -> Result<()> {
+    let call_log = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
+    let cl = call_log.clone();
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::in_memory(Deps)
+        .with_store(store.clone())
+        .with_handler(
+            handler::on::<Ping>()
+                .id("concurrent_journal")
+                .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
+                    let cl = cl.clone();
+                    async move {
+                        // Run 5 sequential ctx.run() calls to generate predictable seqs
+                        for i in 0..5u32 {
+                            let cl2 = cl.clone();
+                            let val: String = ctx
+                                .run(move || async move { Ok(format!("step-{i}")) })
+                                .await?;
+                            cl2.lock().push((i, val));
+                        }
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(Ping {
+            msg: "concurrent".into(),
+        })
+        .settled()
+        .await?;
+
+    let log = call_log.lock().clone();
+    assert_eq!(log.len(), 5, "All 5 journal steps should execute");
+
+    // Verify each step got a unique, sequential seq number
+    for (i, (seq, val)) in log.iter().enumerate() {
+        assert_eq!(*seq, i as u32, "Seq should be sequential");
+        assert_eq!(*val, format!("step-{i}"), "Value should match step");
+    }
+
+    // Verify all 5 entries were persisted to the store
+    let all_events = store.global_log().lock().clone();
+    let ping_event = all_events
+        .iter()
+        .find(|e| e.event_type == "ping")
+        .unwrap();
+
+    let entries = store
+        .load_journal("concurrent_journal", ping_event.event_id)
+        .await?;
+    // Journal is cleared on completion, so entries should be empty
+    assert!(
+        entries.is_empty(),
+        "Journal should be cleared after successful handler"
+    );
+
+    Ok(())
+}
+
+/// Verify serde round-trip works with deeply nested and large payloads.
+#[tokio::test]
+async fn journal_large_nested_payload_round_trips() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let captured = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+
+    // Build a deeply nested JSON structure
+    let mut nested = serde_json::json!({"leaf": "value"});
+    for i in 0..50 {
+        nested = serde_json::json!({ format!("level_{i}"): nested });
+    }
+    let large_payload = nested.clone();
+
+    let engine = Engine::in_memory(Deps)
+        .with_store(store.clone())
+        .with_handler(
+            handler::on::<Ping>()
+                .id("large_journal")
+                .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
+                    let payload = large_payload.clone();
+                    let cap = cap.clone();
+                    async move {
+                        let result: serde_json::Value =
+                            ctx.run(move || async move { Ok(payload) }).await?;
+                        *cap.lock() = Some(result);
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(Ping {
+            msg: "big".into(),
+        })
+        .settled()
+        .await?;
+
+    let result = captured.lock().clone().expect("Should have captured result");
+    assert_eq!(result, nested, "Deeply nested payload should survive journal round-trip");
+
+    Ok(())
+}
+
+/// A handler that panics mid-journal should leave prior journal entries intact
+/// so the next retry attempt replays them.
+#[tokio::test]
+async fn journal_panic_mid_execution_preserves_prior_entries() -> Result<()> {
+    let call_count = Arc::new(AtomicI32::new(0));
+    let step1_count = Arc::new(AtomicI32::new(0));
+    let step2_count = Arc::new(AtomicI32::new(0));
+    let cc = call_count.clone();
+    let s1 = step1_count.clone();
+    let s2 = step2_count.clone();
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::in_memory(Deps)
+        .with_store(store.clone())
+        .with_handler(
+            handler::on::<Ping>()
+                .id("panic_journal")
+                .retry(3)
+                .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
+                    let cc = cc.clone();
+                    let s1 = s1.clone();
+                    let s2 = s2.clone();
+                    async move {
+                        let attempt = cc.fetch_add(1, Ordering::SeqCst);
+
+                        // Step 1: always succeeds
+                        let _: String = ctx
+                            .run(move || {
+                                s1.fetch_add(1, Ordering::SeqCst);
+                                async move { Ok("step1-done".to_string()) }
+                            })
+                            .await?;
+
+                        // Step 2: fails on first attempt, succeeds on second
+                        if attempt == 0 {
+                            anyhow::bail!("simulated crash after step 1");
+                        }
+
+                        let _: String = ctx
+                            .run(move || {
+                                s2.fetch_add(1, Ordering::SeqCst);
+                                async move { Ok("step2-done".to_string()) }
+                            })
+                            .await?;
+
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine
+        .emit(Ping {
+            msg: "panic-test".into(),
+        })
+        .settled()
+        .await?;
+
+    // Handler ran twice (first attempt failed, second succeeded)
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
+
+    // Step 1 closure executed on first attempt, replayed from journal on second
+    assert_eq!(
+        step1_count.load(Ordering::SeqCst),
+        1,
+        "Step 1 should execute once then replay from journal"
+    );
+
+    // Step 2 only executed on the second attempt
+    assert_eq!(
+        step2_count.load(Ordering::SeqCst),
+        1,
+        "Step 2 should execute once on retry"
+    );
+
+    Ok(())
+}
+
+/// Ephemeral events should still get full journaling support. A handler
+/// triggered by an ephemeral event should be able to use ctx.run() with
+/// replay on retry.
+#[tokio::test]
+async fn journal_works_for_ephemeral_event_handlers() -> Result<()> {
+    #[event(ephemeral)]
+    #[derive(Clone, Serialize, Deserialize)]
+    struct EphJournalTrigger;
+
+    #[event]
+    #[derive(Clone, Serialize, Deserialize)]
+    struct JournalOutput {
+        step1: String,
+        step2: String,
+    }
+
+    let step1_count = Arc::new(AtomicI32::new(0));
+    let step2_count = Arc::new(AtomicI32::new(0));
+    let attempt_count = Arc::new(AtomicI32::new(0));
+    let s1 = step1_count.clone();
+    let s2 = step2_count.clone();
+    let ac = attempt_count.clone();
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::in_memory(Deps)
+        .with_store(store.clone())
+        .with_handler(
+            handler::on::<EphJournalTrigger>()
+                .id("eph_journal_handler")
+                .retry(3)
+                .then(move |_event: Arc<EphJournalTrigger>, ctx: Context<Deps>| {
+                    let s1 = s1.clone();
+                    let s2 = s2.clone();
+                    let ac = ac.clone();
+                    async move {
+                        let attempt = ac.fetch_add(1, Ordering::SeqCst);
+
+                        let step1: String = ctx
+                            .run(move || {
+                                s1.fetch_add(1, Ordering::SeqCst);
+                                async move { Ok("eph-step1".to_string()) }
+                            })
+                            .await?;
+
+                        // Fail on first attempt to force retry + replay
+                        if attempt == 0 {
+                            anyhow::bail!("transient failure");
+                        }
+
+                        let step2: String = ctx
+                            .run(move || {
+                                s2.fetch_add(1, Ordering::SeqCst);
+                                async move { Ok("eph-step2".to_string()) }
+                            })
+                            .await?;
+
+                        Ok(events![JournalOutput { step1, step2 }])
+                    }
+                }),
+        );
+
+    engine.emit(EphJournalTrigger).settled().await?;
+
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 2, "Should retry once");
+    assert_eq!(
+        step1_count.load(Ordering::SeqCst),
+        1,
+        "Step 1 should execute once then replay from journal on retry"
+    );
+    assert_eq!(
+        step2_count.load(Ordering::SeqCst),
+        1,
+        "Step 2 should execute once on successful retry"
+    );
+
+    // Verify the persistent output event made it to the log
+    let all_events = store.global_log().lock().clone();
+    let output = all_events
+        .iter()
+        .find(|e| e.event_type == "journal_output")
+        .expect("JournalOutput should be in log");
+    assert!(output.persistent, "Output from ephemeral handler should be persistent");
+
+    // Verify the ephemeral trigger is in log with persistent=false
+    let trigger = all_events
+        .iter()
+        .find(|e| e.event_type == "eph_journal_trigger")
+        .expect("Ephemeral trigger should be in log");
+    assert!(!trigger.persistent, "Ephemeral trigger should have persistent=false");
+
+    Ok(())
+}
+
+/// Two handlers with the same name processing different events must have
+/// completely isolated journals. A stale journal from handler "X" on event A
+/// must never leak into handler "X" on event B.
+#[tokio::test]
+async fn journal_isolation_across_different_events() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let exec_count = Arc::new(AtomicI32::new(0));
+    let ec = exec_count.clone();
+
+    let engine = Engine::in_memory(Deps)
+        .with_store(store.clone())
+        .with_handler(
+            handler::on::<Ping>()
+                .id("isolated_journal")
+                .then(move |event: Arc<Ping>, ctx: Context<Deps>| {
+                    let ec = ec.clone();
+                    async move {
+                        ec.fetch_add(1, Ordering::SeqCst);
+                        // Each invocation journals a unique value based on the event
+                        let _: String = ctx
+                            .run(move || async move {
+                                Ok(format!("result-for-{}", event.msg))
+                            })
+                            .await?;
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    // Emit two separate events — each gets its own event_id, so journals are isolated
+    engine
+        .emit(Ping {
+            msg: "first".into(),
+        })
+        .settled()
+        .await?;
+
+    engine
+        .emit(Ping {
+            msg: "second".into(),
+        })
+        .settled()
+        .await?;
+
+    // Both handlers should have executed (not replayed from each other's journals)
+    assert_eq!(
+        exec_count.load(Ordering::SeqCst),
+        2,
+        "Both handler invocations should execute their closures independently"
+    );
+
+    // Both journals should be cleared after successful completion
+    let all_events = store.global_log().lock().clone();
+    let ping_events: Vec<_> = all_events.iter().filter(|e| e.event_type == "ping").collect();
+    assert_eq!(ping_events.len(), 2, "Both ping events should be in the log");
+
+    for pe in &ping_events {
+        let entries = store
+            .load_journal("isolated_journal", pe.event_id)
+            .await?;
+        assert!(
+            entries.is_empty(),
+            "Journal for event {} should be cleared after completion",
+            pe.event_id
+        );
+    }
+
+    Ok(())
+}
