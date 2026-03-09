@@ -506,7 +506,7 @@ where
                                 error: "cancelled".to_string(),
                                 reason: "cancelled".to_string(),
                                 attempts: execution.attempts,
-                                events_to_publish: Vec::new(),
+
                                 log_entries: Vec::new(),
                             }))
                             .await?;
@@ -573,7 +573,7 @@ where
                                         event_id,
                                         handler_id,
                                         result: result.result,
-                                        events_to_publish: Vec::new(),
+        
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
@@ -597,7 +597,7 @@ where
                                         error,
                                         reason: "failed".to_string(),
                                         attempts,
-                                        events_to_publish: Vec::new(),
+        
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
@@ -652,7 +652,7 @@ where
                                         error: "timeout".to_string(),
                                         reason: "timeout".to_string(),
                                         attempts: 0,
-                                        events_to_publish: Vec::new(),
+        
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
@@ -685,7 +685,7 @@ where
                                     error: error_str,
                                     reason: "settle_handler_error".to_string(),
                                     attempts: 0,
-                                    events_to_publish: Vec::new(),
+    
                                     log_entries: Vec::new(),
                                 }))
                                 .await?;

@@ -940,7 +940,7 @@ mod tests {
                 event_id: Uuid::from_u128(1),
                 handler_id: "handler_x".into(),
                 result: serde_json::json!({}),
-                events_to_publish: vec![],
+
                 log_entries: vec![],
             }))
             .await

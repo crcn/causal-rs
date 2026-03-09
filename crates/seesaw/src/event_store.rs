@@ -1,8 +1,7 @@
 //! Event-sourcing helpers and aggregate utilities.
 //!
-//! The [`Store`](crate::store::Store) trait includes event persistence and
-//! snapshot methods directly. This module provides helper functions and
-//! the `Versioned<A>` wrapper.
+//! The [`EventLog`](crate::event_log::EventLog) trait handles event persistence
+//! and snapshots. This module provides helper functions and the `Versioned<A>` wrapper.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -96,8 +95,8 @@ pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::Deserial
 #[cfg(test)]
 mod tests {
     use super::{event_type_short_name, NewEvent, Uuid};
+    use crate::event_log::EventLog;
     use crate::memory_store::MemoryStore;
-    use crate::store::Store;
     use chrono::Utc;
 
     #[test]
@@ -154,8 +153,8 @@ mod tests {
         let store = MemoryStore::with_persistence();
         let id = Uuid::new_v4();
 
-        store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({"total": 100}), "Order", id)).await.unwrap();
-        store.append_event(make_aggregate_event("OrderShipped", serde_json::json!({"tracking": "ABC"}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({"total": 100}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderShipped", serde_json::json!({"tracking": "ABC"}), "Order", id)).await.unwrap();
 
         let events = store.load_stream("Order", id, None).await.unwrap();
         assert_eq!(events.len(), 2);
@@ -170,7 +169,7 @@ mod tests {
     async fn non_aggregate_event_is_persisted() {
         let store = MemoryStore::with_persistence();
 
-        let result = store.append_event(make_new_event("SystemStarted", serde_json::json!({"node": "a"}))).await.unwrap();
+        let result = store.append(make_new_event("SystemStarted", serde_json::json!({"node": "a"}))).await.unwrap();
         assert!(result.position > 0);
 
         // Not loadable via load_stream (no aggregate)
@@ -190,9 +189,9 @@ mod tests {
         let store = MemoryStore::with_persistence();
         let id = Uuid::new_v4();
 
-        let result1 = store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
-        store.append_event(make_aggregate_event("OrderShipped", serde_json::json!({}), "Order", id)).await.unwrap();
-        store.append_event(make_aggregate_event("OrderDelivered", serde_json::json!({}), "Order", id)).await.unwrap();
+        let result1 = store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderShipped", serde_json::json!({}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderDelivered", serde_json::json!({}), "Order", id)).await.unwrap();
 
         // Filter by stream version (not global position)
         let events = store.load_stream("Order", id, Some(result1.version.unwrap())).await.unwrap();
@@ -207,8 +206,8 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
 
-        store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
-        store.append_event(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
+        store.append(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
 
         let events1 = store.load_stream("Order", id1, None).await.unwrap();
         let events2 = store.load_stream("User", id2, None).await.unwrap();
@@ -224,8 +223,8 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
 
-        store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
-        store.append_event(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id1)).await.unwrap();
+        store.append(make_aggregate_event("UserCreated", serde_json::json!({}), "User", id2)).await.unwrap();
 
         let events1 = store.load_stream("Order", id1, None).await.unwrap();
         let events2 = store.load_stream("User", id2, None).await.unwrap();
@@ -241,7 +240,7 @@ mod tests {
         let correlation_id = Uuid::new_v4();
 
         store
-            .append_event(NewEvent {
+            .append(NewEvent {
                 event_id,
                 parent_id: Some(parent_id),
                 correlation_id,
@@ -272,7 +271,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         store
-            .append_event(NewEvent {
+            .append(NewEvent {
                 event_id: Uuid::new_v4(),
                 parent_id: None,
                 correlation_id: Uuid::new_v4(),
@@ -300,7 +299,7 @@ mod tests {
         let store = MemoryStore::with_persistence();
         let id = Uuid::new_v4();
 
-        store.append_event(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
+        store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
 
         let events = store.load_stream("Order", id, None).await.unwrap();
         assert!(events[0].metadata.is_empty());
@@ -336,8 +335,8 @@ mod tests {
             ephemeral: None,
         };
 
-        let result1 = store.append_event(event1).await.unwrap();
-        let result2 = store.append_event(event2).await.unwrap();
+        let result1 = store.append(event1).await.unwrap();
+        let result2 = store.append(event2).await.unwrap();
 
         assert_eq!(result1, result2);
         let log = store.global_log().lock();
@@ -350,11 +349,11 @@ mod tests {
 
         let mut positions = Vec::new();
         for i in 0..5 {
-            let result = store.append_event(make_new_event(&format!("Event{}", i), serde_json::json!({"i": i}))).await.unwrap();
+            let result = store.append(make_new_event(&format!("Event{}", i), serde_json::json!({"i": i}))).await.unwrap();
             positions.push(result.position);
         }
 
-        let events = store.load_global_from(positions[1], 2).await.unwrap();
+        let events = store.load_from(positions[1], 2).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].position, positions[2]);
         assert_eq!(events[1].position, positions[3]);
@@ -365,10 +364,10 @@ mod tests {
         let store = MemoryStore::with_persistence();
 
         for i in 0..10 {
-            store.append_event(make_new_event(&format!("Event{}", i), serde_json::json!({}))).await.unwrap();
+            store.append(make_new_event(&format!("Event{}", i), serde_json::json!({}))).await.unwrap();
         }
 
-        let events = store.load_global_from(0, 3).await.unwrap();
+        let events = store.load_from(0, 3).await.unwrap();
         assert_eq!(events.len(), 3);
     }
 
@@ -376,9 +375,9 @@ mod tests {
     async fn load_global_from_empty_when_caught_up() {
         let store = MemoryStore::with_persistence();
 
-        let result = store.append_event(make_new_event("Event", serde_json::json!({}))).await.unwrap();
+        let result = store.append(make_new_event("Event", serde_json::json!({}))).await.unwrap();
 
-        let events = store.load_global_from(result.position, 10).await.unwrap();
+        let events = store.load_from(result.position, 10).await.unwrap();
         assert!(events.is_empty());
     }
 }

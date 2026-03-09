@@ -67,16 +67,6 @@ struct FailedTerminal {
     attempts: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BatchItem {
-    index: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BatchResult {
-    count: usize,
-}
-
 // ── Aggregate types ────────────────────────────────────────
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]

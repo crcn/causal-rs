@@ -61,8 +61,7 @@ pub use event_log::EventLog;
 pub use handler_queue::HandlerQueue;
 pub use types::{EventPark, IntentCommit};
 
-// Re-export store trait and in-memory implementation
-pub use store::Store;
+// Re-export in-memory implementation
 pub use memory_store::MemoryStore;
 
 // Re-export upcaster types
@@ -115,9 +114,9 @@ macro_rules! events {
 pub use job_executor::{HandlerResult, HandlerStatus, JobExecutor};
 pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
-    EmittedEvent, EventCommit, EventWorkerConfig, HandlerCompletion,
+    EmittedEvent, EventWorkerConfig, HandlerCompletion,
     HandlerDlq, HandlerIntent, HandlerResolution, HandlerWorkerConfig,
-    JournalEntry, LogEntry, LogLevel, ProjectionFailure, QueuedEvent, QueuedHandler,
+    JournalEntry, LogEntry, LogLevel, ProjectionFailure, QueuedHandler,
     NAMESPACE_SEESAW,
 };
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use seesaw_core::aggregator::{Aggregate, Apply};
-use seesaw_core::{events, handler, Context, Engine, Events, MemoryStore, NewEvent, Snapshot, Store};
+use seesaw_core::{events, handler, Context, Engine, EventLog, Events, HandlerQueue, MemoryStore, NewEvent, Snapshot};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -60,16 +60,6 @@ struct FailEvent {
 struct FailedTerminal {
     error: String,
     attempts: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BatchItem {
-    index: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BatchResult {
-    count: usize,
 }
 
 // -- Tests --
@@ -570,7 +560,7 @@ async fn upcaster_chain_in_aggregate_replay() {
     let order_id = Uuid::new_v4();
 
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderPlacedV3",
             serde_json::json!({"order_id": order_id, "total": 250}),
             Some("Order"),
@@ -1028,7 +1018,7 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
 
     // Pre-populate events directly in store (simulating previous engine run)
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 100}),
             Some("Order"),
@@ -1036,7 +1026,7 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
         ))
         .await?;
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderConfirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
@@ -1086,7 +1076,7 @@ async fn snapshot_acceleration() -> Result<()> {
 
     // Pre-populate: 2 events in store
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 500}),
             Some("Order"),
@@ -1094,7 +1084,7 @@ async fn snapshot_acceleration() -> Result<()> {
         ))
         .await?;
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderConfirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
@@ -1243,7 +1233,7 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
             serde_json::json!({"order_id": order_id})
         };
         store
-            .append_event(new_event(
+            .append(new_event(
                 event_type,
                 payload,
                 Some("Order"),
@@ -1305,7 +1295,7 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
 
     // Events in store but NO snapshot
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 100}),
             Some("Order"),
@@ -1313,7 +1303,7 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
         ))
         .await?;
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderConfirmed",
             serde_json::json!({"order_id": order_id}),
             Some("Order"),
@@ -1496,7 +1486,7 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
 
     // Pre-populate 1000 events: 1 OrderCreated + 999 OrderConfirmed
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 42}),
             Some("Order"),
@@ -1506,7 +1496,7 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
 
     for _i in 1..1000u64 {
         store
-            .append_event(new_event(
+            .append(new_event(
                 "OrderConfirmed",
                 serde_json::json!({"order_id": order_id}),
                 Some("Order"),
@@ -1736,7 +1726,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
     // Pre-populate 50 events in store
     for i in 0..50 {
         store
-            .append_event(new_event(
+            .append(new_event(
                 "OrderCreated",
                 serde_json::json!({"order_id": order_id, "total": (i + 1) * 10}),
                 Some("Order"),
@@ -1805,7 +1795,7 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
 
     // Simulate a foreign node appending an event directly to the store
     store
-        .append_event(NewEvent {
+        .append(NewEvent {
             event_id: Uuid::new_v4(),
             parent_id: None,
             correlation_id: Uuid::new_v4(),
@@ -2316,7 +2306,7 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
                     // Cancel the workflow from within the handler.
                     // The emitted Pong will be queued but should be rejected
                     // on the next settle loop iteration.
-                    s.cancel_correlation(cid).await.unwrap();
+                    s.cancel(cid).await.unwrap();
                     Ok(events![Pong])
                 }
             }),
@@ -2361,7 +2351,6 @@ async fn queue_status_empty_after_settle() -> Result<()> {
         .await?;
 
     let status = handle.status().await?;
-    assert_eq!(status.pending_events, 0);
     assert_eq!(status.pending_handlers, 0);
     assert_eq!(status.dead_lettered, 0);
     Ok(())
@@ -2380,10 +2369,6 @@ async fn queue_status_shows_pending_before_settle() -> Result<()> {
         })
         .await?;
 
-    // In the checkpoint-based model, events go to the log (not a pending queue).
-    // After emit-without-settle, handler intents haven't been created yet.
-    let status = handle.status().await?;
-    assert_eq!(status.pending_events, 0, "no event buffer in checkpoint model");
     Ok(())
 }
 
@@ -2431,10 +2416,6 @@ async fn engine_status_delegates_to_store() -> Result<()> {
         })
         .await?;
 
-    // In the checkpoint-based model, events go to the log (not a pending queue).
-    // After emit-without-settle, handler intents haven't been created yet.
-    let status = engine.status(handle.correlation_id).await?;
-    assert_eq!(status.pending_events, 0, "no event buffer in checkpoint model");
     Ok(())
 }
 
@@ -3454,7 +3435,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
 
     // Step 1: Pre-populate the event store (as if the event was already processed)
     store
-        .append_event(new_event(
+        .append(new_event(
             "OrderCreated",
             serde_json::json!({"order_id": order_id, "total": 250}),
             Some("Order"),
@@ -3625,7 +3606,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
 
     // Step 1: Pre-populate store with both events already persisted
     store
-        .append_event(new_event(
+        .append(new_event(
             "SourcesPrepared",
             serde_json::json!({"plan": "social"}),
             Some("PipelineState"),
@@ -3633,7 +3614,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
         ))
         .await?;
     store
-        .append_event(new_event(
+        .append(new_event(
             "ScrapeCompleted",
             serde_json::json!(null),
             Some("PipelineState"),
@@ -3892,7 +3873,7 @@ async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
     // After settling: StepStarted was applied (count=1), handler emitted StepDone
     // which was also applied (count=2). The stored description should show count=2.
     let descriptions = store_clone
-        .get_handler_descriptions(correlation_id)
+        .get_descriptions(correlation_id)
         .await?;
 
     let desc = descriptions
