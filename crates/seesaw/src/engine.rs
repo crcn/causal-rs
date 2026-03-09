@@ -66,6 +66,7 @@ where
             snapshot_every: None,
             event_metadata: serde_json::Map::new(),
             global_dlq_mapper: None,
+
         }
     }
 
@@ -85,6 +86,7 @@ where
             snapshot_every: None,
             event_metadata: serde_json::Map::new(),
             global_dlq_mapper: None,
+
         }
     }
 
@@ -456,19 +458,25 @@ where
                     continue;
                 }
 
-                // Hydrate cold aggregates before processing
-                self.hydrate_for_event(&event).await?;
+                // Persistent events: hydrate aggregates, apply state, snapshot
+                // Ephemeral events: skip aggregators/projections (not domain facts)
+                let skip_projections = !event.persistent;
 
-                // Apply event to live aggregator state
-                self.apply_to_aggregators(&event);
+                if event.persistent {
+                    // Hydrate cold aggregates before processing
+                    self.hydrate_for_event(&event).await?;
 
-                // Auto-checkpoint snapshots if configured
-                if let Some(threshold) = self.snapshot_every {
-                    self.maybe_auto_snapshot(&event, threshold).await?;
+                    // Apply event to live aggregator state
+                    self.apply_to_aggregators(&event);
+
+                    // Auto-checkpoint snapshots if configured
+                    if let Some(threshold) = self.snapshot_every {
+                        self.maybe_auto_snapshot(&event, threshold).await?;
+                    }
                 }
 
                 // Process event: match handlers, run projections, build intents
-                match executor.process_event(&event, &event_config).await {
+                match executor.process_event_inner(&event, &event_config, skip_projections).await {
                     Ok(commit) => {
                         self.queue.enqueue(commit).await?;
                         event_attempts.remove(&event.position);
@@ -587,7 +595,7 @@ where
                                         event_id,
                                         handler_id,
                                         result: result.result,
-        
+
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
@@ -611,7 +619,7 @@ where
                                         error,
                                         reason: "failed".to_string(),
                                         attempts,
-        
+
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
@@ -666,7 +674,7 @@ where
                                         error: "timeout".to_string(),
                                         reason: "timeout".to_string(),
                                         attempts: 0,
-        
+
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
@@ -699,7 +707,7 @@ where
                                     error: error_str,
                                     reason: "settle_handler_error".to_string(),
                                     attempts: 0,
-    
+
                                     log_entries: Vec::new(),
                                 }))
                                 .await?;
@@ -906,6 +914,8 @@ where
 
         let metadata = self.event_metadata.clone();
 
+        let persistent = !E::is_ephemeral();
+
         let new_event = NewEvent {
             event_id,
             parent_id: None,
@@ -917,6 +927,7 @@ where
             aggregate_id,
             metadata,
             ephemeral: Some(ephemeral),
+            persistent,
         };
 
         self.log.append(new_event).await?;
@@ -969,6 +980,7 @@ where
             aggregate_id,
             metadata,
             ephemeral: output.ephemeral,
+            persistent: output.persistent,
         };
 
         self.log.append(new_event).await?;
@@ -981,15 +993,16 @@ where
     }
 
     /// Resolve aggregate metadata and append events to the EventLog.
-    ///
-    /// Returns the appended events with aggregate metadata populated.
     async fn append_emitted_events(
         &self,
         new_events: &mut [NewEvent],
         ephemerals: &mut std::collections::HashMap<Uuid, Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<()> {
         for new_event in new_events.iter_mut() {
-            // Resolve aggregate metadata
+            if !new_event.persistent {
+                continue; // Skip aggregate resolution for ephemeral events
+            }
+            // Resolve aggregate metadata (persistent events only)
             let matching = self.aggregators.find_by_durable_name(&new_event.event_type);
             if let Some((agg_type, agg_id)) = matching
                 .iter()
@@ -1111,6 +1124,7 @@ where
                     aggregate_id: None,
                     metadata,
                     ephemeral: e.ephemeral,
+                    persistent: e.persistent,
                 }
             })
             .collect()

@@ -145,6 +145,7 @@ impl EventLog for MemoryStore {
             version,
             metadata: event.metadata,
             ephemeral: event.ephemeral,
+            persistent: event.persistent,
         });
 
         Ok(AppendResult { position, version })

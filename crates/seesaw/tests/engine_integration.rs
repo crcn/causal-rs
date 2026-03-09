@@ -28,6 +28,7 @@ fn new_event(
         aggregate_id,
         metadata: serde_json::Map::new(),
         ephemeral: None,
+        persistent: true,
     }
 }
 
@@ -1817,6 +1818,7 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
             aggregate_id: Some(order_id),
             metadata: serde_json::Map::new(),
             ephemeral: None,
+            persistent: true,
         })
         .await?;
 
@@ -3918,6 +3920,1028 @@ async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
          but got {}. This means describe only captured pre-handler state.",
         desc["completed_steps"]
     );
+
+    Ok(())
+}
+
+// ── Ephemeral event tests ─────────────────────────────────────────────
+
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EnrichmentReady {
+    concern_id: Uuid,
+}
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct EnrichmentComplete {
+    concern_id: Uuid,
+}
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphTrigger;
+
+#[tokio::test]
+async fn ephemeral_event_not_in_store() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let handler_ran = Arc::new(AtomicI32::new(0));
+    let handler_ran2 = handler_ran.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentReady {
+                    concern_id: Uuid::nil(),
+                }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                let ran = handler_ran2.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![EnrichmentComplete {
+                        concern_id: event.concern_id,
+                    }])
+                }
+            }),
+        );
+
+    engine
+        .emit(EphTrigger)
+        .settled()
+        .await?;
+
+    // Handler should have executed
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1);
+
+    // All events are in the operational store (Postgres), but ephemeral ones
+    // have persistent=false (won't be forwarded to KurrentDB).
+    let all_events = store.global_log().lock().clone();
+    let event_types: Vec<_> = all_events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(event_types.contains(&"eph_trigger"));
+    assert!(event_types.contains(&"enrichment_ready"));
+    assert!(event_types.contains(&"enrichment_complete"));
+
+    // Ephemeral event has persistent=false
+    let enrichment = all_events.iter().find(|e| e.event_type == "enrichment_ready").unwrap();
+    assert!(!enrichment.persistent, "Ephemeral event should have persistent=false");
+
+    // Persistent events have persistent=true
+    let trigger = all_events.iter().find(|e| e.event_type == "eph_trigger").unwrap();
+    assert!(trigger.persistent, "EphTrigger should have persistent=true");
+    let complete = all_events.iter().find(|e| e.event_type == "enrichment_complete").unwrap();
+    assert!(complete.persistent, "EnrichmentComplete should have persistent=true");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn ephemeral_event_handler_emits_persistent() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let complete_count = Arc::new(AtomicI32::new(0));
+    let complete_count2 = complete_count.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentReady {
+                    concern_id: Uuid::nil(),
+                }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                let count = complete_count2.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![EnrichmentComplete {
+                        concern_id: event.concern_id,
+                    }])
+                }
+            }),
+        );
+
+    engine
+        .emit(EphTrigger)
+        .settled()
+        .await?;
+
+    assert_eq!(complete_count.load(Ordering::SeqCst), 1);
+
+    // The persistent event emitted by the ephemeral handler IS in the log
+    let all_events = store.global_log().lock().clone();
+    let has_complete = all_events
+        .iter()
+        .any(|e| e.event_type == "enrichment_complete");
+    assert!(has_complete, "Persistent event from ephemeral handler should be in log");
+
+    Ok(())
+}
+
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphemeralSignal;
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistentResult {
+    value: i32,
+}
+
+#[tokio::test]
+async fn mixed_persistent_and_ephemeral_in_same_batch() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let signal_handled = Arc::new(AtomicI32::new(0));
+    let result_handled = Arc::new(AtomicI32::new(0));
+    let signal_handled2 = signal_handled.clone();
+    let result_handled2 = result_handled.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![
+                    EphemeralSignal,
+                    PersistentResult { value: 42 },
+                ])
+            }),
+        )
+        .with_handler(
+            handler::on::<EphemeralSignal>().then(move |_event: Arc<EphemeralSignal>, _ctx: Context<Deps>| {
+                let ran = signal_handled2.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+        )
+        .with_handler(
+            handler::on::<PersistentResult>().then(move |_event: Arc<PersistentResult>, _ctx: Context<Deps>| {
+                let ran = result_handled2.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+        );
+
+    engine
+        .emit(EphTrigger)
+        .settled()
+        .await?;
+
+    assert_eq!(signal_handled.load(Ordering::SeqCst), 1, "Ephemeral handler should run");
+    assert_eq!(result_handled.load(Ordering::SeqCst), 1, "Persistent handler should run");
+
+    // All events in operational store; ephemeral has persistent=false
+    let all_events = store.global_log().lock().clone();
+    let ephemeral = all_events.iter().find(|e| e.event_type == "ephemeral_signal").expect("Ephemeral should be in operational store");
+    assert!(!ephemeral.persistent, "Ephemeral should have persistent=false");
+    let persistent = all_events.iter().find(|e| e.event_type == "persistent_result").expect("Persistent should be in log");
+    assert!(persistent.persistent, "Persistent should have persistent=true");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn ephemeral_event_does_not_apply_to_aggregates() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentReady {
+                    concern_id: Uuid::nil(),
+                }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentComplete {
+                    concern_id: event.concern_id,
+                }])
+            }),
+        );
+
+    engine
+        .emit(EphTrigger)
+        .settled()
+        .await?;
+
+    // Ephemeral event IS in operational store but with persistent=false
+    // (won't be forwarded to KurrentDB, won't be applied to aggregates)
+    let all_events = store.global_log().lock().clone();
+    let ephemeral = all_events.iter().find(|e| e.event_type == "enrichment_ready").expect("Ephemeral should be in operational store");
+    assert!(!ephemeral.persistent, "Ephemeral event should have persistent=false");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn ephemeral_event_does_not_run_projections() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let projection_count = Arc::new(AtomicI32::new(0));
+    let projection_count2 = projection_count.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentReady {
+                    concern_id: Uuid::nil(),
+                }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentComplete {
+                    concern_id: event.concern_id,
+                }])
+            }),
+        )
+        .with_projection(
+            handler::project("enrichment_projector").then(move |_event: seesaw_core::AnyEvent, _ctx: Context<Deps>| {
+                let count = projection_count2.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        );
+
+    engine
+        .emit(EphTrigger)
+        .settled()
+        .await?;
+
+    // Projections run for: EphTrigger (persistent) and EnrichmentComplete (persistent)
+    // Projections do NOT run for: EnrichmentReady (ephemeral)
+    let count = projection_count.load(Ordering::SeqCst);
+    assert_eq!(
+        count, 2,
+        "Projections should run for 2 persistent events (EphTrigger + EnrichmentComplete), got {}",
+        count
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn ephemeral_event_hop_counting() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let handler_ran = Arc::new(AtomicI32::new(0));
+    let handler_ran2 = handler_ran.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentReady {
+                    concern_id: Uuid::nil(),
+                }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                let ran = handler_ran2.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![EnrichmentComplete {
+                        concern_id: event.concern_id,
+                    }])
+                }
+            }),
+        );
+
+    engine
+        .emit(EphTrigger)
+        .settled()
+        .await?;
+
+    // Handler should run exactly once (no infinite loops)
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn ephemeral_root_event_not_persisted() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let handler_ran = Arc::new(AtomicI32::new(0));
+    let handler_ran2 = handler_ran.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                let ran = handler_ran2.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![EnrichmentComplete {
+                        concern_id: event.concern_id,
+                    }])
+                }
+            }),
+        );
+
+    // Emit an ephemeral event directly as a root event
+    engine
+        .emit(EnrichmentReady {
+            concern_id: Uuid::nil(),
+        })
+        .settled()
+        .await?;
+
+    // Handler should have executed
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1);
+
+    // EnrichmentReady IS in operational store but with persistent=false
+    let all_events = store.global_log().lock().clone();
+    let ready = all_events.iter().find(|e| e.event_type == "enrichment_ready").expect("Ephemeral root should be in operational store");
+    assert!(!ready.persistent, "Ephemeral root should have persistent=false");
+
+    // EnrichmentComplete (persistent) emitted by the handler SHOULD be in the store
+    let complete = all_events.iter().find(|e| e.event_type == "enrichment_complete").expect("Persistent event from handler should be in store");
+    assert!(complete.persistent, "EnrichmentComplete should have persistent=true");
+
+    Ok(())
+}
+
+// ── Adversarial ephemeral tests ───────────────────────────────────────
+
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphA;
+
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphB;
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistC {
+    chain_complete: bool,
+}
+
+/// Ephemeral → ephemeral → persistent chain. Both ephemeral hops must
+/// process without persistence; the final persistent event must land in the log.
+#[tokio::test]
+async fn chained_ephemeral_to_ephemeral_to_persistent() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let chain_end = Arc::new(AtomicI32::new(0));
+    let chain_end2 = chain_end.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EphA])
+            }),
+        )
+        .with_handler(
+            handler::on::<EphA>().then(|_event: Arc<EphA>, _ctx: Context<Deps>| async move {
+                Ok(events![EphB])
+            }),
+        )
+        .with_handler(
+            handler::on::<EphB>().then(move |_event: Arc<EphB>, _ctx: Context<Deps>| {
+                let end = chain_end2.clone();
+                async move {
+                    end.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![PersistC { chain_complete: true }])
+                }
+            }),
+        );
+
+    engine.emit(EphTrigger).settled().await?;
+
+    assert_eq!(chain_end.load(Ordering::SeqCst), 1, "Chain should complete");
+
+    let all_events = store.global_log().lock().clone();
+    let eph_a = all_events.iter().find(|e| e.event_type == "eph_a").expect("EphA in operational store");
+    assert!(!eph_a.persistent, "EphA should have persistent=false");
+    let eph_b = all_events.iter().find(|e| e.event_type == "eph_b").expect("EphB in operational store");
+    assert!(!eph_b.persistent, "EphB should have persistent=false");
+    let persist_c = all_events.iter().find(|e| e.event_type == "persist_c").expect("PersistC should be in log");
+    assert!(persist_c.persistent, "PersistC should have persistent=true");
+
+    Ok(())
+}
+
+/// Ephemeral root event (no persistent trigger at all). The settle loop
+/// must still process it even though log.load_from returns nothing.
+#[tokio::test]
+async fn ephemeral_only_root_event_still_settles() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let handler_ran = Arc::new(AtomicI32::new(0));
+    let handler_ran2 = handler_ran.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphA>().then(move |_event: Arc<EphA>, _ctx: Context<Deps>| {
+                let ran = handler_ran2.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+        );
+
+    engine.emit(EphA).settled().await?;
+
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "Handler for ephemeral-only root should fire");
+    let all_events = store.global_log().lock().clone();
+    assert_eq!(all_events.len(), 1, "Ephemeral event should be in operational store");
+    assert!(!all_events[0].persistent, "Ephemeral-only root should have persistent=false");
+
+    Ok(())
+}
+
+/// Multiple ephemeral root events emitted back-to-back.
+#[tokio::test]
+async fn multiple_ephemeral_root_events() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let count = Arc::new(AtomicI32::new(0));
+    let count2 = count.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                let c = count2.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![EnrichmentComplete {
+                        concern_id: Uuid::nil(),
+                    }])
+                }
+            }),
+        );
+
+    engine
+        .emit(EnrichmentReady { concern_id: Uuid::new_v4() })
+        .settled()
+        .await?;
+    engine
+        .emit(EnrichmentReady { concern_id: Uuid::new_v4() })
+        .settled()
+        .await?;
+    engine
+        .emit(EnrichmentReady { concern_id: Uuid::new_v4() })
+        .settled()
+        .await?;
+
+    assert_eq!(count.load(Ordering::SeqCst), 3, "All three ephemeral roots should fire handlers");
+
+    // Three EnrichmentReady (ephemeral) + three EnrichmentComplete (persistent)
+    let all_events = store.global_log().lock().clone();
+    let ready_events: Vec<_> = all_events.iter().filter(|e| e.event_type == "enrichment_ready").collect();
+    let complete_events: Vec<_> = all_events.iter().filter(|e| e.event_type == "enrichment_complete").collect();
+    assert_eq!(ready_events.len(), 3);
+    assert_eq!(complete_events.len(), 3);
+    for e in &ready_events { assert!(!e.persistent, "EnrichmentReady should have persistent=false"); }
+    for e in &complete_events { assert!(e.persistent, "EnrichmentComplete should have persistent=true"); }
+
+    Ok(())
+}
+
+/// on_any handler should still fire for ephemeral events (both root and handler-emitted).
+#[tokio::test]
+async fn ephemeral_triggers_on_any_handler() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let any_count = Arc::new(AtomicI32::new(0));
+    let any_count2 = any_count.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EphA])
+            }),
+        )
+        .with_handler(
+            handler::on_any().then(move |_event: seesaw_core::AnyEvent, _ctx: Context<Deps>| {
+                let c = any_count2.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+        );
+
+    engine.emit(EphTrigger).settled().await?;
+
+    // on_any should fire for: EphTrigger (persistent root) + EphA (ephemeral handler-emitted)
+    assert_eq!(
+        any_count.load(Ordering::SeqCst), 2,
+        "on_any should fire for both persistent and ephemeral events"
+    );
+
+    Ok(())
+}
+
+/// Ephemeral root event emitted via emit_output (type-erased path).
+#[tokio::test]
+async fn ephemeral_root_via_emit_output() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let handler_ran = Arc::new(AtomicI32::new(0));
+    let handler_ran2 = handler_ran.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                let ran = handler_ran2.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            }),
+        );
+
+    let output = seesaw_core::handler::EventOutput::new(EnrichmentReady {
+        concern_id: Uuid::nil(),
+    });
+    // EventOutput.persistent should be false for ephemeral events
+    assert!(!output.persistent, "EventOutput for ephemeral event should have persistent=false");
+
+    engine.emit_output(output).settled().await?;
+
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "Handler should fire for emit_output ephemeral");
+    let all_events = store.global_log().lock().clone();
+    assert_eq!(all_events.len(), 1, "Ephemeral event should be in operational store");
+    assert!(!all_events[0].persistent, "Ephemeral via emit_output should have persistent=false");
+
+    Ok(())
+}
+
+// ── Adversarial ephemeral persistence tests ─────────────────────────────
+// Attack the two-tier persistence model from all angles.
+
+/// Ephemeral events in the operational store have correct `persistent` flag
+/// propagated through the full causal chain.
+#[tokio::test]
+async fn ephemeral_persistent_flag_propagates_through_causal_chain() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                // Persistent trigger emits ephemeral
+                Ok(events![EnrichmentReady { concern_id: Uuid::nil() }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+                // Ephemeral emits persistent
+                Ok(events![EnrichmentComplete { concern_id: event.concern_id }])
+            }),
+        );
+
+    engine.emit(EphTrigger).settled().await?;
+
+    let all = store.global_log().lock().clone();
+    assert_eq!(all.len(), 3, "All three events should be in operational store");
+
+    // Check each event's persistent flag
+    let trigger = all.iter().find(|e| e.event_type == "eph_trigger").unwrap();
+    assert!(trigger.persistent, "EphTrigger is a persistent event");
+    assert!(trigger.parent_id.is_none(), "Root event has no parent");
+
+    let ready = all.iter().find(|e| e.event_type == "enrichment_ready").unwrap();
+    assert!(!ready.persistent, "EnrichmentReady is ephemeral");
+    assert_eq!(ready.parent_id, Some(trigger.event_id), "Ephemeral parent is the trigger");
+    assert_eq!(ready.correlation_id, trigger.correlation_id, "Same correlation");
+
+    let complete = all.iter().find(|e| e.event_type == "enrichment_complete").unwrap();
+    assert!(complete.persistent, "EnrichmentComplete is persistent");
+    assert_eq!(complete.correlation_id, trigger.correlation_id, "Same correlation");
+
+    Ok(())
+}
+
+/// Ephemeral events should NOT appear in aggregate load_stream, even though
+/// they're in the operational store. This is naturally true because ephemeral
+/// events don't get aggregate_type/aggregate_id set.
+#[tokio::test]
+async fn ephemeral_events_excluded_from_aggregate_streams() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let order_id = Uuid::new_v4();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
+        .with_handler(
+            handler::on::<OrderCreated>().then(|event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
+                // Persistent event triggers ephemeral signal
+                Ok(events![EnrichmentReady { concern_id: event.order_id }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentComplete { concern_id: event.concern_id }])
+            }),
+        );
+
+    engine.emit(OrderCreated { order_id, total: 100 }).settled().await?;
+
+    // Aggregate stream should only contain the OrderCreated event
+    let stream = store.load_stream("Order", order_id, None).await?;
+    assert_eq!(stream.len(), 1, "Only OrderCreated in aggregate stream");
+    assert_eq!(stream[0].event_type, "order_created");
+
+    // But ALL events are in the global log
+    let all = store.global_log().lock().clone();
+    assert_eq!(all.len(), 3, "All 3 events in operational store");
+
+    // Ephemeral event has no aggregate metadata
+    let ready = all.iter().find(|e| e.event_type == "enrichment_ready").unwrap();
+    assert!(ready.aggregate_type.is_none(), "Ephemeral should have no aggregate_type");
+    assert!(ready.aggregate_id.is_none(), "Ephemeral should have no aggregate_id");
+
+    Ok(())
+}
+
+/// Cancel a correlation that includes ephemeral events — the ephemeral events
+/// should still be in the store but downstream handlers should be DLQ'd.
+#[tokio::test]
+async fn cancel_correlation_with_ephemeral_events() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let handler_ran = Arc::new(AtomicI32::new(0));
+    let handler_ran2 = handler_ran.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EnrichmentReady>()
+                .id("should_be_cancelled")
+                .retry(1)
+                .then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                    let ran = handler_ran2.clone();
+                    async move {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        Ok(events![EnrichmentComplete { concern_id: Uuid::nil() }])
+                    }
+                }),
+        );
+
+    let handle = engine.emit(EnrichmentReady { concern_id: Uuid::nil() }).await?;
+    handle.cancel().await?;
+    engine.settle().await?;
+
+    // The ephemeral root IS in the store (persisted before cancel)
+    let all = store.global_log().lock().clone();
+    let ready = all.iter().find(|e| e.event_type == "enrichment_ready");
+    assert!(ready.is_some(), "Ephemeral root should be in operational store even when cancelled");
+    assert!(!ready.unwrap().persistent, "Should still be ephemeral");
+
+    Ok(())
+}
+
+/// Snapshot should NOT be triggered by ephemeral events, even if many
+/// ephemeral events flow through the system.
+#[tokio::test]
+async fn snapshot_not_triggered_by_ephemeral_events() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let order_id = Uuid::new_v4();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
+        .snapshot_every(2) // Snapshot after every 2 aggregate events
+        .with_handler(
+            handler::on::<OrderCreated>().then(|_event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
+                // Each persistent event triggers 5 ephemeral events
+                Ok(events![
+                    EnrichmentReady { concern_id: Uuid::new_v4() },
+                    EnrichmentReady { concern_id: Uuid::new_v4() },
+                    EnrichmentReady { concern_id: Uuid::new_v4() },
+                    EnrichmentReady { concern_id: Uuid::new_v4() },
+                    EnrichmentReady { concern_id: Uuid::new_v4() },
+                ])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(|_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+                Ok(events![])
+            }),
+        );
+
+    engine.emit(OrderCreated { order_id, total: 100 }).settled().await?;
+
+    // Only 1 aggregate event (OrderCreated), so no snapshot yet (threshold=2)
+    let snapshot = store.load_snapshot("Order", order_id).await?;
+    assert!(snapshot.is_none(), "5 ephemeral events should NOT count toward snapshot threshold");
+
+    Ok(())
+}
+
+/// Idempotent append of ephemeral events — appending same event_id twice
+/// should return the same result (not duplicate).
+#[tokio::test]
+async fn ephemeral_event_idempotent_append() -> Result<()> {
+    let store = MemoryStore::new();
+    let event_id = Uuid::new_v4();
+
+    let event = NewEvent {
+        event_id,
+        parent_id: None,
+        correlation_id: Uuid::new_v4(),
+        event_type: "enrichment_ready".to_string(),
+        payload: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+        aggregate_type: None,
+        aggregate_id: None,
+        metadata: serde_json::Map::new(),
+        ephemeral: None,
+        persistent: false,
+    };
+
+    let r1 = store.append(event.clone()).await?;
+    let r2 = store.append(event).await?;
+
+    assert_eq!(r1, r2, "Idempotent append should return same result");
+    let all = store.global_log().lock().clone();
+    assert_eq!(all.len(), 1, "Should not duplicate ephemeral event");
+    assert!(!all[0].persistent, "Should preserve persistent=false");
+
+    Ok(())
+}
+
+/// DLQ terminal mapper fires correctly for a handler that was triggered
+/// by an ephemeral event and then fails.
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphHandlerFailed {
+    source_event_type: String,
+    error: String,
+}
+
+#[tokio::test]
+async fn dlq_terminal_event_from_ephemeral_triggered_handler() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .on_dlq(|info: seesaw_core::handler::DlqTerminalInfo| {
+            EphHandlerFailed {
+                source_event_type: info.source_event_type,
+                error: info.error,
+            }
+        })
+        .with_handler(
+            handler::on::<EnrichmentReady>()
+                .id("always_fails")
+                .retry(1)
+                .then(|_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+                    anyhow::bail!("permanent failure")
+                }),
+        );
+
+    engine.emit(EnrichmentReady { concern_id: Uuid::nil() }).settled().await?;
+
+    let all = store.global_log().lock().clone();
+
+    // The ephemeral root is in the store
+    let ready = all.iter().find(|e| e.event_type == "enrichment_ready").unwrap();
+    assert!(!ready.persistent, "Source event is ephemeral");
+
+    // The DLQ terminal event should also be in the store and persistent
+    let dlq = all.iter().find(|e| e.event_type == "eph_handler_failed").unwrap();
+    assert!(dlq.persistent, "DLQ terminal event should be persistent");
+    let payload: serde_json::Value = dlq.payload.clone();
+    assert_eq!(payload["source_event_type"], "enrichment_ready");
+    assert!(payload["error"].as_str().unwrap().contains("permanent failure"));
+
+    Ok(())
+}
+
+/// Deeply nested chain: persistent → eph → eph → eph → persistent.
+/// Tests that ephemeral events at arbitrary depth all route correctly
+/// and hop counting accumulates.
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphChain1;
+
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphChain2;
+
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphChain3;
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct ChainTerminal {
+    depth: i32,
+}
+
+#[tokio::test]
+async fn deep_ephemeral_chain_with_hop_counting() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_: Arc<EphTrigger>, _: Context<Deps>| async move {
+                Ok(events![EphChain1])
+            }),
+        )
+        .with_handler(
+            handler::on::<EphChain1>().then(|_: Arc<EphChain1>, _: Context<Deps>| async move {
+                Ok(events![EphChain2])
+            }),
+        )
+        .with_handler(
+            handler::on::<EphChain2>().then(|_: Arc<EphChain2>, _: Context<Deps>| async move {
+                Ok(events![EphChain3])
+            }),
+        )
+        .with_handler(
+            handler::on::<EphChain3>().then(|_: Arc<EphChain3>, _: Context<Deps>| async move {
+                Ok(events![ChainTerminal { depth: 4 }])
+            }),
+        );
+
+    engine.emit(EphTrigger).settled().await?;
+
+    let all = store.global_log().lock().clone();
+    let types: Vec<_> = all.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(types.contains(&"eph_trigger"), "Root persistent event");
+    assert!(types.contains(&"eph_chain1"), "Eph depth 1");
+    assert!(types.contains(&"eph_chain2"), "Eph depth 2");
+    assert!(types.contains(&"eph_chain3"), "Eph depth 3");
+    assert!(types.contains(&"chain_terminal"), "Terminal persistent event");
+
+    // All ephemeral events have persistent=false
+    for e in &all {
+        match e.event_type.as_str() {
+            "eph_chain1" | "eph_chain2" | "eph_chain3" => {
+                assert!(!e.persistent, "{} should be ephemeral", e.event_type);
+            }
+            "eph_trigger" | "chain_terminal" => {
+                assert!(e.persistent, "{} should be persistent", e.event_type);
+            }
+            _ => {}
+        }
+    }
+
+    // Hop counts should accumulate: trigger=0, chain1=1, chain2=2, chain3=3, terminal=4
+    let terminal = all.iter().find(|e| e.event_type == "chain_terminal").unwrap();
+    let hops = terminal.metadata.get("_hops").and_then(|v| v.as_i64()).unwrap_or(0);
+    assert!(hops >= 4, "Terminal should have at least 4 hops, got {}", hops);
+
+    Ok(())
+}
+
+/// Ephemeral events should advance the checkpoint correctly — no stalling.
+#[tokio::test]
+async fn ephemeral_events_advance_checkpoint() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EnrichmentReady>().then(|_: Arc<EnrichmentReady>, _: Context<Deps>| async move {
+                Ok(events![EnrichmentComplete { concern_id: Uuid::nil() }])
+            }),
+        );
+
+    // Emit multiple ephemeral roots sequentially
+    engine.emit(EnrichmentReady { concern_id: Uuid::new_v4() }).settled().await?;
+    engine.emit(EnrichmentReady { concern_id: Uuid::new_v4() }).settled().await?;
+    engine.emit(EnrichmentReady { concern_id: Uuid::new_v4() }).settled().await?;
+
+    // Checkpoint should have advanced past all events
+    let checkpoint = store.checkpoint().await?;
+    let all = store.global_log().lock().clone();
+    let max_position = all.iter().map(|e| e.position).max().unwrap_or(0);
+    assert_eq!(checkpoint, max_position, "Checkpoint should be at max position (no stalling)");
+
+    Ok(())
+}
+
+/// Handler describe() should fire for events in correlations that include
+/// ephemeral events — describe runs for ALL handlers on every event.
+#[tokio::test]
+async fn describe_fires_for_ephemeral_events() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let describe_count = Arc::new(AtomicI32::new(0));
+    let describe_count2 = describe_count.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EnrichmentReady>()
+                .id("described_handler")
+                .filter(|_event: &EnrichmentReady, _ctx: &Context<Deps>| true)
+                .describe(move |_ctx: &Context<Deps>| {
+                    describe_count2.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!({"status": "ready"})
+                })
+                .then(|_: Arc<EnrichmentReady>, _: Context<Deps>| async move {
+                    Ok(events![EnrichmentComplete { concern_id: Uuid::nil() }])
+                }),
+        );
+
+    engine.emit(EnrichmentReady { concern_id: Uuid::nil() }).settled().await?;
+
+    // Describe should have been called (at least once for the ephemeral event,
+    // and once for the persistent EnrichmentComplete)
+    let count = describe_count.load(Ordering::SeqCst);
+    assert!(count >= 1, "describe() should fire during ephemeral event processing, got {}", count);
+
+    Ok(())
+}
+
+/// Mixed batch: handler returns events![] with persistent and ephemeral
+/// events interleaved. Verify ordering and persistent flags are correct.
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EphBatchItem { idx: i32 }
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistBatchItem { idx: i32 }
+
+#[tokio::test]
+async fn interleaved_persistent_ephemeral_batch_ordering() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_: Arc<EphTrigger>, _: Context<Deps>| async move {
+                Ok(events![
+                    PersistBatchItem { idx: 1 },
+                    EphBatchItem { idx: 2 },
+                    PersistBatchItem { idx: 3 },
+                    EphBatchItem { idx: 4 },
+                    PersistBatchItem { idx: 5 },
+                ])
+            }),
+        )
+        // No-op handlers so ephemeral events get routed
+        .with_handler(
+            handler::on::<EphBatchItem>().then(|_: Arc<EphBatchItem>, _: Context<Deps>| async move {
+                Ok(events![])
+            }),
+        );
+
+    engine.emit(EphTrigger).settled().await?;
+
+    let all = store.global_log().lock().clone();
+
+    // Should have 6 events: EphTrigger + 5 batch items
+    assert_eq!(all.len(), 6, "Trigger + 5 batch items");
+
+    // Verify persistent flags
+    let batch_items: Vec<_> = all.iter().filter(|e| {
+        e.event_type == "persist_batch_item" || e.event_type == "eph_batch_item"
+    }).collect();
+    assert_eq!(batch_items.len(), 5);
+
+    for item in &batch_items {
+        match item.event_type.as_str() {
+            "persist_batch_item" => assert!(item.persistent, "PersistBatchItem should be persistent"),
+            "eph_batch_item" => assert!(!item.persistent, "EphBatchItem should be ephemeral"),
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(())
+}
+
+/// Ephemeral event with a retry handler — retry should work within
+/// the same process (ephemeral sidecar survives in cache).
+#[tokio::test]
+async fn ephemeral_event_with_retry_handler() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let attempt_count = Arc::new(AtomicI32::new(0));
+    let attempt_count2 = attempt_count.clone();
+
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_handler(
+            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+                Ok(events![EnrichmentReady {
+                    concern_id: Uuid::nil(),
+                }])
+            }),
+        )
+        .with_handler(
+            handler::on::<EnrichmentReady>()
+                .id("retry_ephemeral")
+                .retry(3)
+                .then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+                    let count = attempt_count2.clone();
+                    async move {
+                        let n = count.fetch_add(1, Ordering::SeqCst);
+                        if n < 2 {
+                            anyhow::bail!("transient failure attempt {}", n);
+                        }
+                        Ok(events![EnrichmentComplete {
+                            concern_id: Uuid::nil(),
+                        }])
+                    }
+                }),
+        );
+
+    engine.emit(EphTrigger).settled().await?;
+
+    // Should have attempted 3 times (0, 1, 2) and succeeded on attempt 2
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 3, "Should retry ephemeral event handler");
+
+    // The persistent output should be in the log
+    let all_events = store.global_log().lock().clone();
+    let has_complete = all_events.iter().any(|e| e.event_type == "enrichment_complete");
+    assert!(has_complete, "Persistent event from retried ephemeral handler should be in log");
 
     Ok(())
 }

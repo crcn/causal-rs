@@ -5,7 +5,15 @@
 Seesaw is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, event sourcing, and journaled side effects.
 
 ```rust
-use seesaw_core::{aggregators, handles, events, Context, Engine, Events};
+use seesaw_core::{event, aggregators, handles, events, Context, Engine, Events};
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct OrderPlaced { order_id: Uuid, total: f64 }
+
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct OrderShipped { order_id: Uuid }
 
 #[aggregators(id = "order_id")]
 mod order_aggregators {
@@ -45,7 +53,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.23"
+seesaw_core = "0.25"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -53,6 +61,40 @@ uuid = { version = "1", features = ["v4", "serde"] }
 ```
 
 ## Core Concepts
+
+### Events
+
+Every event type must implement the `Event` trait. Use the `#[event]` proc macro:
+
+```rust
+use seesaw_core::event;
+
+// Plain struct — durable_name: "order_placed"
+#[event]
+#[derive(Clone, Serialize, Deserialize)]
+struct OrderPlaced { order_id: Uuid, total: f64 }
+
+// Enum with domain prefix — durable_name: "scrape:web_scrape_completed", etc.
+#[event(prefix = "scrape")]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ScrapeEvent {
+    WebScrapeCompleted { urls_scraped: usize },
+    SourcesResolved { sources: Vec<Uuid> },
+}
+
+// Ephemeral event — routes through handlers but not persisted to permanent store
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EnrichmentReady { batch_id: Uuid }
+```
+
+The `#[event]` macro generates:
+- `durable_name(&self) -> &str` — stable string for storage and routing
+- `event_prefix() -> &'static str` — type-level prefix for codec/aggregator lookup
+- `is_ephemeral() -> bool` — whether the event skips the permanent event store
+
+Durable names are derived from the struct/variant name in `snake_case`. They never change when you move code between modules.
 
 ### Handlers
 
@@ -308,50 +350,71 @@ let engine = Engine::new(deps).with_handlers(order_handlers::handles());
 
 ## Event Sourcing
 
-Event persistence, aggregate hydration, and snapshots are built into the unified `Store` trait. The same store that drives the settle loop also persists events — no dual-write risk.
+Persistence is split into two traits: **`EventLog`** for the append-only event log, and **`HandlerQueue`** for handler scheduling, journaling, and coordination. The same store that drives the settle loop also persists events — no dual-write risk.
 
-### Store trait (persistence methods)
-
-The `Store` trait includes optional event persistence methods with default no-ops. Override them to enable durable event sourcing:
+### EventLog trait
 
 ```rust
-// These have default no-op implementations — override for persistence.
-async fn append_event(&self, event: NewEvent) -> Result<u64>;
-async fn load_stream(&self, aggregate_type: &str, aggregate_id: Uuid) -> Result<Vec<PersistedEvent>>;
-async fn load_stream_from(&self, agg_type: &str, agg_id: Uuid, after: u64) -> Result<Vec<PersistedEvent>>;
-async fn load_global_from(&self, after_position: u64, limit: usize) -> Result<Vec<PersistedEvent>>;
-async fn load_snapshot(&self, aggregate_type: &str, aggregate_id: Uuid) -> Result<Option<Snapshot>>;
-async fn save_snapshot(&self, snapshot: Snapshot) -> Result<()>;
+#[async_trait]
+pub trait EventLog: Send + Sync {
+    async fn append(&self, event: NewEvent) -> Result<AppendResult>;
+    async fn load_from(&self, after_position: u64, limit: usize) -> Result<Vec<PersistedEvent>>;
+    async fn load_stream(&self, aggregate_type: &str, aggregate_id: Uuid, after_version: Option<u64>) -> Result<Vec<PersistedEvent>>;
+    async fn load_snapshot(&self, _t: &str, _id: Uuid) -> Result<Option<Snapshot>> { Ok(None) }
+    async fn save_snapshot(&self, _s: Snapshot) -> Result<()> { Ok(()) }
+}
 ```
 
-Append is idempotent by `event_id`. Every event is persisted — not just those with aggregators.
+### HandlerQueue trait
+
+```rust
+#[async_trait]
+pub trait HandlerQueue: Send + Sync {
+    async fn enqueue(&self, commit: IntentCommit) -> Result<()>;
+    async fn checkpoint(&self) -> Result<u64>;
+    async fn dequeue(&self) -> Result<Option<QueuedHandler>>;
+    async fn earliest_pending_at(&self) -> Result<Option<DateTime<Utc>>>;
+    async fn resolve(&self, resolution: HandlerResolution) -> Result<()>;
+    // ... journaling, cancellation, reclaim (all with default no-ops)
+}
+```
+
+Append is idempotent by `event_id`. Every event is persisted to the EventLog — not just those with aggregators.
+
+### Custom backends
+
+Supply your own `EventLog` and `HandlerQueue` implementations:
+
+```rust
+let engine = Engine::with_backends(deps, my_event_log, my_handler_queue);
+```
+
+Or use the built-in `MemoryStore` (implements both traits) for development and testing:
+
+```rust
+let engine = Engine::new(deps); // Uses MemoryStore internally
+```
 
 ### Auto-persist and hydration
 
-Configure a store with persistence enabled and the engine persists **every** event to the global log and hydrates aggregates on cold access:
+The engine persists **every** event to the EventLog and hydrates aggregates on cold access:
 
 ```rust
-use seesaw_core::MemoryStore;
-
 let engine = Engine::new(deps)
-    .with_store(MemoryStore::with_persistence())
     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
     .with_handler(on_order_placed());
 
 // All events are persisted. Aggregate-scoped events get aggregate_type/aggregate_id.
-// On restart, aggregates hydrate from the Store automatically.
-engine.emit(OrderPlaced { order_id, total: 100 }).settled().await?;
+// On restart, aggregates hydrate from the EventLog automatically.
+engine.emit(OrderPlaced { order_id, total: 100.0 }).settled().await?;
 ```
-
-`persist_event` is available for manual persistence with short type names (e.g. `"OrderPlaced"` not `"my_crate::events::OrderPlaced"`) so refactoring modules never breaks replay.
 
 ### Event metadata
 
-Stamp application-level context on every persisted event with `with_event_metadata`. Metadata travels with the event through the Store, letting adapters pull fields like `run_id` or `schema_v` without holding state:
+Stamp application-level context on every persisted event with `with_event_metadata`. Metadata travels with the event through the store, letting adapters pull fields like `run_id` or `schema_v` without holding state:
 
 ```rust
 let engine = Engine::new(deps)
-    .with_store(MemoryStore::with_persistence())
     .with_event_metadata(serde_json::json!({
         "run_id": "scrape-abc123",
         "schema_v": 1,
@@ -370,7 +433,6 @@ Snapshots accelerate cold-start hydration by saving aggregate state at a point-i
 
 ```rust
 let engine = Engine::new(deps)
-    .with_store(my_store)
     .snapshot_every(100)
     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id);
 ```
@@ -379,13 +441,32 @@ On cold start, the engine loads the latest snapshot and replays only events afte
 
 | Configuration | Behavior |
 |---|---|
-| Default store (no persistence overrides) | No persistence, no snapshots |
-| Store with persistence | Events persisted, manual snapshots via `save_snapshot()` |
-| Store with persistence + `snapshot_every(N)` | Auto-checkpoint every N events |
+| Default (MemoryStore) | Events persisted in memory, no durable snapshots |
+| Custom EventLog + HandlerQueue | Events persisted durably, manual snapshots via `save_snapshot()` |
+| Custom + `snapshot_every(N)` | Auto-checkpoint every N events |
+
+### Ephemeral events
+
+Ephemeral events are coordination signals that route through handlers but are not domain facts. Mark them with `#[event(ephemeral)]`:
+
+```rust
+#[event(ephemeral)]
+#[derive(Clone, Serialize, Deserialize)]
+struct EnrichmentReady { batch_id: Uuid }
+```
+
+**Two-tier persistence model:**
+
+| Store | Ephemeral events | Persistent events |
+|-------|-----------------|-------------------|
+| Operational (EventLog/Postgres) | Persisted with `persistent=false` | Persisted with `persistent=true` |
+| Permanent (KurrentDB) | Skipped | Forwarded |
+
+Ephemeral events are always persisted to the operational store (for causal chain durability and handler scheduling) but marked `persistent=false` so downstream forwarders know to skip them. They also skip aggregator apply and projections during the settle loop.
 
 ### Journaled side effects
 
-`ctx.run()` journals closure results in the Store. On retry, completed steps are replayed from the journal instead of re-executing:
+`ctx.run()` journals closure results in the HandlerQueue. On retry, completed steps are replayed from the journal instead of re-executing:
 
 ```rust
 #[handler(on = OrderPlaced, id = "ship_order")]
@@ -401,14 +482,14 @@ async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipp
 
 **How it works:**
 - Each `run()` call gets a sequence number within the handler execution
-- On first execution, the closure runs and its result is persisted to the Store
+- On first execution, the closure runs and its result is persisted to the HandlerQueue
 - On retry (after crash or error), journaled results are replayed — the closure is skipped
 - Journal entries are cleared atomically when the handler completes successfully
 - Errors are not journaled — they propagate normally and trigger the retry/DLQ path
 
 **Determinism contract:** Code between `run()` calls must be deterministic. The same input event must produce the same sequence of `run()` calls. Non-determinism (random values, wall clock reads) between `run()` calls will break replay.
 
-The return type must implement `Serialize + DeserializeOwned`. Store implementations provide the journal backend — the built-in `MemoryStore` includes a working implementation, and Postgres stores can use the same transaction for journal writes.
+The return type must implement `Serialize + DeserializeOwned`. The built-in `MemoryStore` includes a working implementation, and Postgres stores can use the same transaction for journal writes.
 
 ### Ephemeral sidecar (live dispatch optimization)
 
@@ -419,6 +500,7 @@ On **replay or hydration** (e.g. after a crash), the ephemeral is `None` and han
 This is useful when events carry transient, non-serializable data (parsed structs, pre-computed results, file handles) that downstream handlers need during the same dispatch cycle but that shouldn't be persisted:
 
 ```rust
+#[event]
 #[derive(Clone, Serialize, Deserialize)]
 struct PageScraped {
     url: String,
@@ -446,7 +528,7 @@ No code changes are needed to benefit — this is automatic for all events publi
 
 ## Durable Execution
 
-Seesaw provides durable execution natively through its `Store` trait:
+Seesaw provides durable execution natively through its split store traits:
 
 | Concern | MemoryStore (default) | Postgres Store |
 |---------|----------------------|----------------|
@@ -456,7 +538,7 @@ Seesaw provides durable execution natively through its `Store` trait:
 | Crash recovery | State lost | Replay from journal + event log |
 | Handler retries | In-memory queue | Persistent queue with reclaim |
 
-All durability features are built into the `Store` trait with default no-ops, so `MemoryStore` works out of the box for development and testing. Swap in a Postgres store for production durability — no code changes needed.
+All durability features are built into the `EventLog` + `HandlerQueue` traits with default no-ops, so `MemoryStore` works out of the box for development and testing. Swap in a Postgres store for production durability — no code changes needed.
 
 ## Context API
 
@@ -475,7 +557,7 @@ ctx.logger              // Structured logging (see below)
 
 ### Structured Logging
 
-Handlers can emit structured log entries via `ctx.logger`. Entries are captured during execution and drained into `HandlerCompletion` / `HandlerDlq`, so Store implementations can persist them keyed by `(event_id, handler_id)`.
+Handlers can emit structured log entries via `ctx.logger`. Entries are captured during execution and drained into `HandlerCompletion` / `HandlerDlq`, so store implementations can persist them keyed by `(event_id, handler_id)`.
 
 ```rust
 #[handler(on = OrderPlaced, id = "ship_order")]
@@ -514,21 +596,21 @@ cargo run --example simple-order
 
 Three primitives enable syncing events between seesaw instances:
 
-1. **Idempotent append** — `Store::append_event` deduplicates by `event_id`. Appending the same event twice returns the existing position without inserting.
+1. **Idempotent append** — `EventLog::append` deduplicates by `event_id`. Appending the same event twice returns the existing position without inserting.
 
-2. **Global log tailing** — `Store::load_global_from(after_position, limit)` returns events after a given position, enabling a follower node to poll for new events.
+2. **Global log tailing** — `EventLog::load_from(after_position, limit)` returns events after a given position, enabling a follower node to poll for new events.
 
-3. **Aggregate invalidation** — `Engine::invalidate_aggregate::<A>(id)` evicts cached aggregate state, forcing re-hydration from the Store on the next settle loop.
+3. **Aggregate invalidation** — `Engine::invalidate_aggregate::<A>(id)` evicts cached aggregate state, forcing re-hydration from the EventLog on the next settle loop.
 
 **Sync flow:**
 
 ```
-Node B polls Node A:  load_global_from(cursor, 100)
+Node B polls Node A:  load_from(cursor, 100)
                       ↓
-For each event:       append_event(event)    ← idempotent, safe to re-apply
-                      invalidate_aggregate   ← evict stale cache
+For each event:       append(event)            ← idempotent, safe to re-apply
+                      invalidate_aggregate     ← evict stale cache
                       ↓
-Next settle loop:     hydrates from Store (includes foreign events)
+Next settle loop:     hydrates from EventLog (includes foreign events)
 ```
 
 ## Architecture
@@ -537,7 +619,8 @@ Next settle loop:     hydrates from Store (includes foreign events)
 Engine (routing, composition, settle loop)
   ├── Handlers (filter → extract → transition guard → execute → emit)
   ├── Aggregators (event folding, state transitions)
-  └── Store (event/handler queue + persistent event log + snapshots + journal)
+  ├── EventLog (append-only event persistence + snapshots)
+  └── HandlerQueue (handler scheduling + journaling + coordination)
 ```
 
 ## License

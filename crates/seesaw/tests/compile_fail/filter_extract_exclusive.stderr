@@ -1,7 +1,7 @@
 error: filter and extract are mutually exclusive (both consume the filter type-state slot)
-  --> tests/compile_fail/filter_extract_exclusive.rs:24:1
+  --> tests/compile_fail/filter_extract_exclusive.rs:25:1
    |
-24 | #[handler(on = MyEvent, filter = my_filter, extract(id), id = "bad")]
+25 | #[handler(on = MyEvent, filter = my_filter, extract(id), id = "bad")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: this error originates in the attribute macro `handler` (in Nightly builds, run with -Z macro-backtrace for more info)

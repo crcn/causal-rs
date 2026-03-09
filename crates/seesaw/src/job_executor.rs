@@ -65,10 +65,24 @@ where
     /// (observers) run inline during event processing.
     ///
     /// Returns an [`IntentCommit`] that the caller enqueues via `HandlerQueue::enqueue`.
+    /// Process an event: decode, route to handlers, build intents, run projections.
+    ///
+    /// When `skip_projections` is true, projections are not executed. This is
+    /// used for ephemeral events which route through handlers but skip
+    /// persistence, aggregators, and projections.
     pub async fn process_event(
         &self,
         event: &PersistedEvent,
         _config: &EventWorkerConfig,
+    ) -> Result<IntentCommit> {
+        self.process_event_inner(event, _config, false).await
+    }
+
+    pub async fn process_event_inner(
+        &self,
+        event: &PersistedEvent,
+        _config: &EventWorkerConfig,
+        skip_projections: bool,
     ) -> Result<IntentCommit> {
         info!(
             "Processing event: type={}, correlation={}, position={}",
@@ -151,9 +165,10 @@ where
         }
 
         // 5. Execute projections sequentially (projections are observers, not handlers)
+        //    Skipped for ephemeral events.
         let mut projection_failures = Vec::new();
 
-        let projections = self.handlers.projections();
+        let projections = if skip_projections { Vec::new() } else { self.handlers.projections() };
         for projection in &projections {
             let any_event = crate::handler::AnyEvent {
                 value: typed_event.clone(),

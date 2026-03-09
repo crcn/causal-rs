@@ -6,6 +6,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct Deps;
 
+#[seesaw_core::event]
 #[derive(Clone, Serialize, Deserialize)]
 struct MyEvent {
     id: Uuid,

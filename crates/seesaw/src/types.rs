@@ -300,6 +300,11 @@ pub struct PersistedEvent {
     /// Original typed event, available only during live dispatch in-process.
     /// `None` on load from durable store — handlers fall back to JSON deserialization.
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
+    /// Whether this event should be forwarded to the permanent event store
+    /// (e.g. KurrentDB). Ephemeral events (`false`) are persisted to the
+    /// operational store (Postgres) for causal chain durability, but are
+    /// not domain facts and should not be in the permanent log.
+    pub persistent: bool,
 }
 
 impl fmt::Debug for PersistedEvent {
@@ -345,6 +350,10 @@ pub struct NewEvent {
     /// Original typed event for zero-cost dispatch in-process.
     /// `None` for events loaded from durable stores.
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
+    /// Whether this event should be persisted to EventLog.
+    /// Ephemeral events (`false`) route through handlers but skip persistence,
+    /// aggregators, and projections.
+    pub persistent: bool,
 }
 
 impl fmt::Debug for NewEvent {
