@@ -1956,3 +1956,355 @@ fn expand_aggregators_module(
         #(#expanded_fns)*
     })
 }
+
+// ── #[event] proc macro ─────────────────────────────────────────────
+
+/// Marks a type as a seesaw Event, generating a `seesaw_core::event::Event` impl.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Enum with domain prefix (requires #[serde(tag = "...")])
+/// #[event(prefix = "scrape")]
+/// #[derive(Clone, Serialize, Deserialize)]
+/// #[serde(tag = "type", rename_all = "snake_case")]
+/// pub enum ScrapeEvent {
+///     WebScrapeCompleted { urls_scraped: usize },
+///     SourcesResolved { sources: Vec<Uuid> },
+/// }
+///
+/// // Ephemeral enum
+/// #[event(prefix = "synthesis", ephemeral)]
+/// // ...
+///
+/// // Struct (no prefix needed — snake_case of struct name)
+/// #[event]
+/// #[derive(Clone, Serialize, Deserialize)]
+/// pub struct OrderPlaced { pub order_id: Uuid }
+///
+/// // Ephemeral struct
+/// #[event(ephemeral)]
+/// pub struct EnrichmentReady { pub correlation_id: Uuid }
+/// ```
+#[proc_macro_attribute]
+pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    let args = parse_event_args(attr.into());
+
+    match expand_event(args, input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Parsed arguments for #[event(...)].
+struct EventArgs {
+    prefix: Option<String>,
+    ephemeral: bool,
+}
+
+fn parse_event_args(tokens: TokenStream2) -> EventArgs {
+    let mut prefix = None;
+    let mut ephemeral = false;
+
+    if tokens.is_empty() {
+        return EventArgs { prefix, ephemeral };
+    }
+
+    let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+    let metas = match parser.parse2(tokens) {
+        Ok(m) => m,
+        Err(_) => return EventArgs { prefix, ephemeral },
+    };
+
+    for meta in &metas {
+        match meta {
+            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("prefix") => {
+                if let Expr::Lit(expr_lit) = value {
+                    if let Lit::Str(lit) = &expr_lit.lit {
+                        prefix = Some(lit.value());
+                    }
+                }
+            }
+            Meta::Path(path) if path.is_ident("ephemeral") => {
+                ephemeral = true;
+            }
+            _ => {}
+        }
+    }
+
+    EventArgs { prefix, ephemeral }
+}
+
+fn expand_event(args: EventArgs, input: DeriveInput) -> Result<TokenStream2, syn::Error> {
+    let name = &input.ident;
+
+    match &input.data {
+        Data::Enum(data_enum) => expand_event_enum(args, &input, data_enum),
+        Data::Struct(_) => expand_event_struct(args, &input),
+        Data::Union(_) => Err(syn::Error::new_spanned(
+            name,
+            "#[event] cannot be applied to unions",
+        )),
+    }
+}
+
+fn expand_event_enum(
+    args: EventArgs,
+    input: &DeriveInput,
+    data_enum: &syn::DataEnum,
+) -> Result<TokenStream2, syn::Error> {
+    let name = &input.ident;
+
+    // Require a prefix for enums
+    let prefix = args.prefix.ok_or_else(|| {
+        syn::Error::new_spanned(
+            name,
+            "#[event] on enums requires a prefix: #[event(prefix = \"...\")]",
+        )
+    })?;
+
+    // Parse serde attributes to find tag and rename_all
+    let serde_info = parse_serde_attrs(&input.attrs)?;
+
+    // Require #[serde(tag = "...")] for enums
+    if serde_info.tag.is_none() && !serde_info.untagged {
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[event] on enums requires #[serde(tag = \"...\")] for variant discrimination",
+        ));
+    }
+
+    if serde_info.untagged {
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[event] cannot be applied to #[serde(untagged)] enums — untagged enums have no stable variant discriminator",
+        ));
+    }
+
+    let ephemeral = args.ephemeral;
+
+    // Build match arms for durable_name
+    let mut match_arms = Vec::new();
+    for variant in &data_enum.variants {
+        let variant_name = &variant.ident;
+
+        // Check for per-variant #[serde(rename = "...")]
+        let renamed = get_serde_rename(&variant.attrs);
+
+        let variant_str = if let Some(rename) = renamed {
+            rename
+        } else {
+            apply_rename_rule(&variant_name.to_string(), serde_info.rename_all.as_deref())
+        };
+
+        let durable = format!("{}:{}", prefix, variant_str);
+
+        let pattern = match &variant.fields {
+            Fields::Named(_) => quote! { #name::#variant_name { .. } },
+            Fields::Unnamed(_) => quote! { #name::#variant_name(..) },
+            Fields::Unit => quote! { #name::#variant_name },
+        };
+
+        match_arms.push(quote! { #pattern => #durable });
+    }
+
+    Ok(quote! {
+        #input
+
+        impl ::seesaw_core::event::Event for #name {
+            fn durable_name(&self) -> &str {
+                match self {
+                    #(#match_arms,)*
+                }
+            }
+
+            fn event_prefix() -> &'static str {
+                #prefix
+            }
+
+            fn is_ephemeral() -> bool {
+                #ephemeral
+            }
+        }
+    })
+}
+
+fn expand_event_struct(
+    args: EventArgs,
+    input: &DeriveInput,
+) -> Result<TokenStream2, syn::Error> {
+    let name = &input.ident;
+    let ephemeral = args.ephemeral;
+
+    // For structs, the durable name is the snake_case of the struct name
+    // OR the prefix if provided
+    let durable = if let Some(ref prefix) = args.prefix {
+        prefix.clone()
+    } else {
+        to_snake_case(&name.to_string())
+    };
+
+    let prefix_str = durable.clone();
+
+    Ok(quote! {
+        #input
+
+        impl ::seesaw_core::event::Event for #name {
+            fn durable_name(&self) -> &str {
+                #durable
+            }
+
+            fn event_prefix() -> &'static str {
+                #prefix_str
+            }
+
+            fn is_ephemeral() -> bool {
+                #ephemeral
+            }
+        }
+    })
+}
+
+/// Parsed serde attributes relevant to event macro.
+struct SerdeInfo {
+    tag: Option<String>,
+    rename_all: Option<String>,
+    untagged: bool,
+}
+
+fn parse_serde_attrs(attrs: &[Attribute]) -> Result<SerdeInfo, syn::Error> {
+    let mut info = SerdeInfo {
+        tag: None,
+        rename_all: None,
+        untagged: false,
+    };
+
+    for attr in attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("tag") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    info.tag = Some(s.value());
+                }
+            } else if meta.path.is_ident("rename_all") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    info.rename_all = Some(s.value());
+                }
+            } else if meta.path.is_ident("untagged") {
+                info.untagged = true;
+            } else if meta.input.peek(Token![=]) {
+                // Consume `= "value"` for unknown key=value attrs (e.g. content = "data")
+                let _: Token![=] = meta.input.parse()?;
+                let _: Lit = meta.input.parse()?;
+            } else {
+                // Skip unknown flag attrs
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(info)
+}
+
+/// Get #[serde(rename = "...")] from variant attributes.
+fn get_serde_rename(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+
+        let mut rename = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                let value = meta.value()?;
+                let lit: Lit = value.parse()?;
+                if let Lit::Str(s) = lit {
+                    rename = Some(s.value());
+                }
+            }
+            Ok(())
+        });
+        if rename.is_some() {
+            return rename;
+        }
+    }
+    None
+}
+
+/// Apply a serde rename_all rule to a variant name.
+fn apply_rename_rule(name: &str, rule: Option<&str>) -> String {
+    match rule {
+        Some("snake_case") => to_snake_case(name),
+        Some("camelCase") => to_camel_case(name),
+        Some("PascalCase") => name.to_string(),
+        Some("SCREAMING_SNAKE_CASE") => to_snake_case(name).to_uppercase(),
+        Some("kebab-case") => to_snake_case(name).replace('_', "-"),
+        _ => name.to_string(), // No rename_all or unknown rule — use as-is
+    }
+}
+
+/// Convert PascalCase to snake_case.
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    let mut prev_was_upper = false;
+    let mut prev_was_underscore = true; // treat start as underscore
+
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            // Insert underscore before uppercase if:
+            // - not at start
+            // - previous char was NOT uppercase (camelCase boundary)
+            // - OR next char is lowercase (acronym end like "HTTPServer" → "http_server")
+            if i > 0 && !prev_was_underscore {
+                if !prev_was_upper {
+                    result.push('_');
+                } else {
+                    // Check if next char is lowercase (end of acronym)
+                    let next_is_lower = s.chars().nth(i + 1).map_or(false, |c| c.is_lowercase());
+                    if next_is_lower {
+                        result.push('_');
+                    }
+                }
+            }
+            result.push(ch.to_lowercase().next().unwrap());
+            prev_was_upper = true;
+            prev_was_underscore = false;
+        } else if ch == '_' {
+            result.push('_');
+            prev_was_upper = false;
+            prev_was_underscore = true;
+        } else {
+            result.push(ch);
+            prev_was_upper = false;
+            prev_was_underscore = false;
+        }
+    }
+
+    result
+}
+
+/// Convert PascalCase to camelCase.
+fn to_camel_case(s: &str) -> String {
+    let mut result = String::new();
+    let mut first = true;
+
+    for ch in s.chars() {
+        if first && ch.is_uppercase() {
+            result.push(ch.to_lowercase().next().unwrap());
+            first = false;
+        } else {
+            result.push(ch);
+            first = false;
+        }
+    }
+
+    result
+}

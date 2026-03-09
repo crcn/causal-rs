@@ -34,6 +34,7 @@ extern crate self as seesaw_core;
 
 // Module structure
 pub mod aggregator;
+pub mod event;
 pub mod event_log;
 pub mod event_store;
 pub mod handler;
@@ -47,6 +48,9 @@ mod handler_registry;
 pub mod memory_store;
 mod process;
 pub mod upcaster;
+
+// Re-export Event trait
+pub use event::Event;
 
 // Re-export aggregator types
 pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
@@ -124,6 +128,6 @@ pub use handler::{on, on_any, project};
 
 #[cfg(feature = "macros")]
 pub use seesaw_core_macros::{
-    aggregator, aggregators, handle, handler, handlers, handles, projection,
+    aggregator, aggregators, event, handle, handler, handlers, handles, projection,
 };
 

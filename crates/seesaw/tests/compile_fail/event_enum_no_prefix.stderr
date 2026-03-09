@@ -1,0 +1,13 @@
+error: #[event] on enums requires a prefix: #[event(prefix = "...")]
+ --> tests/compile_fail/event_enum_no_prefix.rs:6:10
+  |
+6 | pub enum BadEvent {
+  |          ^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/compile_fail/event_enum_no_prefix.rs:1:13
+  |
+1 | use serde::{Serialize, Deserialize};
+  |             ^^^^^^^^^  ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
