@@ -9,12 +9,13 @@
 //! ## Quick Start
 //!
 //! ```ignore
-//! use seesaw_replay::{ProjectionStream, PgPointerStore};
+//! use seesaw_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource};
 //!
 //! let pointer = PgPointerStore::new(db.clone()).await?;
-//! let version = pointer.load().await?;
+//! let tail = PgNotifyTailSource::new(&db, "events").await?;
 //!
 //! ProjectionStream::new(&log, &pointer)
+//!     .tail(Box::new(tail))
 //!     .promote_if(|| health_check(&neo4j))
 //!     .run(|event| projections.apply(event))
 //!     .await?;
