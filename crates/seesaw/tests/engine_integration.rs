@@ -556,7 +556,7 @@ async fn upcaster_chain_in_aggregate_replay() {
     });
 
     // Store a v1-schema event (no currency, no region)
-    let store = MemoryStore::with_persistence();
+    let store = MemoryStore::new();
     let order_id = Uuid::new_v4();
 
     store
@@ -804,7 +804,7 @@ async fn engine_without_event_store_identical_behavior() -> Result<()> {
 
 #[tokio::test]
 async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::in_memory(Deps)
@@ -840,7 +840,7 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
 
 #[tokio::test]
 async fn events_without_aggregator_not_in_stream() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
 
     // Ping has no aggregator registered
     let engine = Engine::in_memory(Deps)
@@ -868,7 +868,7 @@ async fn events_without_aggregator_not_in_stream() -> Result<()> {
 
 #[tokio::test]
 async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::in_memory(Deps)
@@ -896,7 +896,7 @@ async fn event_metadata_stamped_on_persisted_events() -> Result<()> {
 
 #[tokio::test]
 async fn event_metadata_on_non_aggregate_events() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
@@ -923,7 +923,7 @@ async fn event_metadata_on_non_aggregate_events() -> Result<()> {
 
 #[tokio::test]
 async fn no_metadata_produces_empty_map() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::in_memory(Deps)
@@ -947,7 +947,7 @@ async fn no_metadata_produces_empty_map() -> Result<()> {
 
 #[tokio::test]
 async fn cold_start_hydration() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // Phase 1: Build engine, emit events, populate store
@@ -1013,7 +1013,7 @@ async fn cold_start_hydration() -> Result<()> {
 #[tokio::test]
 async fn transition_guard_works_after_cold_start() -> Result<()> {
     // THE critical scenario: guard checks prev state after restart
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // Pre-populate events directly in store (simulating previous engine run)
@@ -1071,7 +1071,7 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
 
 #[tokio::test]
 async fn snapshot_acceleration() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // Pre-populate: 2 events in store
@@ -1146,7 +1146,7 @@ async fn snapshot_acceleration() -> Result<()> {
 
 #[tokio::test]
 async fn rapid_fire_events_same_aggregate() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::in_memory(Deps)
@@ -1180,7 +1180,7 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
     // An event type that maps to BOTH Order and Customer aggregates
     // We use separate events for each aggregate type
 
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
 
@@ -1217,7 +1217,7 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
 
 #[tokio::test]
 async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // Events V1-V10 in store
@@ -1290,7 +1290,7 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
 
 #[tokio::test]
 async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // Events in store but NO snapshot
@@ -1347,7 +1347,7 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
 
 #[tokio::test]
 async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let confirmed_count = Arc::new(AtomicUsize::new(0));
@@ -1395,7 +1395,7 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
 
 #[tokio::test]
 async fn mixed_aggregate_types_independent_streams() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
     let customer_id = Uuid::new_v4();
 
@@ -1440,7 +1440,7 @@ async fn mixed_aggregate_types_independent_streams() -> Result<()> {
 #[tokio::test]
 async fn empty_aggregate_access_returns_default() -> Result<()> {
     // Transition guard on an aggregate with zero history
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let fired = Arc::new(AtomicUsize::new(0));
@@ -1481,7 +1481,7 @@ async fn empty_aggregate_access_returns_default() -> Result<()> {
 
 #[tokio::test]
 async fn large_event_replay_produces_correct_state() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // Pre-populate 1000 events: 1 OrderCreated + 999 OrderConfirmed
@@ -1542,7 +1542,7 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
 
 #[tokio::test]
 async fn save_snapshot_helper_works() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::in_memory(Deps)
@@ -1586,7 +1586,7 @@ async fn save_snapshot_helper_works() -> Result<()> {
 
 #[tokio::test]
 async fn auto_snapshot_every_n_events() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     let engine = Engine::in_memory(Deps)
@@ -1630,7 +1630,7 @@ async fn auto_snapshot_every_n_events() -> Result<()> {
 
 #[tokio::test]
 async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // First engine: emit 10 events with auto-snapshot every 5
@@ -1694,7 +1694,7 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
 
 #[tokio::test]
 async fn no_snapshot_without_threshold() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // store with persistence but NO snapshot_every
@@ -1720,7 +1720,7 @@ async fn no_snapshot_without_threshold() -> Result<()> {
 
 #[tokio::test]
 async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
 
     // Pre-populate 50 events in store
@@ -1771,7 +1771,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
 
 #[tokio::test]
 async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
@@ -3428,7 +3428,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
     //   3. A fresh engine (cold aggregates) calls settle()
     //   4. The handler should see hydrated aggregate state, not defaults
 
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
@@ -3511,7 +3511,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
 async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
     // DLQ terminal events should have handler_id metadata set to the
     // handler that failed, so causal flow graphs can wire the edge.
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
@@ -3601,7 +3601,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     // reads PipelineState.source_plan (set by SourcesPrepared). On resume,
     // only the ScrapeCompleted aggregator gets hydrated, so source_plan
     // is None and the filter returns false.
-    let store = Arc::new(MemoryStore::with_persistence());
+    let store = Arc::new(MemoryStore::new());
     let correlation_id = Uuid::new_v4();
 
     // Step 1: Pre-populate store with both events already persisted

@@ -143,14 +143,14 @@ mod tests {
 
     #[tokio::test]
     async fn empty_stream_returns_empty() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let events = store.load_stream("Order", Uuid::new_v4(), None).await.unwrap();
         assert!(events.is_empty());
     }
 
     #[tokio::test]
     async fn append_and_load_aggregate_events() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let id = Uuid::new_v4();
 
         store.append(make_aggregate_event("OrderPlaced", serde_json::json!({"total": 100}), "Order", id)).await.unwrap();
@@ -167,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_aggregate_event_is_persisted() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
 
         let result = store.append(make_new_event("SystemStarted", serde_json::json!({"node": "a"}))).await.unwrap();
         assert!(result.position > 0);
@@ -186,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_stream_from_filters_by_version() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let id = Uuid::new_v4();
 
         let result1 = store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
@@ -202,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn streams_are_isolated() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
 
@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn position_increments_globally() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
 
@@ -234,7 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn causal_metadata_round_trips() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let event_id = Uuid::new_v4();
         let parent_id = Uuid::new_v4();
         let correlation_id = Uuid::new_v4();
@@ -263,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_round_trips() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let mut metadata = serde_json::Map::new();
         metadata.insert("run_id".to_string(), serde_json::json!("scrape-abc123"));
         metadata.insert("schema_v".to_string(), serde_json::json!(1));
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_metadata_round_trips() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let id = Uuid::new_v4();
 
         store.append(make_aggregate_event("OrderPlaced", serde_json::json!({}), "Order", id)).await.unwrap();
@@ -307,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_append_returns_existing_position() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
         let event_id = Uuid::new_v4();
 
         let event1 = NewEvent {
@@ -345,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_global_from_returns_events_after_position() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
 
         let mut positions = Vec::new();
         for i in 0..5 {
@@ -361,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_global_from_respects_limit() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
 
         for i in 0..10 {
             store.append(make_new_event(&format!("Event{}", i), serde_json::json!({}))).await.unwrap();
@@ -373,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_global_from_empty_when_caught_up() {
-        let store = MemoryStore::with_persistence();
+        let store = MemoryStore::new();
 
         let result = store.append(make_new_event("Event", serde_json::json!({}))).await.unwrap();
 

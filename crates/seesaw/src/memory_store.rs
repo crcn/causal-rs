@@ -1,6 +1,6 @@
-//! In-memory queue store for seesaw Engine.
+//! In-memory EventLog + HandlerQueue for seesaw Engine.
 //!
-//! Provides event and handler queues used by the Engine's built-in settle loop.
+//! Provides event log persistence and handler queue used by the Engine's settle loop.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,10 +18,10 @@ use crate::event_log::EventLog;
 use crate::handler_queue::HandlerQueue;
 use crate::types::*;
 
-/// In-memory queue store for the Engine's settle loop.
+/// In-memory EventLog + HandlerQueue for the Engine's settle loop.
 ///
-/// Includes optional event persistence and snapshot support for testing
-/// and simple use cases. The event log and snapshots are kept in-memory.
+/// Event log and snapshots are kept in-memory — suitable for testing
+/// and simple single-process use cases.
 #[derive(Clone)]
 pub struct MemoryStore {
     /// Handler executions queue
@@ -65,14 +65,6 @@ impl MemoryStore {
             handler_descriptions: Arc::new(DashMap::new()),
             checkpoint: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    /// Create a MemoryStore with event persistence and snapshots enabled.
-    ///
-    /// Note: In the new EventLog model, persistence is always enabled.
-    /// This constructor is kept for backward compatibility.
-    pub fn with_persistence() -> Self {
-        Self::new()
     }
 
     /// Set the TTL for cancelled correlation entries.

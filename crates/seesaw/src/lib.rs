@@ -39,7 +39,6 @@ pub mod event_store;
 pub mod handler;
 pub mod handler_queue;
 pub mod job_executor;
-pub mod store;
 pub mod types;
 
 mod engine;
