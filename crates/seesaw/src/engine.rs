@@ -780,6 +780,7 @@ where
                 aggregate_type,
                 aggregate_id,
                 metadata,
+                ephemeral: None,
             })
             .await?;
 

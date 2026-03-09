@@ -53,6 +53,7 @@ where
             aggregate_type: Some(A::aggregate_type().to_string()),
             aggregate_id: Some(aggregate_id),
             metadata: serde_json::Map::new(),
+            ephemeral: None,
         })
         .await
 }
@@ -115,6 +116,7 @@ mod tests {
             aggregate_type: None,
             aggregate_id: None,
             metadata: serde_json::Map::new(),
+            ephemeral: None,
         }
     }
 
@@ -134,6 +136,7 @@ mod tests {
             aggregate_type: Some(aggregate_type.to_string()),
             aggregate_id: Some(aggregate_id),
             metadata: serde_json::Map::new(),
+            ephemeral: None,
         }
     }
 
@@ -246,6 +249,7 @@ mod tests {
                 aggregate_type: Some("Test".to_string()),
                 aggregate_id: Some(Uuid::new_v4()),
                 metadata: serde_json::Map::new(),
+                ephemeral: None,
             })
             .await
             .unwrap();
@@ -276,6 +280,7 @@ mod tests {
                 aggregate_type: Some("Order".to_string()),
                 aggregate_id: Some(id),
                 metadata: metadata.clone(),
+                ephemeral: None,
             })
             .await
             .unwrap();
@@ -314,6 +319,7 @@ mod tests {
             aggregate_type: None,
             aggregate_id: None,
             metadata: serde_json::Map::new(),
+            ephemeral: None,
         };
         let event2 = NewEvent {
             event_id, // same event_id
@@ -325,6 +331,7 @@ mod tests {
             aggregate_type: None,
             aggregate_id: None,
             metadata: serde_json::Map::new(),
+            ephemeral: None,
         };
 
         let result1 = store.append_event(event1).await.unwrap();

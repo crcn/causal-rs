@@ -34,8 +34,10 @@ extern crate self as seesaw_core;
 
 // Module structure
 pub mod aggregator;
+pub mod event_log;
 pub mod event_store;
 pub mod handler;
+pub mod handler_queue;
 pub mod job_executor;
 pub mod store;
 pub mod types;
@@ -53,6 +55,11 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 // Re-export event store helpers and types
 pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
 pub use types::{AppendResult, NewEvent, PersistedEvent, QueueStatus, Snapshot};
+
+// Re-export new EventLog + HandlerQueue traits
+pub use event_log::EventLog;
+pub use handler_queue::HandlerQueue;
+pub use types::{EventPark, IntentCommit};
 
 // Re-export store trait and in-memory implementation
 pub use store::Store;

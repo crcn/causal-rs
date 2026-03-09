@@ -27,6 +27,7 @@ fn new_event(
         aggregate_type: aggregate_type.map(|s| s.to_string()),
         aggregate_id,
         metadata: serde_json::Map::new(),
+        ephemeral: None,
     }
 }
 
@@ -1814,6 +1815,7 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
             aggregate_type: Some("Order".to_string()),
             aggregate_id: Some(order_id),
             metadata: serde_json::Map::new(),
+            ephemeral: None,
         })
         .await?;
 

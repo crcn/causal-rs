@@ -345,6 +345,7 @@ impl Store for MemoryStore {
             aggregate_id: event.aggregate_id,
             version,
             metadata: event.metadata,
+            ephemeral: event.ephemeral,
         });
 
         Ok(AppendResult { position, version })

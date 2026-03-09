@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +105,74 @@ pub struct ProjectionFailure {
     pub reason: String,
     pub attempts: i32,
 }
+
+// ── New types (EventLog + HandlerQueue split) ─────────────────────
+
+/// Atomic intent creation payload.
+///
+/// Produced by the engine's `process_event` during Phase 1 of the settle
+/// loop. Contains handler intents to enqueue, projection failures to DLQ,
+/// and the checkpoint position to advance to.
+#[derive(Debug)]
+pub struct IntentCommit {
+    /// Source event identifiers.
+    pub event_id: Uuid,
+    pub correlation_id: Uuid,
+    pub event_type: String,
+    pub event_payload: serde_json::Value,
+    /// Queued handler intents to persist.
+    pub intents: Vec<HandlerIntent>,
+    /// Projection failures to persist to DLQ.
+    pub projection_failures: Vec<ProjectionFailure>,
+    /// Handler gate descriptions (handler_id → serialized describe output).
+    pub handler_descriptions: HashMap<String, serde_json::Value>,
+    /// Advance checkpoint to this EventLog position.
+    pub checkpoint: u64,
+    /// Park this event in DLQ (exceeded hops, exceeded retry, etc.)
+    pub park: Option<EventPark>,
+}
+
+impl IntentCommit {
+    /// Park an event in DLQ and advance checkpoint past it.
+    pub fn park(event: &PersistedEvent, reason: impl Into<String>) -> Self {
+        Self {
+            event_id: event.event_id,
+            correlation_id: event.correlation_id,
+            event_type: event.event_type.clone(),
+            event_payload: event.payload.clone(),
+            intents: Vec::new(),
+            projection_failures: Vec::new(),
+            handler_descriptions: HashMap::new(),
+            checkpoint: event.position,
+            park: Some(EventPark {
+                reason: reason.into(),
+            }),
+        }
+    }
+
+    /// Skip an event (advance checkpoint, no intents, no DLQ).
+    pub fn skip(event: &PersistedEvent) -> Self {
+        Self {
+            event_id: event.event_id,
+            correlation_id: event.correlation_id,
+            event_type: event.event_type.clone(),
+            event_payload: event.payload.clone(),
+            intents: Vec::new(),
+            projection_failures: Vec::new(),
+            handler_descriptions: HashMap::new(),
+            checkpoint: event.position,
+            park: None,
+        }
+    }
+}
+
+/// Reason for parking (DLQ-ing) an event during processing.
+#[derive(Debug, Clone)]
+pub struct EventPark {
+    pub reason: String,
+}
+
+// ── Legacy types (will be removed in Phase 3) ─────────────────────
 
 /// Atomic event processing commit payload.
 #[derive(Debug)]
@@ -301,12 +370,11 @@ pub struct AppendResult {
 }
 
 /// A persisted event loaded from the store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PersistedEvent {
     /// Opaque global ordering cursor. Monotonically increasing; gaps between
-    /// values are allowed. Used only for
-    /// [`Store::load_global_from`](crate::store::Store::load_global_from)
-    /// cursor tracking — no arithmetic should be performed on this value.
+    /// values are allowed. Used for checkpoint-based cursor tracking —
+    /// no arithmetic should be performed on this value.
     pub position: u64,
     /// Unique event ID.
     pub event_id: Uuid,
@@ -328,10 +396,32 @@ pub struct PersistedEvent {
     pub version: Option<u64>,
     /// Application-level metadata (e.g. run_id, schema_v, actor).
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Original typed event, available only during live dispatch in-process.
+    /// `None` on load from durable store — handlers fall back to JSON deserialization.
+    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for PersistedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistedEvent")
+            .field("position", &self.position)
+            .field("event_id", &self.event_id)
+            .field("parent_id", &self.parent_id)
+            .field("correlation_id", &self.correlation_id)
+            .field("event_type", &self.event_type)
+            .field("payload", &self.payload)
+            .field("created_at", &self.created_at)
+            .field("aggregate_type", &self.aggregate_type)
+            .field("aggregate_id", &self.aggregate_id)
+            .field("version", &self.version)
+            .field("metadata", &self.metadata)
+            .field("ephemeral", &self.ephemeral.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 /// A new event to be appended to the global log.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NewEvent {
     /// Unique event ID.
     pub event_id: Uuid,
@@ -351,6 +441,26 @@ pub struct NewEvent {
     pub aggregate_id: Option<Uuid>,
     /// Application-level metadata (e.g. run_id, schema_v, actor).
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Original typed event for zero-cost dispatch in-process.
+    /// `None` for events loaded from durable stores.
+    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for NewEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewEvent")
+            .field("event_id", &self.event_id)
+            .field("parent_id", &self.parent_id)
+            .field("correlation_id", &self.correlation_id)
+            .field("event_type", &self.event_type)
+            .field("payload", &self.payload)
+            .field("created_at", &self.created_at)
+            .field("aggregate_type", &self.aggregate_type)
+            .field("aggregate_id", &self.aggregate_id)
+            .field("metadata", &self.metadata)
+            .field("ephemeral", &self.ephemeral.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 /// A serialized snapshot of aggregate state at a specific stream version.
