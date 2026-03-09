@@ -52,8 +52,26 @@ impl<D> Engine<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Create new engine with dependencies, event log, and handler queue.
-    pub fn new(
+    /// Create an engine with in-memory event log and handler queue.
+    ///
+    /// Use `.with_store(store)` to swap in a durable backend.
+    pub fn new(deps: D) -> Self {
+        let store = Arc::new(MemoryStore::new());
+        Self {
+            log: store.clone(),
+            queue: store,
+            deps: Arc::new(deps),
+            handlers: Arc::new(HandlerRegistry::new()),
+            aggregators: Arc::new(AggregatorRegistry::new()),
+            upcasters: Arc::new(UpcasterRegistry::new()),
+            snapshot_every: None,
+            event_metadata: serde_json::Map::new(),
+            global_dlq_mapper: None,
+        }
+    }
+
+    /// Create an engine with explicit event log and handler queue backends.
+    pub fn with_backends(
         deps: D,
         log: Arc<dyn EventLog>,
         queue: Arc<dyn HandlerQueue>,
@@ -71,12 +89,9 @@ where
         }
     }
 
-    /// Create an engine with in-memory event log and handler queue.
-    ///
-    /// Convenience constructor for tests and simple use cases.
+    /// Alias for `new()` — creates an engine with in-memory backends.
     pub fn in_memory(deps: D) -> Self {
-        let store = Arc::new(MemoryStore::new());
-        Self::new(deps, store.clone(), store)
+        Self::new(deps)
     }
 
     /// Access the shared dependencies.
@@ -131,11 +146,11 @@ where
         self
     }
 
-    /// Supply a custom store backend (legacy compatibility).
+    /// Supply a single backend that implements both `EventLog` and `HandlerQueue`.
     ///
-    /// The store must implement both `EventLog` and `HandlerQueue`.
-    /// Prefer using `Engine::new(deps, log, queue)` for explicit control.
-    pub fn with_store(mut self, store: Arc<MemoryStore>) -> Self {
+    /// Convenience for stores (like `MemoryStore` or `PostgresStore`) that
+    /// handle both responsibilities in one type.
+    pub fn with_store<S: EventLog + HandlerQueue + 'static>(mut self, store: Arc<S>) -> Self {
         self.log = store.clone();
         self.queue = store;
         self
