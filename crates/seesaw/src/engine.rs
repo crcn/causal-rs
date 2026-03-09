@@ -167,9 +167,6 @@ where
             Ok(crate::EmittedEvent {
                 event_type: event_type.clone(),
                 payload: serde_json::to_value(&event)?,
-                batch_id: None,
-                batch_index: None,
-                batch_size: None,
                 handler_id: Some(failed_handler_id),
                 ephemeral: None,
             })
@@ -523,7 +520,7 @@ where
                 for aggregate_type in self.aggregators.unique_aggregate_types() {
                     let singleton_key = format!("{}:{}", aggregate_type, Uuid::nil());
                     if !self.aggregators.has_state(&singleton_key) {
-                        self.hydrate_aggregate(aggregate_type, Uuid::nil(), &singleton_key, u64::MAX).await?;
+                        self.hydrate_aggregate(aggregate_type, Uuid::nil(), &singleton_key, None).await?;
                     }
                 }
                 for execution in &executions {
@@ -535,7 +532,7 @@ where
                         };
                         let key = format!("{}:{}", agg.aggregate_type, agg_id);
                         if !self.aggregators.has_state(&key) {
-                            self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key, u64::MAX).await?;
+                            self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key, None).await?;
                         }
                     }
                 }
@@ -763,7 +760,7 @@ where
             let key = format!("{}:{}", agg.aggregate_type, agg_id);
 
             if !self.aggregators.has_state(&key) {
-                self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key, event.position).await?;
+                self.hydrate_aggregate(&agg.aggregate_type, agg_id, &key, Some(event.position)).await?;
             }
         }
 
@@ -772,14 +769,15 @@ where
 
     /// Hydrate a single aggregate from EventLog (with optional snapshot acceleration).
     ///
-    /// `exclude_position` excludes events at or beyond this global position,
-    /// so the current event being processed isn't double-applied.
+    /// When `exclude_position` is `Some(pos)`, events at or beyond that global
+    /// position are excluded — prevents double-apply when the current event is
+    /// already in the log but hasn't been applied to aggregator state yet.
     async fn hydrate_aggregate(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
         key: &str,
-        exclude_position: u64,
+        exclude_position: Option<u64>,
     ) -> Result<()> {
         // Try snapshot first
         if let Some(snapshot) = self
@@ -796,7 +794,7 @@ where
                     .load_stream(aggregate_type, aggregate_id, Some(snapshot.version))
                     .await?
                     .into_iter()
-                    .filter(|e| e.position < exclude_position)
+                    .filter(|e| exclude_position.map_or(true, |pos| e.position < pos))
                     .collect();
 
                 if !remaining.is_empty() {
@@ -826,7 +824,7 @@ where
             .load_stream(aggregate_type, aggregate_id, None)
             .await?
             .into_iter()
-            .filter(|e| e.position < exclude_position)
+            .filter(|e| exclude_position.map_or(true, |pos| e.position < pos))
             .collect();
         if events.is_empty() {
             return Ok(());
@@ -1083,24 +1081,6 @@ where
                     "_handler_id".to_string(),
                     serde_json::Value::String(handler_id.to_string()),
                 );
-                if let Some(batch_id) = e.batch_id {
-                    metadata.insert(
-                        "_batch_id".to_string(),
-                        serde_json::Value::String(batch_id.to_string()),
-                    );
-                }
-                if let Some(batch_index) = e.batch_index {
-                    metadata.insert(
-                        "_batch_index".to_string(),
-                        serde_json::Value::Number(batch_index.into()),
-                    );
-                }
-                if let Some(batch_size) = e.batch_size {
-                    metadata.insert(
-                        "_batch_size".to_string(),
-                        serde_json::Value::Number(batch_size.into()),
-                    );
-                }
                 if let Some(ref hid) = e.handler_id {
                     metadata.insert(
                         "handler_id".to_string(),
