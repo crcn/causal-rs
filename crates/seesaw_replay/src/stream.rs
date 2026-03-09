@@ -121,6 +121,33 @@ impl<'a> ProjectionStream<'a> {
         self
     }
 
+    /// Resolve the current version.
+    ///
+    /// - **Live mode**: returns the promoted `active` position from the pointer.
+    /// - **Replay mode**: snapshots `latest_position()` from the event log,
+    ///   stages it, and returns it. This is the target version for the replay.
+    ///
+    /// Call before `run()` to derive the database name:
+    ///
+    /// ```ignore
+    /// let stream = ProjectionStream::new(&log, &pointer);
+    /// let version = stream.version().await?;
+    /// let neo4j = connect(&format!("neo4j.v{version}"));
+    /// stream.run(|event| apply(event)).await?;
+    /// ```
+    pub async fn version(&self) -> Result<u64> {
+        let mode = self.mode.unwrap_or_else(Mode::from_env);
+        match mode {
+            Mode::Live => Ok(self.pointer.version().await?.unwrap_or(0)),
+            Mode::Replay => {
+                let target = self.log.latest_position().await?;
+                self.pointer.stage(target).await?;
+                tracing::info!(target, "replay target version staged");
+                Ok(target)
+            }
+        }
+    }
+
     /// Run the projection stream.
     ///
     /// Checks `REPLAY` env var to determine mode (unless overridden with `.mode()`):

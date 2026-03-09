@@ -50,6 +50,9 @@ pub trait EventLog: Send + Sync {
         after_version: Option<u64>,
     ) -> Result<Vec<PersistedEvent>>;
 
+    /// Latest global position in the log (0 if empty).
+    async fn latest_position(&self) -> Result<u64>;
+
     /// Load the latest snapshot for an aggregate.
     async fn load_snapshot(
         &self,

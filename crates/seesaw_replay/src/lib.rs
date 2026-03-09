@@ -14,11 +14,14 @@
 //! let pointer = PgPointerStore::new(db.clone()).await?;
 //! let tail = PgNotifyTailSource::new(&db, "events").await?;
 //!
-//! ProjectionStream::new(&log, &pointer)
+//! let stream = ProjectionStream::new(&log, &pointer)
 //!     .tail(Box::new(tail))
-//!     .promote_if(|| health_check(&neo4j))
-//!     .run(|event| projections.apply(event))
-//!     .await?;
+//!     .promote_if(|| health_check(&neo4j));
+//!
+//! let version = stream.version().await?;  // DB version for both modes
+//! let neo4j = connect(&format!("neo4j.v{version}")).await?;
+//!
+//! stream.run(|event| projections.apply(event)).await?;
 //! ```
 //!
 //! ```bash

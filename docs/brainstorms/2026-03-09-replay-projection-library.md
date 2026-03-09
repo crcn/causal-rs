@@ -52,28 +52,26 @@ async fn main() -> Result<()> {
     let db = PgPool::connect(&env::var("DATABASE_URL")?).await?;
     let log = PgEventLog::new(db.clone());
     let pointer = PgPointerStore::new(db.clone()).await?;
+    let tail = PgNotifyTailSource::new(&db, "events").await?;
 
-    // The promoted pointer position doubles as the DB version.
-    // Replay stages the final position → promote → active = 48050.
-    // Next live boot: pointer.version() returns 48050 → connects to neo4j.v48050.
-    let version = pointer.version().await?.unwrap_or(0);
+    let stream = ProjectionStream::new(&log, &pointer)
+        .tail(Box::new(tail))
+        .promote_if(|| health_check(&neo4j));
+
+    // version() returns the right value in both modes:
+    // - Live: promoted active position (e.g., 48050)
+    // - Replay: snapshots latest_position() from event log, stages it
+    let version = stream.version().await?;
     let neo4j_db = format!("neo4j.v{version}");
     let neo4j = GraphClient::connect(&neo4j_db).await?;
     let projections = Projections::new(neo4j, db.clone());
 
-    // TailSource created by the app, passed via .tail()
-    let tail = PgNotifyTailSource::new(&db, "events").await?;
-
-    ProjectionStream::new(&log, &pointer)
-        .tail(Box::new(tail))
-        .promote_if(|| health_check(&neo4j))
-        .run(|event| projections.apply(event))
-        .await?;
+    stream.run(|event| projections.apply(event)).await?;
 }
 ```
 
 ```
-$ server                                  # live: pointer.version() → neo4j.v48050, catch up, tail
+$ server                                  # live: stream.version() → neo4j.v48050, catch up, tail
 $ REPLAY=1 server                         # replay: full read, promote, exit
 $ REPLAY=1 REPLAY_TARGETS=neo4j server    # replay neo4j only
 ```
@@ -226,7 +224,7 @@ Library only. No binary.
 - Projection logic — must be idempotent
 - Health checks via `promote_if`
 - Target filtering via `REPLAY_TARGETS` (optional)
-- Database selection derived from `pointer.version()` (e.g., `neo4j.v{position}`)
+- Database selection derived from `stream.version()` (e.g., `neo4j.v{version}`)
 - Pointer management UI (CLI subcommand, admin endpoint, whatever)
 
 ## Design Decisions (Pressure-Tested)

@@ -24,11 +24,14 @@ use seesaw_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource};
 let pointer = PgPointerStore::new(db.clone()).await?;
 let tail = PgNotifyTailSource::new(&db, "events").await?;
 
-ProjectionStream::new(&log, &pointer)
+let stream = ProjectionStream::new(&log, &pointer)
     .tail(Box::new(tail))
-    .promote_if(|| health_check(&neo4j))
-    .run(|event| projections.apply(event))
-    .await?;
+    .promote_if(|| health_check(&neo4j));
+
+let version = stream.version().await?;  // DB version for both modes
+let neo4j = connect(&format!("neo4j.v{version}")).await?;
+
+stream.run(|event| projections.apply(event)).await?;
 ```
 
 ```sh
@@ -50,7 +53,7 @@ Mode is detected from the `REPLAY` env var. Override with `.mode(Mode::Replay)` 
 Tracks position with two columns: `active` (promoted) and `staged` (last replay).
 
 ```rust
-pointer.version().await?;  // current active position (= DB version)
+stream.version().await?;   // DB version (active in live, latest_position in replay)
 pointer.status().await?;   // { active: 48000, staged: 50001 }
 pointer.promote().await?;  // staged -> active
 pointer.set(0).await?;     // reset for full rebuild

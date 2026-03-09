@@ -186,6 +186,11 @@ impl EventLog for MemoryStore {
         Ok(events)
     }
 
+    async fn latest_position(&self) -> Result<u64> {
+        let log = self.global_log.lock();
+        Ok(log.last().map(|e| e.position).unwrap_or(0))
+    }
+
     async fn load_snapshot(
         &self,
         aggregate_type: &str,
