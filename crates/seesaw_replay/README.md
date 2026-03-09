@@ -10,7 +10,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-seesaw_replay = "0.26"
+seesaw_replay = "0.26.1"
 
 # For PgPointerStore and PgNotifyTailSource:
 seesaw_replay = { version = "0.26", features = ["postgres"] }
