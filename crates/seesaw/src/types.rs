@@ -63,12 +63,6 @@ pub struct QueuedEvent {
     pub hops: i32,
     /// Retry count (for event-level failure tracking)
     pub retry_count: i32,
-    /// Batch identifier for fan-out grouping.
-    pub batch_id: Option<Uuid>,
-    /// Position inside a batch (0-based).
-    pub batch_index: Option<i32>,
-    /// Total number of items in the batch.
-    pub batch_size: Option<i32>,
     /// Handler that produced this event (None for root/initial events).
     pub handler_id: Option<String>,
     /// When event was created
@@ -85,12 +79,6 @@ pub struct EmittedEvent {
     pub event_type: String,
     /// Event payload (JSON)
     pub payload: serde_json::Value,
-    /// Batch identifier for fan-out grouping.
-    pub batch_id: Option<Uuid>,
-    /// Position inside a batch (0-based).
-    pub batch_index: Option<i32>,
-    /// Total number of items in the batch.
-    pub batch_size: Option<i32>,
     /// Handler that produced this event.
     pub handler_id: Option<String>,
     /// Original typed event (live dispatch only).
@@ -201,10 +189,6 @@ pub struct HandlerIntent {
     pub handler_id: String,
     /// Parent event for causality tracking.
     pub parent_event_id: Option<Uuid>,
-    /// Batch metadata inherited from source event.
-    pub batch_id: Option<Uuid>,
-    pub batch_index: Option<i32>,
-    pub batch_size: Option<i32>,
     /// Earliest time this handler can execute.
     pub execute_at: DateTime<Utc>,
     /// Per-handler timeout in seconds.
@@ -226,9 +210,6 @@ pub struct QueuedHandler {
     pub event_type: String,
     pub event_payload: serde_json::Value,
     pub parent_event_id: Option<Uuid>,
-    pub batch_id: Option<Uuid>,
-    pub batch_index: Option<i32>,
-    pub batch_size: Option<i32>,
     pub execute_at: DateTime<Utc>,
     pub timeout_seconds: i32,
     pub max_attempts: i32,
@@ -246,8 +227,6 @@ pub struct EventWorkerConfig {
     pub poll_interval: Duration,
     /// Maximum hop count before DLQ (infinite loop detection).
     pub max_hops: i32,
-    /// Maximum number of events a handler may emit in one batch.
-    pub max_batch_size: usize,
     /// Maximum retry count for event-level failures.
     pub max_event_retry_attempts: i32,
 }
@@ -257,7 +236,6 @@ impl Default for EventWorkerConfig {
         Self {
             poll_interval: Duration::from_millis(100),
             max_hops: 50,
-            max_batch_size: 10_000,
             max_event_retry_attempts: 3,
         }
     }
@@ -270,8 +248,6 @@ pub struct HandlerWorkerConfig {
     pub poll_interval: Duration,
     /// Default timeout for handler execution.
     pub default_timeout: Duration,
-    /// Maximum number of events a handler may emit in one batch.
-    pub max_batch_size: usize,
 }
 
 impl Default for HandlerWorkerConfig {
@@ -279,7 +255,6 @@ impl Default for HandlerWorkerConfig {
         Self {
             poll_interval: Duration::from_millis(100),
             default_timeout: Duration::from_secs(30),
-            max_batch_size: 10_000,
         }
     }
 }

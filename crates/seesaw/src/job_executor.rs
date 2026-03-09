@@ -125,16 +125,6 @@ where
         let hops = event.metadata.get("_hops")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as i32;
-        let batch_id = event.metadata.get("_batch_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok());
-        let batch_index = event.metadata.get("_batch_index")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
-        let batch_size = event.metadata.get("_batch_size")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
-
         let mut handler_intents = Vec::new();
         for handler in &matching_handlers {
             let execute_at = match handler.delay {
@@ -153,9 +143,6 @@ where
             handler_intents.push(HandlerIntent {
                 handler_id: handler.id.clone(),
                 parent_event_id: event.parent_id,
-                batch_id,
-                batch_index,
-                batch_size,
                 execute_at,
                 timeout_seconds,
                 max_attempts: handler.max_attempts as i32,
@@ -298,7 +285,6 @@ where
                 let emitted_events = self.serialize_emitted_events(
                     emitted_raw,
                     &execution,
-                    config.max_batch_size,
                 )?;
 
                 info!("Handler completed successfully: {}", execution.handler_id);
@@ -491,90 +477,17 @@ where
         &self,
         emitted: Vec<EventOutput>,
         execution: &QueuedHandler,
-        max_batch_size: usize,
     ) -> Result<Vec<EmittedEvent>> {
-        let emitted_count = emitted.len();
-        if emitted_count > max_batch_size {
-            anyhow::bail!(
-                "handler '{}' emitted {} events, exceeding max_batch_size {}",
-                execution.handler_id,
-                emitted_count,
-                max_batch_size
-            );
-        }
-
-        if emitted_count > i32::MAX as usize {
-            anyhow::bail!(
-                "handler '{}' emitted {} events, exceeding i32 batch metadata capacity",
-                execution.handler_id,
-                emitted_count
-            );
-        }
-
-        let inherited_batch = if emitted_count == 1 {
-            match (
-                execution.batch_id,
-                execution.batch_index,
-                execution.batch_size,
-            ) {
-                (Some(batch_id), Some(batch_index), Some(batch_size)) => {
-                    if batch_size <= 0
-                        || batch_index < 0
-                        || batch_index >= batch_size
-                        || batch_size as usize > max_batch_size
-                    {
-                        anyhow::bail!(
-                            "invalid inherited batch metadata: id={} index={} size={} max_batch_size={}",
-                            batch_id,
-                            batch_index,
-                            batch_size,
-                            max_batch_size
-                        );
-                    }
-                    Some((batch_id, batch_index, batch_size))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let emitted_batch_id = if emitted_count > 1 {
-            Some(Uuid::new_v5(
-                &NAMESPACE_SEESAW,
-                format!("{}-{}-batch", execution.event_id, execution.handler_id).as_bytes(),
-            ))
-        } else {
-            None
-        };
-
-        let mut result = Vec::with_capacity(emitted_count);
-        for (emitted_index, output) in emitted.into_iter().enumerate() {
+        let mut result = Vec::with_capacity(emitted.len());
+        for output in emitted {
             // Auto-register codec so the event can be decoded in the next dispatch cycle
             if let Some(codec) = &output.codec {
                 self.handlers.register_codec(codec.clone());
             }
 
-            let payload = output.payload;
-
-            let (batch_id, batch_index, batch_size) = if let Some(inherited) = inherited_batch {
-                (Some(inherited.0), Some(inherited.1), Some(inherited.2))
-            } else if emitted_count > 1 {
-                (
-                    emitted_batch_id,
-                    Some(emitted_index as i32),
-                    Some(emitted_count as i32),
-                )
-            } else {
-                (None, None, None)
-            };
-
             result.push(EmittedEvent {
                 event_type: output.event_type,
-                payload,
-                batch_id,
-                batch_index,
-                batch_size,
+                payload: output.payload,
                 handler_id: Some(execution.handler_id.clone()),
                 ephemeral: output.ephemeral,
             });
@@ -629,19 +542,6 @@ where
         // Ensure handler_id is set for causal tracking
         if emitted.handler_id.is_none() {
             emitted.handler_id = Some(execution.handler_id.clone());
-        }
-
-        // Inherit batch metadata if not set
-        if emitted.batch_id.is_none()
-            && emitted.batch_index.is_none()
-            && emitted.batch_size.is_none()
-            && execution.batch_id.is_some()
-            && execution.batch_index.is_some()
-            && execution.batch_size.is_some()
-        {
-            emitted.batch_id = execution.batch_id;
-            emitted.batch_index = execution.batch_index;
-            emitted.batch_size = execution.batch_size;
         }
 
         Ok(vec![emitted])

@@ -317,9 +317,6 @@ where
             Ok(crate::EmittedEvent {
                 event_type: output_type.clone(),
                 payload: serde_json::to_value(mapper(typed, info))?,
-                batch_id: None,
-                batch_index: None,
-                batch_size: None,
                 handler_id: None,
                 ephemeral: None,
             })
