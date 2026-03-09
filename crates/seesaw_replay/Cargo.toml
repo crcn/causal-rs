@@ -1,0 +1,29 @@
+[package]
+name = "seesaw_replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replay and projection library for seesaw event processing"
+readme = "README.md"
+
+[features]
+default = []
+postgres = ["dep:sqlx"]
+
+[dependencies]
+seesaw_core = { version = "0.26.0", path = "../seesaw" }
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[dependencies.sqlx]
+version = "0.8"
+features = ["runtime-tokio", "postgres", "chrono"]
+optional = true

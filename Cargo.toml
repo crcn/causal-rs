@@ -2,6 +2,7 @@
 members = [
     "crates/seesaw",
     "crates/seesaw_core_macros",
+    "crates/seesaw_replay",
     "crates/seesaw_utils",
     "examples/simple-order",
     "examples/http-fetcher",
