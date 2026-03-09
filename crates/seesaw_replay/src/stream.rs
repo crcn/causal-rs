@@ -17,6 +17,18 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 type PromoteGate =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<bool>> + Send>> + Send + Sync>;
+type ProgressCallback = Box<dyn Fn(ReplayProgress) + Send + Sync>;
+
+/// Progress during replay.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayProgress {
+    /// Events processed so far.
+    pub processed: usize,
+    /// Target position (from `version()`).
+    pub target: u64,
+    /// Current position in the event log.
+    pub position: u64,
+}
 
 /// Mode for projection stream execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +64,7 @@ pub struct ProjectionStream<'a> {
     pointer: &'a dyn PointerStore,
     tail_source: Option<Box<dyn TailSource>>,
     promote_gate: Option<PromoteGate>,
+    progress_callback: Option<ProgressCallback>,
     mode: Option<Mode>,
     poll_interval: Duration,
     batch_size: usize,
@@ -66,6 +79,7 @@ impl<'a> ProjectionStream<'a> {
             pointer,
             tail_source: None,
             promote_gate: None,
+            progress_callback: None,
             mode: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
             batch_size: DEFAULT_BATCH_SIZE,
@@ -121,6 +135,15 @@ impl<'a> ProjectionStream<'a> {
         self
     }
 
+    /// Optional progress callback for replay mode.
+    ///
+    /// Called at each checkpoint interval with current progress.
+    /// Ignored in live mode.
+    pub fn on_progress(mut self, callback: impl Fn(ReplayProgress) + Send + Sync + 'static) -> Self {
+        self.progress_callback = Some(Box::new(callback));
+        self
+    }
+
     /// Resolve the current version.
     ///
     /// - **Live mode**: returns the promoted `active` position from the pointer.
@@ -173,8 +196,9 @@ impl<'a> ProjectionStream<'a> {
     {
         let mut position = 0u64;
         let mut count = 0usize;
+        let target = self.log.latest_position().await?;
 
-        tracing::info!("replay starting from position 0");
+        tracing::info!(target, "replay starting from position 0");
 
         loop {
             let events = self.log.load_from(position, self.batch_size).await?;
@@ -190,14 +214,22 @@ impl<'a> ProjectionStream<'a> {
 
                 if count % self.checkpoint_interval == 0 {
                     self.pointer.stage(position).await?;
-                    tracing::info!(position, count, "replay progress");
+                    tracing::info!(position, count, target, "replay progress");
+
+                    if let Some(ref cb) = self.progress_callback {
+                        cb(ReplayProgress { processed: count, target, position });
+                    }
                 }
             }
         }
 
         // Final stage save.
         self.pointer.stage(position).await?;
-        tracing::info!(position, count, "replay complete");
+        tracing::info!(position, count, target, "replay complete");
+
+        if let Some(ref cb) = self.progress_callback {
+            cb(ReplayProgress { processed: count, target, position });
+        }
 
         // Promotion gate.
         if let Some(ref gate) = self.promote_gate {

@@ -35,7 +35,7 @@ pub mod stream;
 pub mod tail;
 
 pub use pointer::{PointerStatus, PointerStore};
-pub use stream::{Mode, ProjectionStream};
+pub use stream::{Mode, ProjectionStream, ReplayProgress};
 pub use tail::{PollTailSource, TailSource};
 
 #[cfg(feature = "postgres")]
