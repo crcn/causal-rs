@@ -11,7 +11,7 @@ default = []
 postgres = ["dep:sqlx"]
 
 [dependencies]
-seesaw_core = { version = "0.26.2", path = "../seesaw" }
+seesaw_core = { version = "0.26.3", path = "../seesaw" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

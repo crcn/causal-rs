@@ -635,3 +635,246 @@ async fn version_live_then_run_catches_up_from_version() {
     assert_eq!(positions[0], 11);
     assert_eq!(positions[positions.len() - 1], 20);
 }
+
+// ── run_batch tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_batch_replay_processes_all_events_and_promotes() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 50).await;
+
+    let count = AtomicUsize::new(0);
+
+    ProjectionStream::new(&log, &pointer)
+        .mode(Mode::Replay)
+        .run_batch(|batch| {
+            count.fetch_add(batch.len(), Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(count.load(Ordering::SeqCst), 50);
+    assert_eq!(pointer.active().await, 50);
+    assert_eq!(pointer.staged_value().await, None);
+}
+
+#[tokio::test]
+async fn run_batch_replay_callback_receives_whole_batch() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 25).await;
+
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let batch_sizes_clone = batch_sizes.clone();
+
+    ProjectionStream::new(&log, &pointer)
+        .mode(Mode::Replay)
+        .batch_size(7)
+        .run_batch(|batch| {
+            let sizes = batch_sizes_clone.clone();
+            let len = batch.len();
+            async move {
+                sizes.lock().await.push(len);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let sizes = batch_sizes.lock().await;
+    // 25 events with batch_size 7: batches of 7, 7, 7, 4
+    assert_eq!(*sizes, vec![7, 7, 7, 4]);
+    assert_eq!(pointer.active().await, 25);
+}
+
+#[tokio::test]
+async fn run_batch_replay_fail_fast_on_batch_error() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 20).await;
+
+    let call_count = AtomicUsize::new(0);
+
+    let result = ProjectionStream::new(&log, &pointer)
+        .mode(Mode::Replay)
+        .batch_size(5)
+        .run_batch(|_batch| {
+            let n = call_count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 2 {
+                    anyhow::bail!("batch 2 failed");
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+    assert!(result.is_err());
+    // 3 batches attempted (0, 1, 2) — failed on third.
+    assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    assert_eq!(pointer.active().await, 0); // not promoted
+}
+
+#[tokio::test]
+async fn run_batch_replay_checkpoints_after_each_batch() {
+    let log = MemoryStore::new();
+    append_events(&log, 15).await;
+
+    let staged_positions = Arc::new(Mutex::new(Vec::new()));
+    let staged_clone = staged_positions.clone();
+
+    struct SpyPointer2 {
+        inner: MemoryPointerStore,
+        staged_log: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl PointerStore for SpyPointer2 {
+        async fn version(&self) -> Result<Option<u64>> {
+            self.inner.version().await
+        }
+        async fn save(&self, position: u64) -> Result<()> {
+            self.inner.save(position).await
+        }
+        async fn stage(&self, position: u64) -> Result<()> {
+            self.staged_log.lock().await.push(position);
+            self.inner.stage(position).await
+        }
+        async fn promote(&self) -> Result<u64> {
+            self.inner.promote().await
+        }
+        async fn set(&self, position: u64) -> Result<()> {
+            self.inner.set(position).await
+        }
+        async fn status(&self) -> Result<PointerStatus> {
+            self.inner.status().await
+        }
+    }
+
+    let spy = SpyPointer2 {
+        inner: MemoryPointerStore::new(),
+        staged_log: staged_clone,
+    };
+
+    ProjectionStream::new(&log, &spy)
+        .mode(Mode::Replay)
+        .batch_size(5)
+        .run_batch(|_batch| async { Ok(()) })
+        .await
+        .unwrap();
+
+    let stages = staged_positions.lock().await;
+    // 3 batches: position 5, 10, 15, plus final stage (15 again).
+    assert!(stages.contains(&5), "stages: {:?}", *stages);
+    assert!(stages.contains(&10), "stages: {:?}", *stages);
+    assert!(stages.contains(&15), "stages: {:?}", *stages);
+}
+
+#[tokio::test]
+async fn run_batch_replay_progress_callback_fires() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 20).await;
+
+    let progress_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress_clone = progress_log.clone();
+
+    ProjectionStream::new(&log, &pointer)
+        .mode(Mode::Replay)
+        .batch_size(7)
+        .on_progress(move |p| {
+            progress_clone.lock().unwrap().push((p.processed, p.position, p.target));
+        })
+        .run_batch(|_batch| async { Ok(()) })
+        .await
+        .unwrap();
+
+    let log = progress_log.lock().unwrap();
+    // 3 batches (7, 7, 6) + final = 4 progress calls.
+    // Last call is the finish_replay call with processed=20.
+    assert!(log.len() >= 3);
+    let last = log.last().unwrap();
+    assert_eq!(last.0, 20); // processed
+    assert_eq!(last.1, 20); // position
+}
+
+#[tokio::test]
+async fn run_batch_replay_empty_log_still_promotes() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+
+    ProjectionStream::new(&log, &pointer)
+        .mode(Mode::Replay)
+        .run_batch(|_batch| async { Ok(()) })
+        .await
+        .unwrap();
+
+    assert_eq!(pointer.active().await, 0);
+}
+
+#[tokio::test]
+async fn run_batch_live_catches_up_from_pointer() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 20).await;
+
+    pointer.set(10).await.unwrap();
+
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let batch_sizes_clone = batch_sizes.clone();
+
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        ProjectionStream::new(&log, &pointer)
+            .mode(Mode::Live)
+            .poll_interval(std::time::Duration::from_millis(50))
+            .run_batch(|batch| {
+                let sizes = batch_sizes_clone.clone();
+                let len = batch.len();
+                async move {
+                    sizes.lock().await.push(len);
+                    Ok(())
+                }
+            }),
+    )
+    .await;
+
+    let sizes = batch_sizes.lock().await;
+    let total: usize = sizes.iter().sum();
+    assert_eq!(total, 10); // events 11..=20
+    assert_eq!(pointer.active().await, 20);
+}
+
+#[tokio::test]
+async fn run_batch_live_log_and_continue_on_error() {
+    let log = MemoryStore::new();
+    let pointer = MemoryPointerStore::new();
+    append_events(&log, 10).await;
+
+    let call_count = AtomicUsize::new(0);
+
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        ProjectionStream::new(&log, &pointer)
+            .mode(Mode::Live)
+            .batch_size(5)
+            .poll_interval(std::time::Duration::from_millis(50))
+            .run_batch(|_batch| {
+                let n = call_count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        anyhow::bail!("first batch fails");
+                    }
+                    Ok(())
+                }
+            }),
+    )
+    .await;
+
+    // Both batches processed despite first failing.
+    assert!(call_count.load(Ordering::SeqCst) >= 2);
+    // Pointer still advances past all events.
+    assert_eq!(pointer.active().await, 10);
+}

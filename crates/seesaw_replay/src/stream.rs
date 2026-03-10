@@ -171,7 +171,7 @@ impl<'a> ProjectionStream<'a> {
         }
     }
 
-    /// Run the projection stream.
+    /// Run the projection stream with per-event callbacks.
     ///
     /// Checks `REPLAY` env var to determine mode (unless overridden with `.mode()`):
     /// - Replay: full replay from position 0, promote on success, exit
@@ -185,6 +185,26 @@ impl<'a> ProjectionStream<'a> {
         match mode {
             Mode::Replay => self.run_replay(&apply).await,
             Mode::Live => self.run_live(&apply).await,
+        }
+    }
+
+    /// Run the projection stream with batch callbacks.
+    ///
+    /// Same lifecycle as `run()` but passes the whole batch from `load_from`
+    /// to the callback instead of iterating per-event. This lets consumers
+    /// batch writes (e.g. Neo4j transactions, bulk inserts).
+    ///
+    /// Checkpointing happens after each batch callback, not per-event.
+    /// The consumer owns atomicity within the batch.
+    pub async fn run_batch<F, Fut>(self, apply: F) -> Result<()>
+    where
+        F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        let mode = self.mode.unwrap_or_else(Mode::from_env);
+        match mode {
+            Mode::Replay => self.run_batch_replay(&apply).await,
+            Mode::Live => self.run_batch_live(&apply).await,
         }
     }
 
@@ -223,7 +243,46 @@ impl<'a> ProjectionStream<'a> {
             }
         }
 
-        // Final stage save.
+        self.finish_replay(position, count, target).await
+    }
+
+    /// Replay mode with batch callbacks.
+    async fn run_batch_replay<F, Fut>(&self, apply: &F) -> Result<()>
+    where
+        F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        let mut position = 0u64;
+        let mut count = 0usize;
+        let target = self.log.latest_position().await?;
+
+        tracing::info!(target, "replay starting from position 0");
+
+        loop {
+            let events = self.log.load_from(position, self.batch_size).await?;
+            if events.is_empty() {
+                break;
+            }
+
+            // Fail-fast in replay mode — bugs should stop before promotion.
+            apply(&events).await?;
+
+            count += events.len();
+            position = events.last().unwrap().position;
+
+            self.pointer.stage(position).await?;
+            tracing::info!(position, count, target, "replay progress");
+
+            if let Some(ref cb) = self.progress_callback {
+                cb(ReplayProgress { processed: count, target, position });
+            }
+        }
+
+        self.finish_replay(position, count, target).await
+    }
+
+    /// Shared replay finish: final stage, progress, promotion.
+    async fn finish_replay(&self, position: u64, count: usize, target: u64) -> Result<()> {
         self.pointer.stage(position).await?;
         tracing::info!(position, count, target, "replay complete");
 
@@ -286,7 +345,6 @@ impl<'a> ProjectionStream<'a> {
 
         // Tail loop.
         loop {
-            // Wait for signal from tail source or poll fallback.
             match &self.tail_source {
                 Some(source) => {
                     tokio::select! {
@@ -296,9 +354,7 @@ impl<'a> ProjectionStream<'a> {
                                 poll_source.wait().await?;
                             }
                         }
-                        _ = tokio::time::sleep(self.poll_interval) => {
-                            // Poll fallback fires — check for events.
-                        }
+                        _ = tokio::time::sleep(self.poll_interval) => {}
                     }
                 }
                 None => {
@@ -318,6 +374,70 @@ impl<'a> ProjectionStream<'a> {
                 position = event.position;
             }
             if !events.is_empty() {
+                self.pointer.save(position).await?;
+            }
+        }
+    }
+
+    /// Live mode with batch callbacks.
+    async fn run_batch_live<F, Fut>(&self, apply: &F) -> Result<()>
+    where
+        F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        let mut position = self.pointer.version().await?.unwrap_or(0);
+        tracing::info!(position, "live mode: catching up");
+
+        // Catch up.
+        loop {
+            let events = self.log.load_from(position, self.batch_size).await?;
+            if events.is_empty() {
+                break;
+            }
+
+            if let Err(e) = apply(&events).await {
+                tracing::warn!(
+                    error = %e,
+                    "batch projection error, skipping"
+                );
+            }
+            position = events.last().unwrap().position;
+            self.pointer.save(position).await?;
+        }
+
+        tracing::info!(position, "caught up, tailing");
+
+        // Build the fallback poll source.
+        let poll_source = PollTailSource::new(self.poll_interval);
+
+        // Tail loop.
+        loop {
+            match &self.tail_source {
+                Some(source) => {
+                    tokio::select! {
+                        result = source.wait() => {
+                            if let Err(e) = result {
+                                tracing::warn!(error = %e, "tail source error, falling back to poll");
+                                poll_source.wait().await?;
+                            }
+                        }
+                        _ = tokio::time::sleep(self.poll_interval) => {}
+                    }
+                }
+                None => {
+                    poll_source.wait().await?;
+                }
+            }
+
+            let events = self.log.load_from(position, self.batch_size).await?;
+            if !events.is_empty() {
+                if let Err(e) = apply(&events).await {
+                    tracing::warn!(
+                        error = %e,
+                        "batch projection error, skipping"
+                    );
+                }
+                position = events.last().unwrap().position;
                 self.pointer.save(position).await?;
             }
         }
