@@ -1,9 +1,10 @@
 [workspace]
 members = [
-    "crates/seesaw",
-    "crates/seesaw_core_macros",
-    "crates/seesaw_replay",
-    "crates/seesaw_utils",
+    "modules/seesaw",
+    "modules/seesaw_core_macros",
+    "modules/seesaw_replay",
+    "modules/seesaw_utils",
+    "modules/seesaw_admin",
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
