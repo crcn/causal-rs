@@ -1,40 +1,40 @@
 ---
-title: feat: Seesaw-viz Runtime Instrumentation Library
+title: feat: Causal-viz Runtime Instrumentation Library
 type: feat
 date: 2026-02-05
 ---
 
-# Seesaw-viz Runtime Instrumentation Library
+# Causal-viz Runtime Instrumentation Library
 
 ## Overview
 
-Build a comprehensive runtime visualization library for Seesaw that generates Mermaid diagrams by instrumenting live event flow through OpenTelemetry spans. The library will provide development debugging, production monitoring, and documentation generation from actual execution traces.
+Build a comprehensive runtime visualization library for Causal that generates Mermaid diagrams by instrumenting live event flow through OpenTelemetry spans. The library will provide development debugging, production monitoring, and documentation generation from actual execution traces.
 
 **Core value proposition**: Developers can see exactly how events flow through their system, which effects handle which events, how state changes propagate, and where errors occur - all without manually maintaining documentation.
 
 ## Problem Statement / Motivation
 
-Seesaw's event-driven architecture creates emergent workflows through event chains (`Event → Effect → Event → ...`). While this is powerful, it makes the system harder to understand:
+Causal's event-driven architecture creates emergent workflows through event chains (`Event → Effect → Event → ...`). While this is powerful, it makes the system harder to understand:
 
-1. **Implicit flow**: Unlike explicit workflow engines with DAGs, Seesaw's flow is defined by which effects listen to which events - spread across the codebase
+1. **Implicit flow**: Unlike explicit workflow engines with DAGs, Causal's flow is defined by which effects listen to which events - spread across the codebase
 2. **Causation chains**: When `OrderPlaced` eventually leads to `InventoryReserved` through 3 intermediate events, the connection isn't obvious from code
 3. **Debugging complexity**: Effect errors may be 5 events downstream from the root cause
 4. **Documentation drift**: Manual architecture diagrams become stale as effects are added/removed
 5. **Onboarding friction**: New developers struggle to understand the "shape" of the system without running it
 
-**Key insight from codebase**: Seesaw already instruments events and effects with OpenTelemetry spans (`seesaw.event` and `seesaw.effect` spans in `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/engine.rs:38-50`). We just need to capture and visualize these spans.
+**Key insight from codebase**: Causal already instruments events and effects with OpenTelemetry spans (`causal.event` and `causal.effect` spans in `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/engine.rs:38-50`). We just need to capture and visualize these spans.
 
 ## Proposed Solution
 
-Build `seesaw-viz` as a Rust library that:
+Build `causal-viz` as a Rust library that:
 
-1. **Captures OTEL spans** from Seesaw's existing instrumentation during runtime
+1. **Captures OTEL spans** from Causal's existing instrumentation during runtime
 2. **Reconstructs causation chains** using `event_id` + `parent_event_id` relationships
 3. **Generates Mermaid diagrams** showing event flow, effect execution, and state transitions
 4. **Supports multiple output formats**: CLI, file export, HTTP endpoint for live monitoring
 5. **Provides observer effects** for real-time span collection without external OTEL collectors
 
-**Critical design principle**: Visualization is **diagnostic, not semantic** (per existing enhancement plan at `/Users/crcn/Developer/crcn/seesaw-rs/docs/plans/2026-02-05-feat-seesaw-enhancement-patterns-plan.md:691-692`). Diagrams reflect observed events in this execution, not guaranteed causality for all executions.
+**Critical design principle**: Visualization is **diagnostic, not semantic** (per existing enhancement plan at `/Users/crcn/Developer/crcn/causal-rs/docs/plans/2026-02-05-feat-causal-enhancement-patterns-plan.md:691-692`). Diagrams reflect observed events in this execution, not guaranteed causality for all executions.
 
 ## Technical Approach
 
@@ -42,15 +42,15 @@ Build `seesaw-viz` as a Rust library that:
 
 ```
 ┌─────────────────┐
-│  Seesaw Engine  │
+│  Causal Engine  │
 │                 │
 │  ┌───────────┐  │
-│  │ Event     │  │───[span: seesaw.event]───┐
+│  │ Event     │  │───[span: causal.event]───┐
 │  │ Dispatch  │  │                           │
 │  └───────────┘  │                           │
 │                 │                           ▼
 │  ┌───────────┐  │              ┌────────────────────┐
-│  │ Effect    │  │───[span]────▶│  seesaw-viz        │
+│  │ Effect    │  │───[span]────▶│  causal-viz        │
 │  │ Execution │  │              │                    │
 │  └───────────┘  │              │  ┌──────────────┐  │
 └─────────────────┘              │  │ SpanCollector│  │
@@ -82,11 +82,11 @@ Build `seesaw-viz` as a Rust library that:
 
 #### 1. SpanCollector
 
-**Responsibility**: Capture OTEL spans from Seesaw engine using observer effects
+**Responsibility**: Capture OTEL spans from Causal engine using observer effects
 
 **Implementation approach**:
 ```rust
-// crates/seesaw-viz/src/collector.rs
+// crates/causal-viz/src/collector.rs
 
 use crossbeam::channel::{unbounded, Sender, Receiver};
 
@@ -153,7 +153,7 @@ impl SpanCollector {
 ```
 
 **Key decisions**:
-- Use observer effects (`on_any()`) rather than OTEL subscriber layer to avoid global tracing initialization issues (per `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/otel.rs` gotcha - can only init once)
+- Use observer effects (`on_any()`) rather than OTEL subscriber layer to avoid global tracing initialization issues (per `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/otel.rs` gotcha - can only init once)
 - Use lock-free crossbeam channel instead of `Mutex<Vec>` to avoid contention in high-frequency event loops
 - Non-blocking send ensures observer effect never blocks the engine, even if receiver is slow
 
@@ -163,7 +163,7 @@ impl SpanCollector {
 
 **Implementation approach**:
 ```rust
-// crates/seesaw-viz/src/graph.rs
+// crates/causal-viz/src/graph.rs
 
 pub struct EventGraph {
     nodes: HashMap<Uuid, EventNode>,
@@ -273,7 +273,7 @@ impl EventGraph {
 
 **Implementation approach**:
 ```rust
-// crates/seesaw-viz/src/mermaid.rs
+// crates/causal-viz/src/mermaid.rs
 
 pub struct MermaidRenderer {
     config: RenderConfig,
@@ -429,13 +429,13 @@ impl MermaidRenderer {
 
 **Implementation approach**:
 ```rust
-// crates/seesaw-viz/src/bin/seesaw-viz.rs
+// crates/causal-viz/src/bin/causal-viz.rs
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "seesaw-viz")]
-#[command(about = "Generate visualizations from Seesaw event traces")]
+#[command(name = "causal-viz")]
+#[command(about = "Generate visualizations from Causal event traces")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -543,17 +543,17 @@ fn main() -> Result<()> {
 
 #### Phase 1: Foundation (Core span capture)
 
-**Goal**: Capture spans from Seesaw engine and export to JSON
+**Goal**: Capture spans from Causal engine and export to JSON
 
 **Deliverables**:
 - [ ] `SpanCollector` struct with `on_any()` observer effect
-- [ ] `CapturedSpan` model matching Seesaw's span structure
+- [ ] `CapturedSpan` model matching Causal's span structure
 - [ ] JSON export/import for captured spans
 - [ ] Unit tests for span collection from simple event chains
 
 **Files to create**:
 ```
-crates/seesaw-viz/
+crates/causal-viz/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs
@@ -610,7 +610,7 @@ std::fs::write("spans.json", serde_json::to_string_pretty(&spans)?)?;
 
 **Files to create**:
 ```
-crates/seesaw-viz/src/
+crates/causal-viz/src/
 ├── graph.rs
 ├── graph/
 │   ├── builder.rs
@@ -663,7 +663,7 @@ OrderPlaced (root)
 
 **Files to create**:
 ```
-crates/seesaw-viz/src/
+crates/causal-viz/src/
 ├── mermaid.rs
 ├── mermaid/
 │   ├── flowchart.rs
@@ -707,7 +707,7 @@ graph TB
 
 #### Phase 4: CLI Tool (Command-line interface)
 
-**Goal**: Provide seesaw-viz CLI for diagram generation
+**Goal**: Provide causal-viz CLI for diagram generation
 
 **Deliverables**:
 - [ ] Binary crate with clap argument parsing
@@ -718,11 +718,11 @@ graph TB
 
 **Files to create**:
 ```
-crates/seesaw-viz/src/
+crates/causal-viz/src/
 └── bin/
-    └── seesaw-viz.rs
+    └── causal-viz.rs
 
-crates/seesaw-viz/tests/
+crates/causal-viz/tests/
 └── cli_tests.rs
 ```
 
@@ -735,22 +735,22 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 **Acceptance criteria**:
-- `seesaw-viz capture --output flow.mmd` generates diagram
-- `seesaw-viz parse spans.json -d sequence` converts JSON to diagram
+- `causal-viz capture --output flow.mmd` generates diagram
+- `causal-viz parse spans.json -d sequence` converts JSON to diagram
 - `--help` shows clear usage instructions
 - Exit codes: 0 for success, non-zero for errors
 
 **Example CLI usage**:
 ```bash
 # Capture spans from running app (requires instrumentation)
-seesaw-viz capture --duration 30 --output flow.mmd
+causal-viz capture --duration 30 --output flow.mmd
 
 # Parse pre-captured spans
-seesaw-viz parse spans.json --diagram-type sequence -o timeline.mmd
+causal-viz parse spans.json --diagram-type sequence -o timeline.mmd
 
 # Generate all diagram types
 for type in flowchart sequence state; do
-  seesaw-viz parse spans.json -d $type -o diagram_$type.mmd
+  causal-viz parse spans.json -d $type -o diagram_$type.mmd
 done
 ```
 
@@ -767,7 +767,7 @@ done
 
 **Files to create**:
 ```
-crates/seesaw-viz/src/
+crates/causal-viz/src/
 ├── server.rs
 ├── server/
 │   ├── handlers.rs
@@ -797,14 +797,14 @@ tokio = { version = "1", features = ["full"] }
 **Example server usage**:
 ```bash
 # Start server
-seesaw-viz serve --port 3000
+causal-viz serve --port 3000
 
 # Access in browser
 open http://localhost:3000
 
 # Docker deployment
-docker build -t seesaw-viz .
-docker run -p 3000:3000 seesaw-viz
+docker build -t causal-viz .
+docker run -p 3000:3000 causal-viz
 ```
 
 **UI mockup** (viewer.js):
@@ -834,7 +834,7 @@ document.getElementById('diagram-type').addEventListener('change', (e) => {
 
 **Implementation approach**:
 ```rust
-// crates/seesaw-viz/src/state.rs
+// crates/causal-viz/src/state.rs
 
 use serde::Serialize;
 use json_patch::diff as json_diff;
@@ -1119,7 +1119,7 @@ graph TB
 **Cons**:
 - Requires external services (heavy for local dev)
 - Network latency for span export
-- Jaeger UI is generic (not Seesaw-specific)
+- Jaeger UI is generic (not Causal-specific)
 - Overkill for single-process visualization
 
 **Verdict**: Keep as option for production monitoring, but prioritize in-process capture for dev/debugging. Provide `--otel-endpoint` flag for users who want external collectors.
@@ -1136,7 +1136,7 @@ graph TB
 **Cons**:
 - Requires changing user code (effects need annotations)
 - Doesn't work with on! macro (expands to multiple effects)
-- Breaks Seesaw's closure-based API (no trait needed)
+- Breaks Causal's closure-based API (no trait needed)
 
 **Verdict**: Rejected. Observer effects (`on_any()`) are already supported and require no code changes.
 
@@ -1144,7 +1144,7 @@ graph TB
 
 ### Functional Requirements
 
-- [ ] Captures event_id, parent_event_id, event_type, timestamp from Seesaw spans
+- [ ] Captures event_id, parent_event_id, event_type, timestamp from Causal spans
 - [ ] Reconstructs causation chains with correct parent-child relationships
 - [ ] Generates valid Mermaid diagrams (flowchart, sequence, state)
 - [ ] CLI tool accepts JSON input and produces diagram output
@@ -1156,7 +1156,7 @@ graph TB
 - [ ] **Performance**: Observer effect adds <5% overhead to event processing
 - [ ] **Memory**: Span buffer limited to 10,000 spans or 100MB (configurable)
 - [ ] **Latency**: Diagram generation completes in <500ms for 1000 spans
-- [ ] **Compatibility**: Works with Seesaw v0.7.6+ (closure-based API)
+- [ ] **Compatibility**: Works with Causal v0.7.6+ (closure-based API)
 
 ### Quality Gates
 
@@ -1176,12 +1176,12 @@ graph TB
 - Onboarding materials include live system diagrams
 
 **Adoption**:
-- Used in 3+ Seesaw examples (simple-order, scraping, job-queue)
+- Used in 3+ Causal examples (simple-order, scraping, job-queue)
 - Integrated into CI/CD for regression visualization (diagram diffs)
 
 ## Dependencies & Prerequisites
 
-**Seesaw version**: Requires v0.7.0+ (closure-based API, `on_any()` support)
+**Causal version**: Requires v0.7.0+ (closure-based API, `on_any()` support)
 
 **Rust version**: 1.70+ (MSRV, for async traits)
 
@@ -1300,7 +1300,7 @@ std::fs::write("flame.svg", flamegraph.render())?;
 
 ### Distributed Tracing
 
-For multi-service Seesaw deployments (job queues, webhooks):
+For multi-service Causal deployments (job queues, webhooks):
 - Use W3C trace context propagation (already planned in enhancement doc)
 - Attach `traceparent` header to external events
 - Reconstruct cross-service causation chains
@@ -1309,7 +1309,7 @@ For multi-service Seesaw deployments (job queues, webhooks):
 ### IDE Integration
 
 VS Code extension that shows live diagram in sidebar:
-- WebSocket connection to `seesaw-viz serve`
+- WebSocket connection to `causal-viz serve`
 - Click event node to jump to effect definition
 - Hover to see event payload
 
@@ -1326,7 +1326,7 @@ Grafana dashboard from captured spans:
 Compare diagrams across commits to visualize architecture changes:
 ```bash
 git show main:diagram.mmd > before.mmd
-seesaw-viz parse spans.json > after.mmd
+causal-viz parse spans.json > after.mmd
 diff before.mmd after.mmd
 ```
 
@@ -1335,11 +1335,11 @@ diff before.mmd after.mmd
 **README.md** updates:
 - Add "Visualization" section with quick start
 - Show example Mermaid diagrams
-- Link to seesaw-viz crate docs
+- Link to causal-viz crate docs
 
 **New files**:
-- `crates/seesaw-viz/README.md` - Library usage guide
-- `crates/seesaw-viz/EXAMPLES.md` - Code examples
+- `crates/causal-viz/README.md` - Library usage guide
+- `crates/causal-viz/EXAMPLES.md` - Code examples
 - `docs/patterns/observability.md` - Update with viz integration
 
 **API docs** (rustdoc):
@@ -1357,24 +1357,24 @@ diff before.mmd after.mmd
 ### Internal References
 
 **Core Architecture**:
-- `/Users/crcn/Developer/crcn/seesaw-rs/CLAUDE.md` - Architecture guidelines, observer effect pattern
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/engine.rs:38-50` - Existing OTEL span instrumentation
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/effect_registry.rs:119-123` - Effect span creation
+- `/Users/crcn/Developer/crcn/causal-rs/CLAUDE.md` - Architecture guidelines, observer effect pattern
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/engine.rs:38-50` - Existing OTEL span instrumentation
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/effect_registry.rs:119-123` - Effect span creation
 
 **Observability Foundation**:
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/otel.rs` - OTEL initialization (96 lines)
-- `/Users/crcn/Developer/crcn/seesaw-rs/docs/plans/2026-02-05-feat-seesaw-enhancement-patterns-plan.md:749-913` - Three-tier observability approach
-- `/Users/crcn/Developer/crcn/seesaw-rs/docs/plans/2026-02-05-feat-seesaw-enhancement-patterns-plan.md:688-747` - Visualization section (Mermaid generation)
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/otel.rs` - OTEL initialization (96 lines)
+- `/Users/crcn/Developer/crcn/causal-rs/docs/plans/2026-02-05-feat-causal-enhancement-patterns-plan.md:749-913` - Three-tier observability approach
+- `/Users/crcn/Developer/crcn/causal-rs/docs/plans/2026-02-05-feat-causal-enhancement-patterns-plan.md:688-747` - Visualization section (Mermaid generation)
 
 **Context Tracking**:
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/effect/context.rs` - current_event_id, parent_event_id fields
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/effect/context.rs` - current_event_id, parent_event_id fields
 
 **Critical Gotchas**:
-- `/Users/crcn/Developer/crcn/seesaw-rs/docs/plans/2026-02-05-feat-seesaw-enhancement-patterns-plan.md:1270-1281` - Event amplification loops (observer must not dispatch)
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/otel.rs` - Tracing subscriber can only init once
+- `/Users/crcn/Developer/crcn/causal-rs/docs/plans/2026-02-05-feat-causal-enhancement-patterns-plan.md:1270-1281` - Event amplification loops (observer must not dispatch)
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/otel.rs` - Tracing subscriber can only init once
 
 **Examples to Reference**:
-- `/Users/crcn/Developer/crcn/seesaw-rs/examples/simple-order/src/main.rs` - Integration point for visualization
+- `/Users/crcn/Developer/crcn/causal-rs/examples/simple-order/src/main.rs` - Integration point for visualization
 
 ### External References
 
@@ -1409,7 +1409,7 @@ diff before.mmd after.mmd
 For quick prototype (1 week, minimal viable product):
 
 ### Phase 0: Spike (1 day)
-- [ ] Add seesaw-viz crate to workspace
+- [ ] Add causal-viz crate to workspace
 - [ ] Create SpanCollector with crossbeam channel (lock-free)
 - [ ] Implement `effect::on_any()` observer that captures event_type and timestamp
 - [ ] Test with simple-order example, print captured spans to stdout
@@ -1448,7 +1448,7 @@ cargo run --example simple-order
 # Generates spans.json
 
 # Generate diagram
-cargo run --bin seesaw-viz parse spans.json -o diagram.mmd
+cargo run --bin causal-viz parse spans.json -o diagram.mmd
 
 # View in browser
 open https://mermaid.live

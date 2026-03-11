@@ -5,7 +5,7 @@ CREATE OR REPLACE FUNCTION notify_workflow_event()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify(
-        'seesaw_workflow_' || NEW.correlation_id::text,
+        'causal_workflow_' || NEW.correlation_id::text,
         'wake'
     );
     RETURN NEW;

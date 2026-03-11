@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "modules/seesaw",
-    "modules/seesaw_core_macros",
-    "modules/seesaw_replay",
-    "modules/seesaw_utils",
-    "modules/seesaw_admin",
+    "modules/causal",
+    "modules/causal_core_macros",
+    "modules/causal_replay",
+    "modules/causal_utils",
+    "modules/causal_admin",
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",

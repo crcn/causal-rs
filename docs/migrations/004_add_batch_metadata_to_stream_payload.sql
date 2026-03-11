@@ -1,10 +1,10 @@
--- Include batch metadata in seesaw_stream event payload envelopes.
+-- Include batch metadata in causal_stream event payload envelopes.
 -- Safe to run multiple times.
 
 CREATE OR REPLACE FUNCTION stream_event_dispatched()
 RETURNS TRIGGER AS $$
 BEGIN
-    INSERT INTO seesaw_stream (
+    INSERT INTO causal_stream (
         stream_type,
         correlation_id,
         event_id,
@@ -25,7 +25,7 @@ BEGIN
         NEW.created_at
     );
 
-    PERFORM pg_notify('seesaw_stream', NEW.correlation_id::text);
+    PERFORM pg_notify('causal_stream', NEW.correlation_id::text);
 
     RETURN NEW;
 END;

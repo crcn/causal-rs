@@ -1,21 +1,21 @@
 # Brainstorm: Visualization Inspiration from FBP (n8n, NofLo, Temporal, Restate)
 
 **Date:** 2026-03-11
-**Context:** Exploring what seesaw's CausalFlowPane can learn from flow-based programming tools and durable execution UIs
+**Context:** Exploring what causal's CausalFlowPane can learn from flow-based programming tools and durable execution UIs
 
 ## Current State
 
-Seesaw already has two graph visualizations in the rootsignal admin app:
+Causal already has two graph visualizations in the rootsignal admin app:
 
 1. **CausalFlowPane** — ReactFlow + dagre DAG showing the `Event → Handler → Event` causal tree for a specific run. Event-type nodes grouped by `(handlerId, name)`, handler nodes with live status (pending/running/done/error), causal chain highlighting, handler `describe()` blocks rendered inline (progress bars, checklists, counters, status indicators), duration badges, handler filtering. Polls every 5s.
 
-2. **ForceGraph** — d3-force canvas renderer for the Neo4j domain knowledge graph (Gatherings, Resources, Actors, Locations). Separate concern from seesaw flow visualization.
+2. **ForceGraph** — d3-force canvas renderer for the Neo4j domain knowledge graph (Gatherings, Resources, Actors, Locations). Separate concern from causal flow visualization.
 
 The `describe()` → Block DSL → visual node pattern is the unique primitive. Handlers self-report their state into the graph. Everything below extends what that primitive can do.
 
-## Comparison: Where Seesaw Sits
+## Comparison: Where Causal Sits
 
-|  | n8n / NofLo | Temporal | Restate | Seesaw |
+|  | n8n / NofLo | Temporal | Restate | Causal |
 |---|---|---|---|---|
 | **Graph type** | Static wiring (design-time) | Linear timeline (event list) | Journal list | Causal DAG (runtime) |
 | **Data inspection** | Click any edge to see payload | Click event for details | Click invocation for journal | Counts only (today) |
@@ -69,9 +69,9 @@ Temporal shows event history. Restate shows journal entries. Neither shows *doma
 
 ### 5. Pin & Replay (n8n's Data Pinning for Event Sourcing)
 
-n8n lets you freeze a node's output and re-run downstream with frozen data. For seesaw: pick any event in the graph, "pin" it, and re-run just the downstream handlers from that point.
+n8n lets you freeze a node's output and re-run downstream with frozen data. For causal: pick any event in the graph, "pin" it, and re-run just the downstream handlers from that point.
 
-Seesaw already has `ctx.run()` journaling and event replay infrastructure.
+Causal already has `ctx.run()` journaling and event replay infrastructure.
 
 **Implementation sketch:** Right-click event node → "Replay from here." Backend creates a new correlation with the pinned event as root, runs settlement. New run appears in the flow pane.
 
@@ -109,7 +109,7 @@ NofLo's subgraphs let you collapse a sub-network into a single node. The handler
 
 Markdown-formatted annotations on the canvas. Drop a note explaining *why* a handler exists or *what to watch for*. Persisted per-run or per-topology.
 
-**Implementation sketch:** Add a "note" node type to ReactFlow. Persist in a `seesaw_flow_annotations` table keyed by `(run_id | "topology", position_x, position_y, content)`.
+**Implementation sketch:** Add a "note" node type to ReactFlow. Persist in a `causal_flow_annotations` table keyed by `(run_id | "topology", position_x, position_y, content)`.
 
 **Why it matters:** Low effort, surprisingly high value for team communication.
 
@@ -123,9 +123,9 @@ If picking three to build first:
 
 ## Lineage
 
-The deeper lineage: **FBP** (Morrison) → **Actor model** (Hewitt) → **Event sourcing** (Fowler) → **Durable execution** (Temporal) → Seesaw takes the event sourcing + durable execution branch but keeps FBP-style "compose by wiring reactive nodes" ergonomics.
+The deeper lineage: **FBP** (Morrison) → **Actor model** (Hewitt) → **Event sourcing** (Fowler) → **Durable execution** (Temporal) → Causal takes the event sourcing + durable execution branch but keeps FBP-style "compose by wiring reactive nodes" ergonomics.
 
-The n8n/NofLo vibe is real at the topological level — all are "data flows through a graph of processing nodes." But seesaw diverges in having persistent event logs, aggregates, journaled side effects, and settlement. The visualization should lean into those differences, not imitate the FBP tools.
+The n8n/NofLo vibe is real at the topological level — all are "data flows through a graph of processing nodes." But causal diverges in having persistent event logs, aggregates, journaled side effects, and settlement. The visualization should lean into those differences, not imitate the FBP tools.
 
 The `describe()` Block DSL is the unique primitive that none of the others have. Every idea above extends what that primitive can do.
 

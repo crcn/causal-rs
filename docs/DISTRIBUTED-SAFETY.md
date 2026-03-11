@@ -2,14 +2,14 @@
 
 **Last Updated:** 2026-02-06
 
-This guide explains how to write Seesaw handlers that are safe for multi-worker distributed deployments.
+This guide explains how to write Causal handlers that are safe for multi-worker distributed deployments.
 
 ## Quick Start
 
 ### ✅ Safe Pattern
 
 ```rust
-use seesaw_core::{Engine, DistributedSafe};
+use causal_core::{Engine, DistributedSafe};
 use sqlx::PgPool;
 
 // Safe for distributed workers
@@ -49,7 +49,7 @@ struct BadDeps {
 
 ## The Problem
 
-When you run multiple Seesaw workers as separate processes:
+When you run multiple Causal workers as separate processes:
 
 ```
 Worker 1 starts → Deps { cache: {} }

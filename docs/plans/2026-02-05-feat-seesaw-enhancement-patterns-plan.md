@@ -1,23 +1,23 @@
 ---
-title: Seesaw Enhancement Patterns - Job Queues, Workflows, Distributed Systems, and Edge Computing
+title: Causal Enhancement Patterns - Job Queues, Workflows, Distributed Systems, and Edge Computing
 type: feat
 date: 2026-02-05
 status: draft
 ---
 
-# Seesaw Enhancement Patterns
+# Causal Enhancement Patterns
 
 ## Overview
 
-This plan explores integration patterns for extending Seesaw's event-driven runtime with advanced capabilities while maintaining its minimalist philosophy. The goal is to provide **seamless, ergonomic patterns** for job queues, workflow orchestration, distributed systems (NATS), state machines, workflows, observability (OTEL), and edge computing deployment.
+This plan explores integration patterns for extending Causal's event-driven runtime with advanced capabilities while maintaining its minimalist philosophy. The goal is to provide **seamless, ergonomic patterns** for job queues, workflow orchestration, distributed systems (NATS), state machines, workflows, observability (OTEL), and edge computing deployment.
 
-**Key Principle**: Seesaw remains a lightweight event-driven runtime. These enhancements are **patterns and integration guides**, not framework additions. We avoid turning Seesaw into a workflow engine, workflow, or distributed actor system.
+**Key Principle**: Causal remains a lightweight event-driven runtime. These enhancements are **patterns and integration guides**, not framework additions. We avoid turning Causal into a workflow engine, workflow, or distributed actor system.
 
 ### Critical Guardrails (Incorporated from Feedback)
 
 This plan has been hardened with the following protections:
 
-1. **Anti-Patterns First** (Phase 0): Document what Seesaw is NOT before documenting patterns
+1. **Anti-Patterns First** (Phase 0): Document what Causal is NOT before documenting patterns
 2. **Idempotency Mandatory**: All external integration patterns include re-entrancy guards
 3. **No Integration Crates**: Provide copy-paste patterns, not maintenance-heavy crates
 4. **State Machine Decision Rule**: <10 transitions = stay implicit, >10 = consider library
@@ -30,7 +30,7 @@ The maturity path is **proven patterns**, not feature creep.
 
 ## Problem Statement
 
-Seesaw currently excels at:
+Causal currently excels at:
 - Simple event → effect → event flows
 - Local state management
 - Cross-domain event coordination
@@ -68,13 +68,13 @@ However, users need guidance on:
 ### Key Insights
 1. **Transactional Outbox** is the gold standard for reliable event publishing
 2. **Context Propagation** through event metadata enables distributed tracing
-3. **Choreography-based workflows** align perfectly with Seesaw's decentralized model
-4. **Stateless engine design** makes Seesaw ideal for serverless/edge deployment
+3. **Choreography-based workflows** align perfectly with Causal's decentralized model
+4. **Stateless engine design** makes Causal ideal for serverless/edge deployment
 5. **Effect boundaries** are natural span creation points for observability
 
 ## Proposed Solution
 
-Enhance Seesaw with **documented patterns and optional integration examples** across seven categories.
+Enhance Causal with **documented patterns and optional integration examples** across seven categories.
 
 ### Philosophy Enforcement: "Libraries Over Abstractions" Checklist
 
@@ -86,11 +86,11 @@ Every pattern in this plan must pass this checklist:
 - [ ] Hidden state (❌ reject)
 - [x] Plain Rust + direct library usage (✅ accept)
 
-If a pattern introduces runtime concepts, DSLs, or hidden state, it does not belong in Seesaw.
+If a pattern introduces runtime concepts, DSLs, or hidden state, it does not belong in Causal.
 
 ### 1. Job Queue Integration Patterns
 
-**Pattern**: Effects dispatch to job queues; job workers emit completion events back to Seesaw.
+**Pattern**: Effects dispatch to job queues; job workers emit completion events back to Causal.
 
 **Implementation Options**:
 
@@ -117,7 +117,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
     Ok(JobEnqueued { order_id: event.order_id })
 });
 
-// Worker pool processes jobs and dispatches events to Seesaw
+// Worker pool processes jobs and dispatches events to Causal
 async fn job_worker(mut rx: mpsc::Receiver<Job>, engine: Engine<State, Deps>) {
     while let Some(job) = rx.recv().await {
         let event = match job.process().await {
@@ -125,7 +125,7 @@ async fn job_worker(mut rx: mpsc::Receiver<Job>, engine: Engine<State, Deps>) {
             Err(e) => JobFailed { job_id: job.id, error: e.to_string() },
         };
 
-        // Dispatch completion event back to Seesaw engine
+        // Dispatch completion event back to Causal engine
         let handle = engine.activate(State::default());
         handle.run(|_ctx| Ok(event)).unwrap();
         handle.settled().await.unwrap();
@@ -135,7 +135,7 @@ async fn job_worker(mut rx: mpsc::Receiver<Job>, engine: Engine<State, Deps>) {
 
 **⚠️ Critical: Idempotency & Re-entrancy**
 
-When external systems (job workers, webhooks, NATS subscribers) dispatch events back to Seesaw, you **must** prevent event amplification loops:
+When external systems (job workers, webhooks, NATS subscribers) dispatch events back to Causal, you **must** prevent event amplification loops:
 
 ```rust
 // ❌ BAD: Infinite loop risk
@@ -191,8 +191,8 @@ async fn process_order(job: ProcessOrderJob, ctx: JobContext) -> Result<()> {
     // Process job
     ctx.deps().order_service.process(job.order_id).await?;
 
-    // Dispatch completion event back to Seesaw engine
-    let engine = ctx.deps().seesaw_engine;
+    // Dispatch completion event back to Causal engine
+    let engine = ctx.deps().causal_engine;
     let handle = engine.activate(State::default());
     handle.run(|_ctx| Ok(OrderProcessed {
         order_id: job.order_id
@@ -428,12 +428,12 @@ effect::on::<InventoryReserved>().then(|event, ctx| async move {
 **Architecture**:
 ```
 ┌─────────────────┐
-│ Seesaw Instance │──┐
+│ Causal Instance │──┐
 │  (us-east-1a)   │  │
 └─────────────────┘  │
                      ├──> NATS JetStream ──> Stream: SEESAW_EVENTS
 ┌─────────────────┐  │
-│ Seesaw Instance │──┘
+│ Causal Instance │──┘
 │  (us-west-2b)   │
 └─────────────────┘
 ```
@@ -442,13 +442,13 @@ effect::on::<InventoryReserved>().then(|event, ctx| async move {
 ```rust
 use async_nats::jetstream;
 
-pub struct DistributedSeesawRuntime {
+pub struct DistributedCausalRuntime {
     engine: Engine<State, Deps>,
     nats_client: async_nats::Client,
     instance_id: String,
 }
 
-impl DistributedSeesawRuntime {
+impl DistributedCausalRuntime {
     pub async fn new(nats_url: &str, instance_id: String) -> Result<Self> {
         let client = async_nats::connect(nats_url).await?;
 
@@ -483,7 +483,7 @@ impl DistributedSeesawRuntime {
         while let Some(msg) = messages.next().await {
             let event: Event = serde_json::from_slice(&msg.payload)?;
 
-            // Process event in Seesaw
+            // Process event in Causal
             let handle = self.engine.activate(State::default());
             handle.run(|_ctx| Ok(event.clone())).await?;
             handle.settled().await?;
@@ -529,7 +529,7 @@ effect::on::<OrderCompleted>().then(|event, ctx| async move {
 // Use NATS Key-Value for distributed state
 pub async fn sync_state_via_nats(jetstream: jetstream::Context) -> Result<()> {
     let kv = jetstream.create_key_value(jetstream::kv::Config {
-        bucket: "seesaw_state".to_string(),
+        bucket: "causal_state".to_string(),
         history: 10,
         ..Default::default()
     }).await?;
@@ -669,7 +669,7 @@ impl PaymentStateMachine {
     }
 }
 
-// Integrate with Seesaw effects
+// Integrate with Causal effects
 effect::on::<PaymentEvent>().then(|event, ctx| async move {
     let mut machine = ctx.deps().payment_machine.lock().await;
 
@@ -743,7 +743,7 @@ effect::on_any().then(|event, ctx| async move {
 
 **Documentation Additions**:
 - `docs/patterns/visualization.md` - Workflow visualization guide
-- Tool: `seesaw-viz` CLI for generating diagrams from event logs
+- Tool: `causal-viz` CLI for generating diagrams from event logs
 - Integration with Jaeger/Zipkin for runtime visualization
 
 ### 6. Observability (OpenTelemetry)
@@ -859,13 +859,13 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 ```rust
 use opentelemetry::metrics::{Counter, Histogram};
 
-pub struct SeesawMetrics {
+pub struct CausalMetrics {
     events_dispatched: Counter<u64>,
     effect_duration: Histogram<f64>,
     effect_errors: Counter<u64>,
 }
 
-impl SeesawMetrics {
+impl CausalMetrics {
     pub fn record_event_dispatched(&self, event_type: &str) {
         self.events_dispatched.add(1, &[KeyValue::new("event_type", event_type.to_string())]);
     }
@@ -916,7 +916,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 
 **Pattern**: Make EVERY event durable via queue + transactional outbox to enable multi-day workflows.
 
-**Discovery**: Seesaw CAN handle multi-day workflows if all events flow through a durable queue (NATS JetStream, SQS, Kafka).
+**Discovery**: Causal CAN handle multi-day workflows if all events flow through a durable queue (NATS JetStream, SQS, Kafka).
 
 **Architecture:**
 ```
@@ -1301,7 +1301,7 @@ histogram!("outbox.processing_latency_ms", latency.as_millis());
 counter!("outbox.events_published_total", 1);
 ```
 
-| Feature | Seesaw (Durable Choreography) | Temporal | SQL-Based Queue (River/pg-mq) |
+| Feature | Causal (Durable Choreography) | Temporal | SQL-Based Queue (River/pg-mq) |
 |---------|------------------------------|----------|-------------------------------|
 | **Style** | Choreography (events) | Orchestration (DSL) | Job queue (imperative) |
 | **Durability** | You implement (queue + outbox) | Automatic | ACID (Postgres) |
@@ -1331,9 +1331,9 @@ counter!("outbox.events_published_total", 1);
 
 ### 8. Edge Computing Deployment
 
-**Pattern**: Seesaw's stateless engine is ideal for serverless/edge platforms.
+**Pattern**: Causal's stateless engine is ideal for serverless/edge platforms.
 
-**Why Seesaw is Edge-Ready**:
+**Why Causal is Edge-Ready**:
 1. **Stateless Engine**: Define once, activate per-request
 2. **Minimal Dependencies**: Fast cold starts (~100ms)
 3. **No Global State**: Each invocation is isolated
@@ -1366,11 +1366,11 @@ async fn handler(event: LambdaEvent<LambdaInput>) -> Result<LambdaOutput, Error>
     let state = load_state(&event.payload.request_id).await?;
 
     // Parse event
-    let seesaw_event = parse_event(&event.payload.event_type, event.payload.payload)?;
+    let causal_event = parse_event(&event.payload.event_type, event.payload.payload)?;
 
     // Process event
     let handle = ENGINE.activate(state);
-    handle.run(|_ctx| Ok(seesaw_event)).await?;
+    handle.run(|_ctx| Ok(causal_event)).await?;
     handle.settled().await?;
 
     // Extract final state
@@ -1419,7 +1419,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 **⚠️ WASM Binary Size Warning**:
 - Cloudflare Workers have a **1MB gzipped** binary limit
-- Seesaw core + minimal deps fits easily
+- Causal core + minimal deps fits easily
 - **Do NOT** include heavy NATS clients or full OTEL exporters in WASM builds
 - Use lightweight HTTP webhooks for event distribution instead
 - For observability, use Cloudflare's built-in tracing, not full OTEL SDK
@@ -1447,7 +1447,7 @@ effect::on::<OrderCompleted>().then(|event, ctx| async move {
     eb_client.put_events()
         .entries(
             PutEventsRequestEntry::builder()
-                .source("seesaw.orders")
+                .source("causal.orders")
                 .detail_type("OrderCompleted")
                 .detail(serde_json::to_string(&event)?)
                 .build()
@@ -1471,21 +1471,21 @@ effect::on::<OrderCompleted>().then(|event, ctx| async move {
 - `examples/lambda-webhook/` - Full Lambda example
 - `examples/cloudflare-edge/` - Cloudflare Workers example
 
-## When NOT to Use Seesaw
+## When NOT to Use Causal
 
-Before implementing patterns, it's critical to understand Seesaw's boundaries:
+Before implementing patterns, it's critical to understand Causal's boundaries:
 
-### Use Seesaw For:
+### Use Causal For:
 - ✅ Event-driven coordination between services
 - ✅ Reactive workflows (event → effect → event)
 - ✅ Cross-domain event propagation
 - ✅ Stateless edge functions
 - ✅ Choreography-based workflows
 
-### Use Seesaw With Caution For:
+### Use Causal With Caution For:
 - ⚠️ **Long-running durable workflows** → Consider Temporal/Restate OR use "everything in queue" pattern
   - Example: Multi-day approval processes, human-in-the-loop workflows
-  - **Seesaw CAN handle this** if you:
+  - **Causal CAN handle this** if you:
     - Make ALL events durable (NATS JetStream, SQS, Kafka)
     - Implement transactional outbox pattern
     - Track workflow context in events (correlation_id, correlation_id)
@@ -1499,26 +1499,26 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
     - Need visual workflow designer
   - See: `docs/patterns/durable-choreography-workflows.md`
 
-### Do NOT Use Seesaw For:
+### Do NOT Use Causal For:
 
 - ❌ **Complex orchestration with branching logic** → Use workflow engines
   - Example: If/else trees, parallel splits with join points, loops
-  - Reason: Orchestration introduces central coordinator, violating Seesaw's choreography model
+  - Reason: Orchestration introduces central coordinator, violating Causal's choreography model
 
 - ❌ **Job queues with complex scheduling** → Use dedicated job systems
   - Example: Cron-like schedules, priority queues with preemption, rate limiting
-  - Reason: Seesaw dispatches events immediately; it's not a scheduler
+  - Reason: Causal dispatches events immediately; it's not a scheduler
 
 - ❌ **Distributed transactions** → Use workflows or 2PC coordinators
   - Example: Multi-database atomic commits
-  - Reason: Seesaw provides choreography patterns, not distributed transaction guarantees
+  - Reason: Causal provides choreography patterns, not distributed transaction guarantees
 
 - ❌ **Actor model systems** → Use Actix or similar
   - Example: Stateful entities with mailboxes, supervision trees
-  - Reason: Seesaw is stateless; actors are stateful
+  - Reason: Causal is stateless; actors are stateful
 
 ### The Bright Line:
-**If you're thinking "I need Seesaw to manage X", stop. Seesaw doesn't manage—it coordinates.** Use Seesaw to wire together systems that already solve X.
+**If you're thinking "I need Causal to manage X", stop. Causal doesn't manage—it coordinates.** Use Causal to wire together systems that already solve X.
 
 ## Technical Approach
 
@@ -1527,27 +1527,27 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 **Note on Phasing**: Phases 1 and 2 should be done in tight loops. Writing examples often reveals ergonomic issues that documentation alone misses. Iterate between docs and code.
 
 #### Phase 0: Anti-Patterns & Boundaries (1 week)
-**Goal**: Define what Seesaw is NOT before documenting what it is.
+**Goal**: Define what Causal is NOT before documenting what it is.
 
-- [ ] Write `docs/anti-patterns.md` - "When NOT to use Seesaw"
+- [ ] Write `docs/anti-patterns.md` - "When NOT to use Causal"
 - [ ] Document common misuse patterns:
   - [ ] Event amplification loops (re-entrancy footguns)
-  - [ ] Using Seesaw as a workflow
+  - [ ] Using Causal as a workflow
   - [ ] Treating visualization as source of truth
   - [ ] Over-abstracting with unnecessary FSM libraries
-  - [ ] Building "Seesaw adapters" for every library
-- [ ] Create decision tree: "Should I use Seesaw for X?"
+  - [ ] Building "Causal adapters" for every library
+- [ ] Create decision tree: "Should I use Causal for X?"
 - [ ] Add examples of **what to use instead** for each anti-pattern
 
 **Success Criteria**:
 - Anti-patterns doc prevents most common GitHub issues
-- Users can self-select whether Seesaw fits their use case
+- Users can self-select whether Causal fits their use case
 - Document sharpens all subsequent pattern guides
 
 **Why This First**: Writing anti-patterns forces clarity on boundaries, which makes all other documentation sharper and more honest.
 
 #### Phase 1: Documentation & Patterns (2 weeks)
-**Goal**: Document integration patterns without code changes to Seesaw core.
+**Goal**: Document integration patterns without code changes to Causal core.
 
 - [ ] Create `docs/patterns/` directory
 - [ ] Write `job-queues.md` with apalis/asynq examples
@@ -1562,7 +1562,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 **Success Criteria**:
 - All patterns documented with code examples
 - Clear decision trees for choosing patterns
-- No breaking changes to Seesaw core
+- No breaking changes to Causal core
 
 #### Phase 2: Example Implementations (3 weeks)
 **Goal**: Create working examples demonstrating each pattern.
@@ -1579,7 +1579,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 
 **Success Criteria**:
 - All examples run successfully
-- Examples follow Seesaw philosophy (libraries over abstractions)
+- Examples follow Causal philosophy (libraries over abstractions)
 - Clear README for each example
 
 #### Phase 3: Integration Patterns (Not Crates) (4 weeks)
@@ -1600,12 +1600,12 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 - Patterns are self-contained and copy-paste ready
 - No new core dependencies
 - Users can adapt patterns without waiting for crate updates
-- Zero maintenance burden on Seesaw core team
+- Zero maintenance burden on Causal core team
 
 #### Phase 4: Tooling & Visualization (2 weeks)
 **Goal**: Build developer tools for workflow visualization.
 
-- [ ] `seesaw-viz` CLI tool for generating Mermaid diagrams
+- [ ] `causal-viz` CLI tool for generating Mermaid diagrams
 - [ ] Event log → diagram converter
 - [ ] Integration with Jaeger/Zipkin for runtime traces
 - [ ] Web UI for visualizing event flows (optional)
@@ -1617,16 +1617,16 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 ### Alternative Approaches Considered
 
 #### Alternative 1: Framework Approach
-**Description**: Turn Seesaw into a full-featured workflow engine with built-in job queue, retry logic, and state machine DSL.
+**Description**: Turn Causal into a full-featured workflow engine with built-in job queue, retry logic, and state machine DSL.
 
 **Rejected Because**:
-- Violates Seesaw's minimalist philosophy
+- Violates Causal's minimalist philosophy
 - Creates framework lock-in
 - Increases maintenance burden
 - Users lose flexibility to choose best tools
 
 #### Alternative 2: Adapter Ecosystem
-**Description**: Create adapters for popular libraries (seesaw-http, seesaw-anthropic, etc.).
+**Description**: Create adapters for popular libraries (causal-http, causal-anthropic, etc.).
 
 **Rejected Because**:
 - Marked as CANCELLED in ADAPTER_ECOSYSTEM_PLAN.md
@@ -1668,7 +1668,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 - [ ] All examples pass CI/CD tests
 - [ ] Documentation reviewed for clarity and completeness
 - [ ] CLAUDE.md updated with pattern references
-- [ ] No new dependencies in core Seesaw (only in examples/optional crates)
+- [ ] No new dependencies in core Causal (only in examples/optional crates)
 - [ ] Community feedback positive on initial patterns
 
 ## Success Metrics
@@ -1682,8 +1682,8 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 ## Dependencies & Prerequisites
 
 ### Internal Dependencies
-- Seesaw v0.7.6+ (stateless engine API)
-- `seesaw-outbox` crate (for transactional outbox pattern)
+- Causal v0.7.6+ (stateless engine API)
+- `causal-outbox` crate (for transactional outbox pattern)
 - Existing examples infrastructure
 
 ### External Dependencies
@@ -1716,7 +1716,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 ### Risk 1: Complexity Creep
 **Likelihood**: Medium → Low (after Phase 0)
 **Impact**: High
-**Description**: Patterns become too complex, violating Seesaw's simplicity.
+**Description**: Patterns become too complex, violating Causal's simplicity.
 
 **Mitigation**:
 - Phase 0 anti-patterns doc enforces boundaries
@@ -1732,11 +1732,11 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 **Description**: Integration "crates" break when NATS, AWS SDK, or OTEL change APIs.
 
 **Mitigation**:
-- **Do NOT create formal integration crates** (`seesaw-nats`, etc.)
+- **Do NOT create formal integration crates** (`causal-nats`, etc.)
 - Provide **copy-paste patterns** in `patterns/` directory instead
 - Users own and customize the integration code
 - Version compatibility documented per pattern
-- No maintenance burden on Seesaw core team
+- No maintenance burden on Causal core team
 - Users upgrade patterns on their own schedule
 
 ### Risk 3: Dependency Bloat
@@ -1745,7 +1745,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 **Description**: Example dependencies creep into user projects.
 
 **Mitigation**:
-- Keep core Seesaw dependency-minimal (only tokio, anyhow, serde)
+- Keep core Causal dependency-minimal (only tokio, anyhow, serde)
 - Examples use separate Cargo.toml files
 - Document dependency trade-offs in pattern guides
 - Provide "no dependencies" patterns first (e.g., tokio channels before apalis)
@@ -1753,18 +1753,18 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 ### Risk 3: Documentation Drift
 **Likelihood**: Medium
 **Impact**: Medium
-**Description**: Examples become outdated as Seesaw evolves.
+**Description**: Examples become outdated as Causal evolves.
 
 **Mitigation**:
 - Add examples to CI/CD test suite
-- Version examples with Seesaw releases
+- Version examples with Causal releases
 - Include "last updated" dates in documentation
 - Automate example testing in PR checks
 
 ### Risk 4: Edge Computing Limitations
 **Likelihood**: Low
 **Impact**: Low
-**Description**: Seesaw's model doesn't fit edge constraints (cold starts, timeouts).
+**Description**: Causal's model doesn't fit edge constraints (cold starts, timeouts).
 
 **Mitigation**:
 - Document edge limitations clearly (15-minute Lambda timeout)
@@ -1778,7 +1778,7 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 
 1. **Benchmarking Suite**: Add performance benchmarks for distributed patterns
 2. **Admin UI**: Web interface for visualizing live event flows
-3. **Testing Helpers**: `seesaw-test` crate with mocking utilities
+3. **Testing Helpers**: `causal-test` crate with mocking utilities
 4. **Schema Registry**: Optional event schema validation (Avro/Protobuf)
 5. **Multi-Language Support**: Polyglot event bus (Node.js, Python workers)
 
@@ -1794,8 +1794,8 @@ Before implementing patterns, it's critical to understand Seesaw's boundaries:
 ### New Documentation (Priority Order)
 
 **Phase 0 - Boundaries**:
-- `docs/anti-patterns.md` - When NOT to use Seesaw (write this first!)
-- `docs/decision-tree.md` - "Should I use Seesaw?" flowchart
+- `docs/anti-patterns.md` - When NOT to use Causal (write this first!)
+- `docs/decision-tree.md` - "Should I use Causal?" flowchart
 
 **Phase 1 - Core Patterns**:
 - `docs/patterns/job-queues.md` - Job queue integration patterns (includes idempotency section)
@@ -1831,11 +1831,11 @@ Each example includes:
 ## References
 
 ### Internal References
-- `/Users/crcn/Developer/crcn/seesaw-rs/CLAUDE.md` - Architecture guidelines
-- `/Users/crcn/Developer/crcn/seesaw-rs/README.md` - API documentation
-- `/Users/crcn/Developer/crcn/seesaw-rs/ADAPTER_ECOSYSTEM_PLAN.md` - Cancelled adapter plan
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/engine.rs` - Engine implementation
-- `/Users/crcn/Developer/crcn/seesaw-rs/examples/simple-order/` - Existing example pattern
+- `/Users/crcn/Developer/crcn/causal-rs/CLAUDE.md` - Architecture guidelines
+- `/Users/crcn/Developer/crcn/causal-rs/README.md` - API documentation
+- `/Users/crcn/Developer/crcn/causal-rs/ADAPTER_ECOSYSTEM_PLAN.md` - Cancelled adapter plan
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/engine.rs` - Engine implementation
+- `/Users/crcn/Developer/crcn/causal-rs/examples/simple-order/` - Existing example pattern
 
 ### External References
 
@@ -1880,26 +1880,26 @@ Each example includes:
 |---------|-------------|-----------------|----------|----------------|
 | Job Queues | No | No | Yes (apalis, asynq) | Yes |
 | Sagas | No | No | Yes (ecommerce) | Yes |
-| NATS | No | Yes (seesaw-nats) | Yes | Yes |
+| NATS | No | Yes (causal-nats) | Yes | Yes |
 | State Machines | No | No | Yes (statig) | Yes |
-| OTEL | No | Yes (seesaw-otel) | Yes | Yes |
-| Lambda | No | Yes (seesaw-lambda) | Yes | Yes |
+| OTEL | No | Yes (causal-otel) | Yes | Yes |
+| Lambda | No | Yes (causal-lambda) | Yes | Yes |
 | Visualization | No | No (CLI tool) | No | Yes |
 
-**Philosophy Check**: ✅ All enhancements are additive, optional, or documentation-only. Zero impact on core Seesaw.
+**Philosophy Check**: ✅ All enhancements are additive, optional, or documentation-only. Zero impact on core Causal.
 
 ---
 
 ## Summary: What This Plan Accomplishes
 
-This plan moves Seesaw from **"how do I use this?"** to **"how do I build production systems with this?"** without turning it into a framework.
+This plan moves Causal from **"how do I use this?"** to **"how do I build production systems with this?"** without turning it into a framework.
 
 ### What We're Building:
 1. **Anti-patterns document** - Prevents misuse before it happens
 2. **Eight integration patterns** - Job queues, sagas, distributed, FSMs, durable workflows, observability, visualization, edge
 3. **Working examples** - Prove patterns work, reveal ergonomic issues
 4. **Copy-paste integration modules** - Not crates, not maintenance burden
-5. **Decision rules** - When to use implicit vs explicit, Seesaw vs alternatives
+5. **Decision rules** - When to use implicit vs explicit, Causal vs alternatives
 
 ### Key Discovery: Multi-Day Workflows ARE Possible
 **With "Everything in Queue" pattern:**
@@ -1928,6 +1928,6 @@ This plan moves Seesaw from **"how do I use this?"** to **"how do I build produc
 - ❌ DSLs or magic runtime features
 
 ### Key Success Metric:
-Users can answer: **"Should I use Seesaw for X?"** before they write any code.
+Users can answer: **"Should I use Causal for X?"** before they write any code.
 
-If they choose Seesaw, they have **proven patterns** that work, not abstractions they have to learn.
+If they choose Causal, they have **proven patterns** that work, not abstractions they have to learn.

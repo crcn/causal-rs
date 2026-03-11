@@ -35,7 +35,7 @@ without domain knowledge.
 ## Key Decisions
 
 - **`describe` returns a typed struct, not `serde_json::Value`:** User code is
-  `|ctx| FinalizeGate { completed, remaining }`. Seesaw serializes internally.
+  `|ctx| FinalizeGate { completed, remaining }`. Causal serializes internally.
 
 - **Runs during `execute_event`, not `execute_handler`:** Aggregates are already
   updated (line 406 in engine.rs). We're already iterating matching handlers to
@@ -143,4 +143,4 @@ let descriptions = store.get_handler_descriptions(correlation_id).await?;
 
 ## Next Steps
 
-→ Implement in seesaw-rs, then wire up in consuming app's API + flow UI.
+→ Implement in causal-rs, then wire up in consuming app's API + flow UI.

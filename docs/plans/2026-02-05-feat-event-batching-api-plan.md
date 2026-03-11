@@ -160,7 +160,7 @@ Core contract changes required for batch/join metadata:
   - `batch_index: Option<i32>`
   - `batch_size: Option<i32>`
 - `EmittedEvent` adds optional same fields.
-- `seesaw_events` table adds nullable columns for same fields.
+- `causal_events` table adds nullable columns for same fields.
 
 ### 2) Deterministic Batched Event IDs (Critical Fix)
 
@@ -211,7 +211,7 @@ Join is implemented as a two-step durable flow:
 When a join-enabled effect intent is processed:
 
 - Acquire advisory lock for `(join_effect_id, correlation_id, batch_id_or_window_key)`.
-- Upsert source event into `seesaw_join_entries` with unique key `(join_effect_id, correlation_id, source_event_id)`.
+- Upsert source event into `causal_join_entries` with unique key `(join_effect_id, correlation_id, source_event_id)`.
 - For `.same_batch()`: seal when `received_terminal_count == expected_count` where `expected_count = batch_size`.
 - Create a flush effect intent for that `window_id`.
 - Mark append intent as completed.
@@ -308,7 +308,7 @@ AssessmentGenerationEnqueued
 
 Implemented durable tables:
 
-- `seesaw_join_entries`
+- `causal_join_entries`
   - `join_effect_id text`
   - `correlation_id uuid`
   - `source_event_id uuid`
@@ -322,7 +322,7 @@ Implemented durable tables:
   - unique `(join_effect_id, correlation_id, source_event_id)` for append idempotency
   - unique `(join_effect_id, correlation_id, batch_id, batch_index)` for terminal dedupe
 
-- `seesaw_join_windows`
+- `causal_join_windows`
   - primary key `(join_effect_id, correlation_id, batch_id)`
   - `mode text` (`same_batch`)
   - `target_count int not null`
@@ -352,7 +352,7 @@ This enables transaction-level notification coalescing while keeping correctness
 
 **Tasks**
 
-- Add `Emit<E>` type in `crates/seesaw/src/effect/types.rs`.
+- Add `Emit<E>` type in `crates/causal/src/effect/types.rs`.
 - Add output-conversion trait for `.then()` compatibility.
 - Update typed `.then()` / `.then_queue()` internals to use conversion trait.
 - Update inline and queued worker paths to flatten zero/one/many outputs.
@@ -382,14 +382,14 @@ This enables transaction-level notification coalescing while keeping correctness
 
 **Tasks**
 
-- Add `join().same_batch()` builder for typed effects in `crates/seesaw/src/effect/builders.rs`.
+- Add `join().same_batch()` builder for typed effects in `crates/causal/src/effect/builders.rs`.
 - Add join metadata to effect registration (join mode + queued-only enforcement).
 - Add durable join tables/state and locking flow in Postgres store.
 - Implement append+seal+flush flow in queued effect worker path.
 - Propagate and inherit batch metadata (`batch_id`, `batch_index`, `batch_size`) across emitted event chains.
 - Add retry-safe flush execution and DLQ behavior for join flush intents.
 - Add DLQ synthetic terminal failure emission path so failed items close same-batch windows.
-- Add in-memory join behavior in `seesaw-memory` for test parity (best-effort durability in memory).
+- Add in-memory join behavior in `causal-memory` for test parity (best-effort durability in memory).
 
 **Success Criteria**
 
@@ -569,15 +569,15 @@ effect::on::<FetchCompleted>()
 
 ## References
 
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/effect/builders.rs`
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/effect/types.rs`
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/runtime/event_worker.rs`
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/runtime/effect_worker.rs`
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw/src/store.rs`
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw-postgres/src/lib.rs`
-- `/Users/crcn/Developer/crcn/seesaw-rs/crates/seesaw-memory/src/lib.rs`
-- `/Users/crcn/Developer/crcn/seesaw-rs/docs/migrations/001_fix_pg_notify_payload_limit.sql`
-- `/Users/crcn/Developer/crcn/seesaw-rs/docs/migrations/002_add_batch_join_schema.sql`
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/effect/builders.rs`
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/effect/types.rs`
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/runtime/event_worker.rs`
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/runtime/effect_worker.rs`
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal/src/store.rs`
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal-postgres/src/lib.rs`
+- `/Users/crcn/Developer/crcn/causal-rs/crates/causal-memory/src/lib.rs`
+- `/Users/crcn/Developer/crcn/causal-rs/docs/migrations/001_fix_pg_notify_payload_limit.sql`
+- `/Users/crcn/Developer/crcn/causal-rs/docs/migrations/002_add_batch_join_schema.sql`
 
 ## Pressure-Test Matrix (Executed)
 
@@ -620,8 +620,8 @@ effect::on::<FetchCompleted>()
 
 ### Commands Run
 
-- `RUSTC_WRAPPER= cargo test -p seesaw_core -p seesaw-memory`
-- `RUSTC_WRAPPER= cargo test -p seesaw-postgres --no-run`
-- `RUSTC_WRAPPER= cargo test -p seesaw-postgres test_workflow_subscription_coalesced_notify_stress_drains_all_events -- --nocapture` (requires Docker; failed in this environment due Docker connection)
+- `RUSTC_WRAPPER= cargo test -p causal_core -p causal-memory`
+- `RUSTC_WRAPPER= cargo test -p causal-postgres --no-run`
+- `RUSTC_WRAPPER= cargo test -p causal-postgres test_workflow_subscription_coalesced_notify_stress_drains_all_events -- --nocapture` (requires Docker; failed in this environment due Docker connection)
 
 Postgres container-backed integration tests require local Docker; compile validation succeeded.

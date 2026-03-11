@@ -1,4 +1,4 @@
-# Seesaw Architecture Guidelines
+# Causal Architecture Guidelines
 
 **Mental Model**: Events are signals. Handlers react and return new events. That's it.
 
@@ -59,9 +59,9 @@ engine.dispatch(process_webhook(payload)).await?;
 
 ---
 
-## What Seesaw Is
+## What Causal Is
 
-Seesaw is an **event-driven runtime** for building reactive systems.
+Causal is an **event-driven runtime** for building reactive systems.
 
 **Core flow**: Event → Handler → Event
 
@@ -156,7 +156,7 @@ let observer_handler = handler::on_any().then(|event, ctx| async move {
 When handling enum events with multiple variants, the `on!` macro provides concise syntax that mirrors Rust's `match`:
 
 ```rust
-use seesaw::on;
+use causal::on;
 
 // Match-like syntax with Event::Variant patterns
 let handlers = on! {
@@ -332,11 +332,11 @@ handler::on::<RowParsed>()
 ```
 
 **How accumulate works:**
-1. Events with same `batch_id` are accumulated in `seesaw_join_entries` table
+1. Events with same `batch_id` are accumulated in `causal_join_entries` table
 2. Per-event handler is skipped (no-op)
 3. When all events in batch arrive (based on `batch_size`), accumulate handler fires
 4. Accumulate handler receives `Vec<Event>` with all accumulated events
-5. Window marked complete in `seesaw_join_windows` table
+5. Window marked complete in `causal_join_windows` table
 
 **Accumulate properties:**
 - **Durable**: Accumulate state persisted in database, survives restarts
@@ -403,7 +403,7 @@ handler::on::<ImportEvent>()
 3. All 1000 RowParsed events inserted (same batch_id, sequential batch_index)
 4. Validate handler runs 1000 times (once per RowParsed)
 5. Each validation emits RowValidated (new batch_id per event)
-6. Accumulate handler accumulates all RowValidated in seesaw_join_entries
+6. Accumulate handler accumulates all RowValidated in causal_join_entries
 7. When all events arrived, accumulate handler fires with Vec[Row1...Row1000]
 8. Bulk insert runs once
 ```
@@ -500,7 +500,7 @@ See `examples/batch-processor/` for full working example demonstrating:
 
 ### State Management Without Reducers
 
-Seesaw uses **handlers-only** architecture. State is managed through four patterns:
+Causal uses **handlers-only** architecture. State is managed through four patterns:
 
 #### Pattern 1: Event-Threaded State (Pure, Auditable) - ✅ Distributed-Safe
 State flows as event fields. Each event carries accumulated state forward.
@@ -636,7 +636,7 @@ Workers have diverged! They'll never see each other's updates. ☠️
 
 ### Reducer (Removed in v0.9)
 
-**Reducers have been removed** from Seesaw. State is now managed by handlers through:
+**Reducers have been removed** from Causal. State is now managed by handlers through:
 - Event-threaded state (state flows through event fields)
 - Shared dependency state (Arc<Mutex<T>> in deps)
 - Implicit state (event sequences represent state)
@@ -704,9 +704,9 @@ handler::on::<OrderPlaced>()
 ```
 engine.process(OrderPlaced { id: 123 }).await?;
   ↓ [Transaction begins in EventWorker]
-  ↓ Insert OrderPlaced into seesaw_events
+  ↓ Insert OrderPlaced into causal_events
   ↓ Handler executes (same transaction)
-  ↓ Insert OrderSaved into seesaw_events
+  ↓ Insert OrderSaved into causal_events
   ↓ Mark OrderPlaced as processed
   ↓ [Transaction commits - atomic]
   ↓ pg_notify sends events to workers
@@ -741,14 +741,14 @@ handler::on::<PaymentRequested>()
 
 **Execution flow:**
 ```
-1. Event inserted into seesaw_events (Transaction A)
-2. Handler intent inserted into seesaw_handler_intents (Transaction A)
+1. Event inserted into causal_events (Transaction A)
+2. Handler intent inserted into causal_handler_intents (Transaction A)
 3. [Transaction A commits]
 4. pg_notify alerts workers
 5. Worker picks up handler intent
 6. [Transaction B begins in HandlerWorker]
 7. Handler executes
-8. Insert PaymentCharged into seesaw_events
+8. Insert PaymentCharged into causal_events
 9. Mark handler complete
 10. [Transaction B commits]
 11. pg_notify sends new events
@@ -1109,7 +1109,7 @@ handler::on::<HandlerError>()
 
 ## Handler Responsibilities
 
-Handlers are the **only** reactive primitive in Seesaw. They handle:
+Handlers are the **only** reactive primitive in Causal. They handle:
 
 - ✅ Reacting to events
 - ✅ Performing side effects (IO, API calls)
@@ -1124,7 +1124,7 @@ Handlers can be:
 - Synchronous or asynchronous
 - Inline or queued
 
-## What Seesaw Is Not
+## What Causal Is Not
 
 ### ❌ Not a workflow engine
 - No DAGs
@@ -1137,7 +1137,7 @@ Workflows **emerge** from event sequences.
 ### ❌ Not CQRS (exactly)
 
 It overlaps, but:
-- Seesaw doesn't require read models
+- Causal doesn't require read models
 - It doesn't enforce command/event segregation at the system level
 
 It's closer to **event-driven decision modeling**.
@@ -1155,7 +1155,7 @@ You don't "enter" a state. You observe that certain events have occurred.
 
 ### ❌ Not a framework that forces patterns
 
-Seesaw doesn't force you to use machines or commands.
+Causal doesn't force you to use machines or commands.
 
 If your flow is simple, use events and effects.
 If you need guards or branching, add machines.
@@ -1269,7 +1269,7 @@ The engine dispatches events. Handlers that care, react and return new events. T
 For edges that need a response:
 
 ```rust
-use seesaw::{dispatch_request, EnvelopeMatch};
+use causal::{dispatch_request, EnvelopeMatch};
 
 let entry = dispatch_request(
     EntryRequestEvent::Create { ... },

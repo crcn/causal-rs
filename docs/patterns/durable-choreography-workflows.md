@@ -1,10 +1,10 @@
-# Durable Choreography Workflows with Seesaw
+# Durable Choreography Workflows with Causal
 
-## Can Seesaw Handle Multi-Day Workflows?
+## Can Causal Handle Multi-Day Workflows?
 
 **Short Answer:** Yes, with the "everything in queue" pattern.
 
-**Long Answer:** Seesaw can support multi-day workflows if you make ALL events durable and implement proper event context tracking. This is NOT traditional event sourcing or orchestration—it's **durable choreography**.
+**Long Answer:** Causal can support multi-day workflows if you make ALL events durable and implement proper event context tracking. This is NOT traditional event sourcing or orchestration—it's **durable choreography**.
 
 ## Architecture Pattern
 
@@ -17,7 +17,7 @@
          │ Publish                       Consume    │
          │                                          │
 ┌────────┴────────┐                    ┌───────────▼──────────┐
-│  Transactional  │                    │   Seesaw Worker      │
+│  Transactional  │                    │   Causal Worker      │
 │     Outbox      │                    │   (Stateless)        │
 │  (Postgres)     │                    │                      │
 └─────────────────┘                    └──────────────────────┘
@@ -199,7 +199,7 @@ pub struct WorkflowEvent {
 
 **Key Difference from Event Sourcing:**
 
-Seesaw does NOT replay events to reconstruct state. Instead:
+Causal does NOT replay events to reconstruct state. Instead:
 
 ```rust
 effect::on::<DirectorApproved>().then(|event, ctx| async move {
@@ -306,15 +306,15 @@ effect::on::<ManagerApproved>().then(|event, ctx| async move {
 });
 ```
 
-## Comparison: Seesaw vs Temporal
+## Comparison: Causal vs Temporal
 
-| Feature | Seesaw (Durable Choreography) | Temporal |
+| Feature | Causal (Durable Choreography) | Temporal |
 |---------|------------------------------|----------|
 | **Workflow Style** | Choreography (event chains) | Orchestration (workflow DSL) |
 | **State Persistence** | Database (explicit) | Automatic (event sourcing) |
 | **Timers** | External scheduler required | Built-in durable timers |
 | **Retries** | You implement | Automatic with backoff |
-| **Visualization** | Build with seesaw-viz | Built-in UI |
+| **Visualization** | Build with causal-viz | Built-in UI |
 | **Complexity** | Simpler (no DSL) | Higher (workflow runtime) |
 | **Control** | Full (you own durability) | Managed (framework handles) |
 | **Best For** | Choreography, simple flows | Complex orchestration |
@@ -359,11 +359,11 @@ See `examples/durable-approval-workflow/` for a working example including:
 
 ## Key Takeaway
 
-**Seesaw CAN handle multi-day workflows** with the "everything in queue" + event context pattern.
+**Causal CAN handle multi-day workflows** with the "everything in queue" + event context pattern.
 
 The trade-off:
 - **You implement**: Durability, timeouts, retries, idempotency
 - **You get**: Full control, no workflow runtime, choreography-native
 
 If you want automatic durability and orchestration, use Temporal.
-If you want explicit control and choreography, use Seesaw + durable queue.
+If you want explicit control and choreography, use Causal + durable queue.

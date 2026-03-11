@@ -23,12 +23,12 @@ something to poll. But with a checkpoint, the log itself can be that something.
 
 Before:
 ```
-publish(event) → seesaw_events          // buffer copy
+publish(event) → causal_events          // buffer copy
 append_event(event) → events            // durable copy
-poll_next() → claim from seesaw_events
+poll_next() → claim from causal_events
 complete_event() → ack buffer + create handler intents
 poll_next_handler() → claim handler
-resolve_handler() → publish emitted events to seesaw_events  // buffer copy again
+resolve_handler() → publish emitted events to causal_events  // buffer copy again
                    → append_event to events                   // durable copy again
 loop
 ```
@@ -91,7 +91,7 @@ pub trait EventLog: Send + Sync {
 
 /// Where handler work items live. Relational, claimable, resolvable.
 ///
-/// Postgres seesaw_effect_executions. In-memory BTreeMap.
+/// Postgres causal_effect_executions. In-memory BTreeMap.
 #[async_trait]
 pub trait HandlerQueue: Send + Sync {
     /// Create handler intents and advance the checkpoint atomically.
@@ -328,7 +328,7 @@ applied events. No special ordering dance needed.
 With no event buffer, "pending events" becomes "events past checkpoint."
 
 **Resolution:** Compute as `SELECT COUNT(*) FROM events WHERE correlation_id = $1
-AND seq > (SELECT position FROM seesaw_checkpoints WHERE correlation_id = $1)`.
+AND seq > (SELECT position FROM causal_checkpoints WHERE correlation_id = $1)`.
 
 For rootsignal's flow diagram this is arguably better — it shows how far behind
 processing is, not how many items sit in a transient queue.
@@ -347,7 +347,7 @@ processing is, not how many items sit in a transient queue.
 | `QueuedEvent.id` (row_id) | No buffer rows to ack |
 | `HandlerCompletion.events_to_publish` | Engine appends to log directly |
 | `HandlerDlq.events_to_publish` | Engine appends to log directly |
-| `seesaw_events` table | No event buffer |
+| `causal_events` table | No event buffer |
 
 ## New Types
 
@@ -578,9 +578,9 @@ Rootsignal hasn't shipped. Clean cut, no migration.
 
 | Component | Change |
 |---|---|
-| `PostgresStore` | Split into `PostgresEventLog` (events table) + `PostgresHandlerQueue` (seesaw_effect_executions, journals, descriptions, cancellation) |
-| `seesaw_events` table | **Drop.** |
-| `seesaw_checkpoints` table | **New.** `(correlation_id, position)` |
+| `PostgresStore` | Split into `PostgresEventLog` (events table) + `PostgresHandlerQueue` (causal_effect_executions, journals, descriptions, cancellation) |
+| `causal_events` table | **Drop.** |
+| `causal_checkpoints` table | **New.** `(correlation_id, position)` |
 | `event_broadcast.rs` | No change — pg_notify still fires from events table INSERT |
 | `event_cache.rs` | No change |
 | `scout_run.rs` queries | No change |
@@ -589,7 +589,7 @@ Rootsignal hasn't shipped. Clean cut, no migration.
 
 ### Net
 
-- Drop `seesaw_events` table (~50% fewer event writes)
+- Drop `causal_events` table (~50% fewer event writes)
 - One copy of every event instead of two
 - `PostgresStore` (838 lines) → two focused structs
 - Ready to swap `PostgresEventLog` → `KurrentDbEventLog` with zero other changes
@@ -609,7 +609,7 @@ impl HandlerQueue for MemoryStore { ... }
 
 KurrentDB requires every event to go to a **named stream**. There is no
 "append to the global log" — `$all` is a derived view across all streams.
-Seesaw doesn't have an explicit stream name concept; it has
+Causal doesn't have an explicit stream name concept; it has
 `(aggregate_type, aggregate_id)` fields on `NewEvent`.
 
 Three issues:
@@ -672,7 +672,7 @@ where per-aggregate stream reads are critical for hydration performance.
 
 KurrentDB events have separate `data` and `metadata` byte arrays. Map:
 
-| Seesaw field | KurrentDB location |
+| Causal field | KurrentDB location |
 |---|---|
 | `payload` | Event `data` (JSON) |
 | `event_type` | Event `event_type` string |
@@ -807,10 +807,10 @@ Miss this and the first append after restart uses a stale/zero revision →
 
 ```
 crates/
-  seesaw/                    # EventLog + HandlerQueue traits, MemoryStore, Engine
-  seesaw_core_macros/        # existing
-  seesaw_utils/              # existing
-  seesaw-kurrentdb/          # KurrentDbEventLog (future)
+  causal/                    # EventLog + HandlerQueue traits, MemoryStore, Engine
+  causal_core_macros/        # existing
+  causal_utils/              # existing
+  causal-kurrentdb/          # KurrentDbEventLog (future)
 ```
 
 PostgresEventLog and PostgresHandlerQueue live in rootsignal until a second
@@ -837,7 +837,7 @@ but not yet processed into handler intents). This already exists today —
 panel already sees events before their handlers exist. No behavior change.
 
 **Metadata discipline:** Two non-overlapping key sets share the metadata map.
-Seesaw routing keys use underscore prefix: `_hops` (i32), `_batch_id` (UUID),
+Causal routing keys use underscore prefix: `_hops` (i32), `_batch_id` (UUID),
 `_batch_index` (i32), `_batch_size` (i32), `_handler_id` (String — handler
 that produced this event). Domain keys (rootsignal: `run_id`, `schema_v`,
 `handler_id`) are unprefixed. Routing keys MUST round-trip through the store —
@@ -939,7 +939,7 @@ benefits both old and new engine.
 ## Decisions
 
 - **Drop monolithic `Store` trait** — two traits: `EventLog` + `HandlerQueue`
-- **Kill the event buffer** — EventLog + checkpoint replaces `seesaw_events`
+- **Kill the event buffer** — EventLog + checkpoint replaces `causal_events`
 - **Correlation-primary streams for KurrentDB** — all events to `correlation-{cid}`,
   no system projection dependency in hot path, idempotency via `ExpectedRevision::Exact`
 - **Stream names are implementation details** — trait operates on logical concepts,

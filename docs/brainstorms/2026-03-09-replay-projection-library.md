@@ -2,14 +2,14 @@
 date: 2026-03-09
 topic: replay-projection-library
 status: implemented
-crate: crates/seesaw_replay
+crate: crates/causal_replay
 ---
 
-# Replay & Projection Library (`seesaw_replay`)
+# Replay & Projection Library (`causal_replay`)
 
 ## Problem
 
-Seesaw applications need to rebuild read models (Neo4j, Postgres, etc.) from the event log. Today `rootsignal-replay` does this as a bespoke CLI. With multiple projection targets coming (Neo4j + Postgres + PG NOTIFY), the shared patterns should live in seesaw.
+Causal applications need to rebuild read models (Neo4j, Postgres, etc.) from the event log. Today `rootsignal-replay` does this as a bespoke CLI. With multiple projection targets coming (Neo4j + Postgres + PG NOTIFY), the shared patterns should live in causal.
 
 ## Key Insight
 
@@ -29,9 +29,9 @@ Replay mode (REPLAY=1):
 
 Same process. Same code path. Same `apply()` function. The mode determines whether the stream tails after catch-up or exits after replay.
 
-### Relationship to seesaw core projections
+### Relationship to causal core projections
 
-`ProjectionStream` does NOT replace seesaw's inline `project("id").then()` projections. They serve different purposes:
+`ProjectionStream` does NOT replace causal's inline `project("id").then()` projections. They serve different purposes:
 
 - **`project().then()`** — runs inline during event processing, sequentially before handlers. Guarantees read-your-writes within the same causal chain. Required when handlers read graph state projected by earlier events in the same dispatch cycle.
 - **`ProjectionStream`** — runs independently, reads from EventLog asynchronously. For rebuild/replay of external read models. Small latency gap between event insertion and projection.
@@ -45,7 +45,7 @@ In rootsignal, handlers read graph state projected by earlier events in the same
 ```rust
 // main.rs
 
-use seesaw_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource};
+use causal_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -126,7 +126,7 @@ The pointer tracks event log position and doubles as the version for database se
 Auto-created on first use:
 
 ```sql
-CREATE TABLE IF NOT EXISTS seesaw_replay_pointer (
+CREATE TABLE IF NOT EXISTS causal_replay_pointer (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     active BIGINT NOT NULL DEFAULT 0,
     staged BIGINT,
@@ -204,7 +204,7 @@ pointer.set(0).await?;     // reset for full rebuild
 pointer.status().await?;   // { active: 48000, staged: 50001 }
 ```
 
-## The `seesaw_replay` Crate
+## The `causal_replay` Crate
 
 Library only. No binary.
 
@@ -243,7 +243,7 @@ Replay always writes to `staged`. Promotion copies `staged` → `active`. The `p
 
 ### Inline projections are still needed
 
-`ProjectionStream` does NOT replace `project().then()` in seesaw core. Handlers that read graph state within the same causal chain require inline projections for read-your-writes guarantees. `ProjectionStream` is for async rebuild/replay only.
+`ProjectionStream` does NOT replace `project().then()` in causal core. Handlers that read graph state within the same causal chain require inline projections for read-your-writes guarantees. `ProjectionStream` is for async rebuild/replay only.
 
 ### Idempotent projections are a hard requirement
 
@@ -277,8 +277,8 @@ REPLAY=1 REPLAY_TARGETS=neo4j rootsignal-server
 ## Prior Art
 
 - `rootsignal-replay` (354 lines) — bespoke CLI for blue-green Neo4j rebuilds. Replaced by this library.
-- Seesaw's `project("id").then()` — inline projections during live event processing (kept, not replaced)
-- Seesaw's `EventLog::load_from(position, limit)` — sequential batch reads from global log
+- Causal's `project("id").then()` — inline projections during live event processing (kept, not replaced)
+- Causal's `EventLog::load_from(position, limit)` — sequential batch reads from global log
 - EventStoreDB catch-up subscriptions — subscribe, read history, transition to live
 - Marten async daemon — background projection rebuilds with automatic switch to continuous mode
 - Axon tracking event processors — checkpoint-based replay with `ReplayStatus` for mode awareness

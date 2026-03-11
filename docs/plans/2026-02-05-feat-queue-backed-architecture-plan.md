@@ -1,12 +1,12 @@
 ---
-title: Queue-Backed Architecture for Seesaw
+title: Queue-Backed Architecture for Causal
 type: feat
 date: 2026-02-05
 status: draft
 context: Single-developer project, pragmatic approach
 ---
 
-# Queue-Backed Architecture for Seesaw
+# Queue-Backed Architecture for Causal
 
 ## Context
 
@@ -25,7 +25,7 @@ These decisions are **locked** and form the semantic contract of the system. Cha
 
 **Rationale**:
 - Storing `prev_state`/`next_state` JSON per effect execution doesn't scale (15GB/month → bloat)
-- Effect workers already load fresh state from `seesaw_state` before execution
+- Effect workers already load fresh state from `causal_state` before execution
 - Effects are side-effect handlers, not time-travelers - they operate on current reality
 
 **API Contract**:
@@ -33,7 +33,7 @@ These decisions are **locked** and form the semantic contract of the system. Cha
 effect::on::<OrderPlaced>()
     .id("send_email")
     .then(|event, ctx| async move {
-        // ctx.state() returns LATEST state from seesaw_state table
+        // ctx.state() returns LATEST state from causal_state table
         // NOT the state at the time the event was published
         let current_state = ctx.state();  // Loaded fresh from DB
 
@@ -62,7 +62,7 @@ let mut tx = pool.begin().await?;
 
 // 1. Insert emitted event (deterministic ID = idempotent)
 sqlx::query!(
-    "INSERT INTO seesaw_events (event_id, correlation_id, event_type, payload, parent_id)
+    "INSERT INTO causal_events (event_id, correlation_id, event_type, payload, parent_id)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (event_id) DO NOTHING",  // ← Already published if crash+retry
     emitted_event_id,
@@ -74,7 +74,7 @@ sqlx::query!(
 
 // 2. Mark effect complete (atomic with event insert)
 sqlx::query!(
-    "UPDATE seesaw_effect_executions
+    "UPDATE causal_effect_executions
      SET status = 'completed', completed_at = NOW()
      WHERE event_id = $1 AND effect_id = $2",
     event_id,
@@ -109,7 +109,7 @@ async fn handle_stripe_webhook(payload: StripeWebhook) -> Result<()> {
 **Schema**:
 ```sql
 -- Unique constraint prevents duplicate webhook processing
-CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
+CREATE UNIQUE INDEX idx_events_event_id ON causal_events(event_id);
 ```
 
 **Invariant**: `process()` generates random UUIDs (dev use). `process_with_id()` enforces uniqueness (production webhooks).
@@ -131,7 +131,7 @@ CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
 SELECT
     pg_advisory_xact_lock(hashtext(correlation_id::text)),  -- ← Lock workflow for transaction
     *
-FROM seesaw_events
+FROM causal_events
 WHERE processed_at IS NULL
   AND (locked_until IS NULL OR locked_until < NOW())
 ORDER BY created_at ASC  -- FIFO within available events
@@ -209,7 +209,7 @@ pub struct Runtime<S, D> {
 }
 ```
 
-**Future**: If we add Redis queue, it's a **separate crate** (`seesaw-redis`), not a trait impl.
+**Future**: If we add Redis queue, it's a **separate crate** (`causal-redis`), not a trait impl.
 
 ---
 
@@ -238,25 +238,25 @@ pub struct Runtime<S, D> {
 **Required Changes**:
 ```sql
 -- 1. Unique constraint on event_id (idempotency)
-CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
+CREATE UNIQUE INDEX idx_events_event_id ON causal_events(event_id);
 
 -- 2. Add correlation_id to effect_executions (efficient queries)
-ALTER TABLE seesaw_effect_executions ADD COLUMN correlation_id UUID NOT NULL;
-CREATE INDEX idx_effect_executions_workflow ON seesaw_effect_executions(correlation_id);
+ALTER TABLE causal_effect_executions ADD COLUMN correlation_id UUID NOT NULL;
+CREATE INDEX idx_effect_executions_workflow ON causal_effect_executions(correlation_id);
 
 -- 3. Fix claimed_at default (should be NULL for pending rows)
-ALTER TABLE seesaw_effect_executions
+ALTER TABLE causal_effect_executions
 ALTER COLUMN claimed_at DROP DEFAULT,
 ALTER COLUMN claimed_at SET DEFAULT NULL;
 
 -- 4. Retention policy (delete after 30 days)
-CREATE TABLE seesaw_events_archive (LIKE seesaw_events INCLUDING ALL);
+CREATE TABLE causal_events_archive (LIKE causal_events INCLUDING ALL);
 
 -- Daily cron job
-INSERT INTO seesaw_events_archive
-SELECT * FROM seesaw_events WHERE processed_at < NOW() - INTERVAL '30 days';
+INSERT INTO causal_events_archive
+SELECT * FROM causal_events WHERE processed_at < NOW() - INTERVAL '30 days';
 
-DELETE FROM seesaw_events WHERE processed_at < NOW() - INTERVAL '30 days';
+DELETE FROM causal_events WHERE processed_at < NOW() - INTERVAL '30 days';
 ```
 
 **Invariant**: Event and effect data is retained for 30 days for debugging, then archived.
@@ -334,7 +334,7 @@ External Event → engine.process() → Queue.publish()
                                     ├─ Inline effects (execute immediately)
                                     │  └─ Emit events → Queue.publish()
                                     └─ Queued effects (persist to DB)
-                                       └─ INSERT seesaw_effect_executions
+                                       └─ INSERT causal_effect_executions
                                               ↓
                                     Effect Worker (owned by Runtime)
                                               ↓
@@ -353,7 +353,7 @@ External Event → engine.process() → Queue.publish()
    - Receives queue reference via dependency injection
    - Stateless and reusable
 4. **PostgresStateStore** - Per-workflow state isolation with versioning (embedded in PostgresQueue)
-5. **Idempotency Layer** - seesaw_events.event_id + seesaw_effect_executions tables
+5. **Idempotency Layer** - causal_events.event_id + causal_effect_executions tables
 
 ### Effect Execution Model: Inline vs Queued
 
@@ -384,11 +384,11 @@ effect::on::<OrderPlaced>()
 - No `.delayed()`, `.retry()`, `.timeout()`, `.priority()`, or `.queued()` modifiers
 - Executes during event processing (same transaction as state update)
 - Emitted events published immediately
-- Zero Postgres overhead (no `seesaw_effect_executions` write)
+- Zero Postgres overhead (no `causal_effect_executions` write)
 
 #### Queued Effects (Opt-In)
 
-Persisted to `seesaw_effect_executions`, polled by effect workers:
+Persisted to `causal_effect_executions`, polled by effect workers:
 
 ```rust
 // ✅ Queued - has .delayed() → requires persistence
@@ -432,17 +432,17 @@ effect::on::<OrderPlaced>()
 
 **Phase 1: Event Workers** (Fast - State + Inline Effects)
 ```
-1. Poll seesaw_events (SKIP LOCKED + advisory lock for FIFO)
+1. Poll causal_events (SKIP LOCKED + advisory lock for FIFO)
 2. Load state → Run reducers → Save state
 3. For each effect:
    - If inline: Execute immediately, emit events
-   - If queued: Insert into seesaw_effect_executions
+   - If queued: Insert into causal_effect_executions
 4. Mark event processed
 ```
 
 **Phase 2: Effect Workers** (Slow - Queued Effects Only)
 ```
-1. Poll seesaw_effect_executions (where pending AND execute_at <= NOW)
+1. Poll causal_effect_executions (where pending AND execute_at <= NOW)
 2. Execute effect (retry on failure, respect timeout)
 3. Mark completed, emit next events
 ```
@@ -485,7 +485,7 @@ pub trait StateStore: Send + Sync + 'static {
 }
 ```
 
-**Postgres Implementation** (ships with seesaw):
+**Postgres Implementation** (ships with causal):
 ```rust
 pub struct PostgresQueue {
     pool: PgPool,
@@ -494,7 +494,7 @@ pub struct PostgresQueue {
 #[async_trait]
 impl Queue for PostgresQueue {
     async fn publish(&self, envelope: EventEnvelope) -> Result<()> {
-        sqlx::query!("INSERT INTO seesaw_events ...").execute(&self.pool).await?;
+        sqlx::query!("INSERT INTO causal_events ...").execute(&self.pool).await?;
         Ok(())
     }
     // ... other methods
@@ -507,7 +507,7 @@ pub struct PostgresStateStore {
 #[async_trait]
 impl StateStore for PostgresStateStore {
     async fn load<S: DeserializeOwned + Send>(&self, correlation_id: Uuid) -> Result<Option<S>> {
-        let row = sqlx::query!("SELECT state FROM seesaw_state WHERE correlation_id = $1", correlation_id)
+        let row = sqlx::query!("SELECT state FROM causal_state WHERE correlation_id = $1", correlation_id)
             .fetch_optional(&self.pool).await?;
         match row {
             Some(r) => Ok(Some(serde_json::from_value(r.state)?)),
@@ -630,13 +630,13 @@ engine.with_handler(
 
 **How it works**:
 1. Effect ID required at compile time (type-state pattern)
-2. Track executions in `seesaw_effect_executions` table
+2. Track executions in `causal_effect_executions` table
 3. Cache results, skip on replay
 4. Provide `ctx.idempotency_key` for external APIs
 
 **Schema**:
 ```sql
-CREATE TABLE seesaw_effect_executions (
+CREATE TABLE causal_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
@@ -662,7 +662,7 @@ CREATE TABLE seesaw_effect_executions (
     PRIMARY KEY (event_id, effect_id)
 );
 
-CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
+CREATE INDEX idx_effect_executions_event ON causal_effect_executions(event_id);
 ```
 
 **Compile-Time Enforcement**:
@@ -713,7 +713,7 @@ async fn run_effect_idempotent(
 
     // Check if already executed
     let cached = sqlx::query!(
-        "INSERT INTO seesaw_effect_executions (event_id, effect_id, status)
+        "INSERT INTO causal_effect_executions (event_id, effect_id, status)
          VALUES ($1, $2, 'executing')
          ON CONFLICT (event_id, effect_id)
          DO UPDATE SET last_attempted_at = NOW()
@@ -741,7 +741,7 @@ async fn run_effect_idempotent(
         Ok(result) => {
             // Store success
             sqlx::query!(
-                "UPDATE seesaw_effect_executions
+                "UPDATE causal_effect_executions
                  SET status = 'completed', result = $1, completed_at = NOW()
                  WHERE event_id = $2 AND effect_id = $3",
                 Json(&result),
@@ -756,7 +756,7 @@ async fn run_effect_idempotent(
         Err(e) => {
             // Store failure (will retry up to 3 times)
             sqlx::query!(
-                "UPDATE seesaw_effect_executions
+                "UPDATE causal_effect_executions
                  SET status = 'failed', error = $1, attempts = attempts + 1
                  WHERE event_id = $2 AND effect_id = $3",
                 e.to_string(),
@@ -809,7 +809,7 @@ effect::on::<OrderPlaced>()
 **Schema**:
 ```sql
 -- Events queue (envelope carries correlation_id as metadata)
-CREATE TABLE seesaw_events (
+CREATE TABLE causal_events (
     id BIGSERIAL PRIMARY KEY,
     event_id UUID NOT NULL,
     parent_id UUID,
@@ -825,11 +825,11 @@ CREATE TABLE seesaw_events (
 );
 
 -- Idempotency: prevent duplicate event_ids (webhooks, crash+retry)
-CREATE UNIQUE INDEX idx_events_event_id ON seesaw_events(event_id);
+CREATE UNIQUE INDEX idx_events_event_id ON causal_events(event_id);
 
 -- Per-workflow FIFO with advisory locks (no separate priority index needed)
 CREATE INDEX idx_events_pending
-ON seesaw_events(created_at ASC)
+ON causal_events(created_at ASC)
 WHERE processed_at IS NULL;
 
 -- LISTEN/NOTIFY trigger for .wait() pattern (CQRS support)
@@ -837,7 +837,7 @@ CREATE OR REPLACE FUNCTION notify_workflow_event()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify(
-        'seesaw_workflow_' || NEW.correlation_id::text,
+        'causal_workflow_' || NEW.correlation_id::text,
         json_build_object(
             'event_type', NEW.event_type,
             'payload', NEW.payload
@@ -847,8 +847,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER seesaw_events_notify
-    AFTER INSERT ON seesaw_events
+CREATE TRIGGER causal_events_notify
+    AFTER INSERT ON causal_events
     FOR EACH ROW
     EXECUTE FUNCTION notify_workflow_event();
 ```
@@ -857,7 +857,7 @@ CREATE TRIGGER seesaw_events_notify
 ```rust
 impl PostgresQueue {
     async fn publish(&self, event: Event) -> Result<()> {
-        // INSERT INTO seesaw_events
+        // INSERT INTO causal_events
     }
 
     async fn poll_next(&self) -> Result<Option<QueuedEvent>> {
@@ -867,7 +867,7 @@ impl PostgresQueue {
             "SELECT
                 pg_advisory_xact_lock(hashtext(correlation_id::text)),
                 id, event_id, correlation_id, event_type, payload, hops
-             FROM seesaw_events
+             FROM causal_events
              WHERE processed_at IS NULL
                AND (locked_until IS NULL OR locked_until < NOW())
              ORDER BY created_at ASC
@@ -891,7 +891,7 @@ impl PostgresQueue {
 **Schema**:
 ```sql
 -- State per workflow
-CREATE TABLE seesaw_state (
+CREATE TABLE causal_state (
     correlation_id UUID PRIMARY KEY,
     state JSONB NOT NULL,
     version INT NOT NULL DEFAULT 1,
@@ -899,7 +899,7 @@ CREATE TABLE seesaw_state (
 );
 
 -- Effect idempotency (framework-guaranteed)
-CREATE TABLE seesaw_effect_executions (
+CREATE TABLE causal_effect_executions (
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,  -- ← For efficient per-workflow queries
@@ -910,7 +910,7 @@ CREATE TABLE seesaw_effect_executions (
 
     -- Event payload (for delayed effects >30 days)
     event_type VARCHAR(255) NOT NULL,
-    event_payload JSONB NOT NULL,  -- ← Copied from seesaw_events, survives retention deletion
+    event_payload JSONB NOT NULL,  -- ← Copied from causal_events, survives retention deletion
     parent_event_id UUID,           -- For causality tracking
 
     -- Execution properties (from effect builder)
@@ -927,24 +927,24 @@ CREATE TABLE seesaw_effect_executions (
 
 -- Worker polling: find next effect to execute
 CREATE INDEX idx_effect_executions_pending
-ON seesaw_effect_executions(priority DESC, execute_at ASC)
+ON causal_effect_executions(priority DESC, execute_at ASC)
 WHERE status = 'pending' AND execute_at <= NOW();
 
 -- Lookup effects by event (for debugging)
-CREATE INDEX idx_effect_executions_event ON seesaw_effect_executions(event_id);
+CREATE INDEX idx_effect_executions_event ON causal_effect_executions(event_id);
 
 -- Lookup effects by workflow (for per-workflow queries)
-CREATE INDEX idx_effect_executions_workflow ON seesaw_effect_executions(correlation_id);
+CREATE INDEX idx_effect_executions_workflow ON causal_effect_executions(correlation_id);
 
 -- Retry monitoring (find failing effects)
-CREATE INDEX idx_effect_executions_status ON seesaw_effect_executions(status, attempts);
+CREATE INDEX idx_effect_executions_status ON causal_effect_executions(status, attempts);
 ```
 
 **Core methods**:
 ```rust
 impl PostgresStateStore<S> {
     async fn load(&self, correlation_id: Uuid) -> Result<S> {
-        // SELECT state FROM seesaw_state WHERE correlation_id = $1
+        // SELECT state FROM causal_state WHERE correlation_id = $1
     }
 
     async fn save(&self, correlation_id: Uuid, state: &S) -> Result<()> {
@@ -977,12 +977,12 @@ async fn event_worker_loop(&self) -> Result<()> {
             continue;
         }
 
-        // 3. Atomic event idempotency check (use seesaw_events.processed_at)
+        // 3. Atomic event idempotency check (use causal_events.processed_at)
         let mut tx = self.pool.begin().await?;
 
         // Check if already processed
         let already_processed = sqlx::query_scalar!(
-            "SELECT processed_at FROM seesaw_events
+            "SELECT processed_at FROM causal_events
              WHERE event_id = $1
              FOR UPDATE",
             event.event_id
@@ -999,7 +999,7 @@ async fn event_worker_loop(&self) -> Result<()> {
 
         // 4. Initialize or load state
         sqlx::query!(
-            "INSERT INTO seesaw_state (correlation_id, state, version)
+            "INSERT INTO causal_state (correlation_id, state, version)
              VALUES ($1, $2, 1)
              ON CONFLICT (correlation_id) DO NOTHING",
             event.correlation_id,
@@ -1009,7 +1009,7 @@ async fn event_worker_loop(&self) -> Result<()> {
         .await?;
 
         let (prev_state, version) = sqlx::query!(
-            "SELECT state, version FROM seesaw_state
+            "SELECT state, version FROM causal_state
              WHERE correlation_id = $1 FOR UPDATE",
             event.correlation_id
         )
@@ -1021,7 +1021,7 @@ async fn event_worker_loop(&self) -> Result<()> {
 
         // 6. Save state
         sqlx::query!(
-            "UPDATE seesaw_state
+            "UPDATE causal_state
              SET state = $1, version = $2, updated_at = NOW()
              WHERE correlation_id = $3 AND version = $4",
             Json(&next_state),
@@ -1047,7 +1047,7 @@ async fn event_worker_loop(&self) -> Result<()> {
 
                 // Check idempotency (already executed?)
                 let executed = sqlx::query_scalar!(
-                    "SELECT status FROM seesaw_effect_executions
+                    "SELECT status FROM causal_effect_executions
                      WHERE event_id = $1 AND effect_id = $2",
                     event.event_id,
                     effect.id
@@ -1064,7 +1064,7 @@ async fn event_worker_loop(&self) -> Result<()> {
 
                 // Record execution (idempotency)
                 sqlx::query!(
-                    "INSERT INTO seesaw_effect_executions (
+                    "INSERT INTO causal_effect_executions (
                         event_id, effect_id, correlation_id, status, result, completed_at
                      )
                      VALUES ($1, $2, $3, 'completed', $4, NOW())",
@@ -1084,7 +1084,7 @@ async fn event_worker_loop(&self) -> Result<()> {
                     );
 
                     sqlx::query!(
-                        "INSERT INTO seesaw_events (
+                        "INSERT INTO causal_events (
                             event_id, correlation_id, parent_id, event_type, payload, hops
                          )
                          VALUES ($1, $2, $3, $4, $5, $6)
@@ -1102,7 +1102,7 @@ async fn event_worker_loop(&self) -> Result<()> {
             } else {
                 // QUEUED: Insert intent for effect worker
                 sqlx::query!(
-                    "INSERT INTO seesaw_effect_executions (
+                    "INSERT INTO causal_effect_executions (
                         event_id, effect_id, correlation_id, status,
                         event_type, event_payload, parent_event_id,
                         execute_at, timeout_seconds, max_attempts, priority
@@ -1127,7 +1127,7 @@ async fn event_worker_loop(&self) -> Result<()> {
 
         // 8. Mark event as processed
         sqlx::query!(
-            "UPDATE seesaw_events
+            "UPDATE causal_events
              SET processed_at = NOW()
              WHERE event_id = $1",
             event.event_id
@@ -1151,11 +1151,11 @@ async fn effect_worker_loop(&self) -> Result<()> {
     loop {
         // 1. Poll next ready effect
         let Some(pending) = sqlx::query!(
-            "UPDATE seesaw_effect_executions
+            "UPDATE causal_effect_executions
              SET status = 'executing', claimed_at = NOW()
              WHERE (event_id, effect_id) = (
                  SELECT event_id, effect_id
-                 FROM seesaw_effect_executions
+                 FROM causal_effect_executions
                  WHERE status = 'pending'
                  AND execute_at <= NOW()
                  ORDER BY priority DESC, execute_at ASC
@@ -1171,13 +1171,13 @@ async fn effect_worker_loop(&self) -> Result<()> {
         };
 
         // 2. Event payload is already in pending (survives retention deletion)
-        // No need to query seesaw_events - it might have been deleted after 30 days
+        // No need to query causal_events - it might have been deleted after 30 days
         let event_payload = pending.event_payload;
         let correlation_id = pending.correlation_id;
 
         // Get hops from parent event (if still exists, otherwise default to 0)
         let hops = sqlx::query_scalar!(
-            "SELECT hops FROM seesaw_events WHERE event_id = $1",
+            "SELECT hops FROM causal_events WHERE event_id = $1",
             pending.parent_event_id
         )
         .fetch_optional(&self.pool)
@@ -1186,7 +1186,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
 
         // 3. Get state for context
         let state = sqlx::query!(
-            "SELECT state FROM seesaw_state WHERE correlation_id = $1",
+            "SELECT state FROM causal_state WHERE correlation_id = $1",
             correlation_id
         )
         .fetch_one(&self.pool)
@@ -1225,7 +1225,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
 
                 // Insert emitted event (idempotent via event_id unique constraint)
                 sqlx::query!(
-                    "INSERT INTO seesaw_events
+                    "INSERT INTO causal_events
                      (event_id, parent_id, correlation_id, event_type, payload, hops)
                      VALUES ($1, $2, $3, $4, $5, $6)
                      ON CONFLICT (event_id) DO NOTHING",
@@ -1241,7 +1241,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
 
                 // Mark effect complete (same transaction)
                 sqlx::query!(
-                    "UPDATE seesaw_effect_executions
+                    "UPDATE causal_effect_executions
                      SET status = 'completed', completed_at = NOW()
                      WHERE event_id = $1 AND effect_id = $2",
                     pending.event_id,
@@ -1255,7 +1255,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
             Ok(Ok(None)) => {
                 // Observer effect
                 sqlx::query!(
-                    "UPDATE seesaw_effect_executions
+                    "UPDATE causal_effect_executions
                      SET status = 'completed', completed_at = NOW()
                      WHERE event_id = $1 AND effect_id = $2",
                     pending.event_id,
@@ -1273,7 +1273,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
                 } else {
                     // Retry
                     sqlx::query!(
-                        "UPDATE seesaw_effect_executions
+                        "UPDATE causal_effect_executions
                          SET status = 'pending', attempts = $1
                          WHERE event_id = $2 AND effect_id = $3",
                         attempts,
@@ -1303,7 +1303,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
 ```rust
 // Before step 3 in process_next_event:
 sqlx::query!(
-    "INSERT INTO seesaw_state (correlation_id, state, version)
+    "INSERT INTO causal_state (correlation_id, state, version)
      VALUES ($1, $2, 1)
      ON CONFLICT (correlation_id) DO NOTHING",
     queued.correlation_id,
@@ -1340,7 +1340,7 @@ match tokio::time::timeout(
     Err(_) => {
         // Timeout - move to DLQ
         sqlx::query!(
-            "INSERT INTO seesaw_dlq (event_id, effect_id, error, payload)
+            "INSERT INTO causal_dlq (event_id, effect_id, error, payload)
              VALUES ($1, $2, 'timeout', $3)",
             event_id, effect.id, Json(event)
         ).await?;
@@ -1362,7 +1362,7 @@ tokio::spawn(async move {
 
         // Unlock stuck events
         sqlx::query!(
-            "UPDATE seesaw_events
+            "UPDATE causal_events
              SET locked_until = NULL, retry_count = retry_count + 1
              WHERE locked_until < NOW() - INTERVAL '5 minutes'
              AND processed_at IS NULL
@@ -1373,7 +1373,7 @@ tokio::spawn(async move {
 
         // Unlock stuck effect executions
         sqlx::query!(
-            "UPDATE seesaw_effect_executions
+            "UPDATE causal_effect_executions
              SET status = 'pending', attempts = attempts + 1
              WHERE status = 'executing'
              AND last_attempted_at < NOW() - INTERVAL '5 minutes'
@@ -1384,10 +1384,10 @@ tokio::spawn(async move {
 
         // Move permanently failed to DLQ
         sqlx::query!(
-            "INSERT INTO seesaw_dlq (event_id, effect_id, error, payload)
+            "INSERT INTO causal_dlq (event_id, effect_id, error, payload)
              SELECT event_id, effect_id, error,
-                    (SELECT payload FROM seesaw_events WHERE event_id = ee.event_id)
-             FROM seesaw_effect_executions ee
+                    (SELECT payload FROM causal_events WHERE event_id = ee.event_id)
+             FROM causal_effect_executions ee
              WHERE status = 'failed' AND attempts >= 3
              ON CONFLICT DO NOTHING"
         )
@@ -1396,10 +1396,10 @@ tokio::spawn(async move {
 
         // Record heartbeat (critical for monitoring)
         sqlx::query!(
-            "INSERT INTO seesaw_reaper_heartbeat (last_run, events_reaped, effects_reaped)
+            "INSERT INTO causal_reaper_heartbeat (last_run, events_reaped, effects_reaped)
              VALUES (NOW(),
-                     (SELECT COUNT(*) FROM seesaw_events WHERE retry_count > 0),
-                     (SELECT COUNT(*) FROM seesaw_dlq))
+                     (SELECT COUNT(*) FROM causal_events WHERE retry_count > 0),
+                     (SELECT COUNT(*) FROM causal_dlq))
              ON CONFLICT (id) DO UPDATE
              SET last_run = NOW(),
                  events_reaped = EXCLUDED.events_reaped,
@@ -1419,7 +1419,7 @@ tokio::spawn(async move {
 
 **Schema**:
 ```sql
-CREATE TABLE seesaw_reaper_heartbeat (
+CREATE TABLE causal_reaper_heartbeat (
     id INT PRIMARY KEY DEFAULT 1,  -- Single row table
     last_run TIMESTAMPTZ NOT NULL,
     events_reaped INT NOT NULL DEFAULT 0,
@@ -1427,7 +1427,7 @@ CREATE TABLE seesaw_reaper_heartbeat (
     CHECK (id = 1)  -- Enforce single row
 );
 
-CREATE INDEX idx_reaper_heartbeat_last_run ON seesaw_reaper_heartbeat(last_run);
+CREATE INDEX idx_reaper_heartbeat_last_run ON causal_reaper_heartbeat(last_run);
 ```
 
 **Alert Query** (run every 5 minutes via monitoring):
@@ -1437,17 +1437,17 @@ SELECT
     EXTRACT(EPOCH FROM (NOW() - last_run)) as seconds_since_last_run,
     events_reaped,
     effects_reaped
-FROM seesaw_reaper_heartbeat
+FROM causal_reaper_heartbeat
 WHERE last_run < NOW() - INTERVAL '3 minutes';
 ```
 
 **Grafana/Datadog Alert**:
 ```yaml
 alert: ReaperDead
-expr: time() - seesaw_reaper_last_run_seconds > 180  # 3 minutes
+expr: time() - causal_reaper_last_run_seconds > 180  # 3 minutes
 severity: critical
 message: |
-  Seesaw Reaper has not run in {{ $value }}s.
+  Causal Reaper has not run in {{ $value }}s.
   Zombie events/effects are accumulating.
   Check reaper process health immediately.
 ```
@@ -1457,7 +1457,7 @@ message: |
 // GET /health/reaper
 pub async fn reaper_health_check(pool: &PgPool) -> Result<StatusCode> {
     let heartbeat = sqlx::query!(
-        "SELECT last_run FROM seesaw_reaper_heartbeat"
+        "SELECT last_run FROM causal_reaper_heartbeat"
     )
     .fetch_one(pool)
     .await?;
@@ -1492,7 +1492,7 @@ for effect in effects { /* ... */ }
 // Step 6.5: Record effect intents in same transaction (with execution properties)
 for effect in self.effects.handlers_for(&queued.event_type) {
     sqlx::query!(
-        "INSERT INTO seesaw_effect_executions (
+        "INSERT INTO causal_effect_executions (
             event_id, effect_id, status,
             execute_at, timeout_seconds, max_attempts, priority
          )
@@ -1544,7 +1544,7 @@ If you have high-throughput workflows:
 ```rust
 // Load without lock
 let (prev_state, version) = sqlx::query!(
-    "SELECT state, version FROM seesaw_state WHERE correlation_id = $1",
+    "SELECT state, version FROM causal_state WHERE correlation_id = $1",
     queued.correlation_id
 )
 .fetch_one(&mut *tx)
@@ -1552,7 +1552,7 @@ let (prev_state, version) = sqlx::query!(
 
 // Save with version check (will fail if concurrent update)
 let rows_affected = sqlx::query!(
-    "UPDATE seesaw_state
+    "UPDATE causal_state
      SET state = $1, version = $2
      WHERE correlation_id = $3 AND version = $4",
     Json(&next_state), version + 1, queued.correlation_id, version
@@ -1668,7 +1668,7 @@ let event = queue.poll_next().await?;
 // Check hop count
 if event.hops >= 50 {
     sqlx::query!(
-        "INSERT INTO seesaw_dlq (event_id, effect_id, error, payload, reason)
+        "INSERT INTO causal_dlq (event_id, effect_id, error, payload, reason)
          VALUES ($1, 'infinite_loop', 'Event exceeded 50 hops', $2, 'infinite_loop')",
         event.event_id,
         Json(&event.payload)
@@ -1693,7 +1693,7 @@ queue.publish_with_hops(next_event, event.hops + 1).await?;
 **Add to Phase 2 schema**:
 ```sql
 -- Dead letter queue for permanently failed effects AND infinite loops
-CREATE TABLE seesaw_dlq (
+CREATE TABLE causal_dlq (
     id BIGSERIAL PRIMARY KEY,
     event_id UUID NOT NULL,
     effect_id VARCHAR(255) NOT NULL,
@@ -1705,27 +1705,27 @@ CREATE TABLE seesaw_dlq (
     resolved_at TIMESTAMPTZ
 );
 
-CREATE INDEX idx_dlq_unresolved ON seesaw_dlq(resolved_at) WHERE resolved_at IS NULL;
-CREATE INDEX idx_dlq_reason ON seesaw_dlq(reason) WHERE resolved_at IS NULL;
+CREATE INDEX idx_dlq_unresolved ON causal_dlq(resolved_at) WHERE resolved_at IS NULL;
+CREATE INDEX idx_dlq_reason ON causal_dlq(reason) WHERE resolved_at IS NULL;
 ```
 
 ##### 10. Priority Queue (Gemini's Nice-to-Have)
 
 **Add to Phase 1 schema**:
 ```sql
-ALTER TABLE seesaw_events ADD COLUMN priority INT NOT NULL DEFAULT 10;
+ALTER TABLE causal_events ADD COLUMN priority INT NOT NULL DEFAULT 10;
 
 -- Update polling index to respect priority
 DROP INDEX idx_events_pending;
 CREATE INDEX idx_events_pending_priority
-ON seesaw_events(priority DESC, created_at ASC)
+ON causal_events(priority DESC, created_at ASC)
 WHERE processed_at IS NULL;
 
 -- Update poll_next query:
-UPDATE seesaw_events
+UPDATE causal_events
 SET locked_until = NOW() + INTERVAL '5 minutes'
 WHERE id = (
-    SELECT id FROM seesaw_events
+    SELECT id FROM causal_events
     WHERE processed_at IS NULL
     AND (locked_until IS NULL OR locked_until < NOW())
     ORDER BY priority DESC, created_at ASC  -- ← Priority first
@@ -1789,7 +1789,7 @@ effect::on::<GenerateInvoice>()
     });
 ```
 
-**Rule of thumb**: Keep `seesaw_state` under **10KB per workflow**
+**Rule of thumb**: Keep `causal_state` under **10KB per workflow**
 - Under 1KB: Excellent (IDs, enums, small strings)
 - 1-10KB: Good (reasonable domain data)
 - 10-100KB: Warning (consider slimming)
@@ -1801,7 +1801,7 @@ effect::on::<GenerateInvoice>()
 SELECT correlation_id,
        LENGTH(state::text) as state_bytes,
        state::jsonb -> 'order_id' as order_id
-FROM seesaw_state
+FROM causal_state
 WHERE LENGTH(state::text) > 10240  -- >10KB
 ORDER BY state_bytes DESC
 LIMIT 10;
@@ -1836,7 +1836,7 @@ LIMIT 10;
 ### Basic Setup (Postgres)
 
 ```rust
-use seesaw::{Engine, PostgresQueue, PostgresStateStore};
+use causal::{Engine, PostgresQueue, PostgresStateStore};
 use sqlx::PgPool;
 
 #[tokio::main]
@@ -1903,7 +1903,7 @@ async fn main() -> Result<()> {
 ### Custom Backend Setup (NATS + Redis)
 
 ```rust
-use seesaw::{Engine, Queue, StateStore};
+use causal::{Engine, Queue, StateStore};
 use my_adapters::{NatsQueue, RedisStateStore};
 
 #[tokio::main]
@@ -2073,7 +2073,7 @@ let order = engine
     .await?;
 
 // ✅ Handle success or failure
-use seesaw::matches;
+use causal::matches;
 let result = engine
     .process(CreateOrder { user_id: 123 })
     .wait(matches! {
@@ -2095,10 +2095,10 @@ let result = engine
 ```
 
 **How It Works**:
-1. `.wait()` subscribes to `LISTEN seesaw_workflow_{correlation_id}` **before** publishing
+1. `.wait()` subscribes to `LISTEN causal_workflow_{correlation_id}` **before** publishing
 2. `process()` publishes event to queue
 3. Workers process event → reducers update state → effects run → terminal event emitted
-4. Trigger fires `NOTIFY seesaw_workflow_{correlation_id}` with event payload
+4. Trigger fires `NOTIFY causal_workflow_{correlation_id}` with event payload
 5. `.wait()` receives notification, returns typed event
 6. ✅ State is guaranteed committed (terminal event = workflow done)
 
@@ -2168,7 +2168,7 @@ effect::on::<DataExport>()
 **Worker Behavior**:
 ```sql
 -- Effect worker polls by priority DESC
-SELECT * FROM seesaw_effect_executions
+SELECT * FROM causal_effect_executions
 WHERE status = 'pending' AND execute_at <= NOW()
 ORDER BY priority DESC, execute_at ASC  -- ← High priority first
 LIMIT 1
@@ -2277,7 +2277,7 @@ pub trait StateStore: Send + Sync + 'static {
 }
 ```
 
-### PostgresQueue Implementation (Ships with Seesaw)
+### PostgresQueue Implementation (Ships with Causal)
 
 ```rust
 pub struct PostgresQueue {
@@ -2435,7 +2435,7 @@ let order = engine
     .await?;
 
 // Handle multiple terminal events (success or failure)
-use seesaw::matches;
+use causal::matches;
 let result = engine
     .process(OrderPlaced { ... })
     .wait(matches! {
@@ -2487,7 +2487,7 @@ effect::on::<Event>()
     .id("log_event")
     .then(|event, ctx| async move { Ok(()) });
 
-// Queued (explicit) - persisted to seesaw_effect_executions
+// Queued (explicit) - persisted to causal_effect_executions
 effect::on::<Event>()
     .id("long_running")
     .queued()
@@ -2512,7 +2512,7 @@ effect::on::<Event>()
 For enum events with multiple variants, use the `on!` macro with a single `#[effect(...)]` attribute:
 
 ```rust
-use seesaw::on;
+use causal::on;
 
 let effects = on! {
     // Simple effect - only id required
@@ -2634,7 +2634,7 @@ impl PostgresQueue {
         sqlx::query_as!(
             DlqEntry,
             "SELECT event_id, effect_id, error, created_at, payload
-             FROM seesaw_dlq
+             FROM causal_dlq
              ORDER BY created_at DESC
              LIMIT 100"
         )
@@ -2648,9 +2648,9 @@ impl PostgresQueue {
 
         // Move from DLQ back to effect_executions
         sqlx::query!(
-            "INSERT INTO seesaw_effect_executions (event_id, effect_id, correlation_id, status, attempts)
+            "INSERT INTO causal_effect_executions (event_id, effect_id, correlation_id, status, attempts)
              SELECT event_id, effect_id, correlation_id, 'pending', 0
-             FROM seesaw_dlq
+             FROM causal_dlq
              WHERE event_id = $1 AND effect_id = $2",
             event_id,
             effect_id
@@ -2659,7 +2659,7 @@ impl PostgresQueue {
         .await?;
 
         sqlx::query!(
-            "DELETE FROM seesaw_dlq WHERE event_id = $1 AND effect_id = $2",
+            "DELETE FROM causal_dlq WHERE event_id = $1 AND effect_id = $2",
             event_id,
             effect_id
         )
@@ -2673,7 +2673,7 @@ impl PostgresQueue {
     /// Mark DLQ entry as resolved (delete without retry)
     pub async fn resolve_dlq(&self, event_id: Uuid, effect_id: &str) -> Result<()> {
         sqlx::query!(
-            "DELETE FROM seesaw_dlq WHERE event_id = $1 AND effect_id = $2",
+            "DELETE FROM causal_dlq WHERE event_id = $1 AND effect_id = $2",
             event_id,
             effect_id
         )
@@ -2716,7 +2716,7 @@ impl PostgresQueue {
         S: serde::de::DeserializeOwned,
     {
         let row = sqlx::query!(
-            "SELECT state FROM seesaw_state WHERE correlation_id = $1",
+            "SELECT state FROM causal_state WHERE correlation_id = $1",
             correlation_id
         )
         .fetch_optional(&self.pool)
@@ -2734,7 +2734,7 @@ impl PostgresQueue {
             EffectExecution,
             "SELECT event_id, effect_id, status, execute_at,
                     completed_at, attempts, error, event_type
-             FROM seesaw_effect_executions
+             FROM causal_effect_executions
              WHERE correlation_id = $1
              ORDER BY execute_at",
             correlation_id
@@ -2751,7 +2751,7 @@ impl PostgresQueue {
                 COUNT(*) FILTER (WHERE status = 'executing') as executing,
                 COUNT(*) FILTER (WHERE status = 'completed') as completed,
                 COUNT(*) FILTER (WHERE status = 'failed') as failed
-             FROM seesaw_effect_executions
+             FROM causal_effect_executions
              WHERE correlation_id = $1",
             correlation_id
         )
@@ -2774,7 +2774,7 @@ impl PostgresQueue {
             "SELECT DISTINCT correlation_id,
                     MIN(execute_at) as started_at,
                     COUNT(*) as total_effects
-             FROM seesaw_effect_executions
+             FROM causal_effect_executions
              WHERE status IN ('pending', 'executing')
              GROUP BY correlation_id
              ORDER BY started_at DESC"
@@ -3081,14 +3081,14 @@ async fn setup_database(pool: &PgPool) -> Result<()> {
 - 1000 events/sec = **86.4 million events/day**
 - Every event is created and then marked `processed_at` (soft delete)
 - Postgres VACUUM must reclaim 86M rows/day
-- **Without partitioning**: `DELETE FROM seesaw_events WHERE processed_at < NOW() - 30 days` will lock table for **hours**
+- **Without partitioning**: `DELETE FROM causal_events WHERE processed_at < NOW() - 30 days` will lock table for **hours**
 
 **Solution** (Mandatory, Not Optional):
 
 1. **Daily Table Partitioning** - Drop partition = instant metadata operation
 ```sql
 -- Create partitioned table (one-time setup)
-CREATE TABLE seesaw_events (
+CREATE TABLE causal_events (
     id BIGSERIAL,
     event_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -3096,16 +3096,16 @@ CREATE TABLE seesaw_events (
 ) PARTITION BY RANGE (created_at);
 
 -- Create today's partition (run daily via cron)
-CREATE TABLE seesaw_events_2026_02_05 PARTITION OF seesaw_events
+CREATE TABLE causal_events_2026_02_05 PARTITION OF causal_events
 FOR VALUES FROM ('2026-02-05 00:00:00') TO ('2026-02-06 00:00:00');
 
 -- Drop 30-day-old partitions (instant, no table lock)
-DROP TABLE IF EXISTS seesaw_events_2026_01_06;
+DROP TABLE IF EXISTS causal_events_2026_01_06;
 ```
 
 2. **Aggressive Autovacuum** (tune for high churn)
 ```sql
-ALTER TABLE seesaw_events SET (
+ALTER TABLE causal_events SET (
     autovacuum_vacuum_scale_factor = 0.01,  -- Vacuum at 1% dead tuples (not 20%)
     autovacuum_analyze_scale_factor = 0.005,
     autovacuum_vacuum_cost_limit = 10000     -- Faster vacuuming
@@ -3115,12 +3115,12 @@ ALTER TABLE seesaw_events SET (
 3. **Archive Hot Partitions** (for debugging/compliance)
 ```sql
 -- Weekly: archive processed events from yesterday's partition
-INSERT INTO seesaw_events_archive
-SELECT * FROM seesaw_events_2026_02_04
+INSERT INTO causal_events_archive
+SELECT * FROM causal_events_2026_02_04
 WHERE processed_at IS NOT NULL;
 
 -- Then drop the partition
-DROP TABLE seesaw_events_2026_02_04;
+DROP TABLE causal_events_2026_02_04;
 ```
 
 **Invariant**: At 1000+ eps, partitioning is **not optional**. Without it, VACUUM becomes the bottleneck within 2 weeks.
@@ -3132,7 +3132,7 @@ DROP TABLE seesaw_events_2026_02_04;
 ```rust
 // No FOR UPDATE - check version on save
 let rows = sqlx::query!(
-    "UPDATE seesaw_state SET state = $1, version = version + 1
+    "UPDATE causal_state SET state = $1, version = version + 1
      WHERE correlation_id = $2 AND version = $3",
     state, correlation_id, version
 ).execute(&tx).await?.rows_affected();
@@ -3179,7 +3179,7 @@ OrderPlaced { .. } => |ctx| async move {
 
 #### 6. Data Plane vs Control Plane
 **Architecture split at scale**:
-- **Postgres Seesaw**: Source of truth (orders, approvals, account changes)
+- **Postgres Causal**: Source of truth (orders, approvals, account changes)
 - **NATS/Kafka**: High-volume telemetry (logs, analytics, likes, views)
 
 ```rust
@@ -3222,11 +3222,11 @@ impl ThrottledEffectWorker {
 
                 sqlx::query_as!(
                     PendingEffect,
-                    "UPDATE seesaw_effect_executions
+                    "UPDATE causal_effect_executions
                      SET status = 'executing', claimed_at = NOW()
                      WHERE (event_id, effect_id) = (
                          SELECT event_id, effect_id
-                         FROM seesaw_effect_executions
+                         FROM causal_effect_executions
                          WHERE status = 'pending'
                          AND execute_at <= NOW()
                          ORDER BY priority DESC, execute_at ASC
@@ -3288,14 +3288,14 @@ impl ThrottledEffectWorker {
         let (state, event_payload) = {
             let mut conn = pool.acquire().await?;
             let state = sqlx::query!(
-                "SELECT state FROM seesaw_state WHERE correlation_id = $1",
+                "SELECT state FROM causal_state WHERE correlation_id = $1",
                 pending.correlation_id
             )
             .fetch_one(&mut *conn)
             .await?;
 
             let event = sqlx::query!(
-                "SELECT payload FROM seesaw_events WHERE event_id = $1",
+                "SELECT payload FROM causal_events WHERE event_id = $1",
                 pending.event_id
             )
             .fetch_one(&mut *conn)
@@ -3355,7 +3355,7 @@ let worker = ThrottledEffectWorker::new(pool, 50, engine);
 ```rust
 use prometheus::{Counter, Gauge, Histogram};
 
-struct SeesawMetrics {
+struct CausalMetrics {
     // Queue depth
     events_pending: Gauge,
     effects_pending: Gauge,
@@ -3378,9 +3378,9 @@ struct SeesawMetrics {
 }
 
 // Collect every 10s
-async fn collect_metrics(pool: &PgPool, metrics: &SeesawMetrics) {
+async fn collect_metrics(pool: &PgPool, metrics: &CausalMetrics) {
     let pending = sqlx::query!(
-        "SELECT COUNT(*) as count FROM seesaw_events WHERE processed_at IS NULL"
+        "SELECT COUNT(*) as count FROM causal_events WHERE processed_at IS NULL"
     ).fetch_one(pool).await?.count;
 
     metrics.events_pending.set(pending as f64);
@@ -3433,7 +3433,7 @@ Cause: Workers can't keep up with event rate
 
 Steps:
 1. Check worker CPU/memory usage
-2. Scale effect workers: kubectl scale deployment seesaw-workers --replicas=50
+2. Scale effect workers: kubectl scale deployment causal-workers --replicas=50
 3. Check for stuck effects (long-running queries, API timeouts)
 4. Check database connections: SELECT count(*) FROM pg_stat_activity
 5. If DB overwhelmed, add connection pooling (PgBouncer)
@@ -3452,7 +3452,7 @@ Cause: Effects permanently failing
 
 Steps:
 1. Query DLQ for common errors:
-   SELECT error, COUNT(*) FROM seesaw_dlq GROUP BY error
+   SELECT error, COUNT(*) FROM causal_dlq GROUP BY error
 2. Check external service health (Stripe, Mailgun)
 3. Fix root cause in code
 4. Retry from DLQ: engine.retry_from_dlq(event_id, effect_id)
@@ -3535,7 +3535,7 @@ Postgres:
 
 **Events are FIFO, Effects are Prioritized**
 
-The architecture enforces per-workflow FIFO ordering for events to maintain causal consistency. Effects can be prioritized via the `priority` column in `seesaw_effect_executions`, but events always process in chronological order.
+The architecture enforces per-workflow FIFO ordering for events to maintain causal consistency. Effects can be prioritized via the `priority` column in `causal_effect_executions`, but events always process in chronological order.
 
 **Scenario**: 1000 events queued → SystemAlert arrives → SystemAlert waits behind 1000 events
 
@@ -3550,10 +3550,10 @@ Adding priority to events table is a 2-line change:
 
 ```sql
 -- Add priority column
-ALTER TABLE seesaw_events ADD COLUMN priority INT NOT NULL DEFAULT 10;
+ALTER TABLE causal_events ADD COLUMN priority INT NOT NULL DEFAULT 10;
 
 -- Update polling query
-CREATE INDEX idx_events_priority ON seesaw_events(priority DESC, created_at ASC)
+CREATE INDEX idx_events_priority ON causal_events(priority DESC, created_at ASC)
 WHERE processed_at IS NULL;
 ```
 
@@ -3628,7 +3628,7 @@ engine.process_with_id(event_id, correlation_id, OrderPlaced { ... }).await?;
 **Behavior**:
 - Uses provided event_id (must be deterministic for idempotency)
 - Uses provided correlation_id
-- Duplicate event_id fails silently (UNIQUE constraint on seesaw_events.event_id)
+- Duplicate event_id fails silently (UNIQUE constraint on causal_events.event_id)
 
 ---
 
@@ -3637,7 +3637,7 @@ engine.process_with_id(event_id, correlation_id, OrderPlaced { ... }).await?;
 For synchronous request/response (HTTP handlers that need a result):
 
 ```rust
-use seesaw::{dispatch_request, EnvelopeMatch};
+use causal::{dispatch_request, EnvelopeMatch};
 
 let result = dispatch_request(
     CreateOrder { customer_id: 123 },
@@ -4033,7 +4033,7 @@ impl ListingMutation {
 5. **Deploy** - Test graceful shutdown and reaper behavior
 6. **Iterate** - Add observability and nice-to-haves as needed
 
-**Start**: Create `crates/seesaw/src/queue.rs` with PostgresQueue
+**Start**: Create `crates/causal/src/queue.rs` with PostgresQueue
 
 ## Design Review Notes
 

@@ -374,8 +374,8 @@ Event → Reducer → Effect.then() → Result<Event> → Engine dispatches retu
 - [ ] Keep `EffectContext` but plan to deprecate `emit()` method
 
 **Files:**
-- `crates/seesaw/src/effect/types.rs`
-- `crates/seesaw/src/effect/context.rs`
+- `crates/causal/src/effect/types.rs`
+- `crates/causal/src/effect/context.rs`
 
 **Success Criteria:**
 - New types compile
@@ -391,8 +391,8 @@ Event → Reducer → Effect.then() → Result<Event> → Engine dispatches retu
 - [ ] `on_any().run()` returns `anyhow::Result<()>` (observers don't produce events)
 
 **Files:**
-- `crates/seesaw/src/effect/builders.rs`
-- `crates/seesaw/src/effect/mod.rs`
+- `crates/causal/src/effect/builders.rs`
+- `crates/causal/src/effect/mod.rs`
 
 **New Builder Methods:**
 ```rust
@@ -423,8 +423,8 @@ impl<E, F, T, S> EffectBuilder<Typed<E>, F, T, S> {
 - [ ] Update causation/origin tracking for returned events
 
 **Files:**
-- `crates/seesaw/src/effect_registry.rs`
-- `crates/seesaw/src/engine.rs`
+- `crates/causal/src/effect_registry.rs`
+- `crates/causal/src/engine.rs`
 
 **Key Change in Effect Loop:**
 ```rust
@@ -456,8 +456,8 @@ while let Some(envelope) = rx.recv().await {
 - [ ] Update all tests to new API
 
 **Files:**
-- `crates/seesaw/src/effect/context.rs` (deprecation attribute)
-- `crates/seesaw/src/effect/builders.rs` (deprecation attribute)
+- `crates/causal/src/effect/context.rs` (deprecation attribute)
+- `crates/causal/src/effect/builders.rs` (deprecation attribute)
 - `CLAUDE.md`
 - All test files
 
@@ -485,7 +485,7 @@ impl<S, D> EffectContext<S, D> {
 - [ ] Update `API_MIGRATION.md` with v0.7.0 changes
 
 **Files:**
-- `crates/seesaw/src/effect/context.rs`
+- `crates/causal/src/effect/context.rs`
 - `API_MIGRATION.md`
 - `README.md`
 
@@ -819,11 +819,11 @@ effect::on::<PaymentEvent>()
 
 ### Internal References
 
-- Effect types: `crates/seesaw/src/effect/types.rs`
-- Effect builders: `crates/seesaw/src/effect/builders.rs`
-- Effect context: `crates/seesaw/src/effect/context.rs`
-- Effect registry: `crates/seesaw/src/effect_registry.rs`
-- Engine: `crates/seesaw/src/engine.rs`
+- Effect types: `crates/causal/src/effect/types.rs`
+- Effect builders: `crates/causal/src/effect/builders.rs`
+- Effect context: `crates/causal/src/effect/context.rs`
+- Effect registry: `crates/causal/src/effect_registry.rs`
+- Engine: `crates/causal/src/engine.rs`
 - Current API migration: `API_MIGRATION.md`
 
 ### Design Principles

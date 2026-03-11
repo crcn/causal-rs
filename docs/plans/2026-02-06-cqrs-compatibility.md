@@ -1,22 +1,22 @@
-# CQRS Compatibility with Seesaw
+# CQRS Compatibility with Causal
 
 **Date:** 2026-02-06
 
 ## TL;DR
 
-**YES, Seesaw is highly compatible with CQRS.** In fact, Seesaw is the event-driven backbone that sits between the command side and query side.
+**YES, Causal is highly compatible with CQRS.** In fact, Causal is the event-driven backbone that sits between the command side and query side.
 
 ```
 CQRS Pattern:
   Command → Write Model → Events → Read Model(s)
 
-Seesaw's Role:
-  Command → [Thin Layer] → Seesaw Events → Handlers Update Read Models
+Causal's Role:
+  Command → [Thin Layer] → Causal Events → Handlers Update Read Models
                              ↓
                         Event Store (source of truth)
 ```
 
-**Key insight:** Seesaw handles the "Events → Read Models" part of CQRS. Commands can be a thin wrapper on top.
+**Key insight:** Causal handles the "Events → Read Models" part of CQRS. Commands can be a thin wrapper on top.
 
 ---
 
@@ -67,23 +67,23 @@ Seesaw's Role:
 
 ---
 
-## Part 2: Seesaw's Role in CQRS
+## Part 2: Causal's Role in CQRS
 
-### Seesaw as the Event Backbone
+### Causal as the Event Backbone
 
-**Seesaw handles:**
+**Causal handles:**
 - ✅ Event persistence (event store)
 - ✅ Event dispatch (pub/sub)
 - ✅ Event handlers (projection builders)
 - ✅ Retry logic (at-least-once delivery)
 - ✅ Workflow orchestration (multi-step processes)
 
-**Seesaw does NOT handle:**
+**Causal does NOT handle:**
 - ❌ Command validation (you do this)
 - ❌ Command routing (you do this)
 - ❌ Query execution (you do this)
 
-### Architecture with Seesaw
+### Architecture with Causal
 
 ```
 ┌─────────────┐
@@ -105,7 +105,7 @@ Seesaw's Role:
 │            SEESAW                   │
 │  ┌──────────────────────────────┐  │
 │  │      Event Store             │  │
-│  │  (seesaw_events table)       │  │
+│  │  (causal_events table)       │  │
 │  └──────────────────────────────┘  │
 │               │                     │
 │               ▼                     │
@@ -166,7 +166,7 @@ async fn handle_create_order(
     Ok(order_id)
 }
 
-// Seesaw handlers update read models
+// Causal handlers update read models
 #[handler(on = OrderPlaced)]
 async fn update_orders_view(
     event: OrderPlaced,
@@ -206,7 +206,7 @@ async fn update_user_stats_view(
     Ok(())
 }
 
-// Query handler reads from read model (outside Seesaw)
+// Query handler reads from read model (outside Causal)
 async fn get_user_orders(user_id: Uuid, db: &PgPool) -> Result<Vec<Order>> {
     sqlx::query_as(
         "SELECT * FROM orders_view WHERE user_id = $1 ORDER BY created_at DESC"
@@ -252,7 +252,7 @@ impl Order {
         // Business logic
         let total = cmd.items.iter().map(|i| i.price).sum();
 
-        // Return events (to be dispatched via Seesaw)
+        // Return events (to be dispatched via Causal)
         Ok(vec![
             Event::OrderPlaced {
                 order_id,
@@ -292,7 +292,7 @@ impl Order {
         db: &PgPool,
     ) -> Result<Self> {
         let events = sqlx::query_as::<_, StoredEvent>(
-            "SELECT * FROM seesaw_events
+            "SELECT * FROM causal_events
              WHERE payload->>'order_id' = $1
              ORDER BY created_at"
         )
@@ -336,7 +336,7 @@ async fn create_order_endpoint(
     // Execute command on aggregate
     let events = Order::create(cmd.into_inner(), &db).await?;
 
-    // Dispatch events via Seesaw
+    // Dispatch events via Causal
     for event in events {
         engine.dispatch(event).await?;
     }
@@ -344,7 +344,7 @@ async fn create_order_endpoint(
     Ok(Json(order_id))
 }
 
-// Seesaw handlers update read models (same as Pattern 1)
+// Causal handlers update read models (same as Pattern 1)
 #[handler(on = OrderPlaced)]
 async fn update_orders_view(...) { ... }
 ```
@@ -463,7 +463,7 @@ async fn search_orders(query: &str, es: &Elasticsearch) -> Result<Vec<Order>> {
 
 ---
 
-## Part 4: CQRS Benefits with Seesaw
+## Part 4: CQRS Benefits with Causal
 
 ### Benefit 1: Independent Read Model Scaling
 
@@ -486,7 +486,7 @@ async fn create_order(cmd: CreateOrder) -> Result<Uuid> {
 }
 ```
 
-**NEW (decoupled with Seesaw):**
+**NEW (decoupled with Causal):**
 ```rust
 // Write (fast)
 async fn create_order(cmd: CreateOrder, engine: &Engine) -> Result<Uuid> {
@@ -545,7 +545,7 @@ Projection 4: elasticsearch (search)
 - Use different storage (Postgres, Elasticsearch, Redis)
 - Have different schema (normalized vs denormalized)
 - Update at different speeds (fast vs slow)
-- Retry independently (Seesaw handles this)
+- Retry independently (Causal handles this)
 
 ---
 
@@ -561,7 +561,7 @@ async fn rebuild_orders_view(db: &PgPool) -> Result<()> {
 
     // Replay all events
     let events = sqlx::query_as::<_, StoredEvent>(
-        "SELECT * FROM seesaw_events
+        "SELECT * FROM causal_events
          WHERE event_type IN ('OrderPlaced', 'OrderShipped', 'OrderDelivered')
          ORDER BY created_at"
     )
@@ -614,7 +614,7 @@ async fn get_order_at_time(
 ) -> Result<Order> {
     // Query events up to that time
     let events = sqlx::query_as::<_, StoredEvent>(
-        "SELECT * FROM seesaw_events
+        "SELECT * FROM causal_events
          WHERE payload->>'order_id' = $1
            AND created_at <= $2
          ORDER BY created_at"
@@ -716,7 +716,7 @@ All read models updated by: T+100ms (eventual consistency)
 **With new architecture:**
 ```
 OrderPlaced event →
-  ├─ "seesaw.OrderPlaced" stream →
+  ├─ "causal.OrderPlaced" stream →
   │    ├─ Fast read models (Postgres) - Process immediately
   │    ├─ Slow read models (Elasticsearch) - Process when ready
   │    └─ External systems (webhooks) - Process with retry
@@ -1133,7 +1133,7 @@ async fn search_orders_api(
 #[get("/orders/{id}")]
 async fn get_order(order_id: Path<Uuid>, db: Data<PgPool>) -> Result<Json<Order>> {
     // Reading from event store (write model)
-    let events = sqlx::query("SELECT * FROM seesaw_events WHERE ...").fetch_all(&db).await?;
+    let events = sqlx::query("SELECT * FROM causal_events WHERE ...").fetch_all(&db).await?;
     let order = reconstruct_from_events(events)?;
     Ok(Json(order))
 }
@@ -1211,9 +1211,9 @@ async fn cancel_order(cmd: CancelOrder, engine: &Engine, db: &PgPool) -> Result<
 
 ## Conclusion
 
-**Yes, Seesaw is highly compatible with CQRS.**
+**Yes, Causal is highly compatible with CQRS.**
 
-**Seesaw's role:**
+**Causal's role:**
 - ✅ Event store (source of truth)
 - ✅ Event dispatcher (pub/sub)
 - ✅ Projection builder (handlers update read models)
@@ -1231,4 +1231,4 @@ async fn cancel_order(cmd: CancelOrder, engine: &Engine, db: &PgPool) -> Result<
 - ✅ Slow read models don't affect fast ones (separate streams)
 - ✅ Scales to high throughput (1k-100k events/sec)
 
-**Seesaw is the perfect backbone for CQRS systems.**
+**Causal is the perfect backbone for CQRS systems.**

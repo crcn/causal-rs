@@ -334,8 +334,8 @@ Bottleneck: Postgres writes (~620/sec per dispatcher)
 
 **Current limitation:**
 ```
-Single INSERT into seesaw_events: ~3ms
-N INSERT into seesaw_handler_intents: ~2ms each
+Single INSERT into causal_events: ~3ms
+N INSERT into causal_handler_intents: ~2ms each
 
 Total: 3 + 2N ms per event
 
@@ -348,11 +348,11 @@ With 5 handlers:
 ```rust
 // Instead of:
 for event in events {
-    tx.execute("INSERT INTO seesaw_events ...").await?;
+    tx.execute("INSERT INTO causal_events ...").await?;
 }
 
 // Do:
-tx.execute("INSERT INTO seesaw_events VALUES ($1), ($2), ($3), ...").await?;
+tx.execute("INSERT INTO causal_events VALUES ($1), ($2), ($3), ...").await?;
 
 // Result: 100 events in ~50ms = 2,000 events/sec
 ```
@@ -393,7 +393,7 @@ Result: ~100k+ events/sec
 **Current limitation:**
 ```sql
 -- Each worker polls:
-SELECT * FROM seesaw_handler_intents
+SELECT * FROM causal_handler_intents
 WHERE status = 'pending'
 ORDER BY priority, created_at
 FOR UPDATE SKIP LOCKED
@@ -425,8 +425,8 @@ Result: Query load proportional to work, not workers
 **Mitigation 3: Partition intents by event type**
 ```sql
 -- Separate table per event type (or partitioned table)
-seesaw_handler_intents_OrderPlaced
-seesaw_handler_intents_PaymentRequested
+causal_handler_intents_OrderPlaced
+causal_handler_intents_PaymentRequested
 ...
 
 Workers specialized per event type query only relevant partition
@@ -660,8 +660,8 @@ EmailSent (fast): 100 workers
 PaymentRequested (medium): 200 workers
 
 # Workers specialized by event type
-$ seesaw-worker --event-types OrderPlaced,PaymentRequested --workers 100
-$ seesaw-worker --event-types EmailSent --workers 1000
+$ causal-worker --event-types OrderPlaced,PaymentRequested --workers 100
+$ causal-worker --event-types EmailSent --workers 1000
 ```
 
 ---

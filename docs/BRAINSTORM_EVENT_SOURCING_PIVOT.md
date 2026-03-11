@@ -1,4 +1,4 @@
-# Brainstorm: Pivoting Seesaw to Event Sourcing
+# Brainstorm: Pivoting Causal to Event Sourcing
 
 **Date:** 2026-02-27
 **Context:** Strategic pivot from orchestration to event sourcing library
@@ -360,7 +360,7 @@ impl EventStore {
 - EventStore: "Native Rust, better type safety, simpler"
 
 **Complement With:**
-- Restate: "Use Restate for orchestration, Seesaw for event sourcing"
+- Restate: "Use Restate for orchestration, Causal for event sourcing"
 
 ## Conclusion
 

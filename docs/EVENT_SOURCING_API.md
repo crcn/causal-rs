@@ -5,7 +5,7 @@
 ### 1. Aggregates (Entities with State)
 
 ```rust
-use seesaw::{Aggregate, EventStore};
+use causal::{Aggregate, EventStore};
 use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
@@ -89,7 +89,7 @@ enum OrderEvent {
 **The API stays almost identical, just pure instead of async!**
 
 ```rust
-use seesaw::{handler, Context};
+use causal::{handler, Context};
 
 // Handlers become pure state transitions
 #[handler(on = OrderEvent, extract(order_id, customer_id))]
@@ -151,14 +151,14 @@ mod order_handlers {
 ### 5. Event Store (Load & Save Aggregates)
 
 ```rust
-use seesaw::{EventStore, AggregateLoader};
-use seesaw_postgres::PostgresEventStore;
+use causal::{EventStore, AggregateLoader};
+use causal_postgres::PostgresEventStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Create event store (backend-agnostic!)
     let pool = PgPoolOptions::new()
-        .connect("postgres://localhost/seesaw")
+        .connect("postgres://localhost/causal")
         .await?;
 
     let store = PostgresEventStore::new(pool);

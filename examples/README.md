@@ -1,12 +1,12 @@
-# Seesaw Examples
+# Causal Examples
 
-Practical examples showing how to use standard Rust libraries directly in Seesaw effects.
+Practical examples showing how to use standard Rust libraries directly in Causal effects.
 
 ## Philosophy
 
 **No adapters. No ceremony. Just clean code.**
 
-These examples show that you don't need special "Seesaw adapters" to integrate with external services. Just use the standard libraries in your effects:
+These examples show that you don't need special "Causal adapters" to integrate with external services. Just use the standard libraries in your effects:
 
 - Want HTTP? Use `reqwest` directly
 - Want AI? Call the API with `reqwest + serde`

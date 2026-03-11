@@ -1,7 +1,7 @@
 //! HTTP Fetcher Example
 
 use anyhow::Result;
-use seesaw_core::{event, events, handler, Context, Engine};
+use causal_core::{event, events, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 
 #[event(prefix = "fetch")]

@@ -5,7 +5,7 @@
 
 ## Summary
 
-We're implementing the critical safety features to make Seesaw production-ready for distributed systems. This document tracks our progress through the roadmap defined in `2026-02-06-distributed-production-readiness.md`.
+We're implementing the critical safety features to make Causal production-ready for distributed systems. This document tracks our progress through the roadmap defined in `2026-02-06-distributed-production-readiness.md`.
 
 ---
 
@@ -17,8 +17,8 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - `/migrations/20260206_add_dead_letter_queue.sql`
 
 **What was done:**
-- Created `seesaw_dlq_status` enum with lifecycle states: `open`, `retrying`, `replayed`, `resolved`
-- Created `seesaw_dead_letter_queue` table with:
+- Created `causal_dlq_status` enum with lifecycle states: `open`, `retrying`, `replayed`, `resolved`
+- Created `causal_dead_letter_queue` table with:
   - Unique constraint on `intent_id` (prevents duplicate retries)
   - Full error tracking (message, details, retry counts)
   - Lifecycle tracking (status, retry attempts, resolution notes)
@@ -39,8 +39,8 @@ We're implementing the critical safety features to make Seesaw production-ready 
 ### ✅ Task 1.2: Dead Letter Queue - Core Logic (DONE)
 
 **Files Created:**
-- `/crates/seesaw/src/dead_letter_queue.rs`
-- Updated `/crates/seesaw/src/lib.rs` to export DLQ types
+- `/crates/causal/src/dead_letter_queue.rs`
+- Updated `/crates/causal/src/lib.rs` to export DLQ types
 
 **What was done:**
 - Created `DeadLetterQueue` struct with all CRUD operations:
@@ -69,8 +69,8 @@ We're implementing the critical safety features to make Seesaw production-ready 
 ### ✅ Task 1.3: Graceful Shutdown - Core Logic (DONE)
 
 **Files Created:**
-- `/crates/seesaw/src/runtime/graceful_shutdown.rs`
-- Updated `/crates/seesaw/src/runtime/mod.rs` to export graceful_shutdown module
+- `/crates/causal/src/runtime/graceful_shutdown.rs`
+- Updated `/crates/causal/src/runtime/mod.rs` to export graceful_shutdown module
 
 **What was done:**
 - Created `GracefulShutdown` coordinator using `CancellationToken`:
@@ -109,7 +109,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Ensure `intent_id` is passed correctly
 
 **Files to modify:**
-- `/crates/seesaw/src/runtime/handler_worker.rs` (lines 140-165)
+- `/crates/causal/src/runtime/handler_worker.rs` (lines 140-165)
 
 **Exit criteria:**
 - [ ] Handler worker uses new DLQ API
@@ -129,9 +129,9 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Implement proper drain logic in `Runtime::shutdown()`
 
 **Files to modify:**
-- `/crates/seesaw/src/runtime/mod.rs`
-- `/crates/seesaw/src/runtime/handler_worker.rs`
-- `/crates/seesaw/src/runtime/event_worker.rs`
+- `/crates/causal/src/runtime/mod.rs`
+- `/crates/causal/src/runtime/handler_worker.rs`
+- `/crates/causal/src/runtime/event_worker.rs`
 
 **Exit criteria:**
 - [ ] Runtime uses CancellationToken instead of AtomicBool
@@ -152,7 +152,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Update DLQ status on success/failure
 
 **Files to create:**
-- `/crates/seesaw/src/dlq_operations.rs` (or add to existing dead_letter_queue.rs)
+- `/crates/causal/src/dlq_operations.rs` (or add to existing dead_letter_queue.rs)
 
 **Exit criteria:**
 - [ ] Single entry retry with row lock
@@ -165,7 +165,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 ### ✅ Task 1.7: Tests - DLQ Lifecycle (DONE)
 
 **Files created:**
-- `/crates/seesaw/tests/dlq_integration.rs` - 6 comprehensive DLQ tests
+- `/crates/causal/tests/dlq_integration.rs` - 6 comprehensive DLQ tests
 
 **What was done:**
 - Test 1: `test_permanent_failure_creates_dlq_entry` - Handler fails 3 times → DLQ entry created
@@ -186,7 +186,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 ### ✅ Task 1.8: Tests - Graceful Shutdown (DONE)
 
 **Files created:**
-- `/crates/seesaw/tests/graceful_shutdown_integration.rs` - 6 comprehensive shutdown tests
+- `/crates/causal/tests/graceful_shutdown_integration.rs` - 6 comprehensive shutdown tests
 
 **What was done:**
 - Test 1: `test_shutdown_completes_inflight_tasks` - All started handlers complete before shutdown
@@ -215,8 +215,8 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Add spans for handler execution
 
 **Files to modify:**
-- `/crates/seesaw/src/runtime/handler_worker.rs`
-- `/crates/seesaw/src/runtime/event_worker.rs`
+- `/crates/causal/src/runtime/handler_worker.rs`
+- `/crates/causal/src/runtime/event_worker.rs`
 
 **Exit criteria:**
 - [ ] Can trace failed event end-to-end from logs alone
@@ -235,7 +235,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Expose /metrics HTTP endpoint
 
 **Files to create:**
-- `/crates/seesaw/src/metrics.rs`
+- `/crates/causal/src/metrics.rs`
 
 **Exit criteria:**
 - [ ] All key metrics exported
@@ -256,7 +256,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Apply delay when soft limit exceeded
 
 **Files to modify:**
-- `/crates/seesaw/src/engine_v2.rs`
+- `/crates/causal/src/engine_v2.rs`
 
 **Exit criteria:**
 - [ ] Under load test, queue growth stabilizes
@@ -274,7 +274,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Never pause/sleep when backlog exists
 
 **Files to modify:**
-- `/crates/seesaw/src/runtime/handler_worker.rs`
+- `/crates/causal/src/runtime/handler_worker.rs`
 
 **Exit criteria:**
 - [ ] Workers drain faster when backlogged
@@ -291,7 +291,7 @@ We're implementing the critical safety features to make Seesaw production-ready 
 - Fail fast on invalid config
 
 **Files to create:**
-- `/crates/seesaw/src/config.rs`
+- `/crates/causal/src/config.rs`
 
 **Exit criteria:**
 - [ ] Invalid config prevents boot
@@ -304,20 +304,20 @@ We're implementing the critical safety features to make Seesaw production-ready 
 
 ### Files Created: 6
 1. `/migrations/20260206_add_dead_letter_queue.sql` - DLQ schema
-2. `/crates/seesaw/src/dead_letter_queue.rs` - DLQ core logic
-3. `/crates/seesaw/src/runtime/graceful_shutdown.rs` - Graceful shutdown
-4. `/crates/seesaw/tests/dlq_integration.rs` - DLQ integration tests (TDD)
-5. `/crates/seesaw/tests/graceful_shutdown_integration.rs` - Graceful shutdown integration tests (TDD)
+2. `/crates/causal/src/dead_letter_queue.rs` - DLQ core logic
+3. `/crates/causal/src/runtime/graceful_shutdown.rs` - Graceful shutdown
+4. `/crates/causal/tests/dlq_integration.rs` - DLQ integration tests (TDD)
+5. `/crates/causal/tests/graceful_shutdown_integration.rs` - Graceful shutdown integration tests (TDD)
 6. `/docs/plans/2026-02-06-implementation-progress.md` - This file
 
 ### Files Modified: 7
-1. `/crates/seesaw/src/lib.rs` - Added DLQ exports
-2. `/crates/seesaw/src/runtime/mod.rs` - Added graceful_shutdown module
+1. `/crates/causal/src/lib.rs` - Added DLQ exports
+2. `/crates/causal/src/runtime/mod.rs` - Added graceful_shutdown module
 3. `/Cargo.toml` - Added tokio-util workspace dependency
-4. `/crates/seesaw/Cargo.toml` - Added sqlx, tokio-util, seesaw-postgres dependencies
-5. `/crates/seesaw/src/handler/builders.rs` - Fixed join_window → join_window_timeout mappings
-6. `/crates/seesaw/src/runtime/graceful_shutdown.rs` - Fixed CancellationToken borrowing
-7. `/crates/seesaw/src/dead_letter_queue.rs` - Converted from time to chrono
+4. `/crates/causal/Cargo.toml` - Added sqlx, tokio-util, causal-postgres dependencies
+5. `/crates/causal/src/handler/builders.rs` - Fixed join_window → join_window_timeout mappings
+6. `/crates/causal/src/runtime/graceful_shutdown.rs` - Fixed CancellationToken borrowing
+7. `/crates/causal/src/dead_letter_queue.rs` - Converted from time to chrono
 
 ### Lines of Code: ~1100
 - DLQ schema: ~50 lines

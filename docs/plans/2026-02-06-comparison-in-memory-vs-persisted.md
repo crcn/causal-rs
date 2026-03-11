@@ -8,10 +8,10 @@
 |----------|-----------|---------|------------|--------------|----------|
 | **In-Memory Handlers** | 1M+ events/sec | <1ms | ❌ Lost on crash | ❌ Single process | Real-time, ephemeral |
 | **Relay/Forward** | 500k+ events/sec | <5ms | ⚠️ At-most-once | ✅ Multi-process | Event forwarding |
-| **Seesaw (Persisted)** | 1k-100k events/sec | 10-50ms | ✅ Durable | ✅ Multi-worker | Critical workflows |
-| **Seesaw + In-Memory** | 1M+ events/sec | <1ms | ⚠️ Hybrid | ✅ Multi-worker | Hybrid approach |
+| **Causal (Persisted)** | 1k-100k events/sec | 10-50ms | ✅ Durable | ✅ Multi-worker | Critical workflows |
+| **Causal + In-Memory** | 1M+ events/sec | <1ms | ⚠️ Hybrid | ✅ Multi-worker | Hybrid approach |
 
-**Key insight:** Different approaches for different problems. Seesaw prioritizes correctness and durability, but can adopt in-memory patterns when needed.
+**Key insight:** Different approaches for different problems. Causal prioritizes correctness and durability, but can adopt in-memory patterns when needed.
 
 ---
 
@@ -329,11 +329,11 @@ JetStream:
 
 ---
 
-## Part 3: Seesaw vs In-Memory/Relay
+## Part 3: Causal vs In-Memory/Relay
 
 ### Architectural Comparison
 
-| Aspect | In-Memory | Relay (Fire-and-Forget) | Relay (Kafka) | Seesaw |
+| Aspect | In-Memory | Relay (Fire-and-Forget) | Relay (Kafka) | Causal |
 |--------|-----------|------------------------|---------------|--------|
 | **Event Persistence** | ❌ No | ❌ No | ✅ Yes (Kafka) | ✅ Yes (Postgres) |
 | **Handler Persistence** | ❌ No | ❌ No | ⚠️ Manual | ✅ Yes (intent tracking) |
@@ -352,9 +352,9 @@ In-Memory:           1,000,000 events/sec   (pure compute)
 Redis Pub/Sub:         500,000 events/sec   (network + pub/sub)
 NATS:                  500,000 events/sec   (network + routing)
 Kafka:                 100,000 events/sec   (network + persistence)
-Seesaw + Kafka:        100,000 events/sec   (persistence + intent tracking)
-Seesaw + Redis:         10,000 events/sec   (Postgres writes)
-Seesaw + Postgres:       1,000 events/sec   (pg_notify limit)
+Causal + Kafka:        100,000 events/sec   (persistence + intent tracking)
+Causal + Redis:         10,000 events/sec   (Postgres writes)
+Causal + Postgres:       1,000 events/sec   (pg_notify limit)
 ```
 
 **Latency:**
@@ -363,9 +363,9 @@ In-Memory:           <1ms      (function call)
 Redis Pub/Sub:       1-5ms     (network + pub/sub)
 NATS:                1-5ms     (network + routing)
 Kafka:               5-50ms    (network + disk + replication)
-Seesaw + Kafka:      10-50ms   (Postgres + Kafka + intent tracking)
-Seesaw + Redis:      10-30ms   (Postgres writes + Redis)
-Seesaw + Postgres:   10-30ms   (Postgres writes + pg_notify)
+Causal + Kafka:      10-50ms   (Postgres + Kafka + intent tracking)
+Causal + Redis:      10-30ms   (Postgres writes + Redis)
+Causal + Postgres:   10-30ms   (Postgres writes + pg_notify)
 ```
 
 ### Use Case Comparison
@@ -394,7 +394,7 @@ impl AnalyticsEngine {
 // Result: 1M events/sec, <1ms latency
 ```
 
-**Why not Seesaw:** Overkill, don't need persistence/retry
+**Why not Causal:** Overkill, don't need persistence/retry
 
 ---
 
@@ -406,7 +406,7 @@ impl AnalyticsEngine {
 - Must retry failures
 - Need audit trail
 
-**Best approach: Seesaw**
+**Best approach: Causal**
 ```rust
 #[handler(on = PaymentRequested, retry = 3)]
 async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentCharged> {
@@ -443,7 +443,7 @@ let mut pubsub = conn.into_pubsub();
 pubsub.subscribe("user.created").await?;
 ```
 
-**Why not Seesaw:** Don't need durability, want lower latency
+**Why not Causal:** Don't need durability, want lower latency
 
 ---
 
@@ -455,7 +455,7 @@ pubsub.subscribe("user.created").await?;
 - Need retry logic
 - Need to track state
 
-**Best approach: Seesaw**
+**Best approach: Causal**
 ```rust
 #[handler(on = WorkflowStarted)]
 async fn step1(...) -> Result<Step1Complete> { ... }
@@ -480,14 +480,14 @@ async fn step3(...) -> Result<WorkflowComplete> { ... }
 - Also persist for later (audit trail)
 - 1,000 events/sec
 
-**Best approach: In-Memory + Seesaw**
+**Best approach: In-Memory + Causal**
 ```rust
 // In-memory relay for real-time
 struct RealtimeRelay {
     subscribers: Arc<Mutex<Vec<WebSocket>>>,
 }
 
-// Seesaw handler for persistence
+// Causal handler for persistence
 #[handler(on = OrderPlaced)]
 async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     // Persist to database
@@ -506,7 +506,7 @@ async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
 
 ## Part 4: Hybrid Approaches
 
-### Approach 1: Seesaw with In-Memory Fast Path
+### Approach 1: Causal with In-Memory Fast Path
 
 **Architecture:**
 ```
@@ -521,7 +521,7 @@ Persisted Handler (durable, slower)
 ```rust
 struct HybridEngine {
     memory_handlers: Vec<Handler>,   // Execute immediately
-    persisted_handlers: Vec<Handler>, // Execute via Seesaw
+    persisted_handlers: Vec<Handler>, // Execute via Causal
 }
 
 impl HybridEngine {
@@ -535,7 +535,7 @@ impl HybridEngine {
         }
 
         // Slow path: Persist and queue
-        self.seesaw.dispatch(event).await?;
+        self.causal.dispatch(event).await?;
 
         Ok(())
     }
@@ -570,13 +570,13 @@ async fn save_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
 // Result: Instant WebSocket updates + durable database record
 ```
 
-### Approach 2: Relay + Seesaw
+### Approach 2: Relay + Causal
 
 **Architecture:**
 ```
 High-volume events → Kafka (relay)
                      ↓
-                   Seesaw workers consume and process
+                   Causal workers consume and process
                      ↓
                    Results → Postgres (durable state)
 ```
@@ -596,12 +596,12 @@ async fn ingest_events(kafka: &FutureProducer) {
     }
 }
 
-// Seesaw workers (consume from Kafka)
+// Causal workers (consume from Kafka)
 async fn consume_and_process(kafka: &StreamConsumer, engine: &Engine) {
     while let Some(message) = kafka.stream().next().await {
         let event: Event = serde_json::from_slice(message.payload())?;
 
-        // Process through Seesaw (with retry, audit trail)
+        // Process through Causal (with retry, audit trail)
         engine.dispatch(event).await?;
 
         // Commit Kafka offset
@@ -613,13 +613,13 @@ async fn consume_and_process(kafka: &StreamConsumer, engine: &Engine) {
 **Performance:**
 ```
 Kafka ingestion: 100k+ events/sec
-Seesaw processing: Limited by workers (scales horizontally)
+Causal processing: Limited by workers (scales horizontally)
 End-to-end latency: 50-100ms
 ```
 
 **Benefits:**
 - ✅ Kafka handles high-volume ingestion
-- ✅ Seesaw handles complex workflows with retry
+- ✅ Causal handles complex workflows with retry
 - ✅ Best of both worlds
 
 ### Approach 3: Tiered Processing
@@ -630,7 +630,7 @@ Tier 1: In-Memory (fast, ephemeral)
   ↓
 Tier 2: Redis Relay (medium, fire-and-forget)
   ↓
-Tier 3: Seesaw (slow, durable)
+Tier 3: Causal (slow, durable)
 ```
 
 **Use case:**
@@ -647,7 +647,7 @@ async fn invalidate_cache(event: UserUpdated, ctx: Ctx) {
     ctx.deps().redis.publish("cache.invalidate", &event).await?;
 }
 
-// Tier 3: Database persistence (Seesaw)
+// Tier 3: Database persistence (Causal)
 #[handler(on = UserUpdated, retry = 3)]
 async fn update_database(event: UserUpdated, ctx: Ctx) -> Result<UserSaved> {
     ctx.deps().db.update_user(&event).await?;
@@ -676,11 +676,11 @@ Do you need retry logic?
 
 Do you need complex workflows? (multi-step, branching)
   ↓ No  → Simple Kafka consumers
-  ↓ Yes → Seesaw
+  ↓ Yes → Causal
 
 Do you need >10k events/sec?
-  ↓ No  → Seesaw with PostgresQueue or RedisQueue
-  ↓ Yes → Seesaw with KafkaQueue or Hybrid (in-memory + Seesaw)
+  ↓ No  → Causal with PostgresQueue or RedisQueue
+  ↓ Yes → Causal with KafkaQueue or Hybrid (in-memory + Causal)
 ```
 
 ### Summary Table
@@ -691,17 +691,17 @@ Do you need >10k events/sec?
 | **UI notifications** | WebSocket Relay | Low latency, ephemeral |
 | **Cache invalidation** | Redis Pub/Sub | Fire-and-forget, low latency |
 | **Event sourcing** | Kafka | Durable, replayable |
-| **Payment processing** | Seesaw | Critical, needs retry + audit |
-| **Long workflows** | Seesaw | Multi-step, durable state |
+| **Payment processing** | Causal | Critical, needs retry + audit |
+| **Long workflows** | Causal | Multi-step, durable state |
 | **Microservice events** | NATS or Redis | Low latency, fire-and-forget |
-| **High-volume + critical** | Kafka + Seesaw | Best of both |
+| **High-volume + critical** | Kafka + Causal | Best of both |
 | **Mixed requirements** | Hybrid | Combine approaches |
 
 ---
 
-## Part 6: Seesaw's Position
+## Part 6: Causal's Position
 
-### What Seesaw Optimizes For
+### What Causal Optimizes For
 
 1. **Correctness** - At-least-once delivery, retry logic
 2. **Durability** - Events and handler state persisted
@@ -709,13 +709,13 @@ Do you need >10k events/sec?
 4. **Workflow orchestration** - Multi-step processes
 5. **Developer experience** - Simple API, fewer decisions
 
-### What Seesaw Sacrifices
+### What Causal Sacrifices
 
 1. **Raw throughput** - 1k-100k vs 1M+ for in-memory
 2. **Latency** - 10-50ms vs <1ms for in-memory
 3. **Operational simplicity** - Requires database + queue
 
-### When Seesaw is the Right Choice
+### When Causal is the Right Choice
 
 - ✅ Financial transactions
 - ✅ Order processing
@@ -725,7 +725,7 @@ Do you need >10k events/sec?
 - ✅ Need retry logic
 - ✅ Need replay capability
 
-### When Seesaw is NOT the Right Choice
+### When Causal is NOT the Right Choice
 
 - ❌ Real-time analytics (>10k events/sec, ephemeral)
 - ❌ UI state management (in-process only)
@@ -743,7 +743,7 @@ async fn notify_realtime(event: OrderPlaced, ctx: Ctx) {
     ctx.deps().websocket.broadcast(&event).await?;
 }
 
-// Use Seesaw for durability
+// Use Causal for durability
 #[handler(on = OrderPlaced, retry = 3)]
 async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     ctx.deps().db.insert_order(&event).await?;
@@ -760,9 +760,9 @@ async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
 
 ## Conclusion
 
-**Seesaw is not trying to compete with in-memory handlers on raw throughput.** It optimizes for different concerns:
+**Causal is not trying to compete with in-memory handlers on raw throughput.** It optimizes for different concerns:
 
-| Concern | In-Memory | Relay | Seesaw |
+| Concern | In-Memory | Relay | Causal |
 |---------|-----------|-------|--------|
 | **Speed** | ✅ 1M/sec | ✅ 500k/sec | ⚠️ 1k-100k/sec |
 | **Durability** | ❌ No | ⚠️ Maybe | ✅ Yes |
@@ -770,11 +770,11 @@ async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
 | **Workflows** | ❌ Manual | ❌ Manual | ✅ Built-in |
 | **Audit Trail** | ❌ No | ⚠️ Maybe | ✅ Yes |
 
-**The key insight:** Different tools for different problems. Seesaw can adopt in-memory patterns when needed (hybrid approach), but its core value is durability + correctness + workflow orchestration.
+**The key insight:** Different tools for different problems. Causal can adopt in-memory patterns when needed (hybrid approach), but its core value is durability + correctness + workflow orchestration.
 
 **For most production systems,** the hybrid approach gives you the best of both worlds:
 - In-memory for real-time/ephemeral
-- Seesaw for critical/durable
+- Causal for critical/durable
 - Relay for pub/sub/notification
 
-**The new async-first architecture makes Seesaw scale 10-1000x better,** bringing it into the range where it can handle production workloads while maintaining its correctness guarantees.
+**The new async-first architecture makes Causal scale 10-1000x better,** bringing it into the range where it can handle production workloads while maintaining its correctness guarantees.

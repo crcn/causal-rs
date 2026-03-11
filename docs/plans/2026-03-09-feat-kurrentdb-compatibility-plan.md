@@ -10,7 +10,7 @@ depends_on: docs/plans/2026-03-08-refactor-store-trait-split-plan.md
 
 ## Overview
 
-Replace seesaw's implicit event identity (`std::any::type_name`) with a strict
+Replace causal's implicit event identity (`std::any::type_name`) with a strict
 `Event` trait enforced by a `#[event]` proc macro. Every event gets a compile-time
 guaranteed, domain-prefixed durable name. Ephemeral events are a type-level concern.
 No fallbacks, no runtime string parsing, no optional fields.
@@ -19,7 +19,7 @@ Clean slate — no legacy data to protect.
 
 ## Problem Statement
 
-Seesaw currently has no explicit `Event` trait. Events just need `Clone + Send + Sync + 'static`.
+Causal currently has no explicit `Event` trait. Events just need `Clone + Send + Sync + 'static`.
 Identity is derived at runtime from `std::any::type_name::<E>()` → `"ScrapeEvent"` for all
 variants. This causes:
 
@@ -97,7 +97,7 @@ pub struct EnrichmentReady { pub correlation_id: Uuid }
 For enums with `#[serde(tag = "type", rename_all = "snake_case")]`:
 
 ```rust
-impl seesaw::Event for ScrapeEvent {
+impl causal::Event for ScrapeEvent {
     fn durable_name(&self) -> &str {
         match self {
             ScrapeEvent::WebScrapeCompleted { .. } => "scrape:web_scrape_completed",
@@ -112,7 +112,7 @@ impl seesaw::Event for ScrapeEvent {
 For structs:
 
 ```rust
-impl seesaw::Event for OrderPlaced {
+impl causal::Event for OrderPlaced {
     fn durable_name(&self) -> &str { "order_placed" }
     fn event_prefix() -> &'static str { "order_placed" }
     fn is_ephemeral() -> bool { false }
@@ -248,10 +248,10 @@ For ephemeral events (persistent=false):
 
 ### Phase 1: `Event` Trait + `#[event]` Proc Macro
 
-#### `crates/seesaw/src/handler/mod.rs` → new `event.rs` module
+#### `crates/causal/src/handler/mod.rs` → new `event.rs` module
 
 ```rust
-// crates/seesaw/src/event.rs
+// crates/causal/src/event.rs
 pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static {
     fn durable_name(&self) -> &str;
     fn event_prefix() -> &'static str;
@@ -263,7 +263,7 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 - [ ] Re-export from `lib.rs`
 - [ ] Add to existing handler bounds: `on::<E>()` requires `E: Event`
 
-#### `crates/seesaw_core_macros/src/lib.rs`
+#### `crates/causal_core_macros/src/lib.rs`
 
 - [ ] Add `#[event]` proc macro attribute
 - [ ] Parse args: `prefix = "..."` (optional for structs, required for enums), `ephemeral` (flag)
@@ -275,13 +275,13 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 - [ ] Compile error if enum has `#[event]` but no `#[serde(tag = "...")]`
 - [ ] Compile error if enum has `#[serde(untagged)]`
 
-#### `crates/seesaw/src/lib.rs`
+#### `crates/causal/src/lib.rs`
 
 - [ ] `pub mod event;`
 - [ ] Re-export: `pub use event::Event;`
-- [ ] Re-export macro: `pub use seesaw_core_macros::event;`
+- [ ] Re-export macro: `pub use causal_core_macros::event;`
 
-#### Tests (`crates/seesaw_core_macros/tests/`)
+#### Tests (`crates/causal_core_macros/tests/`)
 
 - [ ] Enum with `prefix + snake_case` → correct durable_name per variant
 - [ ] Enum with `prefix + PascalCase` (no rename) → correct durable_name
@@ -294,13 +294,13 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 
 ### Phase 2: Wire `Event` Trait Through Engine
 
-#### `crates/seesaw/src/handler/types.rs`
+#### `crates/causal/src/handler/types.rs`
 
 - [ ] `EventOutput::new::<E: Event>(event: E)` → set `durable_name = event.durable_name().to_string()`
 - [ ] `EventOutput::new::<E: Event>(event: E)` → set `persistent = !E::is_ephemeral()`
 - [ ] Add `durable_name: String` and `persistent: bool` fields to `EventOutput`
 
-#### `crates/seesaw/src/types.rs`
+#### `crates/causal/src/types.rs`
 
 - [ ] `EmittedEvent`: add `durable_name: String`, `persistent: bool`
 - [ ] `NewEvent.event_type`: now stores durable_name (the field name stays `event_type` for minimal churn)
@@ -308,51 +308,51 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 - [ ] `PersistedEvent.event_type`: now stores durable_name
 - [ ] Remove `event_type_short_name` usage from engine paths (no longer needed)
 
-#### `crates/seesaw/src/event_codec.rs`
+#### `crates/causal/src/event_codec.rs`
 
 - [ ] `EventCodec`: replace `event_type: String` with `event_prefix: String`
 - [ ] `typed_event_codec::<E: Event>()`: use `E::event_prefix()` instead of `std::any::type_name`
 
-#### `crates/seesaw/src/handler_registry.rs`
+#### `crates/causal/src/handler_registry.rs`
 
 - [ ] `find_codec_by_event_type` → `find_codec_by_durable_name`: extract prefix, match by prefix
 - [ ] Helper: `fn extract_prefix(durable_name: &str) -> &str` (split on `:`, take first, or full string)
 
-#### `crates/seesaw/src/aggregator.rs`
+#### `crates/causal/src/aggregator.rs`
 
 - [ ] Aggregator registration: use `E::event_prefix()` instead of `type_name`
 - [ ] `find_by_event_type` → `find_by_durable_name`: prefix-based lookup
 
-#### `crates/seesaw/src/upcaster.rs`
+#### `crates/causal/src/upcaster.rs`
 
 - [ ] Upcaster registration: use `E::event_prefix()` instead of short name
 - [ ] `upcast`: prefix-based lookup
 
-#### `crates/seesaw/src/engine.rs`
+#### `crates/causal/src/engine.rs`
 
 - [ ] `publish_event`: use `event.durable_name()` for `NewEvent.event_type`
 - [ ] `build_new_events`: use `EmittedEvent.durable_name` for `NewEvent.event_type`
 - [ ] Deterministic UUID v5 seed: use `durable_name` instead of Rust type name
 - [ ] Remove `event_type_short_name` calls from event building paths
 
-#### `crates/seesaw/src/job_executor.rs`
+#### `crates/causal/src/job_executor.rs`
 
 - [ ] `serialize_emitted_events`: carry `durable_name` and `persistent` from EventOutput to EmittedEvent
 - [ ] `decode_event`: use prefix-based codec lookup
 
-#### `crates/seesaw/src/event_store.rs`
+#### `crates/causal/src/event_store.rs`
 
 - [ ] `persist_event<E: Event>`: use `event.durable_name()` instead of `event_type_short_name(type_name::<E>())`
 - [ ] Keep `event_type_short_name` for backward compat (deprecated), or remove entirely
 
-#### `crates/seesaw/src/memory_store.rs`
+#### `crates/causal/src/memory_store.rs`
 
 - [x] `append()`: copy `persistent` flag from `NewEvent` to `PersistedEvent`.
   All events (including ephemeral) are persisted to the operational store.
 
 ### Phase 3: Ephemeral Event Processing
 
-#### `crates/seesaw/src/engine.rs`
+#### `crates/causal/src/engine.rs`
 
 - [x] All events (persistent and ephemeral) go through `log.append()` — single uniform path
 - [x] Settle loop checks `event.persistent` to skip aggregator hydration/apply/snapshot
@@ -379,7 +379,7 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 
 ### Phase 4: Update All Existing Events
 
-#### `crates/seesaw/tests/` and `examples/`
+#### `crates/causal/tests/` and `examples/`
 
 - [x] Add `#[event]` or `#[event(prefix = "...")]` to all event types in tests
 - [x] Add `#[event]` to all event types in examples
@@ -423,7 +423,7 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 
 ### Rootsignal
 
-When upgrading seesaw, rootsignal needs:
+When upgrading causal, rootsignal needs:
 1. Add `#[event(prefix = "...")]` to all domain event enums
 2. Add `#[event(prefix = "...", ephemeral)]` to gate/trampoline events
 3. Delete `event_domain_prefix()` and `event_layer()` hardcoded maps
@@ -455,7 +455,7 @@ enum TestEnum {
 - Store trait split: PR #2 (`refactor/store-trait-split`)
 - Rootsignal migration plan: `docs/plans/2026-03-09-refactor-rootsignal-postgres-store-migration-plan.md`
 - KurrentDB roadmap: `docs/plans/2026-03-06-kurrentdb-integration-roadmap.md`
-- Event codec: `crates/seesaw/src/event_codec.rs`
-- Engine event building: `crates/seesaw/src/engine.rs:1067-1120`
-- Existing macros: `crates/seesaw_core_macros/src/lib.rs`
+- Event codec: `crates/causal/src/event_codec.rs`
+- Engine event building: `crates/causal/src/engine.rs:1067-1120`
+- Existing macros: `crates/causal_core_macros/src/lib.rs`
 - Rootsignal hardcoded mappings: `rootsignal-api/src/db/models/scout_run.rs:499-528`

@@ -144,5 +144,5 @@ async fn handle(&mut self, event: E, ctx: EffectContext<D, S>) -> Result<Option<
 }
 ```
 
-[0.5.0]: https://github.com/crcn/seesaw-rs/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/crcn/seesaw-rs/compare/v0.3.0...v0.4.0
+[0.5.0]: https://github.com/crcn/causal-rs/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/crcn/causal-rs/compare/v0.3.0...v0.4.0

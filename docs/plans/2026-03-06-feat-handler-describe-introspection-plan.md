@@ -15,7 +15,7 @@ external UIs for rendering per-handler progress on flow visualization nodes.
 
 ## Problem Statement
 
-Filtered handlers in seesaw use opaque closures (`Fn(&E, &Context<D>) -> bool`) as
+Filtered handlers in causal use opaque closures (`Fn(&E, &Context<D>) -> bool`) as
 gates. There is no way for an admin UI or flow visualization to ask "how close is this
 handler to opening?" without hardcoding domain knowledge about each gate. Adding a
 handler or changing a gate requires matching frontend changes.
@@ -51,7 +51,7 @@ let descriptions = store.get_handler_descriptions(correlation_id).await?;
 
 ## Key Decisions
 
-- **Describe returns `T: Serialize`, not `serde_json::Value`** — user code stays typed, seesaw serializes internally.
+- **Describe returns `T: Serialize`, not `serde_json::Value`** — user code stays typed, causal serializes internally.
 - **Runs during `execute_event`** — after aggregates update, while iterating matching handlers to create intents. NOT during `execute_handler`.
 - **Persisted to Store** — external UIs query the Store directly, no coupling to the live Engine process.
 - **Merge semantics** — `set_handler_descriptions` upserts per `(correlation_id, handler_id)`. A flow with 5 gated handlers triggered by different event types shows all 5 simultaneously.
@@ -80,7 +80,7 @@ let descriptions = store.get_handler_descriptions(correlation_id).await?;
 Add `describe` field and accessors.
 
 ```rust
-// crates/seesaw/src/handler/types.rs
+// crates/causal/src/handler/types.rs
 
 // In Handler<D> struct, after `priority`:
 pub(crate) describe: Option<Arc<dyn Fn(&Context<D>) -> serde_json::Value + Send + Sync>>,
@@ -110,7 +110,7 @@ pub fn call_describe(&self, ctx: &Context<D>) -> Option<serde_json::Value> {
 Add `describe` field and builder method.
 
 ```rust
-// crates/seesaw/src/handler/builders.rs
+// crates/causal/src/handler/builders.rs
 
 // Add field to FilteredHandlerBuilder:
 pub struct FilteredHandlerBuilder<E, Started, D, G> {
@@ -161,7 +161,7 @@ pub fn filter<D, F>(self, predicate: F) -> FilteredHandlerBuilder<E, Started, D,
 ### 3. `types.rs` — EventCommit
 
 ```rust
-// crates/seesaw/src/types.rs
+// crates/causal/src/types.rs
 
 // Add to EventCommit:
 pub struct EventCommit {
@@ -173,7 +173,7 @@ pub struct EventCommit {
 ### 4. `store.rs` — Store trait
 
 ```rust
-// crates/seesaw/src/store.rs
+// crates/causal/src/store.rs
 
 // Add two new optional methods with default no-ops:
 
@@ -201,7 +201,7 @@ async fn get_handler_descriptions(
 ### 5. `memory_store.rs` — MemoryStore implementation
 
 ```rust
-// crates/seesaw/src/memory_store.rs
+// crates/causal/src/memory_store.rs
 
 // Add field to MemoryStore:
 handler_descriptions: Arc<DashMap<Uuid, HashMap<String, serde_json::Value>>>,
@@ -236,7 +236,7 @@ async fn get_handler_descriptions(
 Call describe for matching handlers during event processing.
 
 ```rust
-// crates/seesaw/src/job_executor.rs
+// crates/causal/src/job_executor.rs
 
 // In execute_event(), after matching_handlers (line ~110), before building intents:
 
@@ -277,7 +277,7 @@ Ok(EventCommit {
 ### 7. `engine.rs` — settle loop persistence
 
 ```rust
-// crates/seesaw/src/engine.rs
+// crates/causal/src/engine.rs
 
 // In settle loop, after complete_event (line ~417):
 match executor.execute_event(&event, &event_config).await {
@@ -308,7 +308,7 @@ match executor.execute_event(&event, &event_config).await {
 ### Unit tests (`handler/builders.rs`)
 
 ```rust
-// crates/seesaw/src/handler/builders.rs (tests module)
+// crates/causal/src/handler/builders.rs (tests module)
 
 #[test]
 fn describe_stores_closure_on_handler() {
@@ -369,10 +369,10 @@ async fn describe_panic_does_not_crash_settle() {
 ## References
 
 - Brainstorm: `docs/brainstorms/2026-03-06-handler-describe-brainstorm.md`
-- Handler builders: `crates/seesaw/src/handler/builders.rs`
-- Handler types: `crates/seesaw/src/handler/types.rs`
-- Job executor: `crates/seesaw/src/job_executor.rs`
-- Store trait: `crates/seesaw/src/store.rs`
-- Memory store: `crates/seesaw/src/memory_store.rs`
-- Engine settle loop: `crates/seesaw/src/engine.rs:350-550`
-- EventCommit: `crates/seesaw/src/types.rs:109-124`
+- Handler builders: `crates/causal/src/handler/builders.rs`
+- Handler types: `crates/causal/src/handler/types.rs`
+- Job executor: `crates/causal/src/job_executor.rs`
+- Store trait: `crates/causal/src/store.rs`
+- Memory store: `crates/causal/src/memory_store.rs`
+- Engine settle loop: `crates/causal/src/engine.rs:350-550`
+- EventCommit: `crates/causal/src/types.rs:109-124`

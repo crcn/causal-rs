@@ -1,43 +1,43 @@
-# Plan: Extract Seesaw Admin UI into Reusable Modules
+# Plan: Extract Causal Admin UI into Reusable Modules
 
 **Date:** 2026-03-11
 **Status:** Draft
-**Context:** The rootsignal admin app has a mature event browser (timeline, causal tree, causal flow DAG, handler logs) built on top of seesaw's event tables. This functionality is generic — it queries seesaw's own schema, not rootsignal-specific tables. Extracting it into reusable modules lets any seesaw-based project get the same observability out of the box.
+**Context:** The rootsignal admin app has a mature event browser (timeline, causal tree, causal flow DAG, handler logs) built on top of causal's event tables. This functionality is generic — it queries causal's own schema, not rootsignal-specific tables. Extracting it into reusable modules lets any causal-based project get the same observability out of the box.
 
 ## Directory Structure
 
-Adopt a unified `modules/` directory for all seesaw modules (Rust crates + JS packages). Migrate existing `crates/` into `modules/`.
+Adopt a unified `modules/` directory for all causal modules (Rust crates + JS packages). Migrate existing `crates/` into `modules/`.
 
 ```
-seesaw-rs/
+causal-rs/
   modules/
     # ── Existing (moved from crates/) ──
-    seesaw/                    # core runtime
-    seesaw_core_macros/        # proc macros
-    seesaw_replay/             # replay library
-    seesaw_utils/              # utilities
+    causal/                    # core runtime
+    causal_core_macros/        # proc macros
+    causal_replay/             # replay library
+    causal_utils/              # utilities
 
     # ── New: Rust crate ──
-    seesaw_admin/              # backend for admin UI
+    causal_admin/              # backend for admin UI
       Cargo.toml
       src/
         lib.rs
         types.rs               # AdminEvent, AdminEventsPage, AdminCausalTree, etc.
         display.rs             # EventDisplay trait + DefaultEventDisplay
-        queries.rs             # Postgres queries against seesaw tables
+        queries.rs             # Postgres queries against causal tables
         cache.rs               # EventCache (bounded in-memory cache)
         broadcast.rs           # EventBroadcast (pg_notify → broadcast channel)
         graphql.rs             # async-graphql resolvers (behind feature flag)
 
     # ── New: React package ──
-    seesaw-admin-ui/           # frontend components (npm package)
+    causal-admin-ui/           # frontend components (npm package)
       package.json
       tsconfig.json
       src/
         index.ts               # public API
         types.ts               # AdminEvent, FlowSelection, LogsFilter
         queries.ts             # GraphQL queries + subscription
-        context.tsx            # SeesawAdminProvider (generic EventsPaneContext)
+        context.tsx            # CausalAdminProvider (generic EventsPaneContext)
         theme.ts               # Default color maps, configurable
         panes/
           TimelinePane.tsx     # Event stream with filters, infinite scroll, live sub
@@ -61,23 +61,23 @@ seesaw-rs/
 
 1. `mv crates/ modules/`
 2. Update `Cargo.toml` workspace members: `crates/*` → `modules/*`
-3. Update all internal `path = "../seesaw"` references in sub-crate Cargo.tomls
+3. Update all internal `path = "../causal"` references in sub-crate Cargo.tomls
 4. Verify `cargo build` and `cargo test` pass
 
-## What Moves from Rootsignal → seesaw_admin (Rust)
+## What Moves from Rootsignal → causal_admin (Rust)
 
 ### Generic (extract)
 
 | Rootsignal location | Destination | Notes |
 |---|---|---|
-| `db/models/scout_run.rs` → `list_events_paginated()` | `queries.rs` | Queries `events` table (seesaw schema) |
+| `db/models/scout_run.rs` → `list_events_paginated()` | `queries.rs` | Queries `events` table (causal schema) |
 | `db/models/scout_run.rs` → `causal_tree()` | `queries.rs` | Queries by `correlation_id` |
 | `db/models/scout_run.rs` → `causal_flow()` | `queries.rs` | Queries by `run_id` |
 | `db/models/scout_run.rs` → `get_event_by_seq()` | `queries.rs` | Single event lookup |
-| `db/models/scout_run.rs` → `handler_logs()` | `queries.rs` | Queries `seesaw_handler_logs` |
-| `db/models/scout_run.rs` → `handler_logs_by_run()` | `queries.rs` | Queries `seesaw_handler_logs` |
-| `db/models/scout_run.rs` → `handler_outcomes()` | `queries.rs` | Queries `seesaw_effect_executions` |
-| `db/models/scout_run.rs` → `handler_descriptions()` | `queries.rs` | Queries `seesaw_handler_descriptions` |
+| `db/models/scout_run.rs` → `handler_logs()` | `queries.rs` | Queries `causal_handler_logs` |
+| `db/models/scout_run.rs` → `handler_logs_by_run()` | `queries.rs` | Queries `causal_handler_logs` |
+| `db/models/scout_run.rs` → `handler_outcomes()` | `queries.rs` | Queries `causal_effect_executions` |
+| `db/models/scout_run.rs` → `handler_descriptions()` | `queries.rs` | Queries `causal_handler_descriptions` |
 | `event_cache.rs` → `EventCache` | `cache.rs` | Bounded in-memory cache with indexes |
 | `event_broadcast.rs` → `EventBroadcast` | `broadcast.rs` | pg_notify listener → broadcast |
 | `graphql/schema.rs` → `admin_events()` etc. | `graphql.rs` | async-graphql resolvers |
@@ -99,7 +99,7 @@ seesaw-rs/
 The one thing that varies per project is how raw events get displayed. This becomes a trait:
 
 ```rust
-// seesaw_admin/src/display.rs
+// causal_admin/src/display.rs
 
 /// Customizes how events are displayed in the admin UI.
 /// Implement this trait to provide domain-specific naming and summaries.
@@ -138,13 +138,13 @@ impl EventDisplay for DefaultEventDisplay {
 Used in the GraphQL resolvers and cache hydration:
 
 ```rust
-// seesaw_admin/src/graphql.rs
+// causal_admin/src/graphql.rs
 
-pub struct SeesawAdminQuery<D: EventDisplay> {
+pub struct CausalAdminQuery<D: EventDisplay> {
     display: Arc<D>,
 }
 
-impl<D: EventDisplay + 'static> SeesawAdminQuery<D> {
+impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
     pub fn new(display: D) -> Self {
         Self { display: Arc::new(display) }
     }
@@ -178,7 +178,7 @@ impl EventDisplay for RootSignalEventDisplay {
 ## Feature Flags (Rust Crate)
 
 ```toml
-# modules/seesaw_admin/Cargo.toml
+# modules/causal_admin/Cargo.toml
 
 [features]
 default = []
@@ -187,7 +187,7 @@ cache = []                      # in-memory EventCache
 broadcast = ["sqlx/postgres"]   # pg_notify → broadcast channel
 
 [dependencies]
-seesaw_core = { path = "../seesaw" }
+causal_core = { path = "../causal" }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "chrono", "uuid"], optional = true }
 async-graphql = { version = "7", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
@@ -199,7 +199,7 @@ tracing = "0.1"
 anyhow = "1"
 ```
 
-## What Moves from Rootsignal → seesaw-admin-ui (React)
+## What Moves from Rootsignal → causal-admin-ui (React)
 
 ### Generic (extract)
 
@@ -211,7 +211,7 @@ anyhow = "1"
 | `CausalFlowPane.tsx` | `panes/CausalFlowPane.tsx` | Remove `ADMIN_SCOUT_RUN` query; add `headerExtra` render prop |
 | `LogsPane.tsx` | `panes/LogsPane.tsx` | Remove `setInvestigation` (make optional callback prop) |
 | `eventColor.ts` | `theme.ts` | Export as configurable color map |
-| GraphQL queries | `queries.ts` | The 7 seesaw admin queries + subscription |
+| GraphQL queries | `queries.ts` | The 7 causal admin queries + subscription |
 
 ### Stays in rootsignal
 
@@ -219,18 +219,18 @@ anyhow = "1"
 |---|---|
 | `InvestigatePane.tsx` | AI investigation, rootsignal-specific |
 | `EventsPage.tsx` | Layout composition — rootsignal wires in its custom panes |
-| `PaneManager.tsx` | Generic but not seesaw-specific; could be a separate package later |
+| `PaneManager.tsx` | Generic but not causal-specific; could be a separate package later |
 | `ADMIN_SCOUT_RUN` query | Scout-specific |
 | `ScoutRunDetailPage.tsx` | Scout-specific |
 
 ## Frontend Package API
 
 ```tsx
-// @seesaw/admin-ui
+// @causal/admin-ui
 
 // Provider — wraps your app, provides the events context
-export { SeesawAdminProvider } from './context';
-export type { SeesawAdminConfig } from './context';
+export { CausalAdminProvider } from './context';
+export type { CausalAdminConfig } from './context';
 
 // Panes — drop into any layout system
 export { TimelinePane } from './panes/TimelinePane';
@@ -239,7 +239,7 @@ export { CausalFlowPane } from './panes/CausalFlowPane';
 export { LogsPane } from './panes/LogsPane';
 
 // Hooks — for building custom UI
-export { useSeesawAdmin } from './context';  // the context hook
+export { useCausalAdmin } from './context';  // the context hook
 
 // Components — for custom compositions
 export { EventNode, HandlerNode, BlockRenderer } from './components';
@@ -253,18 +253,18 @@ Consumer usage (rootsignal):
 
 ```tsx
 import {
-  SeesawAdminProvider,
+  CausalAdminProvider,
   TimelinePane,
   CausalFlowPane,
   CausalTreePane,
   LogsPane,
-} from '@seesaw/admin-ui';
+} from '@causal/admin-ui';
 import { InvestigatePane } from './panes/InvestigatePane';
 import { ScoutRunStats } from './components/ScoutRunStats';
 
 function EventsPage() {
   return (
-    <SeesawAdminProvider endpoint="/graphql" wsEndpoint="ws://localhost:4000/ws">
+    <CausalAdminProvider endpoint="/graphql" wsEndpoint="ws://localhost:4000/ws">
       <PaneManager panes={[
         { name: "Timeline", render: () => (
           <TimelinePane onInvestigate={(event) => openInvestigation(event)} />
@@ -276,7 +276,7 @@ function EventsPage() {
         { name: "Logs", render: () => <LogsPane /> },
         { name: "Investigate", render: () => <InvestigatePane /> },
       ]} />
-    </SeesawAdminProvider>
+    </CausalAdminProvider>
   );
 }
 ```
@@ -288,28 +288,28 @@ function EventsPage() {
 - Update workspace Cargo.toml
 - Verify builds pass
 
-### Phase 2: seesaw_admin Rust crate
-- Create `modules/seesaw_admin/`
+### Phase 2: causal_admin Rust crate
+- Create `modules/causal_admin/`
 - Extract types, queries, cache, broadcast from rootsignal
 - Implement `EventDisplay` trait
 - Add feature-flagged async-graphql resolvers
-- Rootsignal imports `seesaw_admin` and provides `RootSignalEventDisplay`
+- Rootsignal imports `causal_admin` and provides `RootSignalEventDisplay`
 
-### Phase 3: seesaw-admin-ui React package
-- Create `modules/seesaw-admin-ui/`
+### Phase 3: causal-admin-ui React package
+- Create `modules/causal-admin-ui/`
 - Extract pane components, context, queries, theme
 - Make investigation/custom panes pluggable via callbacks/render props
-- Rootsignal imports `@seesaw/admin-ui` and composes with its custom panes
+- Rootsignal imports `@causal/admin-ui` and composes with its custom panes
 
 ### Phase 4: Integration testing
 - Rootsignal admin app works identically after extraction
-- New example project uses `seesaw_admin` + `@seesaw/admin-ui` with defaults
+- New example project uses `causal_admin` + `@causal/admin-ui` with defaults
 
 ## Open Questions
 
-1. **Monorepo publishing**: Should `seesaw-admin-ui` be published to npm, or consumed via workspace path? If npm, need a build step (tsup/vite library mode).
+1. **Monorepo publishing**: Should `causal-admin-ui` be published to npm, or consumed via workspace path? If npm, need a build step (tsup/vite library mode).
 
-2. **PaneManager**: The flexlayout-react wrapper (`PaneManager.tsx`) is generic but not seesaw-specific. Extract as a separate package, or bundle with `seesaw-admin-ui`?
+2. **PaneManager**: The flexlayout-react wrapper (`PaneManager.tsx`) is generic but not causal-specific. Extract as a separate package, or bundle with `causal-admin-ui`?
 
 3. **Auth**: The admin queries use `AdminGuard` in rootsignal. The generic crate should expose a guard hook point — probably just document that consumers should add their own auth middleware.
 

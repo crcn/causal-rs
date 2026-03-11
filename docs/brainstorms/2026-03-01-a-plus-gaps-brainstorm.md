@@ -3,11 +3,11 @@ date: 2026-03-01
 topic: a-plus-gaps
 ---
 
-# Seesaw A+ Gaps: Evaluation & Plan
+# Causal A+ Gaps: Evaluation & Plan
 
 ## Context
 
-After implementing upcasters (v0.15.10), evaluated what's needed to bring seesaw from "good library" to "A+ production framework."
+After implementing upcasters (v0.15.10), evaluated what's needed to bring causal from "good library" to "A+ production framework."
 
 ## Gaps (Priority Order)
 

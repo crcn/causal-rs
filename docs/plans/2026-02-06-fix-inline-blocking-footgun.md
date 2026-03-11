@@ -37,7 +37,7 @@ engine.dispatch(OrderPlaced { id: 123, total: 99.99 }).await?;
 ```
 T=0ms:   [Transaction begins]
 T=0ms:     Worker 1 acquires transaction lock
-T=1ms:     Insert OrderPlaced event into seesaw_events
+T=1ms:     Insert OrderPlaced event into causal_events
 T=1ms:     Execute inline handler → call Stripe API
 T=2001ms:  Stripe returns success
 T=2002ms:  Insert PaymentCharged event
@@ -51,12 +51,12 @@ While Worker 1 holds the transaction for **2 seconds**:
 ```
 Worker 2 (T=100ms):  Tries to dispatch OrderPlaced { id: 456 }
                      → [Transaction begins]
-                     → INSERT INTO seesaw_events ...
+                     → INSERT INTO causal_events ...
                      → BLOCKED! (Waiting for Worker 1's locks)
 
 Worker 3 (T=200ms):  Tries to dispatch UserSignedUp { ... }
                      → [Transaction begins]
-                     → INSERT INTO seesaw_events ...
+                     → INSERT INTO causal_events ...
                      → BLOCKED! (Waiting for Worker 1's locks)
 
 Worker 4 (T=300ms):  Tries to dispatch EmailSent { ... }
@@ -69,7 +69,7 @@ Worker 4 (T=300ms):  Tries to dispatch EmailSent { ... }
 ```sql
 SELECT * FROM pg_locks WHERE NOT granted;
 -- Shows dozens of workers waiting for row/table locks
--- All blocked on seesaw_events table
+-- All blocked on causal_events table
 -- Connection pool exhausted
 -- Query timeout errors start appearing
 ```
@@ -198,10 +198,10 @@ NEW (Fixed):
 **Stream Model:**
 
 ```
-OrderPlaced events      → "seesaw.OrderPlaced" stream      → Workers subscribe
-PaymentRequested events → "seesaw.PaymentRequested" stream → Workers subscribe
-EmailSent events        → "seesaw.EmailSent" stream        → Workers subscribe
-UserSignedUp events     → "seesaw.UserSignedUp" stream     → Workers subscribe
+OrderPlaced events      → "causal.OrderPlaced" stream      → Workers subscribe
+PaymentRequested events → "causal.PaymentRequested" stream → Workers subscribe
+EmailSent events        → "causal.EmailSent" stream        → Workers subscribe
+UserSignedUp events     → "causal.UserSignedUp" stream     → Workers subscribe
 ```
 
 **Why This Is Better Than Priority:**
@@ -229,7 +229,7 @@ engine.dispatch(OrderPlaced { id: 123 }).await?;
 
 // What happens internally:
 [Transaction begins]  ← Single fast transaction
-  1. Insert event into seesaw_events
+  1. Insert event into causal_events
      - event_id: uuid
      - event_type: "OrderPlaced"
      - payload: {...}
@@ -240,7 +240,7 @@ engine.dispatch(OrderPlaced { id: 123 }).await?;
      - handler_id: "charge_payment"
      - status: "pending"
 
-  3. Notify queue backend: "seesaw.OrderPlaced" stream
+  3. Notify queue backend: "causal.OrderPlaced" stream
      - queue.notify("OrderPlaced", intent_id)
 [Transaction commits]  ← Always <10ms
 
@@ -257,8 +257,8 @@ Worker Pool:
 
 Each worker polls its subscribed streams:
 
-Worker 1 receives notification on "seesaw.OrderPlaced":
-  1. Poll database: SELECT * FROM seesaw_handler_intents
+Worker 1 receives notification on "causal.OrderPlaced":
+  1. Poll database: SELECT * FROM causal_handler_intents
                     WHERE intent_id = ? FOR UPDATE SKIP LOCKED
 
   2. If locked by another worker → Skip (another worker handling it)
@@ -294,8 +294,8 @@ let future = engine.dispatch(OrderPlaced { id: 123 });
 future.await?;
 // Now we wait for:
 // 1. Open database transaction
-// 2. INSERT INTO seesaw_events (5ms)
-// 3. INSERT INTO seesaw_handler_intents (3ms)
+// 2. INSERT INTO causal_events (5ms)
+// 3. INSERT INTO causal_handler_intents (3ms)
 // 4. NOTIFY queue (1ms)
 // 5. Commit transaction (1ms)
 // Total: ~10ms
@@ -341,7 +341,7 @@ pub struct PostgresQueue {
 impl QueueBackend for PostgresQueue {
     async fn notify(&self, event_type: &str, intent_ids: &[Uuid]) -> Result<()> {
         // Use pg_notify with channel per event type
-        let channel = format!("seesaw.{}", event_type);
+        let channel = format!("causal.{}", event_type);
 
         for intent_id in intent_ids {
             self.pool.execute(
@@ -356,7 +356,7 @@ impl QueueBackend for PostgresQueue {
 
         // LISTEN to each event type channel
         for event_type in event_types {
-            listener.listen(&format!("seesaw.{}", event_type)).await?;
+            listener.listen(&format!("causal.{}", event_type)).await?;
         }
 
         // Return channel that forwards notifications
@@ -393,7 +393,7 @@ pub struct RedisQueue {
 impl QueueBackend for RedisQueue {
     async fn notify(&self, event_type: &str, intent_ids: &[Uuid]) -> Result<()> {
         let mut conn = self.client.get_async_connection().await?;
-        let channel = format!("seesaw.{}", event_type);
+        let channel = format!("causal.{}", event_type);
 
         // Publish to Redis channel per event type
         for intent_id in intent_ids {
@@ -411,7 +411,7 @@ impl QueueBackend for RedisQueue {
 
         // Subscribe to each event type channel
         for event_type in event_types {
-            pubsub.subscribe(&format!("seesaw.{}", event_type)).await?;
+            pubsub.subscribe(&format!("causal.{}", event_type)).await?;
         }
 
         let (tx, rx) = mpsc::channel(1000);
@@ -448,7 +448,7 @@ pub struct KafkaQueue {
 
 impl QueueBackend for KafkaQueue {
     async fn notify(&self, event_type: &str, intent_ids: &[Uuid]) -> Result<()> {
-        let topic = format!("seesaw.{}", event_type);
+        let topic = format!("causal.{}", event_type);
 
         // Publish to Kafka topic per event type
         for intent_id in intent_ids {
@@ -463,7 +463,7 @@ impl QueueBackend for KafkaQueue {
 
     async fn subscribe(&self, event_types: &[String]) -> Result<Receiver<Uuid>> {
         let topics: Vec<_> = event_types.iter()
-            .map(|t| format!("seesaw.{}", t))
+            .map(|t| format!("causal.{}", t))
             .collect();
 
         let consumer: StreamConsumer = self.consumer_config.create()?;
@@ -578,9 +578,9 @@ let worker = Worker::builder()
 worker.start().await?;
 
 // Internally subscribes to all event type streams:
-// - seesaw.OrderPlaced
-// - seesaw.PaymentRequested
-// - seesaw.UserSignedUp
+// - causal.OrderPlaced
+// - causal.PaymentRequested
+// - causal.UserSignedUp
 // - ... etc
 ```
 
@@ -665,10 +665,10 @@ OLD (Single Queue with Priority):
   Problem: OrderPlaced (slow) blocks PaymentRequested (fast)
 
 NEW (Separate Streams):
-  OrderPlaced      → "seesaw.OrderPlaced" stream      → Workers 1-3
-  UserSignedUp     → "seesaw.UserSignedUp" stream     → Workers 1-3
-  PaymentRequested → "seesaw.PaymentRequested" stream → Workers 1-3
-  EmailSent        → "seesaw.EmailSent" stream        → Workers 1-3
+  OrderPlaced      → "causal.OrderPlaced" stream      → Workers 1-3
+  UserSignedUp     → "causal.UserSignedUp" stream     → Workers 1-3
+  PaymentRequested → "causal.PaymentRequested" stream → Workers 1-3
+  EmailSent        → "causal.EmailSent" stream        → Workers 1-3
 
   Result: OrderPlaced can be slow - doesn't affect other event types!
 ```
@@ -677,11 +677,11 @@ NEW (Separate Streams):
 
 ```
 T=0s:    100 OrderPlaced events arrive
-         → All go to "seesaw.OrderPlaced" stream
+         → All go to "causal.OrderPlaced" stream
          → Workers start processing (slow handlers, 2s each)
 
 T=0.5s:  100 EmailSent events arrive
-         → All go to "seesaw.EmailSent" stream
+         → All go to "causal.EmailSent" stream
          → Workers start processing (fast handlers, 10ms each)
          → Complete in 1 second ✅
 
@@ -1005,12 +1005,12 @@ async fn handler(...) { }
 5. Update `dispatch()` to only persist + queue
 
 **Files to modify:**
-- `crates/seesaw/src/queue_backend.rs` - Define trait
-- `crates/seesaw/src/postgres_queue.rs` - Implement PostgresQueue
-- `crates/seesaw/src/memory_queue.rs` - Implement MemoryQueue
-- `crates/seesaw/src/engine_v2.rs` - Update dispatch logic
-- `crates/seesaw/src/runtime/event_worker.rs` - Remove inline execution
-- `crates/seesaw/src/runtime/handler_worker.rs` - Update to use streams
+- `crates/causal/src/queue_backend.rs` - Define trait
+- `crates/causal/src/postgres_queue.rs` - Implement PostgresQueue
+- `crates/causal/src/memory_queue.rs` - Implement MemoryQueue
+- `crates/causal/src/engine_v2.rs` - Update dispatch logic
+- `crates/causal/src/runtime/event_worker.rs` - Remove inline execution
+- `crates/causal/src/runtime/handler_worker.rs` - Update to use streams
 
 **Success criteria:**
 - `cargo test` passes
@@ -1027,8 +1027,8 @@ async fn handler(...) { }
 5. Add timeout support
 
 **Files to modify:**
-- `crates/seesaw/src/engine_v2.rs` - Add wait API
-- `crates/seesaw/src/wait.rs` - New module for wait logic
+- `crates/causal/src/engine_v2.rs` - Add wait API
+- `crates/causal/src/wait.rs` - New module for wait logic
 
 **Success criteria:**
 - Can wait for specific events
@@ -1044,8 +1044,8 @@ async fn handler(...) { }
 4. Documentation for choosing backend
 
 **Files to create:**
-- `crates/seesaw-redis/` - New crate
-- `crates/seesaw-kafka/` - New crate
+- `crates/causal-redis/` - New crate
+- `crates/causal-kafka/` - New crate
 
 **Success criteria:**
 - Redis backend works
@@ -1170,7 +1170,7 @@ async fn handler(...) { }
 3. Ultra-high throughput with Kafka/Redis backends
 4. Clear mental model (dispatch = persist, workers = execute)
 
-**This is a necessary breaking change to make Seesaw production-ready.**
+**This is a necessary breaking change to make Causal production-ready.**
 
 ---
 

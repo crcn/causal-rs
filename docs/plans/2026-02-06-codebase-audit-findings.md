@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-The Seesaw codebase **already has the pluggable backend architecture** we proposed. The main gaps are:
+The Causal codebase **already has the pluggable backend architecture** we proposed. The main gaps are:
 1. Safety improvements (DistributedSafe trait, docs warnings)
 2. Context visibility (execution_mode(), worker_id())
 3. Kafka Store implementation (the trait already exists!)
@@ -16,7 +16,7 @@ The Seesaw codebase **already has the pluggable backend architecture** we propos
 
 ### 1. **Store Trait** - Fully Implemented
 
-**Location:** `crates/seesaw/src/store.rs`
+**Location:** `crates/causal/src/store.rs`
 
 The `Store` trait is **exactly** what we proposed - a complete abstraction for:
 
@@ -53,13 +53,13 @@ pub trait Store: Send + Sync + 'static {
 ```
 
 **Implementations:**
-- ✅ `PostgresStore` - Production Postgres backend (`crates/seesaw-postgres/`)
-- ✅ `MemoryStore` - Testing/development backend (`crates/seesaw-memory/`)
+- ✅ `PostgresStore` - Production Postgres backend (`crates/causal-postgres/`)
+- ✅ `MemoryStore` - Testing/development backend (`crates/causal-memory/`)
 - ⏸️ `KafkaStore` - **NOT YET IMPLEMENTED** (but trait exists!)
 
 ### 2. **QueueBackend Trait** - Fully Implemented
 
-**Location:** `crates/seesaw/src/queue_backend.rs`
+**Location:** `crates/causal/src/queue_backend.rs`
 
 Designed specifically for pluggable queue notifications (Kafka/Redis/etc.):
 
@@ -102,7 +102,7 @@ let engine = Engine::new(deps, PostgresStore::new(pool))
 
 ### 3. **Engine Architecture** - Implemented
 
-**Location:** `crates/seesaw/src/engine_v2.rs`
+**Location:** `crates/causal/src/engine_v2.rs`
 
 Already generic over Store:
 
@@ -139,7 +139,7 @@ impl<D, St> Engine<D, St> {
 
 ### 4. **Macro Support** - Comprehensive
 
-**Location:** `crates/seesaw_core_macros/src/lib.rs`
+**Location:** `crates/causal_core_macros/src/lib.rs`
 
 Already supports everything we proposed:
 
@@ -181,7 +181,7 @@ async fn bulk_insert(batch: Vec<RowParsed>, ctx: Ctx) -> Result<BatchInserted> {
 
 ### 5. **HandlerContext** - Partially Implemented
 
-**Location:** `crates/seesaw/src/handler/context.rs`
+**Location:** `crates/causal/src/handler/context.rs`
 
 Already provides:
 
@@ -269,7 +269,7 @@ impl<D: DistributedSafe> Engine<D, St> {
 - ⚠️ No warning about `Arc<Mutex>` breaking with multiple workers
 - ⚠️ No transaction boundary explanation
 - ⚠️ No single-process vs multi-worker capability table
-- ⚠️ No clear "What Seesaw Is/Isn't" positioning
+- ⚠️ No clear "What Causal Is/Isn't" positioning
 
 ### 5. **KafkaStore Implementation** - Not Implemented
 
@@ -296,7 +296,7 @@ impl Store for KafkaStore {
 
     async fn join_same_batch_append_and_maybe_claim(...) -> Result<...> {
         // Join state still goes to Postgres
-        sqlx::query("INSERT INTO seesaw_join_entries ...")
+        sqlx::query("INSERT INTO causal_join_entries ...")
             .execute(&self.state_pool)
             .await
     }
@@ -355,8 +355,8 @@ Already critical, now even more important:
 
 Now easier because architecture exists:
 
-1. **Add DistributedSafe trait** to `crates/seesaw/src/lib.rs`
-2. **Create derive macro** in `crates/seesaw_core_macros/`
+1. **Add DistributedSafe trait** to `crates/causal/src/lib.rs`
+2. **Create derive macro** in `crates/causal_core_macros/`
 3. **Add `.single_worker()` and `.distributed()`** to Engine
 4. **Enforce `queued` requirement** in macro (add validation)
 
@@ -372,7 +372,7 @@ Nice-to-have, not critical:
 
 Now straightforward - just implement the trait:
 
-1. Create `crates/seesaw-kafka/` crate
+1. Create `crates/causal-kafka/` crate
 2. Implement `KafkaStore` (Store trait)
 3. Optionally implement `KafkaQueueBackend` (QueueBackend trait)
 4. Add integration tests

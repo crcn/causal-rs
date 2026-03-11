@@ -1,7 +1,7 @@
 //! Simple Order Processing Example
 
 use anyhow::Result;
-use seesaw_core::{event, handles, Context, Engine};
+use causal_core::{event, handles, Context, Engine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

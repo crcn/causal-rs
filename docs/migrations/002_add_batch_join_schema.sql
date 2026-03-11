@@ -1,17 +1,17 @@
 -- Add batch metadata and durable same-batch join tables.
 -- Safe to run multiple times.
 
-ALTER TABLE seesaw_events
+ALTER TABLE causal_events
     ADD COLUMN IF NOT EXISTS batch_id UUID,
     ADD COLUMN IF NOT EXISTS batch_index INT,
     ADD COLUMN IF NOT EXISTS batch_size INT;
 
-ALTER TABLE seesaw_effect_executions
+ALTER TABLE causal_effect_executions
     ADD COLUMN IF NOT EXISTS batch_id UUID,
     ADD COLUMN IF NOT EXISTS batch_index INT,
     ADD COLUMN IF NOT EXISTS batch_size INT;
 
-CREATE TABLE IF NOT EXISTS seesaw_join_entries (
+CREATE TABLE IF NOT EXISTS causal_join_entries (
     join_effect_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     source_event_id UUID NOT NULL,
@@ -27,9 +27,9 @@ CREATE TABLE IF NOT EXISTS seesaw_join_entries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_join_entries_window
-ON seesaw_join_entries(join_effect_id, correlation_id, batch_id, batch_index);
+ON causal_join_entries(join_effect_id, correlation_id, batch_id, batch_index);
 
-CREATE TABLE IF NOT EXISTS seesaw_join_windows (
+CREATE TABLE IF NOT EXISTS causal_join_windows (
     join_effect_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     mode VARCHAR(50) NOT NULL DEFAULT 'same_batch',
@@ -46,4 +46,4 @@ CREATE TABLE IF NOT EXISTS seesaw_join_windows (
 );
 
 CREATE INDEX IF NOT EXISTS idx_join_windows_status
-ON seesaw_join_windows(status, updated_at DESC);
+ON causal_join_windows(status, updated_at DESC);

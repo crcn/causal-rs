@@ -10,29 +10,29 @@ depends_on: docs/plans/2026-03-08-refactor-store-trait-split-plan.md
 ## Overview
 
 Migrate rootsignal's `PostgresStore` from the removed monolithic `Store` trait to the
-new `EventLog + HandlerQueue` split. Drop the transient `seesaw_events` queue table in
+new `EventLog + HandlerQueue` split. Drop the transient `causal_events` queue table in
 favor of checkpoint-based event processing from the permanent `events` table.
 
 **Key insight**: The admin-app visualization is completely unaffected. It reads from
-`events`, `seesaw_effect_executions`, `seesaw_handler_descriptions`, and
-`seesaw_handler_logs` — none of which change.
+`events`, `causal_effect_executions`, `causal_handler_descriptions`, and
+`causal_handler_logs` — none of which change.
 
 ## Problem Statement
 
-After the seesaw-rs store trait split (PR #2), rootsignal's `PostgresStore` implements
-the deleted `Store` trait. It won't compile against the new seesaw version.
+After the causal-rs store trait split (PR #2), rootsignal's `PostgresStore` implements
+the deleted `Store` trait. It won't compile against the new causal version.
 
-Additionally, rootsignal's `seesaw_events` table is a transient work queue that
-duplicates every event (once in the permanent `events` log, once in `seesaw_events`
+Additionally, rootsignal's `causal_events` table is a transient work queue that
+duplicates every event (once in the permanent `events` log, once in `causal_events`
 for dispatch). The new checkpoint model eliminates this redundancy.
 
 ## What Changes
 
 ### Postgres Tables
 
-**Dropped**: `seesaw_events` (transient queue table)
+**Dropped**: `causal_events` (transient queue table)
 
-The `seesaw_events` table is only used for internal event dispatch:
+The `causal_events` table is only used for internal event dispatch:
 - INSERT with `status = 'pending'` when events arrive
 - UPDATE to `status = 'processing'` via `FOR UPDATE SKIP LOCKED`
 - UPDATE to `status = 'done'` or `'rejected'` when processed
@@ -42,15 +42,15 @@ No admin-app query reads from this table. The causal flow visualization, event
 browser, handler outcomes, handler descriptions, and handler logs all read from
 other tables.
 
-**New table**: `seesaw_checkpoint`
+**New table**: `causal_checkpoint`
 
 ```sql
-CREATE TABLE seesaw_checkpoint (
+CREATE TABLE causal_checkpoint (
     id TEXT PRIMARY KEY DEFAULT 'default',
     position BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-INSERT INTO seesaw_checkpoint (id, position) VALUES ('default', 0);
+INSERT INTO causal_checkpoint (id, position) VALUES ('default', 0);
 ```
 
 Single row tracks how far the engine has processed in the `events` table. The engine
@@ -62,14 +62,14 @@ the checkpoint via `IntentCommit.checkpoint` when committing handler intents.
 | Table | Purpose | Read by admin-app? |
 |---|---|---|
 | `events` | Permanent append-only event log | Yes — event browser, causal flow, realtime subscription |
-| `seesaw_effect_executions` | Handler lifecycle tracking | Yes — handler outcomes, running/completed/error status |
-| `seesaw_handler_descriptions` | describe() block data | Yes — Block DSL widgets in flow nodes |
-| `seesaw_handler_logs` | Handler log entries | Yes — logs pane |
-| `seesaw_dead_letter_queue` | DLQ entries | Yes — error display |
-| `seesaw_cancellations` | Correlation cancellation | No |
+| `causal_effect_executions` | Handler lifecycle tracking | Yes — handler outcomes, running/completed/error status |
+| `causal_handler_descriptions` | describe() block data | Yes — Block DSL widgets in flow nodes |
+| `causal_handler_logs` | Handler log entries | Yes — logs pane |
+| `causal_dead_letter_queue` | DLQ entries | Yes — error display |
+| `causal_cancellations` | Correlation cancellation | No |
 | `aggregate_snapshots` | Aggregate state snapshots | No |
-| `seesaw_join_windows` | Batch join tracking | No |
-| `seesaw_join_entries` | Batch join entries | No |
+| `causal_join_windows` | Batch join tracking | No |
+| `causal_join_entries` | Batch join entries | No |
 
 ### Event Processing Flow
 
@@ -77,12 +77,12 @@ the checkpoint via `IntentCommit.checkpoint` when committing handler intents.
 ```
 event arrives
   → INSERT into `events` (permanent log) + pg_notify('events', seq)
-  → INSERT into `seesaw_events` (transient queue, status='pending')
-  → engine polls `seesaw_events` via FOR UPDATE SKIP LOCKED
+  → INSERT into `causal_events` (transient queue, status='pending')
+  → engine polls `causal_events` via FOR UPDATE SKIP LOCKED
   → UPDATE status='processing'
   → process handlers
   → UPDATE status='done'
-  → handler emits new events → INSERT into `seesaw_events` again
+  → handler emits new events → INSERT into `causal_events` again
 ```
 
 **After** (checkpoint):
@@ -142,7 +142,7 @@ impl HandlerQueue for PostgresStore {
 | `load_snapshot(type, id)` | EventLog | `load_snapshot(type, id)` | Same |
 | `save_snapshot(snapshot)` | EventLog | `save_snapshot(snapshot)` | Same |
 | `enqueue_handler_intents(...)` | HandlerQueue | `enqueue(IntentCommit)` | Destructure IntentCommit |
-| — (new) | HandlerQueue | `checkpoint()` | SELECT from seesaw_checkpoint |
+| — (new) | HandlerQueue | `checkpoint()` | SELECT from causal_checkpoint |
 | `poll_next_handler()` | HandlerQueue | `dequeue()` | Same body |
 | `earliest_pending_handler_at()` | HandlerQueue | `earliest_pending_at()` | Same body |
 | `resolve_handler(resolution)` | HandlerQueue | `resolve(resolution)` | Remove events_to_publish handling |
@@ -175,9 +175,9 @@ Implementation:
 async fn enqueue(&self, commit: IntentCommit) -> Result<()> {
     let mut tx = self.pool.begin().await?;
 
-    // 1. Insert handler intents into seesaw_effect_executions (unchanged)
+    // 1. Insert handler intents into causal_effect_executions (unchanged)
     for intent in &commit.intents {
-        sqlx::query("INSERT INTO seesaw_effect_executions ...")
+        sqlx::query("INSERT INTO causal_effect_executions ...")
             .bind(commit.event_id)
             .bind(&intent.handler_id)
             .bind(commit.correlation_id)
@@ -188,7 +188,7 @@ async fn enqueue(&self, commit: IntentCommit) -> Result<()> {
 
     // 2. Store handler descriptions (unchanged)
     for (handler_id, description) in &commit.handler_descriptions {
-        sqlx::query("INSERT INTO seesaw_handler_descriptions ... ON CONFLICT UPDATE ...")
+        sqlx::query("INSERT INTO causal_handler_descriptions ... ON CONFLICT UPDATE ...")
             .bind(commit.correlation_id)
             .bind(handler_id)
             .bind(description)
@@ -198,27 +198,27 @@ async fn enqueue(&self, commit: IntentCommit) -> Result<()> {
 
     // 3. Handle projection failures → DLQ (unchanged)
     for failure in &commit.projection_failures {
-        sqlx::query("INSERT INTO seesaw_dead_letter_queue ...")
+        sqlx::query("INSERT INTO causal_dead_letter_queue ...")
             .execute(&mut *tx)
             .await?;
     }
 
     // 4. Handle park → DLQ (unchanged)
     if let Some(park) = &commit.park {
-        sqlx::query("INSERT INTO seesaw_dead_letter_queue ...")
+        sqlx::query("INSERT INTO causal_dead_letter_queue ...")
             .execute(&mut *tx)
             .await?;
     }
 
     // 5. Advance checkpoint (NEW)
     sqlx::query(
-        "UPDATE seesaw_checkpoint SET position = $1, updated_at = now() WHERE id = 'default'"
+        "UPDATE causal_checkpoint SET position = $1, updated_at = now() WHERE id = 'default'"
     )
     .bind(commit.checkpoint as i64)
     .execute(&mut *tx)
     .await?;
 
-    // 6. NO INSERT into seesaw_events (REMOVED)
+    // 6. NO INSERT into causal_events (REMOVED)
 
     tx.commit().await?;
     Ok(())
@@ -227,14 +227,14 @@ async fn enqueue(&self, commit: IntentCommit) -> Result<()> {
 
 ### `resolve()` Change: Remove `events_to_publish`
 
-The old `resolve_handler(Complete)` would publish follow-on events into `seesaw_events`.
+The old `resolve_handler(Complete)` would publish follow-on events into `causal_events`.
 In the new model, the engine emits follow-on events through `EventLog::append` directly
 (which writes to `events` and fires `pg_notify`). The `resolve` method just updates
 handler status and clears journal.
 
 ```rust
 // REMOVE from resolve(Complete):
-// - INSERT into seesaw_events for events_to_publish
+// - INSERT into causal_events for events_to_publish
 // - The events_to_publish field no longer exists on HandlerCompletion
 ```
 
@@ -243,7 +243,7 @@ handler status and clears journal.
 **`rootsignal-scout/src/core/engine.rs`** (5 engine builder functions):
 ```rust
 // Before:
-let store: Arc<dyn seesaw_core::Store> = Arc::new(PostgresStore::new(pool));
+let store: Arc<dyn causal_core::Store> = Arc::new(PostgresStore::new(pool));
 Engine::new(deps).with_store(store)
 
 // After (with_store is now generic, no trait object needed):
@@ -254,7 +254,7 @@ Engine::new(deps).with_store(store)
 **`rootsignal-scout/src/store/mod.rs`** (EngineFactory):
 ```rust
 // Before:
-pub fn store(&self) -> Arc<dyn seesaw_core::Store>
+pub fn store(&self) -> Arc<dyn causal_core::Store>
 
 // After:
 pub fn store(&self) -> Arc<PostgresStore>
@@ -263,7 +263,7 @@ pub fn store(&self) -> Arc<PostgresStore>
 **`rootsignal-scout/src/workflows/mod.rs`** (`make_store()`):
 ```rust
 // Before:
-fn make_store() -> Option<Arc<dyn seesaw_core::Store>>
+fn make_store() -> Option<Arc<dyn causal_core::Store>>
 
 // After:
 fn make_store() -> Option<Arc<PostgresStore>>
@@ -284,8 +284,8 @@ store.has_pending_work().await?;  // Keep as inherent method
 
 Note: `reclaim_stale()` and `has_pending_work()` are inherent methods on `PostgresStore`,
 not trait methods. They continue to work. `has_pending_work` currently checks both
-`seesaw_events` and `seesaw_effect_executions` — after migration it only checks
-`seesaw_effect_executions` (handler queue) and whether checkpoint < max(events.seq).
+`causal_events` and `causal_effect_executions` — after migration it only checks
+`causal_effect_executions` (handler queue) and whether checkpoint < max(events.seq).
 
 ### Removed Methods
 
@@ -294,15 +294,15 @@ from `PostgresStore`:
 
 | Method | Reason for removal |
 |---|---|
-| `publish(events)` | Was for `seesaw_events` queue — replaced by checkpoint |
-| `poll_next()` | Was for `seesaw_events` queue — replaced by `EventLog::load_from` |
-| `complete_event(event_id)` | Was for `seesaw_events` status tracking |
-| `reject_event(event_id, reason)` | Was for `seesaw_events` rejection |
+| `publish(events)` | Was for `causal_events` queue — replaced by checkpoint |
+| `poll_next()` | Was for `causal_events` queue — replaced by `EventLog::load_from` |
+| `complete_event(event_id)` | Was for `causal_events` status tracking |
+| `reject_event(event_id, reason)` | Was for `causal_events` rejection |
 | `reclaim_stale_events()` | No queue to reclaim from |
 | `queue_status().pending_events` | No event queue to count |
 
 Keep `reclaim_stale()` as an inherent method for handler execution recovery (resetting
-`'running'` → `'pending'` in `seesaw_effect_executions`).
+`'running'` → `'pending'` in `causal_effect_executions`).
 
 ## Admin-App Visualization Compatibility
 
@@ -315,12 +315,12 @@ Every admin-app feature was audited against the table changes:
 | Event browser (paginated, searchable) | `events` table | No |
 | Realtime event stream (WebSocket) | `events` + `pg_notify('events', seq)` | No |
 | Causal tree (correlation_id drill-down) | `events` WHERE correlation_id | No |
-| React Flow graph (DAG visualization) | `events` + `seesaw_effect_executions` + `seesaw_handler_descriptions` | No |
-| Currently running handlers (yellow pulse) | `seesaw_effect_executions` WHERE status='running' | No |
-| Handler outcomes (green/red/yellow borders) | `seesaw_effect_executions` GROUP BY handler_id | No |
-| describe() Block DSL widgets | `seesaw_handler_descriptions` polled every 5s | No |
-| Handler logs | `seesaw_handler_logs` | No |
-| DLQ entries | `seesaw_dead_letter_queue` | No |
+| React Flow graph (DAG visualization) | `events` + `causal_effect_executions` + `causal_handler_descriptions` | No |
+| Currently running handlers (yellow pulse) | `causal_effect_executions` WHERE status='running' | No |
+| Handler outcomes (green/red/yellow borders) | `causal_effect_executions` GROUP BY handler_id | No |
+| describe() Block DSL widgets | `causal_handler_descriptions` polled every 5s | No |
+| Handler logs | `causal_handler_logs` | No |
+| DLQ entries | `causal_dead_letter_queue` | No |
 
 ### Realtime Mechanism Unchanged
 
@@ -342,21 +342,21 @@ independent of the queue mechanism and continues to work.
 ## SQL Migration
 
 ```sql
--- Migration: Drop seesaw_events queue, add checkpoint table
+-- Migration: Drop causal_events queue, add checkpoint table
 
 -- 1. Create checkpoint table
-CREATE TABLE IF NOT EXISTS seesaw_checkpoint (
+CREATE TABLE IF NOT EXISTS causal_checkpoint (
     id TEXT PRIMARY KEY DEFAULT 'default',
     position BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 2. Seed checkpoint from current seesaw_events high-water mark
+-- 2. Seed checkpoint from current causal_events high-water mark
 -- This ensures no events are re-processed after migration
-INSERT INTO seesaw_checkpoint (id, position)
+INSERT INTO causal_checkpoint (id, position)
 SELECT 'default', COALESCE(
     (SELECT MAX(e.seq) FROM events e
-     INNER JOIN seesaw_events se ON se.event_id = e.id
+     INNER JOIN causal_events se ON se.event_id = e.id
      WHERE se.status = 'done'),
     0
 )
@@ -364,7 +364,7 @@ ON CONFLICT (id) DO NOTHING;
 
 -- 3. Drop the queue table (after confirming migration works)
 -- Run this in a follow-up migration after the code deploys successfully
--- DROP TABLE IF EXISTS seesaw_events;
+-- DROP TABLE IF EXISTS causal_events;
 ```
 
 The `DROP TABLE` is commented out intentionally — run it in a follow-up migration
@@ -374,31 +374,31 @@ after verifying the new checkpoint flow works in production.
 
 ### Phase 1: Code Migration (no schema changes)
 
-1. Upgrade seesaw dependency in rootsignal
+1. Upgrade causal dependency in rootsignal
 2. Split `impl Store` into `impl EventLog` + `impl HandlerQueue`
-3. Keep `seesaw_events` INSERT in `enqueue()` temporarily (belt and suspenders)
-4. Add `checkpoint()` reading from a new `seesaw_checkpoint` table
+3. Keep `causal_events` INSERT in `enqueue()` temporarily (belt and suspenders)
+4. Add `checkpoint()` reading from a new `causal_checkpoint` table
 5. Replace `Arc<dyn Store>` with `Arc<PostgresStore>` at all callsites
 6. Deploy, verify admin-app works identically
 
 ### Phase 2: Drop the Queue (schema change)
 
-1. Remove `seesaw_events` INSERT from `enqueue()`
+1. Remove `causal_events` INSERT from `enqueue()`
 2. Remove `poll_next()`, `complete_event()`, `reject_event()` methods
 3. Update `has_pending_work()` to check checkpoint vs max(events.seq)
-4. Run the `DROP TABLE seesaw_events` migration
+4. Run the `DROP TABLE causal_events` migration
 5. Deploy, verify
 
 ### Rollback Plan
 
 If Phase 2 fails:
-- Revert code to Phase 1 (still writes to `seesaw_events`)
-- Re-create `seesaw_events` table from the migration backup
+- Revert code to Phase 1 (still writes to `causal_events`)
+- Re-create `causal_events` table from the migration backup
 - No data loss — the `events` table is always the source of truth
 
 ## Acceptance Criteria
 
-- [ ] `PostgresStore` compiles against new seesaw version
+- [ ] `PostgresStore` compiles against new causal version
 - [ ] `impl EventLog for PostgresStore` passes all EventLog contract tests
 - [ ] `impl HandlerQueue for PostgresStore` passes all HandlerQueue contract tests
 - [ ] Admin-app event browser works (paginated, searchable)
@@ -407,7 +407,7 @@ If Phase 2 fails:
 - [ ] Admin-app handler status shows running/completed/error states
 - [ ] Admin-app describe() blocks render and update in realtime
 - [ ] Admin-app handler logs display correctly
-- [ ] `seesaw_events` table no longer written to
+- [ ] `causal_events` table no longer written to
 - [ ] Checkpoint advances correctly through event processing
 - [ ] `has_pending_work()` uses checkpoint comparison
 - [ ] `reclaim_stale()` still recovers stuck handler executions
@@ -415,7 +415,7 @@ If Phase 2 fails:
 
 ## References
 
-- Seesaw store trait split: PR #2 (`refactor/store-trait-split` branch)
+- Causal store trait split: PR #2 (`refactor/store-trait-split` branch)
 - Parent plan: `docs/plans/2026-03-08-refactor-store-trait-split-plan.md`
 - PostgresStore: `rootsignal-scout/src/core/postgres_store.rs`
 - Admin-app flow viz: `admin-app/src/pages/events/panes/CausalFlowPane.tsx`

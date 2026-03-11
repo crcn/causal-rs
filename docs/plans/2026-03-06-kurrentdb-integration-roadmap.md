@@ -7,8 +7,8 @@ topic: kurrentdb-integration
 
 ## Goal
 
-Implement `seesaw-kurrentdb`, a Store backend that uses KurrentDB (formerly
-EventStoreDB) as the durable event log and handler queue. Seesaw's Store trait
+Implement `causal-kurrentdb`, a Store backend that uses KurrentDB (formerly
+EventStoreDB) as the durable event log and handler queue. Causal's Store trait
 is already shaped for this — the v0.22 changes (`AppendResult`, stream-version
 filtering, opaque position cursors, total idempotency contract) were
 specifically designed to align with KurrentDB's semantics.
@@ -20,10 +20,10 @@ specifically designed to align with KurrentDB's semantics.
 - **Global $all stream** with commit positions (maps to `load_global_from`)
 - **Persistent subscriptions** for catch-up and competing consumers
 - **Optimistic concurrency** via expected stream version on append
-- **EventId-based dedup** (~1 minute cache; seesaw requires total idempotency,
+- **EventId-based dedup** (~1 minute cache; causal requires total idempotency,
   so we need a supplemental dedup mechanism)
 
-## What Seesaw Already Has (v0.22)
+## What Causal Already Has (v0.22)
 
 | Store trait surface | KurrentDB mapping | Status |
 |---|---|---|
@@ -41,7 +41,7 @@ Implement the optional persistence methods on Store:
 
 - **`append_event`** — Append to a KurrentDB stream named
   `{aggregate_type}-{aggregate_id}` (or a global stream for non-aggregate
-  events). Use `EventData::json()` with the seesaw `event_id` as the
+  events). Use `EventData::json()` with the causal `event_id` as the
   KurrentDB `EventId`. Return `AppendResult` from the write result's
   commit position and stream revision.
 
@@ -98,7 +98,7 @@ The event log is what KurrentDB excels at.
 With KurrentDB as the shared event log:
 
 - **Catch-up subscriptions** replace polling `load_global_from`. Each node
-  subscribes to `$all` and publishes events into its local seesaw engine.
+  subscribes to `$all` and publishes events into its local causal engine.
 - **Checkpointing**: each node persists its last-seen commit position so it
   can resume after restart.
 - **Ordering guarantee**: `$all` is totally ordered, so events arrive in
@@ -116,8 +116,8 @@ With KurrentDB as the shared event log:
 
 ```
 crates/
-  seesaw/                    # core (Store trait, MemoryStore, engine)
-  seesaw-kurrentdb/          # KurrentDB Store implementation
+  causal/                    # core (Store trait, MemoryStore, engine)
+  causal-kurrentdb/          # KurrentDB Store implementation
     src/
       lib.rs                 # KurrentDbStore struct + Store impl
       event_mapper.rs        # NewEvent <-> EventData conversion
@@ -128,15 +128,15 @@ crates/
 ## Open Questions
 
 1. **Stream naming convention** — `{AggregateType}-{aggregate_id}` is the
-   EventStoreDB convention. Should seesaw enforce this or let the user
+   EventStoreDB convention. Should causal enforce this or let the user
    configure it?
 
 2. **Non-aggregate events** — Where do events without an aggregate go?
-   A single `seesaw-global` stream? Per-event-type streams? The global `$all`
+   A single `causal-global` stream? Per-event-type streams? The global `$all`
    handles reads, but writes need a target stream.
 
 3. **Metadata mapping** — KurrentDB events have a separate metadata JSON
-   field. Map seesaw's `NewEvent.metadata` there, or embed in the payload?
+   field. Map causal's `NewEvent.metadata` there, or embed in the payload?
    Metadata field is more idiomatic and enables server-side projections that
    read correlation_id without parsing the payload.
 
@@ -146,6 +146,6 @@ crates/
 ## Dependencies
 
 - KurrentDB Rust client (gRPC)
-- `serde_json` (already in seesaw)
+- `serde_json` (already in causal)
 - Optional: Postgres/Redis for dedup index (Phase 1) and handler queue
   (Phase 2 Option B)

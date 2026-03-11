@@ -2,9 +2,9 @@
 
 ## Phase 1: Core Traits (1-2 days)
 
-### 1.1 Add `Aggregate` trait to `seesaw_core`
+### 1.1 Add `Aggregate` trait to `causal_core`
 
-**File:** `crates/seesaw/src/aggregate.rs`
+**File:** `crates/causal/src/aggregate.rs`
 
 ```rust
 use uuid::Uuid;
@@ -33,7 +33,7 @@ pub trait EventWithId {
 
 ### 1.2 Add `EventStore` trait
 
-**File:** `crates/seesaw/src/event_store.rs`
+**File:** `crates/causal/src/event_store.rs`
 
 ```rust
 use anyhow::Result;
@@ -91,7 +91,7 @@ pub trait EventStore: Clone + Send + Sync + 'static {
 
 ### 1.3 Add `AggregateLoader`
 
-**File:** `crates/seesaw/src/aggregate_loader.rs`
+**File:** `crates/causal/src/aggregate_loader.rs`
 
 ```rust
 use crate::{Aggregate, EventStore, Handler, StoredEvent};
@@ -162,7 +162,7 @@ where
 
 ### 2.1 Make handlers pure (remove async)
 
-**File:** `crates/seesaw/src/handler/types.rs`
+**File:** `crates/causal/src/handler/types.rs`
 
 Update the `Handler` trait:
 
@@ -183,7 +183,7 @@ where
 
 ### 2.2 Update macro to generate pure handlers
 
-**File:** `crates/seesaw_core_macros/src/handler.rs`
+**File:** `crates/causal_core_macros/src/handler.rs`
 
 Change generated code from:
 
@@ -221,8 +221,8 @@ async fn project_with_lookup(
 **File:** `docs/schema.sql`
 
 ```sql
--- Event store table (replaces current seesaw_events)
-CREATE TABLE seesaw_event_store (
+-- Event store table (replaces current causal_events)
+CREATE TABLE causal_event_store (
     -- Aggregate identification
     aggregate_id UUID NOT NULL,
     aggregate_type TEXT NOT NULL,
@@ -243,15 +243,15 @@ CREATE TABLE seesaw_event_store (
     PRIMARY KEY (aggregate_id, sequence),
 
     -- Index for loading events
-    CONSTRAINT seesaw_event_store_sequence_check CHECK (sequence > 0)
+    CONSTRAINT causal_event_store_sequence_check CHECK (sequence > 0)
 );
 
 -- Index for querying by type and time
-CREATE INDEX idx_seesaw_event_store_type_time
-    ON seesaw_event_store(aggregate_type, timestamp DESC);
+CREATE INDEX idx_causal_event_store_type_time
+    ON causal_event_store(aggregate_type, timestamp DESC);
 
 -- Snapshots table for performance
-CREATE TABLE seesaw_snapshots (
+CREATE TABLE causal_snapshots (
     aggregate_id UUID NOT NULL,
     aggregate_type TEXT NOT NULL,
     version BIGINT NOT NULL,
@@ -264,10 +264,10 @@ CREATE TABLE seesaw_snapshots (
 
 ### 3.2 Implement PostgresEventStore
 
-**File:** `crates/seesaw-postgres/src/event_store.rs`
+**File:** `crates/causal-postgres/src/event_store.rs`
 
 ```rust
-use seesaw_core::{EventStore, StoredEvent};
+use causal_core::{EventStore, StoredEvent};
 use sqlx::PgPool;
 
 #[derive(Clone)]
@@ -305,7 +305,7 @@ where
         let rows = sqlx::query!(
             r#"
             SELECT sequence, event_type, event_data, timestamp
-            FROM seesaw_event_store
+            FROM causal_event_store
             WHERE aggregate_id = $1 AND sequence > $2
             ORDER BY sequence ASC
             "#,
@@ -354,7 +354,7 @@ where
 
             sqlx::query!(
                 r#"
-                INSERT INTO seesaw_event_store
+                INSERT INTO causal_event_store
                     (aggregate_id, aggregate_type, sequence, event_type, event_data)
                 VALUES ($1, $2, $3, $4, $5)
                 "#,
@@ -381,7 +381,7 @@ where
         let result = sqlx::query!(
             r#"
             SELECT MAX(sequence) as version
-            FROM seesaw_event_store
+            FROM causal_event_store
             WHERE aggregate_id = $1
             "#,
             aggregate_id,
@@ -402,8 +402,8 @@ where
 
 ```rust
 use anyhow::Result;
-use seesaw::{handler, Aggregate, AggregateLoader};
-use seesaw_postgres::PostgresEventStore;
+use causal::{handler, Aggregate, AggregateLoader};
+use causal_postgres::PostgresEventStore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -470,7 +470,7 @@ mod order_projections {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let pool = sqlx::PgPool::connect("postgres://localhost/seesaw").await?;
+    let pool = sqlx::PgPool::connect("postgres://localhost/causal").await?;
     let store = PostgresEventStore::new(pool);
 
     let order_id = Uuid::new_v4();
@@ -558,7 +558,7 @@ async fn main() -> Result<()> {
 4. Context no longer always available
 
 ### Migration Path
-- Provide `seesaw-orchestration` crate for legacy users
+- Provide `causal-orchestration` crate for legacy users
 - Feature flags: `event-sourcing` vs `orchestration`
 - Clear migration guide with before/after examples
 

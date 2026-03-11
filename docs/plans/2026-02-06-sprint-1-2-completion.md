@@ -40,7 +40,7 @@
 
 ### ✅ Task 3: Enforce `queued` Requirement in Macro
 
-**File:** `crates/seesaw_core_macros/src/lib.rs`
+**File:** `crates/causal_core_macros/src/lib.rs`
 
 **Changes:**
 1. Added validation in `expand_effect` (lines 148-157):
@@ -77,7 +77,7 @@ async fn handler(...) { }
 
 ### ✅ Task 1: Create DistributedSafe Trait
 
-**File:** `crates/seesaw/src/distributed_safe.rs` (new file)
+**File:** `crates/causal/src/distributed_safe.rs` (new file)
 
 **Created:**
 1. **Sealed trait pattern** to prevent external implementations
@@ -88,13 +88,13 @@ async fn handler(...) { }
    - Feature-gated: `sqlx::PgPool`, `reqwest::Client`, `redis::Client`
 4. **Intentionally no implementation** for `Arc<Mutex<T>>`
 
-**Added to:** `crates/seesaw/src/lib.rs`
+**Added to:** `crates/causal/src/lib.rs`
 - Added module: `pub mod distributed_safe;`
 - Re-exported: `pub use distributed_safe::DistributedSafe;`
 
 **Example usage:**
 ```rust
-use seesaw_core::DistributedSafe;
+use causal_core::DistributedSafe;
 
 #[derive(Clone, DistributedSafe)]
 struct Deps {
@@ -109,7 +109,7 @@ struct BadDeps {
 
 ### ✅ Task 2: Create DistributedSafe Derive Macro
 
-**File:** `crates/seesaw_core_macros/src/lib.rs`
+**File:** `crates/causal_core_macros/src/lib.rs`
 
 **Added:**
 1. **Derive macro** `#[proc_macro_derive(DistributedSafe, attributes(allow_non_distributed))]`
@@ -173,10 +173,10 @@ struct Deps {
 ### ✅ Compilation Tests
 
 ```bash
-$ cargo check -p seesaw_core_macros
+$ cargo check -p causal_core_macros
     Finished `dev` profile in 0.22s
 
-$ cargo check -p seesaw_core
+$ cargo check -p causal_core
     Finished `dev` profile in 1.67s (with expected feature warnings)
 ```
 
@@ -207,9 +207,9 @@ All core crates compile successfully!
 - `docs/DISTRIBUTED-SAFETY.md` - New comprehensive guide
 
 ### Source Code
-- `crates/seesaw/src/distributed_safe.rs` - New trait module
-- `crates/seesaw/src/lib.rs` - Added module and re-export
-- `crates/seesaw_core_macros/src/lib.rs` - Added derive macro and queued enforcement
+- `crates/causal/src/distributed_safe.rs` - New trait module
+- `crates/causal/src/lib.rs` - Added module and re-export
+- `crates/causal_core_macros/src/lib.rs` - Added derive macro and queued enforcement
 
 ### Plans/Reports
 - `docs/plans/2026-02-06-distributed-architecture-assessment-and-improvements.md`
@@ -237,4 +237,4 @@ The most critical safety improvements are now in place:
 2. ✅ Macro enforces explicit execution modes
 3. ✅ Compile-time safety prevents Arc<Mutex> in distributed deployments
 
-Users can now write distributed-safe Seesaw applications with confidence.
+Users can now write distributed-safe Causal applications with confidence.

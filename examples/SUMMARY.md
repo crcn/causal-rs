@@ -2,7 +2,7 @@
 
 ## What We Built
 
-Instead of building adapter crates, we created practical examples showing how to use standard Rust libraries directly in Seesaw effects.
+Instead of building adapter crates, we created practical examples showing how to use standard Rust libraries directly in Causal effects.
 
 ### ✅ Created Examples
 
@@ -24,17 +24,17 @@ Instead of building adapter crates, we created practical examples showing how to
 
 ## Why No Adapters?
 
-We explored building `seesaw-http` and `seesaw-anthropic` adapter crates but decided against it because:
+We explored building `causal-http` and `causal-anthropic` adapter crates but decided against it because:
 
 1. **Pointless indirection** - Wrappers add ceremony without value
 2. **One size doesn't fit all** - Different use cases need different features
 3. **Maintenance burden** - Every API change requires adapter updates
 4. **Fights abstraction** - Users forced to work around limitations
-5. **Complicates Seesaw** - Adds concepts without architectural benefit
+5. **Complicates Causal** - Adds concepts without architectural benefit
 
 ## The Pattern
 
-**Seesaw is about architecture, not libraries.**
+**Causal is about architecture, not libraries.**
 
 ```rust
 // Just use libraries directly in your effects
@@ -92,4 +92,4 @@ Both examples compile and run successfully.
 
 ## Key Takeaway
 
-**Keep Seesaw simple. Use libraries directly. Show patterns, not abstractions.**
+**Keep Causal simple. Use libraries directly. Show patterns, not abstractions.**

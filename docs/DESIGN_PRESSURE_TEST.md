@@ -424,7 +424,7 @@ Fowler: "You can speed up the temporal query by taking a snapshot of the applica
 
 **Our Design:**
 ```sql
-CREATE TABLE seesaw_snapshots (
+CREATE TABLE causal_snapshots (
     aggregate_id UUID NOT NULL,
     version BIGINT NOT NULL,
     state JSONB NOT NULL,

@@ -5,8 +5,8 @@
 ### BEFORE (Orchestration)
 
 ```rust
-use seesaw_core::{handler, Context, Engine};
-use seesaw_postgres::PostgresBackend;
+use causal_core::{handler, Context, Engine};
+use causal_postgres::PostgresBackend;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -114,8 +114,8 @@ async fn main() -> Result<()> {
 ### AFTER (Event Sourcing)
 
 ```rust
-use seesaw::{handler, Aggregate, Context};
-use seesaw_postgres::PostgresEventStore;
+use causal::{handler, Aggregate, Context};
+use causal_postgres::PostgresEventStore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -283,7 +283,7 @@ async fn main() -> Result<()> {
         shipping_api: ShippingApi::new(),
     };
 
-    let pool = sqlx::PgPool::connect("postgres://localhost/seesaw").await?;
+    let pool = sqlx::PgPool::connect("postgres://localhost/causal").await?;
     let store = PostgresEventStore::new(pool);
 
     let order_id = Uuid::new_v4();

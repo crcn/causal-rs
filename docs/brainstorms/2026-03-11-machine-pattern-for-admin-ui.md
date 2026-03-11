@@ -1,7 +1,7 @@
-# Brainstorm: Machine Pattern (Store + Engine + Events) for Seesaw Admin UI
+# Brainstorm: Machine Pattern (Store + Engine + Events) for Causal Admin UI
 
 **Date:** 2026-03-11
-**Context:** The current rootsignal admin `EventsPaneContext.tsx` bundles state, side effects, and React rendering into one 463-line context provider with ~15 `useState` calls. Every state change re-renders every consumer. Exploring the paperclip Machine pattern as a scalable architecture for the extracted `seesaw-admin-ui` package.
+**Context:** The current rootsignal admin `EventsPaneContext.tsx` bundles state, side effects, and React rendering into one 463-line context provider with ~15 `useState` calls. Every state change re-renders every consumer. Exploring the paperclip Machine pattern as a scalable architecture for the extracted `causal-admin-ui` package.
 
 ## Source: Paperclip Machine Pattern
 
@@ -19,7 +19,7 @@ The paperclip designer uses this with 7 composed engines (api, history, keyboard
 ## Proposed Domain Decomposition
 
 ```
-seesaw-admin-ui/
+causal-admin-ui/
   src/
     machine/
       events.ts          # Union: AdminMachineEvent
@@ -31,7 +31,7 @@ seesaw-admin-ui/
         cache.ts         # Client-side event cache engine
         flow.ts          # Flow graph building engine (dagre layout computation)
       selectors.ts       # Memoized derivations
-      provider.tsx       # <SeesawAdminProvider> wrapping Machine
+      provider.tsx       # <CausalAdminProvider> wrapping Machine
 ```
 
 ## Events (Discriminated Unions)
@@ -181,7 +181,7 @@ const createFlowEngine: EngineCreator<AdminState, AdminEvent> =
 ### Combined
 
 ```typescript
-export const createAdminEngine = (config: SeesawAdminConfig) =>
+export const createAdminEngine = (config: CausalAdminConfig) =>
   combineEngineCreators(
     createSubscriptionEngine,
     createQueryEngine,
@@ -204,9 +204,9 @@ export const createAdminEngine = (config: SeesawAdminConfig) =>
 
 ## The Philosophical Mirror
 
-The frontend architecture mirrors seesaw's own Event → Handler → Event loop:
+The frontend architecture mirrors causal's own Event → Handler → Event loop:
 
-| Seesaw (backend) | Machine (frontend) |
+| Causal (backend) | Machine (frontend) |
 |---|---|
 | Events | Events (discriminated unions) |
 | Handlers | Engines (side effect processors) |
@@ -227,8 +227,8 @@ The Machine infrastructure is ~200 lines total:
 - `ObservableMap` (~60 lines)
 
 Options:
-1. **Copy into `seesaw-admin-ui`** — simplest, no external dependency
-2. **Extract as `@seesaw/machine`** — if other seesaw UI packages emerge
+1. **Copy into `causal-admin-ui`** — simplest, no external dependency
+2. **Extract as `@causal/machine`** — if other causal UI packages emerge
 3. **Publish paperclip's machine as its own npm package** — if it's truly generic
 
 Option 1 is the pragmatic choice. 200 lines isn't worth a dependency.
@@ -238,7 +238,7 @@ Option 1 is the pragmatic choice. 200 lines isn't worth a dependency.
 Rootsignal would extend the machine with its own engines:
 
 ```typescript
-import { createAdminEngine, createAdminReducer } from '@seesaw/admin-ui';
+import { createAdminEngine, createAdminReducer } from '@causal/admin-ui';
 import { createInvestigationEngine } from './engines/investigation';
 import { investigationReducer } from './reducers/investigation';
 
@@ -259,6 +259,6 @@ const rootsignalReducer = (state, event) =>
 
 2. **Web Worker for flow engine** — dagre layout on 500+ nodes can block the main thread. The engine pattern makes it trivial to move computation to a worker: the engine posts to the worker, the worker posts back, the engine dispatches `flow/graph_built`.
 
-3. **Middleware / devtools** — The event-driven architecture makes it trivial to add logging middleware, time-travel debugging, or event replay. Should `seesaw-admin-ui` ship a devtools panel that shows its own event stream? (Meta: the admin tool debugging itself.)
+3. **Middleware / devtools** — The event-driven architecture makes it trivial to add logging middleware, time-travel debugging, or event replay. Should `causal-admin-ui` ship a devtools panel that shows its own event stream? (Meta: the admin tool debugging itself.)
 
 4. **Selector memoization** — `useSelector` in paperclip does shallow comparison. For derived data (e.g., filtered event list), need `reselect`-style memoized selectors or `useMemo` in components.

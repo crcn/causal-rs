@@ -11,7 +11,7 @@ brainstorm: docs/brainstorms/2026-03-08-kurrentdb-store-composition.md
 
 Replace the monolithic `Store` trait with two focused traits: `EventLog` (durable
 event history) and `HandlerQueue` (work distribution). This eliminates the
-redundant event buffer (`seesaw_events` queue), halves event writes, and enables
+redundant event buffer (`causal_events` queue), halves event writes, and enables
 swapping `PostgresEventLog` for `KurrentDbEventLog` with zero other changes.
 
 ## Problem Statement
@@ -166,7 +166,7 @@ persistent failures exhaust retries. The counter resets on process restart.
 ##### 1a. New types in `types.rs`
 
 ```rust
-// crates/seesaw/src/types.rs
+// crates/causal/src/types.rs
 
 /// Atomic intent creation payload (replaces EventCommit).
 pub struct IntentCommit {
@@ -203,7 +203,7 @@ Remove `pending_events` from `QueueStatus`.
 ##### 1b. `EventLog` trait in `event_log.rs`
 
 ```rust
-// crates/seesaw/src/event_log.rs
+// crates/causal/src/event_log.rs
 
 #[async_trait]
 pub trait EventLog: Send + Sync {
@@ -218,7 +218,7 @@ pub trait EventLog: Send + Sync {
 ##### 1c. `HandlerQueue` trait in `handler_queue.rs`
 
 ```rust
-// crates/seesaw/src/handler_queue.rs
+// crates/causal/src/handler_queue.rs
 
 #[async_trait]
 pub trait HandlerQueue: Send + Sync {
@@ -316,7 +316,7 @@ where the engine half-uses the old Store and half-uses the new traits.
 ##### 3a. Engine struct changes
 
 ```rust
-// crates/seesaw/src/engine.rs
+// crates/causal/src/engine.rs
 
 pub struct Engine<D: Send + Sync + 'static> {
     log: Arc<dyn EventLog>,
@@ -563,7 +563,7 @@ Keep: all other existing re-exports
 
 ## Rootsignal Adoption Checklist
 
-The plan above covers seesaw-core. Rootsignal is the primary consumer and needs
+The plan above covers causal-core. Rootsignal is the primary consumer and needs
 these changes (NOT part of this PR, but tracked here for completeness):
 
 ### PostgresStore split
@@ -578,15 +578,15 @@ these changes (NOT part of this PR, but tracked here for completeness):
 
 **PostgresHandlerQueue** implements:
 - `enqueue` ← current `commit_event` logic (insert intents + advance checkpoint)
-- `checkpoint` ← new: `SELECT position FROM seesaw_checkpoints WHERE correlation_id = $1`
+- `checkpoint` ← new: `SELECT position FROM causal_checkpoints WHERE correlation_id = $1`
 - `dequeue` ← current `poll_next_handler`
 - `resolve` ← current `resolve_handler` (simplified: NO `events_to_publish`)
 - `earliest_pending_at`, `reclaim_stale`, journaling, cancellation, descriptions ← unchanged
 
 ### Schema changes
 
-- **Drop** `seesaw_events` table
-- **Add** `seesaw_checkpoints` table: `(correlation_id UUID PK, position BIGINT)`
+- **Drop** `causal_events` table
+- **Add** `causal_checkpoints` table: `(correlation_id UUID PK, position BIGINT)`
 - **Add** `metadata JSONB` column to `events` table (for routing key round-trip)
 
 ### Engine builder functions
@@ -595,13 +595,13 @@ All 5 `build_*_engine` functions in `engine.rs` change signature:
 
 ```rust
 // Before
-pub fn build_engine(deps: ScoutEngineDeps, seesaw_store: Option<Arc<dyn seesaw_core::Store>>)
+pub fn build_engine(deps: ScoutEngineDeps, causal_store: Option<Arc<dyn causal_core::Store>>)
 
 // After
 pub fn build_engine(
     deps: ScoutEngineDeps,
-    log: Option<Arc<dyn seesaw_core::EventLog>>,
-    queue: Option<Arc<dyn seesaw_core::HandlerQueue>>,
+    log: Option<Arc<dyn causal_core::EventLog>>,
+    queue: Option<Arc<dyn causal_core::HandlerQueue>>,
 )
 ```
 
@@ -612,10 +612,10 @@ When `None`, use `Engine::in_memory(deps)`.
 
 ```rust
 // Before
-fn make_store(&self, run_id: Uuid) -> Option<Arc<dyn seesaw_core::Store>>
+fn make_store(&self, run_id: Uuid) -> Option<Arc<dyn causal_core::Store>>
 
 // After
-fn make_store(&self, run_id: Uuid) -> (Arc<dyn seesaw_core::EventLog>, Arc<dyn seesaw_core::HandlerQueue>) {
+fn make_store(&self, run_id: Uuid) -> (Arc<dyn causal_core::EventLog>, Arc<dyn causal_core::HandlerQueue>) {
     let log = Arc::new(PostgresEventLog::new(self.pg_pool.clone(), run_id));
     let queue = Arc::new(PostgresHandlerQueue::new(self.pg_pool.clone(), run_id));
     (log, queue)
@@ -677,8 +677,8 @@ Accept the behavioral change.
 ## References
 
 - Brainstorm: `docs/brainstorms/2026-03-08-kurrentdb-store-composition.md`
-- Current Store trait: `crates/seesaw/src/store.rs`
-- Current Engine: `crates/seesaw/src/engine.rs`
-- Current MemoryStore: `crates/seesaw/src/memory_store.rs`
-- Current types: `crates/seesaw/src/types.rs`
+- Current Store trait: `crates/causal/src/store.rs`
+- Current Engine: `crates/causal/src/engine.rs`
+- Current MemoryStore: `crates/causal/src/memory_store.rs`
+- Current types: `crates/causal/src/types.rs`
 - KurrentDB roadmap: `docs/plans/2026-03-06-kurrentdb-integration-roadmap.md`

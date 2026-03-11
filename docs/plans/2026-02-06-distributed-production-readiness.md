@@ -44,11 +44,11 @@ async fn charge_payment(...) -> Result<PaymentCharged> {
 
 ```sql
 -- New table for failed intents with explicit lifecycle
-CREATE TYPE seesaw_dlq_status AS ENUM ('open', 'retrying', 'replayed', 'resolved');
+CREATE TYPE causal_dlq_status AS ENUM ('open', 'retrying', 'replayed', 'resolved');
 
-CREATE TABLE seesaw_dead_letter_queue (
+CREATE TABLE causal_dead_letter_queue (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_id UUID NOT NULL REFERENCES seesaw_events(id),
+    event_id UUID NOT NULL REFERENCES causal_events(id),
     handler_id TEXT NOT NULL,
     intent_id UUID NOT NULL UNIQUE,
     error_message TEXT NOT NULL,
@@ -57,7 +57,7 @@ CREATE TABLE seesaw_dead_letter_queue (
     first_failed_at TIMESTAMPTZ NOT NULL,
     last_failed_at TIMESTAMPTZ NOT NULL,
     event_payload JSONB NOT NULL,
-    status seesaw_dlq_status NOT NULL DEFAULT 'open',
+    status causal_dlq_status NOT NULL DEFAULT 'open',
     retry_attempts INTEGER NOT NULL DEFAULT 0,
     last_retry_at TIMESTAMPTZ,
     resolved_at TIMESTAMPTZ,
@@ -66,7 +66,7 @@ CREATE TABLE seesaw_dead_letter_queue (
 );
 
 CREATE INDEX idx_dlq_handler_open
-    ON seesaw_dead_letter_queue(handler_id, created_at DESC)
+    ON causal_dead_letter_queue(handler_id, created_at DESC)
     WHERE status IN ('open', 'retrying');
 ```
 
@@ -82,7 +82,7 @@ async fn handle_permanent_failure(
 
     // Insert (or refresh) DLQ record
     sqlx::query(
-        "INSERT INTO seesaw_dead_letter_queue
+        "INSERT INTO causal_dead_letter_queue
          (event_id, handler_id, intent_id, error_message, error_details,
           retry_count, first_failed_at, last_failed_at, event_payload, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open')
@@ -107,7 +107,7 @@ async fn handle_permanent_failure(
 
     // Mark intent as permanently failed
     sqlx::query(
-        "UPDATE seesaw_handler_intents
+        "UPDATE causal_handler_intents
          SET status = 'dead_letter', updated_at = NOW()
          WHERE id = $1"
     )
@@ -133,7 +133,7 @@ async fn handle_permanent_failure(
 // Inspect DLQ
 async fn list_dead_letters(store: &impl Store) -> Result<Vec<DeadLetter>> {
     sqlx::query_as(
-        "SELECT * FROM seesaw_dead_letter_queue
+        "SELECT * FROM causal_dead_letter_queue
          WHERE status IN ('open', 'retrying')
          ORDER BY created_at DESC
          LIMIT 100"
@@ -151,7 +151,7 @@ async fn retry_dead_letter(
     // Lock row so only one operator retries this entry at a time
     let mut tx = store.pool().begin().await?;
     let dlq: DeadLetter = sqlx::query_as(
-        "SELECT * FROM seesaw_dead_letter_queue
+        "SELECT * FROM causal_dead_letter_queue
          WHERE id = $1
          FOR UPDATE"
     )
@@ -160,7 +160,7 @@ async fn retry_dead_letter(
     .await?;
 
     sqlx::query(
-        "UPDATE seesaw_dead_letter_queue
+        "UPDATE causal_dead_letter_queue
          SET status = 'retrying',
              retry_attempts = retry_attempts + 1,
              last_retry_at = NOW()
@@ -177,7 +177,7 @@ async fn retry_dead_letter(
     match engine.dispatch(event).await {
         Ok(()) => {
             sqlx::query(
-                "UPDATE seesaw_dead_letter_queue
+                "UPDATE causal_dead_letter_queue
                  SET status = 'replayed',
                      resolved_at = NOW(),
                      resolution_note = 're-dispatched from DLQ'
@@ -191,7 +191,7 @@ async fn retry_dead_letter(
         Err(err) => {
             // Preserve record for future retry and postmortem
             sqlx::query(
-                "UPDATE seesaw_dead_letter_queue
+                "UPDATE causal_dead_letter_queue
                  SET status = 'open',
                      last_failed_at = NOW(),
                      error_message = $2,
@@ -216,7 +216,7 @@ async fn retry_all_by_handler(
 ) -> Result<RetrySummary> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id
-         FROM seesaw_dead_letter_queue
+         FROM causal_dead_letter_queue
          WHERE handler_id = $1 AND status = 'open'
          ORDER BY created_at
          LIMIT 100"
@@ -388,7 +388,7 @@ async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentChar
 **Current implementation:**
 ```sql
 -- Workers claim intents using SKIP LOCKED
-SELECT * FROM seesaw_handler_intents
+SELECT * FROM causal_handler_intents
 WHERE status = 'pending'
 ORDER BY created_at
 FOR UPDATE SKIP LOCKED
@@ -493,7 +493,7 @@ impl Engine {
 
     async fn queue_depth(&self) -> Result<u64> {
         let depth = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM seesaw_handler_intents WHERE status = 'pending'"
+            "SELECT COUNT(*) FROM causal_handler_intents WHERE status = 'pending'"
         )
         .fetch_one(&self.store.pool())
         .await?;
@@ -509,7 +509,7 @@ impl Engine {
 use opentelemetry::trace::{Tracer, Span};
 
 async fn dispatch(&self, event: Event) -> Result<()> {
-    let tracer = global::tracer("seesaw");
+    let tracer = global::tracer("causal");
     let mut span = tracer.start("dispatch_event");
     span.set_attribute("event.type", event.type_name());
 
@@ -973,7 +973,7 @@ async fn test_delayed_handler() {
 
 ## Conclusion
 
-**To make Seesaw production-ready for distributed systems, we need:**
+**To make Causal production-ready for distributed systems, we need:**
 
 **Critical (blocking):**
 1. Dead Letter Queue (handle permanent failures)

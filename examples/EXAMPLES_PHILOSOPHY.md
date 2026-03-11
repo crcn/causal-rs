@@ -2,7 +2,7 @@
 
 ## Why No Adapters?
 
-We considered building `seesaw-http`, `seesaw-anthropic`, and other adapter crates.
+We considered building `causal-http`, `causal-anthropic`, and other adapter crates.
 
 **We killed those ideas. Here's why:**
 
@@ -44,9 +44,9 @@ The moment the adapter doesn't do exactly what you need:
 - Work around it (fighting the abstraction)
 - Abandon it (wasted effort)
 
-### Problem 5: It Complicates Seesaw
+### Problem 5: It Complicates Causal
 
-Seesaw's value is conceptual clarity:
+Causal's value is conceptual clarity:
 - Events (facts)
 - Commands (intent)
 - Machines (decisions)
@@ -151,7 +151,7 @@ Only build an adapter when:
 
 ## The Real Pattern
 
-**Seesaw is about architecture, not libraries.**
+**Causal is about architecture, not libraries.**
 
 The architecture is:
 ```
@@ -164,7 +164,7 @@ What libraries you use in your effects? **That's your choice.**
 - Want `hyper`? Use it.
 - Want `surf`? Use it.
 
-**Seesaw doesn't care.** It just provides the architecture.
+**Causal doesn't care.** It just provides the architecture.
 
 ## Examples Structure
 
@@ -178,4 +178,4 @@ No ceremony. No special adapters. Just clean code.
 
 ---
 
-**Keep Seesaw simple. Use libraries directly.**
+**Keep Causal simple. Use libraries directly.**

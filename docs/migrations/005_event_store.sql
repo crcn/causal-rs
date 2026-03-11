@@ -1,5 +1,5 @@
 -- Event Sourcing: permanent event storage with optimistic concurrency
-CREATE TABLE seesaw_event_store (
+CREATE TABLE causal_event_store (
     position BIGINT GENERATED ALWAYS AS IDENTITY,
     id UUID UNIQUE DEFAULT gen_random_uuid(),
     aggregate_id UUID NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE seesaw_event_store (
     UNIQUE (aggregate_id, sequence)
 );
 
-CREATE INDEX idx_es_aggregate ON seesaw_event_store(aggregate_id, sequence ASC);
-CREATE INDEX idx_es_type ON seesaw_event_store(aggregate_type);
-CREATE INDEX idx_es_caused_by ON seesaw_event_store(caused_by) WHERE caused_by IS NOT NULL;
-CREATE INDEX idx_es_position ON seesaw_event_store(position ASC);
+CREATE INDEX idx_es_aggregate ON causal_event_store(aggregate_id, sequence ASC);
+CREATE INDEX idx_es_type ON causal_event_store(aggregate_type);
+CREATE INDEX idx_es_caused_by ON causal_event_store(caused_by) WHERE caused_by IS NOT NULL;
+CREATE INDEX idx_es_position ON causal_event_store(position ASC);

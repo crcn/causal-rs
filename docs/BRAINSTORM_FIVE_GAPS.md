@@ -229,7 +229,7 @@ where
         let events = sqlx::query!(
             r#"
             SELECT DISTINCT aggregate_id, aggregate_type
-            FROM seesaw_event_store
+            FROM causal_event_store
             WHERE timestamp >= $1 AND timestamp <= $2
             "#,
             start,
@@ -693,7 +693,7 @@ where
         let rows = sqlx::query!(
             r#"
             SELECT sequence, event_type, event_data, timestamp, schema_v
-            FROM seesaw_event_store
+            FROM causal_event_store
             WHERE aggregate_id = $1 AND sequence > $2
             ORDER BY sequence ASC
             "#,
@@ -939,7 +939,7 @@ impl PlaceOrder {
 
 ```sql
 -- Already have this table!
-CREATE TABLE seesaw_snapshots (
+CREATE TABLE causal_snapshots (
     aggregate_id UUID NOT NULL,
     aggregate_type TEXT NOT NULL,
     version BIGINT NOT NULL,
@@ -949,8 +949,8 @@ CREATE TABLE seesaw_snapshots (
 );
 
 -- Index for latest snapshot lookup
-CREATE INDEX idx_seesaw_snapshots_latest
-    ON seesaw_snapshots(aggregate_id, version DESC);
+CREATE INDEX idx_causal_snapshots_latest
+    ON causal_snapshots(aggregate_id, version DESC);
 ```
 
 #### Snapshot API

@@ -1,11 +1,11 @@
-# Seesaw
+# Causal
 
 **Event-driven orchestration for Rust.**
 
-Seesaw is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, event sourcing, and journaled side effects.
+Causal is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, event sourcing, and journaled side effects.
 
 ```rust
-use seesaw_core::{event, aggregators, handles, events, Context, Engine, Events};
+use causal_core::{event, aggregators, handles, events, Context, Engine, Events};
 
 #[event]
 #[derive(Clone, Serialize, Deserialize)]
@@ -53,7 +53,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-seesaw_core = "0.26"
+causal_core = "0.26"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -67,7 +67,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 Every event type must implement the `Event` trait. Use the `#[event]` proc macro:
 
 ```rust
-use seesaw_core::event;
+use causal_core::event;
 
 // Plain struct — durable_name: "order_placed"
 #[event]
@@ -493,7 +493,7 @@ The return type must implement `Serialize + DeserializeOwned`. The built-in `Mem
 
 ### Ephemeral sidecar (live dispatch optimization)
 
-When an event is published or emitted, seesaw stashes the original typed object alongside the JSON payload. During the **live dispatch cycle**, handlers receive this original object directly — preserving `#[serde(skip)]` fields that would be lost through serialization.
+When an event is published or emitted, causal stashes the original typed object alongside the JSON payload. During the **live dispatch cycle**, handlers receive this original object directly — preserving `#[serde(skip)]` fields that would be lost through serialization.
 
 On **replay or hydration** (e.g. after a crash), the ephemeral is `None` and handlers fall back to JSON deserialization. Skipped fields get their `Default` values, which is correct by design since durable state is the record of truth.
 
@@ -528,7 +528,7 @@ No code changes are needed to benefit — this is automatic for all events publi
 
 ## Durable Execution
 
-Seesaw provides durable execution natively through its split store traits:
+Causal provides durable execution natively through its split store traits:
 
 | Concern | MemoryStore (default) | Postgres Store |
 |---------|----------------------|----------------|
@@ -594,7 +594,7 @@ cargo run --example simple-order
 
 ## Multi-Node Sync
 
-Three primitives enable syncing events between seesaw instances:
+Three primitives enable syncing events between causal instances:
 
 1. **Idempotent append** — `EventLog::append` deduplicates by `event_id`. Appending the same event twice returns the existing position without inserting.
 

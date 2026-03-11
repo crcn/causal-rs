@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-Seesaw is a **Postgres-backed distributed worker pool** with event-driven handlers, not a distributed system in the traditional sense (like Kafka, Akka, or microservices). It's comparable to Sidekiq, Celery, or BullMQ but with an event-driven programming model.
+Causal is a **Postgres-backed distributed worker pool** with event-driven handlers, not a distributed system in the traditional sense (like Kafka, Akka, or microservices). It's comparable to Sidekiq, Celery, or BullMQ but with an event-driven programming model.
 
 **Current capabilities:**
 - ✅ Multi-worker deployment (horizontal scaling to ~500 workers)
@@ -31,13 +31,13 @@ Seesaw is a **Postgres-backed distributed worker pool** with event-driven handle
 
 ## Part 1: Distributed Systems Assessment
 
-### What Seesaw Actually Is
+### What Causal Actually Is
 
-Seesaw is a **centralized task queue with event-driven handlers**:
+Causal is a **centralized task queue with event-driven handlers**:
 
 ```
 ┌─────────────────────────────────────┐
-│     Seesaw Engine (Single Service)  │
+│     Causal Engine (Single Service)  │
 │                                     │
 │  Worker 1 ┐                         │
 │  Worker 2 ├─→ Postgres Queue        │
@@ -66,7 +66,7 @@ Seesaw is a **centralized task queue with event-driven handlers**:
 
 #### vs **Kafka / Event Streaming**
 
-| Feature | Seesaw | Kafka |
+| Feature | Causal | Kafka |
 |---------|--------|-------|
 | Partitioning | ❌ None | ✅ Topic partitions |
 | Consumer groups | ❌ None | ✅ Yes |
@@ -78,7 +78,7 @@ Seesaw is a **centralized task queue with event-driven handlers**:
 
 #### vs **Temporal / Cadence**
 
-| Feature | Seesaw | Temporal |
+| Feature | Causal | Temporal |
 |---------|--------|----------|
 | Workflow DSL | ❌ No | ✅ Yes |
 | Long-running sagas | ⚠️ Manual | ✅ Built-in |
@@ -89,7 +89,7 @@ Seesaw is a **centralized task queue with event-driven handlers**:
 
 #### vs **Akka / Orleans (Actors)**
 
-| Feature | Seesaw | Akka |
+| Feature | Causal | Akka |
 |---------|--------|------|
 | Actor addressing | ❌ No | ✅ Yes |
 | Location transparency | ❌ No | ✅ Yes |
@@ -143,7 +143,7 @@ let engine = Engine::new(deps, store)
 
 All events go to shared queue, any worker can pick up any event.
 
-### When to Use Seesaw
+### When to Use Causal
 
 #### ✅ **Good For:**
 
@@ -170,17 +170,17 @@ EmailService {
 
 **Replacing ad-hoc job queues:**
 - Instead of: Redis + custom worker code
-- Use: Seesaw with event model
+- Use: Causal with event model
 
 #### ❌ **Not Good For:**
 
 **Microservices architecture:**
 ```rust
 // DON'T: Share Postgres across services
-OrderService (Seesaw) → shared Postgres ← PaymentService (Seesaw)
+OrderService (Causal) → shared Postgres ← PaymentService (Causal)
 
 // DO: Separate services with message broker
-OrderService (Seesaw) → Kafka ← PaymentService (Seesaw)
+OrderService (Causal) → Kafka ← PaymentService (Causal)
 ```
 
 **High-throughput streaming** (>100k events/sec):
@@ -316,7 +316,7 @@ async fn bad_handler(...) { }
 
 #### 2.2 Update Macro to Enforce
 
-In `seesaw_core_macros/src/lib.rs`:
+In `causal_core_macros/src/lib.rs`:
 
 ```rust
 fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectArgs> {
@@ -357,7 +357,7 @@ fn effect_requires_background(args: &EffectArgs) -> bool {
 **Design:** Sealed trait + derive macro + unsafe opt-out
 
 ```rust
-// In seesaw_core/src/distributed_safe.rs
+// In causal_core/src/distributed_safe.rs
 
 mod sealed {
     pub trait Sealed {}
@@ -389,7 +389,7 @@ impl DistributedSafe for reqwest::Client {}
 #### 3.2 Derive Macro
 
 ```rust
-// In seesaw_core_macros
+// In causal_core_macros
 
 #[proc_macro_derive(DistributedSafe, attributes(allow_non_distributed))]
 pub fn derive_distributed_safe(input: TokenStream) -> TokenStream {
@@ -402,8 +402,8 @@ pub fn derive_distributed_safe(input: TokenStream) -> TokenStream {
 
     // Generate impl
     quote! {
-        impl ::seesaw_core::sealed::Sealed for #name {}
-        impl ::seesaw_core::DistributedSafe for #name {}
+        impl ::causal_core::sealed::Sealed for #name {}
+        impl ::causal_core::DistributedSafe for #name {}
     }.into()
 }
 ```
@@ -538,7 +538,7 @@ let engine = Engine::new(deps, RedisStore::new(redis_config, state_pool));
 ```
 Events → PostgresStore ← Workers
          │
-         ├─ Queue (seesaw_queue)
+         ├─ Queue (causal_queue)
          ├─ State (join windows)
          ├─ Idempotency
          └─ pg_notify
@@ -588,7 +588,7 @@ impl Store for PostgresStore {
     async fn enqueue_event(&self, event: &dyn Event) -> Result<EventId> {
         // All in Postgres
         let event_id = sqlx::query_scalar(
-            "INSERT INTO seesaw_queue (event_type, payload) VALUES ($1, $2) RETURNING id"
+            "INSERT INTO causal_queue (event_type, payload) VALUES ($1, $2) RETURNING id"
         )
         .bind(event.type_name())
         .bind(serde_json::to_value(event)?)
@@ -596,14 +596,14 @@ impl Store for PostgresStore {
         .await?;
 
         // Notify workers
-        sqlx::query("NOTIFY seesaw_events").execute(&self.pool).await?;
+        sqlx::query("NOTIFY causal_events").execute(&self.pool).await?;
 
         Ok(event_id)
     }
 
     async fn save_join_entry(&self, entry: JoinEntry) -> Result<()> {
         // Join state in same database
-        sqlx::query("INSERT INTO seesaw_join_entries ...")
+        sqlx::query("INSERT INTO causal_join_entries ...")
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -656,7 +656,7 @@ impl Store for KafkaStore {
 
     async fn save_join_entry(&self, entry: JoinEntry) -> Result<()> {
         // Join state still goes to Postgres
-        sqlx::query("INSERT INTO seesaw_join_entries ...")
+        sqlx::query("INSERT INTO causal_join_entries ...")
             .execute(&self.state_pool)  // Note: state_pool, not Kafka
             .await?;
         Ok(())
@@ -779,8 +779,8 @@ async fn bulk_insert(batch: Vec<RowParsed>, ctx: Ctx) -> Result<BatchInserted> {
 ```
 
 Even with KafkaStore, you need Postgres (or Redis) for:
-- `seesaw_join_entries` (accumulate state)
-- `seesaw_join_windows` (window tracking)
+- `causal_join_entries` (accumulate state)
+- `causal_join_windows` (window tracking)
 - `idempotency_keys` (deduplication)
 - `handler_executions` (retry counts)
 
@@ -868,7 +868,7 @@ let engine = Engine::new(
 
 ### Cross-Service Architecture
 
-For microservices, use multiple Seesaw instances with Kafka **between** them:
+For microservices, use multiple Causal instances with Kafka **between** them:
 
 ```rust
 // Order Service - internal events use PostgresStore
@@ -912,7 +912,7 @@ ctx.deps().kafka_consumer.subscribe("order-events");
 - [ ] Add transaction boundaries section
 - [ ] Add capability table (single-process vs multi-worker)
 - [ ] Update state management section
-- [ ] Add "What Seesaw Is/Isn't" section
+- [ ] Add "What Causal Is/Isn't" section
 
 ### Week 2: Execution Mode
 - [ ] Add `inline` attribute to macro
@@ -982,7 +982,7 @@ let engine = Engine::new(deps, store)
 
 ### Current State
 
-Seesaw is a **well-designed Postgres-backed distributed worker pool** that excels at:
+Causal is a **well-designed Postgres-backed distributed worker pool** that excels at:
 - Event-driven programming within a bounded context
 - Background job processing with retry
 - Strong consistency guarantees
@@ -1016,7 +1016,7 @@ But adds significant complexity and requires outbox pattern.
 
 ### Positioning
 
-Seesaw should be positioned as:
+Causal should be positioned as:
 - ✅ "Distributed worker pool for event-driven systems"
 - ✅ "Postgres-backed reactive task queue"
 - ✅ "Event-driven background job processor"
