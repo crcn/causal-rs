@@ -45,15 +45,7 @@ type FlowClosed = BaseEvent<"ui/flow_closed">;
 type FlowNodeSelected = BaseEvent<"ui/flow_node_selected", FlowSelection>;
 type FilterChanged = BaseEvent<"ui/filter_changed", Partial<FilterState>>;
 type LogsFilterChanged = BaseEvent<"ui/logs_filter_changed", Partial<LogsFilter>>;
-type ScrubberMoved = BaseEvent<"ui/scrubber_moved", { position: number | null }>;
 type LoadMoreRequested = BaseEvent<"ui/load_more_requested">;
-
-// ── Flow graph events (computed) ──
-
-type FlowGraphBuilt = BaseEvent<
-  "flow/graph_built",
-  { nodes: unknown[]; edges: unknown[] }
->;
 
 // ── Union ──
 
@@ -74,6 +66,4 @@ export type AdminMachineEvent =
   | FlowNodeSelected
   | FilterChanged
   | LogsFilterChanged
-  | ScrubberMoved
-  | LoadMoreRequested
-  | FlowGraphBuilt;
+  | LoadMoreRequested;

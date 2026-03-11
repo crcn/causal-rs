@@ -1,4 +1,3 @@
-import { BaseEvent } from "./events";
 import { Engine, EngineCreator } from "./engine";
 import { Reducer, Store } from "./store";
 
@@ -11,7 +10,7 @@ import { Reducer, Store } from "./store";
  *   → Engine handles event with (curr, prev) state
  *   → Engine may dispatch new events (async reactions)
  */
-export class Machine<TState, TEvent extends BaseEvent<any, any>> {
+export class Machine<TState, TEvent extends { type: string }> {
   private _engine: Engine<TState, TEvent>;
   private _store: Store<TState, TEvent>;
 

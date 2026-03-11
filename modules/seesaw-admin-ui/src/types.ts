@@ -33,13 +33,22 @@ export type HandlerLog = {
   handlerId: string;
   level: string;
   message: string;
-  data: unknown | null;
+  data: unknown;
   loggedAt: string;
 };
 
+/** Structured block within a handler description (mirrors seesaw handler DSL). */
+export type Block =
+  | { type: "label"; text: string }
+  | { type: "counter"; label: string; value: number; total: number }
+  | { type: "progress"; label: string; fraction: number }
+  | { type: "checklist"; label: string; items: { text: string; done: boolean }[] }
+  | { type: "key_value"; key: string; value: string }
+  | { type: "status"; label: string; state: "waiting" | "running" | "done" | "error" };
+
 export type HandlerDescription = {
   handlerId: string;
-  blocks: unknown;
+  blocks: Block[];
 };
 
 export type HandlerOutcome = {
@@ -65,11 +74,9 @@ export type LogsFilter = {
   eventId: string | null;
   handlerId: string | null;
   runId: string | null;
-  levels: string[];
-  search: string;
 };
 
-export type FlowSelection = {
-  nodeId: string | null;
-  eventSeq: number | null;
-};
+export type FlowSelection =
+  | { kind: "event-type"; handlerId: string | null; name: string }
+  | { kind: "handler"; handlerId: string }
+  | null;

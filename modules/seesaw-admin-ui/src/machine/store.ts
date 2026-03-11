@@ -1,12 +1,11 @@
 import { produce, type Draft } from "immer";
-import { BaseEvent } from "./events";
 
 type ChangeListener<TState> = (
   newState: TState,
   oldState: TState
 ) => void;
 
-export type Reducer<TState, TEvent extends BaseEvent<any, any>> = (
+export type Reducer<TState, TEvent extends { type: string }> = (
   draft: Draft<TState>,
   event: TEvent
 ) => void;
@@ -17,7 +16,7 @@ export type Reducer<TState, TEvent extends BaseEvent<any, any>> = (
  * Reducer receives a mutable draft (Immer proxy) — mutations are
  * automatically converted to structural sharing under the hood.
  */
-export class Store<TState, TEvent extends BaseEvent<any, any>> {
+export class Store<TState, TEvent extends { type: string }> {
   private _state: TState;
   private _listeners = new Set<ChangeListener<TState>>();
 

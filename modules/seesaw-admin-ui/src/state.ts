@@ -20,13 +20,10 @@ export type AdminState = {
   // Flow (causal DAG)
   flowRunId: string | null;
   flowData: AdminEvent[];
-  flowGraph: { nodes: unknown[]; edges: unknown[] } | null;
   flowSelection: FlowSelection;
-  scrubberPosition: number | null;
 
   // Causal tree
   causalTree: { events: AdminEvent[]; rootSeq: number } | null;
-  treeSource: "dedicated" | "flow";
 
   // Filters
   filters: FilterState;
@@ -52,12 +49,9 @@ export const initialState: AdminState = {
 
   flowRunId: null,
   flowData: [],
-  flowGraph: null,
-  flowSelection: { nodeId: null, eventSeq: null },
-  scrubberPosition: null,
+  flowSelection: null,
 
   causalTree: null,
-  treeSource: "dedicated",
 
   filters: {
     search: "",
@@ -73,8 +67,6 @@ export const initialState: AdminState = {
     eventId: null,
     handlerId: null,
     runId: null,
-    levels: ["info", "warn", "error"],
-    search: "",
   },
 
   descriptions: {},

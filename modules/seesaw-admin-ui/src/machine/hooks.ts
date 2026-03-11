@@ -1,12 +1,12 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Machine } from "./core";
-import { BaseEvent, Dispatch } from "./events";
+import { Dispatch } from "./events";
 import { EngineCreator } from "./engine";
 import { Reducer } from "./store";
 
 export const MachineContext = createContext<Machine<any, any> | null>(null);
 
-const useMachine = <TState, TEvent extends BaseEvent<any, any>>(): Machine<
+const useMachine = <TState, TEvent extends { type: string }>(): Machine<
   TState,
   TEvent
 > => {
@@ -45,7 +45,7 @@ export const useSelector = <TState, TSelected>(
  * Get the dispatch function. Stable reference — never causes re-renders.
  */
 export const useDispatch = <
-  TEvent extends BaseEvent<any, any>
+  TEvent extends { type: string }
 >(): Dispatch<TEvent> => {
   return useMachine<any, TEvent>().dispatch;
 };
@@ -54,7 +54,7 @@ export const useDispatch = <
  * Create and manage a machine inline within a component.
  * Useful for self-contained widgets.
  */
-export const useInlineMachine = <TState, TEvent extends BaseEvent<any, any>>(
+export const useInlineMachine = <TState, TEvent extends { type: string }>(
   reducer: Reducer<TState, TEvent>,
   createEngine: EngineCreator<TState, TEvent>,
   initialState: TState

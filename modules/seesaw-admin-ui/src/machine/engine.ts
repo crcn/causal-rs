@@ -1,11 +1,11 @@
-import { BaseEvent, Dispatch } from "./events";
+import { Dispatch } from "./events";
 
-export type Engine<TState, TEvent extends BaseEvent<any, any>> = {
+export type Engine<TState, TEvent extends { type: string }> = {
   handleEvent?: (event: TEvent, currState: TState, prevState: TState) => void;
   dispose: () => void;
 };
 
-export type EngineCreator<TState, TEvent extends BaseEvent<any, any>> = (
+export type EngineCreator<TState, TEvent extends { type: string }> = (
   dispatch: Dispatch<TEvent>,
   getState: () => TState
 ) => Engine<TState, TEvent>;
@@ -16,7 +16,7 @@ export type EngineCreator<TState, TEvent extends BaseEvent<any, any>> = (
  */
 export const combineEngineCreators = <
   TState,
-  TEvent extends BaseEvent<any, any>
+  TEvent extends { type: string }
 >(
   ...creators: EngineCreator<TState, TEvent>[]
 ): EngineCreator<TState, TEvent> => {

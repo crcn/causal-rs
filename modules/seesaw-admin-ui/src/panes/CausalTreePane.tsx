@@ -1,0 +1,439 @@
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import { useSelector, useDispatch } from "../machine";
+import type { AdminState } from "../state";
+import type { AdminMachineEvent } from "../events";
+import type { AdminEvent, FlowSelection } from "../types";
+import { CopyablePayload } from "../components/CopyablePayload";
+import { eventTextColor, LAYER_COLORS } from "../theme";
+import { formatTs, compactPayload, copyToClipboard } from "../utils";
+
+// ---------------------------------------------------------------------------
+// Tree JSON export
+// ---------------------------------------------------------------------------
+
+type TreeJson = {
+  name: string;
+  layer: string;
+  handlerId: string | null;
+  summary: string | null;
+  children?: TreeJson[];
+};
+
+function buildTreeJson(roots: AdminEvent[], childrenMap: Map<string, AdminEvent[]>): TreeJson[] {
+  function toNode(evt: AdminEvent): TreeJson {
+    const children = evt.id ? (childrenMap.get(evt.id) ?? []) : [];
+    const node: TreeJson = {
+      name: evt.name,
+      layer: evt.layer,
+      handlerId: evt.handlerId,
+      summary: evt.summary,
+    };
+    if (children.length > 0) {
+      node.children = children.map(toNode);
+    }
+    return node;
+  }
+  return roots.map(toNode);
+}
+
+// ---------------------------------------------------------------------------
+// HandlerNode — intermediate node grouping children by handler_id
+// ---------------------------------------------------------------------------
+
+function HandlerNode({
+  handlerId,
+  parentEventId,
+  children,
+  childrenMap,
+  depth,
+  isHighlighted,
+  onClickHandler,
+}: {
+  handlerId: string;
+  parentEventId: string;
+  children: AdminEvent[];
+  childrenMap: Map<string, AdminEvent[]>;
+  depth: number;
+  isHighlighted: boolean;
+  onClickHandler: (handlerId: string, parentEventId: string, runId: string | null) => void;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const nodeRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isHighlighted && nodeRef.current) {
+      nodeRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [isHighlighted]);
+
+  const handleClick = useCallback(() => {
+    const runId = children[0]?.runId ?? null;
+    onClickHandler(handlerId, parentEventId, runId);
+  }, [onClickHandler, parentEventId, handlerId, children]);
+
+  return (
+    <div className={depth > 0 ? "pl-6" : ""}>
+      <div
+        ref={isHighlighted ? nodeRef : undefined}
+        className={`group/tree w-full text-left px-2 py-1 rounded transition-colors hover:bg-accent/30 ${
+          isHighlighted ? "bg-zinc-700/40 ring-1 ring-zinc-500/50" : ""
+        }`}
+      >
+        <div className="flex items-center gap-1.5 min-w-0">
+          <button
+            onClick={(e) => { e.stopPropagation(); setCollapsed(v => !v); }}
+            className="text-[10px] text-muted-foreground hover:text-foreground shrink-0 w-3 text-center"
+          >
+            {collapsed ? "\u25b8" : "\u25be"}
+          </button>
+          <button
+            onClick={handleClick}
+            className="flex items-center gap-1.5 min-w-0"
+          >
+            <span className="px-1 py-0.5 rounded text-[10px] font-medium shrink-0 bg-zinc-600/30 text-zinc-400 italic">
+              handler
+            </span>
+            <span className="text-[10px] font-mono text-zinc-300 shrink-0">
+              {handlerId}
+            </span>
+            {collapsed && (
+              <span className="text-[10px] text-muted-foreground shrink-0">
+                ({children.length})
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {!collapsed && children.map((child) => (
+        <TreeNode
+          key={child.seq}
+          event={child}
+          childrenMap={childrenMap}
+          depth={depth + 1}
+          onClickHandler={onClickHandler}
+        />
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TreeNode (recursive)
+// ---------------------------------------------------------------------------
+
+function TreeNode({
+  event,
+  childrenMap,
+  depth,
+  onClickHandler,
+  onInvestigate,
+}: {
+  event: AdminEvent;
+  childrenMap: Map<string, AdminEvent[]>;
+  depth: number;
+  onClickHandler: (handlerId: string, parentEventId: string, runId: string | null) => void;
+  onInvestigate?: (event: AdminEvent) => void;
+}) {
+  const selectedSeq = useSelector<AdminState, number | null>((s) => s.selectedSeq);
+  const flowSelection = useSelector<AdminState, FlowSelection>((s) => s.flowSelection);
+  const dispatch = useDispatch<AdminMachineEvent>();
+
+  const [payloadOpen, setPayloadOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const isSelected = event.seq === selectedSeq;
+  const layerColor = LAYER_COLORS[event.layer] ?? "bg-zinc-500/20 text-zinc-400";
+  const children = event.id ? (childrenMap.get(event.id) ?? []) : [];
+  const hasChildren = children.length > 0;
+  const nodeRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isSelected && nodeRef.current) {
+      nodeRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [isSelected]);
+
+  // Group children by handler_id
+  const { handlerGroups, directChildren } = useMemo(() => {
+    const groups = new Map<string, AdminEvent[]>();
+    const direct: AdminEvent[] = [];
+    for (const child of children) {
+      if (child.handlerId) {
+        const group = groups.get(child.handlerId) ?? [];
+        group.push(child);
+        groups.set(child.handlerId, group);
+      } else {
+        direct.push(child);
+      }
+    }
+    return { handlerGroups: groups, directChildren: direct };
+  }, [children]);
+
+  const highlightedHandlerId = flowSelection?.kind === "handler" ? flowSelection.handlerId : null;
+
+  return (
+    <div className={depth > 0 ? "pl-6" : ""}>
+      <div
+        ref={isSelected ? nodeRef : undefined}
+        onClick={() => {
+          dispatch({ type: "ui/event_selected", payload: { seq: event.seq } });
+          if (event.runId) {
+            dispatch({ type: "ui/flow_opened", payload: { runId: event.runId } });
+          }
+        }}
+        className={`group/tree w-full text-left px-2 py-1.5 rounded transition-colors cursor-pointer hover:bg-accent/30 ${
+          isSelected ? "bg-accent/50 ring-1 ring-blue-500/50" : ""
+        }`}
+      >
+        <div className="flex items-center gap-1.5 min-w-0">
+          {hasChildren ? (
+            <button
+              onClick={(e) => { e.stopPropagation(); setCollapsed((v) => !v); }}
+              className="text-[10px] text-muted-foreground hover:text-foreground shrink-0 w-3 text-center"
+            >
+              {collapsed ? "\u25b8" : "\u25be"}
+            </button>
+          ) : (
+            <span className="w-3 shrink-0" />
+          )}
+          <span className={`px-1 py-0.5 rounded text-[10px] font-medium shrink-0 ${layerColor}`}>
+            {event.layer}
+          </span>
+          <span className="text-[10px] font-mono shrink-0" style={{ color: eventTextColor(event.name) }}>
+            {event.name}
+          </span>
+          {collapsed && hasChildren && (
+            <span className="text-[10px] text-muted-foreground shrink-0">
+              ({children.length})
+            </span>
+          )}
+          <span className="text-[10px] text-muted-foreground shrink-0">
+            {formatTs(event.ts)}
+          </span>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              const json = buildTreeJson([event], childrenMap);
+              const text = JSON.stringify(json[0], null, 2);
+              copyToClipboard(text);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            }}
+            className="opacity-0 group-hover/tree:opacity-100 transition-opacity ml-auto p-0.5 rounded hover:bg-accent shrink-0 text-[10px] text-muted-foreground"
+            title="Copy subtree as JSON"
+          >
+            {copied ? "ok" : "cp"}
+          </button>
+          {onInvestigate && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onInvestigate(event); }}
+              className="opacity-0 group-hover/tree:opacity-100 transition-opacity p-0.5 rounded hover:bg-accent shrink-0 text-[10px] text-muted-foreground"
+              title="Investigate"
+            >
+              ?
+            </button>
+          )}
+        </div>
+        <button
+          onClick={(e) => { e.stopPropagation(); setPayloadOpen((v) => !v); }}
+          className="mt-0.5 ml-3 text-[10px] font-mono text-muted-foreground hover:text-foreground truncate text-left max-w-full block"
+          title="Click to expand payload"
+        >
+          {event.summary ?? compactPayload(event.payload)}
+        </button>
+        {payloadOpen && (
+          <CopyablePayload payload={event.payload} className="mt-1 ml-3 max-h-48" />
+        )}
+      </div>
+
+      {!collapsed && (
+        <>
+          {directChildren.map((child) => (
+            <TreeNode
+              key={child.seq}
+              event={child}
+              childrenMap={childrenMap}
+              depth={depth + 1}
+              onClickHandler={onClickHandler}
+              onInvestigate={onInvestigate}
+            />
+          ))}
+          {[...handlerGroups.entries()].map(([hid, group]) => (
+            <HandlerNode
+              key={hid}
+              handlerId={hid}
+              parentEventId={event.id!}
+              children={group}
+              childrenMap={childrenMap}
+              depth={depth + 1}
+              isHighlighted={hid === highlightedHandlerId}
+              onClickHandler={onClickHandler}
+            />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// matchesFlowSelection
+// ---------------------------------------------------------------------------
+
+function matchesFlowSelection(event: AdminEvent, sel: FlowSelection): boolean {
+  if (!sel) return true;
+  if (sel.kind === "event-type")
+    return event.handlerId === sel.handlerId && event.name === sel.name;
+  return event.handlerId === sel.handlerId;
+}
+
+// ---------------------------------------------------------------------------
+// CausalTreePane
+// ---------------------------------------------------------------------------
+
+export type CausalTreePaneProps = {
+  onInvestigate?: (event: AdminEvent) => void;
+};
+
+export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
+  const causalTree = useSelector<AdminState, AdminState["causalTree"]>((s) => s.causalTree);
+  const selectedSeq = useSelector<AdminState, number | null>((s) => s.selectedSeq);
+  const flowSelection = useSelector<AdminState, FlowSelection>((s) => s.flowSelection);
+  const flowRunId = useSelector<AdminState, string | null>((s) => s.flowRunId);
+  const dispatch = useDispatch<AdminMachineEvent>();
+
+  const treeEvents = causalTree?.events ?? null;
+  const treeLoading = selectedSeq != null && causalTree == null;
+
+  const onClickHandler = useCallback(
+    (handlerId: string, parentEventId: string, runId: string | null) => {
+      if (flowRunId) {
+        dispatch({ type: "ui/flow_node_selected", payload: { kind: "handler", handlerId } });
+      }
+      dispatch({
+        type: "ui/logs_filter_changed",
+        payload: { eventId: parentEventId, handlerId, runId, scope: "handler" },
+      });
+    },
+    [flowRunId, dispatch]
+  );
+
+  const { roots, childrenMap, totalCount, filteredCount } = useMemo(() => {
+    if (!treeEvents || treeEvents.length === 0)
+      return { roots: [] as AdminEvent[], childrenMap: new Map<string, AdminEvent[]>(), totalCount: 0, filteredCount: 0 };
+
+    const total = treeEvents.length;
+
+    const events = (flowRunId && flowSelection)
+      ? treeEvents.filter(e => matchesFlowSelection(e, flowSelection))
+      : treeEvents;
+
+    const idSet = new Set(events.map(e => e.id).filter(Boolean));
+    const cMap = new Map<string, AdminEvent[]>();
+    const rootList: AdminEvent[] = [];
+
+    for (const evt of events) {
+      if (evt.parentId == null || !idSet.has(evt.parentId)) {
+        rootList.push(evt);
+      } else {
+        const siblings = cMap.get(evt.parentId) ?? [];
+        siblings.push(evt);
+        cMap.set(evt.parentId, siblings);
+      }
+    }
+
+    rootList.sort((a, b) => a.seq - b.seq);
+    const filtered = rootList.length + [...cMap.values()].reduce((s, a) => s + a.length, 0);
+    return { roots: rootList, childrenMap: cMap, totalCount: total, filteredCount: filtered };
+  }, [treeEvents, flowRunId, flowSelection]);
+
+  if (treeLoading) {
+    return (
+      <div className="p-3 space-y-1.5 animate-pulse">
+        <div className="h-3 w-32 bg-muted rounded mb-3" />
+        <div className="flex items-center gap-1.5">
+          <div className="h-4 w-12 bg-muted rounded" />
+          <div className="h-4 w-36 bg-muted rounded" />
+          <div className="h-3 w-24 bg-muted rounded" />
+        </div>
+        <div className="pl-6 space-y-1.5">
+          <div className="flex items-center gap-1.5">
+            <div className="h-4 w-14 bg-muted rounded" />
+            <div className="h-4 w-44 bg-muted rounded" />
+            <div className="h-3 w-24 bg-muted rounded" />
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="h-4 w-10 bg-muted rounded" />
+            <div className="h-4 w-32 bg-muted rounded" />
+            <div className="h-3 w-24 bg-muted rounded" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!treeEvents) {
+    return (
+      <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
+        Select an event to view its causal tree
+      </div>
+    );
+  }
+
+  if (roots.length === 0 && flowSelection) {
+    return (
+      <div className="h-full overflow-y-auto p-3">
+        <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
+          <span>
+            {flowSelection.kind === "event-type"
+              ? `${flowSelection.name} from ${flowSelection.handlerId ?? "root"}`
+              : `outputs of ${flowSelection.handlerId}`}
+          </span>
+          <button
+            onClick={() => dispatch({ type: "ui/flow_node_selected", payload: null })}
+            className="ml-auto hover:text-foreground"
+          >
+            x
+          </button>
+        </div>
+        <div className="flex items-center justify-center h-32 text-sm text-muted-foreground">
+          No events match the current filter
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full overflow-y-auto p-3">
+      {flowSelection && (
+        <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
+          <span>
+            {flowSelection.kind === "event-type"
+              ? `${flowSelection.name} from ${flowSelection.handlerId ?? "root"}`
+              : `outputs of ${flowSelection.handlerId}`}
+          </span>
+          <button
+            onClick={() => dispatch({ type: "ui/flow_node_selected", payload: null })}
+            className="ml-auto hover:text-foreground"
+          >
+            x
+          </button>
+        </div>
+      )}
+      <h3 className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wider">
+        Causal Tree ({flowSelection ? `${filteredCount} of ${totalCount}` : totalCount} events)
+      </h3>
+      {roots.map(root => (
+        <TreeNode
+          key={root.seq}
+          event={root}
+          childrenMap={childrenMap}
+          depth={0}
+          onClickHandler={onClickHandler}
+          onInvestigate={onInvestigate}
+        />
+      ))}
+    </div>
+  );
+}
