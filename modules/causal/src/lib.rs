@@ -120,7 +120,7 @@ pub use types::{
     EmittedEvent, EventWorkerConfig, HandlerCompletion,
     HandlerDlq, HandlerIntent, HandlerResolution, HandlerWorkerConfig,
     JournalEntry, LogEntry, LogLevel, ProjectionFailure, QueuedHandler,
-    NAMESPACE_SEESAW,
+    NAMESPACE_CAUSAL,
 };
 
 // Top-level builder functions

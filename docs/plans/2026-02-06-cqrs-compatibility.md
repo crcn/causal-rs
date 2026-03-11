@@ -102,7 +102,7 @@ Causal's Role:
        │                       │
        ▼                       ▼
 ┌─────────────────────────────────────┐
-│            SEESAW                   │
+│            CAUSAL                   │
 │  ┌──────────────────────────────┐  │
 │  │      Event Store             │  │
 │  │  (causal_events table)       │  │

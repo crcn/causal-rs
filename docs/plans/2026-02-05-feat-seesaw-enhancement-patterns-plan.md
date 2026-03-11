@@ -431,7 +431,7 @@ effect::on::<InventoryReserved>().then(|event, ctx| async move {
 │ Causal Instance │──┐
 │  (us-east-1a)   │  │
 └─────────────────┘  │
-                     ├──> NATS JetStream ──> Stream: SEESAW_EVENTS
+                     ├──> NATS JetStream ──> Stream: CAUSAL_EVENTS
 ┌─────────────────┐  │
 │ Causal Instance │──┘
 │  (us-west-2b)   │
@@ -464,7 +464,7 @@ impl DistributedCausalRuntime {
 
         // Ensure stream exists
         let stream = jetstream.get_or_create_stream(jetstream::stream::Config {
-            name: "SEESAW_EVENTS".to_string(),
+            name: "CAUSAL_EVENTS".to_string(),
             subjects: vec!["events.>".to_string()],
             retention: jetstream::stream::RetentionPolicy::WorkQueue,
             ..Default::default()

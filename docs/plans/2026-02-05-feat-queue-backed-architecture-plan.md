@@ -1199,7 +1199,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
             correlation_id: correlation_id,
             event_id: pending.event_id,
             idempotency_key: Uuid::new_v5(
-                &NAMESPACE_SEESAW,
+                &NAMESPACE_CAUSAL,
                 format!("{}-{}", pending.event_id, pending.effect_id).as_bytes()
             ).to_string(),
         };
@@ -1218,7 +1218,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
 
                 // Generate deterministic event_id
                 let next_event_id = Uuid::new_v5(
-                    &NAMESPACE_SEESAW,
+                    &NAMESPACE_CAUSAL,
                     format!("{}-{}-{}", pending.event_id, pending.effect_id,
                             std::any::type_name_of_val(&next_event)).as_bytes()
                 );
@@ -1635,14 +1635,14 @@ struct EffectContext {
 use uuid::Uuid;
 
 // Define custom namespace (prevents collisions with other systems)
-pub const NAMESPACE_SEESAW: Uuid = Uuid::from_bytes([
+pub const NAMESPACE_CAUSAL: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
     0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
 // In EffectContext construction:
 let idempotency_key = Uuid::new_v5(
-    &NAMESPACE_SEESAW,  // ← Custom namespace, not NAMESPACE_OID
+    &NAMESPACE_CAUSAL,  // ← Custom namespace, not NAMESPACE_OID
     format!("{}-{}", queued.event_id, effect.id).as_bytes()
 ).to_string();
 

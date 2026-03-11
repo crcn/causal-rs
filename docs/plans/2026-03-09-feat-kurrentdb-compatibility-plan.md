@@ -193,7 +193,7 @@ it uses `durable_name`:
 ```rust
 // engine.rs build_new_events
 let seed = format!("{}-{}{}-{}-{}", event_id, handler_id, id_infix, e.durable_name, idx);
-let new_event_id = Uuid::new_v5(&NAMESPACE_SEESAW, seed.as_bytes());
+let new_event_id = Uuid::new_v5(&NAMESPACE_CAUSAL, seed.as_bytes());
 ```
 
 This produces different IDs than before — acceptable on a clean slate with no

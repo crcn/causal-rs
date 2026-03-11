@@ -689,7 +689,7 @@ impl WorkerConfig {
         }
 
         builder = builder.add_source(
-            config::Environment::with_prefix("SEESAW")
+            config::Environment::with_prefix("CAUSAL")
                 .separator("__")
         );
 

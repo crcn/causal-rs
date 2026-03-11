@@ -42,7 +42,7 @@ pub struct LogEntry {
 /// UUID v5 namespace for deterministic event ID generation
 /// Used to prevent duplicate events on crash+retry
 /// This is a custom namespace UUID (derived from URL namespace)
-pub const NAMESPACE_SEESAW: Uuid = Uuid::from_u128(0x6ba7b8109dad11d180b400c04fd430c8);
+pub const NAMESPACE_CAUSAL: Uuid = Uuid::from_u128(0x6ba7b8109dad11d180b400c04fd430c8);
 
 /// Event emitted by a handler (for atomic insertion)
 #[derive(Debug, Clone)]

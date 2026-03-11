@@ -21,7 +21,7 @@ use crate::process::{EmitFuture, ProcessHandle};
 use crate::types::{
     EmittedEvent, EventWorkerConfig, HandlerCompletion, HandlerDlq,
     HandlerResolution, HandlerWorkerConfig, IntentCommit, NewEvent, PersistedEvent,
-    QueuedHandler, Snapshot, NAMESPACE_SEESAW,
+    QueuedHandler, Snapshot, NAMESPACE_CAUSAL,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
 
@@ -1088,7 +1088,7 @@ where
             .enumerate()
             .map(|(idx, e)| {
                 let new_event_id = Uuid::new_v5(
-                    &NAMESPACE_SEESAW,
+                    &NAMESPACE_CAUSAL,
                     format!(
                         "{}-{}{}-{}-{}",
                         event_id, handler_id, id_infix, e.durable_name, idx

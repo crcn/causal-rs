@@ -16,7 +16,7 @@ use crate::handler_queue::HandlerQueue;
 use crate::handler_registry::HandlerRegistry;
 use crate::types::{
     EmittedEvent, EventWorkerConfig, HandlerIntent, HandlerWorkerConfig,
-    IntentCommit, PersistedEvent, ProjectionFailure, QueuedHandler, NAMESPACE_SEESAW,
+    IntentCommit, PersistedEvent, ProjectionFailure, QueuedHandler, NAMESPACE_CAUSAL,
 };
 use crate::upcaster::UpcasterRegistry;
 
@@ -175,7 +175,7 @@ where
                 type_id: event_type_id,
             };
             let idempotency_key = Uuid::new_v5(
-                &NAMESPACE_SEESAW,
+                &NAMESPACE_CAUSAL,
                 format!("{}-{}", event.event_id, projection.id).as_bytes(),
             )
             .to_string();
@@ -261,7 +261,7 @@ where
             self.decode_event(&execution.event_type, &execution.event_payload, execution.ephemeral.as_ref())?;
 
         let idempotency_key = Uuid::new_v5(
-            &NAMESPACE_SEESAW,
+            &NAMESPACE_CAUSAL,
             format!("{}-{}", execution.event_id, execution.handler_id).as_bytes(),
         )
         .to_string();
