@@ -3,6 +3,7 @@ name = "causal_utils"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Utility patterns for causal-based applications — batching, dataloader, and more"
 
 [dependencies]

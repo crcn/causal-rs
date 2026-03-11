@@ -3,6 +3,7 @@ name = "causal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "A deterministic, event-driven coordination layer where machines decide, effects execute, and transactions define authority"
 
 [features]

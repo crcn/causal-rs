@@ -3,6 +3,7 @@ name = "causal_replay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Replay and projection library for causal event processing"
 readme = "README.md"
 

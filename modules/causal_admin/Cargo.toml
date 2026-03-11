@@ -3,6 +3,7 @@ name = "causal_admin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 description = "Admin UI backend for causal event-driven applications"
 
