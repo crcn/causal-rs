@@ -595,13 +595,13 @@ All 5 `build_*_engine` functions in `engine.rs` change signature:
 
 ```rust
 // Before
-pub fn build_engine(deps: ScoutEngineDeps, causal_store: Option<Arc<dyn causal_core::Store>>)
+pub fn build_engine(deps: ScoutEngineDeps, causal_store: Option<Arc<dyn causal::Store>>)
 
 // After
 pub fn build_engine(
     deps: ScoutEngineDeps,
-    log: Option<Arc<dyn causal_core::EventLog>>,
-    queue: Option<Arc<dyn causal_core::HandlerQueue>>,
+    log: Option<Arc<dyn causal::EventLog>>,
+    queue: Option<Arc<dyn causal::HandlerQueue>>,
 )
 ```
 
@@ -612,10 +612,10 @@ When `None`, use `Engine::in_memory(deps)`.
 
 ```rust
 // Before
-fn make_store(&self, run_id: Uuid) -> Option<Arc<dyn causal_core::Store>>
+fn make_store(&self, run_id: Uuid) -> Option<Arc<dyn causal::Store>>
 
 // After
-fn make_store(&self, run_id: Uuid) -> (Arc<dyn causal_core::EventLog>, Arc<dyn causal_core::HandlerQueue>) {
+fn make_store(&self, run_id: Uuid) -> (Arc<dyn causal::EventLog>, Arc<dyn causal::HandlerQueue>) {
     let log = Arc::new(PostgresEventLog::new(self.pg_pool.clone(), run_id));
     let queue = Arc::new(PostgresHandlerQueue::new(self.pg_pool.clone(), run_id));
     (log, queue)

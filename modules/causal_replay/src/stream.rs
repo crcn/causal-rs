@@ -5,8 +5,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use causal_core::event_log::EventLog;
-use causal_core::types::PersistedEvent;
+use causal::event_log::EventLog;
+use causal::types::PersistedEvent;
 
 use crate::pointer::PointerStore;
 use crate::tail::{PollTailSource, TailSource};

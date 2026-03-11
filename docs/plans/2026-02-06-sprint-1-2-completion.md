@@ -94,7 +94,7 @@ async fn handler(...) { }
 
 **Example usage:**
 ```rust
-use causal_core::DistributedSafe;
+use causal::DistributedSafe;
 
 #[derive(Clone, DistributedSafe)]
 struct Deps {
@@ -176,7 +176,7 @@ struct Deps {
 $ cargo check -p causal_core_macros
     Finished `dev` profile in 0.22s
 
-$ cargo check -p causal_core
+$ cargo check -p causal
     Finished `dev` profile in 1.67s (with expected feature warnings)
 ```
 

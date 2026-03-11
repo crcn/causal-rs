@@ -3,7 +3,7 @@ name = "causal_core_macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Procedural macros for causal_core"
+description = "Procedural macros for causal"
 
 [lib]
 proc-macro = true

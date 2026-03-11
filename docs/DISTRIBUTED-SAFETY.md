@@ -9,7 +9,7 @@ This guide explains how to write Causal handlers that are safe for multi-worker 
 ### ✅ Safe Pattern
 
 ```rust
-use causal_core::{Engine, DistributedSafe};
+use causal::{Engine, DistributedSafe};
 use sqlx::PgPool;
 
 // Safe for distributed workers

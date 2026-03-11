@@ -5,7 +5,7 @@
 ### BEFORE (Orchestration)
 
 ```rust
-use causal_core::{handler, Context, Engine};
+use causal::{handler, Context, Engine};
 use causal_postgres::PostgresBackend;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

@@ -1,6 +1,6 @@
 # causal_replay
 
-Replay and projection library for [causal](https://crates.io/crates/causal_core) event processing.
+Replay and projection library for [causal](https://crates.io/crates/causal) event processing.
 
 Replay is a lifecycle state of the application, not an external tool. Same `apply()` function runs in both live and replay mode.
 

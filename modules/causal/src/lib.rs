@@ -30,7 +30,7 @@
 //! engine.emit(UserCreated { name: "Alice".into() }).settled().await?;
 //! ```
 
-extern crate self as causal_core;
+extern crate self as causal;
 
 // Module structure
 pub mod aggregator;

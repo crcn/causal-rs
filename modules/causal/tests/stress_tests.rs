@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use causal_core::{event, events, handler, project, Aggregate, AnyEvent, Apply, Context, Engine, Events};
+use causal::{event, events, handler, project, Aggregate, AnyEvent, Apply, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -978,7 +978,7 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
             handler::on::<FailEvent>()
                 .id("fail_with_info")
                 .retry(2)
-                .on_failure(|_event: Arc<FailEvent>, info: causal_core::ErrorContext| {
+                .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
                     FailedTerminal {
                         error: info.error,
                         attempts: info.attempts,
@@ -1047,7 +1047,7 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
         .with_handler(
             handler::on_any()
                 .id("logger")
-                .then(move |event: causal_core::handler::AnyEvent, _ctx: Context<Deps>| {
+                .then(move |event: causal::handler::AnyEvent, _ctx: Context<Deps>| {
                     let st = st.clone();
                     async move {
                         let type_name = if event.is::<Ping>() {
@@ -1105,7 +1105,7 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
         .with_handler(
             handler::on_any()
                 .id("emitter")
-                .then(|event: causal_core::handler::AnyEvent, _ctx: Context<Deps>| async move {
+                .then(|event: causal::handler::AnyEvent, _ctx: Context<Deps>| async move {
                     if event.is::<Ping>() {
                         Ok(events![EventB { value: 42 }])
                     } else {

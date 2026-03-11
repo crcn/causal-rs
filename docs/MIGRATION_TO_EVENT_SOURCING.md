@@ -2,7 +2,7 @@
 
 ## Phase 1: Core Traits (1-2 days)
 
-### 1.1 Add `Aggregate` trait to `causal_core`
+### 1.1 Add `Aggregate` trait to `causal`
 
 **File:** `crates/causal/src/aggregate.rs`
 
@@ -267,7 +267,7 @@ CREATE TABLE causal_snapshots (
 **File:** `crates/causal-postgres/src/event_store.rs`
 
 ```rust
-use causal_core::{EventStore, StoredEvent};
+use causal::{EventStore, StoredEvent};
 use sqlx::PgPool;
 
 #[derive(Clone)]

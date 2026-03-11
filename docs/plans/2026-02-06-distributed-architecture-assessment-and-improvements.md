@@ -357,7 +357,7 @@ fn effect_requires_background(args: &EffectArgs) -> bool {
 **Design:** Sealed trait + derive macro + unsafe opt-out
 
 ```rust
-// In causal_core/src/distributed_safe.rs
+// In causal/src/distributed_safe.rs
 
 mod sealed {
     pub trait Sealed {}
@@ -402,8 +402,8 @@ pub fn derive_distributed_safe(input: TokenStream) -> TokenStream {
 
     // Generate impl
     quote! {
-        impl ::causal_core::sealed::Sealed for #name {}
-        impl ::causal_core::DistributedSafe for #name {}
+        impl ::causal::sealed::Sealed for #name {}
+        impl ::causal::DistributedSafe for #name {}
     }.into()
 }
 ```

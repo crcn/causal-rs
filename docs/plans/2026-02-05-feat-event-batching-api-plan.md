@@ -620,7 +620,7 @@ effect::on::<FetchCompleted>()
 
 ### Commands Run
 
-- `RUSTC_WRAPPER= cargo test -p causal_core -p causal-memory`
+- `RUSTC_WRAPPER= cargo test -p causal -p causal-memory`
 - `RUSTC_WRAPPER= cargo test -p causal-postgres --no-run`
 - `RUSTC_WRAPPER= cargo test -p causal-postgres test_workflow_subscription_coalesced_notify_stress_drains_all_events -- --nocapture` (requires Docker; failed in this environment due Docker connection)
 

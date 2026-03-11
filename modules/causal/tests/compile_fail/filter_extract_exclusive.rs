@@ -1,12 +1,12 @@
 use anyhow::Result;
-use causal_core::{handler, Context};
+use causal::{handler, Context};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct Deps;
 
-#[causal_core::event]
+#[causal::event]
 #[derive(Clone, Serialize, Deserialize)]
 struct MyEvent {
     id: Uuid,

@@ -194,11 +194,11 @@ struct ParamInfo {
 /// Generate the expression that converts `__result` into `Events`.
 fn result_to_events(kind: &ReturnKind) -> TokenStream2 {
     match kind {
-        ReturnKind::Unit => quote! { ::causal_core::Events::new() },
+        ReturnKind::Unit => quote! { ::causal::Events::new() },
         ReturnKind::Events => quote! { __result },
-        ReturnKind::Emit => quote! { ::causal_core::IntoEvents::into_events(__result) },
+        ReturnKind::Emit => quote! { ::causal::IntoEvents::into_events(__result) },
         ReturnKind::SingleEvent => quote! { {
-            let mut __ev = ::causal_core::Events::new();
+            let mut __ev = ::causal::Events::new();
             __ev.push(__result);
             __ev
         } },
@@ -292,7 +292,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         }
 
         let event_ident = &non_ctx_params[0].ident;
-        let input_builder = quote! { ::causal_core::on_any() };
+        let input_builder = quote! { ::causal::on_any() };
         let builder = apply_on_any_config(input_builder, &args, &fn_ident);
 
         let chain = quote! {
@@ -307,7 +307,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             #input_fn
 
             #[doc(hidden)]
-            pub fn #wrapper_ident() -> ::causal_core::Handler<#deps_ty> {
+            pub fn #wrapper_ident() -> ::causal::Handler<#deps_ty> {
                 #chain
             }
         });
@@ -335,7 +335,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         .filter_map(|(idx, param)| if idx == ctx_idx { None } else { Some(param) })
         .collect();
 
-    let input_builder = quote! { ::causal_core::on::<#on_event_type>() };
+    let input_builder = quote! { ::causal::on::<#on_event_type>() };
     let builder = apply_effect_config(input_builder, &args, &fn_ident);
 
     // Validate aggregate/transition pairing
@@ -509,7 +509,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             // so use closure param type annotations instead of turbofish.
             quote! {
                 #builder
-                    .then(|#event_ident: ::std::sync::Arc<#on_event_type>, __causal_ctx: ::causal_core::Context<#deps_ty>| async move {
+                    .then(|#event_ident: ::std::sync::Arc<#on_event_type>, __causal_ctx: ::causal::Context<#deps_ty>| async move {
                         let __result = #fn_ident((#event_ident).as_ref().clone(), __causal_ctx).await?;
                         Ok(#convert_result)
                     })
@@ -529,7 +529,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         #input_fn
 
         #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::causal_core::Handler<#deps_ty> {
+        pub fn #wrapper_ident() -> ::causal::Handler<#deps_ty> {
             #chain
         }
     })
@@ -640,16 +640,16 @@ fn expand_multi_type_effect(
                 per_type_args.id = Some(format!("{}::{}", fn_ident, type_suffix));
             }
 
-            let base_builder = quote! { ::causal_core::on::<#event_type>() };
+            let base_builder = quote! { ::causal::on::<#event_type>() };
             let builder = apply_effect_config(base_builder, &per_type_args, fn_ident);
 
             if let Some(filter_fn) = &args.filter {
                 // Filter takes only &Context<D> — wrap it for the typed filter signature
                 quote! {
                     #builder
-                        .filter(|_: &#event_type, __causal_ctx: &::causal_core::Context<#deps_ty>| #filter_fn(__causal_ctx))
-                        .then(|#event_ident: ::std::sync::Arc<#event_type>, __causal_ctx: ::causal_core::Context<#deps_ty>| async move {
-                            let #event_ident = ::causal_core::AnyEvent {
+                        .filter(|_: &#event_type, __causal_ctx: &::causal::Context<#deps_ty>| #filter_fn(__causal_ctx))
+                        .then(|#event_ident: ::std::sync::Arc<#event_type>, __causal_ctx: ::causal::Context<#deps_ty>| async move {
+                            let #event_ident = ::causal::AnyEvent {
                                 value: #event_ident as ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>,
                                 type_id: ::std::any::TypeId::of::<#event_type>(),
                             };
@@ -661,7 +661,7 @@ fn expand_multi_type_effect(
                 quote! {
                     #builder
                         .then::<#deps_ty, ::std::sync::Arc<#event_type>, _, _>(|#event_ident, __causal_ctx| async move {
-                            let #event_ident = ::causal_core::AnyEvent {
+                            let #event_ident = ::causal::AnyEvent {
                                 value: #event_ident as ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>,
                                 type_id: ::std::any::TypeId::of::<#event_type>(),
                             };
@@ -677,7 +677,7 @@ fn expand_multi_type_effect(
         #input_fn
 
         #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::std::vec::Vec<::causal_core::Handler<#deps_ty>> {
+        pub fn #wrapper_ident() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
             ::std::vec![#(#handler_exprs),*]
         }
     })
@@ -788,13 +788,13 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     let deps_ty = deps_ty.expect("checked above");
     let handles_fn: ItemFn = if multi_wrappers.is_empty() {
         parse_quote! {
-            pub fn handles() -> ::std::vec::Vec<::causal_core::Handler<#deps_ty>> {
+            pub fn handles() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
                 ::std::vec![#(#wrappers()),*]
             }
         }
     } else {
         parse_quote! {
-            pub fn handles() -> ::std::vec::Vec<::causal_core::Handler<#deps_ty>> {
+            pub fn handles() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
                 let mut __h = ::std::vec![#(#wrappers()),*];
                 #(__h.extend(#multi_wrappers());)*
                 __h
@@ -802,7 +802,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         }
     };
     let handlers_fn: ItemFn = parse_quote! {
-        pub fn handlers() -> ::std::vec::Vec<::causal_core::Handler<#deps_ty>> {
+        pub fn handlers() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
             handles()
         }
     };
@@ -811,7 +811,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
 
     if !projection_wrappers.is_empty() {
         let projections_fn: ItemFn = parse_quote! {
-            pub fn projections() -> ::std::vec::Vec<::causal_core::Projection<#deps_ty>> {
+            pub fn projections() -> ::std::vec::Vec<::causal::Projection<#deps_ty>> {
                 ::std::vec![#(#projection_wrappers()),*]
             }
         };
@@ -1289,7 +1289,7 @@ fn expand_projection(
     let id_str = id.unwrap_or_else(|| fn_ident.to_string());
     let id_lit = syn::LitStr::new(&id_str, fn_ident.span());
 
-    let mut builder = quote! { ::causal_core::project(#id_lit) };
+    let mut builder = quote! { ::causal::project(#id_lit) };
 
     if let Some(p) = priority {
         builder = quote! { #builder .priority(#p) };
@@ -1305,7 +1305,7 @@ fn expand_projection(
         #input_fn
 
         #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::causal_core::Projection<#deps_ty> {
+        pub fn #wrapper_ident() -> ::causal::Projection<#deps_ty> {
             #chain
         }
     })
@@ -1467,7 +1467,7 @@ mod tests {
         };
         let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
         let configured = apply_effect_config(
-            quote!(::causal_core::on::<MyEvent>()),
+            quote!(::causal::on::<MyEvent>()),
             &args,
             &handler_ident,
         );
@@ -1515,7 +1515,7 @@ mod tests {
         };
         let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
         let configured = apply_effect_config(
-            quote!(::causal_core::on::<MyEvent>()),
+            quote!(::causal::on::<MyEvent>()),
             &args,
             &handler_ident,
         );
@@ -1567,7 +1567,7 @@ mod tests {
 /// # Example
 ///
 /// ```rust,ignore
-/// use causal_core::DistributedSafe;
+/// use causal::DistributedSafe;
 ///
 /// #[derive(Clone, DistributedSafe)]
 /// struct Deps {
@@ -1623,9 +1623,9 @@ fn derive_distributed_safe_impl(input: DeriveInput) -> syn::Result<TokenStream2>
     }
 
     Ok(quote! {
-        impl #impl_generics ::causal_core::distributed_safe::sealed::Sealed for #name #ty_generics #where_clause {}
+        impl #impl_generics ::causal::distributed_safe::sealed::Sealed for #name #ty_generics #where_clause {}
 
-        impl #impl_generics ::causal_core::DistributedSafe for #name #ty_generics #where_clause {}
+        impl #impl_generics ::causal::DistributedSafe for #name #ty_generics #where_clause {}
     })
 }
 
@@ -1864,15 +1864,15 @@ fn expand_aggregator_with_id(
     };
 
     Ok(quote! {
-        impl ::causal_core::Apply<#event_ty> for #agg_ty {
+        impl ::causal::Apply<#event_ty> for #agg_ty {
             fn apply(&mut self, #event_ident: #event_ty) {
                 let #agg_ident = self;
                 #body
             }
         }
 
-        fn #factory_name() -> ::causal_core::Aggregator {
-            ::causal_core::Aggregator::new::<#event_ty, #agg_ty, _>(|e| #id_expr)
+        fn #factory_name() -> ::causal::Aggregator {
+            ::causal::Aggregator::new::<#event_ty, #agg_ty, _>(|e| #id_expr)
         }
     })
 }
@@ -1944,7 +1944,7 @@ fn expand_aggregators_module(
     });
 
     let aggregators_fn: ItemFn = parse_quote! {
-        pub fn aggregators() -> ::std::vec::Vec<::causal_core::Aggregator> {
+        pub fn aggregators() -> ::std::vec::Vec<::causal::Aggregator> {
             ::std::vec![#(#factory_names()),*]
         }
     };
@@ -1959,7 +1959,7 @@ fn expand_aggregators_module(
 
 // ── #[event] proc macro ─────────────────────────────────────────────
 
-/// Marks a type as a causal Event, generating a `causal_core::event::Event` impl.
+/// Marks a type as a causal Event, generating a `causal::event::Event` impl.
 ///
 /// # Usage
 ///
@@ -2112,7 +2112,7 @@ fn expand_event_enum(
     Ok(quote! {
         #input
 
-        impl ::causal_core::event::Event for #name {
+        impl ::causal::event::Event for #name {
             fn durable_name(&self) -> &str {
                 match self {
                     #(#match_arms,)*
@@ -2150,7 +2150,7 @@ fn expand_event_struct(
     Ok(quote! {
         #input
 
-        impl ::causal_core::event::Event for #name {
+        impl ::causal::event::Event for #name {
             fn durable_name(&self) -> &str {
                 #durable
             }

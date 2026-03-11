@@ -1,7 +1,7 @@
 //! AI Summarizer Example
 
 use anyhow::{bail, Result};
-use causal_core::{event, events, handler, Context, Engine};
+use causal::{event, events, handler, Context, Engine};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;

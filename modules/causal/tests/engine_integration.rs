@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use causal_core::aggregator::{Aggregate, Apply};
-use causal_core::{event, events, handler, Context, Engine, EventLog, Events, HandlerQueue, MemoryStore, NewEvent, Snapshot};
+use causal::aggregator::{Aggregate, Apply};
+use causal::{event, events, handler, Context, Engine, EventLog, Events, HandlerQueue, MemoryStore, NewEvent, Snapshot};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -301,7 +301,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
             handler::on::<FailEvent>()
                 .id("always_fail")
                 .retry(1)
-                .on_failure(|_event: Arc<FailEvent>, info: causal_core::ErrorContext| {
+                .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
                     FailedTerminal {
                         error: info.error,
                         attempts: info.attempts,
@@ -380,7 +380,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
             handler::on::<FailEvent>()
                 .id("always_fail_corr")
                 .retry(1)
-                .on_failure(|_event: Arc<FailEvent>, info: causal_core::ErrorContext| {
+                .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
                     FailedTerminal {
                         error: info.error,
                         attempts: info.attempts,
@@ -510,8 +510,8 @@ async fn upcaster_transforms_old_event_for_handler() -> Result<()> {
 
 #[tokio::test]
 async fn upcaster_chain_in_aggregate_replay() {
-    use causal_core::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
-    use causal_core::upcaster::{Upcaster, UpcasterRegistry};
+    use causal::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
+    use causal::upcaster::{Upcaster, UpcasterRegistry};
 
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
     struct Order {
@@ -1881,7 +1881,7 @@ async fn on_dlq_emits_event_on_handler_failure() -> Result<()> {
     let c = counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|info: causal_core::DlqTerminalInfo| HandlerDlq {
+        .on_dlq(|info: causal::DlqTerminalInfo| HandlerDlq {
             handler_id: info.handler_id,
             source_event_type: info.source_event_type,
             error: info.error,
@@ -1914,11 +1914,11 @@ async fn on_dlq_emits_event_on_handler_failure() -> Result<()> {
 
 #[tokio::test]
 async fn on_dlq_receives_correct_info() -> Result<()> {
-    let captured: Arc<Mutex<Option<causal_core::DlqTerminalInfo>>> = Arc::new(Mutex::new(None));
+    let captured: Arc<Mutex<Option<causal::DlqTerminalInfo>>> = Arc::new(Mutex::new(None));
     let cap = captured.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             *cap.lock() = Some(info.clone());
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -1957,14 +1957,14 @@ async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
     let gc = global_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|info: causal_core::DlqTerminalInfo| GlobalDlqEvent {
+        .on_dlq(|info: causal::DlqTerminalInfo| GlobalDlqEvent {
             error: info.error,
         })
         .with_handler(
             handler::on::<FailEvent>()
                 .id("has_on_failure")
                 .retry(1)
-                .on_failure(|_event: Arc<FailEvent>, info: causal_core::ErrorContext| {
+                .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
                     HandlerSpecificFailure { error: info.error }
                 })
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2003,7 +2003,7 @@ async fn on_dlq_fires_on_timeout() -> Result<()> {
     let cr = captured_reason.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             *cr.lock() = Some(info.reason.clone());
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2037,7 +2037,7 @@ async fn on_dlq_preserves_correlation_id() -> Result<()> {
     let sc = seen_correlation.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|info: causal_core::DlqTerminalInfo| HandlerDlq {
+        .on_dlq(|info: causal::DlqTerminalInfo| HandlerDlq {
             handler_id: info.handler_id,
             source_event_type: info.source_event_type,
             error: info.error,
@@ -2078,7 +2078,7 @@ async fn on_dlq_not_called_on_success() -> Result<()> {
     let c = counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             c.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2444,7 +2444,7 @@ async fn on_dlq_fires_on_anyhow_bail() -> Result<()> {
     let ce = captured_error.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             *ce.lock() = Some(info.error.clone());
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2487,7 +2487,7 @@ async fn on_dlq_fires_on_custom_error_type() -> Result<()> {
     let ce = captured_error.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             *ce.lock() = Some(info.error.clone());
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2561,7 +2561,7 @@ async fn on_dlq_fires_on_queued_handler_panic() -> Result<()> {
     let dc = dlq_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             dc.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2606,8 +2606,8 @@ async fn projection_error_does_not_stop_other_handlers() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_projection(
-            causal_core::project("failing_projection")
-                .then(|_event: causal_core::AnyEvent, _ctx: Context<Deps>| async move {
+            causal::project("failing_projection")
+                .then(|_event: causal::AnyEvent, _ctx: Context<Deps>| async move {
                     anyhow::bail!("projection failed");
                 }),
         )
@@ -2642,16 +2642,16 @@ async fn projection_error_recorded_as_projection_failure() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_projection(
-            causal_core::project("failing_projection")
+            causal::project("failing_projection")
                 .priority(1)
-                .then(|_event: causal_core::AnyEvent, _ctx: Context<Deps>| async move {
+                .then(|_event: causal::AnyEvent, _ctx: Context<Deps>| async move {
                     anyhow::bail!("projection error");
                 }),
         )
         .with_projection(
-            causal_core::project("passing_projection")
+            causal::project("passing_projection")
                 .priority(2)
-                .then(move |_event: causal_core::AnyEvent, _ctx: Context<Deps>| {
+                .then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
                     let spc = spc.clone();
                     async move {
                         spc.fetch_add(1, Ordering::SeqCst);
@@ -2674,7 +2674,7 @@ async fn projection_error_recorded_as_projection_failure() -> Result<()> {
 async fn on_dlq_mapper_error_does_not_crash_engine() -> Result<()> {
     // The on_dlq mapper itself panics — engine should still settle
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|_info: causal_core::DlqTerminalInfo| -> HandlerDlq {
+        .on_dlq(|_info: causal::DlqTerminalInfo| -> HandlerDlq {
             panic!("mapper panic");
         })
         .with_handler(
@@ -2705,7 +2705,7 @@ async fn on_dlq_fires_for_each_failing_handler() -> Result<()> {
     let dmc = dlq_mapper_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             dmc.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2752,7 +2752,7 @@ async fn on_failure_with_source_event_access() -> Result<()> {
             handler::on::<FailEvent>()
                 .id("source_access_handler")
                 .retry(1)
-                .on_failure(move |event: Arc<FailEvent>, info: causal_core::ErrorContext| {
+                .on_failure(move |event: Arc<FailEvent>, info: causal::ErrorContext| {
                     FailedTerminal {
                         error: format!("attempt={}, err={}", event.attempt, info.error),
                         attempts: info.attempts,
@@ -2789,7 +2789,7 @@ async fn on_dlq_not_fired_when_retry_succeeds() -> Result<()> {
     let ac = attempt_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             dc.fetch_add(1, Ordering::SeqCst);
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2833,11 +2833,11 @@ async fn on_dlq_not_fired_when_retry_succeeds() -> Result<()> {
 async fn on_dlq_fires_after_all_retries_exhausted() -> Result<()> {
     let attempt_counter = Arc::new(AtomicI32::new(0));
     let ac = attempt_counter.clone();
-    let captured_info: Arc<Mutex<Option<causal_core::DlqTerminalInfo>>> = Arc::new(Mutex::new(None));
+    let captured_info: Arc<Mutex<Option<causal::DlqTerminalInfo>>> = Arc::new(Mutex::new(None));
     let ci = captured_info.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(move |info: causal_core::DlqTerminalInfo| {
+        .on_dlq(move |info: causal::DlqTerminalInfo| {
             *ci.lock() = Some(info.clone());
             HandlerDlq {
                 handler_id: info.handler_id,
@@ -2891,7 +2891,7 @@ async fn on_dlq_event_handler_failure_does_not_cascade() -> Result<()> {
     }
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|info: causal_core::DlqTerminalInfo| DlqFailEvent {
+        .on_dlq(|info: causal::DlqTerminalInfo| DlqFailEvent {
             error: info.error,
         })
         .with_handler(
@@ -3251,7 +3251,7 @@ async fn ephemeral_preserved_in_batch_fanout() -> Result<()> {
 /// on_any handler receives the ephemeral via downcast.
 #[tokio::test]
 async fn ephemeral_available_via_on_any_handler() -> Result<()> {
-    use causal_core::handler::AnyEvent;
+    use causal::handler::AnyEvent;
 
     let received_len = Arc::new(AtomicUsize::new(0));
     let received_clone = received_len.clone();
@@ -3285,7 +3285,7 @@ async fn ephemeral_available_via_on_any_handler() -> Result<()> {
 /// Projection (inline observer) also sees the ephemeral via AnyEvent downcast.
 #[tokio::test]
 async fn ephemeral_available_in_projection() -> Result<()> {
-    use causal_core::handler::{project, AnyEvent};
+    use causal::handler::{project, AnyEvent};
 
     let projection_len = Arc::new(AtomicUsize::new(0));
     let projection_clone = projection_len.clone();
@@ -3318,7 +3318,7 @@ async fn ephemeral_available_in_projection() -> Result<()> {
 /// Ephemeral works with emit_output (EventOutput path).
 #[tokio::test]
 async fn ephemeral_via_emit_output() -> Result<()> {
-    use causal_core::handler::EventOutput;
+    use causal::handler::EventOutput;
 
     let received = Arc::new(Mutex::new(None::<usize>));
     let received_clone = received.clone();
@@ -3372,7 +3372,7 @@ async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
             handler::on::<FailSkip>()
                 .id("always_fail")
                 .retry(1)
-                .on_failure(|_event, info: causal_core::handler::ErrorContext| FailedSkip {
+                .on_failure(|_event, info: causal::handler::ErrorContext| FailedSkip {
                     error: info.error,
                 })
                 .then(|_event: Arc<FailSkip>, _ctx: Context<Deps>| async move {
@@ -3470,7 +3470,7 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
         .await?;
 
     // Step 2: Inject a handler directly into the queue (simulating reclaim after crash)
-    use causal_core::types::QueuedHandler;
+    use causal::types::QueuedHandler;
     let event_type = "order_created".to_string();
     store
         .publish_handler_for_test(QueuedHandler {
@@ -3541,7 +3541,7 @@ async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .on_dlq(|info: causal_core::DlqTerminalInfo| GlobalDlqEvent {
+        .on_dlq(|info: causal::DlqTerminalInfo| GlobalDlqEvent {
             error: info.error,
         })
         .with_handler(
@@ -3658,7 +3658,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     // Step 2: Inject a handler into the queue (simulating resume/reclaim)
     let event_type = "scrape_completed".to_string();
     store
-        .publish_handler_for_test(causal_core::types::QueuedHandler {
+        .publish_handler_for_test(causal::types::QueuedHandler {
             event_id: Uuid::new_v4(),
             handler_id: "expand_sources".to_string(),
             correlation_id,
@@ -4160,7 +4160,7 @@ async fn ephemeral_event_does_not_run_projections() -> Result<()> {
             }),
         )
         .with_projection(
-            handler::project("enrichment_projector").then(move |_event: causal_core::AnyEvent, _ctx: Context<Deps>| {
+            handler::project("enrichment_projector").then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
                 let count = projection_count2.clone();
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -4415,7 +4415,7 @@ async fn ephemeral_triggers_on_any_handler() -> Result<()> {
             }),
         )
         .with_handler(
-            handler::on_any().then(move |_event: causal_core::AnyEvent, _ctx: Context<Deps>| {
+            handler::on_any().then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
                 let c = any_count2.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -4453,7 +4453,7 @@ async fn ephemeral_root_via_emit_output() -> Result<()> {
             }),
         );
 
-    let output = causal_core::handler::EventOutput::new(EnrichmentReady {
+    let output = causal::handler::EventOutput::new(EnrichmentReady {
         concern_id: Uuid::nil(),
     });
     // EventOutput.persistent should be false for ephemeral events
@@ -4673,7 +4673,7 @@ async fn dlq_terminal_event_from_ephemeral_triggered_handler() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .on_dlq(|info: causal_core::handler::DlqTerminalInfo| {
+        .on_dlq(|info: causal::handler::DlqTerminalInfo| {
             EphHandlerFailed {
                 source_event_type: info.source_event_type,
                 error: info.error,

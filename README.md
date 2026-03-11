@@ -5,7 +5,7 @@
 Causal is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, event sourcing, and journaled side effects.
 
 ```rust
-use causal_core::{event, aggregators, handles, events, Context, Engine, Events};
+use causal::{event, aggregators, handles, events, Context, Engine, Events};
 
 #[event]
 #[derive(Clone, Serialize, Deserialize)]
@@ -53,7 +53,7 @@ engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 
 ```toml
 [dependencies]
-causal_core = "0.26"
+causal = "0.26"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -67,7 +67,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 Every event type must implement the `Event` trait. Use the `#[event]` proc macro:
 
 ```rust
-use causal_core::event;
+use causal::event;
 
 // Plain struct — durable_name: "order_placed"
 #[event]

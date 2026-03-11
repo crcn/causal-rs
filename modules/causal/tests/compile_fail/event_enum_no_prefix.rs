@@ -1,6 +1,6 @@
 use serde::{Serialize, Deserialize};
 
-#[causal_core::event]
+#[causal::event]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum BadEvent {

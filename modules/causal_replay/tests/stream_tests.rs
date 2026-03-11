@@ -1,9 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use causal_core::event_log::EventLog;
-use causal_core::types::NewEvent;
-use causal_core::MemoryStore;
+use causal::event_log::EventLog;
+use causal::types::NewEvent;
+use causal::MemoryStore;
 use causal_replay::{Mode, PointerStatus, PointerStore, ProjectionStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

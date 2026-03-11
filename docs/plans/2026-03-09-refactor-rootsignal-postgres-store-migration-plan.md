@@ -243,7 +243,7 @@ handler status and clears journal.
 **`rootsignal-scout/src/core/engine.rs`** (5 engine builder functions):
 ```rust
 // Before:
-let store: Arc<dyn causal_core::Store> = Arc::new(PostgresStore::new(pool));
+let store: Arc<dyn causal::Store> = Arc::new(PostgresStore::new(pool));
 Engine::new(deps).with_store(store)
 
 // After (with_store is now generic, no trait object needed):
@@ -254,7 +254,7 @@ Engine::new(deps).with_store(store)
 **`rootsignal-scout/src/store/mod.rs`** (EngineFactory):
 ```rust
 // Before:
-pub fn store(&self) -> Arc<dyn causal_core::Store>
+pub fn store(&self) -> Arc<dyn causal::Store>
 
 // After:
 pub fn store(&self) -> Arc<PostgresStore>
@@ -263,7 +263,7 @@ pub fn store(&self) -> Arc<PostgresStore>
 **`rootsignal-scout/src/workflows/mod.rs`** (`make_store()`):
 ```rust
 // Before:
-fn make_store() -> Option<Arc<dyn causal_core::Store>>
+fn make_store() -> Option<Arc<dyn causal::Store>>
 
 // After:
 fn make_store() -> Option<Arc<PostgresStore>>

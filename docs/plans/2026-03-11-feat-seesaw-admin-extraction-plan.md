@@ -187,7 +187,7 @@ cache = []                      # in-memory EventCache
 broadcast = ["sqlx/postgres"]   # pg_notify → broadcast channel
 
 [dependencies]
-causal_core = { path = "../causal" }
+causal = { path = "../causal" }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "chrono", "uuid"], optional = true }
 async-graphql = { version = "7", optional = true }
 chrono = { version = "0.4", features = ["serde"] }

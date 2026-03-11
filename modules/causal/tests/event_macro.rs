@@ -1,10 +1,10 @@
 //! Tests for #[event] proc macro.
 
-use causal_core::Event;
+use causal::Event;
 
 // ── Enum with prefix + snake_case ───────────────────────────────────
 
-#[causal_core::event(prefix = "scrape")]
+#[causal::event(prefix = "scrape")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScrapeEvent {
@@ -33,7 +33,7 @@ fn enum_not_ephemeral() {
 
 // ── Enum with no rename_all (PascalCase variants) ───────────────────
 
-#[causal_core::event(prefix = "order")]
+#[causal::event(prefix = "order")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum OrderEvent {
@@ -52,7 +52,7 @@ fn enum_no_rename_uses_pascal_case() {
 
 // ── Enum with camelCase ─────────────────────────────────────────────
 
-#[causal_core::event(prefix = "user")]
+#[causal::event(prefix = "user")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum UserEvent {
@@ -71,7 +71,7 @@ fn enum_camel_case_durable_name() {
 
 // ── Enum with SCREAMING_SNAKE_CASE ──────────────────────────────────
 
-#[causal_core::event(prefix = "status")]
+#[causal::event(prefix = "status")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StatusEvent {
@@ -89,7 +89,7 @@ fn enum_screaming_snake_case() {
 
 // ── Enum with kebab-case ────────────────────────────────────────────
 
-#[causal_core::event(prefix = "nav")]
+#[causal::event(prefix = "nav")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum NavEvent {
@@ -104,7 +104,7 @@ fn enum_kebab_case() {
 
 // ── Ephemeral enum ──────────────────────────────────────────────────
 
-#[causal_core::event(prefix = "synthesis", ephemeral)]
+#[causal::event(prefix = "synthesis", ephemeral)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SynthesisEvent {
@@ -124,7 +124,7 @@ fn ephemeral_enum() {
 
 // ── Struct event ────────────────────────────────────────────────────
 
-#[causal_core::event]
+#[causal::event]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrderPlaced {
     pub order_id: u64,
@@ -140,7 +140,7 @@ fn struct_durable_name_is_snake_case() {
 
 // ── Ephemeral struct ────────────────────────────────────────────────
 
-#[causal_core::event(ephemeral)]
+#[causal::event(ephemeral)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnrichmentReady {
     pub correlation_id: u64,
@@ -157,7 +157,7 @@ fn ephemeral_struct() {
 
 // ── Struct with explicit prefix ─────────────────────────────────────
 
-#[causal_core::event(prefix = "custom_name")]
+#[causal::event(prefix = "custom_name")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct MyThing {
     pub value: i32,
@@ -171,7 +171,7 @@ fn struct_with_explicit_prefix() {
 
 // ── Enum with tuple variants ────────────────────────────────────────
 
-#[causal_core::event(prefix = "batch")]
+#[causal::event(prefix = "batch")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BatchEvent {
@@ -193,7 +193,7 @@ fn enum_with_unit_and_named_variants() {
 
 // ── Enum with per-variant #[serde(rename = "...")] ──────────────────
 
-#[causal_core::event(prefix = "custom")]
+#[causal::event(prefix = "custom")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CustomRenameEvent {
@@ -216,7 +216,7 @@ fn enum_with_serde_rename_per_variant() {
 
 // ── Enum with adjacent tagging ──────────────────────────────────────
 
-#[causal_core::event(prefix = "adj")]
+#[causal::event(prefix = "adj")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AdjacentEvent {

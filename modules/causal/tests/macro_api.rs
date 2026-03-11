@@ -1,8 +1,8 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use causal_core::{aggregator, aggregators, event, events, handle, handles, projection, AnyEvent, Context, Emit, ErrorContext, Events};
-use causal_core::{Aggregate, Apply};
+use causal::{aggregator, aggregators, event, events, handle, handles, projection, AnyEvent, Context, Emit, ErrorContext, Events};
+use causal::{Aggregate, Apply};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
