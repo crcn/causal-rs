@@ -1,5 +1,5 @@
 use anyhow::Result;
-use causal::{handler, Context};
+use causal::{reactor, Context};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ fn my_filter(event: &MyEvent, _ctx: &Context<Deps>) -> bool {
     event.value > 100
 }
 
-#[handler(on = MyEvent, filter = my_filter, extract(id), id = "bad")]
+#[reactor(on = MyEvent, filter = my_filter, extract(id), id = "bad")]
 async fn bad_handler(id: Uuid, _ctx: Context<Deps>) -> Result<MyOutput> {
     Ok(MyOutput { id })
 }

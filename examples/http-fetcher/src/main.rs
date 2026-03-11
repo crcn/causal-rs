@@ -1,7 +1,7 @@
 //! HTTP Fetcher Example
 
 use anyhow::Result;
-use causal::{event, events, handler, Context, Engine};
+use causal::{event, events, reactor, Context, Engine};
 use serde::{Deserialize, Serialize};
 
 #[event(prefix = "fetch")]
@@ -41,8 +41,8 @@ async fn main() -> Result<()> {
     };
 
     let engine = Engine::in_memory(deps)
-        .with_handler(
-            handler::on::<FetchEvent>()
+        .with_reactor(
+            reactor::on::<FetchEvent>()
                 .id("fetch_url")
                 .extract(|e| match e {
                     FetchEvent::FetchRequested {
@@ -103,8 +103,8 @@ async fn main() -> Result<()> {
                     },
                 ),
         )
-        .with_handler(
-            handler::on::<FetchEvent>()
+        .with_reactor(
+            reactor::on::<FetchEvent>()
                 .id("all_complete")
                 .extract(|e| match e {
                     FetchEvent::AllComplete {

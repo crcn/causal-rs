@@ -27,7 +27,7 @@ causal-viz = { path = "<path-to-causal-viz>", features = ["web-viewer"] }
 
 ## Step 2: Create Visualization Module
 
-Create a module for visualization handlers (e.g., `src/server/causal_viz.rs` or wherever your handlers live):
+Create a module for visualization reactors (e.g., `src/server/causal_viz.rs` or wherever your reactors live):
 
 ```rust
 // NOTE: Replace `YourStateType` with your actual Causal state type throughout this module
@@ -113,7 +113,7 @@ let engine = Engine::with_deps(deps)
     // ... your existing effects ...
 
     // Add visualization observer (P1: non-blocking async channel)
-    .with_handler(
+    .with_reactor(
         effect::on_any().then(move |event, ctx| {
             let observer = viz_observer.clone();
             async move {

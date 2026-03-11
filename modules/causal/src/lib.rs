@@ -1,11 +1,11 @@
 //! # Causal
 //!
-//! A deterministic event/handler runtime with TypeId-based multi-event dispatch.
+//! A deterministic event/reactor runtime with TypeId-based multi-event dispatch.
 //!
 //! ## Guarantees
 //!
 //! - **Multi-event dispatch**: Support for multiple event types via TypeId routing.
-//! - **Handler system**: Register handlers that react to events and can emit
+//! - **Reactor system**: Register reactors that react to events and can emit
 //!   new events and access shared dependencies.
 //!
 //! ## Example
@@ -19,9 +19,9 @@
 //! #[derive(Clone)]
 //! struct UserWelcomed { name: String }
 //!
-//! // Create engine with handlers
+//! // Create engine with reactors
 //! let engine = Engine::in_memory(deps)
-//!     .with_handler(on::<UserCreated>().then(|event, _ctx| async move {
+//!     .with_reactor(on::<UserCreated>().then(|event, _ctx| async move {
 //!         println!("User created: {}", event.name);
 //!         Ok(UserWelcomed { name: event.name.clone() })
 //!     }));
@@ -37,14 +37,14 @@ pub mod aggregator;
 pub mod event;
 pub mod event_log;
 pub mod event_store;
-pub mod handler;
-pub mod handler_queue;
+pub mod reactor;
+pub mod reactor_queue;
 pub mod job_executor;
 pub mod types;
 
 mod engine;
 mod event_codec;
-mod handler_registry;
+mod reactor_registry;
 pub mod memory_store;
 mod process;
 pub mod upcaster;
@@ -59,9 +59,9 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
 pub use types::{AppendResult, NewEvent, PersistedEvent, QueueStatus, Snapshot};
 
-// Re-export new EventLog + HandlerQueue traits
+// Re-export new EventLog + ReactorQueue traits
 pub use event_log::EventLog;
-pub use handler_queue::HandlerQueue;
+pub use reactor_queue::ReactorQueue;
 pub use types::{EventPark, IntentCommit};
 
 // Re-export in-memory implementation
@@ -72,12 +72,12 @@ pub use upcaster::{Upcaster, UpcasterRegistry};
 
 // Re-export main types
 pub use engine::Engine;
-pub use handler::{
+pub use reactor::{
     AggregateState, AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events,
-    Handler, HandlerError, IntoEvents, Logger, Projection,
+    Reactor, ReactorError, IntoEvents, Logger, Projection,
 };
 
-/// The universal return macro for all handlers.
+/// The universal return macro for all reactors.
 ///
 /// Works like `vec![]` — constructs an [`Events`] collection:
 ///
@@ -114,20 +114,20 @@ macro_rules! events {
     }};
 }
 
-pub use job_executor::{HandlerResult, HandlerStatus, JobExecutor};
+pub use job_executor::{ReactorResult, ReactorStatus, JobExecutor};
 pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
-    EmittedEvent, EventWorkerConfig, HandlerCompletion,
-    HandlerDlq, HandlerIntent, HandlerResolution, HandlerWorkerConfig,
-    JournalEntry, LogEntry, LogLevel, ProjectionFailure, QueuedHandler,
+    EmittedEvent, EventWorkerConfig, ReactorCompletion,
+    ReactorDlq, ReactorIntent, ReactorResolution, ReactorWorkerConfig,
+    JournalEntry, LogEntry, LogLevel, ProjectionFailure, QueuedReactor,
     NAMESPACE_CAUSAL,
 };
 
 // Top-level builder functions
-pub use handler::{on, on_any, project};
+pub use reactor::{on, on_any, project};
 
 #[cfg(feature = "macros")]
 pub use causal_core_macros::{
-    aggregator, aggregators, event, handle, handler, handlers, handles, projection,
+    aggregator, aggregators, event, projection, reactor, reactors,
 };
 

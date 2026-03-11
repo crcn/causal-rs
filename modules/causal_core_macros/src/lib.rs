@@ -10,7 +10,7 @@ use syn::{
 };
 
 #[proc_macro_attribute]
-pub fn handle(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn reactor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let metas = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
     let input_fn = parse_macro_input!(item as ItemFn);
 
@@ -21,22 +21,12 @@ pub fn handle(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
-    handle(attr, item)
-}
-
-#[proc_macro_attribute]
-pub fn handles(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn reactors(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = parse_macro_input!(item as ItemMod);
     match expand_effects_module(&mut module) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
-}
-
-#[proc_macro_attribute]
-pub fn handlers(attr: TokenStream, item: TokenStream) -> TokenStream {
-    handles(attr, item)
 }
 
 /// Marks a function as an aggregator — generates `impl Apply<E> for A` and an `Aggregator` factory.
@@ -126,7 +116,7 @@ enum OnSpec {
     EventType(Path),
     Variants(Vec<Path>),
     /// Multiple distinct event types: `on = [TypeA, TypeB]`.
-    /// Handler takes `AnyEvent`, generates one registration per type.
+    /// Reactor takes `AnyEvent`, generates one registration per type.
     MultiType(Vec<Path>),
 }
 
@@ -213,13 +203,13 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.fn_token,
-            "#[handler] requires an async function",
+            "#[reactor] requires an async function",
         ));
     }
     if !input_fn.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.generics,
-            "#[handler] does not support generic functions",
+            "#[reactor] does not support generic functions",
         ));
     }
 
@@ -247,13 +237,13 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
     if args.describe.is_some() && args.filter.is_none() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "describe requires filter (describe is only available on FilteredHandlerBuilder)",
+            "describe requires filter (describe is only available on FilteredReactorBuilder)",
         ));
     }
     if effect_requires_stable_id(&args) && args.id.is_none() && args.group.is_none() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "queued/durable #[handler] requires an explicit id = \"...\" (or group = \"...\")",
+            "queued/durable #[reactor] requires an explicit id = \"...\" (or group = \"...\")",
         ));
     }
 
@@ -287,7 +277,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         if non_ctx_params.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &input_fn.sig.inputs,
-                "on_any handler requires exactly one AnyEvent parameter plus Context",
+                "on_any reactor requires exactly one AnyEvent parameter plus Context",
             ));
         }
 
@@ -307,7 +297,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
             #input_fn
 
             #[doc(hidden)]
-            pub fn #wrapper_ident() -> ::causal::Handler<#deps_ty> {
+            pub fn #wrapper_ident() -> ::causal::Reactor<#deps_ty> {
                 #chain
             }
         });
@@ -316,7 +306,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
     let on = args.on.clone().ok_or_else(|| {
         syn::Error::new(
             proc_macro2::Span::call_site(),
-            "#[handler] requires on = EventType, on = [Enum::Variant, ...], or on_any",
+            "#[reactor] requires on = EventType, on = [Enum::Variant, ...], or on_any",
         )
     })?;
 
@@ -354,14 +344,14 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         if args.extract.len() != 1 {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "transition handlers require extract() with exactly one Uuid field (the aggregate ID)",
+                "transition reactors require extract() with exactly one Uuid field (the aggregate ID)",
             ));
         }
 
         if non_ctx_params.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &input_fn.sig.inputs,
-                "transition handler function takes (aggregate_id: Uuid, ctx: Context<Deps>)",
+                "transition reactor function takes (aggregate_id: Uuid, ctx: Context<Deps>)",
             ));
         }
 
@@ -485,7 +475,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         if non_ctx_params.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &input_fn.sig.inputs,
-                "#[handler] requires exactly one event parameter plus Context when extract(...) is not used",
+                "#[reactor] requires exactly one event parameter plus Context when extract(...) is not used",
             ));
         }
         if !matches!(on, OnSpec::EventType(_)) {
@@ -505,7 +495,7 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
 
         let event_ident = &event_param.ident;
         if args.filter.is_some() {
-            // FilteredHandlerBuilder::then — D is inferred from the filter fn,
+            // FilteredReactorBuilder::then — D is inferred from the filter fn,
             // so use closure param type annotations instead of turbofish.
             quote! {
                 #builder
@@ -529,15 +519,15 @@ fn expand_effect(args: syn::Result<EffectArgs>, input_fn: ItemFn) -> syn::Result
         #input_fn
 
         #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::causal::Handler<#deps_ty> {
+        pub fn #wrapper_ident() -> ::causal::Reactor<#deps_ty> {
             #chain
         }
     })
 }
 
-/// Expand a `#[handle(on = [TypeA, TypeB])]` into multiple handler registrations.
+/// Expand a `#[reactor(on = [TypeA, TypeB])]` into multiple reactor registrations.
 ///
-/// Each type gets its own `on::<T>()` registration, all sharing the same handler id.
+/// Each type gets its own `on::<T>()` registration, all sharing the same reactor id.
 /// The user function takes `AnyEvent` — the typed event is wrapped automatically.
 /// Filter functions (if any) receive only `&Context<D>` since the event type varies.
 fn expand_multi_type_effect(
@@ -581,7 +571,7 @@ fn expand_multi_type_effect(
     if non_ctx_params.len() != 1 {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.inputs,
-            "multi-type handler requires exactly one AnyEvent parameter plus Context",
+            "multi-type reactor requires exactly one AnyEvent parameter plus Context",
         ));
     }
 
@@ -608,11 +598,11 @@ fn expand_multi_type_effect(
         describe: None,
     };
 
-    // Generate one handler per type, each with a unique suffixed ID
+    // Generate one reactor per type, each with a unique suffixed ID
     let handler_exprs: Vec<TokenStream2> = types
         .iter()
         .map(|event_type| {
-            // Suffix the handler id with the type name for uniqueness
+            // Suffix the reactor id with the type name for uniqueness
             let type_suffix = event_type.segments.last()
                 .map(|s| s.ident.to_string())
                 .unwrap_or_default();
@@ -677,7 +667,7 @@ fn expand_multi_type_effect(
         #input_fn
 
         #[doc(hidden)]
-        pub fn #wrapper_ident() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
+        pub fn #wrapper_ident() -> ::std::vec::Vec<::causal::Reactor<#deps_ty>> {
             ::std::vec![#(#handler_exprs),*]
         }
     })
@@ -687,12 +677,12 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     let Some((_, items)) = &mut module.content else {
         return Err(syn::Error::new_spanned(
             module,
-            "#[handlers] requires an inline module",
+            "#[reactors] requires an inline module",
         ));
     };
 
     let mut wrappers = Vec::new();
-    let mut multi_wrappers = Vec::new(); // multi-type handlers returning Vec<Handler<D>>
+    let mut multi_wrappers = Vec::new(); // multi-type reactors returning Vec<Reactor<D>>
     let mut projection_wrappers = Vec::new();
     let mut deps_ty: Option<Type> = None;
     let mut inferred_fns = Vec::new();
@@ -702,7 +692,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
             continue;
         };
 
-        let has_handle_attr = has_attr_any(&item_fn.attrs, &["handle", "handler"]);
+        let has_handle_attr = has_attr_any(&item_fn.attrs, &["handle", "reactor"]);
         let has_projection_attr = has_attr(&item_fn.attrs, "projection");
 
         if has_projection_attr {
@@ -710,7 +700,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
             let wrapper_ident = format_ident!("__causal_projection_{}", item_fn.sig.ident);
             projection_wrappers.push(wrapper_ident);
         } else if has_handle_attr {
-            // Explicit #[handle(...)]: standalone proc macro handles expansion
+            // Explicit #[reactor(...)]: standalone proc macro handles expansion
             let wrapper_ident = format_ident!("__causal_effect_{}", item_fn.sig.ident);
             if is_multi_type_handle(&item_fn.attrs) {
                 multi_wrappers.push(wrapper_ident);
@@ -735,7 +725,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
             if non_ctx_params.len() != 1 {
                 return Err(syn::Error::new_spanned(
                     &item_fn.sig.inputs,
-                    "bare handler function requires exactly one event parameter plus Context",
+                    "bare reactor function requires exactly one event parameter plus Context",
                 ));
             }
 
@@ -750,7 +740,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
             inferred_fns.push((item_fn.sig.ident.to_string(), expanded));
         }
 
-        // Track deps type from all handler functions
+        // Track deps type from all reactor functions
         if let Ok((_, deps)) = find_effect_context(&item_fn.sig) {
             match &deps_ty {
                 None => deps_ty = Some(deps),
@@ -758,7 +748,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
                     if type_key(existing_deps) != type_key(&deps) {
                         return Err(syn::Error::new_spanned(
                             &item_fn.sig,
-                            "all handlers in a #[handles] module must use the same Context<Deps>",
+                            "all reactors in a #[reactors] module must use the same Context<Deps>",
                         ));
                     }
                 }
@@ -769,7 +759,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     if wrappers.is_empty() && multi_wrappers.is_empty() && projection_wrappers.is_empty() {
         return Err(syn::Error::new_spanned(
             module,
-            "#[handles] module must contain at least one handler or projection function",
+            "#[reactors] module must contain at least one reactor or projection function",
         ));
     }
 
@@ -788,13 +778,13 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
     let deps_ty = deps_ty.expect("checked above");
     let handles_fn: ItemFn = if multi_wrappers.is_empty() {
         parse_quote! {
-            pub fn handles() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
+            pub fn handles() -> ::std::vec::Vec<::causal::Reactor<#deps_ty>> {
                 ::std::vec![#(#wrappers()),*]
             }
         }
     } else {
         parse_quote! {
-            pub fn handles() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
+            pub fn handles() -> ::std::vec::Vec<::causal::Reactor<#deps_ty>> {
                 let mut __h = ::std::vec![#(#wrappers()),*];
                 #(__h.extend(#multi_wrappers());)*
                 __h
@@ -802,7 +792,7 @@ fn expand_effects_module(module: &mut ItemMod) -> syn::Result<TokenStream2> {
         }
     };
     let handlers_fn: ItemFn = parse_quote! {
-        pub fn handlers() -> ::std::vec::Vec<::causal::Handler<#deps_ty>> {
+        pub fn reactors() -> ::std::vec::Vec<::causal::Reactor<#deps_ty>> {
             handles()
         }
     };
@@ -844,7 +834,7 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
                 args.extract = parse_extract_fields(list)?;
             }
             Meta::Path(path) if path.is_ident("projection") => {
-                return Err(syn::Error::new_spanned(path, "#[handler(projection)] is removed in v0.20.0. Use #[projection] instead."));
+                return Err(syn::Error::new_spanned(path, "#[reactor(projection)] is removed in v0.20.0. Use #[projection] instead."));
             }
             Meta::Path(path) if path.is_ident("on_any") => {
                 if args.on_any {
@@ -920,7 +910,7 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
             _ => {
                 return Err(syn::Error::new_spanned(
                     meta,
-                    "unsupported #[handler] option",
+                    "unsupported #[reactor] option",
                 ));
             }
         }
@@ -1049,7 +1039,7 @@ fn parse_path_expr(expr: &Expr, label: &str) -> syn::Result<Path> {
         Expr::Path(expr_path) => Ok(expr_path.path.clone()),
         _ => Err(syn::Error::new_spanned(
             expr,
-            format!("expected path for {label}, e.g. module::handler"),
+            format!("expected path for {label}, e.g. module::reactor"),
         )),
     }
 }
@@ -1086,7 +1076,7 @@ fn find_effect_context(sig: &Signature) -> syn::Result<(usize, Type)> {
     found.ok_or_else(|| {
         syn::Error::new_spanned(
             &sig.inputs,
-            "effect handler must include ctx: Context<Deps>",
+            "effect reactor must include ctx: Context<Deps>",
         )
     })
 }
@@ -1280,7 +1270,7 @@ fn expand_projection(
     if non_ctx_params.len() != 1 {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.inputs,
-            "#[projection] handler requires exactly one AnyEvent parameter plus Context",
+            "#[projection] reactor requires exactly one AnyEvent parameter plus Context",
         ));
     }
 
@@ -1328,10 +1318,10 @@ fn has_attr_any(attrs: &[Attribute], names: &[&str]) -> bool {
     names.iter().any(|name| has_attr(attrs, name))
 }
 
-/// Check if a `#[handle]` attribute uses multi-type `on = [TypeA, TypeB]`.
+/// Check if a `#[reactor]` attribute uses multi-type `on = [TypeA, TypeB]`.
 fn is_multi_type_handle(attrs: &[Attribute]) -> bool {
     for attr in attrs {
-        if attr.path().is_ident("handle") || attr.path().is_ident("handler") {
+        if attr.path().is_ident("handle") || attr.path().is_ident("reactor") {
             if let Ok(metas) = attr.parse_args_with(
                 Punctuated::<Meta, Token![,]>::parse_terminated,
             ) {
@@ -1377,7 +1367,7 @@ fn ensure_unset<T>(existing: &Option<T>, meta: &MetaNameValue, name: &str) -> sy
     Ok(())
 }
 
-/// Classify the handler return type to generate appropriate Events conversion code.
+/// Classify the reactor return type to generate appropriate Events conversion code.
 enum ReturnKind {
     /// `Result<()>` — empty events
     Unit,
@@ -1465,11 +1455,11 @@ mod tests {
             retry: Some(3),
             ..EffectArgs::default()
         };
-        let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
+        let reactor_ident: Ident = syn::parse_quote!(my_effect_handler);
         let configured = apply_effect_config(
             quote!(::causal::on::<MyEvent>()),
             &args,
-            &handler_ident,
+            &reactor_ident,
         );
         let configured_text = configured.to_string();
         assert!(
@@ -1491,7 +1481,7 @@ mod tests {
             .err()
             .expect("delivery option should remain unsupported");
         assert!(
-            error.to_string().contains("unsupported #[handler] option"),
+            error.to_string().contains("unsupported #[reactor] option"),
             "unexpected error: {}",
             error
         );
@@ -1513,11 +1503,11 @@ mod tests {
             filter: Some(filter_path),
             ..EffectArgs::default()
         };
-        let handler_ident: Ident = syn::parse_quote!(my_effect_handler);
+        let reactor_ident: Ident = syn::parse_quote!(my_effect_handler);
         let configured = apply_effect_config(
             quote!(::causal::on::<MyEvent>()),
             &args,
-            &handler_ident,
+            &reactor_ident,
         );
         let configured_text = configured.to_string();
         assert!(

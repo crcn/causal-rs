@@ -2,7 +2,7 @@
 //!
 //! The [`EventLog`] trait abstracts append-only event persistence. It is one
 //! half of the split from the monolithic `Store` trait (the other half being
-//! [`HandlerQueue`](crate::handler_queue::HandlerQueue)).
+//! [`ReactorQueue`](crate::reactor_queue::ReactorQueue)).
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -1,44 +1,44 @@
-//! Handler registry for storing and managing handlers.
+//! Reactor registry for storing and managing reactors.
 
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::event_codec::EventCodec;
-use crate::handler::{Handler, Projection};
+use crate::reactor::{Reactor, Projection};
 
-/// Registry for storing handlers.
-pub struct HandlerRegistry<D>
+/// Registry for storing reactors.
+pub struct ReactorRegistry<D>
 where
     D: Send + Sync + 'static,
 {
-    handlers: RwLock<Vec<Handler<D>>>,
+    reactors: RwLock<Vec<Reactor<D>>>,
     projections: RwLock<Vec<Projection<D>>>,
-    /// Standalone codecs registered independently of handlers (e.g. from aggregators).
+    /// Standalone codecs registered independently of reactors (e.g. from aggregators).
     standalone_codecs: RwLock<Vec<Arc<EventCodec>>>,
 }
 
-impl<D> Default for HandlerRegistry<D>
+impl<D> Default for ReactorRegistry<D>
 where
     D: Send + Sync + 'static,
 {
     fn default() -> Self {
         Self {
-            handlers: RwLock::new(Vec::new()),
+            reactors: RwLock::new(Vec::new()),
             projections: RwLock::new(Vec::new()),
             standalone_codecs: RwLock::new(Vec::new()),
         }
     }
 }
 
-impl<D> HandlerRegistry<D>
+impl<D> ReactorRegistry<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Create a new empty handler registry.
+    /// Create a new empty reactor registry.
     pub fn new() -> Self {
         Self {
-            handlers: RwLock::new(Vec::new()),
+            reactors: RwLock::new(Vec::new()),
             projections: RwLock::new(Vec::new()),
             standalone_codecs: RwLock::new(Vec::new()),
         }
@@ -55,24 +55,24 @@ where
         self.standalone_codecs.write().push(codec);
     }
 
-    /// Register a handler.
-    pub fn register(&self, handler: Handler<D>) {
-        if handler.id.trim().is_empty() {
-            panic!("Handler ID cannot be empty");
+    /// Register a reactor.
+    pub fn register(&self, reactor: Reactor<D>) {
+        if reactor.id.trim().is_empty() {
+            panic!("Reactor ID cannot be empty");
         }
 
-        if !handler.is_default() && looks_like_auto_generated_id(&handler.id) {
+        if !reactor.is_default() && looks_like_auto_generated_id(&reactor.id) {
             panic!(
-                "Background handler '{}' must declare an explicit stable id (for example .id(\"...\") or #[handler(id = \"...\")])",
-                handler.id
+                "Background reactor '{}' must declare an explicit stable id (for example .id(\"...\") or #[reactor(id = \"...\")])",
+                reactor.id
             );
         }
 
-        let mut handlers = self.handlers.write();
-        if handlers.iter().any(|existing| existing.id == handler.id) {
-            panic!("Duplicate handler id '{}'", handler.id);
+        let mut reactors = self.reactors.write();
+        if reactors.iter().any(|existing| existing.id == reactor.id) {
+            panic!("Duplicate reactor id '{}'", reactor.id);
         }
-        handlers.push(handler);
+        reactors.push(reactor);
     }
 
     /// Register a projection.
@@ -81,12 +81,12 @@ where
             panic!("Projection ID cannot be empty");
         }
 
-        // Check uniqueness across both handlers and projections
-        let handlers = self.handlers.read();
-        if handlers.iter().any(|existing| existing.id == projection.id) {
-            panic!("Duplicate id '{}' (conflicts with a handler)", projection.id);
+        // Check uniqueness across both reactors and projections
+        let reactors = self.reactors.read();
+        if reactors.iter().any(|existing| existing.id == projection.id) {
+            panic!("Duplicate id '{}' (conflicts with a reactor)", projection.id);
         }
-        drop(handlers);
+        drop(reactors);
 
         let mut projections = self.projections.write();
         if projections.iter().any(|existing| existing.id == projection.id) {
@@ -102,17 +102,17 @@ where
         projections
     }
 
-    /// Get all registered handlers (cloned).
-    pub(crate) fn all(&self) -> Vec<Handler<D>> {
-        self.handlers.read().iter().cloned().collect()
+    /// Get all registered reactors (cloned).
+    pub(crate) fn all(&self) -> Vec<Reactor<D>> {
+        self.reactors.read().iter().cloned().collect()
     }
 
-    /// Find handler by stable ID.
-    pub(crate) fn find_by_id(&self, handler_id: &str) -> Option<Handler<D>> {
-        self.handlers
+    /// Find reactor by stable ID.
+    pub(crate) fn find_by_id(&self, reactor_id: &str) -> Option<Reactor<D>> {
+        self.reactors
             .read()
             .iter()
-            .find(|h| h.id == handler_id)
+            .find(|h| h.id == reactor_id)
             .cloned()
     }
 
@@ -121,9 +121,9 @@ where
     /// Extracts the prefix from the durable name (e.g. "scrape" from
     /// "scrape:web_scrape_completed") and matches against registered codecs.
     pub(crate) fn find_codec_by_durable_name(&self, durable_name: &str) -> Option<Arc<EventCodec>> {
-        let prefix = crate::handler::extract_prefix(durable_name);
-        for handler in self.handlers.read().iter() {
-            for codec in handler.codecs() {
+        let prefix = crate::reactor::extract_prefix(durable_name);
+        for reactor in self.reactors.read().iter() {
+            for codec in reactor.codecs() {
                 if codec.event_prefix == prefix {
                     return Some(codec.clone());
                 }
@@ -156,7 +156,7 @@ fn looks_like_auto_generated_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler;
+    use crate::reactor;
     use std::any::TypeId;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -173,45 +173,45 @@ mod tests {
     struct TestDeps;
 
     #[tokio::test]
-    async fn test_handler_registry_registers_handlers() {
-        let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
+    async fn test_reactor_registry_registers_handlers() {
+        let registry: ReactorRegistry<TestDeps> = ReactorRegistry::new();
 
-        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
+        registry.register(reactor::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
 
-        assert_eq!(registry.handlers.read().len(), 1);
+        assert_eq!(registry.reactors.read().len(), 1);
     }
 
     #[tokio::test]
     async fn test_multiple_handlers() {
-        let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
+        let registry: ReactorRegistry<TestDeps> = ReactorRegistry::new();
 
-        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
-        registry.register(handler::on::<EventB>().then(|_, _| async { Ok(crate::Events::new()) }));
+        registry.register(reactor::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
+        registry.register(reactor::on::<EventB>().then(|_, _| async { Ok(crate::Events::new()) }));
 
-        assert_eq!(registry.handlers.read().len(), 2);
+        assert_eq!(registry.reactors.read().len(), 2);
     }
 
     #[tokio::test]
     async fn test_handler_can_handle() {
-        let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
+        let registry: ReactorRegistry<TestDeps> = ReactorRegistry::new();
 
-        registry.register(handler::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
+        registry.register(reactor::on::<EventA>().then(|_, _| async { Ok(crate::Events::new()) }));
 
-        let handlers = registry.handlers.read();
-        assert!(handlers[0].can_handle(TypeId::of::<EventA>()));
-        assert!(!handlers[0].can_handle(TypeId::of::<EventB>()));
+        let reactors = registry.reactors.read();
+        assert!(reactors[0].can_handle(TypeId::of::<EventA>()));
+        assert!(!reactors[0].can_handle(TypeId::of::<EventB>()));
     }
 
     #[tokio::test]
     async fn test_group_handler() {
-        let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
+        let registry: ReactorRegistry<TestDeps> = ReactorRegistry::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
         let counter_a = counter.clone();
         let counter_b = counter.clone();
 
         registry.register(
-            handler::on::<EventA>().id("test_a").then(move |_, _| {
+            reactor::on::<EventA>().id("test_a").then(move |_, _| {
                 let c = counter_a.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -220,7 +220,7 @@ mod tests {
             })
         );
         registry.register(
-            handler::on::<EventB>().id("test_b").then(move |_, _| {
+            reactor::on::<EventB>().id("test_b").then(move |_, _| {
                 let c = counter_b.clone();
                 async move {
                     c.fetch_add(10, Ordering::SeqCst);
@@ -229,37 +229,37 @@ mod tests {
             })
         );
 
-        assert_eq!(registry.handlers.read().len(), 2);
+        assert_eq!(registry.reactors.read().len(), 2);
 
         // Each can handle its respective event type
-        let handlers = registry.handlers.read();
-        assert!(handlers.iter().any(|h| h.can_handle(TypeId::of::<EventA>())));
-        assert!(handlers.iter().any(|h| h.can_handle(TypeId::of::<EventB>())));
+        let reactors = registry.reactors.read();
+        assert!(reactors.iter().any(|h| h.can_handle(TypeId::of::<EventA>())));
+        assert!(reactors.iter().any(|h| h.can_handle(TypeId::of::<EventB>())));
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Duplicate handler id 'duplicate'")]
-    async fn test_register_rejects_duplicate_handler_ids() {
-        let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
+    #[should_panic(expected = "Duplicate reactor id 'duplicate'")]
+    async fn test_register_rejects_duplicate_reactor_ids() {
+        let registry: ReactorRegistry<TestDeps> = ReactorRegistry::new();
 
         registry.register(
-            handler::on::<EventA>()
+            reactor::on::<EventA>()
                 .id("duplicate")
                 .then(|_, _| async { Ok(crate::Events::new()) }),
         );
         registry.register(
-            handler::on::<EventB>()
+            reactor::on::<EventB>()
                 .id("duplicate")
                 .then(|_, _| async { Ok(crate::Events::new()) }),
         );
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Background handler")]
+    #[should_panic(expected = "Background reactor")]
     async fn test_register_rejects_generated_id_for_queued_handler() {
-        let registry: HandlerRegistry<TestDeps> = HandlerRegistry::new();
+        let registry: ReactorRegistry<TestDeps> = ReactorRegistry::new();
         registry.register(
-            handler::on::<EventA>()
+            reactor::on::<EventA>()
                 .retry(3)
                 .then(|_, _| async { Ok(crate::Events::new()) }),
         );

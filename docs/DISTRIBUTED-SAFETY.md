@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-02-06
 
-This guide explains how to write Causal handlers that are safe for multi-worker distributed deployments.
+This guide explains how to write Causal reactors that are safe for multi-worker distributed deployments.
 
 ## Quick Start
 
@@ -19,7 +19,7 @@ struct Deps {
 }
 
 let engine = Engine::new(deps, PostgresStore::new(pool))
-    .with_handler(handler::on::<OrderPlaced>().then(|event, ctx| async move {
+    .with_reactor(reactor::on::<OrderPlaced>().then(|event, ctx| async move {
         // All workers share same database
         sqlx::query("INSERT INTO orders ...")
             .execute(&ctx.deps().db)
@@ -85,7 +85,7 @@ enum OrderEvent {
     },
 }
 
-#[handler(on = OrderEvent, extract(order_id, items_processed, items_remaining))]
+#[reactor(on = OrderEvent, extract(order_id, items_processed, items_remaining))]
 async fn process_order(
     order_id: Uuid,
     items_processed: usize,
@@ -124,7 +124,7 @@ struct Deps {
     redis: RedisClient,  // ✅ All workers share same Redis
 }
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn save_order(event: OrderPlaced, ctx: HandlerContext<Deps>) -> Result<OrderSaved> {
     // State in database - all workers see it
     sqlx::query("INSERT INTO orders (id, status) VALUES ($1, 'placed')")
@@ -134,7 +134,7 @@ async fn save_order(event: OrderPlaced, ctx: HandlerContext<Deps>) -> Result<Ord
     Ok(OrderSaved { order_id: event.order_id })
 }
 
-#[handler(on = OrderShipped)]
+#[reactor(on = OrderShipped)]
 async fn update_cache(event: OrderShipped, ctx: HandlerContext<Deps>) -> Result<()> {
     // Cache in Redis - all workers share it
     let mut conn = ctx.deps().redis.get_async_connection().await?;
@@ -159,13 +159,13 @@ State is implicit in "which events have fired".
 // OrderShipped → "shipped"
 // OrderDelivered → "delivered"
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn ship_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderShipped> {
     ctx.deps().ship(event.order_id).await?;
     Ok(OrderShipped { order_id: event.order_id })
 }
 
-#[handler(on = OrderShipped)]
+#[reactor(on = OrderShipped)]
 async fn deliver_order(event: OrderShipped, ctx: Ctx) -> Result<OrderDelivered> {
     ctx.deps().deliver(event.order_id).await?;
     Ok(OrderDelivered { order_id: event.order_id })
@@ -197,19 +197,19 @@ struct DevDeps {
 
 Understanding execution modes is critical for correctness.
 
-### Inline Handlers (Default)
+### Inline Reactors (Default)
 
 Fast, atomic with event dispatch:
 
 ```rust
 // Inline - runs immediately
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn save_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     ctx.deps().db.insert_order(&event).await?;
     Ok(OrderSaved { order_id: event.order_id })
 }
 
-// Execution: [TX begins] → Insert OrderPlaced → Handler runs → Insert OrderSaved → [TX commits]
+// Execution: [TX begins] → Insert OrderPlaced → Reactor runs → Insert OrderSaved → [TX commits]
 ```
 
 **Use when:**
@@ -217,19 +217,19 @@ async fn save_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
 - Must be atomic with dispatch
 - Database updates
 
-### Background Handlers (Queued)
+### Background Reactors (Queued)
 
 Async, retryable, distributed across workers:
 
 ```rust
 // Background - queued for workers
-#[handler(on = PaymentRequested, queued, retry = 3, timeout_secs = 30)]
+#[reactor(on = PaymentRequested, queued, retry = 3, timeout_secs = 30)]
 async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentCharged> {
     ctx.deps().stripe.charge(&event).await?;
     Ok(PaymentCharged { order_id: event.order_id })
 }
 
-// Execution: [TX A: Insert event + handler intent] → Worker picks up → [TX B: Handler runs]
+// Execution: [TX A: Insert event + reactor intent] → Worker picks up → [TX B: Reactor runs]
 ```
 
 **Use when:**
@@ -250,7 +250,7 @@ struct Deps {
     counter: Arc<Mutex<i32>>,
 }
 
-#[handler(on = Event)]
+#[reactor(on = Event)]
 async fn increment(event: Event, ctx: Ctx) -> Result<()> {
     let mut count = ctx.deps().counter.lock().unwrap();
     *count += 1;
@@ -263,7 +263,7 @@ async fn increment(event: Event, ctx: Ctx) -> Result<()> {
 
 ```rust
 // ✅ GOOD: Counter in database
-#[handler(on = Event)]
+#[reactor(on = Event)]
 async fn increment(event: Event, ctx: Ctx) -> Result<()> {
     sqlx::query("UPDATE counters SET count = count + 1 WHERE id = 'global'")
         .execute(&ctx.deps().db)
@@ -282,7 +282,7 @@ struct Deps {
     cache: Arc<Mutex<HashMap<Uuid, User>>>,
 }
 
-#[handler(on = UserUpdated)]
+#[reactor(on = UserUpdated)]
 async fn update_user(event: UserUpdated, ctx: Ctx) -> Result<()> {
     // Update database (all workers see)
     sqlx::query("UPDATE users SET name = $1").execute(&ctx.deps().db).await?;
@@ -305,7 +305,7 @@ struct Deps {
     redis: RedisClient,
 }
 
-#[handler(on = UserUpdated)]
+#[reactor(on = UserUpdated)]
 async fn update_user(event: UserUpdated, ctx: Ctx) -> Result<()> {
     // Update database
     sqlx::query("UPDATE users SET name = $1").execute(&ctx.deps().db).await?;
@@ -325,13 +325,13 @@ async fn update_user(event: UserUpdated, ctx: Ctx) -> Result<()> {
 
 ```rust
 // ❌ BAD: Assuming inline + background are atomic
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn save_order_inline(event: OrderPlaced, ctx: Ctx) -> Result<PaymentRequested> {
     sqlx::query("INSERT INTO orders ...").execute(&ctx.deps().db).await?;
     Ok(PaymentRequested { order_id: event.order_id })
 }
 
-#[handler(on = PaymentRequested, queued, retry = 3)]
+#[reactor(on = PaymentRequested, queued, retry = 3)]
 async fn charge_payment_background(event: PaymentRequested, ctx: Ctx) -> Result<PaymentCharged> {
     ctx.deps().stripe.charge(&event).await?;
     Ok(PaymentCharged { order_id: event.order_id })
@@ -344,7 +344,7 @@ async fn charge_payment_background(event: PaymentRequested, ctx: Ctx) -> Result<
 
 ```rust
 // ✅ GOOD: Idempotent with explicit failure handling
-#[handler(on = PaymentRequested, queued, retry = 3)]
+#[reactor(on = PaymentRequested, queued, retry = 3)]
 async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentResult> {
     match ctx.deps().stripe.charge(&event).await {
         Ok(_) => Ok(PaymentResult::Charged { order_id: event.order_id }),
@@ -355,7 +355,7 @@ async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentResu
     }
 }
 
-#[handler(on = PaymentResult)]
+#[reactor(on = PaymentResult)]
 async fn handle_payment_result(event: PaymentResult, ctx: Ctx) -> Result<()> {
     match event {
         PaymentResult::Charged { order_id } => {

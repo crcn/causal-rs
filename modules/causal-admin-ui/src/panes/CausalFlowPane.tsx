@@ -16,7 +16,7 @@ import dagre from "@dagrejs/dagre";
 import { useSelector, useDispatch } from "../machine";
 import type { AdminState } from "../state";
 import type { AdminMachineEvent } from "../events";
-import type { AdminEvent, Block, FlowSelection, HandlerDescription, HandlerOutcome } from "../types";
+import type { AdminEvent, Block, FlowSelection, ReactorDescription, ReactorOutcome } from "../types";
 import { eventBg, eventBorder } from "../theme";
 
 // ---------------------------------------------------------------------------
@@ -24,13 +24,13 @@ import { eventBg, eventBorder } from "../theme";
 // ---------------------------------------------------------------------------
 
 type FlowNodeData =
-  | { nodeKind: "event-type"; handlerId: string | null; eventName: string; label: string }
-  | { nodeKind: "handler"; handlerId: string; label: string; blocks?: Block[]; outcome?: HandlerOutcome };
+  | { nodeKind: "event-type"; reactorId: string | null; eventName: string; label: string }
+  | { nodeKind: "reactor"; reactorId: string; label: string; blocks?: Block[]; outcome?: ReactorOutcome };
 
 const NODE_WIDTH = 200;
 const NODE_HEIGHT = 50;
-const HANDLER_WIDTH = 180;
-const HANDLER_HEIGHT = 36;
+const REACTOR_WIDTH = 180;
+const REACTOR_HEIGHT = 36;
 
 // ---------------------------------------------------------------------------
 // Block renderers
@@ -109,8 +109,8 @@ const STATUS_BORDER: Record<string, string> = {
   error: "#ef4444",
 };
 
-const HandlerNode = memo(({ data }: NodeProps) => {
-  const d = data as FlowNodeData & { nodeKind: "handler" };
+const ReactorNode = memo(({ data }: NodeProps) => {
+  const d = data as FlowNodeData & { nodeKind: "reactor" };
   const blocks = d.blocks;
   const outcome = d.outcome;
   const hasBlocks = blocks && blocks.length > 0;
@@ -127,7 +127,7 @@ const HandlerNode = memo(({ data }: NodeProps) => {
       borderRadius: hasBlocks ? 8 : 20,
       fontSize: 10,
       padding: hasBlocks ? "6px 10px" : "4px 12px",
-      width: HANDLER_WIDTH,
+      width: REACTOR_WIDTH,
       color: "#a1a1aa",
       fontStyle: "italic",
       animation: isRunning ? "pulse 2s ease-in-out infinite" : undefined,
@@ -170,7 +170,7 @@ const EventNode = memo(({ data }: NodeProps) => {
   );
 });
 
-const nodeTypes = { handler: HandlerNode, event: EventNode };
+const nodeTypes = { reactor: ReactorNode, event: EventNode };
 
 // ---------------------------------------------------------------------------
 // Graph building
@@ -181,17 +181,17 @@ type FlowGraph = { nodes: Node[]; edges: Edge[] };
 function buildFlowGraph(
   events: AdminEvent[],
   descriptions?: Map<string, Block[]>,
-  outcomes?: Map<string, HandlerOutcome>,
-  hiddenHandlers?: Set<string>,
+  outcomes?: Map<string, ReactorOutcome>,
+  hiddenReactors?: Set<string>,
 ): FlowGraph {
   const eventGroups = new Map<string, { name: string; layer: string; count: number; events: AdminEvent[] }>();
-  const handlerIds = new Set<string>();
-  const parentToHandler = new Map<string, Set<string>>();
-  const handlerToChildren = new Map<string, Set<string>>();
+  const reactorIds = new Set<string>();
+  const parentToReactor = new Map<string, Set<string>>();
+  const reactorToChildren = new Map<string, Set<string>>();
 
   for (const evt of events) {
-    const handler = evt.handlerId ?? "__root__";
-    const groupKey = `${handler}::${evt.name}`;
+    const reactor = evt.reactorId ?? "__root__";
+    const groupKey = `${reactor}::${evt.name}`;
 
     const group = eventGroups.get(groupKey);
     if (group) {
@@ -201,17 +201,17 @@ function buildFlowGraph(
       eventGroups.set(groupKey, { name: evt.name, layer: evt.layer, count: 1, events: [evt] });
     }
 
-    if (evt.handlerId) {
-      handlerIds.add(evt.handlerId);
-      const children = handlerToChildren.get(evt.handlerId) ?? new Set();
+    if (evt.reactorId) {
+      reactorIds.add(evt.reactorId);
+      const children = reactorToChildren.get(evt.reactorId) ?? new Set();
       children.add(groupKey);
-      handlerToChildren.set(evt.handlerId, children);
+      reactorToChildren.set(evt.reactorId, children);
     }
 
-    if (evt.parentId && evt.handlerId) {
-      const handlers = parentToHandler.get(evt.parentId) ?? new Set();
-      handlers.add(evt.handlerId);
-      parentToHandler.set(evt.parentId, handlers);
+    if (evt.parentId && evt.reactorId) {
+      const reactors = parentToReactor.get(evt.parentId) ?? new Set();
+      reactors.add(evt.reactorId);
+      parentToReactor.set(evt.parentId, reactors);
     }
   }
 
@@ -228,8 +228,8 @@ function buildFlowGraph(
 
   // Event-type nodes
   for (const [groupKey, group] of eventGroups) {
-    const emittingHandler = group.events[0]?.handlerId;
-    if (emittingHandler && hiddenHandlers?.has(emittingHandler)) continue;
+    const emittingReactor = group.events[0]?.reactorId;
+    if (emittingReactor && hiddenReactors?.has(emittingReactor)) continue;
     nodes.push({
       id: `evt:${groupKey}`,
       type: "event",
@@ -237,7 +237,7 @@ function buildFlowGraph(
       data: {
         label: `${group.name} (${group.count})`,
         nodeKind: "event-type" as const,
-        handlerId: group.events[0]?.handlerId ?? null,
+        reactorId: group.events[0]?.reactorId ?? null,
         eventName: group.name,
       },
       sourcePosition: Position.Bottom,
@@ -245,16 +245,16 @@ function buildFlowGraph(
     });
   }
 
-  // Handler nodes
-  for (const handlerId of handlerIds) {
-    if (hiddenHandlers?.has(handlerId)) continue;
-    const blocks = descriptions?.get(handlerId);
-    const outcome = outcomes?.get(handlerId);
+  // Reactor nodes
+  for (const reactorId of reactorIds) {
+    if (hiddenReactors?.has(reactorId)) continue;
+    const blocks = descriptions?.get(reactorId);
+    const outcome = outcomes?.get(reactorId);
     nodes.push({
-      id: `hdl:${handlerId}`,
-      type: "handler",
+      id: `hdl:${reactorId}`,
+      type: "reactor",
       position: { x: 0, y: 0 },
-      data: { label: handlerId, nodeKind: "handler" as const, handlerId, blocks, outcome },
+      data: { label: reactorId, nodeKind: "reactor" as const, reactorId, blocks, outcome },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
     });
@@ -262,19 +262,19 @@ function buildFlowGraph(
 
   const arrowMarker = { type: MarkerType.ArrowClosed, color: "#52525b", width: 16, height: 16 };
 
-  // Edges: event group -> handler
-  for (const [parentId, handlers] of parentToHandler) {
+  // Edges: event group -> reactor
+  for (const [parentId, reactors] of parentToReactor) {
     const sourceGroupKey = eventIdToGroup.get(parentId);
     if (!sourceGroupKey) continue;
-    for (const handlerId of handlers) {
-      if (hiddenHandlers?.has(handlerId)) continue;
-      const edgeKey = `evt:${sourceGroupKey}->hdl:${handlerId}`;
+    for (const reactorId of reactors) {
+      if (hiddenReactors?.has(reactorId)) continue;
+      const edgeKey = `evt:${sourceGroupKey}->hdl:${reactorId}`;
       if (!edgeSet.has(edgeKey)) {
         edgeSet.add(edgeKey);
         edges.push({
           id: edgeKey,
           source: `evt:${sourceGroupKey}`,
-          target: `hdl:${handlerId}`,
+          target: `hdl:${reactorId}`,
           style: { stroke: "#52525b", strokeWidth: 1 },
           markerEnd: arrowMarker,
         });
@@ -282,17 +282,17 @@ function buildFlowGraph(
     }
   }
 
-  // Edges: handler -> child event groups
-  for (const [handlerId, childGroupKeys] of handlerToChildren) {
-    if (hiddenHandlers?.has(handlerId)) continue;
+  // Edges: reactor -> child event groups
+  for (const [reactorId, childGroupKeys] of reactorToChildren) {
+    if (hiddenReactors?.has(reactorId)) continue;
     for (const groupKey of childGroupKeys) {
-      const edgeKey = `hdl:${handlerId}->evt:${groupKey}`;
+      const edgeKey = `hdl:${reactorId}->evt:${groupKey}`;
       if (!edgeSet.has(edgeKey)) {
         edgeSet.add(edgeKey);
         const count = eventGroups.get(groupKey)?.count ?? 0;
         edges.push({
           id: edgeKey,
-          source: `hdl:${handlerId}`,
+          source: `hdl:${reactorId}`,
           target: `evt:${groupKey}`,
           style: { stroke: "#52525b", strokeWidth: 1 },
           markerEnd: arrowMarker,
@@ -302,22 +302,22 @@ function buildFlowGraph(
     }
   }
 
-  // Root events -> handler edges
+  // Root events -> reactor edges
   for (const [groupKey, group] of eventGroups) {
-    if (group.events[0]?.handlerId) continue;
+    if (group.events[0]?.reactorId) continue;
     for (const evt of group.events) {
       if (!evt.id) continue;
-      const handlers = parentToHandler.get(evt.id);
-      if (!handlers) continue;
-      for (const handlerId of handlers) {
-        if (hiddenHandlers?.has(handlerId)) continue;
-        const edgeKey = `evt:${groupKey}->hdl:${handlerId}`;
+      const reactors = parentToReactor.get(evt.id);
+      if (!reactors) continue;
+      for (const reactorId of reactors) {
+        if (hiddenReactors?.has(reactorId)) continue;
+        const edgeKey = `evt:${groupKey}->hdl:${reactorId}`;
         if (!edgeSet.has(edgeKey)) {
           edgeSet.add(edgeKey);
           edges.push({
             id: edgeKey,
             source: `evt:${groupKey}`,
-            target: `hdl:${handlerId}`,
+            target: `hdl:${reactorId}`,
             style: { stroke: "#52525b", strokeWidth: 1 },
             markerEnd: arrowMarker,
           });
@@ -326,18 +326,18 @@ function buildFlowGraph(
     }
   }
 
-  // Handlers known from outcomes but not from event stream
+  // Reactors known from outcomes but not from event stream
   if (outcomes) {
-    for (const [handlerId, outcome] of outcomes) {
-      if (handlerIds.has(handlerId)) continue;
-      if (hiddenHandlers?.has(handlerId)) continue;
+    for (const [reactorId, outcome] of outcomes) {
+      if (reactorIds.has(reactorId)) continue;
+      if (hiddenReactors?.has(reactorId)) continue;
 
-      const blocks = descriptions?.get(handlerId);
+      const blocks = descriptions?.get(reactorId);
       nodes.push({
-        id: `hdl:${handlerId}`,
-        type: "handler",
+        id: `hdl:${reactorId}`,
+        type: "reactor",
         position: { x: 0, y: 0 },
-        data: { label: handlerId, nodeKind: "handler" as const, handlerId, blocks, outcome },
+        data: { label: reactorId, nodeKind: "reactor" as const, reactorId, blocks, outcome },
         sourcePosition: Position.Bottom,
         targetPosition: Position.Top,
       });
@@ -346,13 +346,13 @@ function buildFlowGraph(
       for (const eventId of outcome.triggeringEventIds ?? []) {
         const groupKey = eventIdToGroup.get(eventId);
         if (!groupKey) continue;
-        const edgeKey = `evt:${groupKey}->hdl:${handlerId}`;
+        const edgeKey = `evt:${groupKey}->hdl:${reactorId}`;
         if (!edgeSet.has(edgeKey)) {
           edgeSet.add(edgeKey);
           edges.push({
             id: edgeKey,
             source: `evt:${groupKey}`,
-            target: `hdl:${handlerId}`,
+            target: `hdl:${reactorId}`,
             style: { stroke: "#52525b", strokeWidth: 1 },
             markerEnd: arrowMarker,
             animated: isPending,
@@ -365,11 +365,11 @@ function buildFlowGraph(
   return layoutGraph(nodes, edges);
 }
 
-function estimateHandlerHeight(data: FlowNodeData): number {
-  if (data.nodeKind !== "handler") return HANDLER_HEIGHT;
+function estimateReactorHeight(data: FlowNodeData): number {
+  if (data.nodeKind !== "reactor") return REACTOR_HEIGHT;
   const hasBlocks = data.blocks && data.blocks.length > 0;
   const outcome = data.outcome;
-  if (!hasBlocks && !outcome) return HANDLER_HEIGHT;
+  if (!hasBlocks && !outcome) return REACTOR_HEIGHT;
   let h = 24;
   if (data.blocks) {
     for (const block of data.blocks) {
@@ -391,11 +391,11 @@ function layoutGraph(nodes: Node[], edges: Edge[]): FlowGraph {
 
   const heights = new Map<string, number>();
   for (const node of nodes) {
-    const isHandler = node.id.startsWith("hdl:");
-    const h = isHandler ? estimateHandlerHeight(node.data as FlowNodeData) : NODE_HEIGHT;
+    const isReactor = node.id.startsWith("hdl:");
+    const h = isReactor ? estimateReactorHeight(node.data as FlowNodeData) : NODE_HEIGHT;
     heights.set(node.id, h);
     g.setNode(node.id, {
-      width: isHandler ? HANDLER_WIDTH : NODE_WIDTH,
+      width: isReactor ? REACTOR_WIDTH : NODE_WIDTH,
       height: h,
     });
   }
@@ -408,8 +408,8 @@ function layoutGraph(nodes: Node[], edges: Edge[]): FlowGraph {
 
   const laidOut = nodes.map((node) => {
     const pos = g.node(node.id);
-    const isHandler = node.id.startsWith("hdl:");
-    const w = isHandler ? HANDLER_WIDTH : NODE_WIDTH;
+    const isReactor = node.id.startsWith("hdl:");
+    const w = isReactor ? REACTOR_WIDTH : NODE_WIDTH;
     const h = heights.get(node.id) ?? NODE_HEIGHT;
     return {
       ...node,
@@ -433,14 +433,14 @@ function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: AdminE
     const evt = flowData.find(e => e.seq === selectedSeq);
     if (!evt) return;
 
-    const handler = evt.handlerId ?? "__root__";
-    const nodeId = `evt:${handler}::${evt.name}`;
+    const reactor = evt.reactorId ?? "__root__";
+    const nodeId = `evt:${reactor}::${evt.name}`;
     const node = nodes.find(n => n.id === nodeId);
     if (!node) return;
 
-    const isHandler = node.id.startsWith("hdl:");
-    const w = isHandler ? HANDLER_WIDTH : NODE_WIDTH;
-    const h = isHandler ? estimateHandlerHeight(node.data as FlowNodeData) : NODE_HEIGHT;
+    const isReactor = node.id.startsWith("hdl:");
+    const w = isReactor ? REACTOR_WIDTH : NODE_WIDTH;
+    const h = isReactor ? estimateReactorHeight(node.data as FlowNodeData) : NODE_HEIGHT;
 
     setCenter(
       node.position.x + w / 2,
@@ -453,13 +453,13 @@ function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: AdminE
 }
 
 // ---------------------------------------------------------------------------
-// Handler filter dropdown
+// Reactor filter dropdown
 // ---------------------------------------------------------------------------
 
-function HandlerFilter({ allHandlerIds, hiddenHandlers, setHiddenHandlers }: {
-  allHandlerIds: string[];
-  hiddenHandlers: Set<string>;
-  setHiddenHandlers: (s: Set<string>) => void;
+function ReactorFilter({ allReactorIds, hiddenReactors, setHiddenReactors }: {
+  allReactorIds: string[];
+  hiddenReactors: Set<string>;
+  setHiddenReactors: (s: Set<string>) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
@@ -478,16 +478,16 @@ function HandlerFilter({ allHandlerIds, hiddenHandlers, setHiddenHandlers }: {
   }, [open]);
 
   const toggle = (id: string) => {
-    const next = new Set(hiddenHandlers);
+    const next = new Set(hiddenReactors);
     if (next.has(id)) next.delete(id); else next.add(id);
-    setHiddenHandlers(next);
+    setHiddenReactors(next);
   };
 
   const filtered = filter
-    ? allHandlerIds.filter(id => id.toLowerCase().includes(filter.toLowerCase()))
-    : allHandlerIds;
+    ? allReactorIds.filter(id => id.toLowerCase().includes(filter.toLowerCase()))
+    : allReactorIds;
 
-  const hiddenCount = hiddenHandlers.size;
+  const hiddenCount = hiddenReactors.size;
 
   return (
     <div ref={containerRef} className="relative">
@@ -505,7 +505,7 @@ function HandlerFilter({ allHandlerIds, hiddenHandlers, setHiddenHandlers }: {
               type="text"
               value={filter}
               onChange={e => setFilter(e.target.value)}
-              placeholder="Search handlers..."
+              placeholder="Search reactors..."
               className="w-full text-xs bg-transparent border-none outline-none text-foreground placeholder:text-muted-foreground"
             />
           </div>
@@ -514,7 +514,7 @@ function HandlerFilter({ allHandlerIds, hiddenHandlers, setHiddenHandlers }: {
               <label key={id} className="flex items-center gap-2 px-3 py-1 hover:bg-accent cursor-pointer">
                 <input
                   type="checkbox"
-                  checked={!hiddenHandlers.has(id)}
+                  checked={!hiddenReactors.has(id)}
                   onChange={() => toggle(id)}
                   className="rounded border-border"
                 />
@@ -536,18 +536,18 @@ function HandlerFilter({ allHandlerIds, hiddenHandlers, setHiddenHandlers }: {
 // ---------------------------------------------------------------------------
 
 export type CausalFlowPaneProps = {
-  /** Optional set of handler IDs to hide by default. */
-  defaultHiddenHandlers?: Set<string>;
+  /** Optional set of reactor IDs to hide by default. */
+  defaultHiddenReactors?: Set<string>;
   /** Optional extra header content (e.g., domain-specific run stats). */
   headerExtra?: React.ReactNode;
 };
 
-export function CausalFlowPane({ defaultHiddenHandlers, headerExtra }: CausalFlowPaneProps = {}) {
+export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlowPaneProps = {}) {
   const flowRunId = useSelector<AdminState, string | null>((s) => s.flowRunId);
   const flowData = useSelector<AdminState, AdminEvent[]>((s) => s.flowData);
   const flowSelection = useSelector<AdminState, FlowSelection>((s) => s.flowSelection);
-  const descriptionsMap = useSelector<AdminState, Record<string, HandlerDescription[]>>((s) => s.descriptions);
-  const outcomesMap = useSelector<AdminState, Record<string, HandlerOutcome[]>>((s) => s.outcomes);
+  const descriptionsMap = useSelector<AdminState, Record<string, ReactorDescription[]>>((s) => s.descriptions);
+  const outcomesMap = useSelector<AdminState, Record<string, ReactorOutcome[]>>((s) => s.outcomes);
   const dispatch = useDispatch<AdminMachineEvent>();
 
   const flowLoading = flowRunId != null && flowData.length === 0;
@@ -558,7 +558,7 @@ export function CausalFlowPane({ defaultHiddenHandlers, headerExtra }: CausalFlo
     const raw = descriptionsMap[flowRunId];
     if (!raw) return undefined;
     const map = new Map<string, Block[]>();
-    for (const d of raw) map.set(d.handlerId, d.blocks);
+    for (const d of raw) map.set(d.reactorId, d.blocks);
     return map;
   }, [descriptionsMap, flowRunId]);
 
@@ -566,33 +566,33 @@ export function CausalFlowPane({ defaultHiddenHandlers, headerExtra }: CausalFlo
     if (!flowRunId) return undefined;
     const raw = outcomesMap[flowRunId];
     if (!raw) return undefined;
-    const map = new Map<string, HandlerOutcome>();
-    for (const o of raw) map.set(o.handlerId, o);
+    const map = new Map<string, ReactorOutcome>();
+    for (const o of raw) map.set(o.reactorId, o);
     return map;
   }, [outcomesMap, flowRunId]);
 
-  const [hiddenHandlers, setHiddenHandlers] = useState<Set<string>>(
-    () => defaultHiddenHandlers ?? new Set()
+  const [hiddenReactors, setHiddenReactors] = useState<Set<string>>(
+    () => defaultHiddenReactors ?? new Set()
   );
 
-  const allHandlerIds = useMemo(() => {
+  const allReactorIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const evt of flowData) { if (evt.handlerId) ids.add(evt.handlerId); }
+    for (const evt of flowData) { if (evt.reactorId) ids.add(evt.reactorId); }
     if (outcomes) for (const id of outcomes.keys()) ids.add(id);
     return [...ids].sort();
   }, [flowData, outcomes]);
 
   const { nodes: rawNodes, edges: rawEdges } = useMemo(() => {
     if (!flowData || flowData.length === 0) return { nodes: [], edges: [] };
-    return buildFlowGraph(flowData, descriptions, outcomes, hiddenHandlers);
-  }, [flowData, descriptions, outcomes, hiddenHandlers]);
+    return buildFlowGraph(flowData, descriptions, outcomes, hiddenReactors);
+  }, [flowData, descriptions, outcomes, hiddenReactors]);
 
   // Derive selected node ID from flowSelection
   const selectedNodeId = useMemo(() => {
     if (!flowSelection) return null;
-    if (flowSelection.kind === "handler") return `hdl:${flowSelection.handlerId}`;
-    const handler = flowSelection.handlerId ?? "__root__";
-    return `evt:${handler}::${flowSelection.name}`;
+    if (flowSelection.kind === "reactor") return `hdl:${flowSelection.reactorId}`;
+    const reactor = flowSelection.reactorId ?? "__root__";
+    return `evt:${reactor}::${flowSelection.name}`;
   }, [flowSelection]);
 
   // Walk causal chain for highlighting
@@ -654,19 +654,19 @@ export function CausalFlowPane({ defaultHiddenHandlers, headerExtra }: CausalFlo
   const syncTree = useCallback((d: FlowNodeData) => {
     if (!flowData.length) return;
     const match = d.nodeKind === "event-type"
-      ? flowData.find(e => e.handlerId === d.handlerId && e.name === d.eventName)
-      : flowData.find(e => e.handlerId === d.handlerId);
+      ? flowData.find(e => e.reactorId === d.reactorId && e.name === d.eventName)
+      : flowData.find(e => e.reactorId === d.reactorId);
     if (match) {
       dispatch({ type: "ui/event_selected", payload: { seq: match.seq } });
     }
   }, [flowData, dispatch]);
 
-  const openLogsForHandler = useCallback((handlerId: string) => {
-    const evt = flowData.find(e => e.handlerId === handlerId && e.parentId);
+  const openLogsForReactor = useCallback((reactorId: string) => {
+    const evt = flowData.find(e => e.reactorId === reactorId && e.parentId);
     if (evt) {
       dispatch({
         type: "ui/logs_filter_changed",
-        payload: { eventId: evt.parentId!, handlerId, runId: evt.runId, scope: "handler" },
+        payload: { eventId: evt.parentId!, reactorId, runId: evt.runId, scope: "reactor" },
       });
     }
   }, [flowData, dispatch]);
@@ -677,30 +677,30 @@ export function CausalFlowPane({ defaultHiddenHandlers, headerExtra }: CausalFlo
     if (d.nodeKind === "event-type") {
       if (
         flowSelection?.kind === "event-type" &&
-        flowSelection.handlerId === d.handlerId &&
+        flowSelection.reactorId === d.reactorId &&
         flowSelection.name === d.eventName
       ) {
         dispatch({ type: "ui/flow_node_selected", payload: null });
       } else {
         dispatch({
           type: "ui/flow_node_selected",
-          payload: { kind: "event-type", handlerId: d.handlerId, name: d.eventName },
+          payload: { kind: "event-type", reactorId: d.reactorId, name: d.eventName },
         });
         syncTree(d);
       }
-    } else if (d.nodeKind === "handler") {
-      if (flowSelection?.kind === "handler" && flowSelection.handlerId === d.handlerId) {
+    } else if (d.nodeKind === "reactor") {
+      if (flowSelection?.kind === "reactor" && flowSelection.reactorId === d.reactorId) {
         dispatch({ type: "ui/flow_node_selected", payload: null });
       } else {
         dispatch({
           type: "ui/flow_node_selected",
-          payload: { kind: "handler", handlerId: d.handlerId },
+          payload: { kind: "reactor", reactorId: d.reactorId },
         });
         syncTree(d);
-        openLogsForHandler(d.handlerId);
+        openLogsForReactor(d.reactorId);
       }
     }
-  }, [flowSelection, dispatch, syncTree, openLogsForHandler]);
+  }, [flowSelection, dispatch, syncTree, openLogsForReactor]);
 
   const onPaneClick = useCallback(() => {
     dispatch({ type: "ui/flow_node_selected", payload: null });
@@ -755,10 +755,10 @@ export function CausalFlowPane({ defaultHiddenHandlers, headerExtra }: CausalFlo
           {flowData.length} events, {nodes.length} nodes
         </span>
         {headerExtra}
-        <HandlerFilter
-          allHandlerIds={allHandlerIds}
-          hiddenHandlers={hiddenHandlers}
-          setHiddenHandlers={setHiddenHandlers}
+        <ReactorFilter
+          allReactorIds={allReactorIds}
+          hiddenReactors={hiddenReactors}
+          setHiddenReactors={setHiddenReactors}
         />
       </div>
       <div className="flex-1">

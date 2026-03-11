@@ -116,7 +116,7 @@ See [API_MIGRATION.md](./API_MIGRATION.md) for complete migration guide.
 
 - Updated `Effect::handle()` to return `Result<Option<Event>>` instead of `Result<Event>`
 - Effects can now skip unhandled events by returning `Ok(None)`
-- Removed need for verbose `unreachable!()` blocks in effect handlers
+- Removed need for verbose `unreachable!()` blocks in effect reactors
 
 ### Migration Guide
 

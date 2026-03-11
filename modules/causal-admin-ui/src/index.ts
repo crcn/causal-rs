@@ -30,9 +30,9 @@ export type {
   AdminCausalTree,
   AdminCausalFlow,
   Block,
-  HandlerLog,
-  HandlerDescription,
-  HandlerOutcome,
+  ReactorLog,
+  ReactorDescription,
+  ReactorOutcome,
   FilterState,
   LogsFilter,
   FlowSelection,
@@ -56,10 +56,10 @@ export {
   ADMIN_EVENTS,
   ADMIN_CAUSAL_TREE,
   ADMIN_CAUSAL_FLOW,
-  ADMIN_HANDLER_LOGS,
-  ADMIN_HANDLER_LOGS_BY_RUN,
-  ADMIN_HANDLER_DESCRIPTIONS,
-  ADMIN_HANDLER_OUTCOMES,
+  ADMIN_REACTOR_LOGS,
+  ADMIN_REACTOR_LOGS_BY_RUN,
+  ADMIN_REACTOR_DESCRIPTIONS,
+  ADMIN_REACTOR_OUTCOMES,
 } from "./queries";
 
 // ── Theme ──

@@ -12,7 +12,7 @@ pub struct EventRow {
     pub run_id: Option<String>,
     pub correlation_id: Option<Uuid>,
     pub parent_seq: Option<i64>,
-    pub handler_id: Option<String>,
+    pub reactor_id: Option<String>,
 }
 
 /// Processed event ready for the admin UI.
@@ -35,7 +35,7 @@ pub struct AdminEvent {
     pub parent_id: Option<String>,
     pub correlation_id: Option<String>,
     pub run_id: Option<String>,
-    pub handler_id: Option<String>,
+    pub reactor_id: Option<String>,
     /// Optional one-line summary from `EventDisplay::summary`.
     pub summary: Option<String>,
     /// JSON payload as string.
@@ -64,9 +64,9 @@ pub struct AdminCausalFlow {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
-pub struct HandlerLog {
+pub struct ReactorLog {
     pub event_id: String,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub level: String,
     pub message: String,
     pub data: Option<serde_json::Value>,
@@ -75,15 +75,15 @@ pub struct HandlerLog {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
-pub struct HandlerDescription {
-    pub handler_id: String,
+pub struct ReactorDescription {
+    pub reactor_id: String,
     pub blocks: serde_json::Value,
 }
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
-pub struct HandlerOutcome {
-    pub handler_id: String,
+pub struct ReactorOutcome {
+    pub reactor_id: String,
     pub status: String,
     pub error: Option<String>,
     pub attempts: i64,
@@ -110,7 +110,7 @@ impl AdminEvent {
             parent_id: row.parent_id.map(|u| u.to_string()),
             correlation_id: row.correlation_id.map(|u| u.to_string()),
             run_id: row.run_id,
-            handler_id: row.handler_id,
+            reactor_id: row.reactor_id,
             summary,
             payload,
         }

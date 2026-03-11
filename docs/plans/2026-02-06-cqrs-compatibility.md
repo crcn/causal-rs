@@ -11,7 +11,7 @@ CQRS Pattern:
   Command → Write Model → Events → Read Model(s)
 
 Causal's Role:
-  Command → [Thin Layer] → Causal Events → Handlers Update Read Models
+  Command → [Thin Layer] → Causal Events → Reactors Update Read Models
                              ↓
                         Event Store (source of truth)
 ```
@@ -59,10 +59,10 @@ Causal's Role:
 
 **Flow:**
 1. Client sends command
-2. Command handler validates + executes on write model
+2. Command reactor validates + executes on write model
 3. Write model produces events
 4. Events stored in event store
-5. Event handlers update read models (projections)
+5. Event reactors update read models (projections)
 6. Client queries read models
 
 ---
@@ -74,7 +74,7 @@ Causal's Role:
 **Causal handles:**
 - ✅ Event persistence (event store)
 - ✅ Event dispatch (pub/sub)
-- ✅ Event handlers (projection builders)
+- ✅ Event reactors (projection builders)
 - ✅ Retry logic (at-least-once delivery)
 - ✅ Workflow orchestration (multi-step processes)
 
@@ -95,7 +95,7 @@ Causal's Role:
       ▼                         ▼
 ┌─────────────┐         ┌────────────┐
 │  Command    │         │   Query    │
-│  Handler    │         │  Handler   │
+│  Reactor    │         │  Reactor   │
 │  (Your Code)│         │ (Your Code)│
 └──────┬──────┘         └──────┬─────┘
        │                       │
@@ -110,7 +110,7 @@ Causal's Role:
 │               │                     │
 │               ▼                     │
 │  ┌──────────────────────────────┐  │
-│  │     Event Handlers           │  │
+│  │     Event Reactors           │  │
 │  │  - Update Read Model 1       │  │
 │  │  - Update Read Model 2       │  │
 │  │  - Update Analytics          │  │
@@ -142,7 +142,7 @@ struct CreateOrder {
     total: f64,
 }
 
-// Command handler dispatches event directly
+// Command reactor dispatches event directly
 async fn handle_create_order(
     cmd: CreateOrder,
     engine: &Engine,
@@ -166,8 +166,8 @@ async fn handle_create_order(
     Ok(order_id)
 }
 
-// Causal handlers update read models
-#[handler(on = OrderPlaced)]
+// Causal reactors update read models
+#[reactor(on = OrderPlaced)]
 async fn update_orders_view(
     event: OrderPlaced,
     ctx: Ctx,
@@ -186,7 +186,7 @@ async fn update_orders_view(
     Ok(())
 }
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn update_user_stats_view(
     event: OrderPlaced,
     ctx: Ctx,
@@ -206,7 +206,7 @@ async fn update_user_stats_view(
     Ok(())
 }
 
-// Query handler reads from read model (outside Causal)
+// Query reactor reads from read model (outside Causal)
 async fn get_user_orders(user_id: Uuid, db: &PgPool) -> Result<Vec<Order>> {
     sqlx::query_as(
         "SELECT * FROM orders_view WHERE user_id = $1 ORDER BY created_at DESC"
@@ -238,7 +238,7 @@ struct Order {
 }
 
 impl Order {
-    // Factory method (command handler)
+    // Factory method (command reactor)
     async fn create(
         cmd: CreateOrder,
         db: &PgPool,
@@ -263,7 +263,7 @@ impl Order {
         ])
     }
 
-    // Command handler
+    // Command reactor
     async fn cancel(
         order_id: Uuid,
         reason: String,
@@ -344,8 +344,8 @@ async fn create_order_endpoint(
     Ok(Json(order_id))
 }
 
-// Causal handlers update read models (same as Pattern 1)
-#[handler(on = OrderPlaced)]
+// Causal reactors update read models (same as Pattern 1)
+#[reactor(on = OrderPlaced)]
 async fn update_orders_view(...) { ... }
 ```
 
@@ -363,7 +363,7 @@ async fn update_orders_view(...) { ... }
 
 ```rust
 // Single event updates multiple read models
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn update_orders_view(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     // Normalized read model (for order details)
     sqlx::query(
@@ -380,7 +380,7 @@ async fn update_orders_view(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     Ok(())
 }
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn update_user_stats_view(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     // Denormalized read model (for user dashboard)
     sqlx::query(
@@ -399,7 +399,7 @@ async fn update_user_stats_view(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     Ok(())
 }
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn update_analytics_view(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     // Analytics read model (for reporting)
     sqlx::query(
@@ -416,7 +416,7 @@ async fn update_analytics_view(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     Ok(())
 }
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn update_elasticsearch(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     // Search read model (for full-text search)
     ctx.deps().elasticsearch
@@ -458,7 +458,7 @@ async fn search_orders(query: &str, es: &Elasticsearch) -> Result<Vec<Order>> {
 **Characteristics:**
 - ✅ Optimized read models per query type
 - ✅ Multiple storage backends (Postgres, Elasticsearch, Redis)
-- ✅ Eventually consistent (handlers run async)
+- ✅ Eventually consistent (reactors run async)
 - ⚠️ More complexity (maintain multiple models)
 
 ---
@@ -499,10 +499,10 @@ async fn create_order(cmd: CreateOrder, engine: &Engine) -> Result<Uuid> {
 }
 
 // Read model updates (async, independent)
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn update_orders_view(...) { /* Fast */ }
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn update_elasticsearch(...) { /* Slow, doesn't block write */ }
 ```
 
@@ -663,20 +663,20 @@ let order = get_order_at_time(
 
 ### How Async-First Improves CQRS
 
-**OLD (inline handlers):**
+**OLD (inline reactors):**
 ```
 Command → Event persisted → Read models updated in same TX
           ↑_______________________________________________↑
           Single long transaction (slow read models block write)
 ```
 
-**NEW (async handlers):**
+**NEW (async reactors):**
 ```
 Command → Event persisted (fast!)
             ↓
           Queue (separate streams per event type)
             ↓
-          Read model handlers (independent, async)
+          Read model reactors (independent, async)
 ```
 
 ### Performance Improvement
@@ -721,7 +721,7 @@ OrderPlaced event →
   │    ├─ Slow read models (Elasticsearch) - Process when ready
   │    └─ External systems (webhooks) - Process with retry
   │
-  └─ Each handler is independent, can fail/retry separately
+  └─ Each reactor is independent, can fail/retry separately
 ```
 
 **Benefits:**
@@ -754,7 +754,7 @@ struct CancelOrder {
     reason: String,
 }
 
-// Command handlers (validate + dispatch events)
+// Command reactors (validate + dispatch events)
 async fn handle_create_order(
     cmd: CreateOrder,
     engine: &Engine,
@@ -839,7 +839,7 @@ enum OrderEvent {
 // QUERY SIDE - Read Model 1: Orders View (Current State)
 // ============================================================================
 
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 async fn update_orders_view(
     event: OrderEvent,
     ctx: Ctx,
@@ -915,7 +915,7 @@ async fn get_order(order_id: Uuid, db: &PgPool) -> Result<Order> {
 // QUERY SIDE - Read Model 2: User Dashboard (Denormalized)
 // ============================================================================
 
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 async fn update_user_dashboard(
     event: OrderEvent,
     ctx: Ctx,
@@ -974,7 +974,7 @@ async fn get_user_dashboard(user_id: Uuid, db: &PgPool) -> Result<UserDashboard>
 // QUERY SIDE - Read Model 3: Analytics (Aggregates)
 // ============================================================================
 
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 async fn update_analytics(
     event: OrderEvent,
     ctx: Ctx,
@@ -1011,7 +1011,7 @@ async fn get_daily_sales(db: &PgPool) -> Result<Vec<DailySales>> {
 // QUERY SIDE - Read Model 4: Search (Elasticsearch)
 // ============================================================================
 
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 async fn update_search_index(
     event: OrderEvent,
     ctx: Ctx,
@@ -1216,7 +1216,7 @@ async fn cancel_order(cmd: CancelOrder, engine: &Engine, db: &PgPool) -> Result<
 **Causal's role:**
 - ✅ Event store (source of truth)
 - ✅ Event dispatcher (pub/sub)
-- ✅ Projection builder (handlers update read models)
+- ✅ Projection builder (reactors update read models)
 - ✅ Retry + reliability (at-least-once delivery)
 
 **You add:**

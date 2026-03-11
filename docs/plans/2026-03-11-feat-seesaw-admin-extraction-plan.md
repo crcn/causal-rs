@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-11
 **Status:** Draft
-**Context:** The rootsignal admin app has a mature event browser (timeline, causal tree, causal flow DAG, handler logs) built on top of causal's event tables. This functionality is generic — it queries causal's own schema, not rootsignal-specific tables. Extracting it into reusable modules lets any causal-based project get the same observability out of the box.
+**Context:** The rootsignal admin app has a mature event browser (timeline, causal tree, causal flow DAG, reactor logs) built on top of causal's event tables. This functionality is generic — it queries causal's own schema, not rootsignal-specific tables. Extracting it into reusable modules lets any causal-based project get the same observability out of the box.
 
 ## Directory Structure
 
@@ -43,10 +43,10 @@ causal-rs/
           TimelinePane.tsx     # Event stream with filters, infinite scroll, live sub
           CausalTreePane.tsx   # Recursive parent→child tree view
           CausalFlowPane.tsx   # ReactFlow DAG with describe blocks
-          LogsPane.tsx         # Structured handler logs
+          LogsPane.tsx         # Structured reactor logs
         components/
           EventNode.tsx        # ReactFlow event-type node
-          HandlerNode.tsx      # ReactFlow handler node with Block rendering
+          HandlerNode.tsx      # ReactFlow reactor node with Block rendering
           BlockRenderer.tsx    # Describe block renderers (checklist, progress, etc.)
           JsonSyntax.tsx       # Colorized JSON renderer
           CopyablePayload.tsx  # Expandable payload with copy/fullscreen
@@ -74,10 +74,10 @@ causal-rs/
 | `db/models/scout_run.rs` → `causal_tree()` | `queries.rs` | Queries by `correlation_id` |
 | `db/models/scout_run.rs` → `causal_flow()` | `queries.rs` | Queries by `run_id` |
 | `db/models/scout_run.rs` → `get_event_by_seq()` | `queries.rs` | Single event lookup |
-| `db/models/scout_run.rs` → `handler_logs()` | `queries.rs` | Queries `causal_handler_logs` |
-| `db/models/scout_run.rs` → `handler_logs_by_run()` | `queries.rs` | Queries `causal_handler_logs` |
+| `db/models/scout_run.rs` → `handler_logs()` | `queries.rs` | Queries `causal_reactor_logs` |
+| `db/models/scout_run.rs` → `handler_logs_by_run()` | `queries.rs` | Queries `causal_reactor_logs` |
 | `db/models/scout_run.rs` → `handler_outcomes()` | `queries.rs` | Queries `causal_effect_executions` |
-| `db/models/scout_run.rs` → `handler_descriptions()` | `queries.rs` | Queries `causal_handler_descriptions` |
+| `db/models/scout_run.rs` → `handler_descriptions()` | `queries.rs` | Queries `causal_reactor_descriptions` |
 | `event_cache.rs` → `EventCache` | `cache.rs` | Bounded in-memory cache with indexes |
 | `event_broadcast.rs` → `EventBroadcast` | `broadcast.rs` | pg_notify listener → broadcast |
 | `graphql/schema.rs` → `admin_events()` etc. | `graphql.rs` | async-graphql resolvers |

@@ -1,16 +1,16 @@
 ---
-title: "refactor: Split Store into EventLog + HandlerQueue"
+title: "refactor: Split Store into EventLog + ReactorQueue"
 type: refactor
 date: 2026-03-08
 brainstorm: docs/brainstorms/2026-03-08-kurrentdb-store-composition.md
 ---
 
-# Split Store into EventLog + HandlerQueue
+# Split Store into EventLog + ReactorQueue
 
 ## Overview
 
 Replace the monolithic `Store` trait with two focused traits: `EventLog` (durable
-event history) and `HandlerQueue` (work distribution). This eliminates the
+event history) and `ReactorQueue` (work distribution). This eliminates the
 redundant event buffer (`causal_events` queue), halves event writes, and enables
 swapping `PostgresEventLog` for `KurrentDbEventLog` with zero other changes.
 
@@ -20,7 +20,7 @@ The `Store` trait does three jobs:
 
 1. **Event buffer** — `publish`/`poll_next`/`complete_event` (transient queue)
 2. **Event log** — `append_event`/`load_stream`/`load_global_from` (durable history)
-3. **Handler queue** — `poll_next_handler`/`resolve_handler` (work distribution)
+3. **Reactor queue** — `poll_next_handler`/`resolve_handler` (work distribution)
 
 Job 1 is redundant. Every event passes through both the buffer AND the log — two
 copies, two writes. With a checkpoint cursor, the log itself can be the source
@@ -28,9 +28,9 @@ for the settle loop.
 
 ## Proposed Solution
 
-Kill the event buffer. Two traits remain: `EventLog` and `HandlerQueue`.
+Kill the event buffer. Two traits remain: `EventLog` and `ReactorQueue`.
 The engine holds both, reads new events from the log via checkpoint, creates
-handler intents via the queue.
+reactor intents via the queue.
 
 See brainstorm for full design rationale and pressure-tested issues.
 
@@ -41,7 +41,7 @@ These were resolved during the brainstorm phase. Not re-litigating here:
 - **Correlation-primary streams** for KurrentDB (Strategy A)
 - **Routing metadata** (`_hops`, `_batch_id`, etc.) in `NewEvent.metadata`
 - **In-memory event retry counter** (KurrentDB subscription model)
-- **Log before resolve** atomicity (emitted events appended before handler complete)
+- **Log before resolve** atomicity (emitted events appended before reactor complete)
 - **Total idempotency contract** on `EventLog::append`
 - **Aggregate matching before append** (cheap JSON extraction, no IO)
 - **Engine-side ephemeral cache** (not on IntentCommit)
@@ -60,7 +60,7 @@ no DLQ, just checkpoint advancement).
 
 ### C2: `QueueStatus.pending_events` removed
 
-`HandlerQueue` cannot compute "events past checkpoint" without access to
+`ReactorQueue` cannot compute "events past checkpoint" without access to
 `EventLog`. Remove `pending_events` from `QueueStatus`. If the engine needs it
 (e.g. for the admin panel), it computes it: `log.load_from(queue.checkpoint(), MAX).len()`.
 
@@ -69,7 +69,7 @@ no DLQ, just checkpoint advancement).
 Add `ephemeral: Option<Arc<dyn Any + Send + Sync>>` to both `NewEvent` and
 `PersistedEvent`. `MemoryStore::append` copies it through. Postgres/KurrentDB
 ignore it (always `None` on load). The engine-side ephemeral cache is populated
-from `PersistedEvent.ephemeral` during Phase 1 of settle. For Postgres, handlers
+from `PersistedEvent.ephemeral` during Phase 1 of settle. For Postgres, reactors
 JSON-deserialize — same as today for replayed events. Acceptable.
 
 For same-process dispatch optimization: `dispatch()` stores the ephemeral on
@@ -84,7 +84,7 @@ Custom `Debug` impl needed since `Arc<dyn Any>` doesn't implement `Debug`.
 pub fn new(
     deps: D,
     log: Arc<dyn EventLog>,
-    queue: Arc<dyn HandlerQueue>,
+    queue: Arc<dyn ReactorQueue>,
 ) -> Self
 ```
 
@@ -111,7 +111,7 @@ source of events now). `MemoryStore::with_persistence()` removed.
 
 Engine writes `_batch_id`, `_batch_index`, `_batch_size` to `NewEvent.metadata`
 in `build_new_event`. During Phase 1, engine reads them from
-`PersistedEvent.metadata` and populates `HandlerIntent.batch_id/index/size`.
+`PersistedEvent.metadata` and populates `ReactorIntent.batch_id/index/size`.
 Same flow as `_hops`.
 
 ### C7: Projection execution timing
@@ -119,11 +119,11 @@ Same flow as `_hops`.
 Projections run during Phase 1 of settle, inside `process_event`. Same timing as
 today. `IntentCommit.projection_failures` captures any failures.
 
-### C8: Handler descriptions in `enqueue`
+### C8: Reactor descriptions in `enqueue`
 
 `IntentCommit.handler_descriptions` is persisted atomically with intents inside
 `queue.enqueue()`. No separate `set_descriptions` call needed during settle.
-The `set_descriptions`/`get_descriptions` methods on `HandlerQueue` remain for
+The `set_descriptions`/`get_descriptions` methods on `ReactorQueue` remain for
 external callers (admin panel, ProcessHandle).
 
 ### C9: `EventOutcome` and rejection removed
@@ -145,14 +145,14 @@ persistent failures exhaust retries. The counter resets on process restart.
 | File | Action |
 |---|---|
 | `src/event_log.rs` | **New** — `EventLog` trait |
-| `src/handler_queue.rs` | **New** — `HandlerQueue` trait |
+| `src/handler_queue.rs` | **New** — `ReactorQueue` trait |
 | `src/types.rs` | **Modify** — add `IntentCommit`, `EventPark`; add `ephemeral` to `NewEvent`/`PersistedEvent`; remove `QueuedEvent`, `EventCommit`, `EventOutcome`, `pending_events` from `QueueStatus`; remove `events_to_publish` from `HandlerCompletion`/`HandlerDlq` |
 | `src/store.rs` | **Remove** |
-| `src/memory_store.rs` | **Modify** — implement `EventLog` + `HandlerQueue`; remove event buffer; add checkpoint; remove persistence flag |
+| `src/memory_store.rs` | **Modify** — implement `EventLog` + `ReactorQueue`; remove event buffer; add checkpoint; remove persistence flag |
 | `src/engine.rs` | **Modify** — `log` + `queue` fields; rewrite settle loop; rewrite dispatch; ephemeral cache; `in_memory()` helper |
-| `src/job_executor.rs` | **Modify** — `Arc<dyn HandlerQueue>` for journaling; `process_event` returns `IntentCommit` |
-| `src/process.rs` | **Modify** — `Arc<dyn HandlerQueue>` |
-| `src/handler/context.rs` | **Modify** — `Arc<dyn HandlerQueue>` for `JournalState` |
+| `src/job_executor.rs` | **Modify** — `Arc<dyn ReactorQueue>` for journaling; `process_event` returns `IntentCommit` |
+| `src/process.rs` | **Modify** — `Arc<dyn ReactorQueue>` |
+| `src/reactor/context.rs` | **Modify** — `Arc<dyn ReactorQueue>` for `JournalState` |
 | `src/event_store.rs` | **Modify** — `&dyn EventLog` for helper functions |
 | `src/lib.rs` | **Modify** — update re-exports |
 | `tests/engine_integration.rs` | **Modify** — update all tests |
@@ -174,7 +174,7 @@ pub struct IntentCommit {
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
-    pub intents: Vec<HandlerIntent>,
+    pub intents: Vec<ReactorIntent>,
     pub projection_failures: Vec<ProjectionFailure>,
     pub handler_descriptions: HashMap<String, serde_json::Value>,
     pub checkpoint: u64,
@@ -215,24 +215,24 @@ pub trait EventLog: Send + Sync {
 }
 ```
 
-##### 1c. `HandlerQueue` trait in `handler_queue.rs`
+##### 1c. `ReactorQueue` trait in `handler_queue.rs`
 
 ```rust
 // crates/causal/src/handler_queue.rs
 
 #[async_trait]
-pub trait HandlerQueue: Send + Sync {
+pub trait ReactorQueue: Send + Sync {
     async fn enqueue(&self, commit: IntentCommit) -> Result<()>;
     async fn checkpoint(&self) -> Result<u64>;
-    async fn dequeue(&self) -> Result<Option<QueuedHandler>>;
+    async fn dequeue(&self) -> Result<Option<QueuedReactor>>;
     async fn earliest_pending_at(&self) -> Result<Option<DateTime<Utc>>>;
     async fn resolve(&self, resolution: HandlerResolution) -> Result<()>;
     async fn reclaim_stale(&self) -> Result<()> { Ok(()) }
 
     // Journaling
-    async fn load_journal(&self, handler_id: &str, event_id: Uuid) -> Result<Vec<JournalEntry>>;
-    async fn append_journal(&self, handler_id: &str, event_id: Uuid, seq: u32, value: Value) -> Result<()>;
-    async fn clear_journal(&self, handler_id: &str, event_id: Uuid) -> Result<()>;
+    async fn load_journal(&self, reactor_id: &str, event_id: Uuid) -> Result<Vec<JournalEntry>>;
+    async fn append_journal(&self, reactor_id: &str, event_id: Uuid, seq: u32, value: Value) -> Result<()>;
+    async fn clear_journal(&self, reactor_id: &str, event_id: Uuid) -> Result<()>;
 
     // Coordination
     async fn cancel(&self, correlation_id: Uuid) -> Result<()> { Ok(()) }
@@ -254,7 +254,7 @@ Keep old re-exports for now.
 
 #### Phase 2: MemoryStore implements new traits (additive)
 
-**Goal:** `MemoryStore` implements both `EventLog` and `HandlerQueue`. Old `Store`
+**Goal:** `MemoryStore` implements both `EventLog` and `ReactorQueue`. Old `Store`
 impl stays temporarily.
 
 ##### 2a. `impl EventLog for MemoryStore`
@@ -268,12 +268,12 @@ Map existing methods:
 
 Store `ephemeral` from `NewEvent` on `PersistedEvent` in the in-memory log.
 
-##### 2b. `impl HandlerQueue for MemoryStore`
+##### 2b. `impl ReactorQueue for MemoryStore`
 
 New field: `checkpoint: Arc<AtomicU64>` (initialized to 0).
 
 Map existing methods:
-- `enqueue` — new: create handler intents + advance checkpoint atomically
+- `enqueue` — new: create reactor intents + advance checkpoint atomically
 - `checkpoint` — new: return current checkpoint value
 - `dequeue` ← current `poll_next_handler`
 - `earliest_pending_at` ← current `earliest_pending_handler_at`
@@ -283,7 +283,7 @@ Map existing methods:
 - Coordination methods ← unchanged
 
 The `enqueue` implementation replaces the old `complete_event(EventOutcome::Processed(...))`.
-It takes an `IntentCommit`, creates `QueuedHandler` entries for each intent,
+It takes an `IntentCommit`, creates `QueuedReactor` entries for each intent,
 handles `park` (DLQ recording), and advances the checkpoint.
 
 **Critical change in `resolve`:** Currently `resolve_handler(Complete(...))` takes
@@ -292,7 +292,7 @@ In the new design, `resolve` does NOT publish events — the engine appends to t
 log before calling resolve. `HandlerCompletion` and `HandlerDlq` no longer have
 `events_to_publish`.
 
-This means the NEW `resolve` impl for MemoryStore is simpler: just mark the handler
+This means the NEW `resolve` impl for MemoryStore is simpler: just mark the reactor
 complete/retry/dlq. No event publishing.
 
 ##### 2c. Remove `persistence_enabled`
@@ -300,14 +300,14 @@ complete/retry/dlq. No event publishing.
 Remove the flag, `with_persistence()`, and the conditional logic. The event log
 is always active. `MemoryStore::new()` is the only constructor.
 
-**Checkpoint:** `cargo test` passes. Both old `Store` and new `EventLog`/`HandlerQueue`
+**Checkpoint:** `cargo test` passes. Both old `Store` and new `EventLog`/`ReactorQueue`
 impls coexist on MemoryStore.
 
 ---
 
 #### Phase 3: Switch engine and all consumers (breaking)
 
-**Goal:** Engine uses `EventLog` + `HandlerQueue`. Old `Store` trait removed.
+**Goal:** Engine uses `EventLog` + `ReactorQueue`. Old `Store` trait removed.
 All tests updated.
 
 This is the big bang. Do it in one commit — there's no useful intermediate state
@@ -320,9 +320,9 @@ where the engine half-uses the old Store and half-uses the new traits.
 
 pub struct Engine<D: Send + Sync + 'static> {
     log: Arc<dyn EventLog>,
-    queue: Arc<dyn HandlerQueue>,
+    queue: Arc<dyn ReactorQueue>,
     deps: Arc<D>,
-    handlers: Arc<HandlerRegistry<D>>,
+    reactors: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
     // ... (unchanged: upcasters, projections, global_dlq_mapper, etc.)
 }
@@ -331,7 +331,7 @@ impl<D: Send + Sync + 'static> Engine<D> {
     pub fn new(
         deps: D,
         log: Arc<dyn EventLog>,
-        queue: Arc<dyn HandlerQueue>,
+        queue: Arc<dyn ReactorQueue>,
     ) -> Self { ... }
 
     /// Convenience: in-memory engine for tests.
@@ -342,7 +342,7 @@ impl<D: Send + Sync + 'static> Engine<D> {
 }
 ```
 
-Remove `with_store()`. Builder methods (`.with_handler()`, `.with_aggregator()`,
+Remove `with_store()`. Builder methods (`.with_reactor()`, `.with_aggregator()`,
 etc.) unchanged.
 
 ##### 3b. Rewrite settle loop
@@ -394,7 +394,7 @@ pub async fn settle(&self) -> Result<()> {
                 continue;
             }
 
-            // Process: hydrate aggregates, apply, match handlers, run projections
+            // Process: hydrate aggregates, apply, match reactors, run projections
             match self.process_event(&event).await {
                 Ok(commit) => {
                     self.queue.enqueue(commit).await?;
@@ -404,7 +404,7 @@ pub async fn settle(&self) -> Result<()> {
             }
         }
 
-        // ── Phase 2: Execute handlers ──
+        // ── Phase 2: Execute reactors ──
         let mut executions = vec![];
         while let Some(mut h) = self.queue.dequeue().await? {
             // Inject ephemeral from cache
@@ -416,7 +416,7 @@ pub async fn settle(&self) -> Result<()> {
             did_work = true;
             // Cancellation check (batch)
             // Hydrate aggregates
-            // Execute handlers in parallel
+            // Execute reactors in parallel
             // For each result:
             //   log.append(emitted_events)  ← FIRST
             //   queue.resolve(Complete/DLQ) ← THEN
@@ -442,17 +442,17 @@ Responsibilities:
 1. Hydrate cold aggregates (`log.load_stream` + `log.load_snapshot`)
 2. Apply event to aggregator state
 3. Auto-snapshot if configured (`log.save_snapshot`)
-4. Match handlers, run projections
+4. Match reactors, run projections
 5. Build `IntentCommit` with checkpoint = event.position
 
 ##### 3d. Rewrite `build_new_event`
 
-Replaces `build_queued_events`. Takes `EmittedEvent` + parent `QueuedHandler`,
+Replaces `build_queued_events`. Takes `EmittedEvent` + parent `QueuedReactor`,
 returns `NewEvent` with routing metadata in `metadata` map:
 
 - `_hops`: parent hops + 1
 - `_batch_id`, `_batch_index`, `_batch_size`: from emitted event
-- `_handler_id`: handler that produced this event
+- `_reactor_id`: reactor that produced this event
 - Plus any engine-level metadata (`event_metadata` from `.with_event_metadata()`)
 
 Deterministic event ID generation (UUID v5) unchanged.
@@ -472,19 +472,19 @@ pub async fn dispatch(&self, event: impl Event) -> Result<()> {
 ##### 3f. Update supporting code
 
 **`job_executor.rs`:**
-- Field: `store: Arc<dyn Store>` → `queue: Arc<dyn HandlerQueue>`
+- Field: `store: Arc<dyn Store>` → `queue: Arc<dyn ReactorQueue>`
 - `execute_event` removed (replaced by `process_event` on Engine)
 - `execute_handler` unchanged (uses `queue.load_journal` for replay)
 - Passes `queue.clone()` to `Context::with_journal`
 
 **`process.rs`:**
-- Field: `store: Option<Arc<dyn Store>>` → `queue: Option<Arc<dyn HandlerQueue>>`
+- Field: `store: Option<Arc<dyn Store>>` → `queue: Option<Arc<dyn ReactorQueue>>`
 - `cancel()` → `queue.cancel()`
 - `status()` → `queue.status()`
 
-**`handler/context.rs`:**
-- `JournalState.store: Arc<dyn Store>` → `queue: Arc<dyn HandlerQueue>`
-- `with_journal` takes `Arc<dyn HandlerQueue>`
+**`reactor/context.rs`:**
+- `JournalState.store: Arc<dyn Store>` → `queue: Arc<dyn ReactorQueue>`
+- `with_journal` takes `Arc<dyn ReactorQueue>`
 
 **`event_store.rs`:**
 - `persist_event` takes `&dyn EventLog` instead of `&dyn Store`
@@ -502,7 +502,7 @@ pub async fn dispatch(&self, event: impl Event) -> Result<()> {
 ##### 3h. Update `lib.rs` re-exports
 
 Remove: `Store`, `QueuedEvent`, `EventCommit`, `EventOutcome`
-Add: `EventLog`, `HandlerQueue`, `IntentCommit`, `EventPark`
+Add: `EventLog`, `ReactorQueue`, `IntentCommit`, `EventPark`
 Keep: all other existing re-exports
 
 ##### 3i. Update all tests
@@ -513,9 +513,9 @@ Keep: all other existing re-exports
 - `store.global_log()` still works (MemoryStore helper, not on trait)
 - Remove any references to `QueuedEvent`, `EventCommit`, `EventOutcome`
 
-**`src/handler/context.rs` tests:**
-- All `Arc<dyn Store>` → `Arc<dyn HandlerQueue>`
-- `MemoryStore::new()` still works (implements HandlerQueue)
+**`src/reactor/context.rs` tests:**
+- All `Arc<dyn Store>` → `Arc<dyn ReactorQueue>`
+- `MemoryStore::new()` still works (implements ReactorQueue)
 
 **`src/event_store.rs` tests:**
 - `MemoryStore::with_persistence()` → `MemoryStore::new()`
@@ -537,12 +537,12 @@ Keep: all other existing re-exports
 ### Functional Requirements
 
 - [x] `EventLog` trait defined with 5 methods (3 required, 2 optional)
-- [x] `HandlerQueue` trait defined with 13 methods (8 required, 5 optional)
-- [x] `MemoryStore` implements both `EventLog` and `HandlerQueue`
-- [x] `Engine` holds `Arc<dyn EventLog>` + `Arc<dyn HandlerQueue>`
+- [x] `ReactorQueue` trait defined with 13 methods (8 required, 5 optional)
+- [x] `MemoryStore` implements both `EventLog` and `ReactorQueue`
+- [x] `Engine` holds `Arc<dyn EventLog>` + `Arc<dyn ReactorQueue>`
 - [x] `Engine::in_memory(deps)` convenience constructor works
 - [x] Settle loop uses checkpoint-based reading from EventLog
-- [x] Handler results: engine appends emitted events to log, then resolves
+- [x] Reactor results: engine appends emitted events to log, then resolves
 - [x] Routing metadata (`_hops`, `_batch_id`, etc.) round-trips through metadata map
 - [x] Ephemeral typed events preserved through MemoryStore path
 - [x] `IntentCommit::park()` and `::skip()` advance checkpoint
@@ -568,7 +568,7 @@ these changes (NOT part of this PR, but tracked here for completeness):
 
 ### PostgresStore split
 
-`PostgresStore` (838 lines) → `PostgresEventLog` + `PostgresHandlerQueue`.
+`PostgresStore` (838 lines) → `PostgresEventLog` + `PostgresReactorQueue`.
 
 **PostgresEventLog** implements:
 - `append` ← current `append_event` (add `metadata JSONB` column for routing keys)
@@ -576,7 +576,7 @@ these changes (NOT part of this PR, but tracked here for completeness):
 - `load_stream` ← current `load_stream`
 - `load_snapshot` / `save_snapshot` ← unchanged
 
-**PostgresHandlerQueue** implements:
+**PostgresReactorQueue** implements:
 - `enqueue` ← current `commit_event` logic (insert intents + advance checkpoint)
 - `checkpoint` ← new: `SELECT position FROM causal_checkpoints WHERE correlation_id = $1`
 - `dequeue` ← current `poll_next_handler`
@@ -601,7 +601,7 @@ pub fn build_engine(deps: ScoutEngineDeps, causal_store: Option<Arc<dyn causal::
 pub fn build_engine(
     deps: ScoutEngineDeps,
     log: Option<Arc<dyn causal::EventLog>>,
-    queue: Option<Arc<dyn causal::HandlerQueue>>,
+    queue: Option<Arc<dyn causal::ReactorQueue>>,
 )
 ```
 
@@ -615,9 +615,9 @@ When `None`, use `Engine::in_memory(deps)`.
 fn make_store(&self, run_id: Uuid) -> Option<Arc<dyn causal::Store>>
 
 // After
-fn make_store(&self, run_id: Uuid) -> (Arc<dyn causal::EventLog>, Arc<dyn causal::HandlerQueue>) {
+fn make_store(&self, run_id: Uuid) -> (Arc<dyn causal::EventLog>, Arc<dyn causal::ReactorQueue>) {
     let log = Arc::new(PostgresEventLog::new(self.pg_pool.clone(), run_id));
-    let queue = Arc::new(PostgresHandlerQueue::new(self.pg_pool.clone(), run_id));
+    let queue = Arc::new(PostgresReactorQueue::new(self.pg_pool.clone(), run_id));
     (log, queue)
 }
 ```
@@ -633,20 +633,20 @@ let store_arc = Arc::new(store) as Arc<dyn Store>;
 build_full_engine(deps, Some(store_arc))
 
 // After
-let queue = Arc::new(PostgresHandlerQueue::new(pool.clone(), run_id));
+let queue = Arc::new(PostgresReactorQueue::new(pool.clone(), run_id));
 queue.reclaim_stale().await?;
-if queue.has_pending_work().await? { ... }  // custom method on PostgresHandlerQueue
+if queue.has_pending_work().await? { ... }  // custom method on PostgresReactorQueue
 let log = Arc::new(PostgresEventLog::new(pool, run_id));
 build_full_engine(deps, Some(log), Some(queue))
 ```
 
-`has_pending_work()` stays as a custom method on `PostgresHandlerQueue` (not on
-the trait). It queries: pending handlers + events past checkpoint. Since both are
+`has_pending_work()` stays as a custom method on `PostgresReactorQueue` (not on
+the trait). It queries: pending reactors + events past checkpoint. Since both are
 in the same Postgres database, it can join across tables.
 
 ### `build_infra_only_engine`
 
-Creates both `PostgresEventLog` and `PostgresHandlerQueue` scoped to `run_id`.
+Creates both `PostgresEventLog` and `PostgresReactorQueue` scoped to `run_id`.
 
 ### `pending_events` in admin panel
 
@@ -657,11 +657,11 @@ helper that queries `SELECT COUNT(*) FROM events WHERE seq > checkpoint`.
 
 ### Atomicity note
 
-Current `complete_handler_inner` publishes emitted events atomically with handler
+Current `complete_handler_inner` publishes emitted events atomically with reactor
 completion (same Postgres transaction). New design: `log.append()` then
 `queue.resolve()` are separate calls. For same-Postgres setup, this could be
 wrapped in a Postgres transaction by having `PostgresEventLog` and
-`PostgresHandlerQueue` share a transaction handle — but the trait API doesn't
+`PostgresReactorQueue` share a transaction handle — but the trait API doesn't
 support that. The idempotency contract (dedup by event_id) covers crash safety.
 Accept the behavioral change.
 

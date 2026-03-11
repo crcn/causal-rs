@@ -22,7 +22,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-causal_core_macros = { version = "0.26.0", path = "../causal_core_macros", optional = true }
+causal_core_macros = { version = "0.1.0", path = "../causal_core_macros", optional = true }
 
 [dev-dependencies]
 fastrand.workspace = true

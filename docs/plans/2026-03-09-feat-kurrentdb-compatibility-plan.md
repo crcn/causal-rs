@@ -159,7 +159,7 @@ directly. No more Rust type name. No separate `durable_type` field.
 | Postgres `events.event_type` column | `"ScrapeEvent"` | `"scrape:web_scrape_completed"` |
 | KurrentDB event type | N/A | `"scrape:web_scrape_completed"` |
 | Admin-app display | reassembled from hardcoded maps | read directly from column |
-| `QueuedHandler.event_type` | `"ScrapeEvent"` | `"scrape:web_scrape_completed"` |
+| `QueuedReactor.event_type` | `"ScrapeEvent"` | `"scrape:web_scrape_completed"` |
 
 ### Codec/Aggregator/Upcaster Registration
 
@@ -192,7 +192,7 @@ it uses `durable_name`:
 
 ```rust
 // engine.rs build_new_events
-let seed = format!("{}-{}{}-{}-{}", event_id, handler_id, id_infix, e.durable_name, idx);
+let seed = format!("{}-{}{}-{}-{}", event_id, reactor_id, id_infix, e.durable_name, idx);
 let new_event_id = Uuid::new_v5(&NAMESPACE_CAUSAL, seed.as_bytes());
 ```
 
@@ -220,12 +220,12 @@ For persistent events (persistent=true):
   → hydrate + apply aggregators
   → auto-snapshot if configured
   → run projections
-  → build handler intents
+  → build reactor intents
 
 For ephemeral events (persistent=false):
   → skip aggregator hydration/apply/snapshot
   → skip projections
-  → build handler intents (routing still works)
+  → build reactor intents (routing still works)
 ```
 
 ### Design Decisions
@@ -236,10 +236,10 @@ For ephemeral events (persistent=false):
 | Permanent store (KurrentDB) | **Skip** | Not domain facts; `persistent` flag controls forwarding |
 | Aggregate apply | **Skip** | Not domain facts; would diverge on KurrentDB replay |
 | Projections | **Skip** | Not domain facts; must be replayable from permanent log |
-| Handler routing | **Yes** | The whole point — coordination signals trigger handlers |
+| Reactor routing | **Yes** | The whole point — coordination signals trigger reactors |
 | Hop counting | **Yes** | Infinite loop protection applies equally |
 | parent_id | **Set** | Full causal chain preserved in operational store |
-| Crash recovery | **Durable** | Event is in Postgres; handler intents rebuild from log |
+| Crash recovery | **Durable** | Event is in Postgres; reactor intents rebuild from log |
 | Admin visualization | **Visible** | In Postgres events table with `persistent=false` |
 | Checkpoint | **Advances** | Normal checkpoint advancement via load_from() |
 | Retention | **TTL** | Postgres events table has retention; KurrentDB retains permanent events forever |
@@ -248,7 +248,7 @@ For ephemeral events (persistent=false):
 
 ### Phase 1: `Event` Trait + `#[event]` Proc Macro
 
-#### `crates/causal/src/handler/mod.rs` → new `event.rs` module
+#### `crates/causal/src/reactor/mod.rs` → new `event.rs` module
 
 ```rust
 // crates/causal/src/event.rs
@@ -261,7 +261,7 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 
 - [ ] Define `Event` trait
 - [ ] Re-export from `lib.rs`
-- [ ] Add to existing handler bounds: `on::<E>()` requires `E: Event`
+- [ ] Add to existing reactor bounds: `on::<E>()` requires `E: Event`
 
 #### `crates/causal_core_macros/src/lib.rs`
 
@@ -294,7 +294,7 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 
 ### Phase 2: Wire `Event` Trait Through Engine
 
-#### `crates/causal/src/handler/types.rs`
+#### `crates/causal/src/reactor/types.rs`
 
 - [ ] `EventOutput::new::<E: Event>(event: E)` → set `durable_name = event.durable_name().to_string()`
 - [ ] `EventOutput::new::<E: Event>(event: E)` → set `persistent = !E::is_ephemeral()`
@@ -364,18 +364,18 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 #### Tests
 
 - [x] `#[event(ephemeral)]` event → in operational store with `persistent=false`
-- [x] `#[event(ephemeral)]` event → downstream handler executes
+- [x] `#[event(ephemeral)]` event → downstream reactor executes
 - [x] Ephemeral event does NOT apply to aggregates
 - [x] Ephemeral event does NOT run projections
 - [x] Mixed: persistent + ephemeral in same `events![]` return
-- [x] Ephemeral handler emits persistent event → persistent event IS in log with `persistent=true`
+- [x] Ephemeral reactor emits persistent event → persistent event IS in log with `persistent=true`
 - [x] Hop counting works for ephemeral events
 - [x] Chained ephemeral → ephemeral → persistent works
 - [x] Ephemeral-only root event settles correctly
 - [x] Multiple sequential ephemeral root events all fire
-- [x] `on_any` handler fires for ephemeral events
+- [x] `on_any` reactor fires for ephemeral events
 - [x] `emit_output` path handles ephemeral events
-- [x] Retry handler works with ephemeral events
+- [x] Retry reactor works with ephemeral events
 
 ### Phase 4: Update All Existing Events
 
@@ -407,11 +407,11 @@ pub trait Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send +
 ### Ephemeral events (two-tier persistence)
 - [x] `#[event(ephemeral)]` events persisted to operational store with `persistent=false`
 - [x] `persistent` flag NOT used by EventLog trait — it's metadata for downstream forwarders
-- [x] Ephemeral events route to handlers (intents created)
+- [x] Ephemeral events route to reactors (intents created)
 - [x] Ephemeral events skip aggregate apply
 - [x] Ephemeral events skip projections
 - [x] Hop counting works
-- [x] Crash recovery: events durable in Postgres; handler intents rebuild from log
+- [x] Crash recovery: events durable in Postgres; reactor intents rebuild from log
 - [x] All existing tests pass (with `#[event]` added to test types)
 
 ### Backward compatibility (rootsignal migration)

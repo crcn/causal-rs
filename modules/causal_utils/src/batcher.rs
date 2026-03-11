@@ -9,10 +9,10 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-/// A shared batcher that accumulates work items across concurrent handler
+/// A shared batcher that accumulates work items across concurrent reactor
 /// invocations, then flushes them together when a threshold is met.
 ///
-/// This is the dataloader pattern applied to event handlers: each handler
+/// This is the dataloader pattern applied to event reactors: each reactor
 /// thinks it's doing one unit of work, but the batcher transparently groups
 /// items and processes them in a single batch call.
 ///

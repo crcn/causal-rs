@@ -1,6 +1,6 @@
 -- Migration: Add Dead Letter Queue
 -- Date: 2026-02-06
--- Purpose: Track handlers that fail permanently after max retries
+-- Purpose: Track reactors that fail permanently after max retries
 
 -- Status enum for DLQ lifecycle
 CREATE TYPE causal_dlq_status AS ENUM ('open', 'retrying', 'replayed', 'resolved');
@@ -9,9 +9,9 @@ CREATE TYPE causal_dlq_status AS ENUM ('open', 'retrying', 'replayed', 'resolved
 CREATE TABLE causal_dead_letter_queue (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
-    -- References to original event and handler
+    -- References to original event and reactor
     event_id UUID NOT NULL REFERENCES causal_events(id) ON DELETE CASCADE,
-    handler_id TEXT NOT NULL,
+    reactor_id TEXT NOT NULL,
     intent_id UUID NOT NULL UNIQUE,  -- Prevent duplicate retries
 
     -- Error details
@@ -36,9 +36,9 @@ CREATE TABLE causal_dead_letter_queue (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Index for finding open DLQ entries by handler
+-- Index for finding open DLQ entries by reactor
 CREATE INDEX idx_dlq_handler_open
-    ON causal_dead_letter_queue(handler_id, created_at DESC)
+    ON causal_dead_letter_queue(reactor_id, created_at DESC)
     WHERE status IN ('open', 'retrying');
 
 -- Index for finding all DLQ entries for an event

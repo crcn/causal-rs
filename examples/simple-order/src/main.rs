@@ -1,7 +1,7 @@
 //! Simple Order Processing Example
 
 use anyhow::Result;
-use causal::{event, handles, Context, Engine};
+use causal::{event, reactors, Context, Engine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ impl Deps {
     }
 }
 
-#[handles]
+#[reactors]
 mod order_handlers {
     use super::*;
 
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         shipping_enabled: true,
     };
 
-    let engine = Engine::in_memory(deps).with_handlers(order_handlers::handles());
+    let engine = Engine::in_memory(deps).with_reactors(order_handlers::handles());
 
     println!("Processing orders...\n");
 

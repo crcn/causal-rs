@@ -2,7 +2,7 @@ import { useState, useMemo } from "react";
 import { useSelector, useDispatch } from "../machine";
 import type { AdminState } from "../state";
 import type { AdminMachineEvent } from "../events";
-import type { HandlerLog, LogsFilter } from "../types";
+import type { ReactorLog, LogsFilter } from "../types";
 import { LOG_LEVEL_COLORS } from "../theme";
 import { formatTs } from "../utils";
 
@@ -10,7 +10,7 @@ import { formatTs } from "../utils";
 // LogRow
 // ---------------------------------------------------------------------------
 
-function LogRow({ log, showHandler }: { log: HandlerLog; showHandler: boolean }) {
+function LogRow({ log, showReactor }: { log: ReactorLog; showReactor: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const levelColor = LOG_LEVEL_COLORS[log.level] ?? "bg-zinc-600/30 text-zinc-400";
 
@@ -23,9 +23,9 @@ function LogRow({ log, showHandler }: { log: HandlerLog; showHandler: boolean })
         <span className="text-[10px] text-muted-foreground shrink-0">
           {formatTs(log.loggedAt)}
         </span>
-        {showHandler && (
+        {showReactor && (
           <span className="text-[10px] font-mono text-zinc-500 shrink-0">
-            {log.handlerId}
+            {log.reactorId}
           </span>
         )}
         <span className="text-[11px] text-zinc-200 truncate">{log.message}</span>
@@ -57,7 +57,7 @@ export type LogsPaneProps = {
 };
 
 export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
-  const logs = useSelector<AdminState, HandlerLog[]>((s) => s.logs);
+  const logs = useSelector<AdminState, ReactorLog[]>((s) => s.logs);
   const logsFilter = useSelector<AdminState, LogsFilter>((s) => s.logsFilter);
   const dispatch = useDispatch<AdminMachineEvent>();
 
@@ -65,7 +65,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   const [searchText, setSearchText] = useState("");
 
   const isRunScope = logsFilter.scope === "run" && logsFilter.runId != null;
-  const hasFilter = logsFilter.eventId != null || logsFilter.handlerId != null;
+  const hasFilter = logsFilter.eventId != null || logsFilter.reactorId != null;
 
   // Client-side filtering
   const filteredLogs = useMemo(() => {
@@ -75,7 +75,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
       filtered = filtered.filter(
         (l) =>
           l.message.toLowerCase().includes(lower) ||
-          l.handlerId.toLowerCase().includes(lower) ||
+          l.reactorId.toLowerCase().includes(lower) ||
           (l.data && String(l.data).toLowerCase().includes(lower)),
       );
     }
@@ -85,7 +85,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   if (!hasFilter) {
     return (
       <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
-        Click a handler node in the causal tree to view logs
+        Click a reactor node in the causal tree to view logs
       </div>
     );
   }
@@ -106,10 +106,10 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
         {/* Scope toggle */}
         <div className="flex items-center gap-1 text-[11px]">
           <button
-            onClick={() => dispatch({ type: "ui/logs_filter_changed", payload: { scope: "handler" } })}
-            className={`px-2 py-0.5 rounded ${logsFilter.scope === "handler" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+            onClick={() => dispatch({ type: "ui/logs_filter_changed", payload: { scope: "reactor" } })}
+            className={`px-2 py-0.5 rounded ${logsFilter.scope === "reactor" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
           >
-            This handler
+            This reactor
           </button>
           {logsFilter.runId && (
             <button
@@ -161,8 +161,8 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
 
       {/* Header */}
       <div className="px-3 py-1.5 text-[10px] text-muted-foreground">
-        <span className="font-mono">{logsFilter.handlerId}</span>
-        {isRunScope && <span className="ml-1">(all handlers in run)</span>}
+        <span className="font-mono">{logsFilter.reactorId}</span>
+        {isRunScope && <span className="ml-1">(all reactors in run)</span>}
         <span className="ml-2">{filteredLogs.length} logs</span>
       </div>
 
@@ -172,7 +172,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
           <div className="p-3 text-[11px] text-muted-foreground">No logs match filters</div>
         )}
         {filteredLogs.map((log, i) => (
-          <LogRow key={i} log={log} showHandler={isRunScope} />
+          <LogRow key={i} log={log} showReactor={isRunScope} />
         ))}
       </div>
     </div>

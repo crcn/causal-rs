@@ -94,7 +94,7 @@ pub trait EventStore: Clone + Send + Sync + 'static {
 **File:** `crates/causal/src/aggregate_loader.rs`
 
 ```rust
-use crate::{Aggregate, EventStore, Handler, StoredEvent};
+use crate::{Aggregate, EventStore, Reactor, StoredEvent};
 use anyhow::Result;
 
 /// Builder for loading aggregates from event store
@@ -105,7 +105,7 @@ where
 {
     store: &'a S,
     aggregate_id: A::Id,
-    handlers: Vec<Box<dyn Handler<A, E>>>,
+    reactors: Vec<Box<dyn Reactor<A, E>>>,
     from_version: u64,
     _phantom: std::marker::PhantomData<E>,
 }
@@ -120,15 +120,15 @@ where
         Self {
             store,
             aggregate_id,
-            handlers: Vec::new(),
+            reactors: Vec::new(),
             from_version: 0,
             _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Add handlers to apply events
-    pub fn with_handlers(mut self, handlers: Vec<Box<dyn Handler<A, E>>>) -> Self {
-        self.handlers = handlers;
+    /// Add reactors to apply events
+    pub fn with_reactors(mut self, reactors: Vec<Box<dyn Reactor<A, E>>>) -> Self {
+        self.reactors = reactors;
         self
     }
 
@@ -145,9 +145,9 @@ where
         let mut aggregate = A::default();
 
         for stored_event in events {
-            // Apply each handler to the aggregate
-            for handler in &self.handlers {
-                handler.apply(&mut aggregate, &stored_event.data)?;
+            // Apply each reactor to the aggregate
+            for reactor in &self.reactors {
+                reactor.apply(&mut aggregate, &stored_event.data)?;
             }
 
             aggregate.set_version(stored_event.sequence);
@@ -158,17 +158,17 @@ where
 }
 ```
 
-## Phase 2: Adapt Handler Macro (2-3 days)
+## Phase 2: Adapt Reactor Macro (2-3 days)
 
-### 2.1 Make handlers pure (remove async)
+### 2.1 Make reactors pure (remove async)
 
-**File:** `crates/causal/src/handler/types.rs`
+**File:** `crates/causal/src/reactor/types.rs`
 
-Update the `Handler` trait:
+Update the `Reactor` trait:
 
 ```rust
-/// Handler trait for pure projections
-pub trait Handler<A, E>: Send + Sync + 'static
+/// Reactor trait for pure projections
+pub trait Reactor<A, E>: Send + Sync + 'static
 where
     A: Aggregate,
     E: Clone + Send + Sync + 'static,
@@ -176,33 +176,33 @@ where
     /// Apply event to aggregate state
     fn apply(&self, state: &mut A, event: &E) -> Result<()>;
 
-    /// Handler ID for debugging
+    /// Reactor ID for debugging
     fn id(&self) -> &str;
 }
 ```
 
-### 2.2 Update macro to generate pure handlers
+### 2.2 Update macro to generate pure reactors
 
-**File:** `crates/causal_core_macros/src/handler.rs`
+**File:** `crates/causal_core_macros/src/reactor.rs`
 
 Change generated code from:
 
 ```rust
-// Old: async handler returning events
+// Old: async reactor returning events
 async fn execute(&self, ctx: Context<D>) -> Result<Option<Event>>
 ```
 
 To:
 
 ```rust
-// New: pure handler mutating state
+// New: pure reactor mutating state
 fn apply(&self, state: &mut Aggregate, event: &Event) -> Result<()>
 ```
 
 ### 2.3 Keep Context optional (for projections with async)
 
 ```rust
-#[handler(on = OrderEvent, extract(order_id, customer_id))]
+#[reactor(on = OrderEvent, extract(order_id, customer_id))]
 async fn project_with_lookup(
     order_id: Uuid,
     customer_id: Uuid,
@@ -402,7 +402,7 @@ where
 
 ```rust
 use anyhow::Result;
-use causal::{handler, Aggregate, AggregateLoader};
+use causal::{reactor, Aggregate, AggregateLoader};
 use causal_postgres::PostgresEventStore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -442,26 +442,26 @@ enum OrderEvent {
     Shipped,
 }
 
-// Handlers (projections)
-#[handlers]
+// Reactors (projections)
+#[reactors]
 mod order_projections {
     use super::*;
 
-    #[handler(on = OrderEvent, extract(order_id))]
+    #[reactor(on = OrderEvent, extract(order_id))]
     fn apply_created(order_id: Uuid, state: &mut Order) -> Result<()> {
         state.id = order_id;
         state.status = OrderStatus::Draft;
         Ok(())
     }
 
-    #[handler(on = OrderEvent, extract(item, total))]
+    #[reactor(on = OrderEvent, extract(item, total))]
     fn apply_item_added(item: String, total: f64, state: &mut Order) -> Result<()> {
         state.items.push(item);
         state.total = total;
         Ok(())
     }
 
-    #[handler(on = OrderEvent)]
+    #[reactor(on = OrderEvent)]
     fn apply_placed(state: &mut Order) -> Result<()> {
         state.status = OrderStatus::Placed;
         Ok(())
@@ -488,7 +488,7 @@ async fn main() -> Result<()> {
     // Load aggregate
     let order: Order = store
         .aggregate(order_id)
-        .with_handlers(order_projections::handlers())
+        .with_reactors(order_projections::reactors())
         .load()
         .await?;
 
@@ -519,8 +519,8 @@ async fn main() -> Result<()> {
 - [ ] Add `Aggregate` trait
 - [ ] Add `EventStore` trait
 - [ ] Add `AggregateLoader` builder
-- [ ] Update `Handler` trait for pure functions
-- [ ] Modify `#[handler]` macro to generate pure handlers
+- [ ] Update `Reactor` trait for pure functions
+- [ ] Modify `#[reactor]` macro to generate pure reactors
 - [ ] Support optional `Context` for async projections
 
 ### Backend Changes
@@ -553,7 +553,7 @@ async fn main() -> Result<()> {
 
 ### What Breaks
 1. `Engine` API changes completely
-2. Handlers change from `async fn(...) -> Result<Event>` to `fn(..., &mut State) -> Result<()>`
+2. Reactors change from `async fn(...) -> Result<Event>` to `fn(..., &mut State) -> Result<()>`
 3. No automatic event dispatch
 4. Context no longer always available
 
@@ -565,7 +565,7 @@ async fn main() -> Result<()> {
 ## Timeline Estimate
 
 - **Phase 1 (Core Traits)**: 1-2 days
-- **Phase 2 (Handler Macro)**: 2-3 days
+- **Phase 2 (Reactor Macro)**: 2-3 days
 - **Phase 3 (PostgreSQL)**: 2-3 days
 - **Phase 4 (Examples)**: 1-2 days
 - **Phase 5 (Docs)**: 2-3 days
@@ -580,7 +580,7 @@ async fn main() -> Result<()> {
 
 2. **How to handle async projections (read models)?**
    - Current proposal: Optional `Context<Deps>` parameter
-   - Makes handler `async` if Context present
+   - Makes reactor `async` if Context present
 
 3. **Command pattern: helper macros or just manual?**
    - Could add `#[command]` macro

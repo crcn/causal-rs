@@ -1,7 +1,7 @@
 //! AI Summarizer Example
 
 use anyhow::{bail, Result};
-use causal::{event, events, handler, Context, Engine};
+use causal::{event, events, reactor, Context, Engine};
 use serde::{Deserialize, Serialize};
 use std::env;
 use uuid::Uuid;
@@ -94,8 +94,8 @@ async fn main() -> Result<()> {
         api_key,
     };
 
-    let engine = Engine::in_memory(deps).with_handler(
-        handler::on::<SummaryEvent>()
+    let engine = Engine::in_memory(deps).with_reactor(
+        reactor::on::<SummaryEvent>()
             .id("summarize")
             .extract(|e| match e {
                 SummaryEvent::SummarizeRequested { task_id, text } => {

@@ -43,7 +43,7 @@ impl EventCache {
     ) -> anyhow::Result<Self> {
         let start = std::time::Instant::now();
 
-        let columns = "seq, ts, event_type, payload AS data, id, parent_id, run_id, correlation_id, parent_seq, handler_id";
+        let columns = "seq, ts, event_type, payload AS data, id, parent_id, run_id, correlation_id, parent_seq, reactor_id";
         let query = format!(
             "SELECT {columns} FROM events ORDER BY seq DESC LIMIT $1"
         );
@@ -93,8 +93,8 @@ impl EventCache {
             self.by_run.entry(run_id.clone()).or_default().push(seq);
         }
 
-        if let Some(ref handler_id) = event.handler_id {
-            self.by_handler.entry(handler_id.clone()).or_default().push(seq);
+        if let Some(ref reactor_id) = event.reactor_id {
+            self.by_handler.entry(reactor_id.clone()).or_default().push(seq);
         }
 
         self.events.push_back(event);
@@ -130,13 +130,13 @@ impl EventCache {
             }
         }
 
-        if let Some(ref handler_id) = evicted.handler_id {
-            if let Some(bucket) = self.by_handler.get_mut(handler_id) {
+        if let Some(ref reactor_id) = evicted.reactor_id {
+            if let Some(bucket) = self.by_handler.get_mut(reactor_id) {
                 if let Ok(pos) = bucket.binary_search(&seq) {
                     bucket.remove(pos);
                 }
                 if bucket.is_empty() {
-                    self.by_handler.remove(handler_id);
+                    self.by_handler.remove(reactor_id);
                 }
             }
         }
@@ -299,7 +299,7 @@ fn row_to_event(row: &sqlx::postgres::PgRow) -> EventRow {
         run_id: row.get("run_id"),
         correlation_id: row.get("correlation_id"),
         parent_seq: row.get("parent_seq"),
-        handler_id: row.get("handler_id"),
+        reactor_id: row.get("reactor_id"),
     }
 }
 
@@ -314,7 +314,7 @@ mod tests {
         payload: &str,
         run_id: Option<&str>,
         correlation_id: Option<&str>,
-        handler_id: Option<&str>,
+        reactor_id: Option<&str>,
         parent_id: Option<&str>,
     ) -> AdminEvent {
         AdminEvent {
@@ -327,7 +327,7 @@ mod tests {
             parent_id: parent_id.map(String::from),
             correlation_id: correlation_id.map(String::from),
             run_id: run_id.map(String::from),
-            handler_id: handler_id.map(String::from),
+            reactor_id: reactor_id.map(String::from),
             summary: None,
             payload: payload.to_string(),
         }
@@ -337,13 +337,13 @@ mod tests {
     fn push_updates_all_indexes() {
         let mut cache = EventCache::new(10);
         let cid = Uuid::new_v4().to_string();
-        let event = Arc::new(make_event(1, "TestEvent", r#"{"type":"test"}"#, Some("run-1"), Some(&cid), Some("handler-a"), None));
+        let event = Arc::new(make_event(1, "TestEvent", r#"{"type":"test"}"#, Some("run-1"), Some(&cid), Some("reactor-a"), None));
 
         cache.push(event);
 
         assert!(cache.by_seq.contains_key(&1));
         assert_eq!(cache.by_run.get("run-1").unwrap(), &vec![1i64]);
-        assert_eq!(cache.by_handler.get("handler-a").unwrap(), &vec![1i64]);
+        assert_eq!(cache.by_handler.get("reactor-a").unwrap(), &vec![1i64]);
         let cid_uuid = Uuid::parse_str(&cid).unwrap();
         assert_eq!(cache.by_correlation.get(&cid_uuid).unwrap(), &vec![1i64]);
     }

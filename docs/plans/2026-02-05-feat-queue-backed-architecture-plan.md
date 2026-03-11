@@ -26,7 +26,7 @@ These decisions are **locked** and form the semantic contract of the system. Cha
 **Rationale**:
 - Storing `prev_state`/`next_state` JSON per effect execution doesn't scale (15GB/month → bloat)
 - Effect workers already load fresh state from `causal_state` before execution
-- Effects are side-effect handlers, not time-travelers - they operate on current reality
+- Effects are side-effect reactors, not time-travelers - they operate on current reality
 
 **API Contract**:
 ```rust
@@ -94,7 +94,7 @@ tx.commit().await?;  // ← Both succeed or both fail
 
 **API**:
 ```rust
-// Webhook handler
+// Webhook reactor
 async fn handle_stripe_webhook(payload: StripeWebhook) -> Result<()> {
     // Use webhook ID as event_id (Stripe guarantees uniqueness)
     engine.process_with_id(
@@ -593,7 +593,7 @@ let engine = Engine::with_deps(deps).with_queue(queue.clone());
 let mut runtime = Runtime::new(engine.clone(), queue);
 runtime.spawn_workers(2, 4);  // 2 event workers, 4 effect workers
 
-// Process external events (webhooks, HTTP handlers)
+// Process external events (webhooks, HTTP reactors)
 engine.process(OrderPlaced { ... }).await?;
 
 // Shutdown
@@ -617,7 +617,7 @@ effect::on::<OrderPlaced>().then(|event, ctx| async move {
 
 **API Design**:
 ```rust
-engine.with_handler(
+engine.with_reactor(
     effect::on::<OrderPlaced>()
         .id("send_welcome_email")  // ← Required! Compile error if missing
         .then(|event, ctx| async move {
@@ -687,10 +687,10 @@ impl<E> EffectBuilder<E, NoId> {
 
 // Can only call .then() if HasIdTag
 impl<E> EffectBuilder<E, HasIdTag> {
-    pub fn then<F>(self, handler: F) -> Effect<E> {
+    pub fn then<F>(self, reactor: F) -> Effect<E> {
         Effect {
             id: self.effect_id.unwrap(),  // Safe - HasIdTag guarantees it
-            handler: Box::new(handler),
+            reactor: Box::new(reactor),
         }
     }
 }
@@ -737,7 +737,7 @@ async fn run_effect_idempotent(
     }
 
     // Execute effect (outside transaction - can take time)
-    match effect.handler.handle(event, ctx).await {
+    match effect.reactor.handle(event, ctx).await {
         Ok(result) => {
             // Store success
             sqlx::query!(
@@ -1060,7 +1060,7 @@ async fn event_worker_loop(&self) -> Result<()> {
                 }
 
                 // Execute effect NOW
-                let result = effect.handler.execute(&event, &ctx).await?;
+                let result = effect.reactor.execute(&event, &ctx).await?;
 
                 // Record execution (idempotency)
                 sqlx::query!(
@@ -1208,7 +1208,7 @@ async fn effect_worker_loop(&self) -> Result<()> {
         let effect = self.effects.get(&pending.effect_id);
         let result = tokio::time::timeout(
             Duration::from_secs(pending.timeout_seconds as u64),
-            effect.handler.handle(&event_payload, &ctx)
+            effect.reactor.handle(&event_payload, &ctx)
         ).await;
 
         match result {
@@ -1325,7 +1325,7 @@ let (prev_state, version) = sqlx::query!(/* ... */)
 // In run_effect_idempotent:
 match tokio::time::timeout(
     Duration::from_secs(30),
-    effect.handler.handle(event, ctx)
+    effect.reactor.handle(event, ctx)
 ).await {
     Ok(Ok(result)) => {
         // Effect succeeded
@@ -1513,7 +1513,7 @@ for effect in self.effects.handlers_for(&queued.event_type) {
 tx.commit().await?;
 
 // Step 8: Workers poll for ready effects (separate process)
-// This happens in a background worker loop, not in this event handler
+// This happens in a background worker loop, not in this event reactor
 ```
 
 **Why better**:
@@ -1684,7 +1684,7 @@ if event.hops >= 50 {
 // Process normally...
 
 // When effect returns new event, increment hops:
-let next_event = effect.handler.handle(&event, &ctx).await?;
+let next_event = effect.reactor.handle(&event, &ctx).await?;
 queue.publish_with_hops(next_event, event.hops + 1).await?;
 ```
 
@@ -1820,7 +1820,7 @@ LIMIT 10;
 - ✅ No worker deadlocks (timeouts)
 - ✅ No stuck events (reaper)
 - ✅ No data loss (transactional effect intents)
-- ✅ Graceful deploys (shutdown handler)
+- ✅ Graceful deploys (shutdown reactor)
 - ✅ Scalability documented (hot workflow limitation)
 - ✅ DLQ for failed events
 - ✅ Priority queue support
@@ -1845,7 +1845,7 @@ async fn main() -> Result<()> {
 
     // Create engine with effects and reducers
     let engine = Engine::new(deps)
-        .with_handler(
+        .with_reactor(
             effect::on::<OrderPlaced>()
                 .id("process_order")  // ← REQUIRED for idempotency
                 .then(|event, ctx| async move {
@@ -1855,7 +1855,7 @@ async fn main() -> Result<()> {
                     })
                 })
         )
-        .with_handler(
+        .with_reactor(
             effect::on::<ApprovalRequested>()
                 .id("send_approval_email")  // ← REQUIRED
                 .then(|event, ctx| async move {
@@ -2183,7 +2183,7 @@ async fn main() -> Result<()> {
     let pool = PgPool::connect(&env::var("DATABASE_URL")?).await?;
 
     let engine = Engine::new(deps)
-        .with_handler(/* ... */)
+        .with_reactor(/* ... */)
         .with_reducer(/* ... */);
 
     let queue = PostgresQueue::new(pool)
@@ -2392,13 +2392,13 @@ pub struct WaitAnyHandle {
 }
 
 impl WaitAnyHandle {
-    pub fn on<E: Event, R>(self, handler: impl Fn(E) -> Result<R>) -> Self;
+    pub fn on<E: Event, R>(self, reactor: impl Fn(E) -> Result<R>) -> Self;
     pub fn timeout(self, duration: Duration) -> Self;
 }
 
 impl<R> IntoFuture for WaitAnyHandle {
     type Output = Result<R>;
-    // Waits for first matching event, applies handler
+    // Waits for first matching event, applies reactor
 }
 
 // Trait for matching events (supports matches! macro)
@@ -2477,7 +2477,7 @@ impl<E> EffectBuilder<E, HasIdTag> {
     // Priority (automatically triggers queued)
     pub fn priority(self, priority: i32) -> Self;              // → Queued (default: 10)
 
-    pub fn then<F>(self, handler: F) -> Effect<E>;  // ← Only available after .id()
+    pub fn then<F>(self, reactor: F) -> Effect<E>;  // ← Only available after .id()
 }
 
 // Examples:
@@ -2539,7 +2539,7 @@ let effects = on! {
 };
 
 // Returns Vec<Effect<S, D>> - add to engine
-let engine = effects.into_iter().fold(Engine::new(deps), |e, eff| e.with_handler(eff));
+let engine = effects.into_iter().fold(Engine::new(deps), |e, eff| e.with_reactor(eff));
 ```
 
 #### Attribute Syntax
@@ -2909,7 +2909,7 @@ async fn list_workflows(
 - [ ] Use `ctx.idempotency_key` for external API calls (Stripe, etc.)
 - [ ] Add database setup (migrations for queue tables)
 - [ ] Configure connection pool sizing (`max_connections = workers * 2`)
-- [ ] Add graceful shutdown handler (`ctrl-c` → `engine.shutdown()`)
+- [ ] Add graceful shutdown reactor (`ctrl-c` → `engine.shutdown()`)
 
 ## What to Skip
 
@@ -3318,7 +3318,7 @@ impl ThrottledEffectWorker {
         let effect = engine.effects.get(&pending.effect_id);
         let result = tokio::time::timeout(
             Duration::from_secs(pending.timeout_seconds as u64),
-            effect.handler.handle(&event_payload, &ctx)
+            effect.reactor.handle(&event_payload, &ctx)
         ).await??;
 
         Ok(result)
@@ -3579,7 +3579,7 @@ engine.process(OrderPlaced { id: 123, total: 99.99 }).await?;
 ```
 
 **Use when**:
-- Processing external events (webhooks, HTTP handlers, cron jobs)
+- Processing external events (webhooks, HTTP reactors, cron jobs)
 - You don't need to wait for a specific response event
 - Standard fire-and-forget semantics
 
@@ -3634,7 +3634,7 @@ engine.process_with_id(event_id, correlation_id, OrderPlaced { ... }).await?;
 
 #### Request/Response Pattern
 
-For synchronous request/response (HTTP handlers that need a result):
+For synchronous request/response (HTTP reactors that need a result):
 
 ```rust
 use causal::{dispatch_request, EnvelopeMatch};
@@ -3649,7 +3649,7 @@ let result = dispatch_request(
 ```
 
 **Use when**:
-- HTTP handlers need to return results to clients
+- HTTP reactors need to return results to clients
 - Waiting for specific terminal events (success or failure)
 - CQRS-style read-after-write
 

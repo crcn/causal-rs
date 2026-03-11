@@ -242,7 +242,7 @@ effect::on::<ManagerApprovalRequested>().then(|event, ctx| async move {
     Ok(())
 });
 
-// Timeout webhook handler
+// Timeout webhook reactor
 async fn check_approval_timeout(payload: TimeoutCheck) -> Result<()> {
     let order = db.get_order(payload.order_id).await?;
 

@@ -1,4 +1,4 @@
-//! Handler builder functions and types.
+//! Reactor builder functions and types.
 
 use std::any::TypeId;
 use std::future::Future;
@@ -9,11 +9,11 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::context::Context;
-use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Handler, Projection};
+use super::types::{AnyEvent, BoxFuture, DlqTerminalInfo, Events, Reactor, Projection};
 use crate::event_codec::EventCodec;
 
 #[track_caller]
-fn default_handler_id(prefix: &str) -> String {
+fn default_reactor_id(prefix: &str) -> String {
     let location = std::panic::Location::caller();
     format!(
         "{prefix}@{}:{}:{}",
@@ -23,22 +23,22 @@ fn default_handler_id(prefix: &str) -> String {
     )
 }
 
-/// Marker for typed event handlers (`on::<E>()`).
+/// Marker for typed event reactors (`on::<E>()`).
 pub struct Typed<E>(PhantomData<E>);
 
-/// Marker for any event handlers (`on_any()`).
+/// Marker for any event reactors (`on_any()`).
 pub struct Untyped;
 
 /// Marker for no filter.
 pub struct NoFilter;
 
-/// Builder for handlers with a context-aware filter predicate.
+/// Builder for reactors with a context-aware filter predicate.
 ///
-/// Created by calling `.filter(predicate)` on a `HandlerBuilder`.
-/// The predicate receives both the event and the handler [`Context`],
+/// Created by calling `.filter(predicate)` on a `ReactorBuilder`.
+/// The predicate receives both the event and the reactor [`Context`],
 /// giving access to aggregate state, deps, etc.
-pub struct FilteredHandlerBuilder<E, Started, D: Send + Sync + 'static, G> {
-    inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
+pub struct FilteredReactorBuilder<E, Started, D: Send + Sync + 'static, G> {
+    inner: ReactorBuilder<Typed<E>, NoFilter, Started>,
     filter_fn: G,
     describe_fn: Option<Arc<dyn Fn(&super::context::Context<D>) -> serde_json::Value + Send + Sync>>,
     _deps: PhantomData<D>,
@@ -47,10 +47,10 @@ pub struct FilteredHandlerBuilder<E, Started, D: Send + Sync + 'static, G> {
 /// Marker for having a filter_map predicate.
 pub struct WithFilterMap<F, T>(F, PhantomData<T>);
 
-/// Marker for no started handler.
+/// Marker for no started reactor.
 pub struct NoStarted;
 
-/// Marker for having a started handler.
+/// Marker for having a started reactor.
 pub struct WithStarted<D, St>(St, PhantomData<D>);
 
 fn typed_event_codec<E>() -> Arc<EventCodec>
@@ -86,8 +86,8 @@ where
     }
 }
 
-/// A unified builder for handlers using a compile-time type-phase pattern.
-pub struct HandlerBuilder<EventType, Filter, Started> {
+/// A unified builder for reactors using a compile-time type-phase pattern.
+pub struct ReactorBuilder<EventType, Filter, Started> {
     filter: Filter,
     started: Started,
     id: Option<String>,
@@ -102,12 +102,12 @@ pub struct HandlerBuilder<EventType, Filter, Started> {
     _marker: PhantomData<EventType>,
 }
 
-/// Create a handler for a specific event type.
-pub fn on<E>() -> HandlerBuilder<Typed<E>, NoFilter, NoStarted>
+/// Create a reactor for a specific event type.
+pub fn on<E>() -> ReactorBuilder<Typed<E>, NoFilter, NoStarted>
 where
     E: crate::event::Event,
 {
-    HandlerBuilder {
+    ReactorBuilder {
         filter: NoFilter,
         started: NoStarted,
         id: None,
@@ -124,9 +124,9 @@ where
     }
 }
 
-/// Create a handler for all events (observer pattern).
-pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
-    HandlerBuilder {
+/// Create a reactor for all events (observer pattern).
+pub fn on_any() -> ReactorBuilder<Untyped, NoFilter, NoStarted> {
+    ReactorBuilder {
         filter: NoFilter,
         started: NoStarted,
         id: None,
@@ -145,8 +145,8 @@ pub fn on_any() -> HandlerBuilder<Untyped, NoFilter, NoStarted> {
 
 /// Create a projection that receives all events.
 ///
-/// Projections run sequentially before all other handlers, ensuring
-/// read models are up-to-date when regular handlers execute.
+/// Projections run sequentially before all other reactors, ensuring
+/// read models are up-to-date when regular reactors execute.
 ///
 /// ```ignore
 /// project("audit_log").then(|event: AnyEvent, ctx| async move {
@@ -163,7 +163,7 @@ pub fn project(id: impl Into<String>) -> ProjectionBuilder {
     }
 }
 
-/// Builder for projection handlers.
+/// Builder for projection reactors.
 pub struct ProjectionBuilder {
     id: String,
     priority: Option<i32>,
@@ -176,8 +176,8 @@ impl ProjectionBuilder {
         self
     }
 
-    /// Set the projection handler (terminal operation).
-    pub fn then<D, H, Fut>(self, handler: H) -> Projection<D>
+    /// Set the projection reactor (terminal operation).
+    pub fn then<D, H, Fut>(self, reactor: H) -> Projection<D>
     where
         D: Send + Sync + 'static,
         H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
@@ -185,20 +185,20 @@ impl ProjectionBuilder {
     {
         Projection {
             id: self.id,
-            handler: Arc::new(move |event, ctx| Box::pin(handler(event, ctx))),
+            reactor: Arc::new(move |event, ctx| Box::pin(reactor(event, ctx))),
             priority: self.priority,
         }
     }
 }
 
-impl<E, Started> HandlerBuilder<Typed<E>, NoFilter, Started>
+impl<E, Started> ReactorBuilder<Typed<E>, NoFilter, Started>
 where
     E: Send + Sync + 'static,
 {
-    /// Add a context-aware filter predicate that must pass for the handler to run.
+    /// Add a context-aware filter predicate that must pass for the reactor to run.
     ///
     /// Unlike `.extract()` (which transforms the event), `.filter()` gates
-    /// execution based on both the event and the handler [`Context`] — giving
+    /// execution based on both the event and the reactor [`Context`] — giving
     /// access to aggregate state, deps, etc.
     ///
     /// ```ignore
@@ -211,12 +211,12 @@ where
     ///     })
     ///     .then(|event, ctx| async move { Ok(events![]) })
     /// ```
-    pub fn filter<D, F>(self, predicate: F) -> FilteredHandlerBuilder<E, Started, D, F>
+    pub fn filter<D, F>(self, predicate: F) -> FilteredReactorBuilder<E, Started, D, F>
     where
         D: Send + Sync + 'static,
         F: Fn(&E, &Context<D>) -> bool + Send + Sync + 'static,
     {
-        FilteredHandlerBuilder {
+        FilteredReactorBuilder {
             inner: self,
             filter_fn: predicate,
             describe_fn: None,
@@ -224,16 +224,16 @@ where
         }
     }
 
-    /// Extract data from events. Handler receives the extracted value.
+    /// Extract data from events. Reactor receives the extracted value.
     pub fn extract<F, T>(
         self,
         extractor: F,
-    ) -> HandlerBuilder<Typed<E>, WithFilterMap<F, T>, Started>
+    ) -> ReactorBuilder<Typed<E>, WithFilterMap<F, T>, Started>
     where
         F: Fn(&E) -> Option<T> + Send + Sync + 'static,
         T: Clone + Send + Sync + 'static,
     {
-        HandlerBuilder {
+        ReactorBuilder {
             filter: WithFilterMap(extractor, PhantomData),
             started: self.started,
             id: self.id,
@@ -251,18 +251,18 @@ where
     }
 }
 
-impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
-    /// Add an init handler that runs when the store is activated.
+impl<EventType, Filter> ReactorBuilder<EventType, Filter, NoStarted> {
+    /// Add an init reactor that runs when the store is activated.
     pub fn init<D, St, StFut>(
         self,
         started: St,
-    ) -> HandlerBuilder<EventType, Filter, WithStarted<D, St>>
+    ) -> ReactorBuilder<EventType, Filter, WithStarted<D, St>>
     where
         D: Send + Sync + 'static,
         St: Fn(Context<D>) -> StFut + Send + Sync + 'static,
         StFut: Future<Output = Result<()>> + Send + 'static,
     {
-        HandlerBuilder {
+        ReactorBuilder {
             filter: self.filter,
             started: WithStarted(started, PhantomData),
             id: self.id,
@@ -280,15 +280,15 @@ impl<EventType, Filter> HandlerBuilder<EventType, Filter, NoStarted> {
     }
 }
 
-impl<EventType, Filter, Started> HandlerBuilder<EventType, Filter, Started> {
-    /// Set a custom ID for this handler (default: auto-generated).
+impl<EventType, Filter, Started> ReactorBuilder<EventType, Filter, Started> {
+    /// Set a custom ID for this reactor (default: auto-generated).
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
     }
 }
 
-impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
+impl<E, Filter, Started> ReactorBuilder<Typed<E>, Filter, Started>
 where
     E: Clone + Send + Sync + 'static,
 {
@@ -319,7 +319,7 @@ where
                 event_prefix: O::event_prefix().to_string(),
                 persistent: !O::is_ephemeral(),
                 payload: serde_json::to_value(terminal_event)?,
-                handler_id: None,
+                reactor_id: None,
                 ephemeral: None,
             })
         }));
@@ -328,7 +328,7 @@ where
 }
 
 #[allow(private_bounds)]
-impl<EventType, Filter, Started> HandlerBuilder<EventType, Filter, Started>
+impl<EventType, Filter, Started> ReactorBuilder<EventType, Filter, Started>
 where
     EventType: QueueCodecProvider,
 {
@@ -350,7 +350,7 @@ where
 
     /// Set maximum retry attempts (default: 1 = no retry).
     ///
-    /// Use `.retry(1)` to explicitly mark a handler as background
+    /// Use `.retry(1)` to explicitly mark a reactor as background
     /// without retries.
     pub fn retry(mut self, attempts: u32) -> Self {
         self.max_attempts = attempts;
@@ -374,7 +374,7 @@ where
 
     /// Set execution priority (lower = higher priority).
     ///
-    /// Handlers with lower priority are polled first.
+    /// Reactors with lower priority are polled first.
     pub fn priority(mut self, level: i32) -> Self {
         self.priority = Some(level);
         self
@@ -403,7 +403,7 @@ where
     }
 }
 
-/// Trait for optional started handlers.
+/// Trait for optional started reactors.
 trait StartedHandler<D>: Send + Sync + 'static
 where
     D: Send + Sync + 'static,
@@ -437,14 +437,14 @@ where
     }
 }
 
-impl<E, Filter, Started> HandlerBuilder<Typed<E>, Filter, Started>
+impl<E, Filter, Started> ReactorBuilder<Typed<E>, Filter, Started>
 where
     E: crate::event::Event,
 {
-    /// Set the handler (terminal operation). Return `events![]` from the handler.
+    /// Set the reactor (terminal operation). Return `events![]` from the reactor.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<D, T, H, Fut>(self, handler: H) -> Handler<D>
+    pub fn then<D, T, H, Fut>(self, reactor: H) -> Reactor<D>
     where
         D: Send + Sync + 'static,
         T: Clone + Send + 'static,
@@ -455,25 +455,25 @@ where
     {
         let target = TypeId::of::<E>();
         let filter = self.filter;
-        // Always register input codec so Engine::decode_event works for all handlers
+        // Always register input codec so Engine::decode_event works for all reactors
         let input_codec = self.codec.unwrap_or_else(typed_event_codec::<E>);
         let dlq_terminal_mapper = self.dlq_terminal_mapper;
 
         let id = self
             .id
-            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
+            .unwrap_or_else(|| default_reactor_id(std::any::type_name::<E>()));
 
-        Handler {
+        Reactor {
             id,
             codecs: vec![input_codec],
             can_handle: Arc::new(move |t| t == target),
             started: self.started.into_started(),
-            handler: Arc::new(move |value, _, ctx| {
+            reactor: Arc::new(move |value, _, ctx| {
                 let typed = value.downcast::<E>().expect("type checked by can_handle");
 
                 match filter.extract(&typed) {
                     Some(extracted) => {
-                        let fut = handler(extracted, ctx);
+                        let fut = reactor(extracted, ctx);
                         Box::pin(async move {
                             let events: Events = fut.await?;
                             Ok(events.into_outputs())
@@ -495,25 +495,25 @@ where
     }
 }
 
-impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
-    /// Set the handler for observing all events. Return `events![]` from the handler.
+impl ReactorBuilder<Untyped, NoFilter, NoStarted> {
+    /// Set the reactor for observing all events. Return `events![]` from the reactor.
     #[track_caller]
-    pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
+    pub fn then<D, H, Fut>(self, reactor: H) -> Reactor<D>
     where
         D: Send + Sync + 'static,
         H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Events>> + Send + 'static,
     {
-        let id = self.id.unwrap_or_else(|| default_handler_id("handler_any"));
+        let id = self.id.unwrap_or_else(|| default_reactor_id("handler_any"));
 
-        Handler {
+        Reactor {
             id,
             codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
             started: None,
-            handler: Arc::new(move |value, type_id, ctx| {
+            reactor: Arc::new(move |value, type_id, ctx| {
                 let event = AnyEvent { value, type_id };
-                let fut = handler(event, ctx);
+                let fut = reactor(event, ctx);
                 Box::pin(async move {
                     let events: Events = fut.await?;
                     Ok(events.into_outputs())
@@ -532,32 +532,32 @@ impl HandlerBuilder<Untyped, NoFilter, NoStarted> {
     }
 }
 
-impl<D, St, StFut> HandlerBuilder<Untyped, NoFilter, WithStarted<D, St>>
+impl<D, St, StFut> ReactorBuilder<Untyped, NoFilter, WithStarted<D, St>>
 where
     D: Send + Sync + 'static,
     St: Fn(Context<D>) -> StFut + Send + Sync + 'static,
     StFut: Future<Output = Result<()>> + Send + 'static,
 {
-    /// Set the handler for observing all events with started hook. Return `events![]`.
+    /// Set the reactor for observing all events with started hook. Return `events![]`.
     #[track_caller]
-    pub fn then<H, Fut>(self, handler: H) -> Handler<D>
+    pub fn then<H, Fut>(self, reactor: H) -> Reactor<D>
     where
         H: Fn(AnyEvent, Context<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Events>> + Send + 'static,
     {
         let id = self
             .id
-            .unwrap_or_else(|| default_handler_id("handler_any_started"));
+            .unwrap_or_else(|| default_reactor_id("handler_any_started"));
         let started = self.started.0;
 
-        Handler {
+        Reactor {
             id,
             codecs: Vec::new(),
             can_handle: Arc::new(|_| true),
             started: Some(Arc::new(move |ctx| Box::pin(started(ctx)))),
-            handler: Arc::new(move |value, type_id, ctx| {
+            reactor: Arc::new(move |value, type_id, ctx| {
                 let event = AnyEvent { value, type_id };
-                let fut = handler(event, ctx);
+                let fut = reactor(event, ctx);
                 Box::pin(async move {
                     let events: Events = fut.await?;
                     Ok(events.into_outputs())
@@ -576,14 +576,14 @@ where
     }
 }
 
-// ── Filtered handler builder ─────────────────────────────────────────────
+// ── Filtered reactor builder ─────────────────────────────────────────────
 
-impl<E, Started, D, G> FilteredHandlerBuilder<E, Started, D, G>
+impl<E, Started, D, G> FilteredReactorBuilder<E, Started, D, G>
 where
     E: Clone + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    /// Set a custom ID for this handler.
+    /// Set a custom ID for this reactor.
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.inner.id = Some(id.into());
         self
@@ -591,9 +591,9 @@ where
 
     /// Add an introspection closure for flow visualization.
     ///
-    /// The closure receives the handler [`Context`] and returns a typed struct
+    /// The closure receives the reactor [`Context`] and returns a typed struct
     /// that causal serializes to JSON. The output is persisted to the Store
-    /// per `(correlation_id, handler_id)` so external UIs can render gate progress.
+    /// per `(correlation_id, reactor_id)` so external UIs can render gate progress.
     ///
     /// ```ignore
     /// on::<SynthesisRoleCompleted>()
@@ -620,19 +620,19 @@ where
     }
 }
 
-impl<E, Started, D, G> FilteredHandlerBuilder<E, Started, D, G>
+impl<E, Started, D, G> FilteredReactorBuilder<E, Started, D, G>
 where
     E: crate::event::Event,
     D: Send + Sync + 'static,
     G: Fn(&E, &Context<D>) -> bool + Send + Sync + 'static,
 {
-    /// Set the handler (terminal operation). Return `events![]` from the handler.
+    /// Set the reactor (terminal operation). Return `events![]` from the reactor.
     ///
-    /// The filter predicate runs first — if it returns `false`, the handler
+    /// The filter predicate runs first — if it returns `false`, the reactor
     /// body is skipped and an empty `events![]` is returned.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<H, Fut>(self, handler: H) -> Handler<D>
+    pub fn then<H, Fut>(self, reactor: H) -> Reactor<D>
     where
         Started: StartedHandler<D>,
         H: Fn(Arc<E>, Context<D>) -> Fut + Send + Sync + 'static,
@@ -646,21 +646,21 @@ where
         let id = self
             .inner
             .id
-            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
+            .unwrap_or_else(|| default_reactor_id(std::any::type_name::<E>()));
 
-        Handler {
+        Reactor {
             id,
             codecs: vec![input_codec],
             can_handle: Arc::new(move |t| t == target),
             started: self.inner.started.into_started(),
-            handler: Arc::new(move |value, _, ctx| {
+            reactor: Arc::new(move |value, _, ctx| {
                 let typed = value.downcast::<E>().expect("type checked by can_handle");
 
                 if !filter_fn(&typed, &ctx) {
                     return Box::pin(async { Ok(Vec::new()) });
                 }
 
-                let fut = handler(typed, ctx);
+                let fut = reactor(typed, ctx);
                 Box::pin(async move {
                     let events: Events = fut.await?;
                     Ok(events.into_outputs())
@@ -683,39 +683,39 @@ where
 
 use crate::aggregator::Aggregate;
 
-/// Builder for handlers guarded by aggregate state transitions.
+/// Builder for reactors guarded by aggregate state transitions.
 ///
 /// Created by calling `.transition::<A>(guard)` after `.extract()` on a
-/// `HandlerBuilder`. The guard function receives `(&prev_state, &next_state)`
-/// and returns `true` to fire the handler.
+/// `ReactorBuilder`. The guard function receives `(&prev_state, &next_state)`
+/// and returns `true` to fire the reactor.
 ///
 /// Aggregate state is replayed using the engine's aggregator registry —
 /// no extra configuration needed on the guard.
-pub struct TransitionHandlerBuilder<E, A, G, Started> {
-    inner: HandlerBuilder<Typed<E>, NoFilter, Started>,
+pub struct TransitionReactorBuilder<E, A, G, Started> {
+    inner: ReactorBuilder<Typed<E>, NoFilter, Started>,
     extractor: Box<dyn Fn(&E) -> Option<uuid::Uuid> + Send + Sync>,
     guard: G,
     _aggregate: PhantomData<A>,
 }
 
-impl<E, F, Started> HandlerBuilder<Typed<E>, WithFilterMap<F, uuid::Uuid>, Started>
+impl<E, F, Started> ReactorBuilder<Typed<E>, WithFilterMap<F, uuid::Uuid>, Started>
 where
     E: Clone + Send + Sync + 'static,
     F: Fn(&E) -> Option<uuid::Uuid> + Send + Sync + 'static,
     Started: Send + Sync + 'static,
 {
-    /// Add a transition guard. The handler fires only when the aggregate
+    /// Add a transition guard. The reactor fires only when the aggregate
     /// state transitions in the way described by `guard(prev, next)`.
     ///
     /// The `.extract()` must return `Option<Uuid>` (the aggregate ID).
     /// Aggregate state is replayed using the engine's aggregator registry.
-    pub fn transition<A, G>(self, guard: G) -> TransitionHandlerBuilder<E, A, G, Started>
+    pub fn transition<A, G>(self, guard: G) -> TransitionReactorBuilder<E, A, G, Started>
     where
         A: Aggregate,
         G: Fn(&A, &A) -> bool + Send + Sync + 'static,
     {
-        TransitionHandlerBuilder {
-            inner: HandlerBuilder {
+        TransitionReactorBuilder {
+            inner: ReactorBuilder {
                 filter: NoFilter,
                 started: self.started,
                 id: self.id,
@@ -737,22 +737,22 @@ where
     }
 }
 
-impl<E, A, G, Started> TransitionHandlerBuilder<E, A, G, Started>
+impl<E, A, G, Started> TransitionReactorBuilder<E, A, G, Started>
 where
     E: Clone + Send + Sync + 'static,
     A: Aggregate,
     G: Fn(&A, &A) -> bool + Send + Sync + 'static,
 {
-    /// Set a custom ID for this handler.
+    /// Set a custom ID for this reactor.
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.inner.id = Some(id.into());
         self
     }
 
-    /// Set the handler that runs when the transition guard passes. Return `events![]`.
+    /// Set the reactor that runs when the transition guard passes. Return `events![]`.
     #[track_caller]
     #[allow(private_bounds)]
-    pub fn then<D, H, Fut>(self, handler: H) -> Handler<D>
+    pub fn then<D, H, Fut>(self, reactor: H) -> Reactor<D>
     where
         D: Send + Sync + 'static,
         Started: StartedHandler<D>,
@@ -763,25 +763,25 @@ where
         let extractor: Arc<dyn Fn(&E) -> Option<uuid::Uuid> + Send + Sync> =
             Arc::from(self.extractor);
         let guard = Arc::new(self.guard);
-        let handler = Arc::new(handler);
+        let reactor = Arc::new(reactor);
 
         let id = self
             .inner
             .id
-            .unwrap_or_else(|| default_handler_id(std::any::type_name::<E>()));
+            .unwrap_or_else(|| default_reactor_id(std::any::type_name::<E>()));
 
         let codec = self.inner.codec;
 
-        Handler {
+        Reactor {
             id,
             codecs: codec.into_iter().collect(),
             can_handle: Arc::new(move |t| t == target),
             started: self.inner.started.into_started(),
-            handler: Arc::new(move |value, _, ctx: Context<D>| {
+            reactor: Arc::new(move |value, _, ctx: Context<D>| {
                 let typed = value.downcast::<E>().expect("type checked by can_handle");
                 let extractor = extractor.clone();
                 let guard = guard.clone();
-                let handler = handler.clone();
+                let reactor = reactor.clone();
 
                 match extractor(&typed) {
                     Some(aggregate_id) => {
@@ -797,7 +797,7 @@ where
                                 return Ok(Vec::new());
                             }
 
-                            let events: Events = handler(aggregate_id, ctx).await?;
+                            let events: Events = reactor(aggregate_id, ctx).await?;
                             Ok(events.into_outputs())
                         })
                     }
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn filter_does_not_force_queued_execution() {
-        let handler = on::<QueueEvent>()
+        let reactor = on::<QueueEvent>()
             .id("filter_probe")
             .filter(|event, _ctx: &Context<Deps>| event.value > 0)
             .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move {
@@ -841,8 +841,8 @@ mod tests {
             });
 
         assert!(
-            handler.is_default(),
-            "filter() should not change handler execution mode"
+            reactor.is_default(),
+            "filter() should not change reactor execution mode"
         );
     }
 }

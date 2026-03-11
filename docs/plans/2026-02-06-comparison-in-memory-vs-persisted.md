@@ -1,4 +1,4 @@
-# Performance Comparison: In-Memory vs Persisted Handlers
+# Performance Comparison: In-Memory vs Persisted Reactors
 
 **Date:** 2026-02-06
 
@@ -6,7 +6,7 @@
 
 | Approach | Throughput | Latency | Durability | Distribution | Use Case |
 |----------|-----------|---------|------------|--------------|----------|
-| **In-Memory Handlers** | 1M+ events/sec | <1ms | ❌ Lost on crash | ❌ Single process | Real-time, ephemeral |
+| **In-Memory Reactors** | 1M+ events/sec | <1ms | ❌ Lost on crash | ❌ Single process | Real-time, ephemeral |
 | **Relay/Forward** | 500k+ events/sec | <5ms | ⚠️ At-most-once | ✅ Multi-process | Event forwarding |
 | **Causal (Persisted)** | 1k-100k events/sec | 10-50ms | ✅ Durable | ✅ Multi-worker | Critical workflows |
 | **Causal + In-Memory** | 1M+ events/sec | <1ms | ⚠️ Hybrid | ✅ Multi-worker | Hybrid approach |
@@ -15,21 +15,21 @@
 
 ---
 
-## Part 1: In-Memory Handlers (No Persistence)
+## Part 1: In-Memory Reactors (No Persistence)
 
 ### Architecture
 
 ```rust
 // Pure in-memory - no database
 struct Engine {
-    handlers: Vec<Handler>,
+    reactors: Vec<Reactor>,
 }
 
 engine.dispatch(event) {
     // No database writes!
-    for handler in handlers {
-        if handler.matches(&event) {
-            let result = handler.execute(event).await?;
+    for reactor in reactors {
+        if reactor.matches(&event) {
+            let result = reactor.execute(event).await?;
             // Recursively dispatch result events
             self.dispatch(result).await?;
         }
@@ -50,7 +50,7 @@ Limited by: CPU and memory bandwidth
 
 **Latency:**
 ```
-Handler execution: 1-100μs
+Reactor execution: 1-100μs
 Total dispatch: <1ms (no I/O)
 ```
 
@@ -68,16 +68,16 @@ Network: Only for external APIs
 use tokio::sync::mpsc;
 
 struct InMemoryEngine {
-    handlers: Vec<Box<dyn Handler>>,
+    reactors: Vec<Box<dyn Reactor>>,
 }
 
 impl InMemoryEngine {
     async fn dispatch(&self, event: Event) -> Result<()> {
-        // Execute all handlers immediately in memory
-        for handler in &self.handlers {
-            if handler.matches(&event) {
+        // Execute all reactors immediately in memory
+        for reactor in &self.reactors {
+            if reactor.matches(&event) {
                 // No persistence - just execute
-                let result = handler.execute(&event).await?;
+                let result = reactor.execute(&event).await?;
 
                 // Recursively dispatch result events
                 if let Some(result_event) = result {
@@ -93,7 +93,7 @@ impl InMemoryEngine {
 let engine = InMemoryEngine::new();
 
 engine.dispatch(OrderPlaced { id: 123 }).await?;
-// Handlers execute immediately, no database writes
+// Reactors execute immediately, no database writes
 // Result: <1ms total latency
 ```
 
@@ -336,7 +336,7 @@ JetStream:
 | Aspect | In-Memory | Relay (Fire-and-Forget) | Relay (Kafka) | Causal |
 |--------|-----------|------------------------|---------------|--------|
 | **Event Persistence** | ❌ No | ❌ No | ✅ Yes (Kafka) | ✅ Yes (Postgres) |
-| **Handler Persistence** | ❌ No | ❌ No | ⚠️ Manual | ✅ Yes (intent tracking) |
+| **Reactor Persistence** | ❌ No | ❌ No | ⚠️ Manual | ✅ Yes (intent tracking) |
 | **At-Least-Once** | ❌ No | ❌ No | ✅ Yes | ✅ Yes |
 | **Exactly-Once** | ⚠️ Maybe | ❌ No | ⚠️ Complex | ⚠️ Idempotency |
 | **Retry Logic** | ❌ Manual | ❌ Manual | ❌ Manual | ✅ Built-in |
@@ -408,7 +408,7 @@ impl AnalyticsEngine {
 
 **Best approach: Causal**
 ```rust
-#[handler(on = PaymentRequested, retry = 3)]
+#[reactor(on = PaymentRequested, retry = 3)]
 async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentCharged> {
     ctx.deps().stripe.charge(&event).await?;
     Ok(PaymentCharged { order_id: event.order_id })
@@ -457,13 +457,13 @@ pubsub.subscribe("user.created").await?;
 
 **Best approach: Causal**
 ```rust
-#[handler(on = WorkflowStarted)]
+#[reactor(on = WorkflowStarted)]
 async fn step1(...) -> Result<Step1Complete> { ... }
 
-#[handler(on = Step1Complete)]
+#[reactor(on = Step1Complete)]
 async fn step2(...) -> Result<Step2Complete> { ... }
 
-#[handler(on = Step2Complete)]
+#[reactor(on = Step2Complete)]
 async fn step3(...) -> Result<WorkflowComplete> { ... }
 
 // Result: Durable, survives restarts, auditable
@@ -487,8 +487,8 @@ struct RealtimeRelay {
     subscribers: Arc<Mutex<Vec<WebSocket>>>,
 }
 
-// Causal handler for persistence
-#[handler(on = OrderPlaced)]
+// Causal reactor for persistence
+#[reactor(on = OrderPlaced)]
 async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     // Persist to database
     ctx.deps().db.insert_order(&event).await?;
@@ -512,25 +512,25 @@ async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
 ```
 Event arrives
   ↓
-In-Memory Handler (instant, ephemeral)
+In-Memory Reactor (instant, ephemeral)
   ↓
-Persisted Handler (durable, slower)
+Persisted Reactor (durable, slower)
 ```
 
 **Implementation:**
 ```rust
 struct HybridEngine {
-    memory_handlers: Vec<Handler>,   // Execute immediately
-    persisted_handlers: Vec<Handler>, // Execute via Causal
+    memory_handlers: Vec<Reactor>,   // Execute immediately
+    persisted_handlers: Vec<Reactor>, // Execute via Causal
 }
 
 impl HybridEngine {
     async fn dispatch(&self, event: Event) -> Result<()> {
-        // Fast path: Execute in-memory handlers immediately
-        for handler in &self.memory_handlers {
+        // Fast path: Execute in-memory reactors immediately
+        for reactor in &self.memory_handlers {
             tokio::spawn({
                 let event = event.clone();
-                async move { handler.execute(event).await }
+                async move { reactor.execute(event).await }
             });
         }
 
@@ -544,11 +544,11 @@ impl HybridEngine {
 
 **Performance:**
 ```
-In-memory handlers: <1ms (fire-and-forget)
-Persisted handlers: 10-50ms (durable)
+In-memory reactors: <1ms (fire-and-forget)
+Persisted reactors: 10-50ms (durable)
 
-Throughput: 1M+ events/sec (limited by memory handlers)
-Durability: Only persisted handlers
+Throughput: 1M+ events/sec (limited by memory reactors)
+Durability: Only persisted reactors
 ```
 
 **Use case:**
@@ -561,7 +561,7 @@ async fn notify_websocket(event: OrderPlaced, ctx: Ctx) -> Result<()> {
 }
 
 // Audit trail (persisted, durable)
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn save_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     ctx.deps().db.insert_order(&event).await?;
     Ok(OrderSaved { order_id: event.order_id })
@@ -648,7 +648,7 @@ async fn invalidate_cache(event: UserUpdated, ctx: Ctx) {
 }
 
 // Tier 3: Database persistence (Causal)
-#[handler(on = UserUpdated, retry = 3)]
+#[reactor(on = UserUpdated, retry = 3)]
 async fn update_database(event: UserUpdated, ctx: Ctx) -> Result<UserSaved> {
     ctx.deps().db.update_user(&event).await?;
     Ok(UserSaved { user_id: event.user_id })
@@ -704,7 +704,7 @@ Do you need >10k events/sec?
 ### What Causal Optimizes For
 
 1. **Correctness** - At-least-once delivery, retry logic
-2. **Durability** - Events and handler state persisted
+2. **Durability** - Events and reactor state persisted
 3. **Auditability** - Full event history
 4. **Workflow orchestration** - Multi-step processes
 5. **Developer experience** - Simple API, fewer decisions
@@ -744,7 +744,7 @@ async fn notify_realtime(event: OrderPlaced, ctx: Ctx) {
 }
 
 // Use Causal for durability
-#[handler(on = OrderPlaced, retry = 3)]
+#[reactor(on = OrderPlaced, retry = 3)]
 async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     ctx.deps().db.insert_order(&event).await?;
     Ok(OrderSaved { order_id: event.order_id })
@@ -760,7 +760,7 @@ async fn persist_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
 
 ## Conclusion
 
-**Causal is not trying to compete with in-memory handlers on raw throughput.** It optimizes for different concerns:
+**Causal is not trying to compete with in-memory reactors on raw throughput.** It optimizes for different concerns:
 
 | Concern | In-Memory | Relay | Causal |
 |---------|-----------|-------|--------|

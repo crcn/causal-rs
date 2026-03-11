@@ -5,19 +5,19 @@ import type {
   AdminEventsPage,
   AdminCausalTree,
   AdminCausalFlow,
-  HandlerLog,
-  HandlerDescription,
-  HandlerOutcome,
+  ReactorLog,
+  ReactorDescription,
+  ReactorOutcome,
   LogsFilter,
 } from "../types";
 import {
   ADMIN_EVENTS,
   ADMIN_CAUSAL_TREE,
   ADMIN_CAUSAL_FLOW,
-  ADMIN_HANDLER_LOGS,
-  ADMIN_HANDLER_LOGS_BY_RUN,
-  ADMIN_HANDLER_DESCRIPTIONS,
-  ADMIN_HANDLER_OUTCOMES,
+  ADMIN_REACTOR_LOGS,
+  ADMIN_REACTOR_LOGS_BY_RUN,
+  ADMIN_REACTOR_DESCRIPTIONS,
+  ADMIN_REACTOR_OUTCOMES,
 } from "../queries";
 
 export type QueryTransport = {
@@ -116,11 +116,11 @@ export const createQueryEngine = (
       try {
         const [descData, outcomeData] = await Promise.all([
           transport.query<{
-            adminHandlerDescriptions: HandlerDescription[];
-          }>(ADMIN_HANDLER_DESCRIPTIONS, { runId }),
+            adminReactorDescriptions: ReactorDescription[];
+          }>(ADMIN_REACTOR_DESCRIPTIONS, { runId }),
           transport.query<{
-            adminHandlerOutcomes: HandlerOutcome[];
-          }>(ADMIN_HANDLER_OUTCOMES, { runId }),
+            adminReactorOutcomes: ReactorOutcome[];
+          }>(ADMIN_REACTOR_OUTCOMES, { runId }),
         ]);
         if (activeFlowRunId !== runId) return; // stale
 
@@ -128,14 +128,14 @@ export const createQueryEngine = (
           type: "events/descriptions_loaded",
           payload: {
             runId,
-            descriptions: descData.adminHandlerDescriptions,
+            descriptions: descData.adminReactorDescriptions,
           },
         });
         dispatch({
           type: "events/outcomes_loaded",
           payload: {
             runId,
-            outcomes: outcomeData.adminHandlerOutcomes,
+            outcomes: outcomeData.adminReactorOutcomes,
           },
         });
       } catch (e) {
@@ -147,14 +147,14 @@ export const createQueryEngine = (
       try {
         if (filter.scope === "run" && filter.runId) {
           const data = await transport.query<{
-            adminHandlerLogsByRun: HandlerLog[];
-          }>(ADMIN_HANDLER_LOGS_BY_RUN, { runId: filter.runId });
-          dispatch({ type: "events/logs_loaded", payload: data.adminHandlerLogsByRun });
-        } else if (filter.eventId && filter.handlerId) {
+            adminReactorLogsByRun: ReactorLog[];
+          }>(ADMIN_REACTOR_LOGS_BY_RUN, { runId: filter.runId });
+          dispatch({ type: "events/logs_loaded", payload: data.adminReactorLogsByRun });
+        } else if (filter.eventId && filter.reactorId) {
           const data = await transport.query<{
-            adminHandlerLogs: HandlerLog[];
-          }>(ADMIN_HANDLER_LOGS, { eventId: filter.eventId, handlerId: filter.handlerId });
-          dispatch({ type: "events/logs_loaded", payload: data.adminHandlerLogs });
+            adminReactorLogs: ReactorLog[];
+          }>(ADMIN_REACTOR_LOGS, { eventId: filter.eventId, reactorId: filter.reactorId });
+          dispatch({ type: "events/logs_loaded", payload: data.adminReactorLogs });
         }
       } catch (e) {
         console.error("[causal-admin] fetch logs failed:", e);

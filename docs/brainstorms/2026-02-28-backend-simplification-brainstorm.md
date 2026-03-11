@@ -7,7 +7,7 @@ topic: backend-simplification
 
 ## What We're Building
 
-Strip causal down to its core value — event routing, handler composition, ES primitives — and delete all backend infrastructure that Restate replaces. Causal runs *inside* Restate handlers; it doesn't wrap or manage Restate.
+Strip causal down to its core value — event routing, reactor composition, ES primitives — and delete all backend infrastructure that Restate replaces. Causal runs *inside* Restate reactors; it doesn't wrap or manage Restate.
 
 ## Mental Model
 
@@ -23,8 +23,8 @@ impl OrderWorkflow for OrderWorkflowImpl {
     async fn run(&self, ctx: &mut WorkflowContext, input: OrderCreated) -> Result<()> {
         let engine = Engine::new(deps)
             .with_runner(RestateRunner::new(ctx))
-            .with_handler(on::<OrderCreated>().then(...))
-            .with_handler(on::<OrderValidated>().then(...));
+            .with_reactor(on::<OrderCreated>().then(...))
+            .with_reactor(on::<OrderValidated>().then(...));
 
         engine.dispatch(input).settled().await?;
         Ok(())
@@ -32,13 +32,13 @@ impl OrderWorkflow for OrderWorkflowImpl {
 }
 ```
 
-- **Causal** owns: event routing, handler composition, DSL ergonomics, settle loop, ES primitives
+- **Causal** owns: event routing, reactor composition, DSL ergonomics, settle loop, ES primitives
 - **Restate** owns: durability, retries, state persistence, observability
-- **HandlerRunner** bridges them: wraps each handler call in `ctx.run()`
+- **HandlerRunner** bridges them: wraps each reactor call in `ctx.run()`
 
 ## Why This Approach
 
-Causal's value is its ergonomic handler DSL (`on::<E>().then(...)`) and deterministic settle loop — not its queue infrastructure. Restate is purpose-built for durable execution and does queuing, retries, DLQ, and observability better than a hand-rolled Postgres backend ever will.
+Causal's value is its ergonomic reactor DSL (`on::<E>().then(...)`) and deterministic settle loop — not its queue infrastructure. Restate is purpose-built for durable execution and does queuing, retries, DLQ, and observability better than a hand-rolled Postgres backend ever will.
 
 By running causal inside Restate, we get durability for free without changing causal's public API. The `HandlerRunner` trait already exists as the integration point.
 
@@ -48,7 +48,7 @@ By running causal inside Restate, we get durability for free without changing ca
 - **Delete `causal-memory` (as a separate crate)**: Fold `MemoryEventStore` into causal core. Drop the `MemoryStore` InsightStore impl.
 - **Delete `causal-insight`**: Restate's built-in dashboard and event projection replace it.
 - **Keep Engine internals**: The settle loop, `memory_store.rs`, `JobExecutor`, `HandlerRegistry`, `EventCodec` all stay — they're the in-process orchestration that makes causal useful.
-- **Keep `HandlerRunner` trait as-is**: It's already the right shape. A `RestateRunner` wraps `ctx.run()` around each handler invocation.
+- **Keep `HandlerRunner` trait as-is**: It's already the right shape. A `RestateRunner` wraps `ctx.run()` around each reactor invocation.
 - **Keep `EventStore` trait + `MemoryEventStore`**: Event sourcing is orthogonal to Restate (Restate is key-value, not event-sourced). Fold the in-memory impl into causal core for tests/examples.
 
 ## What Gets Deleted
@@ -64,17 +64,17 @@ By running causal inside Restate, we get durability for free without changing ca
 | Module | Purpose |
 |---|---|
 | `engine.rs` | Settle loop, dispatch, in-process orchestration |
-| `handler/` | DSL (`on::<E>().then(...)`), builders, context, join mode |
+| `reactor/` | DSL (`on::<E>().then(...)`), builders, context, join mode |
 | `handler_runner.rs` | Pluggable execution — Restate integration point |
-| `handler_registry.rs` | Handler storage and lookup |
-| `job_executor.rs` | Event routing, codec dispatch, handler execution |
+| `handler_registry.rs` | Reactor storage and lookup |
+| `job_executor.rs` | Event routing, codec dispatch, reactor execution |
 | `memory_store.rs` | In-memory queue for settle loop |
 | `event_codec.rs` | Event serialization/deserialization |
 | `es/` | EventStore trait, Aggregate, AggregateLoader, projectors |
 | `types.rs` | Internal plumbing types |
 | `process.rs` | DispatchFuture, ProcessHandle, SettleFuture |
 | `insight.rs` | InsightEvent types (used by on_insight callback) |
-| `causal_core_macros/` | #[handler], #[handles], etc. |
+| `causal_core_macros/` | #[reactor], #[reactors], etc. |
 
 ## Open Questions
 

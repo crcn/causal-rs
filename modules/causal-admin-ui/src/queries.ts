@@ -10,7 +10,7 @@ const ADMIN_EVENT_FIELDS = `
   parentId
   correlationId
   runId
-  handlerId
+  reactorId
   summary
   payload
 `;
@@ -69,11 +69,11 @@ export const ADMIN_CAUSAL_FLOW = `
   }
 `;
 
-export const ADMIN_HANDLER_LOGS = `
-  query AdminHandlerLogs($eventId: String!, $handlerId: String!) {
-    adminHandlerLogs(eventId: $eventId, handlerId: $handlerId) {
+export const ADMIN_REACTOR_LOGS = `
+  query AdminReactorLogs($eventId: String!, $reactorId: String!) {
+    adminReactorLogs(eventId: $eventId, reactorId: $reactorId) {
       eventId
-      handlerId
+      reactorId
       level
       message
       data
@@ -82,11 +82,11 @@ export const ADMIN_HANDLER_LOGS = `
   }
 `;
 
-export const ADMIN_HANDLER_LOGS_BY_RUN = `
-  query AdminHandlerLogsByRun($runId: String!) {
-    adminHandlerLogsByRun(runId: $runId) {
+export const ADMIN_REACTOR_LOGS_BY_RUN = `
+  query AdminReactorLogsByRun($runId: String!) {
+    adminReactorLogsByRun(runId: $runId) {
       eventId
-      handlerId
+      reactorId
       level
       message
       data
@@ -95,19 +95,19 @@ export const ADMIN_HANDLER_LOGS_BY_RUN = `
   }
 `;
 
-export const ADMIN_HANDLER_DESCRIPTIONS = `
-  query AdminHandlerDescriptions($runId: String!) {
-    adminHandlerDescriptions(runId: $runId) {
-      handlerId
+export const ADMIN_REACTOR_DESCRIPTIONS = `
+  query AdminReactorDescriptions($runId: String!) {
+    adminReactorDescriptions(runId: $runId) {
+      reactorId
       blocks
     }
   }
 `;
 
-export const ADMIN_HANDLER_OUTCOMES = `
-  query AdminHandlerOutcomes($runId: String!) {
-    adminHandlerOutcomes(runId: $runId) {
-      handlerId
+export const ADMIN_REACTOR_OUTCOMES = `
+  query AdminReactorOutcomes($runId: String!) {
+    adminReactorOutcomes(runId: $runId) {
+      reactorId
       status
       error
       attempts

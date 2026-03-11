@@ -48,7 +48,7 @@ impl UpcasterRegistry {
         schema_version: u32,
         mut payload: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let prefix = crate::handler::extract_prefix(durable_name);
+        let prefix = crate::reactor::extract_prefix(durable_name);
         if let Some(chain) = self.upcasters.get(prefix) {
             for upcaster in chain {
                 if upcaster.from_version >= schema_version {

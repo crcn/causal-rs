@@ -1,4 +1,4 @@
-# Fix Inline Handler Blocking Footgun - Complete Analysis
+# Fix Inline Reactor Blocking Footgun - Complete Analysis
 
 **Date:** 2026-02-06
 **Status:** Planning
@@ -6,22 +6,22 @@
 
 ## Executive Summary
 
-**Problem:** Inline handlers execute in the same database transaction as event insertion. Slow handlers (1+ minute) hold transactions open, blocking all other events and causing cascading failures.
+**Problem:** Inline reactors execute in the same database transaction as event insertion. Slow reactors (1+ minute) hold transactions open, blocking all other events and causing cascading failures.
 
-**Solution:** ALL handlers execute asynchronously in workers. Separate queue streams per event type eliminates priority decisions and enables natural parallelism.
+**Solution:** ALL reactors execute asynchronously in workers. Separate queue streams per event type eliminates priority decisions and enables natural parallelism.
 
-**Impact:** Enables handlers of any duration, scales to ultra-high throughput, eliminates transaction blocking footgun.
+**Impact:** Enables reactors of any duration, scales to ultra-high throughput, eliminates transaction blocking footgun.
 
 ---
 
 ## Part 1: The Problem (With Concrete Examples)
 
-### Example 1: Slow Inline Handler Blocks Everything
+### Example 1: Slow Inline Reactor Blocks Everything
 
 **Code:**
 ```rust
-// Handler that calls external API
-#[handler(on = OrderPlaced)]
+// Reactor that calls external API
+#[reactor(on = OrderPlaced)]
 async fn charge_payment(event: OrderPlaced, ctx: Ctx) -> Result<PaymentCharged> {
     // Stripe API call takes 2 seconds
     ctx.deps().stripe.charge(&event).await?;
@@ -38,7 +38,7 @@ engine.dispatch(OrderPlaced { id: 123, total: 99.99 }).await?;
 T=0ms:   [Transaction begins]
 T=0ms:     Worker 1 acquires transaction lock
 T=1ms:     Insert OrderPlaced event into causal_events
-T=1ms:     Execute inline handler → call Stripe API
+T=1ms:     Execute inline reactor → call Stripe API
 T=2001ms:  Stripe returns success
 T=2002ms:  Insert PaymentCharged event
 T=2003ms: [Transaction commits]
@@ -81,22 +81,22 @@ SELECT * FROM pg_locks WHERE NOT granted;
 - System grinds to a halt
 - Requires restart to recover
 
-### Example 2: One Slow Handler Ruins Everything
+### Example 2: One Slow Reactor Ruins Everything
 
-**Scenario:** You have 99 fast handlers and 1 slow handler:
+**Scenario:** You have 99 fast reactors and 1 slow reactor:
 
 ```rust
-// Handler 1-99: Fast database writes (10ms each)
-#[handler(on = OrderPlaced)]
+// Reactor 1-99: Fast database writes (10ms each)
+#[reactor(on = OrderPlaced)]
 async fn save_to_orders_table(...) { /* 10ms */ }
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn save_to_analytics_table(...) { /* 10ms */ }
 
-// ... 97 more fast handlers ...
+// ... 97 more fast reactors ...
 
-// Handler 100: Slow AI processing (60 seconds)
-#[handler(on = OrderPlaced)]
+// Reactor 100: Slow AI processing (60 seconds)
+#[reactor(on = OrderPlaced)]
 async fn generate_product_recommendations(...) {
     // OpenAI API call - 60 seconds
     let recommendations = ctx.deps().openai.generate(...).await?;
@@ -109,23 +109,23 @@ async fn generate_product_recommendations(...) {
 ```
 User dispatches OrderPlaced:
   [Transaction begins]
-    Execute handler 1  (10ms)  ✅
-    Execute handler 2  (10ms)  ✅
-    Execute handler 3  (10ms)  ✅
+    Execute reactor 1  (10ms)  ✅
+    Execute reactor 2  (10ms)  ✅
+    Execute reactor 3  (10ms)  ✅
     ...
-    Execute handler 99 (10ms)  ✅
-    Execute handler 100 (60 seconds) ⏰ ← Transaction held for 1 minute!
+    Execute reactor 99 (10ms)  ✅
+    Execute reactor 100 (60 seconds) ⏰ ← Transaction held for 1 minute!
   [Transaction commits after 60+ seconds]
 ```
 
-**Result:** One slow handler blocks the entire system for 60 seconds per event.
+**Result:** One slow reactor blocks the entire system for 60 seconds per event.
 
 ### Example 3: Under Load - Complete Meltdown
 
-**Scenario:** 10 events/second, 1 handler takes 2 seconds
+**Scenario:** 10 events/second, 1 reactor takes 2 seconds
 
 ```
-T=0s:    OrderPlaced #1 dispatched → Handler runs (2s) → Transaction held
+T=0s:    OrderPlaced #1 dispatched → Reactor runs (2s) → Transaction held
 T=0.1s:  OrderPlaced #2 dispatched → BLOCKED (waiting for #1)
 T=0.2s:  OrderPlaced #3 dispatched → BLOCKED (waiting for #1)
 T=0.3s:  OrderPlaced #4 dispatched → BLOCKED (waiting for #1)
@@ -157,22 +157,22 @@ Error rate: 95% (timeouts)
 
 Mixing two concerns in one execution model:
 1. **Event persistence** (fast: ~5-10ms)
-2. **Handler execution** (variable: 1ms to 60+ seconds)
+2. **Reactor execution** (variable: 1ms to 60+ seconds)
 
 **Current Design:**
 ```
-Dispatch = Persist + Execute Inline Handlers (in ONE transaction)
+Dispatch = Persist + Execute Inline Reactors (in ONE transaction)
 ```
 
-If ANY handler is slow → ENTIRE dispatch is slow → Transaction held → Locks block others
+If ANY reactor is slow → ENTIRE dispatch is slow → Transaction held → Locks block others
 
 **Why This Is Broken:**
 
-1. **No isolation**: Fast handlers blocked by slow handlers
+1. **No isolation**: Fast reactors blocked by slow reactors
 2. **Resource exhaustion**: Long transactions hold DB connections
-3. **Cascading failures**: One slow handler cascades to all workers
-4. **Unpredictable**: Adding new handler can break existing system
-5. **No escape hatch**: Can't fix without rewriting handlers
+3. **Cascading failures**: One slow reactor cascades to all workers
+4. **Unpredictable**: Adding new reactor can break existing system
+5. **No escape hatch**: Can't fix without rewriting reactors
 
 ---
 
@@ -180,7 +180,7 @@ If ANY handler is slow → ENTIRE dispatch is slow → Transaction held → Lock
 
 ### Core Principle
 
-**Event persistence and handler execution are separate concerns and should use separate transactions.**
+**Event persistence and reactor execution are separate concerns and should use separate transactions.**
 
 ```
 OLD (Broken):
@@ -188,7 +188,7 @@ OLD (Broken):
 
 NEW (Fixed):
   Dispatch = [TX: Persist + Queue Intents] ← Fast transaction (<10ms)
-  Workers  = [TX: Execute Handler] ← Separate transaction per handler
+  Workers  = [TX: Execute Reactor] ← Separate transaction per reactor
 ```
 
 ### Architecture: Separate Streams Per Event Type
@@ -208,11 +208,11 @@ UserSignedUp events     → "causal.UserSignedUp" stream     → Workers subscri
 
 | Approach | Developer Decision | Parallelism | Scalability |
 |----------|-------------------|-------------|-------------|
-| **Priority** | "What priority should this handler have?" ❌ | Limited (single queue) | Hard to scale |
+| **Priority** | "What priority should this reactor have?" ❌ | Limited (single queue) | Hard to scale |
 | **Separate Streams** | None! ✅ | Natural (per event type) | Easy (scale per stream) |
 
 **Benefits:**
-1. ✅ **No priority decisions needed** - Developer just registers handler, system handles the rest
+1. ✅ **No priority decisions needed** - Developer just registers reactor, system handles the rest
 2. ✅ **Natural parallelism** - OrderPlaced doesn't block PaymentRequested
 3. ✅ **Independent scaling** - Can add workers for slow event types only
 4. ✅ **Clear mental model** - One stream per event type
@@ -234,10 +234,10 @@ engine.dispatch(OrderPlaced { id: 123 }).await?;
      - event_type: "OrderPlaced"
      - payload: {...}
 
-  2. Insert handler_intents for ALL handlers listening to OrderPlaced
+  2. Insert handler_intents for ALL reactors listening to OrderPlaced
      - intent_id: uuid
      - event_id: (from step 1)
-     - handler_id: "charge_payment"
+     - reactor_id: "charge_payment"
      - status: "pending"
 
   3. Notify queue backend: "causal.OrderPlaced" stream
@@ -262,9 +262,9 @@ Worker 1 receives notification on "causal.OrderPlaced":
                     WHERE intent_id = ? FOR UPDATE SKIP LOCKED
 
   2. If locked by another worker → Skip (another worker handling it)
-     If acquired lock → Execute handler
+     If acquired lock → Execute reactor
 
-  3. Execute handler (NO TRANSACTION HELD DURING EXECUTION)
+  3. Execute reactor (NO TRANSACTION HELD DURING EXECUTION)
      - Can take 1 second, 1 minute, 1 hour - doesn't matter!
      - If fails → Retry logic kicks in
      - If succeeds → Continue to step 4
@@ -308,7 +308,7 @@ engine.dispatch(OrderPlaced { id: 123 });  // ❌ Compile error
 ```
 
 **The key difference:**
-- **OLD**: `await` waits for handlers to execute (can be 60 seconds)
+- **OLD**: `await` waits for reactors to execute (can be 60 seconds)
 - **NEW**: `await` waits for event to be persisted + queued (always <10ms)
 
 ---
@@ -318,9 +318,9 @@ engine.dispatch(OrderPlaced { id: 123 });  // ❌ Compile error
 ### QueueBackend Trait
 
 ```rust
-/// Abstraction for notifying workers about handler intents
+/// Abstraction for notifying workers about reactor intents
 pub trait QueueBackend: Send + Sync + 'static {
-    /// Notify that handler intents are available for an event type
+    /// Notify that reactor intents are available for an event type
     async fn notify(&self, event_type: &str, intent_ids: &[Uuid]) -> Result<()>;
 
     /// Subscribe to notifications for specific event types
@@ -630,7 +630,7 @@ impl Worker {
                     Err(e) => return Err(e),
                 };
 
-                // Execute handler (NO TRANSACTION HELD)
+                // Execute reactor (NO TRANSACTION HELD)
                 let result = engine.execute_handler(&intent).await;
 
                 // Persist result in separate transaction
@@ -678,11 +678,11 @@ NEW (Separate Streams):
 ```
 T=0s:    100 OrderPlaced events arrive
          → All go to "causal.OrderPlaced" stream
-         → Workers start processing (slow handlers, 2s each)
+         → Workers start processing (slow reactors, 2s each)
 
 T=0.5s:  100 EmailSent events arrive
          → All go to "causal.EmailSent" stream
-         → Workers start processing (fast handlers, 10ms each)
+         → Workers start processing (fast reactors, 10ms each)
          → Complete in 1 second ✅
 
 Even though OrderPlaced is slow, EmailSent completes quickly!
@@ -692,19 +692,19 @@ Even though OrderPlaced is slow, EmailSent completes quickly!
 
 ## Part 5: API Changes
 
-### Handler Definition (No More `queued`)
+### Reactor Definition (No More `queued`)
 
 **OLD:**
 ```rust
-// Inline handler (executes in dispatch transaction)
-#[handler(on = OrderPlaced)]
+// Inline reactor (executes in dispatch transaction)
+#[reactor(on = OrderPlaced)]
 async fn save_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     ctx.deps().db.insert_order(&event).await?;
     Ok(OrderSaved { order_id: event.order_id })
 }
 
-// Background handler (executes in worker)
-#[handler(on = PaymentRequested, queued, retry = 3)]
+// Background reactor (executes in worker)
+#[reactor(on = PaymentRequested, queued, retry = 3)]
 async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentCharged> {
     ctx.deps().stripe.charge(&event).await?;
     Ok(PaymentCharged { order_id: event.order_id })
@@ -713,14 +713,14 @@ async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentChar
 
 **NEW:**
 ```rust
-// ALL handlers execute in workers - no distinction!
-#[handler(on = OrderPlaced)]
+// ALL reactors execute in workers - no distinction!
+#[reactor(on = OrderPlaced)]
 async fn save_order(event: OrderPlaced, ctx: Ctx) -> Result<OrderSaved> {
     ctx.deps().db.insert_order(&event).await?;
     Ok(OrderSaved { order_id: event.order_id })
 }
 
-#[handler(on = PaymentRequested, retry = 3)]
+#[reactor(on = PaymentRequested, retry = 3)]
 async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentCharged> {
     // Can take 1 minute - no problem!
     ctx.deps().stripe.charge(&event).await?;
@@ -728,13 +728,13 @@ async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentChar
 }
 ```
 
-**Key Change:** Removed `queued` attribute entirely. ALL handlers are queued (execute in workers).
+**Key Change:** Removed `queued` attribute entirely. ALL reactors are queued (execute in workers).
 
 ### Dispatch API
 
 **OLD Behavior:**
 ```rust
-// Blocks until inline handlers complete
+// Blocks until inline reactors complete
 engine.dispatch(OrderPlaced { id: 123 }).await?;
 // After this line, OrderSaved event already persisted
 ```
@@ -743,7 +743,7 @@ engine.dispatch(OrderPlaced { id: 123 }).await?;
 ```rust
 // Returns after event persisted + intents queued (fast!)
 engine.dispatch(OrderPlaced { id: 123 }).await?;
-// After this line, handler is QUEUED but may not have executed yet
+// After this line, reactor is QUEUED but may not have executed yet
 ```
 
 ### Wait API (New Feature)
@@ -771,7 +771,7 @@ match result {
     Either::Right(failed) => println!("Failed: {}", failed.reason),
 }
 
-// Wait for ALL handlers to complete
+// Wait for ALL reactors to complete
 engine.dispatch(OrderPlaced { id: 123 }).await?;
 engine.settled().await?;  // Waits for all intents to finish
 ```
@@ -821,41 +821,41 @@ impl<E: Event> WaitFor<E> {
 
 ### Breaking Changes
 
-1. **Handler execution model**
-   - OLD: Inline handlers run in dispatch transaction
-   - NEW: All handlers run in workers (async)
+1. **Reactor execution model**
+   - OLD: Inline reactors run in dispatch transaction
+   - NEW: All reactors run in workers (async)
 
 2. **Dispatch behavior**
-   - OLD: `dispatch()` waits for inline handlers to complete
+   - OLD: `dispatch()` waits for inline reactors to complete
    - NEW: `dispatch()` returns after event persisted
 
 3. **Attribute changes**
-   - OLD: `#[handler(on = E, queued)]` for background execution
-   - NEW: `queued` attribute removed (all handlers are queued)
+   - OLD: `#[reactor(on = E, queued)]` for background execution
+   - NEW: `queued` attribute removed (all reactors are queued)
 
 ### Migration Steps
 
-**Step 1: Update handler attributes**
+**Step 1: Update reactor attributes**
 
 ```rust
 // OLD
-#[handler(on = OrderPlaced, queued, retry = 3)]
+#[reactor(on = OrderPlaced, queued, retry = 3)]
 
 // NEW (just remove `queued`)
-#[handler(on = OrderPlaced, retry = 3)]
+#[reactor(on = OrderPlaced, retry = 3)]
 ```
 
 **Step 2: Update dispatch call sites**
 
-If you relied on inline handlers completing before `dispatch()` returns:
+If you relied on inline reactors completing before `dispatch()` returns:
 
 ```rust
-// OLD (inline handler guaranteed to complete)
+// OLD (inline reactor guaranteed to complete)
 engine.dispatch(OrderPlaced { id: 123 }).await?;
 let order = db.query("SELECT * FROM orders WHERE id = 123").await?;
 assert!(order.is_some());  // Always passes
 
-// NEW (handler might not have completed yet)
+// NEW (reactor might not have completed yet)
 engine.dispatch(OrderPlaced { id: 123 }).await?;
 
 // Option A: Use wait_for
@@ -873,7 +873,7 @@ loop {
 }
 
 // Option C: Redesign to be async (best!)
-// Don't query immediately - let handler emit event when done
+// Don't query immediately - let reactor emit event when done
 engine.dispatch(OrderPlaced { id: 123 }).await?;
 // Later, OrderSaved event triggers next step
 ```
@@ -914,15 +914,15 @@ tokio::spawn(async move {
 
 ### Backward Compatibility (Optional)
 
-For gradual migration, could add a `#[handler(inline)]` attribute that errors:
+For gradual migration, could add a `#[reactor(inline)]` attribute that errors:
 
 ```rust
-#[handler(on = OrderPlaced, inline)]
-async fn handler(...) { }
+#[reactor(on = OrderPlaced, inline)]
+async fn reactor(...) { }
 
 // Compile error:
 // The `inline` attribute is no longer supported.
-// All handlers execute asynchronously in workers.
+// All reactors execute asynchronously in workers.
 // Remove the `inline` attribute.
 // If you need synchronous-feeling behavior, use:
 //   engine.dispatch(...).wait_for::<ResultEvent>().await?
@@ -935,8 +935,8 @@ async fn handler(...) { }
 ### Benefits
 
 #### Performance
-- ✅ **Event dispatch always fast** (<10ms) regardless of handler complexity
-- ✅ **No transaction blocking** - handlers can take minutes without impact
+- ✅ **Event dispatch always fast** (<10ms) regardless of reactor complexity
+- ✅ **No transaction blocking** - reactors can take minutes without impact
 - ✅ **Better resource utilization** - DB connections not held during slow operations
 - ✅ **Natural parallelism** - separate streams per event type
 - ✅ **Scales horizontally** - add workers without code changes
@@ -944,32 +944,32 @@ async fn handler(...) { }
 #### Scalability
 - ✅ **Ultra-high throughput** with Kafka backend (100k+ events/sec)
 - ✅ **Independent scaling** - scale workers per event type
-- ✅ **No artificial limits** - handlers can be arbitrarily slow
+- ✅ **No artificial limits** - reactors can be arbitrarily slow
 - ✅ **Graceful degradation** - slow event types don't affect fast ones
 
 #### Developer Experience
 - ✅ **No priority decisions** - separate streams remove cognitive load
 - ✅ **Simpler mental model** - event persistence is always fast
-- ✅ **Clear failure model** - dispatch success != handler success
+- ✅ **Clear failure model** - dispatch success != reactor success
 - ✅ **Explicit waits** - when you need synchronous behavior, it's obvious
 
 #### Correctness
-- ✅ **No hidden blocking** - slow handlers can't block dispatch
+- ✅ **No hidden blocking** - slow reactors can't block dispatch
 - ✅ **Better observability** - clear separation of dispatch vs execution
 - ✅ **Predictable behavior** - dispatch latency always <10ms
 
 ### Trade-offs
 
 #### Lost Atomicity
-- ❌ **Handlers not atomic with dispatch** - separate transactions
+- ❌ **Reactors not atomic with dispatch** - separate transactions
 - ⚠️ **Implications:**
-  - Dispatch can succeed even if handler fails
+  - Dispatch can succeed even if reactor fails
   - Need to handle eventual consistency
-  - Can't rely on handler completing before dispatch returns
+  - Can't rely on reactor completing before dispatch returns
 
 - ✅ **Mitigation:**
   - Use `.wait_for()` when you need synchronous behavior
-  - Design for idempotency (handlers may retry)
+  - Design for idempotency (reactors may retry)
   - Embrace async-first design (better anyway!)
 
 #### Migration Effort
@@ -984,7 +984,7 @@ async fn handler(...) { }
 
 #### Operational Complexity
 - ⚠️ **Workers must be managed** - no longer automatic
-- ⚠️ **Need monitoring** - track queue depth, handler latency
+- ⚠️ **Need monitoring** - track queue depth, reactor latency
 
 - ✅ **Standard practice:**
   - Similar to any job queue system
@@ -1001,7 +1001,7 @@ async fn handler(...) { }
 1. Extract `QueueBackend` trait (already exists in codebase!)
 2. Implement `PostgresQueue`, `MemoryQueue`
 3. Remove inline execution from `EventWorker`
-4. Move all handler execution to `HandlerWorker`
+4. Move all reactor execution to `HandlerWorker`
 5. Update `dispatch()` to only persist + queue
 
 **Files to modify:**
@@ -1015,7 +1015,7 @@ async fn handler(...) { }
 **Success criteria:**
 - `cargo test` passes
 - Dispatch always returns in <10ms
-- All handlers execute in workers
+- All reactors execute in workers
 
 ### Phase 2: Wait API (Week 1)
 
@@ -1090,14 +1090,14 @@ async fn handler(...) { }
 
 ## Part 9: Decision Points
 
-### Decision 1: Keep Inline Handlers?
+### Decision 1: Keep Inline Reactors?
 
-**Option A:** Remove inline handlers entirely (proposed)
+**Option A:** Remove inline reactors entirely (proposed)
 - ✅ Simple, one execution model
 - ✅ No footguns
 - ❌ Breaking change
 
-**Option B:** Keep inline handlers with timeout
+**Option B:** Keep inline reactors with timeout
 - ✅ Less breaking change
 - ❌ Still has blocking risk (timeout = 100ms still blocks)
 - ❌ More complex (two execution models)
@@ -1139,7 +1139,7 @@ async fn handler(...) { }
 ### Performance Targets
 
 - ✅ Event dispatch latency <10ms (p99)
-- ✅ Handler execution unlimited duration
+- ✅ Reactor execution unlimited duration
 - ✅ No database connection exhaustion under load
 - ✅ PostgresQueue: 1,000 events/sec
 - ✅ RedisQueue: 10,000 events/sec
@@ -1148,8 +1148,8 @@ async fn handler(...) { }
 ### Correctness
 
 - ✅ No lost events
-- ✅ At-least-once handler execution
-- ✅ Idempotent handler retries
+- ✅ At-least-once reactor execution
+- ✅ Idempotent reactor retries
 - ✅ Graceful failure handling
 
 ### Developer Experience
@@ -1163,9 +1163,9 @@ async fn handler(...) { }
 
 ## Conclusion
 
-**The current inline handler execution model is a critical footgun that breaks at any meaningful scale.** Moving to an async-first architecture with separate queue streams per event type fixes this while enabling:
+**The current inline reactor execution model is a critical footgun that breaks at any meaningful scale.** Moving to an async-first architecture with separate queue streams per event type fixes this while enabling:
 
-1. Handlers of any duration (seconds, minutes, hours)
+1. Reactors of any duration (seconds, minutes, hours)
 2. Natural parallelism without priority decisions
 3. Ultra-high throughput with Kafka/Redis backends
 4. Clear mental model (dispatch = persist, workers = execute)

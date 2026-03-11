@@ -84,15 +84,15 @@ enum OrderEvent {
 }
 ```
 
-### 3. Handlers (Pure Projections)
+### 3. Reactors (Pure Projections)
 
 **The API stays almost identical, just pure instead of async!**
 
 ```rust
-use causal::{handler, Context};
+use causal::{reactor, Context};
 
-// Handlers become pure state transitions
-#[handler(on = OrderEvent, extract(order_id, customer_id))]
+// Reactors become pure state transitions
+#[reactor(on = OrderEvent, extract(order_id, customer_id))]
 fn apply_created(
     order_id: Uuid,
     customer_id: Uuid,
@@ -104,7 +104,7 @@ fn apply_created(
     Ok(())
 }
 
-#[handler(on = OrderEvent, extract(order_id, item, total))]
+#[reactor(on = OrderEvent, extract(order_id, item, total))]
 fn apply_item_added(
     order_id: Uuid,
     item: Item,
@@ -116,13 +116,13 @@ fn apply_item_added(
     Ok(())
 }
 
-#[handler(on = OrderEvent, extract(order_id))]
+#[reactor(on = OrderEvent, extract(order_id))]
 fn apply_placed(order_id: Uuid, state: &mut Order) -> Result<()> {
     state.status = OrderStatus::Placed;
     Ok(())
 }
 
-#[handler(on = OrderEvent, extract(order_id))]
+#[reactor(on = OrderEvent, extract(order_id))]
 fn apply_shipped(order_id: Uuid, state: &mut Order) -> Result<()> {
     state.status = OrderStatus::Shipped;
     Ok(())
@@ -132,11 +132,11 @@ fn apply_shipped(order_id: Uuid, state: &mut Order) -> Result<()> {
 ### 4. Module-Level Registration (Keep Current API!)
 
 ```rust
-#[handlers]
+#[reactors]
 mod order_handlers {
     use super::*;
 
-    #[handler(on = OrderEvent, extract(order_id, customer_id))]
+    #[reactor(on = OrderEvent, extract(order_id, customer_id))]
     fn apply_created(order_id: Uuid, customer_id: Uuid, state: &mut Order) -> Result<()> {
         state.id = order_id;
         state.customer_id = customer_id;
@@ -144,7 +144,7 @@ mod order_handlers {
         Ok(())
     }
 
-    // ... more handlers
+    // ... more reactors
 }
 ```
 
@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
     // Load aggregate by replaying events
     let order: Order = store
         .aggregate(order_id)
-        .with_handlers(order_handlers::handlers())
+        .with_reactors(order_handlers::reactors())
         .load()
         .await?;
 
@@ -201,7 +201,7 @@ impl PlaceOrder {
         // Load current state
         let order: Order = store
             .aggregate(self.order_id)
-            .with_handlers(order_handlers::handlers())
+            .with_reactors(order_handlers::reactors())
             .load()
             .await?;
 
@@ -254,11 +254,11 @@ struct OrderSummary {
 }
 
 // Project events into read model
-#[handlers]
+#[reactors]
 mod order_summary_projection {
     use super::*;
 
-    #[handler(on = OrderEvent, extract(order_id, customer_id))]
+    #[reactor(on = OrderEvent, extract(order_id, customer_id))]
     async fn project_created(
         order_id: Uuid,
         customer_id: Uuid,
@@ -271,7 +271,7 @@ mod order_summary_projection {
         Ok(())
     }
 
-    #[handler(on = OrderEvent, extract(item))]
+    #[reactor(on = OrderEvent, extract(item))]
     fn project_item_added(item: Item, state: &mut OrderSummary) -> Result<()> {
         state.item_count += 1;
         Ok(())
@@ -281,7 +281,7 @@ mod order_summary_projection {
 // Build read model from events
 let summary: OrderSummary = store
     .projection(order_id)
-    .with_handlers(order_summary_projection::handlers())
+    .with_reactors(order_summary_projection::reactors())
     .with_deps(deps)  // For async projections
     .build()
     .await?;
@@ -291,7 +291,7 @@ let summary: OrderSummary = store
 
 ### Before (Orchestration)
 ```rust
-#[handler(on = OrderEvent, extract(order_id), id = "ship_order")]
+#[reactor(on = OrderEvent, extract(order_id), id = "ship_order")]
 async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
     // ASYNC SIDE EFFECT
     ctx.deps().shipping_api.ship(order_id).await?;
@@ -300,14 +300,14 @@ async fn ship_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
 
 // Engine processes events automatically
 let engine = Engine::new(deps, backend)
-    .with_handler(ship_order());
+    .with_reactor(ship_order());
 
 engine.dispatch(OrderEvent::Placed { order_id }).await?;
 ```
 
 ### After (Event Sourcing)
 ```rust
-#[handler(on = OrderEvent, extract(order_id))]
+#[reactor(on = OrderEvent, extract(order_id))]
 fn apply_shipped(order_id: Uuid, state: &mut Order) -> Result<()> {
     // PURE STATE TRANSITION
     state.status = OrderStatus::Shipped;
@@ -317,7 +317,7 @@ fn apply_shipped(order_id: Uuid, state: &mut Order) -> Result<()> {
 // Load aggregate
 let order: Order = store
     .aggregate(order_id)
-    .with_handlers(order_handlers::handlers())
+    .with_reactors(order_handlers::reactors())
     .load()
     .await?;
 
@@ -330,7 +330,7 @@ store.append(order_id, events).await?;
 
 | Aspect | Before (Orchestration) | After (Event Sourcing) |
 |--------|----------------------|----------------------|
-| **Handlers** | Async, side effects, return events | Pure, state transitions |
+| **Reactors** | Async, side effects, return events | Pure, state transitions |
 | **Events** | Trigger work | Store state |
 | **Context** | Always available | Only for projections |
 | **Engine** | Automatically processes | Manual command execution |
@@ -339,16 +339,16 @@ store.append(order_id, events).await?;
 
 ## What Stays the Same
 
-✅ `#[handler]` macro syntax
+✅ `#[reactor]` macro syntax
 ✅ Field extraction: `extract(order_id, total)`
 ✅ Type-safe event matching
-✅ Module registration: `#[handlers]`
+✅ Module registration: `#[reactors]`
 ✅ Backend abstraction (Memory, PostgreSQL, Kafka)
 ✅ Context for dependencies
 
 ## What Changes
 
-1. **Handlers are pure** (sync, no async by default)
+1. **Reactors are pure** (sync, no async by default)
 2. **Add `state: &mut Aggregate` parameter**
 3. **Commands separate from projections**
 4. **EventStore replaces Engine**
@@ -375,7 +375,7 @@ Or keep both patterns:
 
 **Before:**
 ```rust
-#[handler(on = OrderEvent, extract(order_id))]
+#[reactor(on = OrderEvent, extract(order_id))]
 async fn complete_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent> {
     ctx.deps().db.mark_complete(order_id).await?;
     Ok(OrderEvent::Completed { order_id })
@@ -384,7 +384,7 @@ async fn complete_order(order_id: Uuid, ctx: Context<Deps>) -> Result<OrderEvent
 
 **After:**
 ```rust
-#[handler(on = OrderEvent, extract(order_id))]
+#[reactor(on = OrderEvent, extract(order_id))]
 fn apply_completed(order_id: Uuid, state: &mut Order) -> Result<()> {
     state.status = OrderStatus::Completed;
     Ok(())
@@ -400,17 +400,17 @@ impl CompleteOrder {
 }
 ```
 
-### Example 2: Multiple Handlers (Fan-out)
+### Example 2: Multiple Reactors (Fan-out)
 
 **Before:**
 ```rust
-#[handler(on = OrderEvent, extract(order_id))]
+#[reactor(on = OrderEvent, extract(order_id))]
 async fn send_email(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
     ctx.deps().email.send(order_id).await?;
     Ok(())
 }
 
-#[handler(on = OrderEvent, extract(order_id))]
+#[reactor(on = OrderEvent, extract(order_id))]
 async fn update_inventory(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
     ctx.deps().inventory.reserve(order_id).await?;
     Ok(())
@@ -437,7 +437,7 @@ impl PlaceOrder {
 ## Next Steps
 
 1. ✅ Define core traits (`Aggregate`, `EventStore`)
-2. ✅ Adapt handler macro for pure functions
+2. ✅ Adapt reactor macro for pure functions
 3. ✅ Implement PostgreSQL event store
 4. ✅ Add snapshot support
 5. ✅ Build command pattern helpers

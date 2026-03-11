@@ -32,7 +32,7 @@ pub trait Store: Send + Sync + 'static {
 
     // Effect execution operations
     async fn insert_effect_intent(...) -> Result<()>;
-    async fn poll_next_effect(&self) -> Result<Option<QueuedHandlerExecution>>;
+    async fn poll_next_effect(&self) -> Result<Option<QueuedReactorExecution>>;
     async fn complete_effect(...) -> Result<()>;
     async fn complete_effect_with_events(...) -> Result<()>;
     async fn fail_effect(...) -> Result<()>;
@@ -79,7 +79,7 @@ pub trait QueueBackend<St: Store>: Send + Sync + 'static {
     ) -> Result<()>;
 
     /// Fetch the next queued effect execution to process.
-    async fn poll_next_effect(&self, store: &St) -> Result<Option<QueuedHandlerExecution>>;
+    async fn poll_next_effect(&self, store: &St) -> Result<Option<QueuedReactorExecution>>;
 }
 
 /// Default queue backend that uses the store for polling
@@ -97,7 +97,7 @@ pub struct StoreQueueBackend;
 ```rust
 let engine = Engine::new(deps, PostgresStore::new(pool))
     .with_queue_backend(KafkaQueueBackend::new(kafka_config))  // Optional!
-    .with_handlers(handlers![...]);
+    .with_reactors(reactors![...]);
 ```
 
 ### 3. **Engine Architecture** - Implemented
@@ -126,9 +126,9 @@ impl<D, St> Engine<D, St> {
     pub fn with_queue_backend<B>(mut self, queue_backend: B) -> Self
     where B: QueueBackend<St> { ... }
 
-    /// Register handlers
-    pub fn with_handler(mut self, handler: Handler<D>) -> Self { ... }
-    pub fn with_handlers<I>(mut self, handlers: I) -> Self { ... }
+    /// Register reactors
+    pub fn with_reactor(mut self, reactor: Reactor<D>) -> Self { ... }
+    pub fn with_reactors<I>(mut self, reactors: I) -> Self { ... }
 
     /// Process event (dispatch to store)
     pub fn process<E>(&self, event: E) -> ProcessFuture<St> { ... }
@@ -145,10 +145,10 @@ Already supports everything we proposed:
 
 ```rust
 #[proc_macro_attribute]
-pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream { ... }
+pub fn reactor(attr: TokenStream, item: TokenStream) -> TokenStream { ... }
 
 #[proc_macro_attribute]
-pub fn handlers(attr: TokenStream, item: TokenStream) -> TokenStream { ... }
+pub fn reactors(attr: TokenStream, item: TokenStream) -> TokenStream { ... }
 ```
 
 **Supported attributes:**
@@ -160,19 +160,19 @@ pub fn handlers(attr: TokenStream, item: TokenStream) -> TokenStream { ... }
 - ✅ `timeout_secs = N` / `timeout_ms = N`
 - ✅ `delay_secs = N` / `delay_ms = N`
 - ✅ `priority = N`
-- ✅ `id = "handler_id"` or `group = "group_name"`
+- ✅ `id = "reactor_id"` or `group = "group_name"`
 - ✅ `window_timeout_secs = N` - accumulation window timeout
 - ✅ `dlq_terminal = handler_fn` - dead letter mapping
 
 **Example usage (already works):**
 ```rust
-#[handler(on = OrderPlaced, queued, retry = 3, timeout_secs = 30, priority = 1)]
+#[reactor(on = OrderPlaced, queued, retry = 3, timeout_secs = 30, priority = 1)]
 async fn process_order(event: OrderPlaced, ctx: HandlerContext<Deps>) -> Result<OrderShipped> {
     ctx.deps().db.insert_order(&event).await?;
     Ok(OrderShipped { order_id: event.order_id })
 }
 
-#[handler(on = RowParsed, accumulate)]
+#[reactor(on = RowParsed, accumulate)]
 async fn bulk_insert(batch: Vec<RowParsed>, ctx: Ctx) -> Result<BatchInserted> {
     ctx.deps().db.bulk_insert(&batch).await?;
     Ok(BatchInserted { count: batch.len() })
@@ -181,13 +181,13 @@ async fn bulk_insert(batch: Vec<RowParsed>, ctx: Ctx) -> Result<BatchInserted> {
 
 ### 5. **HandlerContext** - Partially Implemented
 
-**Location:** `crates/causal/src/handler/context.rs`
+**Location:** `crates/causal/src/reactor/context.rs`
 
 Already provides:
 
 ```rust
 pub struct HandlerContext<D> {
-    pub handler_id: String,
+    pub reactor_id: String,
     pub idempotency_key: String,
     pub correlation_id: Uuid,
     pub event_id: Uuid,
@@ -195,7 +195,7 @@ pub struct HandlerContext<D> {
 }
 
 impl<D> HandlerContext<D> {
-    pub fn handler_id(&self) -> &str { ... }
+    pub fn reactor_id(&self) -> &str { ... }
     pub fn idempotency_key(&self) -> &str { ... }
     pub fn deps(&self) -> &D { ... }
     pub fn current_event_id(&self) -> Uuid { ... }
@@ -240,12 +240,12 @@ struct Deps {
 
 Macro currently allows:
 ```rust
-#[handler(on = Event, retry = 3)]  // Silently becomes background
+#[reactor(on = Event, retry = 3)]  // Silently becomes background
 ```
 
 **Should require:**
 ```rust
-#[handler(on = Event, queued, retry = 3)]  // Explicit
+#[reactor(on = Event, queued, retry = 3)]  // Explicit
 ```
 
 ### 3. **Engine Configuration Methods** - Not Implemented
@@ -321,7 +321,7 @@ impl Store for KafkaStore {
 | MemoryStore | ✅ Done | - | - |
 | KafkaStore | ❌ Missing | Medium | Medium |
 | **Macros** |
-| #[handler] | ✅ Done | - | - |
+| #[reactor] | ✅ Done | - | - |
 | All attributes | ✅ Done | - | - |
 | Explicit `queued` check | ❌ Missing | High | Low |
 | **Safety** |

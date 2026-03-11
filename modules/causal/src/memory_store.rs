@@ -1,6 +1,6 @@
-//! In-memory EventLog + HandlerQueue for causal Engine.
+//! In-memory EventLog + ReactorQueue for causal Engine.
 //!
-//! Provides event log persistence and handler queue used by the Engine's settle loop.
+//! Provides event log persistence and reactor queue used by the Engine's settle loop.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,22 +15,22 @@ use uuid::Uuid;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::event_log::EventLog;
-use crate::handler_queue::HandlerQueue;
+use crate::reactor_queue::ReactorQueue;
 use crate::types::*;
 
-/// In-memory EventLog + HandlerQueue for the Engine's settle loop.
+/// In-memory EventLog + ReactorQueue for the Engine's settle loop.
 ///
 /// Event log and snapshots are kept in-memory — suitable for testing
 /// and simple single-process use cases.
 #[derive(Clone)]
 pub struct MemoryStore {
-    /// Handler executions queue
-    handler_queue: Arc<Mutex<VecDeque<QueuedHandler>>>,
-    /// Completed handlers (for idempotency)
-    completed_handlers: Arc<DashMap<(Uuid, String), serde_json::Value>>,
-    /// In-flight handlers: populated by poll_next_handler, consumed by
+    /// Reactor executions queue
+    reactor_queue: Arc<Mutex<VecDeque<QueuedReactor>>>,
+    /// Completed reactors (for idempotency)
+    completed_reactors: Arc<DashMap<(Uuid, String), serde_json::Value>>,
+    /// In-flight reactors: populated by poll_next_handler, consumed by
     /// resolve_handler(Retry) to reconstruct the execution for re-enqueueing.
-    in_flight: Arc<DashMap<(Uuid, String), QueuedHandler>>,
+    in_flight: Arc<DashMap<(Uuid, String), QueuedReactor>>,
     // ── Event persistence ────────────────────────────────────────
     /// Global event log for event persistence.
     global_log: Arc<Mutex<Vec<PersistedEvent>>>,
@@ -42,19 +42,19 @@ pub struct MemoryStore {
     cancelled: Arc<DashMap<Uuid, Instant>>,
     /// TTL for cancelled entries (default 1 hour).
     cancel_ttl: std::time::Duration,
-    /// Journal entries keyed by (handler_id, event_id).
+    /// Journal entries keyed by (reactor_id, event_id).
     journal: Arc<DashMap<(String, Uuid), Vec<JournalEntry>>>,
-    /// Handler gate descriptions keyed by correlation_id.
-    handler_descriptions: Arc<DashMap<Uuid, HashMap<String, serde_json::Value>>>,
-    /// Checkpoint position for HandlerQueue (last fully processed EventLog position).
+    /// Reactor gate descriptions keyed by correlation_id.
+    reactor_descriptions: Arc<DashMap<Uuid, HashMap<String, serde_json::Value>>>,
+    /// Checkpoint position for ReactorQueue (last fully processed EventLog position).
     checkpoint: Arc<AtomicU64>,
 }
 
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
-            handler_queue: Arc::new(Mutex::new(VecDeque::new())),
-            completed_handlers: Arc::new(DashMap::new()),
+            reactor_queue: Arc::new(Mutex::new(VecDeque::new())),
+            completed_reactors: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
             global_log: Arc::new(Mutex::new(Vec::new())),
             global_position: Arc::new(AtomicU64::new(1)),
@@ -62,7 +62,7 @@ impl MemoryStore {
             cancelled: Arc::new(DashMap::new()),
             cancel_ttl: std::time::Duration::from_secs(3600),
             journal: Arc::new(DashMap::new()),
-            handler_descriptions: Arc::new(DashMap::new()),
+            reactor_descriptions: Arc::new(DashMap::new()),
             checkpoint: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -76,9 +76,9 @@ impl MemoryStore {
         self
     }
 
-    /// Insert a queued handler directly (for test setup).
-    pub async fn publish_handler_for_test(&self, handler: QueuedHandler) {
-        self.handler_queue.lock().push_back(handler);
+    /// Insert a queued reactor directly (for test setup).
+    pub async fn publish_reactor_for_test(&self, reactor: QueuedReactor) {
+        self.reactor_queue.lock().push_back(reactor);
     }
 
     /// Set the checkpoint position directly (for test setup / resume simulation).
@@ -92,8 +92,8 @@ impl MemoryStore {
     }
 
     /// Internal journal clear (avoids trait method ambiguity).
-    fn clear_journal_internal(&self, handler_id: &str, event_id: Uuid) {
-        let key = (handler_id.to_string(), event_id);
+    fn clear_journal_internal(&self, reactor_id: &str, event_id: Uuid) {
+        let key = (reactor_id.to_string(), event_id);
         self.journal.remove(&key);
     }
 
@@ -207,25 +207,25 @@ impl EventLog for MemoryStore {
     }
 }
 
-// ── HandlerQueue implementation ─────────────────────────────────────
+// ── ReactorQueue implementation ─────────────────────────────────────
 
 #[async_trait]
-impl HandlerQueue for MemoryStore {
+impl ReactorQueue for MemoryStore {
     async fn enqueue(&self, commit: IntentCommit) -> Result<()> {
-        // Persist handler descriptions atomically
-        if !commit.handler_descriptions.is_empty() {
+        // Persist reactor descriptions atomically
+        if !commit.reactor_descriptions.is_empty() {
             let mut entry = self
-                .handler_descriptions
+                .reactor_descriptions
                 .entry(commit.correlation_id)
                 .or_default();
-            entry.extend(commit.handler_descriptions);
+            entry.extend(commit.reactor_descriptions);
         }
 
         // Handle projection failures as DLQ entries
         for failure in commit.projection_failures {
             eprintln!(
                 "Projection DLQ: {}:{} - {} ({})",
-                commit.event_id, failure.handler_id, failure.error, failure.reason
+                commit.event_id, failure.reactor_id, failure.error, failure.reason
             );
         }
 
@@ -237,11 +237,11 @@ impl HandlerQueue for MemoryStore {
             );
         }
 
-        // Create handler intents
+        // Create reactor intents
         for intent in commit.intents {
-            let execution = QueuedHandler {
+            let execution = QueuedReactor {
                 event_id: commit.event_id,
-                handler_id: intent.handler_id,
+                reactor_id: intent.reactor_id,
                 correlation_id: commit.correlation_id,
                 event_type: commit.event_type.clone(),
                 event_payload: commit.event_payload.clone(),
@@ -254,7 +254,7 @@ impl HandlerQueue for MemoryStore {
                 attempts: 0,
                 ephemeral: None, // Engine injects ephemeral from its cache
             };
-            self.handler_queue.lock().push_back(execution);
+            self.reactor_queue.lock().push_back(execution);
         }
 
         // Advance checkpoint
@@ -267,8 +267,8 @@ impl HandlerQueue for MemoryStore {
         Ok(self.checkpoint.load(Ordering::SeqCst))
     }
 
-    async fn dequeue(&self) -> Result<Option<QueuedHandler>> {
-        let mut queue = self.handler_queue.lock();
+    async fn dequeue(&self) -> Result<Option<QueuedReactor>> {
+        let mut queue = self.reactor_queue.lock();
         let now = Utc::now();
         if let Some(pos) = queue
             .iter()
@@ -279,7 +279,7 @@ impl HandlerQueue for MemoryStore {
         {
             let execution = queue.remove(pos).unwrap();
             self.in_flight.insert(
-                (execution.event_id, execution.handler_id.clone()),
+                (execution.event_id, execution.reactor_id.clone()),
                 execution.clone(),
             );
             Ok(Some(execution))
@@ -289,51 +289,51 @@ impl HandlerQueue for MemoryStore {
     }
 
     async fn earliest_pending_at(&self) -> Result<Option<DateTime<Utc>>> {
-        let queue = self.handler_queue.lock();
+        let queue = self.reactor_queue.lock();
         Ok(queue.iter().map(|e| e.execute_at).min())
     }
 
-    async fn resolve(&self, resolution: HandlerResolution) -> Result<()> {
+    async fn resolve(&self, resolution: ReactorResolution) -> Result<()> {
         match resolution {
-            HandlerResolution::Complete(completion) => {
+            ReactorResolution::Complete(completion) => {
                 self.in_flight
-                    .remove(&(completion.event_id, completion.handler_id.clone()));
-                self.clear_journal_internal(&completion.handler_id, completion.event_id);
-                self.completed_handlers
-                    .insert((completion.event_id, completion.handler_id), completion.result);
+                    .remove(&(completion.event_id, completion.reactor_id.clone()));
+                self.clear_journal_internal(&completion.reactor_id, completion.event_id);
+                self.completed_reactors
+                    .insert((completion.event_id, completion.reactor_id), completion.result);
             }
-            HandlerResolution::Retry {
+            ReactorResolution::Retry {
                 event_id,
-                handler_id,
+                reactor_id,
                 error,
                 new_attempts,
                 next_execute_at,
             } => {
                 tracing::warn!(
-                    "Handler retry: {}:{} - {} (attempt {})",
+                    "Reactor retry: {}:{} - {} (attempt {})",
                     event_id,
-                    handler_id,
+                    reactor_id,
                     error,
                     new_attempts
                 );
-                let key = (event_id, handler_id.clone());
+                let key = (event_id, reactor_id.clone());
                 if let Some((_, mut execution)) = self.in_flight.remove(&key) {
                     execution.attempts = new_attempts;
                     execution.execute_at = next_execute_at;
-                    self.handler_queue.lock().push_back(execution);
+                    self.reactor_queue.lock().push_back(execution);
                 } else {
                     tracing::warn!(
                         "resolve(Retry): no in-flight execution found for {}:{} — retry will be lost",
-                        key.0, handler_id
+                        key.0, reactor_id
                     );
                 }
             }
-            HandlerResolution::DeadLetter(dlq) => {
+            ReactorResolution::DeadLetter(dlq) => {
                 self.in_flight
-                    .remove(&(dlq.event_id, dlq.handler_id.clone()));
+                    .remove(&(dlq.event_id, dlq.reactor_id.clone()));
                 eprintln!(
-                    "Handler sent to DLQ: {}:{} - {} (attempts: {})",
-                    dlq.event_id, dlq.handler_id, dlq.error, dlq.attempts
+                    "Reactor sent to DLQ: {}:{} - {} (attempts: {})",
+                    dlq.event_id, dlq.reactor_id, dlq.error, dlq.attempts
                 );
             }
         }
@@ -344,21 +344,21 @@ impl HandlerQueue for MemoryStore {
 
     async fn load_journal(
         &self,
-        handler_id: &str,
+        reactor_id: &str,
         event_id: Uuid,
     ) -> Result<Vec<JournalEntry>> {
-        let key = (handler_id.to_string(), event_id);
+        let key = (reactor_id.to_string(), event_id);
         Ok(self.journal.get(&key).map(|v| v.clone()).unwrap_or_default())
     }
 
     async fn append_journal(
         &self,
-        handler_id: &str,
+        reactor_id: &str,
         event_id: Uuid,
         seq: u32,
         value: serde_json::Value,
     ) -> Result<()> {
-        let key = (handler_id.to_string(), event_id);
+        let key = (reactor_id.to_string(), event_id);
         self.journal
             .entry(key)
             .or_default()
@@ -368,10 +368,10 @@ impl HandlerQueue for MemoryStore {
 
     async fn clear_journal(
         &self,
-        handler_id: &str,
+        reactor_id: &str,
         event_id: Uuid,
     ) -> Result<()> {
-        let key = (handler_id.to_string(), event_id);
+        let key = (reactor_id.to_string(), event_id);
         self.journal.remove(&key);
         Ok(())
     }
@@ -399,15 +399,15 @@ impl HandlerQueue for MemoryStore {
     }
 
     async fn status(&self, correlation_id: Uuid) -> Result<QueueStatus> {
-        let pending_handlers = self
-            .handler_queue
+        let pending_reactors = self
+            .reactor_queue
             .lock()
             .iter()
             .filter(|e| e.correlation_id == correlation_id)
             .count();
 
         Ok(QueueStatus {
-            pending_handlers,
+            pending_reactors,
             dead_lettered: 0,
         })
     }
@@ -417,7 +417,7 @@ impl HandlerQueue for MemoryStore {
         correlation_id: Uuid,
         descriptions: HashMap<String, serde_json::Value>,
     ) -> Result<()> {
-        let mut entry = self.handler_descriptions.entry(correlation_id).or_default();
+        let mut entry = self.reactor_descriptions.entry(correlation_id).or_default();
         entry.extend(descriptions);
         Ok(())
     }
@@ -427,7 +427,7 @@ impl HandlerQueue for MemoryStore {
         correlation_id: Uuid,
     ) -> Result<HashMap<String, serde_json::Value>> {
         Ok(self
-            .handler_descriptions
+            .reactor_descriptions
             .get(&correlation_id)
             .map(|e| e.value().clone())
             .unwrap_or_default())

@@ -1,4 +1,4 @@
-//! Handler context and related types.
+//! Reactor context and related types.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,13 +11,13 @@ use uuid::Uuid;
 use parking_lot::Mutex;
 
 use crate::aggregator::{Aggregate, AggregatorRegistry};
-use crate::handler_queue::HandlerQueue;
+use crate::reactor_queue::ReactorQueue;
 use crate::types::{JournalEntry, LogEntry, LogLevel};
 
 /// Journaling state for `ctx.run()` replay.
 pub(crate) struct JournalState {
-    queue: Arc<dyn HandlerQueue>,
-    handler_id: String,
+    queue: Arc<dyn ReactorQueue>,
+    reactor_id: String,
     event_id: Uuid,
     /// Preloaded journal entries keyed by sequence number.
     entries: HashMap<u32, serde_json::Value>,
@@ -25,10 +25,10 @@ pub(crate) struct JournalState {
     next_seq: AtomicU32,
 }
 
-/// Structured logger for capturing log entries during handler execution.
+/// Structured logger for capturing log entries during reactor execution.
 ///
 /// Entries are drained by the engine after execution and attached to the
-/// `HandlerCompletion` for Store implementations to persist.
+/// `ReactorCompletion` for Store implementations to persist.
 #[derive(Clone, Default)]
 pub struct Logger {
     entries: Arc<Mutex<Vec<LogEntry>>>,
@@ -98,13 +98,13 @@ pub struct AggregateState<A> {
     pub curr: Arc<A>,
 }
 
-/// Context passed to handlers.
+/// Context passed to reactors.
 pub struct Context<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Human-readable identifier of the handler being executed.
-    pub handler_id: String,
+    /// Human-readable identifier of the reactor being executed.
+    pub reactor_id: String,
     /// Deterministic idempotency key for external API calls.
     pub idempotency_key: String,
     /// Correlation ID from event envelope - groups related events together.
@@ -114,7 +114,7 @@ where
     /// Parent event ID for causal tracking.
     pub parent_event_id: Option<Uuid>,
     pub(crate) deps: Arc<D>,
-    /// Structured logger — entries are drained into `HandlerCompletion` after execution.
+    /// Structured logger — entries are drained into `ReactorCompletion` after execution.
     pub logger: Logger,
     /// Aggregator registry for transition guard replay.
     pub(crate) aggregator_registry: Option<Arc<AggregatorRegistry>>,
@@ -128,7 +128,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            handler_id: self.handler_id.clone(),
+            reactor_id: self.reactor_id.clone(),
             idempotency_key: self.idempotency_key.clone(),
             correlation_id: self.correlation_id,
             event_id: self.event_id,
@@ -146,7 +146,7 @@ where
     D: Send + Sync + 'static,
 {
     pub(crate) fn new(
-        handler_id: String,
+        reactor_id: String,
         idempotency_key: String,
         correlation_id: Uuid,
         event_id: Uuid,
@@ -154,7 +154,7 @@ where
         deps: Arc<D>,
     ) -> Self {
         Self {
-            handler_id,
+            reactor_id,
             idempotency_key,
             correlation_id,
             event_id,
@@ -169,13 +169,13 @@ where
     /// Attach journal state for `ctx.run()` replay.
     pub(crate) fn with_journal(
         mut self,
-        queue: Arc<dyn HandlerQueue>,
+        queue: Arc<dyn ReactorQueue>,
         entries: Vec<JournalEntry>,
     ) -> Self {
         let map = entries.into_iter().map(|e| (e.seq, e.value)).collect();
         self.journal = Some(Arc::new(JournalState {
             queue,
-            handler_id: self.handler_id.clone(),
+            reactor_id: self.reactor_id.clone(),
             event_id: self.event_id,
             entries: map,
             next_seq: AtomicU32::new(0),
@@ -227,9 +227,9 @@ where
         AggregateState { prev, curr }
     }
 
-    /// Get the handler ID (human-readable identifier).
-    pub fn handler_id(&self) -> &str {
-        &self.handler_id
+    /// Get the reactor ID (human-readable identifier).
+    pub fn reactor_id(&self) -> &str {
+        &self.reactor_id
     }
 
     /// Get the idempotency key for external API calls.
@@ -255,7 +255,7 @@ where
     /// Execute a side-effect closure with journaling.
     ///
     /// When a journal is wired (durable store), the result is persisted
-    /// so that retried handlers can skip already-completed steps. Without
+    /// so that retried reactors can skip already-completed steps. Without
     /// a journal the closure executes directly (passthrough).
     ///
     /// ```rust,ignore
@@ -287,7 +287,7 @@ where
         journal
             .queue
             .append_journal(
-                &journal.handler_id,
+                &journal.reactor_id,
                 journal.event_id,
                 seq,
                 serde_json::to_value(&result)?,
@@ -323,7 +323,7 @@ mod tests {
     }
 
     fn create_journaled_context(entries: Vec<JournalEntry>) -> Context<TestDeps> {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         create_test_context().with_journal(store, entries)
     }
 
@@ -331,7 +331,7 @@ mod tests {
     async fn test_effect_context_accessors() {
         let context = create_test_context();
 
-        assert_eq!(context.handler_id(), "test_effect");
+        assert_eq!(context.reactor_id(), "test_effect");
         assert_eq!(context.idempotency_key(), "test_idempotency_key");
         assert_eq!(context.deps().multiplier, 2);
     }
@@ -341,7 +341,7 @@ mod tests {
         let context = create_test_context();
         let cloned = context.clone();
 
-        assert_eq!(cloned.handler_id(), "test_effect");
+        assert_eq!(cloned.reactor_id(), "test_effect");
         assert_eq!(cloned.deps().multiplier, 2);
     }
 
@@ -441,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_persists_new_entries_to_store() {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         let _: String = ctx.run(|| async { Ok("first".into()) }).await.unwrap();
@@ -472,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_error_not_journaled_allows_retry() {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         // First run succeeds
@@ -582,7 +582,7 @@ mod tests {
     async fn journal_crash_retry_simulation() {
         // Simulate: effect runs 2 of 3 steps, then "crashes".
         // On retry, load journal from store, first 2 replay, third executes fresh.
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
 
         let call_counts = Arc::new([AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)]);
 
@@ -662,10 +662,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn journal_isolation_by_handler_id() {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+    async fn journal_isolation_by_reactor_id() {
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
 
-        // Handler A writes to journal
+        // Reactor A writes to journal
         let ctx_a = Context::new(
             "handler_a".into(),
             "key".into(),
@@ -678,11 +678,11 @@ mod tests {
 
         let _: String = ctx_a.run(|| async { Ok("from_a".into()) }).await.unwrap();
 
-        // Handler B should have empty journal
+        // Reactor B should have empty journal
         let entries_b = store.load_journal("handler_b", Uuid::nil()).await.unwrap();
         assert!(entries_b.is_empty(), "handler_b journal should be empty");
 
-        // Handler A should have its entry
+        // Reactor A should have its entry
         let entries_a = store.load_journal("handler_a", Uuid::nil()).await.unwrap();
         assert_eq!(entries_a.len(), 1);
         assert_eq!(entries_a[0].value, serde_json::json!("from_a"));
@@ -690,13 +690,13 @@ mod tests {
 
     #[tokio::test]
     async fn journal_isolation_by_event_id() {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let event_1 = Uuid::from_u128(1);
         let event_2 = Uuid::from_u128(2);
 
-        // Same handler, different events
+        // Same reactor, different events
         let ctx_1 = Context::new(
-            "handler".into(),
+            "reactor".into(),
             "key".into(),
             Uuid::nil(),
             event_1,
@@ -708,17 +708,17 @@ mod tests {
         let _: String = ctx_1.run(|| async { Ok("event1".into()) }).await.unwrap();
 
         // Event 2 should have empty journal
-        let entries_2 = store.load_journal("handler", event_2).await.unwrap();
+        let entries_2 = store.load_journal("reactor", event_2).await.unwrap();
         assert!(entries_2.is_empty());
 
         // Event 1 should have its entry
-        let entries_1 = store.load_journal("handler", event_1).await.unwrap();
+        let entries_1 = store.load_journal("reactor", event_1).await.unwrap();
         assert_eq!(entries_1.len(), 1);
     }
 
     #[tokio::test]
     async fn journal_cloned_context_shares_sequence_counter() {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
         let cloned = ctx.clone();
 
@@ -736,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_many_sequential_runs() {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         for i in 0..100u32 {
@@ -761,7 +761,7 @@ mod tests {
             })
             .collect();
 
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), entries);
 
         let call_count = Arc::new(AtomicI32::new(0));
@@ -797,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn journal_error_midway_preserves_prior_entries() {
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         let _: String = ctx.run(|| async { Ok("ok1".into()) }).await.unwrap();
@@ -821,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn journal_error_then_retry_replays_and_continues() {
         // Simulate: 2 succeed, 3rd fails. Retry: 2 replay, 3rd succeeds.
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
 
         // --- First attempt ---
         {
@@ -878,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn journal_seq_counter_advances_even_on_error() {
         // If run() at seq=1 fails, the next run() should be seq=2, not seq=1
-        let store: Arc<dyn HandlerQueue> = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ReactorQueue> = Arc::new(MemoryStore::new());
         let ctx = create_test_context().with_journal(store.clone(), vec![]);
 
         let _: String = ctx.run(|| async { Ok("seq0".into()) }).await.unwrap();
@@ -934,11 +934,11 @@ mod tests {
         assert_eq!(entries.len(), 2);
 
         // resolve(Complete) should clear journal atomically
-        use crate::types::{HandlerCompletion, HandlerResolution};
+        use crate::types::{ReactorCompletion, ReactorResolution};
         store
-            .resolve(HandlerResolution::Complete(HandlerCompletion {
+            .resolve(ReactorResolution::Complete(ReactorCompletion {
                 event_id: Uuid::from_u128(1),
-                handler_id: "handler_x".into(),
+                reactor_id: "handler_x".into(),
                 result: serde_json::json!({}),
 
                 log_entries: vec![],
@@ -957,18 +957,18 @@ mod tests {
     async fn journal_preserved_on_retry_resolution() {
         let store = Arc::new(MemoryStore::new());
 
-        // Seed journal and an in-flight handler
+        // Seed journal and an in-flight reactor
         store
             .append_journal("handler_y", Uuid::from_u128(2), 0, serde_json::json!("a"))
             .await
             .unwrap();
 
-        // We need an in-flight handler for retry to work in MemoryStore
+        // We need an in-flight reactor for retry to work in MemoryStore
         // Poll it first to put it in the in-flight map
-        use crate::types::{HandlerResolution, QueuedHandler};
-        let queued = QueuedHandler {
+        use crate::types::{ReactorResolution, QueuedReactor};
+        let queued = QueuedReactor {
             event_id: Uuid::from_u128(2),
-            handler_id: "handler_y".into(),
+            reactor_id: "handler_y".into(),
             correlation_id: Uuid::nil(),
             event_type: "Test".into(),
             event_payload: serde_json::json!({}),
@@ -981,14 +981,14 @@ mod tests {
             attempts: 1,
             ephemeral: None,
         };
-        // Insert directly into handler queue, then dequeue to put in-flight
-        store.publish_handler_for_test(queued).await;
+        // Insert directly into reactor queue, then dequeue to put in-flight
+        store.publish_reactor_for_test(queued).await;
         let _ = store.dequeue().await.unwrap();
 
         store
-            .resolve(HandlerResolution::Retry {
+            .resolve(ReactorResolution::Retry {
                 event_id: Uuid::from_u128(2),
-                handler_id: "handler_y".into(),
+                reactor_id: "handler_y".into(),
                 error: "transient".into(),
                 new_attempts: 2,
                 next_execute_at: chrono::Utc::now(),

@@ -1,15 +1,15 @@
 ---
 date: 2026-03-06
-topic: handler-describe
+topic: reactor-describe
 ---
 
-# Handler Describe — Introspectable Gate Progress
+# Reactor Describe — Introspectable Gate Progress
 
 ## What We're Building
 
-An optional `.describe()` method on filtered handlers that returns a typed struct
-(serialized to JSON) representing the handler's gate status. The output is persisted
-to the Store so external UIs (flow visualization) can render per-handler progress
+An optional `.describe()` method on filtered reactors that returns a typed struct
+(serialized to JSON) representing the reactor's gate status. The output is persisted
+to the Store so external UIs (flow visualization) can render per-reactor progress
 without domain knowledge.
 
 ## Why This Approach
@@ -38,19 +38,19 @@ without domain knowledge.
   `|ctx| FinalizeGate { completed, remaining }`. Causal serializes internally.
 
 - **Runs during `execute_event`, not `execute_handler`:** Aggregates are already
-  updated (line 406 in engine.rs). We're already iterating matching handlers to
+  updated (line 406 in engine.rs). We're already iterating matching reactors to
   create intents. Natural place to call `describe` and collect results.
 
 - **Persisted to Store, not live-queried from Engine:** The flow UI is a separate
   process. It queries the Store (Postgres) directly. No coupling to the live Engine.
 
-- **`filter` stays as-is:** Simple event-match handlers keep using closures without
+- **`filter` stays as-is:** Simple event-match reactors keep using closures without
   `describe`. Gates are for stateful multi-event convergence points that need
   introspection.
 
 ## Implementation Plan
 
-### 1. `handler/types.rs` — Handler struct
+### 1. `reactor/types.rs` — Reactor struct
 
 ```rust
 pub(crate) describe: Option<Arc<dyn Fn(&Context<D>) -> serde_json::Value + Send + Sync>>,
@@ -61,7 +61,7 @@ pub fn call_describe(&self, ctx: &Context<D>) -> Option<serde_json::Value> {
 }
 ```
 
-### 2. `handler/builders.rs` — FilteredHandlerBuilder
+### 2. `reactor/builders.rs` — FilteredHandlerBuilder
 
 ```rust
 pub fn describe<T, Desc>(self, f: Desc) -> Self
@@ -88,7 +88,7 @@ async fn get_handler_descriptions(
 
 ### 4. `job_executor.rs` — execute_event
 
-After matching handlers, before building intents: for each handler with `describe`,
+After matching reactors, before building intents: for each reactor with `describe`,
 build a lightweight context and call it. Return descriptions via `EventCommit`.
 
 ### 5. `types.rs` — EventCommit
@@ -136,7 +136,7 @@ let descriptions = store.get_handler_descriptions(correlation_id).await?;
 
 ## Open Questions
 
-- Should `describe` also be available on non-filtered handlers (e.g. `on::<E>().describe(...)`)?
+- Should `describe` also be available on non-filtered reactors (e.g. `on::<E>().describe(...)`)?
   Not needed today but trivial to add later.
 - Should the Store persist describe history (append) or just latest (upsert)?
   Upsert is simpler and sufficient for the flow UI.

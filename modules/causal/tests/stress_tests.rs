@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use causal::{event, events, handler, project, Aggregate, AnyEvent, Apply, Context, Engine, Events};
+use causal::{event, events, reactor, project, Aggregate, AnyEvent, Apply, Context, Engine, Events};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -121,14 +121,14 @@ async fn parent_event_id_set_on_handler_chain() -> Result<()> {
     let sp = seen_parent.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(handler::on::<EventA>().then(
+        .with_reactor(reactor::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
                     value: event.value + 1,
                 }])
             },
         ))
-        .with_handler(handler::on::<EventB>().then(
+        .with_reactor(reactor::on::<EventB>().then(
             move |_event: Arc<EventB>, ctx: Context<Deps>| {
                 let sp = sp.clone();
                 async move {
@@ -152,8 +152,8 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
     let sp = seen_parent.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<EventA>()
+        .with_reactor(
+            reactor::on::<EventA>()
                 .id("emit_b")
                 .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
@@ -162,7 +162,7 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
                     }])
                 }),
         )
-        .with_handler(handler::on::<EventB>().then(
+        .with_reactor(reactor::on::<EventB>().then(
             move |_event: Arc<EventB>, ctx: Context<Deps>| {
                 let sp = sp.clone();
                 async move {
@@ -173,13 +173,13 @@ async fn parent_event_id_set_on_queued_chain() -> Result<()> {
         ));
 
     let _handle = engine.emit(EventA { value: 1 }).settled().await?;
-    assert!(seen_parent.lock().is_some(), "EventB handler should have run");
+    assert!(seen_parent.lock().is_some(), "EventB reactor should have run");
     Ok(())
 }
 
 #[tokio::test]
 async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
-    // A → B → C → D, each handler emits the next event.
+    // A → B → C → D, each reactor emits the next event.
     // Each event's parent should be the preceding event (not root).
     let parents: Arc<Mutex<Vec<(String, Option<Uuid>)>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -188,14 +188,14 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
     let p3 = parents.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(handler::on::<EventA>().then(
+        .with_reactor(reactor::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
                     value: event.value + 1,
                 }])
             },
         ))
-        .with_handler(handler::on::<EventB>().then(
+        .with_reactor(reactor::on::<EventB>().then(
             move |event: Arc<EventB>, ctx: Context<Deps>| {
                 let p = p1.clone();
                 async move {
@@ -206,7 +206,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
                 }
             },
         ))
-        .with_handler(handler::on::<EventC>().then(
+        .with_reactor(reactor::on::<EventC>().then(
             move |event: Arc<EventC>, ctx: Context<Deps>| {
                 let p = p2.clone();
                 async move {
@@ -217,7 +217,7 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
                 }
             },
         ))
-        .with_handler(handler::on::<EventD>().then(
+        .with_reactor(reactor::on::<EventD>().then(
             move |_event: Arc<EventD>, ctx: Context<Deps>| {
                 let p = p3.clone();
                 async move {
@@ -230,12 +230,12 @@ async fn deep_causal_chain_preserves_parent_links() -> Result<()> {
     engine.emit(EventA { value: 0 }).settled().await?;
 
     let parents = parents.lock();
-    assert_eq!(parents.len(), 3, "B, C, D handlers should all fire");
-    // Every handler should have a parent
+    assert_eq!(parents.len(), 3, "B, C, D reactors should all fire");
+    // Every reactor should have a parent
     for (name, parent) in parents.iter() {
         assert!(
             parent.is_some(),
-            "Handler {} should have parent_event_id",
+            "Reactor {} should have parent_event_id",
             name
         );
     }
@@ -266,15 +266,15 @@ async fn aggregate_state_transitions_correctly() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(handler::on::<OrderPlaced>().then(
+        .with_reactor(reactor::on::<OrderPlaced>().then(
             |event: Arc<OrderPlaced>, _ctx: Context<Deps>| async move {
                 Ok(events![OrderShipped {
                     order_id: event.order_id,
                 }])
             },
         ))
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status != OrderStatus::Shipped && next.status == OrderStatus::Shipped
@@ -313,8 +313,8 @@ async fn transition_guard_blocks_duplicate_transition() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status != OrderStatus::Shipped && next.status == OrderStatus::Shipped
@@ -365,8 +365,8 @@ async fn transition_guard_does_not_fire_when_guard_returns_false() -> Result<()>
 
     let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderPlaced>()
+        .with_reactor(
+            reactor::on::<OrderPlaced>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|_prev, next| {
                     // Only fire if total > 100 — but we'll send total=50
@@ -409,8 +409,8 @@ async fn aggregate_state_isolated_between_ids() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status != OrderStatus::Shipped && next.status == OrderStatus::Shipped
@@ -466,8 +466,8 @@ async fn filter_blocks_non_matching_events() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<EventA>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<EventA>()
             .filter(|e, _ctx: &Context<Deps>| e.value > 10)
             .then(move |_event: Arc<EventA>, _ctx: Context<Deps>| {
                 let c = c.clone();
@@ -494,8 +494,8 @@ async fn extract_returns_none_skips_handler() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<EventA>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<EventA>()
             .extract(|e| {
                 if e.value > 0 {
                     Some(e.value as u64)
@@ -512,13 +512,13 @@ async fn extract_returns_none_skips_handler() -> Result<()> {
             }),
     );
 
-    // value=0: extract returns None, handler skipped
+    // value=0: extract returns None, reactor skipped
     engine.emit(EventA { value: 0 }).settled().await?;
-    assert_eq!(counter.load(Ordering::SeqCst), 0, "extract→None should skip handler");
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "extract→None should skip reactor");
 
-    // value=5: extract returns Some, handler runs
+    // value=5: extract returns Some, reactor runs
     engine.emit(EventA { value: 5 }).settled().await?;
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "extract→Some should run handler");
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "extract→Some should run reactor");
 
     Ok(())
 }
@@ -535,8 +535,8 @@ async fn handlers_execute_in_priority_order() -> Result<()> {
     let eo3 = execution_order.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("low_priority")
                 .priority(100)
                 .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -547,8 +547,8 @@ async fn handlers_execute_in_priority_order() -> Result<()> {
                     }
                 }),
         )
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("high_priority")
                 .priority(1)
                 .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -559,8 +559,8 @@ async fn handlers_execute_in_priority_order() -> Result<()> {
                     }
                 }),
         )
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("medium_priority")
                 .priority(50)
                 .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -593,7 +593,7 @@ async fn idempotency_key_is_deterministic() -> Result<()> {
     let seen_keys: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sk = seen_keys.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(Deps).with_reactor(reactor::on::<Ping>().then(
         move |_event: Arc<Ping>, ctx: Context<Deps>| {
             let sk = sk.clone();
             async move {
@@ -612,7 +612,7 @@ async fn idempotency_key_is_deterministic() -> Result<()> {
 
     let keys = seen_keys.lock();
     assert_eq!(keys.len(), 1);
-    // Key should be a valid UUID string (deterministic from event_id + handler_id)
+    // Key should be a valid UUID string (deterministic from event_id + reactor_id)
     assert!(
         Uuid::parse_str(&keys[0]).is_ok(),
         "idempotency key should be a valid UUID"
@@ -630,8 +630,8 @@ async fn context_exposes_all_fields() -> Result<()> {
         Arc::new(Mutex::new(None));
     let cd = ctx_data.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("test_ctx")
             .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
                 let cd = cd.clone();
@@ -640,7 +640,7 @@ async fn context_exposes_all_fields() -> Result<()> {
                         ctx.correlation_id,
                         ctx.event_id,
                         ctx.parent_event_id(),
-                        ctx.handler_id().to_string(),
+                        ctx.reactor_id().to_string(),
                         ctx.idempotency_key().to_string(),
                     ));
                     Ok(events![])
@@ -656,12 +656,12 @@ async fn context_exposes_all_fields() -> Result<()> {
         .await?;
 
     let data = ctx_data.lock();
-    let (correlation_id, event_id, parent, handler_id, idem_key) = data.as_ref().unwrap();
+    let (correlation_id, event_id, parent, reactor_id, idem_key) = data.as_ref().unwrap();
 
     assert_eq!(*correlation_id, handle.correlation_id);
     assert_eq!(*event_id, handle.event_id);
     assert!(parent.is_none(), "root event has no parent");
-    assert_eq!(handler_id, "test_ctx");
+    assert_eq!(reactor_id, "test_ctx");
     assert!(!idem_key.is_empty());
     Ok(())
 }
@@ -672,11 +672,11 @@ async fn context_exposes_all_fields() -> Result<()> {
 
 #[tokio::test]
 async fn hops_limit_prevents_infinite_loop() -> Result<()> {
-    // A handler that emits EventA on EventA — infinite loop
+    // A reactor that emits EventA on EventA — infinite loop
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(handler::on::<EventA>().then(
+    let engine = Engine::in_memory(Deps).with_reactor(reactor::on::<EventA>().then(
         move |event: Arc<EventA>, _ctx: Context<Deps>| {
             let c = c.clone();
             async move {
@@ -694,7 +694,7 @@ async fn hops_limit_prevents_infinite_loop() -> Result<()> {
     let count = counter.load(Ordering::SeqCst);
     assert!(
         count > 1 && count <= 51,
-        "handler should fire multiple times then stop at hop limit, fired {} times",
+        "reactor should fire multiple times then stop at hop limit, fired {} times",
         count
     );
     Ok(())
@@ -703,26 +703,26 @@ async fn hops_limit_prevents_infinite_loop() -> Result<()> {
 #[tokio::test]
 async fn hops_increment_through_chain() -> Result<()> {
     // Track the hops value at each step via event values
-    // A → B → C. Each handler passes along the value.
+    // A → B → C. Each reactor passes along the value.
     let values_seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
     let vs = values_seen.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(handler::on::<EventA>().then(
+        .with_reactor(reactor::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
                     value: event.value,
                 }])
             },
         ))
-        .with_handler(handler::on::<EventB>().then(
+        .with_reactor(reactor::on::<EventB>().then(
             |event: Arc<EventB>, _ctx: Context<Deps>| async move {
                 Ok(events![EventC {
                     value: event.value,
                 }])
             },
         ))
-        .with_handler(handler::on::<EventC>().then(
+        .with_reactor(reactor::on::<EventC>().then(
             move |event: Arc<EventC>, _ctx: Context<Deps>| {
                 let vs = vs.clone();
                 async move {
@@ -750,15 +750,15 @@ async fn handler_error_does_not_stop_other_handlers() -> Result<()> {
     let sc = success_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("failing_handler")
                 .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("I always fail"))
                 }),
         )
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("succeeding_handler")
                 .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                     let sc = sc.clone();
@@ -779,7 +779,7 @@ async fn handler_error_does_not_stop_other_handlers() -> Result<()> {
     assert_eq!(
         success_counter.load(Ordering::SeqCst),
         1,
-        "other handlers should still run when one fails"
+        "other reactors should still run when one fails"
     );
     Ok(())
 }
@@ -789,8 +789,8 @@ async fn queued_handler_exhausts_retries_then_dlqs() -> Result<()> {
     let attempt_counter = Arc::new(AtomicI32::new(0));
     let ac = attempt_counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<FailEvent>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<FailEvent>()
             .id("always_fail_retry3")
             .retry(3)
             .then(move |_event: Arc<FailEvent>, _ctx: Context<Deps>| {
@@ -808,7 +808,7 @@ async fn queued_handler_exhausts_retries_then_dlqs() -> Result<()> {
         .await?;
 
     // retry(3) sets max_attempts=3. The check is `attempts >= max_attempts`
-    // AFTER the handler runs: attempts 0,1,2 → Retry, attempt 3 → Failed.
+    // AFTER the reactor runs: attempts 0,1,2 → Retry, attempt 3 → Failed.
     // So 4 total calls (initial + 3 retries).
     assert_eq!(
         attempt_counter.load(Ordering::SeqCst),
@@ -828,10 +828,10 @@ async fn emit_none_produces_no_events() -> Result<()> {
     let dc = downstream_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ))
-        .with_handler(handler::on::<EventA>().then(
+        .with_reactor(reactor::on::<EventA>().then(
             move |_event: Arc<EventA>, _ctx: Context<Deps>| {
                 let dc = dc.clone();
                 async move {
@@ -851,7 +851,7 @@ async fn emit_none_produces_no_events() -> Result<()> {
     assert_eq!(
         downstream_counter.load(Ordering::SeqCst),
         0,
-        "returning () should not trigger any downstream handlers"
+        "returning () should not trigger any downstream reactors"
     );
     Ok(())
 }
@@ -862,12 +862,12 @@ async fn emit_option_none_produces_no_events() -> Result<()> {
     let dc = downstream.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                 Ok(events![])
             },
         ))
-        .with_handler(handler::on::<EventA>().then(
+        .with_reactor(reactor::on::<EventA>().then(
             move |_event: Arc<EventA>, _ctx: Context<Deps>| {
                 let dc = dc.clone();
                 async move {
@@ -894,12 +894,12 @@ async fn emit_option_some_produces_event() -> Result<()> {
     let dc = downstream.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                 Ok(events![EventA { value: 42 }])
             },
         ))
-        .with_handler(handler::on::<EventA>().then(
+        .with_reactor(reactor::on::<EventA>().then(
             move |_event: Arc<EventA>, _ctx: Context<Deps>| {
                 let dc = dc.clone();
                 async move {
@@ -929,7 +929,7 @@ async fn multiple_dispatches_have_independent_correlation_ids() -> Result<()> {
     let correlations: Arc<Mutex<Vec<Uuid>>> = Arc::new(Mutex::new(Vec::new()));
     let c = correlations.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(Deps).with_reactor(reactor::on::<Ping>().then(
         move |_event: Arc<Ping>, ctx: Context<Deps>| {
             let c = c.clone();
             async move {
@@ -974,8 +974,8 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
     let td = terminal_data.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("fail_with_info")
                 .retry(2)
                 .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
@@ -988,7 +988,7 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
                     Err::<Events, _>(anyhow::anyhow!("specific error message"))
                 }),
         )
-        .with_handler(handler::on::<FailedTerminal>().then(
+        .with_reactor(reactor::on::<FailedTerminal>().then(
             move |event: Arc<FailedTerminal>, _ctx: Context<Deps>| {
                 let td = td.clone();
                 async move {
@@ -1004,7 +1004,7 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
         .await?;
 
     let data = terminal_data.lock();
-    let (error, attempts) = data.as_ref().expect("terminal handler should run");
+    let (error, attempts) = data.as_ref().expect("terminal reactor should run");
     assert!(
         error.contains("specific error message"),
         "error should contain the original message, got: {}",
@@ -1015,14 +1015,14 @@ async fn on_failure_receives_correct_error_info() -> Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NO HANDLER REGISTERED FOR EVENT
+// NO REACTOR REGISTERED FOR EVENT
 // ═══════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn dispatch_event_with_no_handler_settles_cleanly() -> Result<()> {
     let engine = Engine::in_memory(Deps);
 
-    // Dispatch an event that no handler listens to
+    // Dispatch an event that no reactor listens to
     engine
         .emit(Ping {
             msg: "nobody".into(),
@@ -1035,7 +1035,7 @@ async fn dispatch_event_with_no_handler_settles_cleanly() -> Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HANDLER ON_ANY (observer)
+// REACTOR ON_ANY (observer)
 // ═══════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1044,10 +1044,10 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
     let st = seen_types.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on_any()
+        .with_reactor(
+            reactor::on_any()
                 .id("logger")
-                .then(move |event: causal::handler::AnyEvent, _ctx: Context<Deps>| {
+                .then(move |event: causal::reactor::AnyEvent, _ctx: Context<Deps>| {
                     let st = st.clone();
                     async move {
                         let type_name = if event.is::<Ping>() {
@@ -1062,13 +1062,13 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
                     }
                 }),
         )
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move {
                 Ok(events![EventA { value: 1 }])
             },
         ))
-        // Need a handler for EventA so its codec is registered
-        .with_handler(handler::on::<EventA>().then(
+        // Need a reactor for EventA so its codec is registered
+        .with_reactor(reactor::on::<EventA>().then(
             |_event: Arc<EventA>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
 
@@ -1086,7 +1086,7 @@ async fn on_any_handler_sees_all_events() -> Result<()> {
     );
     assert!(
         types.contains(&"EventA".to_string()),
-        "on_any should see EventA emitted by Ping handler"
+        "on_any should see EventA emitted by Ping reactor"
     );
     Ok(())
 }
@@ -1097,15 +1097,15 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
     let ch = child_handled.clone();
 
     let engine = Engine::in_memory(Deps)
-        // Typed Ping handler so codec is registered
-        .with_handler(handler::on::<Ping>().id("ping_noop").then(
+        // Typed Ping reactor so codec is registered
+        .with_reactor(reactor::on::<Ping>().id("ping_noop").then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ))
         // on_any emits EventB when it sees a Ping
-        .with_handler(
-            handler::on_any()
+        .with_reactor(
+            reactor::on_any()
                 .id("emitter")
-                .then(|event: causal::handler::AnyEvent, _ctx: Context<Deps>| async move {
+                .then(|event: causal::reactor::AnyEvent, _ctx: Context<Deps>| async move {
                     if event.is::<Ping>() {
                         Ok(events![EventB { value: 42 }])
                     } else {
@@ -1113,8 +1113,8 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
                     }
                 }),
         )
-        // Typed handler proves the child event was dispatched
-        .with_handler(handler::on::<EventB>().id("child_receiver").then(
+        // Typed reactor proves the child event was dispatched
+        .with_reactor(reactor::on::<EventB>().id("child_receiver").then(
             move |event: Arc<EventB>, _ctx: Context<Deps>| {
                 let ch = ch.clone();
                 async move {
@@ -1141,10 +1141,10 @@ async fn on_any_handler_emits_child_events() -> Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HANDLER WITH INIT (startup hook)
+// REACTOR WITH INIT (startup hook)
 // ═══════════════════════════════════════════════════════════
 
-// Note: startup handlers are invoked by run_startup_handlers(),
+// Note: startup reactors are invoked by run_startup_reactors(),
 // which is called by backends. The Engine itself doesn't call it
 // during settle. Testing the builder compiles correctly.
 
@@ -1154,8 +1154,8 @@ async fn handler_with_init_compiles_and_handles_events() -> Result<()> {
     let handler_ran = Arc::new(AtomicUsize::new(0));
     let hr = handler_ran.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .init(move |_ctx: Context<Deps>| {
                 // Note: init is not called by Engine.settle()
                 async move { Ok(()) }
@@ -1177,7 +1177,7 @@ async fn handler_with_init_compiles_and_handles_events() -> Result<()> {
         .await?;
 
     assert_eq!(init_ran.load(Ordering::SeqCst), 0, "init not called by settle");
-    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "handler still fires");
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "reactor still fires");
     Ok(())
 }
 
@@ -1190,8 +1190,8 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("delayed_ping")
             .delayed(Duration::from_millis(10))
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -1204,7 +1204,7 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
     );
 
     // settled() drives the full causal tree including delayed effects.
-    // The settle loop sleeps until the delay expires, then executes the handler.
+    // The settle loop sleeps until the delay expires, then executes the reactor.
     engine
         .emit(Ping {
             msg: "delayed".into(),
@@ -1215,13 +1215,13 @@ async fn delayed_handler_eventually_executes() -> Result<()> {
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
-        "delayed handler should execute after delay within settled()"
+        "delayed reactor should execute after delay within settled()"
     );
     Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════
-// QUEUED HANDLER EMITS CHAIN
+// QUEUED REACTOR EMITS CHAIN
 // ═══════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1230,8 +1230,8 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
     let bc = b_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<EventA>()
+        .with_reactor(
+            reactor::on::<EventA>()
                 .id("emit_b_queued")
                 .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
@@ -1240,7 +1240,7 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
                     }])
                 }),
         )
-        .with_handler(handler::on::<EventB>().then(
+        .with_reactor(reactor::on::<EventB>().then(
             move |event: Arc<EventB>, _ctx: Context<Deps>| {
                 let bc = bc.clone();
                 async move {
@@ -1255,7 +1255,7 @@ async fn queued_handler_emitted_events_are_processed() -> Result<()> {
     assert_eq!(
         b_counter.load(Ordering::SeqCst),
         10,
-        "queued handler should emit EventB which is then processed"
+        "queued reactor should emit EventB which is then processed"
     );
     Ok(())
 }
@@ -1274,7 +1274,7 @@ async fn handler_can_access_deps() -> Result<()> {
     let seen_value = Arc::new(AtomicI32::new(0));
     let sv = seen_value.clone();
 
-    let engine = Engine::in_memory(AppDeps { value: 42 }).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(AppDeps { value: 42 }).with_reactor(reactor::on::<Ping>().then(
         move |_event: Arc<Ping>, ctx: Context<AppDeps>| {
             let sv = sv.clone();
             async move {
@@ -1301,7 +1301,7 @@ async fn handler_can_access_deps() -> Result<()> {
 
 #[tokio::test]
 async fn dispatch_returns_valid_process_handle() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(handler::on::<Ping>().then(
+    let engine = Engine::in_memory(Deps).with_reactor(reactor::on::<Ping>().then(
         |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
     ));
 
@@ -1319,7 +1319,7 @@ async fn dispatch_returns_valid_process_handle() -> Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HANDLER TIMEOUT
+// REACTOR TIMEOUT
 // ═══════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1327,8 +1327,8 @@ async fn queued_handler_timeout_goes_to_dlq() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("timeout_handler")
             .timeout(Duration::from_millis(50))
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -1351,17 +1351,17 @@ async fn queued_handler_timeout_goes_to_dlq() -> Result<()> {
 
     // Default max_attempts=1. Timeout check: attempts(0) >= max(1)? No → Retry.
     // Second attempt: attempts(1) >= max(1)? Yes → Failed/DLQ.
-    // So handler is called exactly 2 times.
+    // So reactor is called exactly 2 times.
     assert_eq!(
         counter.load(Ordering::SeqCst),
         2,
-        "timeout handler: 2 calls (initial + 1 retry) before DLQ"
+        "timeout reactor: 2 calls (initial + 1 retry) before DLQ"
     );
     Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════
-// PROJECTION HANDLERS
+// PROJECTION REACTORS
 // ═══════════════════════════════════════════════════════════
 
 /// Simulates a read model / projection store.
@@ -1382,7 +1382,7 @@ async fn projection_handler_runs_before_regular_handlers() -> Result<()> {
     let store = Arc::new(dashmap::DashMap::new());
     let deps = ProjectionDeps { store: store.clone() };
 
-    // Track what the regular handler saw
+    // Track what the regular reactor saw
     let reader_saw_projection = Arc::new(parking_lot::Mutex::new(false));
     let rs = reader_saw_projection.clone();
 
@@ -1402,9 +1402,9 @@ async fn projection_handler_runs_before_regular_handlers() -> Result<()> {
                     }
                 }),
         )
-        // Regular handler: reads from the store — should see the projection
-        .with_handler(
-            handler::on::<OrderCreated>()
+        // Regular reactor: reads from the store — should see the projection
+        .with_reactor(
+            reactor::on::<OrderCreated>()
                 .id("order_reader")
                 .then(move |event: Arc<OrderCreated>, ctx: Context<ProjectionDeps>| {
                     let rs = rs.clone();
@@ -1426,7 +1426,7 @@ async fn projection_handler_runs_before_regular_handlers() -> Result<()> {
 
     assert!(
         *reader_saw_projection.lock(),
-        "regular handler should see projection data — projection must run first"
+        "regular reactor should see projection data — projection must run first"
     );
     Ok(())
 }
@@ -1479,9 +1479,9 @@ async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Res
                     }
                 }),
         )
-        // Regular handler A
-        .with_handler(
-            handler::on::<OrderCreated>()
+        // Regular reactor A
+        .with_reactor(
+            reactor::on::<OrderCreated>()
                 .id("handler_a")
                 .then(move |_event: Arc<OrderCreated>, _ctx: Context<ProjectionDeps>| {
                     let eo = eo3.clone();
@@ -1491,9 +1491,9 @@ async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Res
                     }
                 }),
         )
-        // Regular handler B
-        .with_handler(
-            handler::on::<OrderCreated>()
+        // Regular reactor B
+        .with_reactor(
+            reactor::on::<OrderCreated>()
                 .id("handler_b")
                 .then(move |_event: Arc<OrderCreated>, _ctx: Context<ProjectionDeps>| {
                     let eo = eo4.clone();
@@ -1514,7 +1514,7 @@ async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Res
 
     let order = execution_order.lock();
 
-    // Both projections must come before any regular handler
+    // Both projections must come before any regular reactor
     let proj_1_pos = order.iter().position(|s| s == "projection_1").unwrap();
     let proj_2_pos = order.iter().position(|s| s == "projection_2").unwrap();
     let handler_a_pos = order.iter().position(|s| s == "handler_a").unwrap();
@@ -1522,12 +1522,12 @@ async fn multiple_projections_run_sequentially_before_parallel_handlers() -> Res
 
     assert!(
         proj_1_pos < handler_a_pos && proj_1_pos < handler_b_pos,
-        "projection_1 must run before regular handlers, order: {:?}",
+        "projection_1 must run before regular reactors, order: {:?}",
         *order
     );
     assert!(
         proj_2_pos < handler_a_pos && proj_2_pos < handler_b_pos,
-        "projection_2 must run before regular handlers, order: {:?}",
+        "projection_2 must run before regular reactors, order: {:?}",
         *order
     );
 

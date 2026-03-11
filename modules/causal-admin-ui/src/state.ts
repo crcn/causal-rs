@@ -2,9 +2,9 @@ import type {
   AdminEvent,
   FilterState,
   FlowSelection,
-  HandlerDescription,
-  HandlerLog,
-  HandlerOutcome,
+  ReactorDescription,
+  ReactorLog,
+  ReactorOutcome,
   LogsFilter,
 } from "./types";
 
@@ -29,12 +29,12 @@ export type AdminState = {
   filters: FilterState;
 
   // Logs
-  logs: HandlerLog[];
+  logs: ReactorLog[];
   logsFilter: LogsFilter;
 
-  // Handler metadata (keyed by runId)
-  descriptions: Record<string, HandlerDescription[]>;
-  outcomes: Record<string, HandlerOutcome[]>;
+  // Reactor metadata (keyed by runId)
+  descriptions: Record<string, ReactorDescription[]>;
+  outcomes: Record<string, ReactorOutcome[]>;
 
   // Subscription status
   subscription: "connected" | "disconnected" | "error";
@@ -63,9 +63,9 @@ export const initialState: AdminState = {
 
   logs: [],
   logsFilter: {
-    scope: "handler",
+    scope: "reactor",
     eventId: null,
-    handlerId: null,
+    reactorId: null,
     runId: null,
   },
 

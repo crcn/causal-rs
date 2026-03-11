@@ -20,7 +20,7 @@ This avoids the failure modes identified in review (ID collisions, ordering regr
 
 ## Implemented Notes (2026-02-06)
 
-- Effect handlers now emit `Vec<EventOutput>` internally, with `Emit<E>` + compatibility conversions preserved at call sites.
+- Effect reactors now emit `Vec<EventOutput>` internally, with `Emit<E>` + compatibility conversions preserved at call sites.
 - Deterministic emitted event IDs include the emission index:
   - `uuid_v5(namespace, "{parent_event_id}-{effect_id}-{event_type}-{index}")`
 - Batch metadata is now propagated on queued and inline emissions via:
@@ -33,7 +33,7 @@ This avoids the failure modes identified in review (ID collisions, ordering regr
   - claim is single-winner (`open -> processing`)
   - failed flushes release the claim for retry
 - DLQ now emits a synthetic terminal event when failed execution had batch metadata, so same-batch windows can close instead of hanging.
-- Typed effects can use `.queued().then(...)` (queue codec is carried by builder flags), so `then_queue()` is optional for queued typed handlers.
+- Typed effects can use `.queued().then(...)` (queue codec is carried by builder flags), so `then_queue()` is optional for queued typed reactors.
 - Typed effects now support `.dlq_terminal(...)` to map retry-exhausted failures into explicit terminal events before DLQ completion.
 - Store API now includes `dlq_effect_with_events(...)` for atomic "DLQ + mapped terminal event" writes; runtime falls back to plain `dlq_effect(...)` if unsupported.
 - Runtime now enforces `max_batch_size` (default `10_000`) for emitted batches and `join().same_batch()` metadata.
@@ -41,7 +41,7 @@ This avoids the failure modes identified in review (ID collisions, ordering regr
 
 ## Problem
 
-Current effect handlers can return at most one output event (`Option<EventOutput>`). That forces one of two bad patterns:
+Current effect reactors can return at most one output event (`Option<EventOutput>`). That forces one of two bad patterns:
 
 - Emit large collections as one event payload (risks payload and ergonomics issues).
 - Emit N events through N effect executions / N calls.
@@ -64,7 +64,7 @@ Postgres notifications are already metadata-only via trigger (`event_id`, `corre
 ### In Scope (v0.9)
 
 - `Emit<E>` API for explicit multi-event returns.
-- Backward-compatible handler ergonomics (`Ok(())`, `Ok(event)`, `Ok(Some(event))`, `Ok(vec![...])`, `Ok(Emit::...)`).
+- Backward-compatible reactor ergonomics (`Ok(())`, `Ok(event)`, `Ok(Some(event))`, `Ok(vec![...])`, `Ok(Emit::...)`).
 - Batch flattening in both inline and queued effect workers.
 - Deterministic, collision-free event IDs for batched same-type emissions.
 - Durable `join().same_batch()` fan-in for typed effects (`effect::on::<E>()`).
@@ -99,7 +99,7 @@ Keep `.then()` call sites working by introducing an internal conversion trait (n
 - `Vec<E>` -> zero or many emitted events
 - `Emit<E>` -> explicit zero/one/many emitted events
 
-This keeps existing handlers source-compatible while enabling explicit batching.
+This keeps existing reactors source-compatible while enabling explicit batching.
 
 ### Key API Changes (Implemented)
 
@@ -149,7 +149,7 @@ Terminal-dedupe key for same-batch closure:
 
 ### 1) Effect Output Flattening
 
-Both `EventWorker` (inline effects) and `EffectWorker` (queued effects) flatten handler output to `Vec<(TypeId, Arc<dyn Any + Send + Sync>)>` before serialization.
+Both `EventWorker` (inline effects) and `EffectWorker` (queued effects) flatten reactor output to `Vec<(TypeId, Arc<dyn Any + Send + Sync>)>` before serialization.
 
 No parallel fan-out path is introduced. Emitted events are persisted and then processed by existing queue workers.
 
@@ -225,7 +225,7 @@ When flush intent executes:
 - Load sealed entries for `window_id` in deterministic order.
   - `.same_batch()`: order by `batch_index`
 - Decode into `Vec<E>`.
-- Run user join handler once.
+- Run user join reactor once.
 - On success: delete sealed entries and complete flush intent (with emitted events if any).
 - On failure: mark flush intent failed/DLQ; sealed entries remain for retry.
 
@@ -280,7 +280,7 @@ DLQ interaction:
 
 #### Domain Failures vs Runtime Terminal Mapping
 
-- Use handler-level error mapping (`map_err`, `match`, or explicit branching) when a domain failure should be terminal immediately and should not consume retry budget.
+- Use reactor-level error mapping (`map_err`, `match`, or explicit branching) when a domain failure should be terminal immediately and should not consume retry budget.
 - Use `.dlq_terminal(...)` when runtime retries are allowed and you only want a terminal failure event after retries are exhausted/time out.
 - In `same_batch` joins, normalize both success and failure into a single join input type (for example `ResearchSearchResult::Completed` / `ResearchSearchResult::Failed`) so aggregation logic stays deterministic.
 
@@ -360,7 +360,7 @@ This enables transaction-level notification coalescing while keeping correctness
 
 **Success Criteria**
 
-- Existing handlers compile unchanged.
+- Existing reactors compile unchanged.
 - `Ok(Emit::Batch(vec![a, b]))` emits two events.
 - `Ok(vec![a, b])` emits two events.
 
@@ -394,7 +394,7 @@ This enables transaction-level notification coalescing while keeping correctness
 **Success Criteria**
 
 - Joined events survive worker restart in Postgres path.
-- `join().same_batch()` executes handler exactly once per emitted batch.
+- `join().same_batch()` executes reactor exactly once per emitted batch.
 - Join flush retries do not duplicate downstream emitted events.
 - Mixed success/failure item batches still close exactly once when all items are terminal.
 
@@ -419,7 +419,7 @@ This enables transaction-level notification coalescing while keeping correctness
 - Effect may emit 0/1/N events atomically through one completion transaction.
 - Batch with repeated event type persists all items (no silent dedupe).
 - Inline and queued effect paths behave consistently.
-- Existing handlers remain source-compatible.
+- Existing reactors remain source-compatible.
 - `join().same_batch()` fan-ins exactly one emitted batch by `(correlation_id, batch_id)`.
 - `join().same_batch()` includes failed items as terminal results (no silent drop, no hanging window).
 
@@ -429,7 +429,7 @@ This enables transaction-level notification coalescing while keeping correctness
 - No new out-of-order behavior introduced by batching.
 - Workflow notifications continue to work with metadata-only payloads.
 - Join flushes are retry-safe and do not lose buffered events on worker restart.
-- Batches with partial failures complete deterministically and surface failure details to join handler.
+- Batches with partial failures complete deterministically and surface failure details to join reactor.
 
 ### Testing
 
@@ -452,7 +452,7 @@ Implemented stress/failure coverage includes:
 
 ### Risk 1: Non-deterministic emission order across retries
 
-If handler output order varies between retries, index-based deterministic IDs can differ.
+If reactor output order varies between retries, index-based deterministic IDs can differ.
 
 **Mitigation**
 
@@ -588,12 +588,12 @@ effect::on::<FetchCompleted>()
   - contiguous `batch_index`
   - consistent `batch_id`/`batch_size`
 - Same-batch join closure with mixed item success/failure payloads:
-  - single join handler execution
+  - single join reactor execution
   - single downstream summary emission
 
 ### Failure Modes
 
-- Same-batch join handler failure + retry:
+- Same-batch join reactor failure + retry:
   - first claim fails
   - claim is released
   - retry re-claims and succeeds

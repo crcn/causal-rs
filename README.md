@@ -2,7 +2,7 @@
 
 **Event-driven orchestration for Rust.**
 
-Causal is a lightweight runtime for building reactive systems with a simple **Event → Handler → Event** loop. It handles routing, aggregation, settlement, event sourcing, and journaled side effects.
+Causal is a lightweight runtime for building reactive systems with a simple **Event → Reactor → Event** loop. It handles routing, aggregation, settlement, event sourcing, and journaled side effects.
 
 ```rust
 use causal::{event, aggregators, handles, events, Context, Engine, Events};
@@ -26,7 +26,7 @@ mod order_aggregators {
     }
 }
 
-#[handles]
+#[reactors]
 mod order_handlers {
     async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
         ctx.run(|| async {
@@ -44,7 +44,7 @@ mod order_handlers {
 
 let engine = Engine::new(deps)
     .with_aggregators(order_aggregators::aggregators())
-    .with_handlers(order_handlers::handles());
+    .with_reactors(order_handlers::handles());
 
 engine.emit(OrderPlaced { order_id, total: 99.99 }).settled().await?;
 ```
@@ -83,7 +83,7 @@ enum ScrapeEvent {
     SourcesResolved { sources: Vec<Uuid> },
 }
 
-// Ephemeral event — routes through handlers but not persisted to permanent store
+// Ephemeral event — routes through reactors but not persisted to permanent store
 #[event(ephemeral)]
 #[derive(Clone, Serialize, Deserialize)]
 struct EnrichmentReady { batch_id: Uuid }
@@ -96,14 +96,14 @@ The `#[event]` macro generates:
 
 Durable names are derived from the struct/variant name in `snake_case`. They never change when you move code between modules.
 
-### Handlers
+### Reactors
 
-Handlers react to events, perform side effects, and return new events:
+Reactors react to events, perform side effects, and return new events:
 
 ```rust
-#[handles]
+#[reactors]
 mod order_handlers {
-    // Event type inferred from parameter — no #[handle] needed
+    // Event type inferred from parameter — no #[reactor] needed
     async fn ship(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
         ctx.run(|| async {
             ctx.deps().shipping_api.ship(event.order_id).await
@@ -111,14 +111,14 @@ mod order_handlers {
         Ok(OrderShipped { order_id: event.order_id })
     }
 
-    // Use #[handle] for advanced features (extract, retry, etc.)
-    #[handle(on = [OrderEvent::Placed], extract(order_id), id = "enqueue")]
+    // Use #[reactor] for advanced features (extract, retry, etc.)
+    #[reactor(on = [OrderEvent::Placed], extract(order_id), id = "enqueue")]
     async fn enqueue(order_id: Uuid, ctx: Context<Deps>) -> Result<Events> {
         Ok(events![Enqueued { order_id }])
     }
 }
 
-let engine = Engine::new(deps).with_handlers(order_handlers::handles());
+let engine = Engine::new(deps).with_reactors(order_handlers::handles());
 ```
 
 The `events![]` macro handles all return shapes:
@@ -136,7 +136,7 @@ Ok(events![..items])                       // Fan-out batch from iterator
 
 ```rust
 engine.emit(event).await?;              // Publish only
-engine.emit(event).settled().await?;    // Publish + settle all downstream handlers
+engine.emit(event).settled().await?;    // Publish + settle all downstream reactors
 ```
 
 ### Aggregates
@@ -165,14 +165,14 @@ impl Apply<OrderShipped> for Order {
 }
 ```
 
-Register aggregators and use **transition guards** to fire handlers only on specific state changes:
+Register aggregators and use **transition guards** to fire reactors only on specific state changes:
 
 ```rust
 let engine = Engine::new(deps)
     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
     .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-    .with_handler(
-        handler::on::<OrderShipped>()
+    .with_reactor(
+        reactor::on::<OrderShipped>()
             .extract(|e| Some(e.order_id))
             .transition::<Order, _>(|prev, next| {
                 prev.status != OrderStatus::Shipped && next.status == OrderStatus::Shipped
@@ -218,7 +218,7 @@ mod pipeline_aggregators {
 }
 ```
 
-## Handler Configuration
+## Reactor Configuration
 
 ### Filter and extract
 
@@ -231,7 +231,7 @@ fn is_pipeline_ready(event: &ScrapeCompleted, ctx: &Context<Deps>) -> bool {
     state.completed_roles.is_superset(&required_roles())
 }
 
-#[handler(on = ScrapeCompleted, filter = is_pipeline_ready, id = "enrich")]
+#[reactor(on = ScrapeCompleted, filter = is_pipeline_ready, id = "enrich")]
 async fn enrich(event: ScrapeCompleted, ctx: Context<Deps>) -> Result<Events> {
     Ok(events![EnrichmentStarted { id: event.id }])
 }
@@ -241,7 +241,7 @@ fn is_high_value(event: &OrderPlaced, _ctx: &Context<Deps>) -> bool {
     event.total > 500.0
 }
 
-#[handler(on = OrderPlaced, filter = is_high_value, id = "ship_high_value")]
+#[reactor(on = OrderPlaced, filter = is_high_value, id = "ship_high_value")]
 async fn ship_high_value(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
     Ok(OrderShipped { order_id: event.order_id })
 }
@@ -250,7 +250,7 @@ async fn ship_high_value(event: OrderPlaced, ctx: Context<Deps>) -> Result<Order
 Builder style:
 
 ```rust
-handler::on::<ScrapeCompleted>()
+reactor::on::<ScrapeCompleted>()
     .id("enrich")
     .retry(3)
     .filter(|event, ctx: &Context<Deps>| {
@@ -265,7 +265,7 @@ handler::on::<ScrapeCompleted>()
 Extract — pull fields from enum variants:
 
 ```rust
-#[handler(on = [CrawlEvent::Ingested, CrawlEvent::Regenerated], extract(website_id, job_id), id = "enqueue")]
+#[reactor(on = [CrawlEvent::Ingested, CrawlEvent::Regenerated], extract(website_id, job_id), id = "enqueue")]
 async fn enqueue(website_id: Uuid, job_id: Uuid, ctx: Context<Deps>) -> Result<EnqueuedEvent> {
     Ok(EnqueuedEvent { website_id })
 }
@@ -274,7 +274,7 @@ async fn enqueue(website_id: Uuid, job_id: Uuid, ctx: Context<Deps>) -> Result<E
 ### Retry, timeout, delay, priority
 
 ```rust
-#[handler(on = PaymentRequested, id = "charge", retry = 3, timeout_secs = 30, priority = 1)]
+#[reactor(on = PaymentRequested, id = "charge", retry = 3, timeout_secs = 30, priority = 1)]
 async fn charge(event: PaymentRequested, ctx: Context<Deps>) -> Result<PaymentCharged> {
     ctx.run(|| async {
         ctx.deps().stripe.charge(event.order_id).await
@@ -288,7 +288,7 @@ async fn charge(event: PaymentRequested, ctx: Context<Deps>) -> Result<PaymentCh
 Map exhausted retries to a terminal event:
 
 ```rust
-handler::on::<FailEvent>()
+reactor::on::<FailEvent>()
     .id("risky_op")
     .retry(3)
     .on_failure(|_event, info: ErrorContext| OperationFailed {
@@ -302,7 +302,7 @@ handler::on::<FailEvent>()
 
 ```rust
 // Macro style
-#[handler(on_any, id = "audit_log")]
+#[reactor(on_any, id = "audit_log")]
 async fn audit_log(event: AnyEvent, ctx: Context<Deps>) -> Result<()> {
     if let Some(order) = event.downcast::<OrderPlaced>() {
         println!("Order placed: {:?}", order.order_id);
@@ -311,7 +311,7 @@ async fn audit_log(event: AnyEvent, ctx: Context<Deps>) -> Result<()> {
 }
 
 // Builder style
-handler::on_any()
+reactor::on_any()
     .id("audit_log")
     .then(|event: AnyEvent, ctx: Context<Deps>| async move {
         if let Some(order) = event.downcast::<OrderPlaced>() {
@@ -323,10 +323,10 @@ handler::on_any()
 
 ### Module registration
 
-Group related handlers into a module. Bare async functions are auto-registered — `#[handle]` is only needed for advanced features:
+Group related reactors into a module. Bare async functions are auto-registered — `#[reactor]` is only needed for advanced features:
 
 ```rust
-#[handles]
+#[reactors]
 mod order_handlers {
     use super::*;
 
@@ -335,8 +335,8 @@ mod order_handlers {
         Ok(OrderShipped { order_id: event.order_id })
     }
 
-    // Explicit #[handle] for extract, retry, etc.
-    #[handle(on = [OrderEvent::Shipped], extract(order_id), id = "notify")]
+    // Explicit #[reactor] for extract, retry, etc.
+    #[reactor(on = [OrderEvent::Shipped], extract(order_id), id = "notify")]
     async fn notify(order_id: Uuid, ctx: Context<Deps>) -> Result<()> {
         ctx.run(|| async {
             ctx.deps().email.send(order_id).await
@@ -345,12 +345,12 @@ mod order_handlers {
     }
 }
 
-let engine = Engine::new(deps).with_handlers(order_handlers::handles());
+let engine = Engine::new(deps).with_reactors(order_handlers::handles());
 ```
 
 ## Event Sourcing
 
-Persistence is split into two traits: **`EventLog`** for the append-only event log, and **`HandlerQueue`** for handler scheduling, journaling, and coordination. The same store that drives the settle loop also persists events — no dual-write risk.
+Persistence is split into two traits: **`EventLog`** for the append-only event log, and **`ReactorQueue`** for reactor scheduling, journaling, and coordination. The same store that drives the settle loop also persists events — no dual-write risk.
 
 ### EventLog trait
 
@@ -365,14 +365,14 @@ pub trait EventLog: Send + Sync {
 }
 ```
 
-### HandlerQueue trait
+### ReactorQueue trait
 
 ```rust
 #[async_trait]
-pub trait HandlerQueue: Send + Sync {
+pub trait ReactorQueue: Send + Sync {
     async fn enqueue(&self, commit: IntentCommit) -> Result<()>;
     async fn checkpoint(&self) -> Result<u64>;
-    async fn dequeue(&self) -> Result<Option<QueuedHandler>>;
+    async fn dequeue(&self) -> Result<Option<QueuedReactor>>;
     async fn earliest_pending_at(&self) -> Result<Option<DateTime<Utc>>>;
     async fn resolve(&self, resolution: HandlerResolution) -> Result<()>;
     // ... journaling, cancellation, reclaim (all with default no-ops)
@@ -383,7 +383,7 @@ Append is idempotent by `event_id`. Every event is persisted to the EventLog —
 
 ### Custom backends
 
-Supply your own `EventLog` and `HandlerQueue` implementations:
+Supply your own `EventLog` and `ReactorQueue` implementations:
 
 ```rust
 let engine = Engine::with_backends(deps, my_event_log, my_handler_queue);
@@ -402,7 +402,7 @@ The engine persists **every** event to the EventLog and hydrates aggregates on c
 ```rust
 let engine = Engine::new(deps)
     .with_aggregator::<OrderPlaced, Order, _>(|e| e.order_id)
-    .with_handler(on_order_placed());
+    .with_reactor(on_order_placed());
 
 // All events are persisted. Aggregate-scoped events get aggregate_type/aggregate_id.
 // On restart, aggregates hydrate from the EventLog automatically.
@@ -442,12 +442,12 @@ On cold start, the engine loads the latest snapshot and replays only events afte
 | Configuration | Behavior |
 |---|---|
 | Default (MemoryStore) | Events persisted in memory, no durable snapshots |
-| Custom EventLog + HandlerQueue | Events persisted durably, manual snapshots via `save_snapshot()` |
+| Custom EventLog + ReactorQueue | Events persisted durably, manual snapshots via `save_snapshot()` |
 | Custom + `snapshot_every(N)` | Auto-checkpoint every N events |
 
 ### Ephemeral events
 
-Ephemeral events are coordination signals that route through handlers but are not domain facts. Mark them with `#[event(ephemeral)]`:
+Ephemeral events are coordination signals that route through reactors but are not domain facts. Mark them with `#[event(ephemeral)]`:
 
 ```rust
 #[event(ephemeral)]
@@ -462,16 +462,16 @@ struct EnrichmentReady { batch_id: Uuid }
 | Operational (EventLog/Postgres) | Persisted with `persistent=false` | Persisted with `persistent=true` |
 | Permanent (KurrentDB) | Skipped | Forwarded |
 
-Ephemeral events are always persisted to the operational store (for causal chain durability and handler scheduling) but marked `persistent=false` so downstream forwarders know to skip them. They also skip aggregator apply and projections during the settle loop.
+Ephemeral events are always persisted to the operational store (for causal chain durability and reactor scheduling) but marked `persistent=false` so downstream forwarders know to skip them. They also skip aggregator apply and projections during the settle loop.
 
 ### Journaled side effects
 
-`ctx.run()` journals closure results in the HandlerQueue. On retry, completed steps are replayed from the journal instead of re-executing:
+`ctx.run()` journals closure results in the ReactorQueue. On retry, completed steps are replayed from the journal instead of re-executing:
 
 ```rust
-#[handler(on = OrderPlaced, id = "ship_order")]
+#[reactor(on = OrderPlaced, id = "ship_order")]
 async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
-    // Journaled: if this handler retries, the shipping API call won't re-execute
+    // Journaled: if this reactor retries, the shipping API call won't re-execute
     let tracking_id: String = ctx.run(|| async {
         ctx.deps().shipping_api.ship(event.order_id).await
     }).await?;
@@ -481,10 +481,10 @@ async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipp
 ```
 
 **How it works:**
-- Each `run()` call gets a sequence number within the handler execution
-- On first execution, the closure runs and its result is persisted to the HandlerQueue
+- Each `run()` call gets a sequence number within the reactor execution
+- On first execution, the closure runs and its result is persisted to the ReactorQueue
 - On retry (after crash or error), journaled results are replayed — the closure is skipped
-- Journal entries are cleared atomically when the handler completes successfully
+- Journal entries are cleared atomically when the reactor completes successfully
 - Errors are not journaled — they propagate normally and trigger the retry/DLQ path
 
 **Determinism contract:** Code between `run()` calls must be deterministic. The same input event must produce the same sequence of `run()` calls. Non-determinism (random values, wall clock reads) between `run()` calls will break replay.
@@ -493,11 +493,11 @@ The return type must implement `Serialize + DeserializeOwned`. The built-in `Mem
 
 ### Ephemeral sidecar (live dispatch optimization)
 
-When an event is published or emitted, causal stashes the original typed object alongside the JSON payload. During the **live dispatch cycle**, handlers receive this original object directly — preserving `#[serde(skip)]` fields that would be lost through serialization.
+When an event is published or emitted, causal stashes the original typed object alongside the JSON payload. During the **live dispatch cycle**, reactors receive this original object directly — preserving `#[serde(skip)]` fields that would be lost through serialization.
 
-On **replay or hydration** (e.g. after a crash), the ephemeral is `None` and handlers fall back to JSON deserialization. Skipped fields get their `Default` values, which is correct by design since durable state is the record of truth.
+On **replay or hydration** (e.g. after a crash), the ephemeral is `None` and reactors fall back to JSON deserialization. Skipped fields get their `Default` values, which is correct by design since durable state is the record of truth.
 
-This is useful when events carry transient, non-serializable data (parsed structs, pre-computed results, file handles) that downstream handlers need during the same dispatch cycle but that shouldn't be persisted:
+This is useful when events carry transient, non-serializable data (parsed structs, pre-computed results, file handles) that downstream reactors need during the same dispatch cycle but that shouldn't be persisted:
 
 ```rust
 #[event]
@@ -511,8 +511,8 @@ struct PageScraped {
     extracted_batches: Vec<Batch>,
 }
 
-// The scrape handler emits PageScraped with extracted_batches populated.
-// The downstream dedup handler receives the original typed event (with batches intact)
+// The scrape reactor emits PageScraped with extracted_batches populated.
+// The downstream dedup reactor receives the original typed event (with batches intact)
 // during live dispatch — no need to re-parse or stash in shared state.
 ```
 
@@ -524,7 +524,7 @@ struct PageScraped {
 | Replay / hydration | JSON deserialization | `Default` values |
 | Store persistence | JSON payload only | Not persisted |
 
-No code changes are needed to benefit — this is automatic for all events published via `engine.emit()` or returned from handlers via `events![]`.
+No code changes are needed to benefit — this is automatic for all events published via `engine.emit()` or returned from reactors via `events![]`.
 
 ## Durable Execution
 
@@ -532,21 +532,21 @@ Causal provides durable execution natively through its split store traits:
 
 | Concern | MemoryStore (default) | Postgres Store |
 |---------|----------------------|----------------|
-| Handler execution | Direct call | Direct call |
+| Reactor execution | Direct call | Direct call |
 | Side effect journaling | In-memory (lost on crash) | Durable (survives crash) |
 | Aggregate state | In-memory DashMap | Hydrated from event log |
 | Crash recovery | State lost | Replay from journal + event log |
-| Handler retries | In-memory queue | Persistent queue with reclaim |
+| Reactor retries | In-memory queue | Persistent queue with reclaim |
 
-All durability features are built into the `EventLog` + `HandlerQueue` traits with default no-ops, so `MemoryStore` works out of the box for development and testing. Swap in a Postgres store for production durability — no code changes needed.
+All durability features are built into the `EventLog` + `ReactorQueue` traits with default no-ops, so `MemoryStore` works out of the box for development and testing. Swap in a Postgres store for production durability — no code changes needed.
 
 ## Context API
 
-Every handler receives a `Context<D>` with:
+Every reactor receives a `Context<D>` with:
 
 ```rust
 ctx.deps()              // Shared dependencies (&D)
-ctx.handler_id()        // Handler identifier
+ctx.reactor_id()        // Reactor identifier
 ctx.event_id            // Current event's unique ID
 ctx.correlation_id      // Workflow grouping ID
 ctx.parent_event_id     // Parent event for causal tracking
@@ -557,10 +557,10 @@ ctx.logger              // Structured logging (see below)
 
 ### Structured Logging
 
-Handlers can emit structured log entries via `ctx.logger`. Entries are captured during execution and drained into `HandlerCompletion` / `HandlerDlq`, so store implementations can persist them keyed by `(event_id, handler_id)`.
+Reactors can emit structured log entries via `ctx.logger`. Entries are captured during execution and drained into `HandlerCompletion` / `HandlerDlq`, so store implementations can persist them keyed by `(event_id, reactor_id)`.
 
 ```rust
-#[handler(on = OrderPlaced, id = "ship_order")]
+#[reactor(on = OrderPlaced, id = "ship_order")]
 async fn ship_order(event: OrderPlaced, ctx: Context<Deps>) -> Result<OrderShipped> {
     ctx.logger.info("Starting shipment");
     ctx.logger.debug_with("Order details", &serde_json::json!({
@@ -617,10 +617,10 @@ Next settle loop:     hydrates from EventLog (includes foreign events)
 
 ```
 Engine (routing, composition, settle loop)
-  ├── Handlers (filter → extract → transition guard → execute → emit)
+  ├── Reactors (filter → extract → transition guard → execute → emit)
   ├── Aggregators (event folding, state transitions)
   ├── EventLog (append-only event persistence + snapshots)
-  └── HandlerQueue (handler scheduling + journaling + coordination)
+  └── ReactorQueue (reactor scheduling + journaling + coordination)
 ```
 
 ## License

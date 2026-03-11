@@ -329,7 +329,7 @@ effect::on::<CrawlEvent>()
 ```
 Effect<S, D> {
     can_handle: Fn(TypeId) -> bool,
-    handler: Fn(Arc<dyn Any>, TypeId, EffectContext<S, D>) -> BoxFuture<Result<()>>,
+    reactor: Fn(Arc<dyn Any>, TypeId, EffectContext<S, D>) -> BoxFuture<Result<()>>,
 }
 ```
 
@@ -340,7 +340,7 @@ Effect<S, D> {
     input_type: TypeId,
     output_type: TypeId,  // NEW: Track output type
     can_handle: Fn(TypeId) -> bool,
-    handler: Fn(Arc<dyn Any>, TypeId, EffectContext<S, D>) -> BoxFuture<Result<EventOutput>>,
+    reactor: Fn(Arc<dyn Any>, TypeId, EffectContext<S, D>) -> BoxFuture<Result<EventOutput>>,
 }
 
 struct EventOutput {
@@ -397,10 +397,10 @@ Event → Reducer → Effect.then() → Result<Event> → Engine dispatches retu
 **New Builder Methods:**
 ```rust
 impl<E, F, T, S> EffectBuilder<Typed<E>, F, T, S> {
-    /// Handler returns anyhow::Result<O> - the next event in the chain
+    /// Reactor returns anyhow::Result<O> - the next event in the chain
     /// Output type O is inferred from the closure return
     /// Reads as: "on Event, then NextEvent"
-    pub fn then<H, Fut, O>(self, handler: H) -> Effect<State, Deps>
+    pub fn then<H, Fut, O>(self, reactor: H) -> Effect<State, Deps>
     where
         H: Fn(ExtractedData, EffectContext<State, Deps>) -> Fut,
         Fut: Future<Output = anyhow::Result<O>>,
@@ -430,12 +430,12 @@ impl<E, F, T, S> EffectBuilder<Typed<E>, F, T, S> {
 ```rust
 // Before
 while let Some(envelope) = rx.recv().await {
-    effect.handler(event, type_id, ctx).await?;  // Returns ()
+    effect.reactor(event, type_id, ctx).await?;  // Returns ()
 }
 
 // After
 while let Some(envelope) = rx.recv().await {
-    let output = effect.handler(event, type_id, ctx).await?;
+    let output = effect.reactor(event, type_id, ctx).await?;
     engine_emitter.emit(output.type_id, output.value, ctx);
 }
 ```
@@ -646,7 +646,7 @@ pub fn agent_effects() -> Effect<AgentState, AgentDeps> {
 1. **Proc macro for outcome enums**: Could generate dispatch logic for user enums
 2. **Effect composition**: Chain effects declaratively (future API TBD)
 3. **Typed event graphs**: Generate documentation/diagrams from effect signatures
-4. **Compile-time chain validation**: Ensure all events have handlers
+4. **Compile-time chain validation**: Ensure all events have reactors
 
 ## Real-World Migration Examples
 

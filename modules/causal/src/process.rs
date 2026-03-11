@@ -8,14 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::handler_queue::HandlerQueue;
+use crate::reactor_queue::ReactorQueue;
 use crate::types::QueueStatus;
 
 /// Handle returned after an event is published.
 pub struct ProcessHandle {
     pub correlation_id: Uuid,
     pub event_id: Uuid,
-    pub(crate) queue: Option<Arc<dyn HandlerQueue>>,
+    pub(crate) queue: Option<Arc<dyn ReactorQueue>>,
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -92,7 +92,7 @@ impl EmitFuture {
 
     /// Settle: publish event, then drive the entire causal tree to completion.
     ///
-    /// Returns after all handlers (and their emitted events)
+    /// Returns after all reactors (and their emitted events)
     /// have been fully processed.
     pub fn settled(self) -> SettleFuture {
         SettleFuture {

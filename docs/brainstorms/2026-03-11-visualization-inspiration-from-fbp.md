@@ -7,11 +7,11 @@
 
 Causal already has two graph visualizations in the rootsignal admin app:
 
-1. **CausalFlowPane** — ReactFlow + dagre DAG showing the `Event → Handler → Event` causal tree for a specific run. Event-type nodes grouped by `(handlerId, name)`, handler nodes with live status (pending/running/done/error), causal chain highlighting, handler `describe()` blocks rendered inline (progress bars, checklists, counters, status indicators), duration badges, handler filtering. Polls every 5s.
+1. **CausalFlowPane** — ReactFlow + dagre DAG showing the `Event → Reactor → Event` causal tree for a specific run. Event-type nodes grouped by `(handlerId, name)`, reactor nodes with live status (pending/running/done/error), causal chain highlighting, reactor `describe()` blocks rendered inline (progress bars, checklists, counters, status indicators), duration badges, reactor filtering. Polls every 5s.
 
 2. **ForceGraph** — d3-force canvas renderer for the Neo4j domain knowledge graph (Gatherings, Resources, Actors, Locations). Separate concern from causal flow visualization.
 
-The `describe()` → Block DSL → visual node pattern is the unique primitive. Handlers self-report their state into the graph. Everything below extends what that primitive can do.
+The `describe()` → Block DSL → visual node pattern is the unique primitive. Reactors self-report their state into the graph. Everything below extends what that primitive can do.
 
 ## Comparison: Where Causal Sits
 
@@ -21,13 +21,13 @@ The `describe()` → Block DSL → visual node pattern is the unique primitive. 
 | **Data inspection** | Click any edge to see payload | Click event for details | Click invocation for journal | Counts only (today) |
 | **Replay** | Pin data + re-run downstream | Replay from event history | Re-invoke from journal | Event sourcing (infrastructure exists, no UI) |
 | **Self-reporting nodes** | No | No | No | Yes (describe blocks) |
-| **State visualization** | No domain state | Workflow state only | Handler state only | Aggregates (not visualized yet) |
+| **State visualization** | No domain state | Workflow state only | Reactor state only | Aggregates (not visualized yet) |
 
 ## Ideas (ordered by impact vs effort)
 
 ### 1. Time Scrubber — Replay the Graph Growing
 
-The causal flow graph is built from `flowData` (array of `AdminEvent`). Today it renders the final state. Add a timeline scrubber at the bottom — drag left and the graph shrinks back in time, showing only events up to that point. Handlers pulse as they activate. Events appear as they're emitted.
+The causal flow graph is built from `flowData` (array of `AdminEvent`). Today it renders the final state. Add a timeline scrubber at the bottom — drag left and the graph shrinks back in time, showing only events up to that point. Reactors pulse as they activate. Events appear as they're emitted.
 
 Temporal's timeline view shows the *unfolding* of execution, but as a linear list. This would be an animated DAG — nobody has that.
 
@@ -39,7 +39,7 @@ Temporal's timeline view shows the *unfolding* of execution, but as a linear lis
 
 n8n's best UX: click any connection and see the data that flowed through it — table view, JSON view, schema view.
 
-Event nodes already show counts (`x47`). Clicking one should expand a detail drawer showing actual event payloads. Clicking a handler node should show input event, output events, journal entries, logs, duration, retry history.
+Event nodes already show counts (`x47`). Clicking one should expand a detail drawer showing actual event payloads. Clicking a reactor node should show input event, output events, journal entries, logs, duration, retry history.
 
 **Implementation sketch:** Add a side panel / drawer component. On node click, query `adminEventPayloads(groupKey)` via GraphQL. Render with tabs: Table | JSON | Schema (inferred from first payload).
 
@@ -47,11 +47,11 @@ Event nodes already show counts (`x47`). Clicking one should expand a detail dra
 
 ### 3. Static Topology View (NofLo's Contribution)
 
-Today the graph requires a specific run to render. NofLo's insight: the *static wiring* is also valuable. A companion view showing all registered handlers, event types they listen to, and event types they can emit — derived from the handler registry at startup, no run needed.
+Today the graph requires a specific run to render. NofLo's insight: the *static wiring* is also valuable. A companion view showing all registered reactors, event types they listen to, and event types they can emit — derived from the reactor registry at startup, no run needed.
 
-The `#[handles]` macro already knows input/output types at compile time. The `HandlerRegistry` has the runtime information.
+The `#[reactors]` macro already knows input/output types at compile time. The `HandlerRegistry` has the runtime information.
 
-**Implementation sketch:** Two tabs in the flow pane — **Topology** (static, what *can* happen) and **Flow** (runtime, what *did* happen). Topology derived from a new `GET /api/admin/topology` endpoint that serializes the handler registry.
+**Implementation sketch:** Two tabs in the flow pane — **Topology** (static, what *can* happen) and **Flow** (runtime, what *did* happen). Topology derived from a new `GET /api/admin/topology` endpoint that serializes the reactor registry.
 
 **Why it matters:** The "architecture diagram that's always up to date" because it's generated from code. Teams would use this daily even outside debugging.
 
@@ -69,23 +69,23 @@ Temporal shows event history. Restate shows journal entries. Neither shows *doma
 
 ### 5. Pin & Replay (n8n's Data Pinning for Event Sourcing)
 
-n8n lets you freeze a node's output and re-run downstream with frozen data. For causal: pick any event in the graph, "pin" it, and re-run just the downstream handlers from that point.
+n8n lets you freeze a node's output and re-run downstream with frozen data. For causal: pick any event in the graph, "pin" it, and re-run just the downstream reactors from that point.
 
 Causal already has `ctx.run()` journaling and event replay infrastructure.
 
 **Implementation sketch:** Right-click event node → "Replay from here." Backend creates a new correlation with the pinned event as root, runs settlement. New run appears in the flow pane.
 
-**Why it matters:** Development superpower. "This handler failed on event #47 — pin it, tweak handler code, re-run just that subtree."
+**Why it matters:** Development superpower. "This reactor failed on event #47 — pin it, tweak reactor code, re-run just that subtree."
 
-### 6. Handler Heat Map / Throughput Overlay
+### 6. Reactor Heat Map / Throughput Overlay
 
-Color-code handler nodes by performance: green (fast), yellow (slow), red (erroring). Size event-type nodes by volume. Animate edge thickness by throughput.
+Color-code reactor nodes by performance: green (fast), yellow (slow), red (erroring). Size event-type nodes by volume. Animate edge thickness by throughput.
 
 The describe blocks already push progress data into nodes — extend that to visual encoding on the graph itself.
 
 NofLo's FBP inspiration article references "packets moving through running systems, similar to control panels in industrial settings."
 
-**Implementation sketch:** Compute `avg_duration`, `error_rate`, `throughput` per handler from `adminHandlerOutcomes`. Map to HSL color scale. Apply as node background gradient or border glow.
+**Implementation sketch:** Compute `avg_duration`, `error_rate`, `throughput` per reactor from `adminReactorOutcomes`. Map to HSL color scale. Apply as node background gradient or border glow.
 
 **Why it matters:** Turns the flow graph into a live operational dashboard.
 
@@ -99,15 +99,15 @@ Side-by-side or overlay view: pick run A and run B, see where they diverge. Same
 
 ### 8. Subgraph Collapse (NofLo's Composability)
 
-NofLo's subgraphs let you collapse a sub-network into a single node. The handler filter dropdown already does a version of this (hiding handlers). But a proper "group these N handlers into a named subgraph" with expand/collapse would help at scale. Double-click to zoom in, like a filesystem.
+NofLo's subgraphs let you collapse a sub-network into a single node. The reactor filter dropdown already does a version of this (hiding reactors). But a proper "group these N reactors into a named subgraph" with expand/collapse would help at scale. Double-click to zoom in, like a filesystem.
 
-**Implementation sketch:** Let users define named groups in handler registration (e.g., `#[handles(group = "scraping")]`). Render collapsed groups as a single meta-node with aggregate stats. Click to expand inline.
+**Implementation sketch:** Let users define named groups in reactor registration (e.g., `#[reactors(group = "scraping")]`). Render collapsed groups as a single meta-node with aggregate stats. Click to expand inline.
 
-**Why it matters:** Scale. When you have 30+ handlers, the graph needs hierarchy.
+**Why it matters:** Scale. When you have 30+ reactors, the graph needs hierarchy.
 
 ### 9. Sticky Notes / Annotations (n8n's Simplest Good Idea)
 
-Markdown-formatted annotations on the canvas. Drop a note explaining *why* a handler exists or *what to watch for*. Persisted per-run or per-topology.
+Markdown-formatted annotations on the canvas. Drop a note explaining *why* a reactor exists or *what to watch for*. Persisted per-run or per-topology.
 
 **Implementation sketch:** Add a "note" node type to ReactFlow. Persist in a `causal_flow_annotations` table keyed by `(run_id | "topology", position_x, position_y, content)`.
 

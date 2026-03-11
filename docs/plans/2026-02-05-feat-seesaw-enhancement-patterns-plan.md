@@ -1361,7 +1361,7 @@ lazy_static! {
     static ref ENGINE: Engine<State, Deps> = build_engine();
 }
 
-async fn handler(event: LambdaEvent<LambdaInput>) -> Result<LambdaOutput, Error> {
+async fn reactor(event: LambdaEvent<LambdaInput>) -> Result<LambdaOutput, Error> {
     // Reconstruct state from DynamoDB/RDS
     let state = load_state(&event.payload.request_id).await?;
 
@@ -1387,7 +1387,7 @@ async fn handler(event: LambdaEvent<LambdaInput>) -> Result<LambdaOutput, Error>
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    lambda_runtime::run(service_fn(handler)).await
+    lambda_runtime::run(service_fn(reactor)).await
 }
 ```
 

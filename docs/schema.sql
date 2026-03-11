@@ -100,11 +100,11 @@ WHERE completed_at IS NOT NULL;
 COMMENT ON TABLE causal_processed IS 'Processing ledger - atomic claim via ON CONFLICT, persists after queue deletion';
 COMMENT ON COLUMN causal_processed.completed_at IS 'Phase 2 complete - all effects finished';
 
--- Handler execution intents (framework-guaranteed idempotency)
+-- Reactor execution intents (framework-guaranteed idempotency)
 -- Effect workers poll this table for ready effects
 CREATE TABLE causal_handler_executions (
     event_id UUID NOT NULL,
-    handler_id VARCHAR(255) NOT NULL,
+    reactor_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending',  -- pending, executing, completed, failed (retryable)
     result JSONB,
@@ -119,7 +119,7 @@ CREATE TABLE causal_handler_executions (
     batch_index INT,
     batch_size INT,
 
-    -- Execution properties (from handler builder)
+    -- Execution properties (from reactor builder)
     execute_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- When to execute (.delayed())
     timeout_seconds INT NOT NULL DEFAULT 30,
     max_attempts INT NOT NULL DEFAULT 3,
@@ -130,10 +130,10 @@ CREATE TABLE causal_handler_executions (
     completed_at TIMESTAMPTZ,
     last_attempted_at TIMESTAMPTZ,
 
-    PRIMARY KEY (event_id, handler_id)
+    PRIMARY KEY (event_id, reactor_id)
 );
 
--- Worker polling: Find next ready handler (respects priority and schedule)
+-- Worker polling: Find next ready reactor (respects priority and schedule)
 -- Note: execute_at <= NOW() check is done in query, not index (NOW() is STABLE not IMMUTABLE)
 -- Lower priority number = higher priority, so ASC order
 CREATE INDEX idx_handler_executions_pending
@@ -155,7 +155,7 @@ CREATE INDEX idx_handler_executions_workflow ON causal_handler_executions(correl
 CREATE INDEX idx_handler_executions_failed ON causal_handler_executions(status, attempts)
 WHERE status = 'failed';
 
-COMMENT ON TABLE causal_handler_executions IS 'Handler intents - created by event workers, executed by handler workers';
+COMMENT ON TABLE causal_handler_executions IS 'Reactor intents - created by event workers, executed by reactor workers';
 COMMENT ON COLUMN causal_handler_executions.event_payload IS 'Event data copied here - survives parent event deletion after 30 days';
 COMMENT ON COLUMN causal_handler_executions.priority IS 'Worker polling priority - lower number = higher priority';
 
@@ -164,7 +164,7 @@ COMMENT ON COLUMN causal_handler_executions.priority IS 'Worker polling priority
 -- ============================================================
 
 CREATE TABLE causal_join_entries (
-    join_handler_id VARCHAR(255) NOT NULL,
+    join_reactor_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     source_event_id UUID NOT NULL,
     source_event_type VARCHAR(255) NOT NULL,
@@ -174,15 +174,15 @@ CREATE TABLE causal_join_entries (
     batch_index INT NOT NULL,
     batch_size INT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (join_handler_id, correlation_id, source_event_id),
-    UNIQUE (join_handler_id, correlation_id, batch_id, batch_index)
+    PRIMARY KEY (join_reactor_id, correlation_id, source_event_id),
+    UNIQUE (join_reactor_id, correlation_id, batch_id, batch_index)
 );
 
 CREATE INDEX idx_join_entries_window
-ON causal_join_entries(join_handler_id, correlation_id, batch_id, batch_index);
+ON causal_join_entries(join_reactor_id, correlation_id, batch_id, batch_index);
 
 CREATE TABLE causal_join_windows (
-    join_handler_id VARCHAR(255) NOT NULL,
+    join_reactor_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     mode VARCHAR(50) NOT NULL DEFAULT 'same_batch',
     batch_id UUID NOT NULL,
@@ -196,7 +196,7 @@ CREATE TABLE causal_join_windows (
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (join_handler_id, correlation_id, batch_id)
+    PRIMARY KEY (join_reactor_id, correlation_id, batch_id)
 );
 
 CREATE INDEX idx_join_windows_status
@@ -209,7 +209,7 @@ ON causal_join_windows(status, updated_at DESC);
 -- Failed effects that exceeded retry limits
 CREATE TABLE causal_dlq (
     event_id UUID NOT NULL,
-    handler_id VARCHAR(255) NOT NULL,
+    reactor_id VARCHAR(255) NOT NULL,
     correlation_id UUID NOT NULL,
     error TEXT NOT NULL,
     event_type VARCHAR(255) NOT NULL,
@@ -218,7 +218,7 @@ CREATE TABLE causal_dlq (
     attempts INT NOT NULL DEFAULT 0,
     failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at TIMESTAMPTZ,         -- NULL = unresolved, set when manually fixed
-    PRIMARY KEY (event_id, handler_id)
+    PRIMARY KEY (event_id, reactor_id)
 );
 
 -- Ops query: List unresolved failures
@@ -239,7 +239,7 @@ COMMENT ON COLUMN causal_dlq.reason IS 'Why it failed: failed (retry exhausted),
 -- Observability Stream (for real-time visualization)
 -- ============================================================
 
--- Stream of all workflow events and handler transitions
+-- Stream of all workflow events and reactor transitions
 -- Append-only table for real-time monitoring and debugging
 CREATE TABLE causal_stream (
     seq BIGSERIAL PRIMARY KEY,
@@ -247,10 +247,10 @@ CREATE TABLE causal_stream (
     correlation_id UUID NOT NULL,
     event_id UUID,
     effect_event_id UUID,              -- For effects: the triggering event_id
-    handler_id VARCHAR(255),             -- For handlers: the handler identifier
+    reactor_id VARCHAR(255),             -- For reactors: the reactor identifier
     status VARCHAR(50),                 -- For effects: 'executing', 'completed', 'failed'
     error TEXT,                         -- For failures: error message
-    payload JSONB,                      -- Event payload or handler result
+    payload JSONB,                      -- Event payload or reactor result
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -304,7 +304,7 @@ CREATE TRIGGER causal_events_stream
     FOR EACH ROW
     EXECUTE FUNCTION stream_event_dispatched();
 
--- Trigger: Stream handler execution lifecycle
+-- Trigger: Stream reactor execution lifecycle
 CREATE OR REPLACE FUNCTION stream_handler_transition()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -327,7 +327,7 @@ BEGIN
         correlation_id,
         event_id,
         effect_event_id,
-        handler_id,
+        reactor_id,
         status,
         error,
         payload,
@@ -335,9 +335,9 @@ BEGIN
     ) VALUES (
         stream_type_val,
         NEW.correlation_id,
-        NULL,  -- No new event for handler lifecycle
+        NULL,  -- No new event for reactor lifecycle
         NEW.event_id,
-        NEW.handler_id,
+        NEW.reactor_id,
         NEW.status,
         NEW.error,
         NEW.result,
@@ -357,7 +357,7 @@ CREATE TRIGGER causal_handler_executions_stream
     EXECUTE FUNCTION stream_handler_transition();
 
 COMMENT ON FUNCTION stream_event_dispatched IS 'Trigger: Log event dispatches to observability stream';
-COMMENT ON FUNCTION stream_handler_transition IS 'Trigger: Log handler lifecycle transitions to observability stream';
+COMMENT ON FUNCTION stream_handler_transition IS 'Trigger: Log reactor lifecycle transitions to observability stream';
 
 -- ============================================================
 -- Operational Tables
@@ -412,7 +412,7 @@ BEGIN
     WHERE processed_at < NOW() - (retention_days || ' days')::INTERVAL;
     GET DIAGNOSTICS events_count = ROW_COUNT;
 
-    -- Delete old completed handlers
+    -- Delete old completed reactors
     DELETE FROM causal_handler_executions
     WHERE completed_at < NOW() - (retention_days || ' days')::INTERVAL
     AND status = 'completed';
@@ -479,7 +479,7 @@ COMMENT ON FUNCTION causal_create_next_partition IS 'Create partition 7 days ahe
 -- FROM causal_events
 -- WHERE processed_at IS NULL;
 
--- Alert: Pending handler payload size > 10KB (performance risk)
+-- Alert: Pending reactor payload size > 10KB (performance risk)
 -- SELECT event_id, LENGTH(event_payload::text) as payload_bytes
 -- FROM causal_handler_executions
 -- WHERE LENGTH(event_payload::text) > 10240
@@ -497,7 +497,7 @@ COMMENT ON FUNCTION causal_create_next_partition IS 'Create partition 7 days ahe
 -- FROM causal_handler_executions
 -- WHERE status IN ('pending', 'executing', 'failed');
 
--- Dashboard: Handler execution latency (p50, p95, p99)
+-- Dashboard: Reactor execution latency (p50, p95, p99)
 -- SELECT
 --     PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - execute_at))) as p50,
 --     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - execute_at))) as p95,
@@ -534,7 +534,7 @@ COMMENT ON FUNCTION causal_create_next_partition IS 'Create partition 7 days ahe
 
 -- Monthly:
 --   - VACUUM ANALYZE all tables
---   - Check handler payload size distribution
+--   - Check reactor payload size distribution
 --   - Review DLQ for patterns
 
 -- Schema complete! Ready for production at 1000+ events/sec.

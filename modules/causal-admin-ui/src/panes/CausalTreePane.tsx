@@ -14,7 +14,7 @@ import { formatTs, compactPayload, copyToClipboard } from "../utils";
 type TreeJson = {
   name: string;
   layer: string;
-  handlerId: string | null;
+  reactorId: string | null;
   summary: string | null;
   children?: TreeJson[];
 };
@@ -25,7 +25,7 @@ function buildTreeJson(roots: AdminEvent[], childrenMap: Map<string, AdminEvent[
     const node: TreeJson = {
       name: evt.name,
       layer: evt.layer,
-      handlerId: evt.handlerId,
+      reactorId: evt.reactorId,
       summary: evt.summary,
     };
     if (children.length > 0) {
@@ -37,25 +37,25 @@ function buildTreeJson(roots: AdminEvent[], childrenMap: Map<string, AdminEvent[
 }
 
 // ---------------------------------------------------------------------------
-// HandlerNode — intermediate node grouping children by handler_id
+// ReactorNode — intermediate node grouping children by reactor_id
 // ---------------------------------------------------------------------------
 
-function HandlerNode({
-  handlerId,
+function ReactorNode({
+  reactorId,
   parentEventId,
   children,
   childrenMap,
   depth,
   isHighlighted,
-  onClickHandler,
+  onClickReactor,
 }: {
-  handlerId: string;
+  reactorId: string;
   parentEventId: string;
   children: AdminEvent[];
   childrenMap: Map<string, AdminEvent[]>;
   depth: number;
   isHighlighted: boolean;
-  onClickHandler: (handlerId: string, parentEventId: string, runId: string | null) => void;
+  onClickReactor: (reactorId: string, parentEventId: string, runId: string | null) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const nodeRef = useRef<HTMLDivElement>(null);
@@ -68,8 +68,8 @@ function HandlerNode({
 
   const handleClick = useCallback(() => {
     const runId = children[0]?.runId ?? null;
-    onClickHandler(handlerId, parentEventId, runId);
-  }, [onClickHandler, parentEventId, handlerId, children]);
+    onClickReactor(reactorId, parentEventId, runId);
+  }, [onClickReactor, parentEventId, reactorId, children]);
 
   return (
     <div className={depth > 0 ? "pl-6" : ""}>
@@ -91,10 +91,10 @@ function HandlerNode({
             className="flex items-center gap-1.5 min-w-0"
           >
             <span className="px-1 py-0.5 rounded text-[10px] font-medium shrink-0 bg-zinc-600/30 text-zinc-400 italic">
-              handler
+              reactor
             </span>
             <span className="text-[10px] font-mono text-zinc-300 shrink-0">
-              {handlerId}
+              {reactorId}
             </span>
             {collapsed && (
               <span className="text-[10px] text-muted-foreground shrink-0">
@@ -111,7 +111,7 @@ function HandlerNode({
           event={child}
           childrenMap={childrenMap}
           depth={depth + 1}
-          onClickHandler={onClickHandler}
+          onClickReactor={onClickReactor}
         />
       ))}
     </div>
@@ -126,13 +126,13 @@ function TreeNode({
   event,
   childrenMap,
   depth,
-  onClickHandler,
+  onClickReactor,
   onInvestigate,
 }: {
   event: AdminEvent;
   childrenMap: Map<string, AdminEvent[]>;
   depth: number;
-  onClickHandler: (handlerId: string, parentEventId: string, runId: string | null) => void;
+  onClickReactor: (reactorId: string, parentEventId: string, runId: string | null) => void;
   onInvestigate?: (event: AdminEvent) => void;
 }) {
   const selectedSeq = useSelector<AdminState, number | null>((s) => s.selectedSeq);
@@ -154,23 +154,23 @@ function TreeNode({
     }
   }, [isSelected]);
 
-  // Group children by handler_id
-  const { handlerGroups, directChildren } = useMemo(() => {
+  // Group children by reactor_id
+  const { reactorGroups, directChildren } = useMemo(() => {
     const groups = new Map<string, AdminEvent[]>();
     const direct: AdminEvent[] = [];
     for (const child of children) {
-      if (child.handlerId) {
-        const group = groups.get(child.handlerId) ?? [];
+      if (child.reactorId) {
+        const group = groups.get(child.reactorId) ?? [];
         group.push(child);
-        groups.set(child.handlerId, group);
+        groups.set(child.reactorId, group);
       } else {
         direct.push(child);
       }
     }
-    return { handlerGroups: groups, directChildren: direct };
+    return { reactorGroups: groups, directChildren: direct };
   }, [children]);
 
-  const highlightedHandlerId = flowSelection?.kind === "handler" ? flowSelection.handlerId : null;
+  const highlightedReactorId = flowSelection?.kind === "reactor" ? flowSelection.reactorId : null;
 
   return (
     <div className={depth > 0 ? "pl-6" : ""}>
@@ -255,20 +255,20 @@ function TreeNode({
               event={child}
               childrenMap={childrenMap}
               depth={depth + 1}
-              onClickHandler={onClickHandler}
+              onClickReactor={onClickReactor}
               onInvestigate={onInvestigate}
             />
           ))}
-          {[...handlerGroups.entries()].map(([hid, group]) => (
-            <HandlerNode
+          {[...reactorGroups.entries()].map(([hid, group]) => (
+            <ReactorNode
               key={hid}
-              handlerId={hid}
+              reactorId={hid}
               parentEventId={event.id!}
               children={group}
               childrenMap={childrenMap}
               depth={depth + 1}
-              isHighlighted={hid === highlightedHandlerId}
-              onClickHandler={onClickHandler}
+              isHighlighted={hid === highlightedReactorId}
+              onClickReactor={onClickReactor}
             />
           ))}
         </>
@@ -284,8 +284,8 @@ function TreeNode({
 function matchesFlowSelection(event: AdminEvent, sel: FlowSelection): boolean {
   if (!sel) return true;
   if (sel.kind === "event-type")
-    return event.handlerId === sel.handlerId && event.name === sel.name;
-  return event.handlerId === sel.handlerId;
+    return event.reactorId === sel.reactorId && event.name === sel.name;
+  return event.reactorId === sel.reactorId;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,14 +306,14 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   const treeEvents = causalTree?.events ?? null;
   const treeLoading = selectedSeq != null && causalTree == null;
 
-  const onClickHandler = useCallback(
-    (handlerId: string, parentEventId: string, runId: string | null) => {
+  const onClickReactor = useCallback(
+    (reactorId: string, parentEventId: string, runId: string | null) => {
       if (flowRunId) {
-        dispatch({ type: "ui/flow_node_selected", payload: { kind: "handler", handlerId } });
+        dispatch({ type: "ui/flow_node_selected", payload: { kind: "reactor", reactorId } });
       }
       dispatch({
         type: "ui/logs_filter_changed",
-        payload: { eventId: parentEventId, handlerId, runId, scope: "handler" },
+        payload: { eventId: parentEventId, reactorId, runId, scope: "reactor" },
       });
     },
     [flowRunId, dispatch]
@@ -387,8 +387,8 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
         <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
           <span>
             {flowSelection.kind === "event-type"
-              ? `${flowSelection.name} from ${flowSelection.handlerId ?? "root"}`
-              : `outputs of ${flowSelection.handlerId}`}
+              ? `${flowSelection.name} from ${flowSelection.reactorId ?? "root"}`
+              : `outputs of ${flowSelection.reactorId}`}
           </span>
           <button
             onClick={() => dispatch({ type: "ui/flow_node_selected", payload: null })}
@@ -410,8 +410,8 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
         <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
           <span>
             {flowSelection.kind === "event-type"
-              ? `${flowSelection.name} from ${flowSelection.handlerId ?? "root"}`
-              : `outputs of ${flowSelection.handlerId}`}
+              ? `${flowSelection.name} from ${flowSelection.reactorId ?? "root"}`
+              : `outputs of ${flowSelection.reactorId}`}
           </span>
           <button
             onClick={() => dispatch({ type: "ui/flow_node_selected", payload: null })}
@@ -430,7 +430,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
           event={root}
           childrenMap={childrenMap}
           depth={0}
-          onClickHandler={onClickHandler}
+          onClickReactor={onClickReactor}
           onInvestigate={onInvestigate}
         />
       ))}

@@ -49,7 +49,7 @@ pub trait Event:
 
     /// Whether this event is ephemeral (not persisted to EventLog).
     ///
-    /// Ephemeral events route through handlers but skip persistence,
+    /// Ephemeral events route through reactors but skip persistence,
     /// aggregate apply, and projections.
     fn is_ephemeral() -> bool {
         false

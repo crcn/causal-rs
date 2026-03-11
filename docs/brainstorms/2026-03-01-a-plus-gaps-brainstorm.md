@@ -19,7 +19,7 @@ After implementing upcasters (v0.15.10), evaluated what's needed to bring causal
 
 ### 2. Settled timeout
 
-`.settled()` can block forever on long-but-finite handler chains. Hop limit catches infinite loops, but no wall-clock protection.
+`.settled()` can block forever on long-but-finite reactor chains. Hop limit catches infinite loops, but no wall-clock protection.
 
 ```rust
 engine.emit(event)
@@ -54,7 +54,7 @@ Smart loader: snapshot + partial replay of events after snapshot version.
 Retries execute immediately. Real effects need backoff.
 
 ```rust
-handler::on::<PaymentRequested>()
+reactor::on::<PaymentRequested>()
     .id("charge")
     .queued()
     .retry(5)
@@ -77,7 +77,7 @@ Lowest priority — workarounds exist (deps, event fields, tracing spans).
 
 ### 7. Panics in handler_registry
 
-`panic!("Duplicate effect id '{}'"` and `panic!("Handler ID cannot be empty")` should be warnings or Results, not process crashes during setup.
+`panic!("Duplicate effect id '{}'"` and `panic!("Reactor ID cannot be empty")` should be warnings or Results, not process crashes during setup.
 
 ## Priority Ranking
 

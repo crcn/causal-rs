@@ -7,7 +7,7 @@
 
 ### The Strategic Rationale
 
-1. **Play to Strengths**: Our `#[handler]` macro API is genuinely nice - that's the differentiator
+1. **Play to Strengths**: Our `#[reactor]` macro API is genuinely nice - that's the differentiator
 2. **Don't Compete with Restate**: Restate owns orchestration. They have backing, production deployments, superior runtime
 3. **Natural Fit**: Event sourcing is simpler than orchestration and actually suits our API better
 4. **Weak Competition**: Rust event sourcing libs are either low-level (postgres-es) or abandoned
@@ -16,7 +16,7 @@
 ### What Makes Sense
 
 Event sourcing is a BETTER fit for our API than orchestration because:
-- Handlers naturally map to projections (event → state transition)
+- Reactors naturally map to projections (event → state transition)
 - Simpler operational model (no distributed coordination)
 - Lower complexity (local state reconstruction vs saga compensation)
 - The macro API provides more value (you write more projections than orchestrators)
@@ -25,16 +25,16 @@ Event sourcing is a BETTER fit for our API than orchestration because:
 
 ### Core Philosophy: Keep What Works
 
-The `#[handler]` macro stays essentially identical, just changes from:
+The `#[reactor]` macro stays essentially identical, just changes from:
 ```rust
 // Orchestration: async side effects
-async fn handler(ctx: Context<Deps>) -> Result<Event>
+async fn reactor(ctx: Context<Deps>) -> Result<Event>
 ```
 
 To:
 ```rust
 // Event Sourcing: pure state transitions
-fn handler(state: &mut Aggregate) -> Result<()>
+fn reactor(state: &mut Aggregate) -> Result<()>
 ```
 
 ### Key API Elements
@@ -67,9 +67,9 @@ enum OrderEvent {
 }
 ```
 
-**Handlers/Projections (Pure Functions):**
+**Reactors/Projections (Pure Functions):**
 ```rust
-#[handler(on = OrderEvent, extract(order_id, total))]
+#[reactor(on = OrderEvent, extract(order_id, total))]
 fn apply_placed(order_id: Uuid, total: f64, state: &mut Order) -> Result<()> {
     state.id = order_id;
     state.total = total;
@@ -109,7 +109,7 @@ let store = PostgresEventStore::new(pool);
 // Load aggregate by replaying events
 let order: Order = store
     .aggregate(order_id)
-    .with_handlers(order_handlers::handlers())
+    .with_reactors(order_handlers::reactors())
     .load()
     .await?;
 
@@ -127,7 +127,7 @@ Validated against Martin Fowler's authoritative articles on Event Sourcing.
 1. **Event Storage**: Append-only event log as source of truth
 2. **State Reconstruction**: Rebuild by replaying events
 3. **Snapshots**: Planned from the start
-4. **Pure Projections**: Handlers are deterministic
+4. **Pure Projections**: Reactors are deterministic
 5. **Backend Abstraction**: Memory/PostgreSQL/Kafka
 
 ### ❌ Critical Gaps (High Priority)
@@ -279,8 +279,8 @@ impl EventStore {
 - Add `AggregateLoader` builder
 - Add `VersionedEvent` + `EventUpcast` (NEW)
 
-### Phase 2: Handler Macro (2-3 days)
-- Update to generate pure handlers
+### Phase 2: Reactor Macro (2-3 days)
+- Update to generate pure reactors
 - Support optional `Context` for async projections
 - Add `#[reversible]` attribute (optional)
 
@@ -342,14 +342,14 @@ impl EventStore {
 
 4. **How to handle async projections?**
    - Current proposal: Optional `Context<Deps>`
-   - Makes handler `async` if Context present
+   - Makes reactor `async` if Context present
 
 ## Positioning
 
 **Tagline:** "Ergonomic Event Sourcing for Rust"
 
 **Value Props:**
-- Declarative projections with `#[handler]` macro
+- Declarative projections with `#[reactor]` macro
 - Type-safe event matching and field extraction
 - Backend-agnostic (Memory → PostgreSQL → Kafka)
 - CQRS support built-in

@@ -29,14 +29,14 @@
 **Added new section:** "Transaction Boundaries and Execution Modes"
 
 **Content:**
-- Inline handlers execution flow (same transaction)
-- Background handlers execution flow (separate transaction)
+- Inline reactors execution flow (same transaction)
+- Background reactors execution flow (separate transaction)
 - Key differences table (transaction, speed, atomicity, retry)
 - Common patterns (DB inline, external API background)
 - Transaction safety rules
 - Debugging transaction issues with examples
 
-**Impact:** Users understand when handlers run in which transaction, preventing correctness bugs.
+**Impact:** Users understand when reactors run in which transaction, preventing correctness bugs.
 
 ### ✅ Task 3: Enforce `queued` Requirement in Macro
 
@@ -47,28 +47,28 @@
    ```rust
    if effect_requires_background(&args) && !args.queued && !is_accumulate {
        return Err(syn::Error::new(
-           "handlers with retry/timeout/delay/priority must explicitly include 'queued' attribute"
+           "reactors with retry/timeout/delay/priority must explicitly include 'queued' attribute"
        ));
    }
    ```
 
 2. Added helper functions (lines 772-805):
-   - `effect_requires_background()` - Checks if handler needs background
+   - `effect_requires_background()` - Checks if reactor needs background
    - `collect_background_features()` - Collects feature names for error message
 
 **Before:**
 ```rust
-#[handler(on = Event, retry = 3)]  // Silently becomes background
-async fn handler(...) { }
+#[reactor(on = Event, retry = 3)]  // Silently becomes background
+async fn reactor(...) { }
 ```
 
 **After:**
 ```rust
-#[handler(on = Event, retry = 3)]  // ❌ Compile error
-// Error: handlers with retry > 1 must explicitly include 'queued' attribute
+#[reactor(on = Event, retry = 3)]  // ❌ Compile error
+// Error: reactors with retry > 1 must explicitly include 'queued' attribute
 
-#[handler(on = Event, queued, retry = 3)]  // ✅ Explicit and clear
-async fn handler(...) { }
+#[reactor(on = Event, queued, retry = 3)]  // ✅ Explicit and clear
+async fn reactor(...) { }
 ```
 
 **Impact:** Execution mode is now explicit. No more silent background conversion.

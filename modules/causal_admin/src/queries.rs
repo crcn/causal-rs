@@ -19,7 +19,7 @@ fn row_to_event(r: &sqlx::postgres::PgRow) -> EventRow {
         run_id: r.get("run_id"),
         correlation_id: r.get("correlation_id"),
         parent_seq: r.get("parent_seq"),
-        handler_id: r.get("handler_id"),
+        reactor_id: r.get("reactor_id"),
     }
 }
 
@@ -43,7 +43,7 @@ pub async fn get_event_by_seq(
     let row = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, handler_id
+               run_id, correlation_id, parent_seq, reactor_id
         FROM events
         WHERE seq = $1
         "#,
@@ -67,7 +67,7 @@ pub async fn get_events_from_seq(
     let rows = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, handler_id
+               run_id, correlation_id, parent_seq, reactor_id
         FROM events
         WHERE seq >= $1
         ORDER BY seq ASC
@@ -98,7 +98,7 @@ pub async fn list_events_paginated(
     let rows = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, handler_id
+               run_id, correlation_id, parent_seq, reactor_id
         FROM events
         WHERE ($1::bigint IS NULL OR seq < $1)
           AND ($2::timestamptz IS NULL OR ts >= $2)
@@ -134,7 +134,7 @@ pub async fn causal_tree(
     let rows = sqlx::query(
         r#"
         SELECT e.seq, e.ts, e.event_type, e.payload AS data, e.id, e.parent_id,
-               e.run_id, e.correlation_id, e.parent_seq, e.handler_id
+               e.run_id, e.correlation_id, e.parent_seq, e.reactor_id
         FROM events e
         WHERE e.correlation_id = (SELECT correlation_id FROM events WHERE seq = $1)
           AND e.correlation_id IS NOT NULL
@@ -164,7 +164,7 @@ pub async fn causal_flow(
     let rows = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, handler_id
+               run_id, correlation_id, parent_seq, reactor_id
         FROM events
         WHERE run_id = $1
         ORDER BY seq ASC
@@ -177,40 +177,40 @@ pub async fn causal_flow(
     Ok(rows_to_admin_events(rows, display))
 }
 
-// ── Handler queries ──
+// ── Reactor queries ──
 
-/// Handler log row from `causal_handler_logs`.
-pub struct HandlerLogRow {
+/// Reactor log row from `causal_handler_logs`.
+pub struct ReactorLogRow {
     pub event_id: Uuid,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub level: String,
     pub message: String,
     pub data: Option<serde_json::Value>,
     pub logged_at: DateTime<Utc>,
 }
 
-/// Fetch handler logs for a specific event + handler.
+/// Fetch reactor logs for a specific event + reactor.
 pub async fn handler_logs(
     pool: &PgPool,
     event_id: &Uuid,
-    handler_id: &str,
-) -> anyhow::Result<Vec<HandlerLogRow>> {
+    reactor_id: &str,
+) -> anyhow::Result<Vec<ReactorLogRow>> {
     let rows = sqlx::query_as::<_, (Uuid, String, String, String, Option<serde_json::Value>, DateTime<Utc>)>(
-        "SELECT event_id, handler_id, level, message, data, logged_at \
+        "SELECT event_id, reactor_id, level, message, data, logged_at \
          FROM causal_handler_logs \
-         WHERE event_id = $1 AND handler_id = $2 \
+         WHERE event_id = $1 AND reactor_id = $2 \
          ORDER BY id",
     )
     .bind(event_id)
-    .bind(handler_id)
+    .bind(reactor_id)
     .fetch_all(pool)
     .await?;
 
     Ok(rows
         .into_iter()
-        .map(|(event_id, handler_id, level, message, data, logged_at)| HandlerLogRow {
+        .map(|(event_id, reactor_id, level, message, data, logged_at)| ReactorLogRow {
             event_id,
-            handler_id,
+            reactor_id,
             level,
             message,
             data,
@@ -219,16 +219,16 @@ pub async fn handler_logs(
         .collect())
 }
 
-/// Fetch all handler logs for a run (by correlation_id).
+/// Fetch all reactor logs for a run (by correlation_id).
 pub async fn handler_logs_by_run(
     pool: &PgPool,
     run_id: &str,
-) -> anyhow::Result<Vec<HandlerLogRow>> {
+) -> anyhow::Result<Vec<ReactorLogRow>> {
     let correlation_id = Uuid::parse_str(run_id)
         .map_err(|e| anyhow::anyhow!("Invalid run_id as UUID: {e}"))?;
 
     let rows = sqlx::query_as::<_, (Uuid, String, String, String, Option<serde_json::Value>, DateTime<Utc>)>(
-        "SELECT event_id, handler_id, level, message, data, logged_at \
+        "SELECT event_id, reactor_id, level, message, data, logged_at \
          FROM causal_handler_logs \
          WHERE correlation_id = $1 \
          ORDER BY id",
@@ -239,9 +239,9 @@ pub async fn handler_logs_by_run(
 
     Ok(rows
         .into_iter()
-        .map(|(event_id, handler_id, level, message, data, logged_at)| HandlerLogRow {
+        .map(|(event_id, reactor_id, level, message, data, logged_at)| ReactorLogRow {
             event_id,
-            handler_id,
+            reactor_id,
             level,
             message,
             data,
@@ -250,9 +250,9 @@ pub async fn handler_logs_by_run(
         .collect())
 }
 
-/// Aggregated handler outcome row from `causal_effect_executions`.
-pub struct HandlerOutcomeRow {
-    pub handler_id: String,
+/// Aggregated reactor outcome row from `causal_effect_executions`.
+pub struct ReactorOutcomeRow {
+    pub reactor_id: String,
     pub status: String,
     pub error: Option<String>,
     pub attempts: i64,
@@ -261,16 +261,16 @@ pub struct HandlerOutcomeRow {
     pub triggering_event_ids: Vec<String>,
 }
 
-/// Fetch aggregated handler execution outcomes for a run.
+/// Fetch aggregated reactor execution outcomes for a run.
 pub async fn handler_outcomes(
     pool: &PgPool,
     run_id: &str,
-) -> anyhow::Result<Vec<HandlerOutcomeRow>> {
+) -> anyhow::Result<Vec<ReactorOutcomeRow>> {
     let correlation_id = Uuid::parse_str(run_id)
         .map_err(|e| anyhow::anyhow!("Invalid run_id as UUID: {e}"))?;
 
     let rows = sqlx::query_as::<_, (String, String, Option<String>, i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<Vec<String>>)>(
-        "SELECT handler_id, \
+        "SELECT reactor_id, \
                 CASE WHEN bool_or(status = 'error') THEN 'error' \
                      WHEN bool_or(status = 'running') THEN 'running' \
                      WHEN bool_or(status = 'pending') AND bool_or(status = 'completed') THEN 'running' \
@@ -283,7 +283,7 @@ pub async fn handler_outcomes(
                 array_agg(DISTINCT event_id::text) AS triggering_event_ids \
          FROM causal_effect_executions \
          WHERE correlation_id = $1 \
-         GROUP BY handler_id",
+         GROUP BY reactor_id",
     )
     .bind(correlation_id)
     .fetch_all(pool)
@@ -291,8 +291,8 @@ pub async fn handler_outcomes(
 
     Ok(rows
         .into_iter()
-        .map(|(handler_id, status, error, attempts, started_at, completed_at, triggering_event_ids)| HandlerOutcomeRow {
-            handler_id,
+        .map(|(reactor_id, status, error, attempts, started_at, completed_at, triggering_event_ids)| ReactorOutcomeRow {
+            reactor_id,
             status,
             error,
             attempts,
@@ -303,23 +303,23 @@ pub async fn handler_outcomes(
         .collect())
 }
 
-/// Handler description row from `causal_handler_descriptions`.
-pub struct HandlerDescriptionRow {
-    pub handler_id: String,
+/// Reactor description row from `causal_reactor_descriptions`.
+pub struct ReactorDescriptionRow {
+    pub reactor_id: String,
     pub description: serde_json::Value,
 }
 
-/// Fetch handler describe() blocks for a run.
-pub async fn handler_descriptions(
+/// Fetch reactor describe() blocks for a run.
+pub async fn reactor_descriptions(
     pool: &PgPool,
     run_id: &str,
-) -> anyhow::Result<Vec<HandlerDescriptionRow>> {
+) -> anyhow::Result<Vec<ReactorDescriptionRow>> {
     let correlation_id = Uuid::parse_str(run_id)
         .map_err(|e| anyhow::anyhow!("Invalid run_id as UUID: {e}"))?;
 
     let rows = sqlx::query_as::<_, (String, serde_json::Value)>(
-        "SELECT handler_id, description \
-         FROM causal_handler_descriptions \
+        "SELECT reactor_id, description \
+         FROM causal_reactor_descriptions \
          WHERE correlation_id = $1",
     )
     .bind(correlation_id)
@@ -328,8 +328,8 @@ pub async fn handler_descriptions(
 
     Ok(rows
         .into_iter()
-        .map(|(handler_id, description)| HandlerDescriptionRow {
-            handler_id,
+        .map(|(reactor_id, description)| ReactorDescriptionRow {
+            reactor_id,
             description,
         })
         .collect())

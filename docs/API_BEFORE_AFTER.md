@@ -5,7 +5,7 @@
 ### BEFORE (Orchestration)
 
 ```rust
-use causal::{handler, Context, Engine};
+use causal::{reactor, Context, Engine};
 use causal_postgres::PostgresBackend;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -34,10 +34,10 @@ struct Deps {
 }
 
 // ============================================================================
-// Handlers (async, side effects, return events)
+// Reactors (async, side effects, return events)
 // ============================================================================
 
-#[handler(on = OrderEvent, extract(order_id), id = "process_payment", retry = 3)]
+#[reactor(on = OrderEvent, extract(order_id), id = "process_payment", retry = 3)]
 async fn process_payment(
     order_id: Uuid,
     ctx: Context<Deps>
@@ -48,11 +48,11 @@ async fn process_payment(
     // SIDE EFFECT: Update database
     ctx.deps().db.mark_paid(order_id).await?;
 
-    // Return new event (triggers next handlers)
+    // Return new event (triggers next reactors)
     Ok(OrderEvent::PaymentProcessed { order_id })
 }
 
-#[handler(on = OrderEvent, extract(order_id), id = "ship_order", retry = 3)]
+#[reactor(on = OrderEvent, extract(order_id), id = "ship_order", retry = 3)]
 async fn ship_order(
     order_id: Uuid,
     ctx: Context<Deps>
@@ -64,7 +64,7 @@ async fn ship_order(
     Ok(OrderEvent::Shipped { order_id, tracking })
 }
 
-#[handler(on = OrderEvent, extract(order_id), id = "send_notification")]
+#[reactor(on = OrderEvent, extract(order_id), id = "send_notification")]
 async fn send_notification(
     order_id: Uuid,
     ctx: Context<Deps>
@@ -72,7 +72,7 @@ async fn send_notification(
     // SIDE EFFECT: Send email
     ctx.deps().email.send(order_id, "Order shipped!").await?;
 
-    // No new event (terminal handler)
+    // No new event (terminal reactor)
     Ok(())
 }
 
@@ -90,11 +90,11 @@ async fn main() -> Result<()> {
 
     let backend = PostgresBackend::new(pool);
 
-    // Engine automatically processes events through handlers
+    // Engine automatically processes events through reactors
     let engine = Engine::new(deps, backend)
-        .with_handler(process_payment())
-        .with_handler(ship_order())
-        .with_handler(send_notification());
+        .with_reactor(process_payment())
+        .with_reactor(ship_order())
+        .with_reactor(send_notification());
 
     // Dispatch event - engine handles the rest
     engine.dispatch(OrderEvent::Placed {
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
 ### AFTER (Event Sourcing)
 
 ```rust
-use causal::{handler, Aggregate, Context};
+use causal::{reactor, Aggregate, Context};
 use causal_postgres::PostgresEventStore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -163,14 +163,14 @@ enum OrderEvent {
 }
 
 // ============================================================================
-// Handlers (pure state transitions)
+// Reactors (pure state transitions)
 // ============================================================================
 
-#[handlers]
+#[reactors]
 mod order_projections {
     use super::*;
 
-    #[handler(on = OrderEvent, extract(order_id, total))]
+    #[reactor(on = OrderEvent, extract(order_id, total))]
     fn apply_placed(order_id: Uuid, total: f64, state: &mut Order) -> Result<()> {
         state.id = order_id;
         state.total = total;
@@ -178,20 +178,20 @@ mod order_projections {
         Ok(())
     }
 
-    #[handler(on = OrderEvent, extract(order_id))]
+    #[reactor(on = OrderEvent, extract(order_id))]
     fn apply_payment_processed(order_id: Uuid, state: &mut Order) -> Result<()> {
         state.status = OrderStatus::Paid;
         Ok(())
     }
 
-    #[handler(on = OrderEvent, extract(order_id, tracking))]
+    #[reactor(on = OrderEvent, extract(order_id, tracking))]
     fn apply_shipped(order_id: Uuid, tracking: String, state: &mut Order) -> Result<()> {
         state.status = OrderStatus::Shipped;
         state.tracking_number = Some(tracking);
         Ok(())
     }
 
-    #[handler(on = OrderEvent, extract(order_id))]
+    #[reactor(on = OrderEvent, extract(order_id))]
     fn apply_delivered(order_id: Uuid, state: &mut Order) -> Result<()> {
         state.status = OrderStatus::Delivered;
         Ok(())
@@ -221,7 +221,7 @@ impl ProcessPayment {
         // Load current state
         let order: Order = store
             .aggregate(self.order_id)
-            .with_handlers(order_projections::handlers())
+            .with_reactors(order_projections::reactors())
             .load()
             .await?;
 
@@ -252,7 +252,7 @@ impl ShipOrder {
     ) -> Result<Vec<OrderEvent>> {
         let order: Order = store
             .aggregate(self.order_id)
-            .with_handlers(order_projections::handlers())
+            .with_reactors(order_projections::reactors())
             .load()
             .await?;
 
@@ -308,7 +308,7 @@ async fn main() -> Result<()> {
     // 4. Load final state
     let order: Order = store
         .aggregate(order_id)
-        .with_handlers(order_projections::handlers())
+        .with_reactors(order_projections::reactors())
         .load()
         .await?;
 
@@ -326,9 +326,9 @@ async fn main() -> Result<()> {
 **Before:**
 ```rust
 // State is external (in databases, APIs)
-// Handlers don't build state, they trigger work
+// Reactors don't build state, they trigger work
 
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 async fn ship_order(...) -> Result<OrderEvent> {
     // No aggregate state to mutate
     // Just call APIs and return events
@@ -338,9 +338,9 @@ async fn ship_order(...) -> Result<OrderEvent> {
 **After:**
 ```rust
 // State is derived from events
-// Handlers build aggregate state
+// Reactors build aggregate state
 
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 fn apply_shipped(..., state: &mut Order) -> Result<()> {
     state.status = OrderStatus::Shipped;  // Pure state transition
     Ok(())
@@ -352,7 +352,7 @@ fn apply_shipped(..., state: &mut Order) -> Result<()> {
 **Before:**
 ```rust
 // Side effects mixed with event handling
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 async fn process_payment(ctx: Context<Deps>) -> Result<OrderEvent> {
     ctx.deps().payment_api.charge(...).await?;  // Side effect HERE
     Ok(OrderEvent::PaymentProcessed { ... })
@@ -371,8 +371,8 @@ impl ProcessPayment {
     }
 }
 
-// Handlers are pure
-#[handler(on = OrderEvent)]
+// Reactors are pure
+#[reactor(on = OrderEvent)]
 fn apply_payment_processed(state: &mut Order) -> Result<()> {
     state.status = OrderStatus::Paid;  // No side effects
     Ok(())
@@ -385,7 +385,7 @@ fn apply_payment_processed(state: &mut Order) -> Result<()> {
 ```rust
 // Automatic - engine processes events
 engine.dispatch(OrderEvent::Placed { ... }).await?;
-// Engine automatically calls all matching handlers
+// Engine automatically calls all matching reactors
 ```
 
 **After:**
@@ -408,7 +408,7 @@ let status = deps.db.get_order_status(order_id).await?;
 // Rebuild from events
 let order: Order = store
     .aggregate(order_id)
-    .with_handlers(order_projections::handlers())
+    .with_reactors(order_projections::reactors())
     .load()
     .await?;
 
@@ -424,7 +424,7 @@ async fn test_payment_processing() {
     let deps = MockDeps::new();
     let backend = MemoryBackend::new();
     let engine = Engine::new(deps.clone(), backend)
-        .with_handler(process_payment());
+        .with_reactor(process_payment());
 
     engine.dispatch(OrderEvent::Placed { ... }).await?;
 
@@ -456,18 +456,18 @@ async fn test_payment_processing() {
 
 ## What Stays the Same
 
-✅ `#[handler]` macro syntax
+✅ `#[reactor]` macro syntax
 ✅ Field extraction: `extract(order_id, total)`
 ✅ Type-safe event matching
-✅ Module registration: `#[handlers]`
+✅ Module registration: `#[reactors]`
 ✅ Context for dependencies
 ✅ Backend abstraction (Memory, PostgreSQL, Kafka)
 
 ## What Changes
 
-❌ Handlers are **pure** (no async, no side effects)
-❌ Handlers mutate **state** instead of returning events
-❌ **Commands** separate from handlers
+❌ Reactors are **pure** (no async, no side effects)
+❌ Reactors mutate **state** instead of returning events
+❌ **Commands** separate from reactors
 ❌ **Explicit** control flow (no automatic dispatch)
 ❌ State **derived** from events (event sourcing)
 
@@ -476,7 +476,7 @@ async fn test_payment_processing() {
 | Aspect | Orchestration | Event Sourcing |
 |--------|--------------|----------------|
 | **Purpose** | Coordinate distributed work | Store & rebuild state |
-| **Handlers** | Async, side effects | Pure, state transitions |
+| **Reactors** | Async, side effects | Pure, state transitions |
 | **Events** | Trigger work | Store state changes |
 | **Control** | Automatic dispatch | Explicit commands |
 | **State** | External (DBs, APIs) | Derived from events |

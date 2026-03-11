@@ -4,7 +4,7 @@
 
 ## Executive Summary
 
-**OLD Architecture:** Throughput limited by slowest handler (1 event per handler duration)
+**OLD Architecture:** Throughput limited by slowest reactor (1 event per reactor duration)
 **NEW Architecture:** Throughput limited by database write speed + queue backend
 
 **Key Metrics:**
@@ -12,7 +12,7 @@
 - PostgresQueue: ~1,000 events/sec
 - RedisQueue: ~10,000 events/sec
 - KafkaQueue: ~100,000+ events/sec
-- Handler execution: Unlimited duration, scales horizontally
+- Reactor execution: Unlimited duration, scales horizontally
 
 ---
 
@@ -22,26 +22,26 @@
 
 **Formula:** `Throughput = 1 / (dispatch_time + slowest_inline_handler_time)`
 
-**Example 1: Fast handlers**
+**Example 1: Fast reactors**
 ```
-Slowest handler: 100ms
+Slowest reactor: 100ms
 Throughput: 1 / 0.1s = 10 events/sec per worker
 
 With 10 workers: ~100 events/sec max
 ```
 
-**Example 2: Slow handlers (typical)**
+**Example 2: Slow reactors (typical)**
 ```
-Slowest handler: 2 seconds (external API call)
+Slowest reactor: 2 seconds (external API call)
 Throughput: 1 / 2s = 0.5 events/sec per worker
 
 With 10 workers: ~5 events/sec max
 With 100 workers: ~50 events/sec max (but hitting DB connection limits!)
 ```
 
-**Example 3: Very slow handlers (realistic)**
+**Example 3: Very slow reactors (realistic)**
 ```
-Slowest handler: 60 seconds (AI processing)
+Slowest reactor: 60 seconds (AI processing)
 Throughput: 1 / 60s = 0.016 events/sec per worker
 
 With 10 workers: ~0.16 events/sec = 576 events/hour
@@ -52,7 +52,7 @@ Problem: 100 workers × 60s = holding 100 DB connections for 1 minute each!
 
 ### The Blocking Problem
 
-**Scenario:** Processing 1,000 OrderPlaced events with one slow handler (2 seconds)
+**Scenario:** Processing 1,000 OrderPlaced events with one slow reactor (2 seconds)
 
 ```
 Worker 1: Event #1   [TX held for 2s] → Done
@@ -74,7 +74,7 @@ With 100 workers:
 ```
 Postgres connection pool: 100 connections (typical)
 Workers: 100
-Handler duration: 2 seconds
+Reactor duration: 2 seconds
 
 Scenario:
   T=0s:   100 events arrive
@@ -86,7 +86,7 @@ Scenario:
 
 ### Scalability Limits (Current)
 
-| Workers | Handler Duration | Max Throughput | DB Connections | Feasible? |
+| Workers | Reactor Duration | Max Throughput | DB Connections | Feasible? |
 |---------|-----------------|----------------|----------------|-----------|
 | 10 | 100ms | 100 events/sec | 10 | ✅ Yes |
 | 10 | 2s | 5 events/sec | 10 | ⚠️ Slow |
@@ -106,7 +106,7 @@ Scenario:
 
 **Components:**
 1. Event insert: ~3ms
-2. Handler intent inserts (N handlers): ~2ms per handler
+2. Reactor intent inserts (N reactors): ~2ms per reactor
 3. Queue notification: ~1ms (Postgres) / ~0.1ms (Redis) / ~0.01ms (Kafka)
 4. Transaction commit: ~2ms
 
@@ -117,7 +117,7 @@ RedisQueue:     3 + (2 × N) + 0.1 + 2 = 5.1 + 2N ms
 KafkaQueue:     3 + (2 × N) + 0.01 + 2 = 5.01 + 2N ms
 ```
 
-**Example with 5 handlers:**
+**Example with 5 reactors:**
 ```
 PostgresQueue:  6 + 10 = 16ms per event → ~62 events/sec per dispatcher
 RedisQueue:     5.1 + 10 = 15.1ms per event → ~66 events/sec per dispatcher
@@ -131,30 +131,30 @@ RedisQueue:     ~660 events/sec
 KafkaQueue:     ~660 events/sec
 ```
 
-### Handler Execution Throughput (Independent!)
+### Reactor Execution Throughput (Independent!)
 
-**Handler execution is now SEPARATE from dispatch:**
+**Reactor execution is now SEPARATE from dispatch:**
 
 ```
 Dispatch workers (10):  Handle event persistence
   ↓
 Queue (PostgresQueue/Redis/Kafka): Distribute intents
   ↓
-Handler workers (100+): Execute handlers asynchronously
+Reactor workers (100+): Execute reactors asynchronously
 ```
 
-**Handler throughput = Number of handler workers × (1 / handler_duration)**
+**Reactor throughput = Number of reactor workers × (1 / handler_duration)**
 
-**Example: 2-second handler, 100 handler workers**
+**Example: 2-second reactor, 100 reactor workers**
 ```
-Throughput: 100 workers × (1 / 2s) = 50 handlers/sec
+Throughput: 100 workers × (1 / 2s) = 50 reactors/sec
 ```
 
-**Key insight:** Can scale handler workers independently of dispatch workers!
+**Key insight:** Can scale reactor workers independently of dispatch workers!
 
 ### Scalability Comparison
 
-**Scenario:** 1,000 events/sec, handler takes 2 seconds
+**Scenario:** 1,000 events/sec, reactor takes 2 seconds
 
 **OLD Architecture:**
 ```
@@ -173,18 +173,18 @@ Dispatch:
   Need: 1,000 events/sec ÷ 62 events/sec per dispatcher = 17 dispatchers
   DB connections: 17 (one per dispatcher)
 
-Handlers:
+Reactors:
   Need: 1,000 events/sec × 2s = 2,000 worker-seconds
   Workers needed: 2,000
   DB connections: 0 during execution! (only during result persistence)
 
-Total DB connections: 17 dispatchers + ~100 for handler results = ~120
+Total DB connections: 17 dispatchers + ~100 for reactor results = ~120
 ```
 
 **Result:**
 - ✅ Feasible with standard DB connection pool (100-200 connections)
 - ✅ Dispatch workers handle persistence (fast, < 10ms)
-- ✅ Handler workers scale independently (no DB connection during execution)
+- ✅ Reactor workers scale independently (no DB connection during execution)
 
 ---
 
@@ -277,7 +277,7 @@ Bottleneck: Postgres event writes (~620/sec per dispatcher)
 **With Option 3 (full Kafka):**
 ```
 Events stored in Kafka topics
-Handler intents tracked in Kafka
+Reactor intents tracked in Kafka
 State snapshots in Postgres (optional)
 
 Throughput: ~100,000+ events/sec
@@ -339,7 +339,7 @@ N INSERT into causal_handler_intents: ~2ms each
 
 Total: 3 + 2N ms per event
 
-With 5 handlers:
+With 5 reactors:
   3 + 10 = 13ms per event
   = ~77 events/sec per dispatcher
 ```
@@ -388,7 +388,7 @@ Postgres only for intent claims and state
 Result: ~100k+ events/sec
 ```
 
-### Bottleneck 2: Handler Intent Claims
+### Bottleneck 2: Reactor Intent Claims
 
 **Current limitation:**
 ```sql
@@ -444,7 +444,7 @@ Mitigation: Batch notifications
   Instead of 1 NOTIFY per intent
   Group into: NOTIFY per event (multiple intents)
 
-Result: ~5,000 intents/sec (5 handlers per event × 1k events/sec)
+Result: ~5,000 intents/sec (5 reactors per event × 1k events/sec)
 ```
 
 **RedisQueue:**
@@ -469,12 +469,12 @@ Not a bottleneck
 
 **Setup:**
 - 1,000 OrderPlaced events/sec
-- 5 handlers per event (3 fast, 2 slow)
-- Handler durations: 10ms, 50ms, 100ms, 2s, 5s
+- 5 reactors per event (3 fast, 2 slow)
+- Reactor durations: 10ms, 50ms, 100ms, 2s, 5s
 
 **OLD Architecture:**
 ```
-Slowest handler: 5s
+Slowest reactor: 5s
 Throughput: 1 / 5s = 0.2 events/sec per worker
 
 Workers needed: 1,000 / 0.2 = 5,000 workers
@@ -489,19 +489,19 @@ Dispatch:
   1,000 events/sec ÷ 62 events/sec per dispatcher = 17 dispatchers
   DB connections: 17
 
-Handlers:
-  Fast handlers (10ms): 1,000 events/sec × 3 handlers = 3,000 executions/sec
+Reactors:
+  Fast reactors (10ms): 1,000 events/sec × 3 reactors = 3,000 executions/sec
     Workers needed: 3,000 × 0.01s = 30 workers
 
-  Fast handlers (50ms): 1,000 × 0.05s = 50 workers
+  Fast reactors (50ms): 1,000 × 0.05s = 50 workers
 
-  Medium handlers (100ms): 1,000 × 0.1s = 100 workers
+  Medium reactors (100ms): 1,000 × 0.1s = 100 workers
 
-  Slow handlers (2s): 1,000 × 2s = 2,000 workers
+  Slow reactors (2s): 1,000 × 2s = 2,000 workers
 
-  Very slow handlers (5s): 1,000 × 5s = 5,000 workers
+  Very slow reactors (5s): 1,000 × 5s = 5,000 workers
 
-Total handler workers: 30 + 50 + 100 + 2,000 + 5,000 = 7,180 workers
+Total reactor workers: 30 + 50 + 100 + 2,000 + 5,000 = 7,180 workers
 DB connections during execution: 0
 DB connections for results: ~100 (burst)
 
@@ -538,7 +538,7 @@ Dispatch:
   10,000 events/sec ÷ 62 events/sec = 162 dispatchers
   DB connections: 162
 
-Handlers:
+Reactors:
   7,180 workers × 10 = 71,800 workers needed
   DB connections: 162 + 1,000 = ~1,200
 
@@ -552,7 +552,7 @@ Dispatch:
   Events written to Kafka: ~100,000 events/sec capacity
   Actual: 10,000 events/sec
 
-Handlers:
+Reactors:
   71,800 workers
   DB connections: ~100 (only for state snapshots)
 
@@ -578,7 +578,7 @@ Dispatch:
 
 Can spin up dispatchers quickly (just DB writers)
 
-Handlers:
+Reactors:
   Queue absorbs burst
   Workers process at steady rate
   Backlog clears over time
@@ -601,13 +601,13 @@ Result: ✅ Graceful degradation
 Limited by database write throughput
 ```
 
-**Handler Workers:**
+**Reactor Workers:**
 ```
 Unlimited scaling (no shared resources during execution)
 
-100 handler workers
-1,000 handler workers
-10,000 handler workers
+100 reactor workers
+1,000 reactor workers
+10,000 reactor workers
 
 Only limited by:
   - Queue throughput
@@ -677,9 +677,9 @@ $ causal-worker --event-types EmailSent --workers 1000
 | **NEW (RedisQueue)** | 5-15ms | ~66 events/sec | ~660 events/sec |
 | **NEW (KafkaQueue)** | 5-15ms | ~66 events/sec | ~660 events/sec |
 
-### Handler Performance
+### Reactor Performance
 
-| Architecture | Handler Duration Limit | Horizontal Scaling | DB Connections |
+| Architecture | Reactor Duration Limit | Horizontal Scaling | DB Connections |
 |--------------|------------------------|-------------------|----------------|
 | **OLD (inline)** | <100ms (soft), <1s (hard) | ❌ Limited by DB connections | N workers |
 | **NEW (async)** | Unlimited | ✅ Yes | 0 during execution |
@@ -698,7 +698,7 @@ $ causal-worker --event-types EmailSent --workers 1000
 | Load | OLD Architecture | NEW (Postgres) | NEW (Redis) | NEW (Kafka) |
 |------|-----------------|----------------|-------------|-------------|
 | **100 events/sec** | ✅ Works | ✅ Works | ✅ Works | ✅ Works |
-| **1k events/sec** | ⚠️ Slow handlers fail | ✅ Works | ✅ Works | ✅ Works |
+| **1k events/sec** | ⚠️ Slow reactors fail | ✅ Works | ✅ Works | ✅ Works |
 | **10k events/sec** | ❌ Impossible | ❌ Queue bottleneck | ✅ Works | ✅ Works |
 | **100k events/sec** | ❌ Impossible | ❌ Impossible | ⚠️ DB pressure | ✅ Works |
 | **1M events/sec** | ❌ Impossible | ❌ Impossible | ❌ Impossible | ⚠️ Possible with tuning |
@@ -712,7 +712,7 @@ $ causal-worker --event-types EmailSent --workers 1000
 **Use:**
 - PostgresQueue (simplest, built-in)
 - 5-10 dispatcher workers
-- 50-100 handler workers
+- 50-100 reactor workers
 
 **Expected performance:**
 - Dispatch: <10ms (p99)
@@ -724,7 +724,7 @@ $ causal-worker --event-types EmailSent --workers 1000
 **Use:**
 - RedisQueue
 - 10-20 dispatcher workers
-- 500-1,000 handler workers
+- 500-1,000 reactor workers
 
 **Expected performance:**
 - Dispatch: <10ms (p99)
@@ -737,18 +737,18 @@ $ causal-worker --event-types EmailSent --workers 1000
 - KafkaQueue
 - Consider Kafka as event store (not just queue)
 - 50-100 dispatcher workers
-- 1,000-10,000 handler workers
+- 1,000-10,000 reactor workers
 
 **Expected performance:**
 - Dispatch: <5ms (p99)
 - Throughput: 50,000-100,000+ events/sec
 - Cost: Postgres + Kafka cluster
 
-### For Slow Handlers (>10s duration)
+### For Slow Reactors (>10s duration)
 
 **Regardless of scale, use:**
 - Separate streams per event type ✅
-- Scale handler workers independently
+- Scale reactor workers independently
 - Monitor queue depth per event type
 - Consider batching results
 
@@ -761,7 +761,7 @@ $ causal-worker --event-types EmailSent --workers 1000
 | Metric | OLD | NEW (Postgres) | NEW (Redis) | NEW (Kafka) |
 |--------|-----|----------------|-------------|-------------|
 | **Max throughput** | ~100 events/sec | ~1k events/sec | ~10k events/sec | ~100k+ events/sec |
-| **Handler duration** | <100ms | Unlimited | Unlimited | Unlimited |
+| **Reactor duration** | <100ms | Unlimited | Unlimited | Unlimited |
 | **Horizontal scaling** | ❌ No | ⚠️ Limited | ✅ Yes | ✅ Yes |
 | **DB connections** | N workers | <200 | <200 | <200 |
 | **Cost scaling** | Linear (workers) | Sub-linear | Sub-linear | Sub-linear |

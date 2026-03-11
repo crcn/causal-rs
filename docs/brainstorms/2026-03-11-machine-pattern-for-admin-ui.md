@@ -46,9 +46,9 @@ type AdminEvent =
   | { type: "events/page_loaded"; payload: { events: AdminEventData[]; hasMore: boolean } }
   | { type: "events/causal_tree_loaded"; payload: CausalTreeData }
   | { type: "events/flow_loaded"; payload: FlowData }
-  | { type: "events/logs_loaded"; payload: HandlerLog[] }
-  | { type: "events/handler_descriptions_loaded"; payload: HandlerDescription[] }
-  | { type: "events/handler_outcomes_loaded"; payload: HandlerOutcome[] }
+  | { type: "events/logs_loaded"; payload: ReactorLog[] }
+  | { type: "events/handler_descriptions_loaded"; payload: ReactorDescription[] }
+  | { type: "events/handler_outcomes_loaded"; payload: ReactorOutcome[] }
   // UI
   | { type: "ui/event_selected"; payload: { seq: number } }
   | { type: "ui/flow_opened"; payload: { runId: string } }
@@ -78,11 +78,11 @@ type AdminState = {
   treeSource: "dedicated" | "flow";
 
   filters: FilterState;
-  logs: HandlerLog[];
+  logs: ReactorLog[];
   logsFilter: LogsFilter;
 
-  descriptions: Map<string, HandlerDescription[]>;
-  outcomes: Map<string, HandlerOutcome[]>;
+  descriptions: Map<string, ReactorDescription[]>;
+  outcomes: Map<string, ReactorOutcome[]>;
 
   subscription: "connected" | "disconnected" | "error";
 };
@@ -204,12 +204,12 @@ export const createAdminEngine = (config: CausalAdminConfig) =>
 
 ## The Philosophical Mirror
 
-The frontend architecture mirrors causal's own Event → Handler → Event loop:
+The frontend architecture mirrors causal's own Event → Reactor → Event loop:
 
 | Causal (backend) | Machine (frontend) |
 |---|---|
 | Events | Events (discriminated unions) |
-| Handlers | Engines (side effect processors) |
+| Reactors | Engines (side effect processors) |
 | Aggregates | Store (state folded from events) |
 | Projections | Selectors (derived views) |
 | Settlement | Engine composition (chained reactions) |

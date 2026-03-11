@@ -3,9 +3,9 @@ import type {
   AdminEvent,
   FilterState,
   FlowSelection,
-  HandlerDescription,
-  HandlerLog,
-  HandlerOutcome,
+  ReactorDescription,
+  ReactorLog,
+  ReactorOutcome,
   LogsFilter,
 } from "./types";
 
@@ -26,14 +26,14 @@ type CausalTreeLoaded = BaseEvent<
   { events: AdminEvent[]; rootSeq: number }
 >;
 type FlowLoaded = BaseEvent<"events/flow_loaded", AdminEvent[]>;
-type LogsLoaded = BaseEvent<"events/logs_loaded", HandlerLog[]>;
+type LogsLoaded = BaseEvent<"events/logs_loaded", ReactorLog[]>;
 type DescriptionsLoaded = BaseEvent<
   "events/descriptions_loaded",
-  { runId: string; descriptions: HandlerDescription[] }
+  { runId: string; descriptions: ReactorDescription[] }
 >;
 type OutcomesLoaded = BaseEvent<
   "events/outcomes_loaded",
-  { runId: string; outcomes: HandlerOutcome[] }
+  { runId: string; outcomes: ReactorOutcome[] }
 >;
 
 // ── UI events ──

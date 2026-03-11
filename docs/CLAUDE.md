@@ -1,15 +1,15 @@
 # Causal Architecture Guidelines
 
-**Mental Model**: Events are signals. Handlers react and return new events. That's it.
+**Mental Model**: Events are signals. Reactors react and return new events. That's it.
 
 ## Quick Start - v0.9.0 API
 
-### Simple Pattern - Handlers Only
+### Simple Pattern - Reactors Only
 
 ```rust
 // Define engine once with dependencies and store
 let engine = Engine::new(deps, store)
-    .with_handler(handler::on::<OrderPlaced>().then(|event, ctx| async move {
+    .with_reactor(reactor::on::<OrderPlaced>().then(|event, ctx| async move {
         ctx.deps().mailer.send_confirmation(&event).await?;
         Ok(EmailSent { order_id: event.id })  // Return event to dispatch
     }));
@@ -23,7 +23,7 @@ engine.dispatch(OrderPlaced { id: 123, total: 99.99 }).await?;
 ```rust
 // Engine is stateless - define once, use many times
 let engine = Engine::new(deps, store)
-    .with_handler(handler::on::<OrderPlaced>().then(|event, ctx| async move {
+    .with_reactor(reactor::on::<OrderPlaced>().then(|event, ctx| async move {
         ctx.deps().ship(event.order_id).await?;
         Ok(OrderShipped { order_id: event.order_id })
     }));
@@ -39,22 +39,22 @@ engine.dispatch(process_webhook(payload)).await?;
 
 ### Key Differences from v0.6
 
-- **Handlers return events**: Use `.then()` and return `Ok(Event)` instead of `ctx.emit()`
-- **`engine.dispatch()` for dispatch**: Async method that dispatches event and waits for handlers
-- **`ctx.emit()` removed from public API**: Handlers and edge functions return events
+- **Reactors return events**: Use `.then()` and return `Ok(Event)` instead of `ctx.emit()`
+- **`engine.dispatch()` for dispatch**: Async method that dispatches event and waits for reactors
+- **`ctx.emit()` removed from public API**: Reactors and edge functions return events
 - **Observer pattern**: Return `Ok(())` to dispatch nothing
 - **Reducers removed**: No more `.with_reducer()`, state lives in events or dependencies
 
 ### What's New in v0.10
 
-- **Renamed `effect` → `handler`**: Clearer terminology, no confusion with React/FP effects
+- **Renamed `effect` → `reactor`**: Clearer terminology, no confusion with React/FP effects
 - **Renamed methods**: `.process()` → `.dispatch()`, `.id()` → `.name()`, `.delayed()` → `.delay()`, `.queued()` → `.background()`, `.join()` → `.accumulate()`
-- **`Emit<E>` type**: Handlers return `Emit::One(e)`, `Emit::Batch(vec![...])`, or `Emit::None`
+- **`Emit<E>` type**: Reactors return `Emit::One(e)`, `Emit::Batch(vec![...])`, or `Emit::None`
 - **Event batching**: Emit multiple events atomically with `Ok(Emit::Batch(events))`
 - **Accumulate pattern**: Accumulate batched events with `.accumulate()` for bulk operations
 - **Batch metadata**: Events track `batch_id`, `batch_index`, `batch_size`
 - **Backward compatible**: `Ok(event)` and `Ok(Some(event))` auto-convert to `Emit`
-- **Reducers removed**: Handlers-only architecture, state lives in events or dependencies
+- **Reducers removed**: Reactors-only architecture, state lives in events or dependencies
 - **Simplified HandlerContext**: Only `deps()` method, removed state accessors
 
 ---
@@ -63,10 +63,10 @@ engine.dispatch(process_webhook(payload)).await?;
 
 Causal is an **event-driven runtime** for building reactive systems.
 
-**Core flow**: Event → Handler → Event
+**Core flow**: Event → Reactor → Event
 
 - **Events** are signals (facts that already happened)
-- **Handlers** react to events, perform IO, return new events
+- **Reactors** react to events, perform IO, return new events
 - **State** lives in events or shared dependencies
 
 Simple, direct, no ceremony.
@@ -103,13 +103,13 @@ Events may come from:
 
 Events are the only signals in the system.
 
-### Handler
+### Reactor
 
-Handlers react to events and return new events.
+Reactors react to events and return new events.
 
 ```rust
-// Simple handler - reacts to one event type, returns new event
-let scrape_handler = handler::on::<SourceRequested>().then(|event, ctx| async move {
+// Simple reactor - reacts to one event type, returns new event
+let scrape_handler = reactor::on::<SourceRequested>().then(|event, ctx| async move {
     let data = ctx.deps().scraper.scrape(event.source_id).await?;
     Ok(SourceScraped {
         source_id: event.source_id,
@@ -117,8 +117,8 @@ let scrape_handler = handler::on::<SourceRequested>().then(|event, ctx| async mo
     })
 });
 
-// Handler with extract - extract data and return event
-let priority_handler = handler::on::<OrderPlaced>()
+// Reactor with extract - extract data and return event
+let priority_handler = reactor::on::<OrderPlaced>()
     .extract(|event| {
         if event.priority > 5 { Some(event.clone()) } else { None }
     })
@@ -127,22 +127,22 @@ let priority_handler = handler::on::<OrderPlaced>()
         Ok(UrgentNotified { order_id: event.id })
     });
 
-// Handler with state transition
-let status_handler = handler::on::<StatusChanged>()
+// Reactor with state transition
+let status_handler = reactor::on::<StatusChanged>()
     .transition(|prev, next| prev.status != next.status)
     .then(|event, ctx| async move {
         ctx.deps().notify_status_change(&event).await?;
         Ok(StatusNotified { id: event.id })
     });
 
-// Observer handler - returns () to dispatch nothing
-let logger_handler = handler::on::<OrderPlaced>().then(|event, ctx| async move {
+// Observer reactor - returns () to dispatch nothing
+let logger_handler = reactor::on::<OrderPlaced>().then(|event, ctx| async move {
     ctx.deps().logger.log(&event);
     Ok(())  // No event dispatched
 });
 
 // Observe ALL events (for logging, metrics, debugging)
-let observer_handler = handler::on_any().then(|event, ctx| async move {
+let observer_handler = reactor::on_any().then(|event, ctx| async move {
     ctx.deps().logger.log(event.type_id);
     if let Some(order) = event.downcast::<OrderPlaced>() {
         ctx.deps().analytics.track("order_placed", order);
@@ -159,7 +159,7 @@ When handling enum events with multiple variants, the `on!` macro provides conci
 use causal::on;
 
 // Match-like syntax with Event::Variant patterns
-let handlers = on! {
+let reactors = on! {
     // Multiple variants with | - same fields required
     CrawlEvent::WebsiteIngested { website_id, job_id, .. } |
     CrawlEvent::WebsitePostsRegenerated { website_id, job_id, .. } => |ctx| async move {
@@ -177,17 +177,17 @@ let handlers = on! {
     },
 };
 
-// Returns Vec<Handler<D>> - add to engine
-let engine = handlers.into_iter().fold(Engine::new(deps, store), |e, h| e.with_handler(h));
+// Returns Vec<Reactor<D>> - add to engine
+let engine = reactors.into_iter().fold(Engine::new(deps, store), |e, h| e.with_reactor(h));
 ```
 
-#### Handler Execution Configuration (v0.8.0+)
+#### Reactor Execution Configuration (v0.8.0+)
 
-Handlers can be configured for retry, timeout, delay, priority, and background execution:
+Reactors can be configured for retry, timeout, delay, priority, and background execution:
 
 ```rust
-// Background handler with retry and timeout
-handler::on::<PaymentRequested>()
+// Background reactor with retry and timeout
+reactor::on::<PaymentRequested>()
     .name("charge_payment")          // Custom name for tracing/debugging
     .retry(5)                        // Retry up to 5 times on failure
     .timeout(Duration::from_secs(30))  // 30 second timeout
@@ -198,7 +198,7 @@ handler::on::<PaymentRequested>()
     });
 
 // Delayed execution
-handler::on::<OrderPlaced>()
+reactor::on::<OrderPlaced>()
     .delay(Duration::from_secs(3600))  // Run 1 hour later
     .then(|event, ctx| async move {
         ctx.deps().send_followup_email(&event).await?;
@@ -206,7 +206,7 @@ handler::on::<OrderPlaced>()
     });
 
 // Force background execution (even without retry/delay/timeout)
-handler::on::<AnalyticsEvent>()
+reactor::on::<AnalyticsEvent>()
     .background()                    // Execute in background worker
     .then(|event, ctx| async move {
         ctx.deps().analytics.track(&event).await?;
@@ -214,7 +214,7 @@ handler::on::<AnalyticsEvent>()
     });
 
 // Chaining works in any order
-handler::on::<OrderPlaced>()
+reactor::on::<OrderPlaced>()
     .filter(|e| e.total > 100.0)     // Filter first
     .retry(3)                        // Then config
     .name("large_orders")
@@ -236,9 +236,9 @@ handler::on::<OrderPlaced>()
 - `.priority(i32)` - Priority (lower = higher priority)
 - `.background()` - Force background execution
 
-Each arm generates a handler equivalent to:
+Each arm generates a reactor equivalent to:
 ```rust
-handler::on::<CrawlEvent>()
+reactor::on::<CrawlEvent>()
     .extract(|e| match e {
         CrawlEvent::WebsiteIngested { website_id, job_id, .. } => Some((website_id.clone(), job_id.clone())),
         _ => None,
@@ -246,7 +246,7 @@ handler::on::<CrawlEvent>()
     .then(|(website_id, job_id), ctx| async move { ... })
 ```
 
-Handlers can:
+Reactors can:
 - Do IO (DB queries, API calls, etc.)
 - Make decisions
 - Branch on conditions
@@ -258,14 +258,14 @@ Handlers can:
 
 HandlerContext provides:
 - `deps()` — shared dependencies
-- `handler_id()` — handler identifier for tracing
+- `reactor_id()` — reactor identifier for tracing
 - `idempotency_key()` — deterministic key for external APIs
 - `correlation_id` — groups related events in workflow
 - `event_id` — current event's unique identifier
 
 ### Event Batching
 
-**v0.9+** Handlers can emit multiple events atomically using `Emit<E>`:
+**v0.9+** Reactors can emit multiple events atomically using `Emit<E>`:
 
 ```rust
 pub enum Emit<E> {
@@ -281,7 +281,7 @@ Use `Emit::Batch` when processing collections that need to emit one event per it
 
 ```rust
 // Parse CSV and emit batch of row events
-handler::on::<FileUploaded>().then(|event, ctx| async move {
+reactor::on::<FileUploaded>().then(|event, ctx| async move {
     let rows = ctx.deps().parse_csv(&event.path).await?;
 
     // Emit all row events atomically with same batch_id
@@ -305,7 +305,7 @@ handler::on::<FileUploaded>().then(|event, ctx| async move {
 Ok(event)                     // → Emit::One(event) when always returning events
 Ok(vec![e1, e2])             // → Emit::Batch([e1, e2]) when always returning vecs
 
-// Use explicit Emit when mixing return types in same handler:
+// Use explicit Emit when mixing return types in same reactor:
 Ok(Emit::One(event))         // Single event
 Ok(Emit::Batch(vec![...]))   // Multiple events atomically
 Ok(Emit::None)               // Observer pattern, no event
@@ -319,10 +319,10 @@ Use `.accumulate()` to accumulate events from the same batch before processing:
 
 ```rust
 // Accumulate all RowParsed events from same batch
-handler::on::<RowParsed>()
+reactor::on::<RowParsed>()
     .accumulate()  // Enable batch accumulation
     .then(|batch: Vec<RowParsed>, ctx| async move {
-        // Handler receives Vec<Event> instead of single Event
+        // Reactor receives Vec<Event> instead of single Event
 
         // Bulk insert all rows at once
         ctx.deps().db.bulk_insert(&batch).await?;
@@ -333,16 +333,16 @@ handler::on::<RowParsed>()
 
 **How accumulate works:**
 1. Events with same `batch_id` are accumulated in `causal_join_entries` table
-2. Per-event handler is skipped (no-op)
-3. When all events in batch arrive (based on `batch_size`), accumulate handler fires
-4. Accumulate handler receives `Vec<Event>` with all accumulated events
+2. Per-event reactor is skipped (no-op)
+3. When all events in batch arrive (based on `batch_size`), accumulate reactor fires
+4. Accumulate reactor receives `Vec<Event>` with all accumulated events
 5. Window marked complete in `causal_join_windows` table
 
 **Accumulate properties:**
 - **Durable**: Accumulate state persisted in database, survives restarts
 - **Deterministic**: Window closes when `batch_size` events received
 - **Ordered**: Events in `Vec` maintain `batch_index` order
-- **Always background**: Accumulate handlers execute in background workers
+- **Always background**: Accumulate reactors execute in background workers
 
 #### Batch Flow Example
 
@@ -357,8 +357,8 @@ enum ImportEvent {
     BatchInserted { count: usize },
 }
 
-// Handler 1: Parse file, emit batch
-handler::on::<ImportEvent>()
+// Reactor 1: Parse file, emit batch
+reactor::on::<ImportEvent>()
     .extract(|e| match e {
         ImportEvent::FileUploaded { path } => Some(path.clone()),
         _ => None,
@@ -371,8 +371,8 @@ handler::on::<ImportEvent>()
         Ok(Emit::Batch(events))  // 1000 events with same batch_id
     })
 
-// Handler 2: Validate each row (runs 1000 times)
-handler::on::<ImportEvent>()
+// Reactor 2: Validate each row (runs 1000 times)
+reactor::on::<ImportEvent>()
     .extract(|e| match e {
         ImportEvent::RowParsed { row } => Some(row.clone()),
         _ => None,
@@ -382,8 +382,8 @@ handler::on::<ImportEvent>()
         Ok(Emit::One(ImportEvent::RowValidated { row }))
     })
 
-// Handler 3: Accumulate validated rows, bulk insert (runs once per batch)
-handler::on::<ImportEvent>()
+// Reactor 3: Accumulate validated rows, bulk insert (runs once per batch)
+reactor::on::<ImportEvent>()
     .extract(|e| match e {
         ImportEvent::RowValidated { row } => Some(row.clone()),
         _ => None,
@@ -399,12 +399,12 @@ handler::on::<ImportEvent>()
 **Execution trace:**
 ```
 1. FileUploaded dispatched
-2. Parse handler runs → Emit::Batch([Row1, Row2, ..., Row1000])
+2. Parse reactor runs → Emit::Batch([Row1, Row2, ..., Row1000])
 3. All 1000 RowParsed events inserted (same batch_id, sequential batch_index)
-4. Validate handler runs 1000 times (once per RowParsed)
+4. Validate reactor runs 1000 times (once per RowParsed)
 5. Each validation emits RowValidated (new batch_id per event)
-6. Accumulate handler accumulates all RowValidated in causal_join_entries
-7. When all events arrived, accumulate handler fires with Vec[Row1...Row1000]
+6. Accumulate reactor accumulates all RowValidated in causal_join_entries
+7. When all events arrived, accumulate reactor fires with Vec[Row1...Row1000]
 8. Bulk insert runs once
 ```
 
@@ -412,7 +412,7 @@ handler::on::<ImportEvent>()
 
 **Pattern 1: Per-item error events** (recommended)
 ```rust
-handler::on::<RowParsed>().then(|event, ctx| async move {
+reactor::on::<RowParsed>().then(|event, ctx| async move {
     match ctx.deps().validate_row(&event.row).await {
         Ok(_) => Ok(Emit::One(RowValidated { row: event.row })),
         Err(e) => Ok(Emit::One(RowRejected { row: event.row, reason: e.to_string() })),
@@ -422,7 +422,7 @@ handler::on::<RowParsed>().then(|event, ctx| async move {
 
 **Pattern 2: Collect successes and failures**
 ```rust
-handler::on::<RowParsed>()
+reactor::on::<RowParsed>()
     .accumulate()
     .then(|batch, ctx| async move {
         let mut results = Vec::new();
@@ -438,7 +438,7 @@ handler::on::<RowParsed>()
 
 **Pattern 3: Retry entire batch** (for idempotent operations)
 ```rust
-handler::on::<RowValidated>()
+reactor::on::<RowValidated>()
     .accumulate()
     .retry(3)  // Retry whole batch on failure
     .then(|batch, ctx| async move {
@@ -500,7 +500,7 @@ See `examples/batch-processor/` for full working example demonstrating:
 
 ### State Management Without Reducers
 
-Causal uses **handlers-only** architecture. State is managed through four patterns:
+Causal uses **reactors-only** architecture. State is managed through four patterns:
 
 #### Pattern 1: Event-Threaded State (Pure, Auditable) - ✅ Distributed-Safe
 State flows as event fields. Each event carries accumulated state forward.
@@ -519,7 +519,7 @@ enum OrderEvent {
     },
 }
 
-handler::on::<OrderEvent>()
+reactor::on::<OrderEvent>()
     .extract(|e| match e {
         OrderEvent::Processing { order_id, items_processed, items_remaining } =>
             Some((*order_id, *items_processed, items_remaining.clone())),
@@ -554,7 +554,7 @@ struct Deps {
     redis: RedisClient,   // ✅ Shared across workers
 }
 
-handler::on::<OrderEvent>()
+reactor::on::<OrderEvent>()
     .then(|event, ctx| async move {
         // State lives in database - all workers see same data
         sqlx::query("UPDATE orders SET status = 'shipped' WHERE id = $1")
@@ -575,7 +575,7 @@ State is implicit in "which events have fired".
 //          OrderShipped → state "shipped"
 //          OrderDelivered → state "delivered"
 
-handler::on::<OrderPlaced>().then(|event, ctx| async move {
+reactor::on::<OrderPlaced>().then(|event, ctx| async move {
     ctx.deps().ship(event.order_id).await?;
     Ok(OrderShipped { order_id: event.order_id })
 })
@@ -594,7 +594,7 @@ struct Deps {
     order_status: Arc<Mutex<HashMap<Uuid, OrderStatus>>>,
 }
 
-handler::on::<OrderEvent>()
+reactor::on::<OrderEvent>()
     .then(|event, ctx| async move {
         let mut status = ctx.deps().order_status.lock().unwrap();
         status.insert(event.order_id, OrderStatus::Shipped);
@@ -636,7 +636,7 @@ Workers have diverged! They'll never see each other's updates. ☠️
 
 ### Reducer (Removed in v0.9)
 
-**Reducers have been removed** from Causal. State is now managed by handlers through:
+**Reducers have been removed** from Causal. State is now managed by reactors through:
 - Event-threaded state (state flows through event fields)
 - Shared dependency state (Arc<Mutex<T>> in deps)
 - Implicit state (event sequences represent state)
@@ -648,14 +648,14 @@ Simple and direct:
 ```
 Event dispatched
   ↓
-All Handlers listening to this event execute
+All Reactors listening to this event execute
   ↓
-Handlers perform IO, make decisions, query state from:
+Reactors perform IO, make decisions, query state from:
   - Event payload (state-in-events pattern)
   - Shared dependencies (Arc<Mutex<T>> pattern)
   - Event history (implicit state pattern)
   ↓
-Handlers return new Event (or () for observer pattern)
+Reactors return new Event (or () for observer pattern)
   ↓
 Repeat
 ```
@@ -669,7 +669,7 @@ ScrapeEvent::SourceRequested
   → SyncHandler → syncs to DB → returns SyncComplete
 ```
 
-Multiple handlers can listen to the same event and run in parallel.
+Multiple reactors can listen to the same event and run in parallel.
 
 **Example**: Parallel notifications
 
@@ -681,19 +681,19 @@ UserEvent::SignedUp
   └─→ AnalyticsHandler → tracks event → returns ()
 ```
 
-All three handlers run concurrently when `SignedUp` is dispatched.
+All three reactors run concurrently when `SignedUp` is dispatched.
 
 ## Transaction Boundaries and Execution Modes
 
-Understanding when handlers run in which transaction is critical for correctness.
+Understanding when reactors run in which transaction is critical for correctness.
 
-### Inline Handlers (Default)
+### Inline Reactors (Default)
 
-Handlers without `.retry() > 1`, `.delay()`, `.timeout()`, or `.priority()` run **inline**:
+Reactors without `.retry() > 1`, `.delay()`, `.timeout()`, or `.priority()` run **inline**:
 
 ```rust
-// Inline handler - runs immediately
-handler::on::<OrderPlaced>()
+// Inline reactor - runs immediately
+reactor::on::<OrderPlaced>()
     .then(|event, ctx| async move {
         ctx.deps().db.insert_order(&event).await?;
         Ok(OrderSaved { order_id: event.order_id })
@@ -705,7 +705,7 @@ handler::on::<OrderPlaced>()
 engine.process(OrderPlaced { id: 123 }).await?;
   ↓ [Transaction begins in EventWorker]
   ↓ Insert OrderPlaced into causal_events
-  ↓ Handler executes (same transaction)
+  ↓ Reactor executes (same transaction)
   ↓ Insert OrderSaved into causal_events
   ↓ Mark OrderPlaced as processed
   ↓ [Transaction commits - atomic]
@@ -716,7 +716,7 @@ engine.process(OrderPlaced { id: 123 }).await?;
 - ⚡ **Fast** - no queue overhead, runs immediately
 - 🔒 **Atomic** - all-or-nothing with event dispatch
 - 🎯 **Synchronous** - `.await` waits for completion
-- ✅ **Same transaction** - event + handler + emitted events all atomic
+- ✅ **Same transaction** - event + reactor + emitted events all atomic
 
 **Use when:**
 - Fast operations (<100ms)
@@ -724,13 +724,13 @@ engine.process(OrderPlaced { id: 123 }).await?;
 - Need synchronous confirmation
 - Database updates that must commit together
 
-### Background Handlers (Queued)
+### Background Reactors (Queued)
 
-Handlers with `.retry() > 1`, `.delay()`, `.timeout()`, or `.priority()` run in **background workers**:
+Reactors with `.retry() > 1`, `.delay()`, `.timeout()`, or `.priority()` run in **background workers**:
 
 ```rust
-// Background handler - queued for workers
-handler::on::<PaymentRequested>()
+// Background reactor - queued for workers
+reactor::on::<PaymentRequested>()
     .retry(3)
     .timeout(Duration::from_secs(30))
     .then(|event, ctx| async move {
@@ -742,14 +742,14 @@ handler::on::<PaymentRequested>()
 **Execution flow:**
 ```
 1. Event inserted into causal_events (Transaction A)
-2. Handler intent inserted into causal_handler_intents (Transaction A)
+2. Reactor intent inserted into causal_handler_intents (Transaction A)
 3. [Transaction A commits]
 4. pg_notify alerts workers
-5. Worker picks up handler intent
+5. Worker picks up reactor intent
 6. [Transaction B begins in HandlerWorker]
-7. Handler executes
+7. Reactor executes
 8. Insert PaymentCharged into causal_events
-9. Mark handler complete
+9. Mark reactor complete
 10. [Transaction B commits]
 11. pg_notify sends new events
 ```
@@ -774,7 +774,7 @@ handler::on::<PaymentRequested>()
 | **Speed** | Immediate | Queued (eventually) |
 | **Atomicity** | With dispatch | No |
 | **Retry** | No (failure = rollback) | Yes (configurable) |
-| **Workers** | Any worker | Dedicated handler workers |
+| **Workers** | Any worker | Dedicated reactor workers |
 | **Latency** | Low (~ms) | Higher (~100ms+) |
 | **Use case** | DB updates | External APIs |
 
@@ -783,14 +783,14 @@ handler::on::<PaymentRequested>()
 **Pattern 1: Inline for DB, Background for External**
 ```rust
 // Inline - update local database atomically
-handler::on::<OrderPlaced>()
+reactor::on::<OrderPlaced>()
     .then(|event, ctx| async move {
         sqlx::query("INSERT INTO orders ...").execute(&ctx.deps().db).await?;
         Ok(OrderSaved { order_id: event.order_id })
     })
 
 // Background - call external API with retry
-handler::on::<OrderSaved>()
+reactor::on::<OrderSaved>()
     .retry(3)
     .then(|event, ctx| async move {
         ctx.deps().stripe.charge(&event).await?;
@@ -800,8 +800,8 @@ handler::on::<OrderSaved>()
 
 **Pattern 2: Chain via Events**
 ```rust
-// Inline handler emits event for background processing
-handler::on::<WebhookReceived>()
+// Inline reactor emits event for background processing
+reactor::on::<WebhookReceived>()
     .then(|event, ctx| async move {
         // Fast validation and persistence
         ctx.deps().db.insert_webhook(&event).await?;
@@ -809,8 +809,8 @@ handler::on::<WebhookReceived>()
         Ok(WebhookValidated { webhook_id: event.id })
     })
 
-// Background handler does slow work
-handler::on::<WebhookValidated>()
+// Background reactor does slow work
+reactor::on::<WebhookValidated>()
     .retry(5)
     .timeout(Duration::from_secs(60))
     .then(|event, ctx| async move {
@@ -822,8 +822,8 @@ handler::on::<WebhookValidated>()
 
 ### Transaction Safety Rules
 
-1. **Inline handlers must be idempotent** within their transaction - they may be called multiple times if transaction retries
-2. **Background handlers must be idempotent** across executions - they WILL be retried on failure
+1. **Inline reactors must be idempotent** within their transaction - they may be called multiple times if transaction retries
+2. **Background reactors must be idempotent** across executions - they WILL be retried on failure
 3. **Never assume atomicity across inline → background** - they're separate transactions
 4. **Use idempotency_key()** for external API calls to prevent duplicate charges/notifications
 5. **Emit events for coordination** - don't rely on shared mutable state
@@ -832,8 +832,8 @@ handler::on::<WebhookValidated>()
 
 **Problem: Changes disappear**
 ```rust
-// ❌ Inline handler that might rollback
-handler::on::<OrderPlaced>()
+// ❌ Inline reactor that might rollback
+reactor::on::<OrderPlaced>()
     .then(|event, ctx| async move {
         ctx.deps().db.insert_order(&event).await?;  // ✅ Inserted
         external_api_call().await?;  // ❌ Fails, entire TX rolls back
@@ -844,14 +844,14 @@ handler::on::<OrderPlaced>()
 **Solution: Split inline (DB) and background (external)**
 ```rust
 // ✅ Inline - just DB (fast, atomic)
-handler::on::<OrderPlaced>()
+reactor::on::<OrderPlaced>()
     .then(|event, ctx| async move {
         ctx.deps().db.insert_order(&event).await?;
         Ok(OrderSaved { order_id: event.order_id })  // Always succeeds
     })
 
 // ✅ Background - external API (retryable)
-handler::on::<OrderSaved>()
+reactor::on::<OrderSaved>()
     .retry(3)
     .then(|event, ctx| async move {
         external_api_call().await?;  // Retries on failure
@@ -872,9 +872,9 @@ enum ScrapeEvent {
 }
 
 let engine = Engine::new(deps, store)
-    // Handler 1: Scrape on request
-    .with_handler(
-        handler::on::<ScrapeEvent>()
+    // Reactor 1: Scrape on request
+    .with_reactor(
+        reactor::on::<ScrapeEvent>()
             .extract(|e| match e {
                 ScrapeEvent::SourceRequested { source_id } => Some(*source_id),
                 _ => None,
@@ -884,9 +884,9 @@ let engine = Engine::new(deps, store)
                 Ok(ScrapeEvent::SourceScraped { source_id, data })
             })
     )
-    // Handler 2: Extract on scrape
-    .with_handler(
-        handler::on::<ScrapeEvent>()
+    // Reactor 2: Extract on scrape
+    .with_reactor(
+        reactor::on::<ScrapeEvent>()
             .extract(|e| match e {
                 ScrapeEvent::SourceScraped { source_id, data } => Some((*source_id, data.clone())),
                 _ => None,
@@ -909,9 +909,9 @@ enum NotificationEvent {
 }
 
 let engine = Engine::new(deps, store)
-    // Email handler
-    .with_handler(
-        handler::on::<NotificationEvent>()
+    // Email reactor
+    .with_reactor(
+        reactor::on::<NotificationEvent>()
             .extract(|e| match e {
                 NotificationEvent::UserSignedUp { user_id, email } => Some((*user_id, email.clone())),
                 _ => None,
@@ -921,9 +921,9 @@ let engine = Engine::new(deps, store)
                 Ok(NotificationEvent::EmailSent { user_id, email_id })
             })
     )
-    // Slack handler
-    .with_handler(
-        handler::on::<NotificationEvent>()
+    // Slack reactor
+    .with_reactor(
+        reactor::on::<NotificationEvent>()
             .extract(|e| match e {
                 NotificationEvent::UserSignedUp { user_id, .. } => Some(*user_id),
                 _ => None,
@@ -935,13 +935,13 @@ let engine = Engine::new(deps, store)
     );
 ```
 
-Both handlers run in parallel when `UserSignedUp` is dispatched. No coordination needed.
+Both reactors run in parallel when `UserSignedUp` is dispatched. No coordination needed.
 
 ### Example 3: Conditional event dispatch
 
 ```rust
-// Handler that conditionally returns different events
-handler::on::<ScrapeEvent>()
+// Reactor that conditionally returns different events
+reactor::on::<ScrapeEvent>()
     .extract(|e| match e {
         ScrapeEvent::SourceRequested { source_id } => Some(*source_id),
         _ => None,
@@ -960,7 +960,7 @@ handler::on::<ScrapeEvent>()
     })
 ```
 
-Handlers return events based on outcomes - success, failure, or rate-limited all flow as events.
+Reactors return events based on outcomes - success, failure, or rate-limited all flow as events.
 
 ## Design Guidelines
 
@@ -975,9 +975,9 @@ Otherwise you get:
 - Silent deadlocks
 - Ghost workflows
 
-### Handlers can do anything
+### Reactors can do anything
 
-Handlers are unconstrained. They can:
+Reactors are unconstrained. They can:
 - Do IO or be pure
 - Hold state or be stateless
 - Make complex decisions or be simple transforms
@@ -987,11 +987,11 @@ You decide based on your needs.
 
 ### Cross-domain listening
 
-Handlers can listen to events from any domain and return events from another.
+Reactors can listen to events from any domain and return events from another.
 
 ```rust
-// Handler listening to WebsiteEvent, returning CrawlEvent
-handler::on::<WebsiteEvent>()
+// Reactor listening to WebsiteEvent, returning CrawlEvent
+reactor::on::<WebsiteEvent>()
     .extract(|e| match e {
         WebsiteEvent::WebsiteApproved { website_id } => Some(*website_id),
         _ => None,
@@ -1006,7 +1006,7 @@ This is normal and correct. Cross-domain coordination happens via events.
 
 ## Error Handling Pattern
 
-Handlers can handle errors in two ways:
+Reactors can handle errors in two ways:
 
 ### Preferred: Explicit Failure Events
 
@@ -1021,7 +1021,7 @@ enum OrderEvent {
 }
 
 // Handle failures explicitly
-handler::on::<OrderEvent>()
+reactor::on::<OrderEvent>()
     .extract(|e| match e {
         OrderEvent::OrderPlaced { order_id, total, .. } => Some((*order_id, *total)),
         _ => None,
@@ -1037,7 +1037,7 @@ handler::on::<OrderEvent>()
     });
 
 // Compensation
-handler::on::<OrderEvent>()
+reactor::on::<OrderEvent>()
     .extract(|e| match e {
         OrderEvent::PaymentChargeFailed { order_id, reason, .. } => Some((*order_id, reason.clone())),
         _ => None,
@@ -1057,13 +1057,13 @@ handler::on::<OrderEvent>()
 
 ```rust
 // Use ? for ergonomics
-handler::on::<OrderPlaced>().then(|order, ctx| async move {
+reactor::on::<OrderPlaced>().then(|order, ctx| async move {
     ctx.deps().payment.charge(order.total).await?;  // Propagates error
     Ok(PaymentCharged { order_id: order.id })
 })
 
-// Generic HandlerError handler
-handler::on::<HandlerError>()
+// Generic HandlerError reactor
+reactor::on::<HandlerError>()
     .filter(|err| {
         // Explicit retry logic
         err.source_event_type == TypeId::of::<OrderPlaced>() &&
@@ -1077,7 +1077,7 @@ handler::on::<HandlerError>()
     });
 
 // Typed error handling
-handler::on::<HandlerError>()
+reactor::on::<HandlerError>()
     .extract(|err| {
         // Filter by source event + error type
         if err.source_event_type == TypeId::of::<OrderPlaced>() {
@@ -1105,11 +1105,11 @@ handler::on::<HandlerError>()
 1. **Use explicit failure events** for critical flows where you need fine-grained control
 2. **Use HandlerError** for convenience when you just want to use `?`
 3. **Write explicit logic** - no magic helpers for "transient" or "should_retry"
-4. **Compensation handlers should be infallible** - catch errors internally, don't propagate
+4. **Compensation reactors should be infallible** - catch errors internally, don't propagate
 
-## Handler Responsibilities
+## Reactor Responsibilities
 
-Handlers are the **only** reactive primitive in Causal. They handle:
+Reactors are the **only** reactive primitive in Causal. They handle:
 
 - ✅ Reacting to events
 - ✅ Performing side effects (IO, API calls)
@@ -1118,7 +1118,7 @@ Handlers are the **only** reactive primitive in Causal. They handle:
 - ✅ Making decisions and branching logic
 - ✅ Returning new events to dispatch
 
-Handlers can be:
+Reactors can be:
 - Pure or impure (your choice)
 - Stateless or stateful (your choice)
 - Synchronous or asynchronous
@@ -1178,14 +1178,14 @@ Event::UserRequested { user_id: Uuid }  // Immutable reference
 
 Events should reference facts, not embed data that might change.
 
-### 2. Handlers that know too much
+### 2. Reactors that know too much
 
-If your handler:
+If your reactor:
 - Has dozens of fields
 - Mirrors database rows
 - Holds authoritative data
 
-You're putting the source of truth in the wrong place. Handlers should query deps, not store domain data.
+You're putting the source of truth in the wrong place. Reactors should query deps, not store domain data.
 
 ### 3. Missing terminal events
 
@@ -1207,7 +1207,7 @@ Every long-running flow needs success and failure terminal events.
 ```rust
 // Define engine with dependencies and store
 let engine = Engine::new(deps, store)
-    .with_handler(handler::on::<MyEvent>().then(|event, ctx| async move {
+    .with_reactor(reactor::on::<MyEvent>().then(|event, ctx| async move {
         // Query state from deps or event
         let count = ctx.deps().get_count().await?;
         ctx.deps().set_count(count + 1).await?;
@@ -1222,19 +1222,19 @@ engine.dispatch(MyEvent::Started { count: 0 }).await?;
 ```
 
 Builder methods:
-- `.with_handler(handler)` — Register event handlers (use `.then()` to return events)
+- `.with_reactor(reactor)` — Register event reactors (use `.then()` to return events)
 - `Engine::new(deps, store)` — Create engine with dependencies and event store
 
 Engine methods:
-- `.dispatch(event).await` — Dispatch event and wait for handlers to complete
-- `.settled().await` — Wait for all handlers to complete
+- `.dispatch(event).await` — Dispatch event and wait for reactors to complete
+- `.settled().await` — Wait for all reactors to complete
 - `.cancel()` — Cancel all tasks
 
 ## Cross-Domain Reactions
 
-Handlers can listen to events from other domains. This is normal and correct.
+Reactors can listen to events from other domains. This is normal and correct.
 
-**Pattern**: Domain A dispatches event → Domain B's handler reacts → Domain B returns its own events
+**Pattern**: Domain A dispatches event → Domain B's reactor reacts → Domain B returns its own events
 
 ### Example: Website approval triggers crawling
 
@@ -1244,8 +1244,8 @@ pub enum WebsiteEvent {
     WebsiteApproved { website_id: Uuid },
 }
 
-// Crawl handler listens to WebsiteEvent, returns CrawlEvent
-handler::on::<WebsiteEvent>()
+// Crawl reactor listens to WebsiteEvent, returns CrawlEvent
+reactor::on::<WebsiteEvent>()
     .extract(|e| match e {
         WebsiteEvent::WebsiteApproved { website_id } => Some(*website_id),
         _ => None,
@@ -1262,7 +1262,7 @@ handler::on::<WebsiteEvent>()
 - Trivially testable
 - Explicit and localized
 
-The engine dispatches events. Handlers that care, react and return new events. That's it.
+The engine dispatches events. Reactors that care, react and return new events. That's it.
 
 ## Request/Response Pattern
 
@@ -1297,7 +1297,7 @@ tx.commit().await?;
 ## Architecture Flow
 
 ```
-Engine → Handler.then(event) → returns Event → Engine
+Engine → Reactor.then(event) → returns Event → Engine
 ```
 
 Simple and direct.
@@ -1305,10 +1305,10 @@ Simple and direct.
 ## Design Principles Summary
 
 1. **Events are the only signals** — Everything flows through events
-2. **Handlers are the only reactive primitive** — Handle both state queries/updates AND side effects
+2. **Reactors are the only reactive primitive** — Handle both state queries/updates AND side effects
 3. **State lives in events or dependencies** — Choose pattern based on needs
-4. **Handlers are unconstrained** — Can do anything, pure or impure, stateful or stateless
+4. **Reactors are unconstrained** — Can do anything, pure or impure, stateful or stateless
 5. **Events are facts, past-tense** — `UserCreated`, not `CreateUser`
-6. **Handlers can listen to any domain** — Cross-domain coordination via events
-7. **One Handler execution = One transaction** — Multiple atomic writes belong together
+6. **Reactors can listen to any domain** — Cross-domain coordination via events
+7. **One Reactor execution = One transaction** — Multiple atomic writes belong together
 8. **Terminal events close loops** — Every workflow needs success/failure events

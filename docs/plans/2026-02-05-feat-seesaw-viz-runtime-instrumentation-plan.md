@@ -585,8 +585,8 @@ json-patch = "2.0"  # Structured state diffs (optional, for serde formatter)
 let collector = SpanCollector::new();
 
 let engine = Engine::new()
-    .with_handler(collector.effect())  // Register observer
-    .with_handler(/* user's effects */);
+    .with_reactor(collector.effect())  // Register observer
+    .with_reactor(/* user's effects */);
 
 let handle = engine.activate(State::default());
 handle.run(|_| Ok(OrderPlaced { id: 123 })).unwrap();
@@ -770,7 +770,7 @@ done
 crates/causal-viz/src/
 ├── server.rs
 ├── server/
-│   ├── handlers.rs
+│   ├── reactors.rs
 │   ├── websocket.rs
 │   └── static/
 │       ├── index.html
@@ -1126,7 +1126,7 @@ graph TB
 
 ### 3. Proc Macro Instrumentation
 
-**Approach**: #[instrument] proc macro on effect handlers
+**Approach**: #[instrument] proc macro on effect reactors
 
 **Pros**:
 - Zero-cost when disabled

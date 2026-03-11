@@ -3,7 +3,7 @@ date: 2026-03-08
 topic: kurrentdb-store-composition
 ---
 
-# Splitting the Store: EventLog + HandlerQueue
+# Splitting the Store: EventLog + ReactorQueue
 
 ## The Core Idea
 
@@ -11,13 +11,13 @@ The monolithic `Store` trait does three jobs:
 
 1. **Event buffer** — `publish` / `poll_next` / `complete_event` (transient queue)
 2. **Event log** — `append_event` / `load_stream` / `load_global_from` (durable history)
-3. **Handler queue** — `poll_next_handler` / `resolve_handler` (work distribution)
+3. **Reactor queue** — `poll_next_handler` / `resolve_handler` (work distribution)
 
 Job 1 is redundant. Every event passes through the buffer AND the log — two
 copies, two tables, for every event. The buffer exists because the engine needs
 something to poll. But with a checkpoint, the log itself can be that something.
 
-**Kill the event buffer. Two traits remain: EventLog and HandlerQueue.**
+**Kill the event buffer. Two traits remain: EventLog and ReactorQueue.**
 
 ## The Settle Loop
 
@@ -26,8 +26,8 @@ Before:
 publish(event) → causal_events          // buffer copy
 append_event(event) → events            // durable copy
 poll_next() → claim from causal_events
-complete_event() → ack buffer + create handler intents
-poll_next_handler() → claim handler
+complete_event() → ack buffer + create reactor intents
+poll_next_handler() → claim reactor
 resolve_handler() → publish emitted events to causal_events  // buffer copy again
                    → append_event to events                   // durable copy again
 loop
@@ -38,8 +38,8 @@ After:
 log.append(event)                                  // one copy
 events = log.load_from(last_checkpoint)            // read what's new
 queue.enqueue(intents, new_checkpoint)             // create work + advance cursor
-handler = queue.dequeue()                          // claim work
-execute handler
+reactor = queue.dequeue()                          // claim work
+execute reactor
 log.append(emitted_events)                         // one copy (log first)
 queue.resolve(Complete)                            // mark done (resolve second)
 loop until nothing new past checkpoint and queue empty
@@ -89,33 +89,33 @@ pub trait EventLog: Send + Sync {
     ) -> Result<()> { Ok(()) }
 }
 
-/// Where handler work items live. Relational, claimable, resolvable.
+/// Where reactor work items live. Relational, claimable, resolvable.
 ///
 /// Postgres causal_effect_executions. In-memory BTreeMap.
 #[async_trait]
-pub trait HandlerQueue: Send + Sync {
-    /// Create handler intents and advance the checkpoint atomically.
+pub trait ReactorQueue: Send + Sync {
+    /// Create reactor intents and advance the checkpoint atomically.
     async fn enqueue(&self, commit: IntentCommit) -> Result<()>;
 
     /// Last processed EventLog position.
     async fn checkpoint(&self) -> Result<u64>;
 
-    /// Claim next ready handler (pending → running).
-    async fn dequeue(&self) -> Result<Option<QueuedHandler>>;
+    /// Claim next ready reactor (pending → running).
+    async fn dequeue(&self) -> Result<Option<QueuedReactor>>;
 
-    /// Earliest future-scheduled handler (for sleep-until).
+    /// Earliest future-scheduled reactor (for sleep-until).
     async fn earliest_pending_at(&self) -> Result<Option<DateTime<Utc>>>;
 
-    /// Complete, retry, or dead-letter a handler.
+    /// Complete, retry, or dead-letter a reactor.
     async fn resolve(&self, resolution: HandlerResolution) -> Result<()>;
 
-    /// Reclaim handlers stuck in running state past timeout.
+    /// Reclaim reactors stuck in running state past timeout.
     async fn reclaim_stale(&self) -> Result<()> { Ok(()) }
 
-    // ── Journaling (handler retry replay) ──
-    async fn load_journal(&self, handler_id: &str, event_id: Uuid) -> Result<Vec<JournalEntry>>;
-    async fn append_journal(&self, handler_id: &str, event_id: Uuid, seq: u32, value: Value) -> Result<()>;
-    async fn clear_journal(&self, handler_id: &str, event_id: Uuid) -> Result<()>;
+    // ── Journaling (reactor retry replay) ──
+    async fn load_journal(&self, reactor_id: &str, event_id: Uuid) -> Result<Vec<JournalEntry>>;
+    async fn append_journal(&self, reactor_id: &str, event_id: Uuid, seq: u32, value: Value) -> Result<()>;
+    async fn clear_journal(&self, reactor_id: &str, event_id: Uuid) -> Result<()>;
 
     // ── Coordination ──
     async fn cancel(&self, correlation_id: Uuid) -> Result<()> { Ok(()) }
@@ -146,11 +146,11 @@ metadata the engine needs. `PersistedEvent` doesn't have these fields.
 
 **Resolution: Store in `NewEvent.metadata`.**
 
-When a handler emits events, the engine builds `NewEvent` with routing metadata
+When a reactor emits events, the engine builds `NewEvent` with routing metadata
 in the metadata map:
 
 ```rust
-fn build_new_event(&self, emitted: EmittedEvent, parent: &QueuedHandler) -> NewEvent {
+fn build_new_event(&self, emitted: EmittedEvent, parent: &QueuedReactor) -> NewEvent {
     let mut metadata = self.event_metadata.clone();
     metadata.insert("hops", json!(parent.hops + 1));
     if let Some(bid) = emitted.batch_id {
@@ -275,7 +275,7 @@ pub struct PersistedEvent {
 ```
 
 `MemoryStore`'s EventLog stashes the ephemeral alongside the event and returns
-it on `load_from`. Postgres/KurrentDB always return `None`. Handlers fall back
+it on `load_from`. Postgres/KurrentDB always return `None`. Reactors fall back
 to JSON deserialization when ephemeral is absent (they already do this today for
 replayed events).
 
@@ -291,7 +291,7 @@ Aggregate matching is cheap — just `extract_id_from_json(&payload)`. No IO,
 no hydration. The engine has all aggregator registrations at all times.
 
 ```rust
-// Before appending (both at dispatch and handler emit time):
+// Before appending (both at dispatch and reactor emit time):
 fn build_new_event(&self, emitted: EmittedEvent, ...) -> NewEvent {
     let (agg_type, agg_id) = self.aggregators
         .find_by_event_type(&emitted.event_type)
@@ -315,7 +315,7 @@ fn build_new_event(&self, emitted: EmittedEvent, ...) -> NewEvent {
 - **Hydration** = "load that aggregate's state" (expensive, from store)
 
 Matching moves earlier (before append). Hydration stays where it is (during
-settle, before handler execution).
+settle, before reactor execution).
 
 **Bonus simplification:** Today's `persist_and_hydrate` carefully hydrates
 BEFORE appending to avoid double-apply during `load_stream`. In the new design,
@@ -337,7 +337,7 @@ processing is, not how many items sit in a transient queue.
 
 | Gone | Why |
 |---|---|
-| `Store` trait | Replaced by `EventLog` + `HandlerQueue` |
+| `Store` trait | Replaced by `EventLog` + `ReactorQueue` |
 | `publish()` | No event buffer |
 | `poll_next()` | No event buffer |
 | `complete_event()` | Replaced by `enqueue()` |
@@ -358,7 +358,7 @@ pub struct IntentCommit {
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
-    pub intents: Vec<HandlerIntent>,
+    pub intents: Vec<ReactorIntent>,
     pub projection_failures: Vec<ProjectionFailure>,
     pub handler_descriptions: HashMap<String, serde_json::Value>,
     /// Advance checkpoint to this EventLog position.
@@ -372,18 +372,18 @@ pub struct EventPark {
     pub reason: String,
 }
 
-/// Handler completion (no events_to_publish).
+/// Reactor completion (no events_to_publish).
 pub struct HandlerCompletion {
     pub event_id: Uuid,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub result: serde_json::Value,
     pub log_entries: Vec<LogEntry>,
 }
 
-/// Handler DLQ (no events_to_publish — engine appends terminal events to log).
+/// Reactor DLQ (no events_to_publish — engine appends terminal events to log).
 pub struct HandlerDlq {
     pub event_id: Uuid,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub error: String,
     pub reason: String,
     pub attempts: i32,
@@ -396,9 +396,9 @@ pub struct HandlerDlq {
 ```rust
 pub struct Engine<D: Send + Sync + 'static> {
     log: Arc<dyn EventLog>,
-    queue: Arc<dyn HandlerQueue>,
+    queue: Arc<dyn ReactorQueue>,
     deps: Arc<D>,
-    handlers: Arc<HandlerRegistry<D>>,
+    reactors: Arc<HandlerRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
     // ...
 }
@@ -413,12 +413,12 @@ let engine = Engine::new(deps, store.clone(), store);
 
 // Postgres (rootsignal today)
 let log = PostgresEventLog::new(pool.clone(), correlation_id);
-let queue = PostgresHandlerQueue::new(pool, correlation_id);
+let queue = PostgresReactorQueue::new(pool, correlation_id);
 let engine = Engine::new(deps, log, queue);
 
 // KurrentDB (rootsignal future)
 let log = KurrentDbEventLog::new(client, correlation_id);
-let queue = PostgresHandlerQueue::new(pool, correlation_id);
+let queue = PostgresReactorQueue::new(pool, correlation_id);
 let engine = Engine::new(deps, log, queue);
 ```
 
@@ -467,7 +467,7 @@ pub async fn settle(&self) -> Result<()> {
                 continue;
             }
 
-            // Process event: hydrate, apply aggregators, determine handlers
+            // Process event: hydrate, apply aggregators, determine reactors
             match self.process_event(&event).await {
                 Ok(commit) => {
                     self.queue.enqueue(commit).await?;
@@ -483,7 +483,7 @@ pub async fn settle(&self) -> Result<()> {
             }
         }
 
-        // ── Phase 2: Execute handlers ──
+        // ── Phase 2: Execute reactors ──
         let mut executions = vec![];
         while let Some(h) = self.queue.dequeue().await? {
             executions.push(h);
@@ -504,10 +504,10 @@ pub async fn settle(&self) -> Result<()> {
                             let new_event = self.build_new_event(emitted, &execution);
                             self.log.append(new_event).await?;
                         }
-                        // THEN mark handler complete
+                        // THEN mark reactor complete
                         self.queue.resolve(Complete(HandlerCompletion {
                             event_id: execution.event_id,
-                            handler_id: execution.handler_id,
+                            reactor_id: execution.reactor_id,
                             result: r.result,
                             log_entries: r.log_entries,
                         })).await?;
@@ -551,18 +551,18 @@ pub async fn dispatch(&self, event: impl Event) -> Result<()> {
 
 ### Log before resolve
 
-When a handler emits events:
+When a reactor emits events:
 ```
 1. log.append(emitted_events)     ← must succeed (durable)
-2. queue.resolve(Complete)        ← marks handler done
+2. queue.resolve(Complete)        ← marks reactor done
 ```
 
-Crash after 1, before 2: handler re-executes, re-appends (deduped by event_id),
+Crash after 1, before 2: reactor re-executes, re-appends (deduped by event_id),
 resolves. Safe. Total idempotency contract on `append` guarantees this.
 
 ### Enqueue is atomic
 
-`queue.enqueue(commit)` atomically: inserts handler intents + advances
+`queue.enqueue(commit)` atomically: inserts reactor intents + advances
 checkpoint. If it fails, checkpoint stays at old position, engine reprocesses
 the event on next loop. Idempotent.
 
@@ -578,7 +578,7 @@ Rootsignal hasn't shipped. Clean cut, no migration.
 
 | Component | Change |
 |---|---|
-| `PostgresStore` | Split into `PostgresEventLog` (events table) + `PostgresHandlerQueue` (causal_effect_executions, journals, descriptions, cancellation) |
+| `PostgresStore` | Split into `PostgresEventLog` (events table) + `PostgresReactorQueue` (causal_effect_executions, journals, descriptions, cancellation) |
 | `causal_events` table | **Drop.** |
 | `causal_checkpoints` table | **New.** `(correlation_id, position)` |
 | `event_broadcast.rs` | No change — pg_notify still fires from events table INSERT |
@@ -600,7 +600,7 @@ Single struct implements both traits:
 
 ```rust
 impl EventLog for MemoryStore { ... }
-impl HandlerQueue for MemoryStore { ... }
+impl ReactorQueue for MemoryStore { ... }
 ```
 
 ## KurrentDB Stream Strategy
@@ -681,7 +681,7 @@ KurrentDB events have separate `data` and `metadata` byte arrays. Map:
 | `parent_id` | Metadata `$causationId` |
 | `aggregate_type` | Metadata `_aggregate_type` |
 | `aggregate_id` | Metadata `_aggregate_id` |
-| `_hops`, `_batch_*`, `_handler_id` | Metadata (routing, underscore-prefixed) |
+| `_hops`, `_batch_*`, `_reactor_id` | Metadata (routing, underscore-prefixed) |
 | Domain keys (`run_id`, etc.) | Metadata (unprefixed) |
 
 Setting `$correlationId` and `$causationId` enables KurrentDB's built-in
@@ -720,7 +720,7 @@ let log = PostgresEventLog::new(pool.clone(), cid);
 let log = KurrentDbEventLog::new(client, cid);
 ```
 
-HandlerQueue stays Postgres. Everything else stays the same.
+ReactorQueue stays Postgres. Everything else stays the same.
 
 ### Postgres Events Table — Full Mirror, Not Read Model
 
@@ -765,7 +765,7 @@ after each append. On retry after crash:
 
 This only works because:
 - All events for a correlation go to ONE stream (Strategy A)
-- Event IDs are deterministic (UUID v5 from parent + handler + index)
+- Event IDs are deterministic (UUID v5 from parent + reactor + index)
 - The engine always knows the expected revision (from the last successful append)
 
 Strategy B would need an external dedup index because events go to MULTIPLE
@@ -807,13 +807,13 @@ Miss this and the first append after restart uses a stale/zero revision →
 
 ```
 crates/
-  causal/                    # EventLog + HandlerQueue traits, MemoryStore, Engine
+  causal/                    # EventLog + ReactorQueue traits, MemoryStore, Engine
   causal_core_macros/        # existing
   causal_utils/              # existing
   causal-kurrentdb/          # KurrentDbEventLog (future)
 ```
 
-PostgresEventLog and PostgresHandlerQueue live in rootsignal until a second
+PostgresEventLog and PostgresReactorQueue live in rootsignal until a second
 app needs them.
 
 ## Notes from Review
@@ -825,29 +825,29 @@ finite). For a future long-running subscription consumer, add a staleness reset:
 `(attempts, last_seen_at)` — reset attempts if last_seen_at is older than a
 threshold. YAGNI for now.
 
-**Phase 1/2 interleaving:** Processing all events before any handlers means
+**Phase 1/2 interleaving:** Processing all events before any reactors means
 emitted high-priority events wait for the current batch to finish. This is the
-same behavior as today (current engine drains ALL events, then ALL handlers, per
+same behavior as today (current engine drains ALL events, then ALL reactors, per
 iteration). Not a regression. If latency matters later, process events in smaller
 chunks.
 
 **Consistency gap:** The log may be "ahead" of the checkpoint (events appended
-but not yet processed into handler intents). This already exists today —
+but not yet processed into reactor intents). This already exists today —
 `append_event` fires `pg_notify` before `complete_event` creates intents. Admin
-panel already sees events before their handlers exist. No behavior change.
+panel already sees events before their reactors exist. No behavior change.
 
 **Metadata discipline:** Two non-overlapping key sets share the metadata map.
 Causal routing keys use underscore prefix: `_hops` (i32), `_batch_id` (UUID),
-`_batch_index` (i32), `_batch_size` (i32), `_handler_id` (String — handler
+`_batch_index` (i32), `_batch_size` (i32), `_reactor_id` (String — reactor
 that produced this event). Domain keys (rootsignal: `run_id`, `schema_v`,
-`handler_id`) are unprefixed. Routing keys MUST round-trip through the store —
+`reactor_id`) are unprefixed. Routing keys MUST round-trip through the store —
 the settle loop reads `_hops` from `PersistedEvent.metadata` via `load_from`
 for infinite loop detection. If routing keys are lost on round-trip, the hops
 check silently defaults to 0 and infinite loops go undetected.
 
 **Metadata round-trip in Postgres:** Rootsignal's current `into_persisted`
 reconstructs metadata from only 3 promoted columns (`run_id`, `schema_v`,
-`handler_id`). Routing keys (`_hops`, `_batch_id`, etc.) are silently dropped.
+`reactor_id`). Routing keys (`_hops`, `_batch_id`, etc.) are silently dropped.
 Fix: add a `metadata JSONB` column to the Postgres events table. Store the
 full metadata map in this column. Promoted columns remain for indexed queries.
 KurrentDB and MemoryStore don't have this problem — KurrentDB stores metadata
@@ -864,11 +864,11 @@ Or promote `_batch_id` to a top-level column if query patterns warrant it.
 ### Issue 7: Ephemeral typed events through the queue
 
 Current `EventCommit` carries `ephemeral: Option<Arc<dyn Any + Send + Sync>>` so
-the store can pass the typed event through to `QueuedHandler` without JSON
+the store can pass the typed event through to `QueuedReactor` without JSON
 round-tripping. The brainstorm's `IntentCommit` doesn't have this field.
 
-Without it, even MemoryStore handlers would need JSON deserialization on every
-handler execution — a performance regression for the common case.
+Without it, even MemoryStore reactors would need JSON deserialization on every
+reactor execution — a performance regression for the common case.
 
 **Resolution: Engine-side ephemeral cache, not on IntentCommit.**
 
@@ -886,7 +886,7 @@ for event in events {
     // ... process_event ...
 }
 
-// In Phase 2, inject into QueuedHandler after dequeue:
+// In Phase 2, inject into QueuedReactor after dequeue:
 while let Some(mut h) = self.queue.dequeue().await? {
     h.ephemeral = ephemerals.get(&h.event_id).cloned();
     executions.push(h);
@@ -938,7 +938,7 @@ benefits both old and new engine.
 
 ## Decisions
 
-- **Drop monolithic `Store` trait** — two traits: `EventLog` + `HandlerQueue`
+- **Drop monolithic `Store` trait** — two traits: `EventLog` + `ReactorQueue`
 - **Kill the event buffer** — EventLog + checkpoint replaces `causal_events`
 - **Correlation-primary streams for KurrentDB** — all events to `correlation-{cid}`,
   no system projection dependency in hot path, idempotency via `ExpectedRevision::Exact`
@@ -949,5 +949,5 @@ benefits both old and new engine.
   in the consumer, not the log. Park after N failures.
 - **Aggregate matching before append** — cheap JSON extraction, no IO
 - **`load_from` replaces `load_global_from`** — scope is implementation-defined
-- **Log before resolve** — emitted events appended before handler marked complete
+- **Log before resolve** — emitted events appended before reactor marked complete
 - **Adopt in rootsignal now** — no migration needed, clean cut

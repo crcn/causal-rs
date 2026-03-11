@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-// ── Handler logging ──────────────────────────────────────────────
+// ── Reactor logging ──────────────────────────────────────────────
 
-/// Log level for handler log entries.
+/// Log level for reactor log entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -28,7 +28,7 @@ impl fmt::Display for LogLevel {
     }
 }
 
-/// A structured log entry captured during handler execution.
+/// A structured log entry captured during reactor execution.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub level: LogLevel,
@@ -44,7 +44,7 @@ pub struct LogEntry {
 /// This is a custom namespace UUID (derived from URL namespace)
 pub const NAMESPACE_CAUSAL: Uuid = Uuid::from_u128(0x6ba7b8109dad11d180b400c04fd430c8);
 
-/// Event emitted by a handler (for atomic insertion)
+/// Event emitted by a reactor (for atomic insertion)
 #[derive(Debug, Clone)]
 pub struct EmittedEvent {
     /// Stable durable name from Event trait (e.g. "scrape:web_scrape_completed").
@@ -55,8 +55,8 @@ pub struct EmittedEvent {
     pub persistent: bool,
     /// Event payload (JSON)
     pub payload: serde_json::Value,
-    /// Handler that produced this event.
-    pub handler_id: Option<String>,
+    /// Reactor that produced this event.
+    pub reactor_id: Option<String>,
     /// Original typed event (live dispatch only).
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -64,18 +64,18 @@ pub struct EmittedEvent {
 /// Captured projection failure to persist in DLQ at commit time.
 #[derive(Debug, Clone)]
 pub struct ProjectionFailure {
-    pub handler_id: String,
+    pub reactor_id: String,
     pub error: String,
     pub reason: String,
     pub attempts: i32,
 }
 
-// ── New types (EventLog + HandlerQueue split) ─────────────────────
+// ── New types (EventLog + ReactorQueue split) ─────────────────────
 
 /// Atomic intent creation payload.
 ///
 /// Produced by the engine's `process_event` during Phase 1 of the settle
-/// loop. Contains handler intents to enqueue, projection failures to DLQ,
+/// loop. Contains reactor intents to enqueue, projection failures to DLQ,
 /// and the checkpoint position to advance to.
 #[derive(Debug)]
 pub struct IntentCommit {
@@ -84,12 +84,12 @@ pub struct IntentCommit {
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
-    /// Queued handler intents to persist.
-    pub intents: Vec<HandlerIntent>,
+    /// Queued reactor intents to persist.
+    pub intents: Vec<ReactorIntent>,
     /// Projection failures to persist to DLQ.
     pub projection_failures: Vec<ProjectionFailure>,
-    /// Handler gate descriptions (handler_id → serialized describe output).
-    pub handler_descriptions: HashMap<String, serde_json::Value>,
+    /// Reactor gate descriptions (reactor_id → serialized describe output).
+    pub reactor_descriptions: HashMap<String, serde_json::Value>,
     /// Advance checkpoint to this EventLog position.
     pub checkpoint: u64,
     /// Park this event in DLQ (exceeded hops, exceeded retry, etc.)
@@ -106,7 +106,7 @@ impl IntentCommit {
             event_payload: event.payload.clone(),
             intents: Vec::new(),
             projection_failures: Vec::new(),
-            handler_descriptions: HashMap::new(),
+            reactor_descriptions: HashMap::new(),
             checkpoint: event.position,
             park: Some(EventPark {
                 reason: reason.into(),
@@ -123,7 +123,7 @@ impl IntentCommit {
             event_payload: event.payload.clone(),
             intents: Vec::new(),
             projection_failures: Vec::new(),
-            handler_descriptions: HashMap::new(),
+            reactor_descriptions: HashMap::new(),
             checkpoint: event.position,
             park: None,
         }
@@ -136,18 +136,18 @@ pub struct EventPark {
     pub reason: String,
 }
 
-/// Persisted intent for a queued handler execution.
+/// Persisted intent for a queued reactor execution.
 #[derive(Debug, Clone)]
-pub struct HandlerIntent {
-    /// Stable handler identifier.
-    pub handler_id: String,
+pub struct ReactorIntent {
+    /// Stable reactor identifier.
+    pub reactor_id: String,
     /// Parent event for causality tracking.
     pub parent_event_id: Option<Uuid>,
-    /// Earliest time this handler can execute.
+    /// Earliest time this reactor can execute.
     pub execute_at: DateTime<Utc>,
-    /// Per-handler timeout in seconds.
+    /// Per-reactor timeout in seconds.
     pub timeout_seconds: i32,
-    /// Max retry attempts for this handler.
+    /// Max retry attempts for this reactor.
     pub max_attempts: i32,
     /// Queue priority (lower = higher priority).
     pub priority: i32,
@@ -155,11 +155,11 @@ pub struct HandlerIntent {
     pub hops: i32,
 }
 
-/// Queued handler execution from store
+/// Queued reactor execution from store
 #[derive(Debug, Clone)]
-pub struct QueuedHandler {
+pub struct QueuedReactor {
     pub event_id: Uuid,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
@@ -195,16 +195,16 @@ impl Default for EventWorkerConfig {
     }
 }
 
-/// Handler worker configuration.
+/// Reactor worker configuration.
 #[derive(Debug, Clone)]
-pub struct HandlerWorkerConfig {
-    /// Polling interval when no handlers available.
+pub struct ReactorWorkerConfig {
+    /// Polling interval when no reactors available.
     pub poll_interval: Duration,
-    /// Default timeout for handler execution.
+    /// Default timeout for reactor execution.
     pub default_timeout: Duration,
 }
 
-impl Default for HandlerWorkerConfig {
+impl Default for ReactorWorkerConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_millis(100),
@@ -213,46 +213,46 @@ impl Default for HandlerWorkerConfig {
     }
 }
 
-/// Atomic handler completion payload.
+/// Atomic reactor completion payload.
 #[derive(Debug)]
-pub struct HandlerCompletion {
+pub struct ReactorCompletion {
     pub event_id: Uuid,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub result: serde_json::Value,
-    /// Log entries captured during handler execution.
+    /// Log entries captured during reactor execution.
     pub log_entries: Vec<LogEntry>,
 }
 
 /// Atomic DLQ + terminal-event payload.
 #[derive(Debug)]
-pub struct HandlerDlq {
+pub struct ReactorDlq {
     pub event_id: Uuid,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub error: String,
     pub reason: String,
     pub attempts: i32,
-    /// Log entries captured during handler execution.
+    /// Log entries captured during reactor execution.
     pub log_entries: Vec<LogEntry>,
 }
 
-/// Unified handler resolution outcome.
+/// Unified reactor resolution outcome.
 ///
 /// Replaces the three separate `complete_handler`, `fail_handler`, `dlq_handler`
-/// Store methods with a single `resolve_handler(HandlerResolution)` call.
+/// Store methods with a single `resolve_handler(ReactorResolution)` call.
 #[derive(Debug)]
-pub enum HandlerResolution {
-    /// Handler completed successfully.
-    Complete(HandlerCompletion),
-    /// Handler failed but can be retried.
+pub enum ReactorResolution {
+    /// Reactor completed successfully.
+    Complete(ReactorCompletion),
+    /// Reactor failed but can be retried.
     Retry {
         event_id: Uuid,
-        handler_id: String,
+        reactor_id: String,
         error: String,
         new_attempts: i32,
         next_execute_at: DateTime<Utc>,
     },
-    /// Handler exhausted retries — send to dead letter queue.
-    DeadLetter(HandlerDlq),
+    /// Reactor exhausted retries — send to dead letter queue.
+    DeadLetter(ReactorDlq),
 }
 
 // ── Event persistence types ───────────────────────────────────────
@@ -298,7 +298,7 @@ pub struct PersistedEvent {
     /// Application-level metadata (e.g. run_id, schema_v, actor).
     pub metadata: serde_json::Map<String, serde_json::Value>,
     /// Original typed event, available only during live dispatch in-process.
-    /// `None` on load from durable store — handlers fall back to JSON deserialization.
+    /// `None` on load from durable store — reactors fall back to JSON deserialization.
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
     /// Whether this event should be forwarded to the permanent event store
     /// (e.g. KurrentDB). Ephemeral events (`false`) are persisted to the
@@ -351,7 +351,7 @@ pub struct NewEvent {
     /// `None` for events loaded from durable stores.
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
     /// Whether this event should be persisted to EventLog.
-    /// Ephemeral events (`false`) route through handlers but skip persistence,
+    /// Ephemeral events (`false`) route through reactors but skip persistence,
     /// aggregators, and projections.
     pub persistent: bool,
 }
@@ -393,17 +393,17 @@ pub struct JournalEntry {
 /// Summary of pending work for a correlation ID.
 #[derive(Debug, Clone, Default)]
 pub struct QueueStatus {
-    pub pending_handlers: usize,
+    pub pending_reactors: usize,
     pub dead_lettered: usize,
 }
 
-impl fmt::Display for QueuedHandler {
+impl fmt::Display for QueuedReactor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Handler(event_id={}, handler_id={}, correlation_id={}, priority={}, attempts={}/{})",
+            "Reactor(event_id={}, reactor_id={}, correlation_id={}, priority={}, attempts={}/{})",
             self.event_id,
-            self.handler_id,
+            self.reactor_id,
             self.correlation_id,
             self.priority,
             self.attempts,

@@ -24,7 +24,7 @@ We're implementing the critical safety features to make Causal production-ready 
   - Lifecycle tracking (status, retry attempts, resolution notes)
   - Original event payload (for replay)
 - Created optimized indexes:
-  - `idx_dlq_handler_open` - Find open entries by handler (partial index)
+  - `idx_dlq_handler_open` - Find open entries by reactor (partial index)
   - `idx_dlq_event` - Find all DLQ entries for an event
   - `idx_dlq_status` - Find entries by status
 
@@ -44,7 +44,7 @@ We're implementing the critical safety features to make Causal production-ready 
 
 **What was done:**
 - Created `DeadLetterQueue` struct with all CRUD operations:
-  - `insert()` - Add failed handler to DLQ (with ON CONFLICT for updates)
+  - `insert()` - Add failed reactor to DLQ (with ON CONFLICT for updates)
   - `list()` / `list_by_handler()` - Query open entries
   - `get()` - Fetch single entry by ID
   - `start_retry()` - Mark as retrying with row lock (`FOR UPDATE`)
@@ -100,7 +100,7 @@ We're implementing the critical safety features to make Causal production-ready 
 
 ---
 
-### ⚠️ Task 1.4: Integration - DLQ with Handler Worker (TODO)
+### ⚠️ Task 1.4: Integration - DLQ with Reactor Worker (TODO)
 
 **What needs to be done:**
 - Update `HandlerWorker::process_next_effect()` to use new DLQ API
@@ -112,7 +112,7 @@ We're implementing the critical safety features to make Causal production-ready 
 - `/crates/causal/src/runtime/handler_worker.rs` (lines 140-165)
 
 **Exit criteria:**
-- [ ] Handler worker uses new DLQ API
+- [ ] Reactor worker uses new DLQ API
 - [ ] All permanent failures go to DLQ
 - [ ] Error details properly captured
 - [ ] Integration test verifies DLQ entry created
@@ -147,7 +147,7 @@ We're implementing the critical safety features to make Causal production-ready 
 **What needs to be done:**
 - Create retry API for operators:
   - `retry_dead_letter(dlq_id)` - Retry single entry
-  - `retry_all_by_handler(handler_id)` - Bulk retry with bounded batches
+  - `retry_all_by_handler(reactor_id)` - Bulk retry with bounded batches
 - Add proper error handling for retry failures
 - Update DLQ status on success/failure
 
@@ -168,7 +168,7 @@ We're implementing the critical safety features to make Causal production-ready 
 - `/crates/causal/tests/dlq_integration.rs` - 6 comprehensive DLQ tests
 
 **What was done:**
-- Test 1: `test_permanent_failure_creates_dlq_entry` - Handler fails 3 times → DLQ entry created
+- Test 1: `test_permanent_failure_creates_dlq_entry` - Reactor fails 3 times → DLQ entry created
 - Test 2: `test_dlq_retry_replays_event` - Retry from DLQ → Event successfully replayed
 - Test 3: `test_dlq_duplicate_retry_prevented` - Row lock prevents concurrent retry attempts
 - Test 4: `test_partial_batch_failure_creates_dlq_entries` - Multiple events, only failures go to DLQ
@@ -189,12 +189,12 @@ We're implementing the critical safety features to make Causal production-ready 
 - `/crates/causal/tests/graceful_shutdown_integration.rs` - 6 comprehensive shutdown tests
 
 **What was done:**
-- Test 1: `test_shutdown_completes_inflight_tasks` - All started handlers complete before shutdown
+- Test 1: `test_shutdown_completes_inflight_tasks` - All started reactors complete before shutdown
 - Test 2: `test_shutdown_stops_accepting_new_work` - No new work after shutdown signal
 - Test 3: `test_shutdown_timeout_aborts_tasks` - Timeout enforced after configured duration
 - Test 4: `test_worker_restart_after_shutdown` - Clean restart with no state corruption
 - Test 5: `test_concurrent_shutdown_calls_safe` - Shutdown can be called safely (once integrated)
-- Test 6: `test_shutdown_during_handler_error` - Shutdown waits for failing handlers too
+- Test 6: `test_shutdown_during_handler_error` - Shutdown waits for failing reactors too
 
 **Exit criteria met:**
 - [x] Zero lost work scenarios tested
@@ -209,10 +209,10 @@ We're implementing the critical safety features to make Causal production-ready 
 ### ⚠️ Task 2.1: Structured Logging (TODO)
 
 **What needs to be done:**
-- Add tracing instrumentation to all handler paths
-- Include contextual fields: `event_id`, `handler_id`, `correlation_id`
+- Add tracing instrumentation to all reactor paths
+- Include contextual fields: `event_id`, `reactor_id`, `correlation_id`
 - Normalize error fields and retry context
-- Add spans for handler execution
+- Add spans for reactor execution
 
 **Files to modify:**
 - `/crates/causal/src/runtime/handler_worker.rs`
@@ -315,7 +315,7 @@ We're implementing the critical safety features to make Causal production-ready 
 2. `/crates/causal/src/runtime/mod.rs` - Added graceful_shutdown module
 3. `/Cargo.toml` - Added tokio-util workspace dependency
 4. `/crates/causal/Cargo.toml` - Added sqlx, tokio-util, causal-postgres dependencies
-5. `/crates/causal/src/handler/builders.rs` - Fixed join_window → join_window_timeout mappings
+5. `/crates/causal/src/reactor/builders.rs` - Fixed join_window → join_window_timeout mappings
 6. `/crates/causal/src/runtime/graceful_shutdown.rs` - Fixed CancellationToken borrowing
 7. `/crates/causal/src/dead_letter_queue.rs` - Converted from time to chrono
 

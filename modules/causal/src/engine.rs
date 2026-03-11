@@ -1,7 +1,7 @@
 //! Store-agnostic Engine with built-in settle loop.
 //!
 //! Engine<D> reads events from an [`EventLog`](crate::event_log::EventLog),
-//! distributes handler work via a [`HandlerQueue`](crate::handler_queue::HandlerQueue),
+//! distributes reactor work via a [`ReactorQueue`](crate::reactor_queue::ReactorQueue),
 //! and settles the full causal tree synchronously.
 
 use std::sync::Arc;
@@ -12,23 +12,23 @@ use tracing::info;
 
 use crate::aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 use crate::event_log::EventLog;
-use crate::handler::{GlobalDlqMapper, Handler, Projection};
-use crate::handler_queue::HandlerQueue;
-use crate::handler_registry::HandlerRegistry;
-use crate::job_executor::{HandlerStatus, JobExecutor};
+use crate::reactor::{GlobalDlqMapper, Reactor, Projection};
+use crate::reactor_queue::ReactorQueue;
+use crate::reactor_registry::ReactorRegistry;
+use crate::job_executor::{ReactorStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
 use crate::process::{EmitFuture, ProcessHandle};
 use crate::types::{
-    EmittedEvent, EventWorkerConfig, HandlerCompletion, HandlerDlq,
-    HandlerResolution, HandlerWorkerConfig, IntentCommit, NewEvent, PersistedEvent,
-    QueuedHandler, Snapshot, NAMESPACE_CAUSAL,
+    EmittedEvent, EventWorkerConfig, ReactorCompletion, ReactorDlq,
+    ReactorResolution, ReactorWorkerConfig, IntentCommit, NewEvent, PersistedEvent,
+    QueuedReactor, Snapshot, NAMESPACE_CAUSAL,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
 
 /// Store-agnostic Engine with built-in settle loop.
 ///
-/// Reads events from an [`EventLog`], distributes handler work via a
-/// [`HandlerQueue`], and drives the full causal tree to completion.
+/// Reads events from an [`EventLog`], distributes reactor work via a
+/// [`ReactorQueue`], and drives the full causal tree to completion.
 ///
 /// Supply custom implementations via [`new`](Engine::new), or use
 /// [`in_memory`](Engine::in_memory) for tests and simple use cases.
@@ -37,9 +37,9 @@ where
     D: Send + Sync + 'static,
 {
     log: Arc<dyn EventLog>,
-    queue: Arc<dyn HandlerQueue>,
+    queue: Arc<dyn ReactorQueue>,
     deps: Arc<D>,
-    handlers: Arc<HandlerRegistry<D>>,
+    reactors: Arc<ReactorRegistry<D>>,
     aggregators: Arc<AggregatorRegistry>,
     upcasters: Arc<UpcasterRegistry>,
     snapshot_every: Option<u64>,
@@ -51,7 +51,7 @@ impl<D> Engine<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Create an engine with in-memory event log and handler queue.
+    /// Create an engine with in-memory event log and reactor queue.
     ///
     /// Use `.with_store(store)` to swap in a durable backend.
     pub fn new(deps: D) -> Self {
@@ -60,7 +60,7 @@ where
             log: store.clone(),
             queue: store,
             deps: Arc::new(deps),
-            handlers: Arc::new(HandlerRegistry::new()),
+            reactors: Arc::new(ReactorRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
             upcasters: Arc::new(UpcasterRegistry::new()),
             snapshot_every: None,
@@ -70,17 +70,17 @@ where
         }
     }
 
-    /// Create an engine with explicit event log and handler queue backends.
+    /// Create an engine with explicit event log and reactor queue backends.
     pub fn with_backends(
         deps: D,
         log: Arc<dyn EventLog>,
-        queue: Arc<dyn HandlerQueue>,
+        queue: Arc<dyn ReactorQueue>,
     ) -> Self {
         Self {
             log,
             queue,
             deps: Arc::new(deps),
-            handlers: Arc::new(HandlerRegistry::new()),
+            reactors: Arc::new(ReactorRegistry::new()),
             aggregators: Arc::new(AggregatorRegistry::new()),
             upcasters: Arc::new(UpcasterRegistry::new()),
             snapshot_every: None,
@@ -147,77 +147,77 @@ where
         self
     }
 
-    /// Supply a single backend that implements both `EventLog` and `HandlerQueue`.
+    /// Supply a single backend that implements both `EventLog` and `ReactorQueue`.
     ///
     /// Convenience for stores (like `MemoryStore` or `PostgresStore`) that
     /// handle both responsibilities in one type.
-    pub fn with_store<S: EventLog + HandlerQueue + 'static>(mut self, store: Arc<S>) -> Self {
+    pub fn with_store<S: EventLog + ReactorQueue + 'static>(mut self, store: Arc<S>) -> Self {
         self.log = store.clone();
         self.queue = store;
         self
     }
 
-    /// Register a global DLQ callback that fires when any handler exhausts retries.
+    /// Register a global DLQ callback that fires when any reactor exhausts retries.
     ///
-    /// The callback receives [`DlqTerminalInfo`] with handler and event metadata,
+    /// The callback receives [`DlqTerminalInfo`] with reactor and event metadata,
     /// and returns a serializable event that gets dispatched into the causal chain.
     ///
-    /// Per-handler `on_failure` takes precedence when present.
+    /// Per-reactor `on_failure` takes precedence when present.
     ///
     /// ```ignore
     /// let engine = Engine::in_memory(deps)
     ///     .on_dlq(|info: DlqTerminalInfo| HandlerFailed {
-    ///         handler_id: info.handler_id.clone(),
+    ///         reactor_id: info.reactor_id.clone(),
     ///         error: info.error.clone(),
     ///     });
     /// ```
     pub fn on_dlq<E, F>(mut self, mapper: F) -> Self
     where
         E: crate::event::Event,
-        F: Fn(crate::handler::DlqTerminalInfo) -> E + Send + Sync + 'static,
+        F: Fn(crate::reactor::DlqTerminalInfo) -> E + Send + Sync + 'static,
     {
         self.global_dlq_mapper = Some(Arc::new(move |info| {
-            let failed_handler_id = info.handler_id.clone();
+            let failed_reactor_id = info.reactor_id.clone();
             let event = mapper(info);
             Ok(crate::EmittedEvent {
                 durable_name: event.durable_name().to_string(),
                 event_prefix: E::event_prefix().to_string(),
                 persistent: !E::is_ephemeral(),
                 payload: serde_json::to_value(&event)?,
-                handler_id: Some(failed_handler_id),
+                reactor_id: Some(failed_reactor_id),
                 ephemeral: None,
             })
         }));
         self
     }
 
-    /// Register a handler.
-    pub fn with_handler(mut self, handler: Handler<D>) -> Self {
-        Arc::get_mut(&mut self.handlers)
-            .expect("Cannot add handler after cloning")
-            .register(handler);
+    /// Register a reactor.
+    pub fn with_reactor(mut self, reactor: Reactor<D>) -> Self {
+        Arc::get_mut(&mut self.reactors)
+            .expect("Cannot add reactor after cloning")
+            .register(reactor);
         self
     }
 
     /// Register a projection.
     ///
     /// Projections receive ALL events, return `Result<()>`, and run
-    /// sequentially before other handlers.
+    /// sequentially before other reactors.
     pub fn with_projection(mut self, projection: Projection<D>) -> Self {
-        Arc::get_mut(&mut self.handlers)
+        Arc::get_mut(&mut self.reactors)
             .expect("Cannot add projection after cloning")
             .register_projection(projection);
         self
     }
 
-    /// Register multiple handlers.
-    pub fn with_handlers<I>(mut self, handlers: I) -> Self
+    /// Register multiple reactors.
+    pub fn with_reactors<I>(mut self, reactors: I) -> Self
     where
-        I: IntoIterator<Item = Handler<D>>,
+        I: IntoIterator<Item = Reactor<D>>,
     {
-        let registry = Arc::get_mut(&mut self.handlers).expect("Cannot add handlers after cloning");
-        for handler in handlers {
-            registry.register(handler);
+        let registry = Arc::get_mut(&mut self.reactors).expect("Cannot add reactors after cloning");
+        for reactor in reactors {
+            registry.register(reactor);
         }
         self
     }
@@ -246,7 +246,7 @@ where
                 Ok(Arc::new(event))
             }),
         });
-        Arc::get_mut(&mut self.handlers)
+        Arc::get_mut(&mut self.reactors)
             .expect("Cannot add aggregator after cloning")
             .register_codec(codec);
 
@@ -335,7 +335,7 @@ where
     ///     engine.emit_output(output).settled().await?;
     /// }
     /// ```
-    pub fn emit_output(&self, output: crate::handler::EventOutput) -> EmitFuture {
+    pub fn emit_output(&self, output: crate::reactor::EventOutput) -> EmitFuture {
         let engine = self.clone();
         let engine2 = self.clone();
 
@@ -360,18 +360,18 @@ where
         self.queue.status(correlation_id).await
     }
 
-    /// Drive all pending events and handlers to completion.
+    /// Drive all pending events and reactors to completion.
     pub async fn settle(&self) -> Result<()> {
         let executor = JobExecutor::new(
             self.deps.clone(),
             self.queue.clone(),
-            self.handlers.clone(),
+            self.reactors.clone(),
             self.aggregators.clone(),
             self.upcasters.clone(),
             self.global_dlq_mapper.clone(),
         );
         let event_config = EventWorkerConfig::default();
-        let handler_config = HandlerWorkerConfig::default();
+        let handler_config = ReactorWorkerConfig::default();
 
         // In-memory event retry counter (resets on process restart)
         let mut event_attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
@@ -382,7 +382,7 @@ where
         loop {
             let mut processed_any = false;
 
-            // Reclaim stale handlers (running longer than timeout)
+            // Reclaim stale reactors (running longer than timeout)
             self.queue.reclaim_stale().await?;
 
             // ── Phase 1: Read new events from the log ──────────────────
@@ -475,7 +475,7 @@ where
                     }
                 }
 
-                // Process event: match handlers, run projections, build intents
+                // Process event: match reactors, run projections, build intents
                 match executor.process_event_inner(&event, &event_config, skip_projections).await {
                     Ok(commit) => {
                         self.queue.enqueue(commit).await?;
@@ -488,7 +488,7 @@ where
                 }
             }
 
-            // ── Phase 2: Execute handlers ──────────────────────────────
+            // ── Phase 2: Execute reactors ──────────────────────────────
             let mut executions = Vec::new();
             while let Some(mut h) = self.queue.dequeue().await? {
                 // Inject ephemeral from cache
@@ -500,7 +500,7 @@ where
                 processed_any = true;
 
                 // Cancellation checkpoint 2: batch-check unique correlation IDs,
-                // then DLQ cancelled handlers before execution.
+                // then DLQ cancelled reactors before execution.
                 let unique_ids: std::collections::HashSet<Uuid> =
                     executions.iter().map(|e| e.correlation_id).collect();
                 let mut cancelled_ids = std::collections::HashSet::new();
@@ -518,13 +518,13 @@ where
                         info!(
                             correlation_id = %execution.correlation_id,
                             event_id = %execution.event_id,
-                            handler_id = %execution.handler_id,
-                            "DLQ handler: workflow cancelled",
+                            reactor_id = %execution.reactor_id,
+                            "DLQ reactor: workflow cancelled",
                         );
                         self.queue
-                            .resolve(HandlerResolution::DeadLetter(HandlerDlq {
+                            .resolve(ReactorResolution::DeadLetter(ReactorDlq {
                                 event_id: execution.event_id,
-                                handler_id: execution.handler_id.clone(),
+                                reactor_id: execution.reactor_id.clone(),
                                 error: "cancelled".to_string(),
                                 reason: "cancelled".to_string(),
                                 attempts: execution.attempts,
@@ -538,7 +538,7 @@ where
                 }
                 let executions = active_executions;
 
-                // Hydrate cold aggregates before handler execution
+                // Hydrate cold aggregates before reactor execution
                 for aggregate_type in self.aggregators.unique_aggregate_types() {
                     let singleton_key = format!("{}:{}", aggregate_type, Uuid::nil());
                     if !self.aggregators.has_state(&singleton_key) {
@@ -562,7 +562,7 @@ where
                 let handler_futures: Vec<_> = executions
                     .iter()
                     .map(|execution| {
-                        executor.execute_handler(execution.clone(), &handler_config)
+                        executor.execute_reactor(execution.clone(), &handler_config)
                     })
                     .collect();
 
@@ -572,16 +572,16 @@ where
                     handler_results.into_iter().zip(executions)
                 {
                     let event_id = execution_clone.event_id;
-                    let handler_id = execution_clone.handler_id.clone();
+                    let reactor_id = execution_clone.reactor_id.clone();
 
                     match exec_result {
                         Ok(result) => match result.status {
-                            HandlerStatus::Success => {
+                            ReactorStatus::Success => {
                                 // Append emitted events to the log FIRST
                                 let mut new_events = Self::build_new_events(
                                     result.emitted_events,
                                     event_id,
-                                    &handler_id,
+                                    &reactor_id,
                                     execution_clone.correlation_id,
                                     execution_clone.hops,
                                     "",
@@ -589,22 +589,22 @@ where
                                 );
                                 self.append_emitted_events(&mut new_events, &mut ephemerals)
                                     .await?;
-                                // THEN resolve handler
+                                // THEN resolve reactor
                                 self.queue
-                                    .resolve(HandlerResolution::Complete(HandlerCompletion {
+                                    .resolve(ReactorResolution::Complete(ReactorCompletion {
                                         event_id,
-                                        handler_id,
+                                        reactor_id,
                                         result: result.result,
 
                                         log_entries: result.log_entries,
                                     }))
                                     .await?;
                             }
-                            HandlerStatus::Failed { error, attempts } => {
+                            ReactorStatus::Failed { error, attempts } => {
                                 let mut dlq_events = Self::build_new_events(
                                     result.emitted_events,
                                     event_id,
-                                    &handler_id,
+                                    &reactor_id,
                                     execution_clone.correlation_id,
                                     execution_clone.hops,
                                     "-dlq",
@@ -613,9 +613,9 @@ where
                                 self.append_emitted_events(&mut dlq_events, &mut ephemerals)
                                     .await?;
                                 self.queue
-                                    .resolve(HandlerResolution::DeadLetter(HandlerDlq {
+                                    .resolve(ReactorResolution::DeadLetter(ReactorDlq {
                                         event_id,
-                                        handler_id,
+                                        reactor_id,
                                         error,
                                         reason: "failed".to_string(),
                                         attempts,
@@ -624,10 +624,10 @@ where
                                     }))
                                     .await?;
                             }
-                            HandlerStatus::Retry { error, attempts } => {
+                            ReactorStatus::Retry { error, attempts } => {
                                 let mut next_execute_at = chrono::Utc::now();
                                 if let Some(h) =
-                                    executor.handler_registry().find_by_id(&handler_id)
+                                    executor.reactor_registry().find_by_id(&reactor_id)
                                 {
                                     if let Some(base) = h.backoff {
                                         let multiplier =
@@ -639,27 +639,27 @@ where
                                     }
                                 }
                                 self.queue
-                                    .resolve(HandlerResolution::Retry {
+                                    .resolve(ReactorResolution::Retry {
                                         event_id,
-                                        handler_id,
+                                        reactor_id,
                                         error,
                                         new_attempts: attempts + 1,
                                         next_execute_at,
                                     })
                                     .await?;
                             }
-                            HandlerStatus::Timeout => {
+                            ReactorStatus::Timeout => {
                                 let dlq_events_raw = self
                                     .build_global_dlq_event(
                                         &execution_clone,
-                                        "Handler execution timed out".to_string(),
+                                        "Reactor execution timed out".to_string(),
                                         "timeout",
                                     )
                                     .unwrap_or_default();
                                 let mut dlq_events = Self::build_new_events(
                                     dlq_events_raw,
                                     event_id,
-                                    &handler_id,
+                                    &reactor_id,
                                     execution_clone.correlation_id,
                                     execution_clone.hops,
                                     "-dlq",
@@ -668,9 +668,9 @@ where
                                 self.append_emitted_events(&mut dlq_events, &mut ephemerals)
                                     .await?;
                                 self.queue
-                                    .resolve(HandlerResolution::DeadLetter(HandlerDlq {
+                                    .resolve(ReactorResolution::DeadLetter(ReactorDlq {
                                         event_id,
-                                        handler_id,
+                                        reactor_id,
                                         error: "timeout".to_string(),
                                         reason: "timeout".to_string(),
                                         attempts: 0,
@@ -692,7 +692,7 @@ where
                             let mut dlq_events = Self::build_new_events(
                                 dlq_events_raw,
                                 event_id,
-                                &handler_id,
+                                &reactor_id,
                                 execution_clone.correlation_id,
                                 execution_clone.hops,
                                 "-dlq",
@@ -701,9 +701,9 @@ where
                             self.append_emitted_events(&mut dlq_events, &mut ephemerals)
                                 .await?;
                             self.queue
-                                .resolve(HandlerResolution::DeadLetter(HandlerDlq {
+                                .resolve(ReactorResolution::DeadLetter(ReactorDlq {
                                     event_id,
-                                    handler_id,
+                                    reactor_id,
                                     error: error_str,
                                     reason: "settle_handler_error".to_string(),
                                     attempts: 0,
@@ -738,13 +738,13 @@ where
     /// Try to build a DLQ event using the global mapper.
     fn build_global_dlq_event(
         &self,
-        execution: &QueuedHandler,
+        execution: &QueuedReactor,
         error: String,
         reason: &str,
     ) -> Option<Vec<crate::types::EmittedEvent>> {
         let global = self.global_dlq_mapper.as_ref()?;
-        let info = crate::handler::DlqTerminalInfo {
-            handler_id: execution.handler_id.clone(),
+        let info = crate::reactor::DlqTerminalInfo {
+            reactor_id: execution.reactor_id.clone(),
             source_event_type: execution.event_type.clone(),
             source_event_id: execution.event_id,
             error,
@@ -754,8 +754,8 @@ where
         };
         match global(info) {
             Ok(mut emitted) => {
-                if emitted.handler_id.is_none() {
-                    emitted.handler_id = Some(execution.handler_id.clone());
+                if emitted.reactor_id.is_none() {
+                    emitted.reactor_id = Some(execution.reactor_id.clone());
                 }
                 Some(vec![emitted])
             }
@@ -888,7 +888,7 @@ where
                 Ok(Arc::new(event))
             }),
         });
-        self.handlers.register_codec(codec);
+        self.reactors.register_codec(codec);
 
         let event_id = Uuid::new_v4();
         let correlation_id = correlation_id_override.unwrap_or_else(Uuid::new_v4);
@@ -941,11 +941,11 @@ where
 
     async fn publish_output(
         &self,
-        output: crate::handler::EventOutput,
+        output: crate::reactor::EventOutput,
         correlation_id_override: Option<Uuid>,
     ) -> Result<ProcessHandle> {
         if let Some(codec) = &output.codec {
-            self.handlers.register_codec(codec.clone());
+            self.reactors.register_codec(codec.clone());
         }
 
         let event_id = Uuid::new_v4();
@@ -1077,7 +1077,7 @@ where
     fn build_new_events(
         emitted: Vec<EmittedEvent>,
         event_id: Uuid,
-        handler_id: &str,
+        reactor_id: &str,
         correlation_id: Uuid,
         parent_hops: i32,
         id_infix: &str,
@@ -1091,7 +1091,7 @@ where
                     &NAMESPACE_CAUSAL,
                     format!(
                         "{}-{}{}-{}-{}",
-                        event_id, handler_id, id_infix, e.durable_name, idx
+                        event_id, reactor_id, id_infix, e.durable_name, idx
                     )
                     .as_bytes(),
                 );
@@ -1103,12 +1103,12 @@ where
                     serde_json::Value::Number((parent_hops + 1).into()),
                 );
                 metadata.insert(
-                    "_handler_id".to_string(),
-                    serde_json::Value::String(handler_id.to_string()),
+                    "_reactor_id".to_string(),
+                    serde_json::Value::String(reactor_id.to_string()),
                 );
-                if let Some(ref hid) = e.handler_id {
+                if let Some(ref hid) = e.reactor_id {
                     metadata.insert(
-                        "handler_id".to_string(),
+                        "reactor_id".to_string(),
                         serde_json::Value::String(hid.clone()),
                     );
                 }
@@ -1141,7 +1141,7 @@ where
             log: self.log.clone(),
             queue: self.queue.clone(),
             deps: self.deps.clone(),
-            handlers: self.handlers.clone(),
+            reactors: self.reactors.clone(),
             aggregators: self.aggregators.clone(),
             upcasters: self.upcasters.clone(),
             snapshot_every: self.snapshot_every,

@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-Causal is a **Postgres-backed distributed worker pool** with event-driven handlers, not a distributed system in the traditional sense (like Kafka, Akka, or microservices). It's comparable to Sidekiq, Celery, or BullMQ but with an event-driven programming model.
+Causal is a **Postgres-backed distributed worker pool** with event-driven reactors, not a distributed system in the traditional sense (like Kafka, Akka, or microservices). It's comparable to Sidekiq, Celery, or BullMQ but with an event-driven programming model.
 
 **Current capabilities:**
 - ✅ Multi-worker deployment (horizontal scaling to ~500 workers)
@@ -33,7 +33,7 @@ Causal is a **Postgres-backed distributed worker pool** with event-driven handle
 
 ### What Causal Actually Is
 
-Causal is a **centralized task queue with event-driven handlers**:
+Causal is a **centralized task queue with event-driven reactors**:
 
 ```
 ┌─────────────────────────────────────┐
@@ -44,7 +44,7 @@ Causal is a **centralized task queue with event-driven handlers**:
 │  Worker 3 ┘    (pg_notify)          │
 │                                     │
 │  ┌──────────┐  ┌──────────┐       │
-│  │ Handler  │  │ Handler  │       │
+│  │ Reactor  │  │ Reactor  │       │
 │  │  Pool    │  │  Pool    │       │
 │  └──────────┘  └──────────┘       │
 └─────────────────────────────────────┘
@@ -82,7 +82,7 @@ Causal is a **centralized task queue with event-driven handlers**:
 |---------|--------|----------|
 | Workflow DSL | ❌ No | ✅ Yes |
 | Long-running sagas | ⚠️ Manual | ✅ Built-in |
-| Timeouts/retries | ⚠️ Per-handler | ✅ Workflow-level |
+| Timeouts/retries | ⚠️ Per-reactor | ✅ Workflow-level |
 | Versioning | ❌ No | ✅ Yes |
 | Multi-service | ❌ No | ✅ Yes |
 | Simplicity | ✅ High | ❌ Low |
@@ -127,15 +127,15 @@ The design assumes:
 
 #### 4. **No Service Boundaries**
 
-All handlers in same system, same Postgres instance:
+All reactors in same system, same Postgres instance:
 
 ```rust
 // All tightly coupled in one Engine
 let engine = Engine::new(deps, store)
-    .with_handlers(handlers![
-        order_handlers::handlers(),
-        payment_handlers::handlers(),
-        shipping_handlers::handlers(),
+    .with_reactors(reactors![
+        order_handlers::reactors(),
+        payment_handlers::reactors(),
+        shipping_handlers::reactors(),
     ]);
 ```
 
@@ -241,26 +241,26 @@ struct Deps {
 
 #### 1.2 Document Transaction Boundaries
 
-Add clear section explaining when handlers run in which transaction:
+Add clear section explaining when reactors run in which transaction:
 
-**Inline Handlers (Default):**
+**Inline Reactors (Default):**
 ```rust
 engine.dispatch(OrderPlaced { id: 123 }).await?;
 // ↓ [Transaction begins]
-// ↓ Handler executes
+// ↓ Reactor executes
 // ↓ Emits OrderShipped (inserted in same TX)
 // ↓ [Transaction commits - atomic]
 ```
 
-**Background Handlers:**
+**Background Reactors:**
 ```rust
-#[handler(on = PaymentRequested, retry = 3, queued)]
+#[reactor(on = PaymentRequested, retry = 3, queued)]
 async fn charge_payment(...) { }
 
 // 1. Event inserted into queue (transaction A)
 // 2. Worker picks up event
 // 3. [Transaction B begins]
-// 4. Handler executes
+// 4. Reactor executes
 // 5. Emits new events (same TX B)
 // 6. [Transaction B commits]
 ```
@@ -277,8 +277,8 @@ async fn charge_payment(...) { }
 | External storage | ✅ | ✅ | DB, Redis, etc. |
 | `Arc<Mutex>` in deps | ✅ | ❌ | Dev only |
 | **Execution** |
-| Inline handlers | ✅ | ✅ | Same transaction |
-| Background handlers | ✅ | ✅ | Queued, retryable |
+| Inline reactors | ✅ | ✅ | Same transaction |
+| Background reactors | ✅ | ✅ | Queued, retryable |
 | Horizontal scaling | ❌ | ✅ | Add workers |
 | **Reliability** |
 | Survives crashes | ⚠️ | ✅ | Durable queue |
@@ -295,22 +295,22 @@ async fn charge_payment(...) { }
 
 **Current:**
 ```rust
-#[handler(on = Event, retry = 3)]  // Silently becomes background
-async fn handler(...) { }
+#[reactor(on = Event, retry = 3)]  // Silently becomes background
+async fn reactor(...) { }
 ```
 
 **Proposed:**
 ```rust
 // Explicit inline (default)
-#[handler(on = Event)]
+#[reactor(on = Event)]
 async fn fast_handler(...) { }
 
 // Explicit background - MUST add queued
-#[handler(on = Event, queued, retry = 3)]
+#[reactor(on = Event, queued, retry = 3)]
 async fn slow_handler(...) { }
 
 // Compile error if mixing
-#[handler(on = Event, inline, retry = 3)]  // ❌ ERROR
+#[reactor(on = Event, inline, retry = 3)]  // ❌ ERROR
 async fn bad_handler(...) { }
 ```
 
@@ -326,14 +326,14 @@ fn parse_effect_args(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<EffectA
     if args.inline && effect_requires_background(&args) {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "inline handlers cannot use retry, timeout, delay, or priority (use queued instead)",
+            "inline reactors cannot use retry, timeout, delay, or priority (use queued instead)",
         ));
     }
 
     if effect_requires_background(&args) && !args.queued {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "handlers with retry/timeout/delay/priority must be explicitly marked 'queued'",
+            "reactors with retry/timeout/delay/priority must be explicitly marked 'queued'",
         ));
     }
 
@@ -443,7 +443,7 @@ impl<D: DistributedSafe> Engine<D> {
 pub trait HandlerContext<D> {
     // Existing
     fn deps(&self) -> &D;
-    fn handler_id(&self) -> Uuid;
+    fn reactor_id(&self) -> Uuid;
     fn idempotency_key(&self) -> String;
     fn correlation_id(&self) -> Uuid;
     fn event_id(&self) -> Uuid;
@@ -463,7 +463,7 @@ pub enum ExecutionMode {
 #### 4.2 Usage Examples
 
 ```rust
-#[handler(on = Event)]
+#[reactor(on = Event)]
 async fn adaptive_handler(event: Event, ctx: Ctx) -> Result<NextEvent> {
     let timeout = match ctx.execution_mode() {
         ExecutionMode::Inline => Duration::from_secs(1),
@@ -485,7 +485,7 @@ examples/
 ├── single-process/
 │   ├── simple-pipeline/
 │   ├── in-memory-state/          # Arc<Mutex> - dev only
-│   └── inline-handlers/
+│   └── inline-reactors/
 ├── distributed/
 │   ├── event-threaded-state/
 │   ├── external-state/
@@ -507,13 +507,13 @@ examples/
 
 **Key Insight:** Kafka support should be a **backend implementation detail**, not a user-facing API change.
 
-**Design Principle:** Handlers remain unchanged. Only Engine construction differs.
+**Design Principle:** Reactors remain unchanged. Only Engine construction differs.
 
 ### User-Facing API (Stays Identical)
 
 ```rust
-// Handlers don't change AT ALL
-#[handler(on = OrderPlaced, queued, retry = 3)]
+// Reactors don't change AT ALL
+#[reactor(on = OrderPlaced, queued, retry = 3)]
 async fn process_order(event: OrderPlaced, ctx: HandlerContext<Deps>) -> Result<OrderShipped> {
     ctx.deps().db.insert_order(&event).await?;
     Ok(OrderShipped { order_id: event.order_id })
@@ -523,14 +523,14 @@ async fn process_order(event: OrderPlaced, ctx: HandlerContext<Deps>) -> Result<
 // Postgres backend (default)
 let engine = Engine::new(deps, PostgresStore::new(pool));
 
-// Kafka backend (same handler API!)
+// Kafka backend (same reactor API!)
 let engine = Engine::new(deps, KafkaStore::new(kafka_config, state_pool));
 
 // Redis Streams backend (future)
 let engine = Engine::new(deps, RedisStore::new(redis_config, state_pool));
 ```
 
-**Zero handler code changes** when switching backends.
+**Zero reactor code changes** when switching backends.
 
 ### Architecture Comparison
 
@@ -676,11 +676,11 @@ impl Store for KafkaStore {
 
 ### What Changes vs What Stays Same
 
-#### ✅ **Handlers Stay Identical**
+#### ✅ **Reactors Stay Identical**
 
 ```rust
 // This code NEVER changes regardless of backend
-#[handler(on = RowParsed, accumulate)]
+#[reactor(on = RowParsed, accumulate)]
 async fn bulk_insert(batch: Vec<RowParsed>, ctx: Ctx) -> Result<BatchInserted> {
     ctx.deps().db.bulk_insert(&batch).await?;
     Ok(BatchInserted { count: batch.len() })
@@ -767,12 +767,12 @@ KafkaStore:     ~1M+ events/sec
 
 ```rust
 // Accumulate pattern requires queryable state
-#[handler(on = RowParsed, accumulate)]
+#[reactor(on = RowParsed, accumulate)]
 async fn bulk_insert(batch: Vec<RowParsed>, ctx: Ctx) -> Result<BatchInserted> {
     // Kafka is a log, not a database
     // Can't efficiently query: "give me all events for batch_id X"
 
-    // Join state, idempotency, handler tracking all need Postgres/Redis
+    // Join state, idempotency, reactor tracking all need Postgres/Redis
     ctx.deps().db.bulk_insert(&batch).await?;
     Ok(BatchInserted { count: batch.len() })
 }
@@ -806,7 +806,7 @@ Even with KafkaStore, you need Postgres (or Redis) for:
 engine.dispatch(OrderPlaced { id: 123 }).await?;
   ↓ [Single Postgres Transaction]
   ↓ Insert event into queue
-  ↓ Handler runs (inline)
+  ↓ Reactor runs (inline)
   ↓ Insert OrderShipped into queue
   ↓ [Commit - all or nothing]
 ```
@@ -817,7 +817,7 @@ engine.dispatch(OrderPlaced { id: 123 }).await?;
   ↓ [Kafka write - committed]
   ↓ Worker picks up (async)
   ↓ [Separate transaction]
-  ↓ Handler runs
+  ↓ Reactor runs
   ↓ [Another Kafka write]
 
 // Can't guarantee atomicity across Kafka + Postgres
@@ -830,7 +830,7 @@ engine.dispatch(OrderPlaced { id: 123 }).await?;
 - ✅ Throughput < 50k events/sec
 - ✅ Workers < 500
 - ✅ Single datacenter
-- ✅ Need strong consistency (atomic dispatch+handler)
+- ✅ Need strong consistency (atomic dispatch+reactor)
 - ✅ Want operational simplicity
 - ✅ Small team / startup
 
@@ -877,7 +877,7 @@ let order_engine = Engine::new(
     PostgresStore::new(order_db),
 );
 
-#[handler(on = OrderPlaced)]
+#[reactor(on = OrderPlaced)]
 async fn process_order_internal(event: OrderPlaced, ctx: Ctx) -> Result<OrderProcessed> {
     // Internal processing
     ctx.deps().db.insert_order(&event).await?;
@@ -916,7 +916,7 @@ ctx.deps().kafka_consumer.subscribe("order-events");
 
 ### Week 2: Execution Mode
 - [ ] Add `inline` attribute to macro
-- [ ] Make `queued` required for background handlers
+- [ ] Make `queued` required for background reactors
 - [ ] Add compile-time enforcement
 - [ ] Update all examples
 
@@ -945,13 +945,13 @@ ctx.deps().kafka_consumer.subscribe("order-events");
 
 ### Required Code Changes
 
-1. **Add `queued` to background handlers:**
+1. **Add `queued` to background reactors:**
 ```rust
 // Before
-#[handler(on = Event, retry = 3)]
+#[reactor(on = Event, retry = 3)]
 
 // After
-#[handler(on = Event, queued, retry = 3)]
+#[reactor(on = Event, queued, retry = 3)]
 ```
 
 2. **Use `DistributedSafe` for multi-worker:**

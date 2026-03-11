@@ -1,29 +1,29 @@
 ---
-title: "feat: Handler describe() for flow UI introspection"
+title: "feat: Reactor describe() for flow UI introspection"
 type: feat
 date: 2026-03-06
 ---
 
-# feat: Handler `.describe()` for flow UI introspection
+# feat: Reactor `.describe()` for flow UI introspection
 
 ## Overview
 
 Add an optional `.describe()` method to `FilteredHandlerBuilder` that returns a typed
-struct (`T: Serialize`) representing the handler's gate status. The output is serialized
-to JSON, persisted to the Store per `(correlation_id, handler_id)`, and queryable by
-external UIs for rendering per-handler progress on flow visualization nodes.
+struct (`T: Serialize`) representing the reactor's gate status. The output is serialized
+to JSON, persisted to the Store per `(correlation_id, reactor_id)`, and queryable by
+external UIs for rendering per-reactor progress on flow visualization nodes.
 
 ## Problem Statement
 
-Filtered handlers in causal use opaque closures (`Fn(&E, &Context<D>) -> bool`) as
+Filtered reactors in causal use opaque closures (`Fn(&E, &Context<D>) -> bool`) as
 gates. There is no way for an admin UI or flow visualization to ask "how close is this
-handler to opening?" without hardcoding domain knowledge about each gate. Adding a
-handler or changing a gate requires matching frontend changes.
+reactor to opening?" without hardcoding domain knowledge about each gate. Adding a
+reactor or changing a gate requires matching frontend changes.
 
 ## Proposed Solution
 
 A generic `describe()` builder method that co-locates gate progress reporting with the
-filter itself. The handler declares its own progress shape — the UI renders whatever it
+filter itself. The reactor declares its own progress shape — the UI renders whatever it
 gets. No domain coupling.
 
 ```rust
@@ -52,43 +52,43 @@ let descriptions = store.get_handler_descriptions(correlation_id).await?;
 ## Key Decisions
 
 - **Describe returns `T: Serialize`, not `serde_json::Value`** — user code stays typed, causal serializes internally.
-- **Runs during `execute_event`** — after aggregates update, while iterating matching handlers to create intents. NOT during `execute_handler`.
+- **Runs during `execute_event`** — after aggregates update, while iterating matching reactors to create intents. NOT during `execute_handler`.
 - **Persisted to Store** — external UIs query the Store directly, no coupling to the live Engine process.
-- **Merge semantics** — `set_handler_descriptions` upserts per `(correlation_id, handler_id)`. A flow with 5 gated handlers triggered by different event types shows all 5 simultaneously.
+- **Merge semantics** — `set_handler_descriptions` upserts per `(correlation_id, reactor_id)`. A flow with 5 gated reactors triggered by different event types shows all 5 simultaneously.
 - **Errors are non-fatal** — describe panics are caught with `catch_unwind`, serialize failures logged as warnings. Never fail `execute_event` because of describe.
 - **Context-only signature** — `describe` receives `&Context<D>`, not the event. Purpose is aggregate-level gate progress, not per-event detail.
 - **FilteredHandlerBuilder only** — expand to other builders later if needed.
 - **No initial seeding** — UI handles missing descriptions gracefully.
-- **Upsert latest, no history** — Store overwrites per handler per correlation.
+- **Upsert latest, no history** — Store overwrites per reactor per correlation.
 
 ## Acceptance Criteria
 
 - [x] `FilteredHandlerBuilder` has a `.describe()` method accepting `Fn(&Context<D>) -> T` where `T: Serialize`
-- [x] `Handler<D>` stores describe as `Option<Arc<dyn Fn(&Context<D>) -> serde_json::Value + Send + Sync>>`
-- [x] `execute_event` calls describe for matching handlers, collects results into `EventCommit`
+- [x] `Reactor<D>` stores describe as `Option<Arc<dyn Fn(&Context<D>) -> serde_json::Value + Send + Sync>>`
+- [x] `execute_event` calls describe for matching reactors, collects results into `EventCommit`
 - [x] Engine persists describe results via `store.set_handler_descriptions()` after `complete_event`
 - [x] Store trait has `set_handler_descriptions` and `get_handler_descriptions` with default no-ops
 - [x] MemoryStore implements both methods
 - [x] Describe panics and serialize failures are caught and logged, never crash the settle loop
-- [x] Handlers without `.describe()` are unaffected (describe field is `None`)
+- [x] Reactors without `.describe()` are unaffected (describe field is `None`)
 - [x] `cargo test` passes with no regressions
 
 ## MVP
 
-### 1. `handler/types.rs` — Handler struct
+### 1. `reactor/types.rs` — Reactor struct
 
 Add `describe` field and accessors.
 
 ```rust
-// crates/causal/src/handler/types.rs
+// crates/causal/src/reactor/types.rs
 
-// In Handler<D> struct, after `priority`:
+// In Reactor<D> struct, after `priority`:
 pub(crate) describe: Option<Arc<dyn Fn(&Context<D>) -> serde_json::Value + Send + Sync>>,
 
 // In Clone impl, after priority:
 describe: self.describe.clone(),
 
-// New methods on impl<D> Handler<D>:
+// New methods on impl<D> Reactor<D>:
 pub fn has_describe(&self) -> bool {
     self.describe.is_some()
 }
@@ -98,19 +98,19 @@ pub fn call_describe(&self, ctx: &Context<D>) -> Option<serde_json::Value> {
 }
 ```
 
-**5 `Handler { .. }` literals need `describe: None`:**
+**5 `Reactor { .. }` literals need `describe: None`:**
 - `JoinHandlerBuilder::then()` (line ~448)
 - `HandlerBuilder<Typed<E>, Filter, Started>::then()` (line ~566)
 - `HandlerBuilder<Untyped, NoFilter, NoStarted>::then()` (line ~610)
 - `HandlerBuilder<Untyped, NoFilter, WithStarted>::then()` (line ~655)
 - `TransitionHandlerBuilder::then()` (line ~848)
 
-### 2. `handler/builders.rs` — FilteredHandlerBuilder
+### 2. `reactor/builders.rs` — FilteredHandlerBuilder
 
 Add `describe` field and builder method.
 
 ```rust
-// crates/causal/src/handler/builders.rs
+// crates/causal/src/reactor/builders.rs
 
 // Add field to FilteredHandlerBuilder:
 pub struct FilteredHandlerBuilder<E, Started, D, G> {
@@ -141,8 +141,8 @@ where
     }
 }
 
-// In FilteredHandlerBuilder::then(), pass describe_fn to Handler:
-Handler {
+// In FilteredHandlerBuilder::then(), pass describe_fn to Reactor:
+Reactor {
     // ... existing fields ...
     describe: self.describe_fn,
 }
@@ -177,10 +177,10 @@ pub struct EventCommit {
 
 // Add two new optional methods with default no-ops:
 
-/// Upsert handler gate descriptions for a correlation.
+/// Upsert reactor gate descriptions for a correlation.
 ///
 /// Merges `descriptions` into any existing entries for `correlation_id`.
-/// Each key is a handler ID, each value is the serialized describe output.
+/// Each key is a reactor ID, each value is the serialized describe output.
 async fn set_handler_descriptions(
     &self,
     _correlation_id: Uuid,
@@ -189,7 +189,7 @@ async fn set_handler_descriptions(
     Ok(())
 }
 
-/// Read all handler gate descriptions for a correlation.
+/// Read all reactor gate descriptions for a correlation.
 async fn get_handler_descriptions(
     &self,
     _correlation_id: Uuid,
@@ -233,7 +233,7 @@ async fn get_handler_descriptions(
 
 ### 6. `job_executor.rs` — execute_event
 
-Call describe for matching handlers during event processing.
+Call describe for matching reactors during event processing.
 
 ```rust
 // crates/causal/src/job_executor.rs
@@ -241,25 +241,25 @@ Call describe for matching handlers during event processing.
 // In execute_event(), after matching_handlers (line ~110), before building intents:
 
 let mut handler_descriptions = std::collections::HashMap::new();
-for handler in &matching_handlers {
-    if handler.has_describe() {
+for reactor in &matching_handlers {
+    if reactor.has_describe() {
         let ctx = self.make_context(
-            handler.id.clone(),
-            format!("describe::{}", handler.id),
+            reactor.id.clone(),
+            format!("describe::{}", reactor.id),
             event.correlation_id,
             event.event_id,
             event.parent_id,
         );
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handler.call_describe(&ctx)
+            reactor.call_describe(&ctx)
         })) {
             Ok(Some(value)) => {
-                handler_descriptions.insert(handler.id.clone(), value);
+                handler_descriptions.insert(reactor.id.clone(), value);
             }
-            Ok(None) => {} // no describe on this handler
+            Ok(None) => {} // no describe on this reactor
             Err(_) => {
                 tracing::warn!(
-                    handler_id = %handler.id,
+                    reactor_id = %reactor.id,
                     "describe() panicked, skipping"
                 );
             }
@@ -290,7 +290,7 @@ match executor.execute_event(&event, &event_config).await {
             ).await {
                 tracing::warn!(
                     correlation_id = %commit.correlation_id,
-                    "Failed to persist handler descriptions: {}",
+                    "Failed to persist reactor descriptions: {}",
                     e
                 );
             }
@@ -305,32 +305,32 @@ match executor.execute_event(&event, &event_config).await {
 
 ## Testing Strategy
 
-### Unit tests (`handler/builders.rs`)
+### Unit tests (`reactor/builders.rs`)
 
 ```rust
-// crates/causal/src/handler/builders.rs (tests module)
+// crates/causal/src/reactor/builders.rs (tests module)
 
 #[test]
 fn describe_stores_closure_on_handler() {
-    let handler = on::<QueueEvent>()
+    let reactor = on::<QueueEvent>()
         .id("described")
         .filter(|_event, _ctx: &Context<Deps>| true)
         .describe(|_ctx: &Context<Deps>| serde_json::json!({"ready": true}))
         .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move {
             Ok(crate::events![])
         });
-    assert!(handler.has_describe());
+    assert!(reactor.has_describe());
 }
 
 #[test]
 fn handler_without_describe_has_none() {
-    let handler = on::<QueueEvent>()
+    let reactor = on::<QueueEvent>()
         .id("no_describe")
         .filter(|_event, _ctx: &Context<Deps>| true)
         .then(|_event: Arc<QueueEvent>, _ctx: Context<Deps>| async move {
             Ok(crate::events![])
         });
-    assert!(!handler.has_describe());
+    assert!(!reactor.has_describe());
 }
 ```
 
@@ -341,8 +341,8 @@ fn handler_without_describe_has_none() {
 
 #[tokio::test]
 async fn describe_output_persisted_to_store() {
-    // 1. Build engine with a filtered handler that has .describe()
-    // 2. Emit an event that matches the handler
+    // 1. Build engine with a filtered reactor that has .describe()
+    // 2. Emit an event that matches the reactor
     // 3. Settle
     // 4. Query store.get_handler_descriptions(correlation_id)
     // 5. Assert the description JSON matches expected shape
@@ -350,27 +350,27 @@ async fn describe_output_persisted_to_store() {
 
 #[tokio::test]
 async fn describe_merges_across_events() {
-    // 1. Build engine with two filtered handlers for different event types, both with .describe()
-    // 2. Emit event A (matches handler 1)
-    // 3. Emit event B (matches handler 2)
+    // 1. Build engine with two filtered reactors for different event types, both with .describe()
+    // 2. Emit event A (matches reactor 1)
+    // 3. Emit event B (matches reactor 2)
     // 4. Settle
     // 5. Query descriptions — both should be present
 }
 
 #[tokio::test]
 async fn describe_panic_does_not_crash_settle() {
-    // 1. Build engine with a handler whose describe panics
+    // 1. Build engine with a reactor whose describe panics
     // 2. Emit matching event
     // 3. Settle should succeed
-    // 4. Handler should still run (filter + then still work)
+    // 4. Reactor should still run (filter + then still work)
 }
 ```
 
 ## References
 
-- Brainstorm: `docs/brainstorms/2026-03-06-handler-describe-brainstorm.md`
-- Handler builders: `crates/causal/src/handler/builders.rs`
-- Handler types: `crates/causal/src/handler/types.rs`
+- Brainstorm: `docs/brainstorms/2026-03-06-reactor-describe-brainstorm.md`
+- Reactor builders: `crates/causal/src/reactor/builders.rs`
+- Reactor types: `crates/causal/src/reactor/types.rs`
 - Job executor: `crates/causal/src/job_executor.rs`
 - Store trait: `crates/causal/src/store.rs`
 - Memory store: `crates/causal/src/memory_store.rs`

@@ -33,10 +33,10 @@ Same process. Same code path. Same `apply()` function. The mode determines wheth
 
 `ProjectionStream` does NOT replace causal's inline `project("id").then()` projections. They serve different purposes:
 
-- **`project().then()`** — runs inline during event processing, sequentially before handlers. Guarantees read-your-writes within the same causal chain. Required when handlers read graph state projected by earlier events in the same dispatch cycle.
+- **`project().then()`** — runs inline during event processing, sequentially before reactors. Guarantees read-your-writes within the same causal chain. Required when reactors read graph state projected by earlier events in the same dispatch cycle.
 - **`ProjectionStream`** — runs independently, reads from EventLog asynchronously. For rebuild/replay of external read models. Small latency gap between event insertion and projection.
 
-In rootsignal, handlers read graph state projected by earlier events in the same causal chain (e.g., enrichment reads signal nodes projected from events emitted by dedup). Inline projections handle this. `ProjectionStream` handles full graph rebuilds via `REPLAY=1`.
+In rootsignal, reactors read graph state projected by earlier events in the same causal chain (e.g., enrichment reads signal nodes projected from events emitted by dedup). Inline projections handle this. `ProjectionStream` handles full graph rebuilds via `REPLAY=1`.
 
 ## App Code
 
@@ -243,7 +243,7 @@ Replay always writes to `staged`. Promotion copies `staged` → `active`. The `p
 
 ### Inline projections are still needed
 
-`ProjectionStream` does NOT replace `project().then()` in causal core. Handlers that read graph state within the same causal chain require inline projections for read-your-writes guarantees. `ProjectionStream` is for async rebuild/replay only.
+`ProjectionStream` does NOT replace `project().then()` in causal core. Reactors that read graph state within the same causal chain require inline projections for read-your-writes guarantees. `ProjectionStream` is for async rebuild/replay only.
 
 ### Idempotent projections are a hard requirement
 

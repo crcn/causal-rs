@@ -132,27 +132,27 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
         Ok(AdminCausalFlow { events })
     }
 
-    /// Fetch handler logs for a specific event + handler.
+    /// Fetch reactor logs for a specific event + reactor.
     async fn admin_handler_logs(
         &self,
         ctx: &Context<'_>,
         event_id: String,
-        handler_id: String,
-    ) -> Result<Vec<HandlerLog>> {
+        reactor_id: String,
+    ) -> Result<Vec<ReactorLog>> {
         let pool = ctx.data::<sqlx::PgPool>()?;
 
         let event_uuid = Uuid::parse_str(&event_id)
             .map_err(|e| async_graphql::Error::new(format!("Invalid event_id: {e}")))?;
 
-        let rows = crate::queries::handler_logs(pool, &event_uuid, &handler_id)
+        let rows = crate::queries::handler_logs(pool, &event_uuid, &reactor_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("Failed to load handler logs: {e}")))?;
+            .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor logs: {e}")))?;
 
         Ok(rows
             .into_iter()
-            .map(|r| HandlerLog {
+            .map(|r| ReactorLog {
                 event_id: event_id.clone(),
-                handler_id: handler_id.clone(),
+                reactor_id: reactor_id.clone(),
                 level: r.level,
                 message: r.message,
                 data: r.data,
@@ -161,23 +161,23 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
             .collect())
     }
 
-    /// Fetch all handler logs for a run.
+    /// Fetch all reactor logs for a run.
     async fn admin_handler_logs_by_run(
         &self,
         ctx: &Context<'_>,
         run_id: String,
-    ) -> Result<Vec<HandlerLog>> {
+    ) -> Result<Vec<ReactorLog>> {
         let pool = ctx.data::<sqlx::PgPool>()?;
 
         let rows = crate::queries::handler_logs_by_run(pool, &run_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("Failed to load handler logs: {e}")))?;
+            .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor logs: {e}")))?;
 
         Ok(rows
             .into_iter()
-            .map(|r| HandlerLog {
+            .map(|r| ReactorLog {
                 event_id: r.event_id.to_string(),
-                handler_id: r.handler_id,
+                reactor_id: r.reactor_id,
                 level: r.level,
                 message: r.message,
                 data: r.data,
@@ -186,43 +186,43 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
             .collect())
     }
 
-    /// Fetch handler describe() blocks for a run.
-    async fn admin_handler_descriptions(
+    /// Fetch reactor describe() blocks for a run.
+    async fn admin_reactor_descriptions(
         &self,
         ctx: &Context<'_>,
         run_id: String,
-    ) -> Result<Vec<HandlerDescription>> {
+    ) -> Result<Vec<ReactorDescription>> {
         let pool = ctx.data::<sqlx::PgPool>()?;
 
-        let rows = crate::queries::handler_descriptions(pool, &run_id)
+        let rows = crate::queries::reactor_descriptions(pool, &run_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("Failed to load handler descriptions: {e}")))?;
+            .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor descriptions: {e}")))?;
 
         Ok(rows
             .into_iter()
-            .map(|r| HandlerDescription {
-                handler_id: r.handler_id,
+            .map(|r| ReactorDescription {
+                reactor_id: r.reactor_id,
                 blocks: r.description,
             })
             .collect())
     }
 
-    /// Fetch aggregated handler execution outcomes for a run.
+    /// Fetch aggregated reactor execution outcomes for a run.
     async fn admin_handler_outcomes(
         &self,
         ctx: &Context<'_>,
         run_id: String,
-    ) -> Result<Vec<HandlerOutcome>> {
+    ) -> Result<Vec<ReactorOutcome>> {
         let pool = ctx.data::<sqlx::PgPool>()?;
 
         let rows = crate::queries::handler_outcomes(pool, &run_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("Failed to load handler outcomes: {e}")))?;
+            .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor outcomes: {e}")))?;
 
         Ok(rows
             .into_iter()
-            .map(|r| HandlerOutcome {
-                handler_id: r.handler_id,
+            .map(|r| ReactorOutcome {
+                reactor_id: r.reactor_id,
                 status: r.status,
                 error: r.error,
                 attempts: r.attempts,

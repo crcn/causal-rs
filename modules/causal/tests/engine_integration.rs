@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use causal::aggregator::{Aggregate, Apply};
-use causal::{event, events, handler, Context, Engine, EventLog, Events, HandlerQueue, MemoryStore, NewEvent, Snapshot};
+use causal::{event, events, reactor, Context, Engine, EventLog, Events, ReactorQueue, MemoryStore, NewEvent, Snapshot};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -75,8 +75,8 @@ async fn basic_handler_fires() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -102,14 +102,14 @@ async fn handler_emits_chain() -> Result<()> {
     let b_counter_clone = b_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(handler::on::<EventA>().then(
+        .with_reactor(reactor::on::<EventA>().then(
             |event: Arc<EventA>, _ctx: Context<Deps>| async move {
                 Ok(events![EventB {
                     value: event.value + 1,
                 }])
             },
         ))
-        .with_handler(handler::on::<EventB>().then(
+        .with_reactor(reactor::on::<EventB>().then(
             move |event: Arc<EventB>, _ctx: Context<Deps>| {
                 let c = b_counter_clone.clone();
                 async move {
@@ -133,8 +133,8 @@ async fn multiple_handlers_same_event() -> Result<()> {
     let cb = counter_b.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("ping_handler_a")
                 .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                     let c = ca.clone();
@@ -144,8 +144,8 @@ async fn multiple_handlers_same_event() -> Result<()> {
                     }
                 }),
         )
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("ping_handler_b")
                 .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                     let c = cb.clone();
@@ -173,8 +173,8 @@ async fn queued_handler_executes() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("queued_ping")
             .retry(1)
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -202,8 +202,8 @@ async fn emit_requires_settled() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("queued_fire_forget")
             .retry(1)
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -222,7 +222,7 @@ async fn emit_requires_settled() -> Result<()> {
         })
         .await?;
 
-    // Queued handler has not run yet (no settle)
+    // Queued reactor has not run yet (no settle)
     assert_eq!(counter.load(Ordering::SeqCst), 0);
 
     // Now settle
@@ -233,8 +233,8 @@ async fn emit_requires_settled() -> Result<()> {
 
 #[tokio::test]
 async fn handler_returns_nothing() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
             Ok(events![])
         }),
     );
@@ -256,8 +256,8 @@ async fn retry_succeeds_on_second_attempt() -> Result<()> {
     let ac = attempt_counter.clone();
     let sc = success_counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<FailEvent>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<FailEvent>()
             .id("retry_handler")
             .retry(3)
             .then(move |_event: Arc<FailEvent>, _ctx: Context<Deps>| {
@@ -297,8 +297,8 @@ async fn dlq_terminal_event_published() -> Result<()> {
     let tc = terminal_counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("always_fail")
                 .retry(1)
                 .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
@@ -311,7 +311,7 @@ async fn dlq_terminal_event_published() -> Result<()> {
                     Err::<Events, _>(anyhow::anyhow!("always fails"))
                 }),
         )
-        .with_handler(handler::on::<FailedTerminal>().then(
+        .with_reactor(reactor::on::<FailedTerminal>().then(
             move |_event: Arc<FailedTerminal>, _ctx: Context<Deps>| {
                 let c = tc.clone();
                 async move {
@@ -340,8 +340,8 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
     let sc = seen_correlation.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<EventA>()
+        .with_reactor(
+            reactor::on::<EventA>()
                 .id("emit_b_queued")
                 .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
@@ -350,7 +350,7 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
                     }])
                 }),
         )
-        .with_handler(handler::on::<EventB>().then(
+        .with_reactor(reactor::on::<EventB>().then(
             move |_event: Arc<EventB>, ctx: Context<Deps>| {
                 let sc = sc.clone();
                 async move {
@@ -362,10 +362,10 @@ async fn correlation_preserved_through_queued_chain() -> Result<()> {
 
     let handle = engine.emit(EventA { value: 1 }).settled().await?;
 
-    let seen = seen_correlation.lock().expect("EventB handler should have run");
+    let seen = seen_correlation.lock().expect("EventB reactor should have run");
     assert_eq!(
         seen, handle.correlation_id,
-        "EventB emitted by queued handler must carry the original correlation_id"
+        "EventB emitted by queued reactor must carry the original correlation_id"
     );
     Ok(())
 }
@@ -376,8 +376,8 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
     let sc = seen_correlation.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("always_fail_corr")
                 .retry(1)
                 .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
@@ -390,7 +390,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
                     Err::<Events, _>(anyhow::anyhow!("always fails"))
                 }),
         )
-        .with_handler(handler::on::<FailedTerminal>().then(
+        .with_reactor(reactor::on::<FailedTerminal>().then(
             move |_event: Arc<FailedTerminal>, ctx: Context<Deps>| {
                 let sc = sc.clone();
                 async move {
@@ -407,7 +407,7 @@ async fn dlq_terminal_preserves_correlation() -> Result<()> {
 
     let seen = seen_correlation
         .lock()
-        .expect("FailedTerminal handler should have run");
+        .expect("FailedTerminal reactor should have run");
     assert_eq!(
         seen, handle.correlation_id,
         "DLQ terminal event must carry the original correlation_id"
@@ -420,8 +420,8 @@ async fn ctx_run_executes_side_effect_in_handler() -> Result<()> {
     let captured = Arc::new(Mutex::new(None::<String>));
     let cap = captured.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(move |event: Arc<Ping>, ctx: Context<Deps>| {
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(move |event: Arc<Ping>, ctx: Context<Deps>| {
             let cap = cap.clone();
             async move {
                 let result: String = ctx
@@ -469,7 +469,7 @@ async fn upcaster_transforms_old_event_for_handler() -> Result<()> {
             v["currency"] = serde_json::json!("USD");
             Ok(v)
         })
-        .with_handler(handler::on::<OrderPlaced>().then(
+        .with_reactor(reactor::on::<OrderPlaced>().then(
             move |event: Arc<OrderPlaced>, _ctx: Context<Deps>| {
                 let s = seen_clone.clone();
                 async move {
@@ -480,9 +480,9 @@ async fn upcaster_transforms_old_event_for_handler() -> Result<()> {
         ));
 
     // Emit a "v1" event (no currency field) by serializing manually.
-    // The upcaster should inject "currency": "USD" before the handler sees it.
+    // The upcaster should inject "currency": "USD" before the reactor sees it.
     //
-    // We emit an EventA that the handler won't match, then manually publish
+    // We emit an EventA that the reactor won't match, then manually publish
     // a raw v1-schema OrderPlaced through the engine's internal store.
     // Instead, we can just emit an OrderPlaced WITH the currency field —
     // since schema_version defaults to 0, the upcaster (from_version=1)
@@ -602,8 +602,8 @@ async fn upcaster_chain_in_aggregate_replay() {
 
 #[tokio::test]
 async fn settled_timeout_succeeds_when_fast() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
             Ok(events![])
         }),
     );
@@ -619,8 +619,8 @@ async fn settled_timeout_succeeds_when_fast() -> Result<()> {
 
 #[tokio::test]
 async fn settled_timeout_errors_when_slow() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("slow_handler")
             .retry(1)
             .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
@@ -653,8 +653,8 @@ async fn backoff_retries_handler_with_exponential_delay() -> Result<()> {
     let attempt_times = Arc::new(Mutex::new(Vec::<std::time::Instant>::new()));
     let at = attempt_times.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("backoff_ping")
             .retry(3)
             .backoff(std::time::Duration::from_millis(20))
@@ -791,7 +791,7 @@ async fn engine_without_event_store_identical_behavior() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
-        .with_handler(handler::on::<OrderCreated>().then(
+        .with_reactor(reactor::on::<OrderCreated>().then(
             move |_event: Arc<OrderCreated>, _ctx: Context<Deps>| {
                 let c = c.clone();
                 async move {
@@ -823,7 +823,7 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
-        .with_handler(handler::on::<OrderCreated>().then(
+        .with_reactor(reactor::on::<OrderCreated>().then(
             |event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
                 Ok(events![OrderConfirmed {
                     order_id: event.order_id,
@@ -857,7 +857,7 @@ async fn events_without_aggregator_not_in_stream() -> Result<()> {
     // Ping has no aggregator registered
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
 
@@ -915,7 +915,7 @@ async fn event_metadata_on_non_aggregate_events() -> Result<()> {
         .with_event_metadata(serde_json::json!({
             "run_id": "run-xyz"
         }))
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             |_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) },
         ));
 
@@ -991,8 +991,8 @@ async fn cold_start_hydration() -> Result<()> {
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status == "confirmed" && next.status == "shipped"
@@ -1055,8 +1055,8 @@ async fn transition_guard_works_after_cold_start() -> Result<()> {
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status == "confirmed" && next.status == "shipped"
@@ -1124,8 +1124,8 @@ async fn snapshot_acceleration() -> Result<()> {
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status == "confirmed" && next.status == "shipped"
@@ -1200,7 +1200,7 @@ async fn cross_aggregate_event_persisted_to_multiple_streams() -> Result<()> {
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<CustomerOrderPlaced, Customer, _>(|e| e.customer_id)
-        .with_handler(handler::on::<OrderCreated>().then(
+        .with_reactor(reactor::on::<OrderCreated>().then(
             move |event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
                 Ok(events![CustomerOrderPlaced {
                     customer_id,
@@ -1274,8 +1274,8 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status == "confirmed" && next.status == "shipped"
@@ -1331,8 +1331,8 @@ async fn missing_snapshot_falls_back_to_full_replay() -> Result<()> {
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status == "confirmed" && next.status == "shipped"
@@ -1369,7 +1369,7 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
-        .with_handler(handler::on::<OrderConfirmed>().then(
+        .with_reactor(reactor::on::<OrderConfirmed>().then(
             move |_event: Arc<OrderConfirmed>, _ctx: Context<Deps>| {
                 let cc = cc.clone();
                 async move {
@@ -1461,8 +1461,8 @@ async fn empty_aggregate_access_returns_default() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderCreated>()
+        .with_reactor(
+            reactor::on::<OrderCreated>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     // Default status is "" → next is "created"
@@ -1526,8 +1526,8 @@ async fn large_event_replay_produces_correct_state() -> Result<()> {
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderConfirmed, Order, _>(|e| e.order_id)
         .with_aggregator::<OrderShipped, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderShipped>()
+        .with_reactor(
+            reactor::on::<OrderShipped>()
                 .extract(|e| Some(e.order_id))
                 .transition::<Order, _>(|prev, next| {
                     prev.status == "confirmed" && next.status == "shipped"
@@ -1676,8 +1676,8 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
 
-    let engine2 = engine2.with_handler(
-        handler::on::<OrderConfirmed>()
+    let engine2 = engine2.with_reactor(
+        reactor::on::<OrderConfirmed>()
             .extract(|e| Some(e.order_id))
             .transition::<Order, _>(|prev, next| {
                 prev.status == "created" && next.status == "confirmed"
@@ -1698,8 +1698,8 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
         .settled()
         .await?;
 
-    // Transition handler should fire — proves hydration worked (state was "created" from snapshot)
-    assert_eq!(fired.load(Ordering::SeqCst), 1, "handler should fire from snapshot-hydrated state");
+    // Transition reactor should fire — proves hydration worked (state was "created" from snapshot)
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "reactor should fire from snapshot-hydrated state");
 
     Ok(())
 }
@@ -1855,8 +1855,8 @@ async fn invalidate_aggregate_forces_rehydration() -> Result<()> {
 
 #[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct HandlerDlq {
-    handler_id: String,
+struct ReactorDlq {
+    reactor_id: String,
     source_event_type: String,
     error: String,
     reason: String,
@@ -1881,23 +1881,23 @@ async fn on_dlq_emits_event_on_handler_failure() -> Result<()> {
     let c = counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|info: causal::DlqTerminalInfo| HandlerDlq {
-            handler_id: info.handler_id,
+        .on_dlq(|info: causal::DlqTerminalInfo| ReactorDlq {
+            reactor_id: info.reactor_id,
             source_event_type: info.source_event_type,
             error: info.error,
             reason: info.reason,
             attempts: info.attempts,
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("always_fail_dlq")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("boom"))
                 }),
         )
-        .with_handler(handler::on::<HandlerDlq>().then(
-            move |_event: Arc<HandlerDlq>, _ctx: Context<Deps>| {
+        .with_reactor(reactor::on::<ReactorDlq>().then(
+            move |_event: Arc<ReactorDlq>, _ctx: Context<Deps>| {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -1920,16 +1920,16 @@ async fn on_dlq_receives_correct_info() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             *cap.lock() = Some(info.clone());
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("check_info_handler")
                 .retry(2)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -1940,7 +1940,7 @@ async fn on_dlq_receives_correct_info() -> Result<()> {
     engine.emit(FailEvent { attempt: 0 }).settled().await?;
 
     let info = captured.lock().take().expect("on_dlq should have been called");
-    assert_eq!(info.handler_id, "check_info_handler");
+    assert_eq!(info.reactor_id, "check_info_handler");
     assert_eq!(info.source_event_type, "fail_event");
     assert!(!info.source_event_id.is_nil(), "source_event_id should be a valid UUID");
     assert!(info.error.contains("detailed error"));
@@ -1960,8 +1960,8 @@ async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
         .on_dlq(|info: causal::DlqTerminalInfo| GlobalDlqEvent {
             error: info.error,
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("has_on_failure")
                 .retry(1)
                 .on_failure(|_event: Arc<FailEvent>, info: causal::ErrorContext| {
@@ -1971,7 +1971,7 @@ async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
                     Err::<Events, _>(anyhow::anyhow!("fail"))
                 }),
         )
-        .with_handler(handler::on::<HandlerSpecificFailure>().then(
+        .with_reactor(reactor::on::<HandlerSpecificFailure>().then(
             move |_event: Arc<HandlerSpecificFailure>, _ctx: Context<Deps>| {
                 let sc = sc.clone();
                 async move {
@@ -1980,7 +1980,7 @@ async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
                 }
             },
         ))
-        .with_handler(handler::on::<GlobalDlqEvent>().then(
+        .with_reactor(reactor::on::<GlobalDlqEvent>().then(
             move |_event: Arc<GlobalDlqEvent>, _ctx: Context<Deps>| {
                 let gc = gc.clone();
                 async move {
@@ -1992,7 +1992,7 @@ async fn on_dlq_per_handler_on_failure_takes_precedence() -> Result<()> {
 
     engine.emit(FailEvent { attempt: 0 }).settled().await?;
 
-    assert_eq!(specific_counter.load(Ordering::SeqCst), 1, "per-handler on_failure should fire");
+    assert_eq!(specific_counter.load(Ordering::SeqCst), 1, "per-reactor on_failure should fire");
     assert_eq!(global_counter.load(Ordering::SeqCst), 0, "global on_dlq should NOT fire when on_failure is present");
     Ok(())
 }
@@ -2005,16 +2005,16 @@ async fn on_dlq_fires_on_timeout() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             *cr.lock() = Some(info.reason.clone());
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("timeout_handler")
                 .retry(1)
                 .timeout(std::time::Duration::from_millis(10))
@@ -2037,23 +2037,23 @@ async fn on_dlq_preserves_correlation_id() -> Result<()> {
     let sc = seen_correlation.clone();
 
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|info: causal::DlqTerminalInfo| HandlerDlq {
-            handler_id: info.handler_id,
+        .on_dlq(|info: causal::DlqTerminalInfo| ReactorDlq {
+            reactor_id: info.reactor_id,
             source_event_type: info.source_event_type,
             error: info.error,
             reason: info.reason,
             attempts: info.attempts,
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("corr_fail")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("fail"))
                 }),
         )
-        .with_handler(handler::on::<HandlerDlq>().then(
-            move |_event: Arc<HandlerDlq>, ctx: Context<Deps>| {
+        .with_reactor(reactor::on::<ReactorDlq>().then(
+            move |_event: Arc<ReactorDlq>, ctx: Context<Deps>| {
                 let sc = sc.clone();
                 async move {
                     *sc.lock() = Some(ctx.correlation_id);
@@ -2064,7 +2064,7 @@ async fn on_dlq_preserves_correlation_id() -> Result<()> {
 
     let handle = engine.emit(FailEvent { attempt: 0 }).settled().await?;
 
-    let seen = seen_correlation.lock().expect("HandlerDlq handler should have run");
+    let seen = seen_correlation.lock().expect("ReactorDlq reactor should have run");
     assert_eq!(
         seen, handle.correlation_id,
         "DLQ event must carry the original correlation_id"
@@ -2080,16 +2080,16 @@ async fn on_dlq_not_called_on_success() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             c.fetch_add(1, Ordering::SeqCst);
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("success_handler")
                 .retry(1)
                 .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move {
@@ -2106,8 +2106,8 @@ async fn on_dlq_not_called_on_success() -> Result<()> {
 #[tokio::test]
 async fn engine_without_on_dlq_unchanged() -> Result<()> {
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("no_dlq_handler")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2124,8 +2124,8 @@ async fn engine_without_on_dlq_unchanged() -> Result<()> {
 
 #[tokio::test]
 async fn custom_correlation_id_on_process_handle() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("noop")
             .retry(1)
             .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
@@ -2148,16 +2148,16 @@ async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
     let sc = seen_correlation.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<EventA>()
+        .with_reactor(
+            reactor::on::<EventA>()
                 .id("a_to_b")
                 .retry(1)
                 .then(|event: Arc<EventA>, _ctx: Context<Deps>| async move {
                     Ok(events![EventB { value: event.value }])
                 }),
         )
-        .with_handler(
-            handler::on::<EventB>()
+        .with_reactor(
+            reactor::on::<EventB>()
                 .id("observe_b")
                 .retry(1)
                 .then(
@@ -2179,7 +2179,7 @@ async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
         .await?;
 
     assert_eq!(handle.correlation_id, my_id);
-    let seen = seen_correlation.lock().expect("EventB handler should have run");
+    let seen = seen_correlation.lock().expect("EventB reactor should have run");
     assert_eq!(
         seen, my_id,
         "Child event must inherit the custom correlation_id"
@@ -2189,8 +2189,8 @@ async fn custom_correlation_id_propagates_to_child_events() -> Result<()> {
 
 #[tokio::test]
 async fn omitted_correlation_id_auto_generates() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("noop")
             .retry(1)
             .then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
@@ -2213,8 +2213,8 @@ async fn cancel_prevents_event_processing() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -2228,18 +2228,18 @@ async fn cancel_prevents_event_processing() -> Result<()> {
     engine.cancel(handle.correlation_id).await?;
     engine.settle().await?;
 
-    assert_eq!(counter.load(Ordering::SeqCst), 0, "handler should not fire for cancelled workflow");
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "reactor should not fire for cancelled workflow");
     Ok(())
 }
 
 #[tokio::test]
-async fn cancel_dlqs_pending_handlers() -> Result<()> {
+async fn cancel_dlqs_pending_reactors() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    // Use a queued handler so it goes through poll_next_handler
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>()
+    // Use a queued reactor so it goes through poll_next_handler
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>()
             .id("cancel_dlq_handler")
             .retry(1)
             .then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
@@ -2256,7 +2256,7 @@ async fn cancel_dlqs_pending_handlers() -> Result<()> {
     engine.cancel(handle.correlation_id).await?;
     engine.settle().await?;
 
-    assert_eq!(counter.load(Ordering::SeqCst), 0, "queued handler should not fire for cancelled workflow");
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "queued reactor should not fire for cancelled workflow");
     Ok(())
 }
 
@@ -2276,8 +2276,8 @@ async fn cancel_does_not_affect_other_correlations() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -2301,7 +2301,7 @@ async fn cancel_does_not_affect_other_correlations() -> Result<()> {
 
 #[tokio::test]
 async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
-    /// Child event emitted by the Ping handler.
+    /// Child event emitted by the Ping reactor.
     #[event]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Pong;
@@ -2314,13 +2314,13 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store)
-        // Ping handler: emits Pong, then cancels own correlation via the store
-        .with_handler(
-            handler::on::<Ping>().then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
+        // Ping reactor: emits Pong, then cancels own correlation via the store
+        .with_reactor(
+            reactor::on::<Ping>().then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
                 let s = store_for_handler.clone();
                 let cid = ctx.correlation_id;
                 async move {
-                    // Cancel the workflow from within the handler.
+                    // Cancel the workflow from within the reactor.
                     // The emitted Pong will be queued but should be rejected
                     // on the next settle loop iteration.
                     s.cancel(cid).await.unwrap();
@@ -2328,9 +2328,9 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
                 }
             }),
         )
-        // Pong handler: should never fire because workflow is cancelled
-        .with_handler(
-            handler::on::<Pong>().then(move |_event: Arc<Pong>, _ctx: Context<Deps>| {
+        // Pong reactor: should never fire because workflow is cancelled
+        .with_reactor(
+            reactor::on::<Pong>().then(move |_event: Arc<Pong>, _ctx: Context<Deps>| {
                 let c = pong_clone.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -2347,7 +2347,7 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
     assert_eq!(
         pong_counter.load(Ordering::SeqCst),
         0,
-        "downstream Pong handler should not fire after mid-settle cancel"
+        "downstream Pong reactor should not fire after mid-settle cancel"
     );
     Ok(())
 }
@@ -2356,8 +2356,8 @@ async fn cancel_mid_settle_rejects_downstream_events() -> Result<()> {
 
 #[tokio::test]
 async fn queue_status_empty_after_settle() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 
     let handle = engine
@@ -2368,15 +2368,15 @@ async fn queue_status_empty_after_settle() -> Result<()> {
         .await?;
 
     let status = handle.status().await?;
-    assert_eq!(status.pending_handlers, 0);
+    assert_eq!(status.pending_reactors, 0);
     assert_eq!(status.dead_lettered, 0);
     Ok(())
 }
 
 #[tokio::test]
 async fn queue_status_shows_pending_before_settle() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 
     // Emit without settling — event should be pending
@@ -2394,8 +2394,8 @@ async fn process_handle_cancel_works() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(move |_event: Arc<Ping>, _ctx: Context<Deps>| {
             let c = counter_clone.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -2416,15 +2416,15 @@ async fn process_handle_cancel_works() -> Result<()> {
     assert_eq!(
         counter.load(Ordering::SeqCst),
         0,
-        "handler should not fire after cancel via ProcessHandle"
+        "reactor should not fire after cancel via ProcessHandle"
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn engine_status_delegates_to_store() -> Result<()> {
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<Ping>().then(|_event: Arc<Ping>, _ctx: Context<Deps>| async move { Ok(events![]) }),
     );
 
     let handle = engine
@@ -2446,16 +2446,16 @@ async fn on_dlq_fires_on_anyhow_bail() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             *ce.lock() = Some(info.error.clone());
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("bail_handler")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2489,16 +2489,16 @@ async fn on_dlq_fires_on_custom_error_type() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             *ce.lock() = Some(info.error.clone());
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("custom_error_handler")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2515,13 +2515,13 @@ async fn on_dlq_fires_on_custom_error_type() -> Result<()> {
 
 #[tokio::test]
 async fn handler_panic_does_not_crash_engine() -> Result<()> {
-    // Document current behavior: a panic in a handler may crash the engine.
+    // Document current behavior: a panic in a reactor may crash the engine.
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("panic_handler")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2530,7 +2530,7 @@ async fn handler_panic_does_not_crash_engine() -> Result<()> {
                     Ok(events![])
                 }),
         )
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                 let c = c.clone();
                 async move {
@@ -2563,16 +2563,16 @@ async fn on_dlq_fires_on_queued_handler_panic() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             dc.fetch_add(1, Ordering::SeqCst);
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("queued_panic_handler")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2611,7 +2611,7 @@ async fn projection_error_does_not_stop_other_handlers() -> Result<()> {
                     anyhow::bail!("projection failed");
                 }),
         )
-        .with_handler(handler::on::<Ping>().then(
+        .with_reactor(reactor::on::<Ping>().then(
             move |_event: Arc<Ping>, _ctx: Context<Deps>| {
                 let hc = hc.clone();
                 async move {
@@ -2626,7 +2626,7 @@ async fn projection_error_does_not_stop_other_handlers() -> Result<()> {
     assert_eq!(
         handler_counter.load(Ordering::SeqCst),
         1,
-        "handler should still fire even when projection errors"
+        "reactor should still fire even when projection errors"
     );
     Ok(())
 }
@@ -2674,11 +2674,11 @@ async fn projection_error_recorded_as_projection_failure() -> Result<()> {
 async fn on_dlq_mapper_error_does_not_crash_engine() -> Result<()> {
     // The on_dlq mapper itself panics — engine should still settle
     let engine = Engine::in_memory(Deps)
-        .on_dlq(|_info: causal::DlqTerminalInfo| -> HandlerDlq {
+        .on_dlq(|_info: causal::DlqTerminalInfo| -> ReactorDlq {
             panic!("mapper panic");
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("trigger_bad_mapper")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2707,24 +2707,24 @@ async fn on_dlq_fires_for_each_failing_handler() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             dmc.fetch_add(1, Ordering::SeqCst);
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("fail_handler_1")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("fail 1"))
                 }),
         )
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("fail_handler_2")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
@@ -2737,7 +2737,7 @@ async fn on_dlq_fires_for_each_failing_handler() -> Result<()> {
     assert_eq!(
         dlq_mapper_counter.load(Ordering::SeqCst),
         2,
-        "on_dlq mapper should fire once for each failing handler"
+        "on_dlq mapper should fire once for each failing reactor"
     );
     Ok(())
 }
@@ -2748,8 +2748,8 @@ async fn on_failure_with_source_event_access() -> Result<()> {
     let cap = captured.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("source_access_handler")
                 .retry(1)
                 .on_failure(move |event: Arc<FailEvent>, info: causal::ErrorContext| {
@@ -2762,7 +2762,7 @@ async fn on_failure_with_source_event_access() -> Result<()> {
                     Err::<Events, _>(anyhow::anyhow!("source event test"))
                 }),
         )
-        .with_handler(handler::on::<FailedTerminal>().then(
+        .with_reactor(reactor::on::<FailedTerminal>().then(
             move |event: Arc<FailedTerminal>, _ctx: Context<Deps>| {
                 let cap = cap.clone();
                 async move {
@@ -2774,7 +2774,7 @@ async fn on_failure_with_source_event_access() -> Result<()> {
 
     engine.emit(FailEvent { attempt: 42 }).settled().await?;
 
-    let (attempts, error) = captured.lock().take().expect("on_failure handler should have fired");
+    let (attempts, error) = captured.lock().take().expect("on_failure reactor should have fired");
     assert!(error.contains("attempt=42"), "should access source event field, got: {error}");
     assert!(error.contains("source event test"), "should contain original error, got: {error}");
     assert!(attempts > 0, "attempts should be > 0");
@@ -2791,16 +2791,16 @@ async fn on_dlq_not_fired_when_retry_succeeds() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             dc.fetch_add(1, Ordering::SeqCst);
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("retry_success_handler")
                 .retry(3)
                 .then(move |_event: Arc<FailEvent>, _ctx: Context<Deps>| {
@@ -2824,7 +2824,7 @@ async fn on_dlq_not_fired_when_retry_succeeds() -> Result<()> {
     );
     assert!(
         attempt_counter.load(Ordering::SeqCst) >= 2,
-        "handler should have been called at least twice"
+        "reactor should have been called at least twice"
     );
     Ok(())
 }
@@ -2839,16 +2839,16 @@ async fn on_dlq_fires_after_all_retries_exhausted() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .on_dlq(move |info: causal::DlqTerminalInfo| {
             *ci.lock() = Some(info.clone());
-            HandlerDlq {
-                handler_id: info.handler_id,
+            ReactorDlq {
+                reactor_id: info.reactor_id,
                 source_event_type: info.source_event_type,
                 error: info.error,
                 reason: info.reason,
                 attempts: info.attempts,
             }
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("exhaust_retries")
                 .retry(3)
                 .then(move |_event: Arc<FailEvent>, _ctx: Context<Deps>| {
@@ -2863,7 +2863,7 @@ async fn on_dlq_fires_after_all_retries_exhausted() -> Result<()> {
     engine.emit(FailEvent { attempt: 0 }).settled().await?;
 
     let info = captured_info.lock().take().expect("on_dlq should fire after retries exhausted");
-    assert_eq!(info.handler_id, "exhaust_retries");
+    assert_eq!(info.reactor_id, "exhaust_retries");
     assert_eq!(info.reason, "failed");
     assert_eq!(
         info.attempts, info.max_attempts,
@@ -2872,7 +2872,7 @@ async fn on_dlq_fires_after_all_retries_exhausted() -> Result<()> {
     );
     assert!(
         attempt_counter.load(Ordering::SeqCst) >= 2,
-        "handler should have been called multiple times, got: {}",
+        "reactor should have been called multiple times, got: {}",
         attempt_counter.load(Ordering::SeqCst)
     );
     Ok(())
@@ -2880,7 +2880,7 @@ async fn on_dlq_fires_after_all_retries_exhausted() -> Result<()> {
 
 #[tokio::test]
 async fn on_dlq_event_handler_failure_does_not_cascade() -> Result<()> {
-    // The handler for the DLQ event itself fails — engine should NOT infinite loop
+    // The reactor for the DLQ event itself fails — engine should NOT infinite loop
     let dlq_handler_counter = Arc::new(AtomicUsize::new(0));
     let dhc = dlq_handler_counter.clone();
 
@@ -2894,23 +2894,23 @@ async fn on_dlq_event_handler_failure_does_not_cascade() -> Result<()> {
         .on_dlq(|info: causal::DlqTerminalInfo| DlqFailEvent {
             error: info.error,
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("original_failure")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("original fail"))
                 }),
         )
-        .with_handler(
-            handler::on::<DlqFailEvent>()
+        .with_reactor(
+            reactor::on::<DlqFailEvent>()
                 .id("dlq_handler_that_fails")
                 .retry(1)
                 .then(move |_event: Arc<DlqFailEvent>, _ctx: Context<Deps>| {
                     let dhc = dhc.clone();
                     async move {
                         dhc.fetch_add(1, Ordering::SeqCst);
-                        Err::<Events, _>(anyhow::anyhow!("dlq handler also fails"))
+                        Err::<Events, _>(anyhow::anyhow!("dlq reactor also fails"))
                     }
                 }),
         );
@@ -2924,12 +2924,12 @@ async fn on_dlq_event_handler_failure_does_not_cascade() -> Result<()> {
 
     assert!(
         result.is_ok(),
-        "engine should settle without infinite loop even when DLQ handler fails"
+        "engine should settle without infinite loop even when DLQ reactor fails"
     );
 
     assert!(
         dlq_handler_counter.load(Ordering::SeqCst) >= 1,
-        "DLQ event handler should have fired at least once"
+        "DLQ event reactor should have fired at least once"
     );
     Ok(())
 }
@@ -2968,11 +2968,11 @@ async fn journal_replays_completed_run_calls_on_retry() -> Result<()> {
     let entries = store.load_journal("journal_handler", Uuid::nil()).await?;
     assert!(entries.is_empty());
 
-    // Now test that ctx.run() inside a queued handler persists to journal
+    // Now test that ctx.run() inside a queued reactor persists to journal
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("journal_handler")
                 .then(move |event: Arc<Ping>, ctx: Context<Deps>| {
                     let cc = cc.clone();
@@ -3008,8 +3008,8 @@ async fn journal_cleared_after_successful_handler() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("journal_clear_test")
                 .then(|event: Arc<Ping>, ctx: Context<Deps>| async move {
                     let _: String = ctx
@@ -3027,19 +3027,19 @@ async fn journal_cleared_after_successful_handler() -> Result<()> {
         .await?;
 
     // After successful settlement, journal should be cleared
-    // We can't easily get the event_id from inside the handler, but we can
-    // check that no journal entries remain for this handler
+    // We can't easily get the event_id from inside the reactor, but we can
+    // check that no journal entries remain for this reactor
     // The store's journal map should be empty after clear
     let entries = store
         .load_journal("journal_clear_test", handle.event_id)
         .await?;
     // Note: the journal key uses the triggering event_id, not the root event_id.
-    // Since this is a queued handler, the event_id in the journal is the source event's ID.
+    // Since this is a queued reactor, the event_id in the journal is the source event's ID.
     // We verify indirectly: if entries exist for any key, the clear didn't work.
     // For a more direct test, we check that the store's journal is empty overall.
     assert!(
         entries.is_empty(),
-        "journal should be cleared after successful handler"
+        "journal should be cleared after successful reactor"
     );
     Ok(())
 }
@@ -3055,14 +3055,14 @@ struct EventWithSkip {
     transient: Vec<String>,
 }
 
-/// Core scenario: handler receives the original typed event with #[serde(skip)] fields preserved.
+/// Core scenario: reactor receives the original typed event with #[serde(skip)] fields preserved.
 #[tokio::test]
 async fn ephemeral_preserves_serde_skip_fields() -> Result<()> {
     let received = Arc::new(Mutex::new(None::<(i32, usize)>));
     let received_clone = received.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<EventWithSkip>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<EventWithSkip>()
             .id("check_skip")
             .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
                 let r = received_clone.clone();
@@ -3087,8 +3087,8 @@ async fn ephemeral_preserves_serde_skip_fields() -> Result<()> {
     Ok(())
 }
 
-/// Ephemeral flows through a handler chain: A → handler → B → handler.
-/// The child event (B) emitted by the first handler should also have its ephemeral preserved.
+/// Ephemeral flows through a reactor chain: A → reactor → B → reactor.
+/// The child event (B) emitted by the first reactor should also have its ephemeral preserved.
 #[tokio::test]
 async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
     #[event]
@@ -3111,8 +3111,8 @@ async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
     let final_clone = final_received.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<Step1>()
+        .with_reactor(
+            reactor::on::<Step1>()
                 .id("step1_handler")
                 .then(|event: Arc<Step1>, _ctx: Context<Deps>| async move {
                     // Verify step1 ephemeral works
@@ -3123,8 +3123,8 @@ async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
                     }])
                 }),
         )
-        .with_handler(
-            handler::on::<Step2>()
+        .with_reactor(
+            reactor::on::<Step2>()
                 .id("step2_handler")
                 .then(move |event: Arc<Step2>, _ctx: Context<Deps>| {
                     let r = final_clone.clone();
@@ -3149,7 +3149,7 @@ async fn ephemeral_preserved_in_handler_chain() -> Result<()> {
     Ok(())
 }
 
-/// Multiple handlers on the same event all see the ephemeral.
+/// Multiple reactors on the same event all see the ephemeral.
 #[tokio::test]
 async fn ephemeral_shared_across_multiple_handlers() -> Result<()> {
     let seen_a = Arc::new(Mutex::new(None::<usize>));
@@ -3158,8 +3158,8 @@ async fn ephemeral_shared_across_multiple_handlers() -> Result<()> {
     let seen_b_clone = seen_b.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<EventWithSkip>()
+        .with_reactor(
+            reactor::on::<EventWithSkip>()
                 .id("handler_a")
                 .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
                     let r = seen_a_clone.clone();
@@ -3169,8 +3169,8 @@ async fn ephemeral_shared_across_multiple_handlers() -> Result<()> {
                     }
                 }),
         )
-        .with_handler(
-            handler::on::<EventWithSkip>()
+        .with_reactor(
+            reactor::on::<EventWithSkip>()
                 .id("handler_b")
                 .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
                     let r = seen_b_clone.clone();
@@ -3215,8 +3215,8 @@ async fn ephemeral_preserved_in_batch_fanout() -> Result<()> {
     let secrets_clone = secrets.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<Trigger>()
+        .with_reactor(
+            reactor::on::<Trigger>()
                 .id("fan_out")
                 .then(|event: Arc<Trigger>, _ctx: Context<Deps>| async move {
                     Ok(events![..(0..event.count).map(|i| BatchChild {
@@ -3225,8 +3225,8 @@ async fn ephemeral_preserved_in_batch_fanout() -> Result<()> {
                     })])
                 }),
         )
-        .with_handler(
-            handler::on::<BatchChild>()
+        .with_reactor(
+            reactor::on::<BatchChild>()
                 .id("collect")
                 .then(move |event: Arc<BatchChild>, _ctx: Context<Deps>| {
                     let s = secrets_clone.clone();
@@ -3248,16 +3248,16 @@ async fn ephemeral_preserved_in_batch_fanout() -> Result<()> {
     Ok(())
 }
 
-/// on_any handler receives the ephemeral via downcast.
+/// on_any reactor receives the ephemeral via downcast.
 #[tokio::test]
 async fn ephemeral_available_via_on_any_handler() -> Result<()> {
-    use causal::handler::AnyEvent;
+    use causal::reactor::AnyEvent;
 
     let received_len = Arc::new(AtomicUsize::new(0));
     let received_clone = received_len.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on_any()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on_any()
             .id("any_check")
             .then(move |event: AnyEvent, _ctx: Context<Deps>| {
                 let r = received_clone.clone();
@@ -3285,7 +3285,7 @@ async fn ephemeral_available_via_on_any_handler() -> Result<()> {
 /// Projection (inline observer) also sees the ephemeral via AnyEvent downcast.
 #[tokio::test]
 async fn ephemeral_available_in_projection() -> Result<()> {
-    use causal::handler::{project, AnyEvent};
+    use causal::reactor::{project, AnyEvent};
 
     let projection_len = Arc::new(AtomicUsize::new(0));
     let projection_clone = projection_len.clone();
@@ -3318,13 +3318,13 @@ async fn ephemeral_available_in_projection() -> Result<()> {
 /// Ephemeral works with emit_output (EventOutput path).
 #[tokio::test]
 async fn ephemeral_via_emit_output() -> Result<()> {
-    use causal::handler::EventOutput;
+    use causal::reactor::EventOutput;
 
     let received = Arc::new(Mutex::new(None::<usize>));
     let received_clone = received.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<EventWithSkip>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<EventWithSkip>()
             .id("output_check")
             .then(move |event: Arc<EventWithSkip>, _ctx: Context<Deps>| {
                 let r = received_clone.clone();
@@ -3347,7 +3347,7 @@ async fn ephemeral_via_emit_output() -> Result<()> {
     Ok(())
 }
 
-/// DLQ on_failure handler still works — ephemeral doesn't interfere with error path.
+/// DLQ on_failure reactor still works — ephemeral doesn't interfere with error path.
 #[tokio::test]
 async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
     #[event]
@@ -3368,19 +3368,19 @@ async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
     let dlq_clone = dlq_received.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handler(
-            handler::on::<FailSkip>()
+        .with_reactor(
+            reactor::on::<FailSkip>()
                 .id("always_fail")
                 .retry(1)
-                .on_failure(|_event, info: causal::handler::ErrorContext| FailedSkip {
+                .on_failure(|_event, info: causal::reactor::ErrorContext| FailedSkip {
                     error: info.error,
                 })
                 .then(|_event: Arc<FailSkip>, _ctx: Context<Deps>| async move {
                     anyhow::bail!("intentional failure")
                 }),
         )
-        .with_handler(
-            handler::on::<FailedSkip>()
+        .with_reactor(
+            reactor::on::<FailedSkip>()
                 .id("catch_failure")
                 .then(move |event: Arc<FailedSkip>, _ctx: Context<Deps>| {
                     let r = dlq_clone.clone();
@@ -3403,7 +3403,7 @@ async fn ephemeral_does_not_break_dlq_path() -> Result<()> {
     Ok(())
 }
 
-/// Extract handler receives ephemeral-derived data correctly.
+/// Extract reactor receives ephemeral-derived data correctly.
 #[tokio::test]
 async fn ephemeral_with_extract_handler() -> Result<()> {
     #[event]
@@ -3418,8 +3418,8 @@ async fn ephemeral_with_extract_handler() -> Result<()> {
     let received_id = Arc::new(AtomicI32::new(0));
     let received_clone = received_id.clone();
 
-    let engine = Engine::in_memory(Deps).with_handler(
-        handler::on::<ExtractEvent>()
+    let engine = Engine::in_memory(Deps).with_reactor(
+        reactor::on::<ExtractEvent>()
             .id("extract_check")
             .extract(|e: &ExtractEvent| Some(e.id))
             .then(move |id: i32, _ctx: Context<Deps>| {
@@ -3450,9 +3450,9 @@ async fn ephemeral_with_extract_handler() -> Result<()> {
 async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
     // Simulate a "resume after crash" scenario:
     //   1. Events are already persisted in the store
-    //   2. A handler is sitting in the handler queue (as if reclaimed)
+    //   2. A reactor is sitting in the reactor queue (as if reclaimed)
     //   3. A fresh engine (cold aggregates) calls settle()
-    //   4. The handler should see hydrated aggregate state, not defaults
+    //   4. The reactor should see hydrated aggregate state, not defaults
 
     let store = Arc::new(MemoryStore::new());
     let order_id = Uuid::new_v4();
@@ -3469,13 +3469,13 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
         ))
         .await?;
 
-    // Step 2: Inject a handler directly into the queue (simulating reclaim after crash)
-    use causal::types::QueuedHandler;
+    // Step 2: Inject a reactor directly into the queue (simulating reclaim after crash)
+    use causal::types::QueuedReactor;
     let event_type = "order_created".to_string();
     store
-        .publish_handler_for_test(QueuedHandler {
+        .publish_reactor_for_test(QueuedReactor {
             event_id,
-            handler_id: "check_order_state".to_string(),
+            reactor_id: "check_order_state".to_string(),
             correlation_id,
             event_type,
             event_payload: serde_json::json!({"order_id": order_id, "total": 250}),
@@ -3500,8 +3500,8 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderCreated>()
+        .with_reactor(
+            reactor::on::<OrderCreated>()
                 .id("check_order_state")
                 .then(move |event: Arc<OrderCreated>, ctx: Context<Deps>| {
                     let os = os.clone();
@@ -3515,28 +3515,28 @@ async fn reclaimed_handler_sees_hydrated_aggregate_state() -> Result<()> {
                 }),
         );
 
-    // Step 4: Settle — this should hydrate aggregates before running the reclaimed handler
+    // Step 4: Settle — this should hydrate aggregates before running the reclaimed reactor
     engine.settle().await?;
 
-    // Step 5: Assert the handler saw the real aggregate state, not defaults
+    // Step 5: Assert the reactor saw the real aggregate state, not defaults
     assert_eq!(
         *observed_status.lock(),
         "created",
-        "handler should see hydrated aggregate status, not default empty string"
+        "reactor should see hydrated aggregate status, not default empty string"
     );
     assert_eq!(
         observed_total.load(Ordering::SeqCst),
         250,
-        "handler should see hydrated aggregate total, not default 0"
+        "reactor should see hydrated aggregate total, not default 0"
     );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
-    // DLQ terminal events should have handler_id metadata set to the
-    // handler that failed, so causal flow graphs can wire the edge.
+async fn dlq_event_carries_failed_reactor_id_in_metadata() -> Result<()> {
+    // DLQ terminal events should have reactor_id metadata set to the
+    // reactor that failed, so causal flow graphs can wire the edge.
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::in_memory(Deps)
@@ -3544,16 +3544,16 @@ async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
         .on_dlq(|info: causal::DlqTerminalInfo| GlobalDlqEvent {
             error: info.error,
         })
-        .with_handler(
-            handler::on::<FailEvent>()
+        .with_reactor(
+            reactor::on::<FailEvent>()
                 .id("failing_handler")
                 .retry(1)
                 .then(|_event: Arc<FailEvent>, _ctx: Context<Deps>| async move {
                     Err::<Events, _>(anyhow::anyhow!("boom"))
                 }),
         )
-        .with_handler(
-            handler::on::<GlobalDlqEvent>()
+        .with_reactor(
+            reactor::on::<GlobalDlqEvent>()
                 .id("dlq_sink")
                 .then(|_event: Arc<GlobalDlqEvent>, _ctx: Context<Deps>| async move {
                     Ok(events![])
@@ -3570,9 +3570,9 @@ async fn dlq_event_carries_failed_handler_id_in_metadata() -> Result<()> {
         .expect("GlobalDlqEvent should be persisted");
 
     assert_eq!(
-        dlq_event.metadata.get("handler_id").and_then(|v| v.as_str()),
+        dlq_event.metadata.get("reactor_id").and_then(|v| v.as_str()),
         Some("failing_handler"),
-        "DLQ event metadata should carry the failed handler's ID"
+        "DLQ event metadata should carry the failed reactor's ID"
     );
 
     // Also verify parent_id is set (causal link to the source event)
@@ -3626,7 +3626,7 @@ impl Apply<ScrapeCompleted> for PipelineState {
 
 #[tokio::test]
 async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()> {
-    // Reproduces: handler triggered by ScrapeCompleted has a filter that
+    // Reproduces: reactor triggered by ScrapeCompleted has a filter that
     // reads PipelineState.source_plan (set by SourcesPrepared). On resume,
     // only the ScrapeCompleted aggregator gets hydrated, so source_plan
     // is None and the filter returns false.
@@ -3655,12 +3655,12 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     // MemoryStore positions start at 1, so two events are at positions 1 and 2.
     store.set_checkpoint(2);
 
-    // Step 2: Inject a handler into the queue (simulating resume/reclaim)
+    // Step 2: Inject a reactor into the queue (simulating resume/reclaim)
     let event_type = "scrape_completed".to_string();
     store
-        .publish_handler_for_test(causal::types::QueuedHandler {
+        .publish_reactor_for_test(causal::types::QueuedReactor {
             event_id: Uuid::new_v4(),
-            handler_id: "expand_sources".to_string(),
+            reactor_id: "expand_sources".to_string(),
             correlation_id,
             event_type,
             event_payload: serde_json::json!(null),
@@ -3676,7 +3676,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
         })
         .await;
 
-    // Step 3: Fresh engine — handler filter reads singleton state set by
+    // Step 3: Fresh engine — reactor filter reads singleton state set by
     // a DIFFERENT event type than the one that triggered it
     let fired = Arc::new(AtomicUsize::new(0));
     let f = fired.clone();
@@ -3684,11 +3684,11 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
         // Only SourcesPrepared has an aggregator — ScrapeCompleted does NOT
-        // register an aggregator for PipelineState. The handler triggered by
+        // register an aggregator for PipelineState. The reactor triggered by
         // ScrapeCompleted reads the singleton in its filter.
         .with_aggregator::<SourcesPrepared, PipelineState, _>(|_| Uuid::nil())
-        .with_handler(
-            handler::on::<ScrapeCompleted>()
+        .with_reactor(
+            reactor::on::<ScrapeCompleted>()
                 .id("expand_sources")
                 .filter(move |_event, ctx: &Context<Deps>| {
                     let state = ctx.aggregate::<PipelineState>();
@@ -3710,13 +3710,13 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
     assert_eq!(
         fired.load(Ordering::SeqCst),
         1,
-        "handler filter should see fully hydrated singleton (source_plan + scrape_done)"
+        "reactor filter should see fully hydrated singleton (source_plan + scrape_done)"
     );
 
     Ok(())
 }
 
-// ── Multi-type handler integration tests ─────────────────────────────
+// ── Multi-type reactor integration tests ─────────────────────────────
 
 #[event]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3746,9 +3746,9 @@ async fn multi_type_handler_fires_on_both_event_types() -> Result<()> {
     let sources_c = sources.clone();
 
     let engine = Engine::in_memory(Deps)
-        .with_handlers(vec![
-            // Register one handler for ReviewDone
-            handler::on::<ReviewDone>()
+        .with_reactors(vec![
+            // Register one reactor for ReviewDone
+            reactor::on::<ReviewDone>()
                 .id("enrich::ReviewDone")
                 .then(move |_event: Arc<ReviewDone>, _ctx: Context<Deps>| {
                     let f = fired_c.clone();
@@ -3759,8 +3759,8 @@ async fn multi_type_handler_fires_on_both_event_types() -> Result<()> {
                         Ok(events![])
                     }
                 }),
-            // Register same logical handler for NoSignals
-            handler::on::<NoSignals>()
+            // Register same logical reactor for NoSignals
+            reactor::on::<NoSignals>()
                 .id("enrich::NoSignals")
                 .then({
                     let fired = fired.clone();
@@ -3802,8 +3802,8 @@ async fn multi_type_handler_with_filter_fires_on_both_types() -> Result<()> {
 
     // Simulate a context-only filter (always returns true here)
     let engine = Engine::in_memory(Deps)
-        .with_handlers(vec![
-            handler::on::<ReviewDone>()
+        .with_reactors(vec![
+            reactor::on::<ReviewDone>()
                 .id("enrich_filtered::ReviewDone")
                 .filter(|_event: &ReviewDone, _ctx: &Context<Deps>| true)
                 .then(move |_event: Arc<ReviewDone>, _ctx: Context<Deps>| {
@@ -3815,7 +3815,7 @@ async fn multi_type_handler_with_filter_fires_on_both_types() -> Result<()> {
                         Ok(events![])
                     }
                 }),
-            handler::on::<NoSignals>()
+            reactor::on::<NoSignals>()
                 .id("enrich_filtered::NoSignals")
                 .filter(|_event: &NoSignals, _ctx: &Context<Deps>| true)
                 .then(move |_event: Arc<NoSignals>, _ctx: Context<Deps>| {
@@ -3877,8 +3877,8 @@ impl Apply<StepDone> for ProgressTracker {
 
 #[tokio::test]
 async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
-    // Regression: describe() runs during execute_event (before handlers run),
-    // so it captures stale aggregate state. After a handler completes and
+    // Regression: describe() runs during execute_event (before reactors run),
+    // so it captures stale aggregate state. After a reactor completes and
     // emits events that update aggregates, describe should be re-run so the
     // stored description reflects the latest state.
     let store = Arc::new(MemoryStore::new());
@@ -3888,8 +3888,8 @@ async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
         .with_store(store.clone())
         .with_aggregator::<StepStarted, ProgressTracker, _>(|_| Uuid::nil())
         .with_aggregator::<StepDone, ProgressTracker, _>(|_| Uuid::nil())
-        .with_handler(
-            handler::on::<StepStarted>()
+        .with_reactor(
+            reactor::on::<StepStarted>()
                 .id("process_step")
                 .filter(|_event: &StepStarted, _ctx: &Context<Deps>| true)
                 .describe(|ctx: &Context<Deps>| {
@@ -3904,7 +3904,7 @@ async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
     let handle = engine.emit(StepStarted).settled().await?;
     let correlation_id = handle.correlation_id;
 
-    // After settling: StepStarted was applied (count=1), handler emitted StepDone
+    // After settling: StepStarted was applied (count=1), reactor emitted StepDone
     // which was also applied (count=2). The stored description should show count=2.
     let descriptions = store_clone
         .get_descriptions(correlation_id)
@@ -3916,8 +3916,8 @@ async fn describe_reflects_post_handler_aggregate_state() -> Result<()> {
 
     assert_eq!(
         desc["completed_steps"], 2,
-        "describe should reflect post-handler aggregate state (count=2), \
-         but got {}. This means describe only captured pre-handler state.",
+        "describe should reflect post-reactor aggregate state (count=2), \
+         but got {}. This means describe only captured pre-reactor state.",
         desc["completed_steps"]
     );
 
@@ -3949,15 +3949,15 @@ async fn ephemeral_event_not_in_store() -> Result<()> {
     let handler_ran2 = handler_ran.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentReady {
                     concern_id: Uuid::nil(),
                 }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
                 let ran = handler_ran2.clone();
                 async move {
                     ran.fetch_add(1, Ordering::SeqCst);
@@ -3973,7 +3973,7 @@ async fn ephemeral_event_not_in_store() -> Result<()> {
         .settled()
         .await?;
 
-    // Handler should have executed
+    // Reactor should have executed
     assert_eq!(handler_ran.load(Ordering::SeqCst), 1);
 
     // All events are in the operational store (Postgres), but ephemeral ones
@@ -4004,15 +4004,15 @@ async fn ephemeral_event_handler_emits_persistent() -> Result<()> {
     let complete_count2 = complete_count.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentReady {
                     concern_id: Uuid::nil(),
                 }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
                 let count = complete_count2.clone();
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -4030,12 +4030,12 @@ async fn ephemeral_event_handler_emits_persistent() -> Result<()> {
 
     assert_eq!(complete_count.load(Ordering::SeqCst), 1);
 
-    // The persistent event emitted by the ephemeral handler IS in the log
+    // The persistent event emitted by the ephemeral reactor IS in the log
     let all_events = store.global_log().lock().clone();
     let has_complete = all_events
         .iter()
         .any(|e| e.event_type == "enrichment_complete");
-    assert!(has_complete, "Persistent event from ephemeral handler should be in log");
+    assert!(has_complete, "Persistent event from ephemeral reactor should be in log");
 
     Ok(())
 }
@@ -4059,16 +4059,16 @@ async fn mixed_persistent_and_ephemeral_in_same_batch() -> Result<()> {
     let result_handled2 = result_handled.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![
                     EphemeralSignal,
                     PersistentResult { value: 42 },
                 ])
             }),
         )
-        .with_handler(
-            handler::on::<EphemeralSignal>().then(move |_event: Arc<EphemeralSignal>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EphemeralSignal>().then(move |_event: Arc<EphemeralSignal>, _ctx: Context<Deps>| {
                 let ran = signal_handled2.clone();
                 async move {
                     ran.fetch_add(1, Ordering::SeqCst);
@@ -4076,8 +4076,8 @@ async fn mixed_persistent_and_ephemeral_in_same_batch() -> Result<()> {
                 }
             }),
         )
-        .with_handler(
-            handler::on::<PersistentResult>().then(move |_event: Arc<PersistentResult>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<PersistentResult>().then(move |_event: Arc<PersistentResult>, _ctx: Context<Deps>| {
                 let ran = result_handled2.clone();
                 async move {
                     ran.fetch_add(1, Ordering::SeqCst);
@@ -4091,8 +4091,8 @@ async fn mixed_persistent_and_ephemeral_in_same_batch() -> Result<()> {
         .settled()
         .await?;
 
-    assert_eq!(signal_handled.load(Ordering::SeqCst), 1, "Ephemeral handler should run");
-    assert_eq!(result_handled.load(Ordering::SeqCst), 1, "Persistent handler should run");
+    assert_eq!(signal_handled.load(Ordering::SeqCst), 1, "Ephemeral reactor should run");
+    assert_eq!(result_handled.load(Ordering::SeqCst), 1, "Persistent reactor should run");
 
     // All events in operational store; ephemeral has persistent=false
     let all_events = store.global_log().lock().clone();
@@ -4109,15 +4109,15 @@ async fn ephemeral_event_does_not_apply_to_aggregates() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentReady {
                     concern_id: Uuid::nil(),
                 }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentComplete {
                     concern_id: event.concern_id,
                 }])
@@ -4145,22 +4145,22 @@ async fn ephemeral_event_does_not_run_projections() -> Result<()> {
     let projection_count2 = projection_count.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentReady {
                     concern_id: Uuid::nil(),
                 }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentComplete {
                     concern_id: event.concern_id,
                 }])
             }),
         )
         .with_projection(
-            handler::project("enrichment_projector").then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
+            reactor::project("enrichment_projector").then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
                 let count = projection_count2.clone();
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -4193,15 +4193,15 @@ async fn ephemeral_event_hop_counting() -> Result<()> {
     let handler_ran2 = handler_ran.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentReady {
                     concern_id: Uuid::nil(),
                 }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
                 let ran = handler_ran2.clone();
                 async move {
                     ran.fetch_add(1, Ordering::SeqCst);
@@ -4217,7 +4217,7 @@ async fn ephemeral_event_hop_counting() -> Result<()> {
         .settled()
         .await?;
 
-    // Handler should run exactly once (no infinite loops)
+    // Reactor should run exactly once (no infinite loops)
     assert_eq!(handler_ran.load(Ordering::SeqCst), 1);
 
     Ok(())
@@ -4230,8 +4230,8 @@ async fn ephemeral_root_event_not_persisted() -> Result<()> {
     let handler_ran2 = handler_ran.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(move |event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
                 let ran = handler_ran2.clone();
                 async move {
                     ran.fetch_add(1, Ordering::SeqCst);
@@ -4250,7 +4250,7 @@ async fn ephemeral_root_event_not_persisted() -> Result<()> {
         .settled()
         .await?;
 
-    // Handler should have executed
+    // Reactor should have executed
     assert_eq!(handler_ran.load(Ordering::SeqCst), 1);
 
     // EnrichmentReady IS in operational store but with persistent=false
@@ -4258,8 +4258,8 @@ async fn ephemeral_root_event_not_persisted() -> Result<()> {
     let ready = all_events.iter().find(|e| e.event_type == "enrichment_ready").expect("Ephemeral root should be in operational store");
     assert!(!ready.persistent, "Ephemeral root should have persistent=false");
 
-    // EnrichmentComplete (persistent) emitted by the handler SHOULD be in the store
-    let complete = all_events.iter().find(|e| e.event_type == "enrichment_complete").expect("Persistent event from handler should be in store");
+    // EnrichmentComplete (persistent) emitted by the reactor SHOULD be in the store
+    let complete = all_events.iter().find(|e| e.event_type == "enrichment_complete").expect("Persistent event from reactor should be in store");
     assert!(complete.persistent, "EnrichmentComplete should have persistent=true");
 
     Ok(())
@@ -4290,18 +4290,18 @@ async fn chained_ephemeral_to_ephemeral_to_persistent() -> Result<()> {
     let chain_end2 = chain_end.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EphA])
             }),
         )
-        .with_handler(
-            handler::on::<EphA>().then(|_event: Arc<EphA>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphA>().then(|_event: Arc<EphA>, _ctx: Context<Deps>| async move {
                 Ok(events![EphB])
             }),
         )
-        .with_handler(
-            handler::on::<EphB>().then(move |_event: Arc<EphB>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EphB>().then(move |_event: Arc<EphB>, _ctx: Context<Deps>| {
                 let end = chain_end2.clone();
                 async move {
                     end.fetch_add(1, Ordering::SeqCst);
@@ -4334,8 +4334,8 @@ async fn ephemeral_only_root_event_still_settles() -> Result<()> {
     let handler_ran2 = handler_ran.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphA>().then(move |_event: Arc<EphA>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EphA>().then(move |_event: Arc<EphA>, _ctx: Context<Deps>| {
                 let ran = handler_ran2.clone();
                 async move {
                     ran.fetch_add(1, Ordering::SeqCst);
@@ -4346,7 +4346,7 @@ async fn ephemeral_only_root_event_still_settles() -> Result<()> {
 
     engine.emit(EphA).settled().await?;
 
-    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "Handler for ephemeral-only root should fire");
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "Reactor for ephemeral-only root should fire");
     let all_events = store.global_log().lock().clone();
     assert_eq!(all_events.len(), 1, "Ephemeral event should be in operational store");
     assert!(!all_events[0].persistent, "Ephemeral-only root should have persistent=false");
@@ -4362,8 +4362,8 @@ async fn multiple_ephemeral_root_events() -> Result<()> {
     let count2 = count.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
                 let c = count2.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -4387,7 +4387,7 @@ async fn multiple_ephemeral_root_events() -> Result<()> {
         .settled()
         .await?;
 
-    assert_eq!(count.load(Ordering::SeqCst), 3, "All three ephemeral roots should fire handlers");
+    assert_eq!(count.load(Ordering::SeqCst), 3, "All three ephemeral roots should fire reactors");
 
     // Three EnrichmentReady (ephemeral) + three EnrichmentComplete (persistent)
     let all_events = store.global_log().lock().clone();
@@ -4401,7 +4401,7 @@ async fn multiple_ephemeral_root_events() -> Result<()> {
     Ok(())
 }
 
-/// on_any handler should still fire for ephemeral events (both root and handler-emitted).
+/// on_any reactor should still fire for ephemeral events (both root and reactor-emitted).
 #[tokio::test]
 async fn ephemeral_triggers_on_any_handler() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
@@ -4409,13 +4409,13 @@ async fn ephemeral_triggers_on_any_handler() -> Result<()> {
     let any_count2 = any_count.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EphA])
             }),
         )
-        .with_handler(
-            handler::on_any().then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on_any().then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
                 let c = any_count2.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -4426,7 +4426,7 @@ async fn ephemeral_triggers_on_any_handler() -> Result<()> {
 
     engine.emit(EphTrigger).settled().await?;
 
-    // on_any should fire for: EphTrigger (persistent root) + EphA (ephemeral handler-emitted)
+    // on_any should fire for: EphTrigger (persistent root) + EphA (ephemeral reactor-emitted)
     assert_eq!(
         any_count.load(Ordering::SeqCst), 2,
         "on_any should fire for both persistent and ephemeral events"
@@ -4443,8 +4443,8 @@ async fn ephemeral_root_via_emit_output() -> Result<()> {
     let handler_ran2 = handler_ran.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
                 let ran = handler_ran2.clone();
                 async move {
                     ran.fetch_add(1, Ordering::SeqCst);
@@ -4453,7 +4453,7 @@ async fn ephemeral_root_via_emit_output() -> Result<()> {
             }),
         );
 
-    let output = causal::handler::EventOutput::new(EnrichmentReady {
+    let output = causal::reactor::EventOutput::new(EnrichmentReady {
         concern_id: Uuid::nil(),
     });
     // EventOutput.persistent should be false for ephemeral events
@@ -4461,7 +4461,7 @@ async fn ephemeral_root_via_emit_output() -> Result<()> {
 
     engine.emit_output(output).settled().await?;
 
-    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "Handler should fire for emit_output ephemeral");
+    assert_eq!(handler_ran.load(Ordering::SeqCst), 1, "Reactor should fire for emit_output ephemeral");
     let all_events = store.global_log().lock().clone();
     assert_eq!(all_events.len(), 1, "Ephemeral event should be in operational store");
     assert!(!all_events[0].persistent, "Ephemeral via emit_output should have persistent=false");
@@ -4479,14 +4479,14 @@ async fn ephemeral_persistent_flag_propagates_through_causal_chain() -> Result<(
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 // Persistent trigger emits ephemeral
                 Ok(events![EnrichmentReady { concern_id: Uuid::nil() }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
                 // Ephemeral emits persistent
                 Ok(events![EnrichmentComplete { concern_id: event.concern_id }])
             }),
@@ -4524,14 +4524,14 @@ async fn ephemeral_events_excluded_from_aggregate_streams() -> Result<()> {
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
-        .with_handler(
-            handler::on::<OrderCreated>().then(|event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<OrderCreated>().then(|event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
                 // Persistent event triggers ephemeral signal
                 Ok(events![EnrichmentReady { concern_id: event.order_id }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(|event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentComplete { concern_id: event.concern_id }])
             }),
         );
@@ -4556,7 +4556,7 @@ async fn ephemeral_events_excluded_from_aggregate_streams() -> Result<()> {
 }
 
 /// Cancel a correlation that includes ephemeral events — the ephemeral events
-/// should still be in the store but downstream handlers should be DLQ'd.
+/// should still be in the store but downstream reactors should be DLQ'd.
 #[tokio::test]
 async fn cancel_correlation_with_ephemeral_events() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
@@ -4564,8 +4564,8 @@ async fn cancel_correlation_with_ephemeral_events() -> Result<()> {
     let handler_ran2 = handler_ran.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EnrichmentReady>()
+        .with_reactor(
+            reactor::on::<EnrichmentReady>()
                 .id("should_be_cancelled")
                 .retry(1)
                 .then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
@@ -4600,8 +4600,8 @@ async fn snapshot_not_triggered_by_ephemeral_events() -> Result<()> {
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
         .with_aggregator::<OrderCreated, Order, _>(|e| e.order_id)
         .snapshot_every(2) // Snapshot after every 2 aggregate events
-        .with_handler(
-            handler::on::<OrderCreated>().then(|_event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<OrderCreated>().then(|_event: Arc<OrderCreated>, _ctx: Context<Deps>| async move {
                 // Each persistent event triggers 5 ephemeral events
                 Ok(events![
                     EnrichmentReady { concern_id: Uuid::new_v4() },
@@ -4612,8 +4612,8 @@ async fn snapshot_not_triggered_by_ephemeral_events() -> Result<()> {
                 ])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(|_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(|_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
                 Ok(events![])
             }),
         );
@@ -4659,7 +4659,7 @@ async fn ephemeral_event_idempotent_append() -> Result<()> {
     Ok(())
 }
 
-/// DLQ terminal mapper fires correctly for a handler that was triggered
+/// DLQ terminal mapper fires correctly for a reactor that was triggered
 /// by an ephemeral event and then fails.
 #[event]
 #[derive(Clone, Serialize, Deserialize)]
@@ -4673,14 +4673,14 @@ async fn dlq_terminal_event_from_ephemeral_triggered_handler() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .on_dlq(|info: causal::handler::DlqTerminalInfo| {
+        .on_dlq(|info: causal::reactor::DlqTerminalInfo| {
             EphHandlerFailed {
                 source_event_type: info.source_event_type,
                 error: info.error,
             }
         })
-        .with_handler(
-            handler::on::<EnrichmentReady>()
+        .with_reactor(
+            reactor::on::<EnrichmentReady>()
                 .id("always_fails")
                 .retry(1)
                 .then(|_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| async move {
@@ -4732,23 +4732,23 @@ async fn deep_ephemeral_chain_with_hop_counting() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_: Arc<EphTrigger>, _: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_: Arc<EphTrigger>, _: Context<Deps>| async move {
                 Ok(events![EphChain1])
             }),
         )
-        .with_handler(
-            handler::on::<EphChain1>().then(|_: Arc<EphChain1>, _: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphChain1>().then(|_: Arc<EphChain1>, _: Context<Deps>| async move {
                 Ok(events![EphChain2])
             }),
         )
-        .with_handler(
-            handler::on::<EphChain2>().then(|_: Arc<EphChain2>, _: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphChain2>().then(|_: Arc<EphChain2>, _: Context<Deps>| async move {
                 Ok(events![EphChain3])
             }),
         )
-        .with_handler(
-            handler::on::<EphChain3>().then(|_: Arc<EphChain3>, _: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphChain3>().then(|_: Arc<EphChain3>, _: Context<Deps>| async move {
                 Ok(events![ChainTerminal { depth: 4 }])
             }),
         );
@@ -4790,8 +4790,8 @@ async fn ephemeral_events_advance_checkpoint() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EnrichmentReady>().then(|_: Arc<EnrichmentReady>, _: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EnrichmentReady>().then(|_: Arc<EnrichmentReady>, _: Context<Deps>| async move {
                 Ok(events![EnrichmentComplete { concern_id: Uuid::nil() }])
             }),
         );
@@ -4810,8 +4810,8 @@ async fn ephemeral_events_advance_checkpoint() -> Result<()> {
     Ok(())
 }
 
-/// Handler describe() should fire for events in correlations that include
-/// ephemeral events — describe runs for ALL handlers on every event.
+/// Reactor describe() should fire for events in correlations that include
+/// ephemeral events — describe runs for ALL reactors on every event.
 #[tokio::test]
 async fn describe_fires_for_ephemeral_events() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
@@ -4819,8 +4819,8 @@ async fn describe_fires_for_ephemeral_events() -> Result<()> {
     let describe_count2 = describe_count.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EnrichmentReady>()
+        .with_reactor(
+            reactor::on::<EnrichmentReady>()
                 .id("described_handler")
                 .filter(|_event: &EnrichmentReady, _ctx: &Context<Deps>| true)
                 .describe(move |_ctx: &Context<Deps>| {
@@ -4842,7 +4842,7 @@ async fn describe_fires_for_ephemeral_events() -> Result<()> {
     Ok(())
 }
 
-/// Mixed batch: handler returns events![] with persistent and ephemeral
+/// Mixed batch: reactor returns events![] with persistent and ephemeral
 /// events interleaved. Verify ordering and persistent flags are correct.
 #[event(ephemeral)]
 #[derive(Clone, Serialize, Deserialize)]
@@ -4857,8 +4857,8 @@ async fn interleaved_persistent_ephemeral_batch_ordering() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_: Arc<EphTrigger>, _: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_: Arc<EphTrigger>, _: Context<Deps>| async move {
                 Ok(events![
                     PersistBatchItem { idx: 1 },
                     EphBatchItem { idx: 2 },
@@ -4868,9 +4868,9 @@ async fn interleaved_persistent_ephemeral_batch_ordering() -> Result<()> {
                 ])
             }),
         )
-        // No-op handlers so ephemeral events get routed
-        .with_handler(
-            handler::on::<EphBatchItem>().then(|_: Arc<EphBatchItem>, _: Context<Deps>| async move {
+        // No-op reactors so ephemeral events get routed
+        .with_reactor(
+            reactor::on::<EphBatchItem>().then(|_: Arc<EphBatchItem>, _: Context<Deps>| async move {
                 Ok(events![])
             }),
         );
@@ -4899,7 +4899,7 @@ async fn interleaved_persistent_ephemeral_batch_ordering() -> Result<()> {
     Ok(())
 }
 
-/// Ephemeral event with a retry handler — retry should work within
+/// Ephemeral event with a retry reactor — retry should work within
 /// the same process (ephemeral sidecar survives in cache).
 #[tokio::test]
 async fn ephemeral_event_with_retry_handler() -> Result<()> {
@@ -4908,15 +4908,15 @@ async fn ephemeral_event_with_retry_handler() -> Result<()> {
     let attempt_count2 = attempt_count.clone();
 
     let engine = Engine::with_backends(Deps, store.clone(), store.clone())
-        .with_handler(
-            handler::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
+        .with_reactor(
+            reactor::on::<EphTrigger>().then(|_event: Arc<EphTrigger>, _ctx: Context<Deps>| async move {
                 Ok(events![EnrichmentReady {
                     concern_id: Uuid::nil(),
                 }])
             }),
         )
-        .with_handler(
-            handler::on::<EnrichmentReady>()
+        .with_reactor(
+            reactor::on::<EnrichmentReady>()
                 .id("retry_ephemeral")
                 .retry(3)
                 .then(move |_event: Arc<EnrichmentReady>, _ctx: Context<Deps>| {
@@ -4936,12 +4936,12 @@ async fn ephemeral_event_with_retry_handler() -> Result<()> {
     engine.emit(EphTrigger).settled().await?;
 
     // Should have attempted 3 times (0, 1, 2) and succeeded on attempt 2
-    assert_eq!(attempt_count.load(Ordering::SeqCst), 3, "Should retry ephemeral event handler");
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 3, "Should retry ephemeral event reactor");
 
     // The persistent output should be in the log
     let all_events = store.global_log().lock().clone();
     let has_complete = all_events.iter().any(|e| e.event_type == "enrichment_complete");
-    assert!(has_complete, "Persistent event from retried ephemeral handler should be in log");
+    assert!(has_complete, "Persistent event from retried ephemeral reactor should be in log");
 
     Ok(())
 }
@@ -4958,8 +4958,8 @@ async fn journal_concurrent_ctx_run_from_spawned_tasks() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("concurrent_journal")
                 .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
                     let cl = cl.clone();
@@ -5006,7 +5006,7 @@ async fn journal_concurrent_ctx_run_from_spawned_tasks() -> Result<()> {
     // Journal is cleared on completion, so entries should be empty
     assert!(
         entries.is_empty(),
-        "Journal should be cleared after successful handler"
+        "Journal should be cleared after successful reactor"
     );
 
     Ok(())
@@ -5028,8 +5028,8 @@ async fn journal_large_nested_payload_round_trips() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("large_journal")
                 .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
                     let payload = large_payload.clone();
@@ -5056,7 +5056,7 @@ async fn journal_large_nested_payload_round_trips() -> Result<()> {
     Ok(())
 }
 
-/// A handler that panics mid-journal should leave prior journal entries intact
+/// A reactor that panics mid-journal should leave prior journal entries intact
 /// so the next retry attempt replays them.
 #[tokio::test]
 async fn journal_panic_mid_execution_preserves_prior_entries() -> Result<()> {
@@ -5070,8 +5070,8 @@ async fn journal_panic_mid_execution_preserves_prior_entries() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("panic_journal")
                 .retry(3)
                 .then(move |_event: Arc<Ping>, ctx: Context<Deps>| {
@@ -5113,7 +5113,7 @@ async fn journal_panic_mid_execution_preserves_prior_entries() -> Result<()> {
         .settled()
         .await?;
 
-    // Handler ran twice (first attempt failed, second succeeded)
+    // Reactor ran twice (first attempt failed, second succeeded)
     assert_eq!(call_count.load(Ordering::SeqCst), 2);
 
     // Step 1 closure executed on first attempt, replayed from journal on second
@@ -5133,7 +5133,7 @@ async fn journal_panic_mid_execution_preserves_prior_entries() -> Result<()> {
     Ok(())
 }
 
-/// Ephemeral events should still get full journaling support. A handler
+/// Ephemeral events should still get full journaling support. A reactor
 /// triggered by an ephemeral event should be able to use ctx.run() with
 /// replay on retry.
 #[tokio::test]
@@ -5159,8 +5159,8 @@ async fn journal_works_for_ephemeral_event_handlers() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(
-            handler::on::<EphJournalTrigger>()
+        .with_reactor(
+            reactor::on::<EphJournalTrigger>()
                 .id("eph_journal_handler")
                 .retry(3)
                 .then(move |_event: Arc<EphJournalTrigger>, ctx: Context<Deps>| {
@@ -5214,7 +5214,7 @@ async fn journal_works_for_ephemeral_event_handlers() -> Result<()> {
         .iter()
         .find(|e| e.event_type == "journal_output")
         .expect("JournalOutput should be in log");
-    assert!(output.persistent, "Output from ephemeral handler should be persistent");
+    assert!(output.persistent, "Output from ephemeral reactor should be persistent");
 
     // Verify the ephemeral trigger is in log with persistent=false
     let trigger = all_events
@@ -5226,9 +5226,9 @@ async fn journal_works_for_ephemeral_event_handlers() -> Result<()> {
     Ok(())
 }
 
-/// Two handlers with the same name processing different events must have
-/// completely isolated journals. A stale journal from handler "X" on event A
-/// must never leak into handler "X" on event B.
+/// Two reactors with the same name processing different events must have
+/// completely isolated journals. A stale journal from reactor "X" on event A
+/// must never leak into reactor "X" on event B.
 #[tokio::test]
 async fn journal_isolation_across_different_events() -> Result<()> {
     let store = Arc::new(MemoryStore::new());
@@ -5237,8 +5237,8 @@ async fn journal_isolation_across_different_events() -> Result<()> {
 
     let engine = Engine::in_memory(Deps)
         .with_store(store.clone())
-        .with_handler(
-            handler::on::<Ping>()
+        .with_reactor(
+            reactor::on::<Ping>()
                 .id("isolated_journal")
                 .then(move |event: Arc<Ping>, ctx: Context<Deps>| {
                     let ec = ec.clone();
@@ -5270,11 +5270,11 @@ async fn journal_isolation_across_different_events() -> Result<()> {
         .settled()
         .await?;
 
-    // Both handlers should have executed (not replayed from each other's journals)
+    // Both reactors should have executed (not replayed from each other's journals)
     assert_eq!(
         exec_count.load(Ordering::SeqCst),
         2,
-        "Both handler invocations should execute their closures independently"
+        "Both reactor invocations should execute their closures independently"
     );
 
     // Both journals should be cleared after successful completion

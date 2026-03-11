@@ -203,11 +203,11 @@ where
         // Start with blank state
         let mut aggregate = A::default();
 
-        // Apply each event through handlers
+        // Apply each event through reactors
         for stored_event in events {
-            // Handlers can check context.mode to suppress side effects
-            for handler in &handlers {
-                handler.apply_with_context(&mut aggregate, &stored_event.data, &context)?;
+            // Reactors can check context.mode to suppress side effects
+            for reactor in &reactors {
+                reactor.apply_with_context(&mut aggregate, &stored_event.data, &context)?;
             }
 
             aggregate.set_version(stored_event.sequence);
@@ -280,11 +280,11 @@ A: Depends on strategy:
 - `Incremental`: Continue on errors, report via `ReplayStats`
 - `Validate`: No state changes, just collect errors
 
-**Q: How do handlers know they're in replay mode?**
-A: Pass `ReplayContext` through handler signature:
+**Q: How do reactors know they're in replay mode?**
+A: Pass `ReplayContext` through reactor signature:
 
 ```rust
-#[handler(on = OrderEvent, replay_aware)]
+#[reactor(on = OrderEvent, replay_aware)]
 fn apply_placed(state: &mut Order, ctx: &ReplayContext) -> Result<()> {
     state.status = OrderStatus::Placed;
 
@@ -789,7 +789,7 @@ async fn process_batch(&self, aggregate_id: Uuid, events: Vec<Event>) -> Result<
     let mut tx = self.pool.begin().await?;
 
     for (i, event) in events.iter().enumerate() {
-        // Apply through handlers
+        // Apply through reactors
         match self.apply_event(&mut aggregate, event) {
             Ok(_) => {
                 // Store event
@@ -819,7 +819,7 @@ async fn process_batch(&self, aggregate_id: Uuid, events: Vec<Event>) -> Result<
 pub struct ProjectionFailure {
     pub event_id: Uuid,
     pub aggregate_id: Uuid,
-    pub handler_id: String,
+    pub reactor_id: String,
     pub error: String,
     pub retry_count: u32,
     pub failed_at: DateTime<Utc>,
@@ -847,7 +847,7 @@ impl AggregateLoader {
                     dlq.record_failure(ProjectionFailure {
                         event_id: event.id,
                         aggregate_id: self.aggregate_id,
-                        handler_id: "apply_placed".into(),
+                        reactor_id: "apply_placed".into(),
                         error: e.to_string(),
                         retry_count: 0,
                         failed_at: Utc::now(),
@@ -1038,7 +1038,7 @@ impl AggregateLoader {
 // Load with automatic snapshots
 let order: Order = store
     .aggregate(order_id)
-    .with_handlers(order_handlers::handlers())
+    .with_reactors(order_handlers::reactors())
     .load_with_snapshots(SnapshotConfig::default())
     .await?;
 
@@ -1052,7 +1052,7 @@ store.prune_snapshots(order_id, 10).await?;
 ### Performance Impact
 
 **Before (no snapshots):**
-- 1000 events = 1000 handler calls = ~500ms
+- 1000 events = 1000 reactor calls = ~500ms
 
 **After (snapshot every 100 events):**
 - Latest snapshot at event 900
@@ -1065,7 +1065,7 @@ store.prune_snapshots(order_id, 10).await?;
 ## Implementation Priority
 
 ### Phase 1: Foundation (Week 1)
-1. ✅ **ReplayContext** - Add to all handler signatures
+1. ✅ **ReplayContext** - Add to all reactor signatures
 2. ✅ **EventUpcast trait** - Foundation for schema evolution
 3. ✅ **Gateway pattern** - Basic implementation
 
@@ -1089,7 +1089,7 @@ store.prune_snapshots(order_id, 10).await?;
 ## Next Actions
 
 1. **Create tracking issues** for each gap
-2. **Prototype ReplayContext** - Add to handler signatures
+2. **Prototype ReplayContext** - Add to reactor signatures
 3. **Implement EventUpcast** - Start with simple example
 4. **Design Gateway API** - Get feedback on ergonomics
 5. **Write integration tests** - Replay scenarios

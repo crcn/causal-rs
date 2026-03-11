@@ -8,7 +8,7 @@ topic: kurrentdb-integration
 ## Goal
 
 Implement `causal-kurrentdb`, a Store backend that uses KurrentDB (formerly
-EventStoreDB) as the durable event log and handler queue. Causal's Store trait
+EventStoreDB) as the durable event log and reactor queue. Causal's Store trait
 is already shaped for this — the v0.22 changes (`AppendResult`, stream-version
 filtering, opaque position cursors, total idempotency contract) were
 specifically designed to align with KurrentDB's semantics.
@@ -68,24 +68,24 @@ Implement the optional persistence methods on Store:
   separate backing store (Postgres/Redis). KurrentDB doesn't have native
   snapshot support, so this is an application-level concern.
 
-### Phase 2: Handler queue
+### Phase 2: Reactor queue
 
-The handler queue (publish, poll_next, complete_event, poll_next_handler,
+The reactor queue (publish, poll_next, complete_event, poll_next_handler,
 resolve_handler) is the harder problem. KurrentDB is an event store, not a
 job queue. Options:
 
 - **Option A: KurrentDB persistent subscriptions as the queue.** Use
-  competing consumers for handler distribution. Track handler state
+  competing consumers for reactor distribution. Track reactor state
   (pending/running/completed) in a separate metadata stream or projection.
   Ack/nack maps to resolve_handler semantics.
 
 - **Option B: Hybrid — KurrentDB for events, Postgres/SQLite for queues.**
-  The event log lives in KurrentDB. The handler queue, join windows,
+  The event log lives in KurrentDB. The reactor queue, join windows,
   journals, and cancellation state live in a relational store. This is
   simpler and plays to each system's strengths.
 
 - **Option C: KurrentDB projections as queue driver.** Custom projections
-  emit to handler-specific streams. Workers subscribe to their stream.
+  emit to reactor-specific streams. Workers subscribe to their stream.
   Elegant but couples deeply to KurrentDB's projection system.
 
 **Recommendation: Option B (hybrid).** The queue operations (poll with skip
@@ -107,7 +107,7 @@ With KurrentDB as the shared event log:
 ### Phase 4: Production hardening
 
 - **Connection pooling / reconnection** for the KurrentDB gRPC client
-- **Batched appends** where multiple events from one handler can be appended
+- **Batched appends** where multiple events from one reactor can be appended
   atomically
 - **Metrics**: append latency, subscription lag, dedup cache hit rate
 - **Integration tests** against a real KurrentDB instance (Docker)
@@ -147,5 +147,5 @@ crates/
 
 - KurrentDB Rust client (gRPC)
 - `serde_json` (already in causal)
-- Optional: Postgres/Redis for dedup index (Phase 1) and handler queue
+- Optional: Postgres/Redis for dedup index (Phase 1) and reactor queue
   (Phase 2 Option B)

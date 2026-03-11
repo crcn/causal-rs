@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use anyhow::Result;
-use causal::{aggregator, aggregators, event, events, handle, handles, projection, AnyEvent, Context, Emit, ErrorContext, Events};
+use causal::{aggregator, aggregators, event, events, reactor, reactors, projection, AnyEvent, Context, Emit, ErrorContext, Events};
 use causal::{Aggregate, Apply};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -71,18 +71,18 @@ fn is_high_value(event: &HighValueOrder, _ctx: &Context<Deps>) -> bool {
     event.total > 500.0
 }
 
-#[handles]
+#[reactors]
 mod order_effects {
     use super::*;
 
-    #[handle(on = OrderPlaced, id = "ship_order")]
+    #[reactor(on = OrderPlaced, id = "ship_order")]
     async fn ship_order(event: OrderPlaced, _ctx: Context<Deps>) -> Result<OrderShipped> {
         Ok(OrderShipped {
             order_id: event.order_id,
         })
     }
 
-    #[handle(
+    #[reactor(
         on = PaymentRequested,
         id = "charge_payment",
         retry = 3,
@@ -101,7 +101,7 @@ mod order_effects {
         })
     }
 
-    #[handle(
+    #[reactor(
         on = PaymentRequested,
         id = "run_search",
         retry = 3,
@@ -128,7 +128,7 @@ mod order_effects {
         }
     }
 
-    #[handle(on = OrderPlaced, queued, id = "bg_observer")]
+    #[reactor(on = OrderPlaced, queued, id = "bg_observer")]
     async fn bg_observer(
         _event: OrderPlaced,
         _ctx: Context<Deps>,
@@ -136,7 +136,7 @@ mod order_effects {
         Ok(Emit::None)
     }
 
-    #[handle(
+    #[reactor(
         on = PaymentRequested,
         queued,
         retry = 1,
@@ -154,7 +154,7 @@ mod order_effects {
         })
     }
 
-    #[handle(
+    #[reactor(
         on = [CrawlEvent::Ingested, CrawlEvent::Regenerated],
         extract(website_id, job_id)
     )]
@@ -167,7 +167,7 @@ mod order_effects {
         Ok(ExtractEnqueued { website_id })
     }
 
-    #[handle(on = OrderPlaced, group = "analytics")]
+    #[reactor(on = OrderPlaced, group = "analytics")]
     async fn log_order(
         _event: OrderPlaced,
         _ctx: Context<Deps>,
@@ -175,7 +175,7 @@ mod order_effects {
         Ok(Emit::None)
     }
 
-    #[handle(on = HighValueOrder, filter = is_high_value, id = "ship_high_value")]
+    #[reactor(on = HighValueOrder, filter = is_high_value, id = "ship_high_value")]
     async fn ship_high_value(
         event: HighValueOrder,
         _ctx: Context<Deps>,
@@ -193,7 +193,7 @@ mod order_effects {
         Ok(())
     }
 
-    #[handle(on_any, id = "event_logger")]
+    #[reactor(on_any, id = "event_logger")]
     async fn log_all_events(
         _event: AnyEvent,
         _ctx: Context<Deps>,
@@ -390,7 +390,7 @@ fn singleton_aggregator_apply_works() {
     assert_eq!(stats.event_count, 2);
 }
 
-// ── Handler macro tests ────────────────────────────────────────────────
+// ── Reactor macro tests ────────────────────────────────────────────────
 
 #[test]
 fn effects_module_registration_works() {
@@ -409,16 +409,16 @@ fn effects_module_registration_works() {
     let ship_order = effects
         .iter()
         .find(|h| h.id == "ship_order")
-        .expect("ship_order handler should exist");
+        .expect("ship_order reactor should exist");
     assert!(
         ship_order.is_default(),
-        "default handler should have default execution"
+        "default reactor should have default execution"
     );
 
     let bg_observer = effects
         .iter()
         .find(|h| h.id == "bg_observer")
-        .expect("bg_observer handler should exist");
+        .expect("bg_observer reactor should exist");
     assert!(
         !bg_observer.is_default(),
         "queued attribute should force background execution"
@@ -427,7 +427,7 @@ fn effects_module_registration_works() {
     let bg_retry_one = effects
         .iter()
         .find(|h| h.id == "bg_retry_one")
-        .expect("bg_retry_one handler should exist");
+        .expect("bg_retry_one reactor should exist");
     assert!(
         !bg_retry_one.is_default(),
         "queued attribute should force background execution even when retry = 1"
@@ -439,7 +439,7 @@ fn effects_module_registration_works() {
         .expect("ship_high_value effect should exist");
     assert!(
         ship_high_value.can_handle(TypeId::of::<HighValueOrder>()),
-        "filter handler should handle HighValueOrder events"
+        "filter reactor should handle HighValueOrder events"
     );
 
     // Projection is now in a separate projections() collection
@@ -450,19 +450,19 @@ fn effects_module_registration_works() {
     let event_logger = effects
         .iter()
         .find(|effect| effect.id == "event_logger")
-        .expect("event_logger on_any handler should exist");
-    // on_any handlers match all event types
+        .expect("event_logger on_any reactor should exist");
+    // on_any reactors match all event types
     assert!(
         event_logger.can_handle(TypeId::of::<OrderPlaced>()),
-        "on_any handler should match OrderPlaced"
+        "on_any reactor should match OrderPlaced"
     );
     assert!(
         event_logger.can_handle(TypeId::of::<PaymentRequested>()),
-        "on_any handler should match PaymentRequested"
+        "on_any reactor should match PaymentRequested"
     );
 }
 
-// ── Bare handler inference tests ──────────────────────────────────────
+// ── Bare reactor inference tests ──────────────────────────────────────
 
 #[event]
 #[derive(Clone, Serialize, Deserialize)]
@@ -476,19 +476,19 @@ struct TaskFinished {
     task_id: Uuid,
 }
 
-#[handles]
+#[reactors]
 mod bare_handlers {
     use super::*;
 
-    // No #[handle] — inferred from event param type
+    // No #[reactor] — inferred from event param type
     async fn on_task_created(event: TaskCreated, _ctx: Context<Deps>) -> Result<Events> {
         Ok(events![TaskFinished {
             task_id: event.task_id,
         }])
     }
 
-    // Explicit #[handle] still works alongside bare fns
-    #[handle(on = TaskFinished, id = "log_finished")]
+    // Explicit #[reactor] still works alongside bare fns
+    #[reactor(on = TaskFinished, id = "log_finished")]
     async fn log_finished(_event: TaskFinished, _ctx: Context<Deps>) -> Result<()> {
         Ok(())
     }
@@ -502,17 +502,17 @@ fn bare_handler_inference_works() {
     let inferred = effects
         .iter()
         .find(|e| e.id == "on_task_created")
-        .expect("bare fn should produce handler with fn name as id");
+        .expect("bare fn should produce reactor with fn name as id");
     assert!(inferred.can_handle(TypeId::of::<TaskCreated>()));
 
     let explicit = effects
         .iter()
         .find(|e| e.id == "log_finished")
-        .expect("explicit #[handle] should still work");
+        .expect("explicit #[reactor] should still work");
     assert!(explicit.can_handle(TypeId::of::<TaskFinished>()));
 }
 
-// ── Multi-type handler tests ─────────────────────────────────────────
+// ── Multi-type reactor tests ─────────────────────────────────────────
 
 #[event]
 #[derive(Clone, Serialize, Deserialize)]
@@ -536,11 +536,11 @@ fn enrichment_pending(_ctx: &Context<Deps>) -> bool {
     true
 }
 
-#[handles]
+#[reactors]
 mod multi_type_handlers {
     use super::*;
 
-    #[handle(on = [SystemEvent, SignalEvent], filter = enrichment_pending, id = "extract_actors")]
+    #[reactor(on = [SystemEvent, SignalEvent], filter = enrichment_pending, id = "extract_actors")]
     async fn extract_actors(
         _event: AnyEvent,
         _ctx: Context<Deps>,
@@ -548,7 +548,7 @@ mod multi_type_handlers {
         Ok(())
     }
 
-    #[handle(on = [SystemEvent, SignalEvent], id = "extract_themes")]
+    #[reactor(on = [SystemEvent, SignalEvent], id = "extract_themes")]
     async fn extract_themes(
         _event: AnyEvent,
         _ctx: Context<Deps>,
@@ -559,31 +559,31 @@ mod multi_type_handlers {
 
 #[test]
 fn multi_type_handler_generates_registrations_per_type() {
-    let handlers = multi_type_handlers::handles();
-    // 2 types × 2 handlers = 4 registrations
-    assert_eq!(handlers.len(), 4);
+    let reactors = multi_type_handlers::handles();
+    // 2 types × 2 reactors = 4 registrations
+    assert_eq!(reactors.len(), 4);
 
     // extract_actors generates suffixed IDs per type
-    let actor_sys = handlers
+    let actor_sys = reactors
         .iter()
         .find(|h| h.id == "extract_actors::SystemEvent")
         .expect("should have extract_actors::SystemEvent");
     assert!(actor_sys.can_handle(TypeId::of::<SystemEvent>()));
 
-    let actor_sig = handlers
+    let actor_sig = reactors
         .iter()
         .find(|h| h.id == "extract_actors::SignalEvent")
         .expect("should have extract_actors::SignalEvent");
     assert!(actor_sig.can_handle(TypeId::of::<SignalEvent>()));
 
     // extract_themes also generates suffixed IDs
-    let theme_sys = handlers
+    let theme_sys = reactors
         .iter()
         .find(|h| h.id == "extract_themes::SystemEvent")
         .expect("should have extract_themes::SystemEvent");
     assert!(theme_sys.can_handle(TypeId::of::<SystemEvent>()));
 
-    let theme_sig = handlers
+    let theme_sig = reactors
         .iter()
         .find(|h| h.id == "extract_themes::SignalEvent")
         .expect("should have extract_themes::SignalEvent");

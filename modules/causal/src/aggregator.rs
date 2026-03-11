@@ -10,7 +10,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::handler::extract_prefix;
+use crate::reactor::extract_prefix;
 use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate + Apply traits ─────────────────────────────────────

@@ -13,7 +13,7 @@ Add three methods to `Store` with default no-ops:
 
 async fn load_journal(
     &self,
-    _handler_id: &str,
+    _reactor_id: &str,
     _event_id: Uuid,
 ) -> Result<Vec<JournalEntry>> {
     Ok(Vec::new())
@@ -21,7 +21,7 @@ async fn load_journal(
 
 async fn append_journal(
     &self,
-    _handler_id: &str,
+    _reactor_id: &str,
     _event_id: Uuid,
     _seq: u32,
     _value: serde_json::Value,
@@ -31,7 +31,7 @@ async fn append_journal(
 
 async fn clear_journal(
     &self,
-    _handler_id: &str,
+    _reactor_id: &str,
     _event_id: Uuid,
 ) -> Result<()> {
     Ok(())
@@ -56,14 +56,14 @@ MemoryStore implements with `HashMap<(String, Uuid), Vec<JournalEntry>>`.
 
 ## Phase 2: Wire Journal into Context
 
-Give `JobExecutor` a `store: Arc<dyn Store>` reference. Before handler execution, load journal entries. Pass them into Context via a `JournalState`.
+Give `JobExecutor` a `store: Arc<dyn Store>` reference. Before reactor execution, load journal entries. Pass them into Context via a `JournalState`.
 
 ```rust
 // context.rs
 
 struct JournalState {
     store: Arc<dyn Store>,
-    handler_id: String,
+    reactor_id: String,
     event_id: Uuid,
     entries: Vec<JournalEntry>,  // preloaded, indexed by seq
     next_seq: AtomicU32,
@@ -94,7 +94,7 @@ where
     // Execute + persist
     let result = f().await?;
     journal.store.append_journal(
-        &journal.handler_id,
+        &journal.reactor_id,
         journal.event_id,
         seq,
         serde_json::to_value(&result)?,
@@ -112,7 +112,7 @@ When no journal state is present (inline effects today, or MemoryStore where it 
 // Effect success (line ~504)
 EffectStatus::Success => {
     // ... existing resolve_effect(Complete) ...
-    self.store.clear_journal(&handler_id, event_id).await?;
+    self.store.clear_journal(&reactor_id, event_id).await?;
 }
 
 // Effect retry — journal is NOT cleared (that's the whole point)
@@ -121,7 +121,7 @@ EffectStatus::Success => {
 ```
 
 ### Files touched
-- `handler/context.rs` — add `JournalState`, update `run()`
+- `reactor/context.rs` — add `JournalState`, update `run()`
 - `job_executor.rs` — accept `store`, load journal before execution
 - `engine.rs` — pass store to JobExecutor, clear journal on success
 
@@ -135,7 +135,7 @@ What "inline" becomes: an effect with `priority=0` and `delay=0`. The settle loo
 
 1. **Remove `run_inline_effect`** from `job_executor.rs` (line 502-639) — all effects use `execute_handler`
 2. **Remove inline filtering** from `execute_event` (line 182-214) — all matched effects become `EffectIntent` entries
-3. **`execute_event` simplifies to**: decode event, find matching handlers, create intents, apply projections. No more inline execution.
+3. **`execute_event` simplifies to**: decode event, find matching reactors, create intents, apply projections. No more inline execution.
 4. **Retry support for previously-inline effects** comes for free from the existing effect queue retry/DLQ/backoff logic.
 5. **Journaling for all effects** comes for free since `execute_handler` is the single path and it loads journal state.
 
@@ -150,8 +150,8 @@ What "inline" becomes: an effect with `priority=0` and `delay=0`. The settle loo
 ### Files touched
 - `job_executor.rs` — remove `run_inline_effect`, simplify `execute_event`
 - `engine.rs` — settle loop handles all effects uniformly
-- `handler/builders.rs` — `.inline()` becomes `.priority(0)` alias or is removed
-- `handler/types.rs` — remove `is_inline` field if no longer needed
+- `reactor/builders.rs` — `.inline()` becomes `.priority(0)` alias or is removed
+- `reactor/types.rs` — remove `is_inline` field if no longer needed
 
 ## Phase 4: Tests
 

@@ -1,13 +1,13 @@
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 
-/// Event emitted when a handler returns an error.
+/// Event emitted when a reactor returns an error.
 ///
 /// Minimal data structure - just what happened and what failed.
 /// Users write explicit handling logic for retries, compensation, etc.
 #[derive(Clone)]
-pub struct HandlerError {
-    /// The event that triggered the handler.
+pub struct ReactorError {
+    /// The event that triggered the reactor.
     pub source_event: Arc<dyn Any + Send + Sync>,
 
     /// TypeId of the source event (for filtering).
@@ -17,7 +17,7 @@ pub struct HandlerError {
     pub error: Arc<anyhow::Error>,
 }
 
-impl HandlerError {
+impl ReactorError {
     pub fn new(
         source_event: Arc<dyn Any + Send + Sync>,
         source_event_type: TypeId,
@@ -36,9 +36,9 @@ impl HandlerError {
     }
 }
 
-impl std::fmt::Debug for HandlerError {
+impl std::fmt::Debug for ReactorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HandlerError")
+        f.debug_struct("ReactorError")
             .field("source_event_type", &self.source_event_type)
             .field("error", &self.error.to_string())
             .finish()
@@ -64,7 +64,7 @@ mod tests {
         let error = anyhow::anyhow!("test error");
 
         let handler_error =
-            HandlerError::new(Arc::new(event.clone()), TypeId::of::<TestEvent>(), error);
+            ReactorError::new(Arc::new(event.clone()), TypeId::of::<TestEvent>(), error);
 
         assert_eq!(handler_error.source_event_type, TypeId::of::<TestEvent>());
         assert!(handler_error.error.to_string().contains("test error"));
@@ -78,7 +78,7 @@ mod tests {
         };
         let error = anyhow::Error::from(custom_error);
 
-        let handler_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let handler_error = ReactorError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         // Should successfully downcast to CustomError
         let downcasted = handler_error.downcast::<CustomError>();
@@ -91,7 +91,7 @@ mod tests {
         let event = TestEvent;
         let error = anyhow::anyhow!("generic error");
 
-        let handler_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let handler_error = ReactorError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         // Should fail to downcast to CustomError
         let downcasted = handler_error.downcast::<CustomError>();
@@ -103,10 +103,10 @@ mod tests {
         let event = TestEvent;
         let error = anyhow::anyhow!("formatting test");
 
-        let handler_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let handler_error = ReactorError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         let debug_str = format!("{:?}", handler_error);
-        assert!(debug_str.contains("HandlerError"));
+        assert!(debug_str.contains("ReactorError"));
         assert!(debug_str.contains("formatting test"));
     }
 
@@ -115,7 +115,7 @@ mod tests {
         let event = TestEvent;
         let error = anyhow::anyhow!("clone test");
 
-        let handler_error = HandlerError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
+        let handler_error = ReactorError::new(Arc::new(event), TypeId::of::<TestEvent>(), error);
 
         let cloned = handler_error.clone();
         assert_eq!(cloned.source_event_type, handler_error.source_event_type);

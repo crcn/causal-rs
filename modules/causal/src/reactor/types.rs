@@ -1,4 +1,4 @@
-//! Core handler types.
+//! Core reactor types.
 
 use std::any::{Any, TypeId};
 use std::future::Future;
@@ -12,16 +12,16 @@ use uuid::Uuid;
 use super::context::Context;
 use crate::event_codec::EventCodec;
 
-/// Error handler called when a handler returns an error.
+/// Error reactor called when a reactor returns an error.
 ///
-/// The handler receives the error, event type that caused it, and context.
+/// The reactor receives the error, event type that caused it, and context.
 /// It can emit failure events or log the error. The chain continues regardless.
 pub type ErrorHandler<D> = Arc<dyn Fn(Error, TypeId, Context<D>) -> BoxFuture<()> + Send + Sync>;
 
-/// Metadata passed to DLQ terminal mappers when a handler exhausts retries.
+/// Metadata passed to DLQ terminal mappers when a reactor exhausts retries.
 #[derive(Debug, Clone)]
 pub struct DlqTerminalInfo {
-    pub handler_id: String,
+    pub reactor_id: String,
     pub source_event_type: String,
     pub source_event_id: Uuid,
     pub error: String,
@@ -30,7 +30,7 @@ pub struct DlqTerminalInfo {
     pub max_attempts: i32,
 }
 
-/// Global DLQ mapper that converts any handler DLQ into a domain event.
+/// Global DLQ mapper that converts any reactor DLQ into a domain event.
 pub type GlobalDlqMapper = Arc<
     dyn Fn(DlqTerminalInfo) -> Result<crate::EmittedEvent> + Send + Sync,
 >;
@@ -38,17 +38,17 @@ pub type GlobalDlqMapper = Arc<
 /// Alias for DLQ terminal mapper metadata used by macro APIs.
 pub type ErrorContext = DlqTerminalInfo;
 
-/// Optional mapper that converts exhausted handler failures into terminal events.
+/// Optional mapper that converts exhausted reactor failures into terminal events.
 pub type DlqTerminalMapper = Arc<
     dyn Fn(Arc<dyn Any + Send + Sync>, TypeId, DlqTerminalInfo) -> Result<crate::EmittedEvent>
         + Send
         + Sync,
 >;
 
-/// A boxed future for async handlers.
+/// A boxed future for async reactors.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// Event emission result from handlers.
+/// Event emission result from reactors.
 #[derive(Debug, Clone)]
 pub enum Emit<E> {
     None,
@@ -81,7 +81,7 @@ impl<E> From<Option<E>> for Emit<E> {
     }
 }
 
-/// Output from a handler that returns an event.
+/// Output from a reactor that returns an event.
 ///
 /// The payload is eagerly serialized at creation time, making `EventOutput`
 /// trivially journalable for durable execution.
@@ -158,7 +158,7 @@ pub fn extract_prefix(durable_name: &str) -> &str {
     durable_name.split(':').next().unwrap_or(durable_name)
 }
 
-/// The universal return type for all handlers.
+/// The universal return type for all reactors.
 ///
 /// Use the [`events!`](crate::events) macro:
 ///
@@ -232,7 +232,7 @@ impl Events {
     }
 }
 
-/// Trait for converting handler return values into [`Events`].
+/// Trait for converting reactor return values into [`Events`].
 ///
 /// The blanket impl converts any `T: Send + Sync + 'static` into a single-event `Events`.
 /// Specialized impls exist for `Events` (pass-through), `()` (empty), `Emit<T>` (legacy).
@@ -278,7 +278,7 @@ impl std::fmt::Debug for EventOutput {
     }
 }
 
-/// Payload for handlers that receive all events (type-erased).
+/// Payload for reactors that receive all events (type-erased).
 #[derive(Clone)]
 pub struct AnyEvent {
     /// The type-erased event value.
@@ -304,12 +304,12 @@ impl AnyEvent {
     }
 }
 
-/// A projection handler — receives ALL events, returns `Result<()>`, runs sequentially.
+/// A projection reactor — receives ALL events, returns `Result<()>`, runs sequentially.
 ///
-/// Projections are fundamentally different from handlers:
+/// Projections are fundamentally different from reactors:
 /// - They receive all events (no type routing)
 /// - They return `Result<()>` (no emitted events)
-/// - They run sequentially before other handlers
+/// - They run sequentially before other reactors
 /// - They have no retry/timeout/delay semantics
 pub struct Projection<D>
 where
@@ -317,8 +317,8 @@ where
 {
     /// Human-readable identifier.
     pub id: String,
-    /// The projection handler — receives ALL events as AnyEvent.
-    pub(crate) handler: Arc<dyn Fn(AnyEvent, Context<D>) -> BoxFuture<Result<()>> + Send + Sync>,
+    /// The projection reactor — receives ALL events as AnyEvent.
+    pub(crate) reactor: Arc<dyn Fn(AnyEvent, Context<D>) -> BoxFuture<Result<()>> + Send + Sync>,
     /// Execution priority (lower = runs first).
     pub(crate) priority: Option<i32>,
 }
@@ -330,31 +330,31 @@ where
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
-            handler: self.handler.clone(),
+            reactor: self.reactor.clone(),
             priority: self.priority,
         }
     }
 }
 
-/// A handler — no traits, just data with closures.
-pub struct Handler<D>
+/// A reactor — no traits, just data with closures.
+pub struct Reactor<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Human-readable identifier for this handler.
+    /// Human-readable identifier for this reactor.
     pub id: String,
 
     /// Queue codec metadata for typed event handling/serialization.
     pub(crate) codecs: Vec<std::sync::Arc<EventCodec>>,
 
-    /// Determines if this handler handles the given event type.
+    /// Determines if this reactor handles the given event type.
     pub(crate) can_handle: Arc<dyn Fn(TypeId) -> bool + Send + Sync>,
 
     /// Called once when the store is activated.
     pub(crate) started: Option<Arc<dyn Fn(Context<D>) -> BoxFuture<Result<()>> + Send + Sync>>,
 
     /// Called for each event that passes `can_handle`.
-    pub(crate) handler: Arc<
+    pub(crate) reactor: Arc<
         dyn Fn(
                 Arc<dyn Any + Send + Sync>,
                 TypeId,
@@ -384,7 +384,7 @@ where
     pub(crate) describe: Option<Arc<dyn Fn(&Context<D>) -> serde_json::Value + Send + Sync>>,
 }
 
-impl<D> Clone for Handler<D>
+impl<D> Clone for Reactor<D>
 where
     D: Send + Sync + 'static,
 {
@@ -394,7 +394,7 @@ where
             codecs: self.codecs.clone(),
             can_handle: self.can_handle.clone(),
             started: self.started.clone(),
-            handler: self.handler.clone(),
+            reactor: self.reactor.clone(),
             dlq_terminal_mapper: self.dlq_terminal_mapper.clone(),
             queued: self.queued,
             delay: self.delay,
@@ -407,16 +407,16 @@ where
     }
 }
 
-impl<D> Handler<D>
+impl<D> Reactor<D>
 where
     D: Send + Sync + 'static,
 {
-    /// Check if this handler handles the given event type.
+    /// Check if this reactor handles the given event type.
     pub fn can_handle(&self, type_id: TypeId) -> bool {
         (self.can_handle)(type_id)
     }
 
-    /// Call the started handler if present.
+    /// Call the started reactor if present.
     pub async fn call_started(&self, ctx: Context<D>) -> Result<()> {
         if let Some(ref started) = self.started {
             started(ctx).await
@@ -425,17 +425,17 @@ where
         }
     }
 
-    /// Call the event handler.
+    /// Call the event reactor.
     pub async fn call_handler(
         &self,
         value: Arc<dyn Any + Send + Sync>,
         type_id: TypeId,
         ctx: Context<D>,
     ) -> Result<Vec<EventOutput>> {
-        (self.handler)(value, type_id, ctx).await
+        (self.reactor)(value, type_id, ctx).await
     }
 
-    /// Create the handler future without awaiting it.
+    /// Create the reactor future without awaiting it.
     ///
     /// Returns a `'static` future suitable for direct execution.
     pub fn make_handler_future(
@@ -444,7 +444,7 @@ where
         type_id: TypeId,
         ctx: Context<D>,
     ) -> BoxFuture<Result<Vec<EventOutput>>> {
-        (self.handler)(value, type_id, ctx)
+        (self.reactor)(value, type_id, ctx)
     }
 
     /// Internal queue codec metadata.
@@ -452,7 +452,7 @@ where
         &self.codecs
     }
 
-    /// Check if this handler has a describe closure.
+    /// Check if this reactor has a describe closure.
     pub fn has_describe(&self) -> bool {
         self.describe.is_some()
     }
@@ -462,7 +462,7 @@ where
         self.describe.as_ref().map(|f| f(ctx))
     }
 
-    /// Check if this handler uses default execution (no explicit background config).
+    /// Check if this reactor uses default execution (no explicit background config).
     pub fn is_default(&self) -> bool {
         !self.queued
             && self.delay.is_none()

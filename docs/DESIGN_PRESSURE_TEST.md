@@ -21,7 +21,7 @@ enum OrderEvent {
 }
 
 // What about these?
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 async fn send_notification(...) {  // Event Notification: trigger side effect
     ctx.deps().email.send(...).await?;
 }
@@ -46,7 +46,7 @@ enum OrderEvent {
 }
 
 // Pure projections rebuild state
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 fn apply_placed(state: &mut Order) -> Result<()> {
     state.status = OrderStatus::Placed;  // Pure state transition
     Ok(())
@@ -98,7 +98,7 @@ struct OrderListView {
 }
 
 // Async projection for read model
-#[handler(on = OrderEvent, extract(order_id, customer_id))]
+#[reactor(on = OrderEvent, extract(order_id, customer_id))]
 async fn project_order_list(
     order_id: Uuid,
     customer_id: Uuid,
@@ -119,7 +119,7 @@ async fn project_order_list(
 ```
 
 **Recommendation:** Add three distinct concepts to the API:
-1. `Aggregate` + `#[handler]` = Event Sourcing (pure projections)
+1. `Aggregate` + `#[reactor]` = Event Sourcing (pure projections)
 2. `EventBus` = Event Notification (publish/subscribe)
 3. `Projection` + `Context` = CQRS (async read models)
 
@@ -181,7 +181,7 @@ enum AccountEvent {
 
 ```rust
 #[reversible(ItemRemoved)]  // Specifies the compensating event type
-#[handler(on = OrderEvent)]
+#[reactor(on = OrderEvent)]
 fn apply_item_added(state: &mut Order) -> Result<()> {
     // ...
 }
@@ -573,7 +573,7 @@ enum OrderEvent {
 **Overall Grade: B- (Needs Work)**
 
 **Strengths:**
-- ✅ Clean handler API
+- ✅ Clean reactor API
 - ✅ Backend abstraction
 - ✅ Snapshot support planned
 - ✅ Pure projections

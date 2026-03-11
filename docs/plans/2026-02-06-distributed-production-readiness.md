@@ -23,11 +23,11 @@
 
 ### 1. Dead Letter Queue 🔴 NEED TO IMPLEMENT
 
-**Problem:** When a handler fails after max retries, what happens to the event?
+**Problem:** When a reactor fails after max retries, what happens to the event?
 
 **Current behavior:**
 ```rust
-#[handler(on = PaymentRequested, retry = 3)]
+#[reactor(on = PaymentRequested, retry = 3)]
 async fn charge_payment(...) -> Result<PaymentCharged> {
     ctx.deps().stripe.charge(&event).await?;  // Fails 3 times
     Ok(PaymentCharged { ... })
@@ -49,7 +49,7 @@ CREATE TYPE causal_dlq_status AS ENUM ('open', 'retrying', 'replayed', 'resolved
 CREATE TABLE causal_dead_letter_queue (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_id UUID NOT NULL REFERENCES causal_events(id),
-    handler_id TEXT NOT NULL,
+    reactor_id TEXT NOT NULL,
     intent_id UUID NOT NULL UNIQUE,
     error_message TEXT NOT NULL,
     error_details JSONB,
@@ -66,7 +66,7 @@ CREATE TABLE causal_dead_letter_queue (
 );
 
 CREATE INDEX idx_dlq_handler_open
-    ON causal_dead_letter_queue(handler_id, created_at DESC)
+    ON causal_dead_letter_queue(reactor_id, created_at DESC)
     WHERE status IN ('open', 'retrying');
 ```
 
@@ -74,7 +74,7 @@ CREATE INDEX idx_dlq_handler_open
 ```rust
 // After max retries exhausted
 async fn handle_permanent_failure(
-    intent: &HandlerIntent,
+    intent: &ReactorIntent,
     error: &Error,
     store: &impl Store,
 ) -> Result<()> {
@@ -83,7 +83,7 @@ async fn handle_permanent_failure(
     // Insert (or refresh) DLQ record
     sqlx::query(
         "INSERT INTO causal_dead_letter_queue
-         (event_id, handler_id, intent_id, error_message, error_details,
+         (event_id, reactor_id, intent_id, error_message, error_details,
           retry_count, first_failed_at, last_failed_at, event_payload, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open')
          ON CONFLICT (intent_id) DO UPDATE SET
@@ -94,7 +94,7 @@ async fn handle_permanent_failure(
            status = 'open'"
     )
     .bind(intent.event_id)
-    .bind(&intent.handler_id)
+    .bind(&intent.reactor_id)
     .bind(intent.id)
     .bind(error.to_string())
     .bind(json!({"error": format!("{:?}", error)}))
@@ -120,7 +120,7 @@ async fn handle_permanent_failure(
     // Emit DLQ event for monitoring (outside transaction)
     store.dispatch(HandlerFailedPermanently {
         event_id: intent.event_id,
-        handler_id: intent.handler_id.clone(),
+        reactor_id: intent.reactor_id.clone(),
         error: error.to_string(),
     }).await?;
 
@@ -210,18 +210,18 @@ async fn retry_dead_letter(
 
 // Bulk retry with bounded batch size
 async fn retry_all_by_handler(
-    handler_id: &str,
+    reactor_id: &str,
     engine: &Engine,
     store: &impl Store,
 ) -> Result<RetrySummary> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id
          FROM causal_dead_letter_queue
-         WHERE handler_id = $1 AND status = 'open'
+         WHERE reactor_id = $1 AND status = 'open'
          ORDER BY created_at
          LIMIT 100"
     )
-    .bind(handler_id)
+    .bind(reactor_id)
     .fetch_all(&store.pool())
     .await?;
 
@@ -249,7 +249,7 @@ async fn retry_all_by_handler(
 
 **Current behavior:**
 ```
-SIGTERM received → Worker killed immediately → In-flight handlers aborted
+SIGTERM received → Worker killed immediately → In-flight reactors aborted
 ```
 
 **Solution: Graceful Shutdown**
@@ -332,7 +332,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn poll_intent(&self) -> Result<Option<HandlerIntent>> {
+    async fn poll_intent(&self) -> Result<Option<ReactorIntent>> {
         if self.shutdown.is_cancelled() {
             // Don't claim new work once shutdown starts
             return Ok(None);
@@ -355,15 +355,15 @@ impl Worker {
 ```rust
 impl HandlerContext {
     pub fn idempotency_key(&self) -> String {
-        // Deterministic key based on event_id + handler_id
-        format!("{}-{}", self.event_id, self.handler_id)
+        // Deterministic key based on event_id + reactor_id
+        format!("{}-{}", self.event_id, self.reactor_id)
     }
 }
 ```
 
 **Usage:**
 ```rust
-#[handler(on = PaymentRequested, retry = 3)]
+#[reactor(on = PaymentRequested, retry = 3)]
 async fn charge_payment(event: PaymentRequested, ctx: Ctx) -> Result<PaymentCharged> {
     // Use idempotency key for external API
     let result = ctx.deps().stripe
@@ -419,18 +419,18 @@ use tracing::{info, warn, error, instrument};
 
 #[instrument(skip(ctx), fields(
     event_id = %ctx.event_id(),
-    handler_id = %ctx.handler_id(),
+    reactor_id = %ctx.reactor_id(),
     correlation_id = %ctx.correlation_id
 ))]
 async fn execute_handler(
-    handler: &Handler,
+    reactor: &Reactor,
     event: Event,
     ctx: HandlerContext,
 ) -> Result<Vec<Event>> {
-    info!("Executing handler");
+    info!("Executing reactor");
 
     let start = Instant::now();
-    let result = handler.execute(event, ctx).await;
+    let result = reactor.execute(event, ctx).await;
     let duration = start.elapsed();
 
     match &result {
@@ -438,14 +438,14 @@ async fn execute_handler(
             info!(
                 events_emitted = events.len(),
                 duration_ms = duration.as_millis(),
-                "Handler succeeded"
+                "Reactor succeeded"
             );
         }
         Err(e) => {
             error!(
                 error = %e,
                 duration_ms = duration.as_millis(),
-                "Handler failed"
+                "Reactor failed"
             );
         }
     }
@@ -475,7 +475,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn execute_handler(&self, intent: &HandlerIntent) -> Result<()> {
+    async fn execute_handler(&self, intent: &ReactorIntent) -> Result<()> {
         let start = Instant::now();
         self.metrics.handlers_executed.inc();
 
@@ -518,11 +518,11 @@ async fn dispatch(&self, event: Event) -> Result<()> {
     span.set_attribute("event.id", event_id.to_string());
 
     // Insert intents
-    for handler in &self.handlers {
+    for reactor in &self.reactors {
         let mut intent_span = tracer.start("create_intent");
-        intent_span.set_attribute("handler.id", handler.id());
+        intent_span.set_attribute("reactor.id", reactor.id());
 
-        self.store.insert_intent(event_id, handler.id()).await?;
+        self.store.insert_intent(event_id, reactor.id()).await?;
 
         intent_span.end();
     }
@@ -758,8 +758,8 @@ struct OrderPlaced {
 
 fn default_version() -> u32 { 1 }
 
-// Handler handles multiple versions
-#[handler(on = OrderPlaced)]
+// Reactor handles multiple versions
+#[reactor(on = OrderPlaced)]
 async fn handle_order(event: OrderPlaced, ctx: Ctx) -> Result<()> {
     match event.version {
         1 => {
@@ -828,7 +828,7 @@ impl TestEngine {
         // Dispatch event
         self.engine.dispatch(event).await?;
 
-        // Run all handlers synchronously (for testing)
+        // Run all reactors synchronously (for testing)
         let mut results = Vec::new();
 
         while let Some(intent) = self.engine.store.claim_intent().await? {
@@ -847,7 +847,7 @@ impl TestEngine {
     pub async fn advance_time(&self, duration: Duration) {
         self.clock.lock().unwrap().advance(duration);
 
-        // Process delayed handlers
+        // Process delayed reactors
         self.engine.process_delayed_handlers().await.unwrap();
     }
 }
@@ -877,7 +877,7 @@ async fn test_delayed_handler() {
     // Advance time by 1 hour
     engine.advance_time(Duration::from_secs(3600)).await;
 
-    // Delayed handler should have executed
+    // Delayed reactor should have executed
     let events = engine.emitted_events().await?;
     assert!(events.iter().any(|e| matches!(e, FollowupSent { .. })));
 }
@@ -906,14 +906,14 @@ async fn test_delayed_handler() {
 
 ### Phase 2: Operability Baseline (Week 1)
 3. [ ] Structured logs + correlation IDs
-   - Include `event_id`, `handler_id`, and correlation metadata on all handler paths
+   - Include `event_id`, `reactor_id`, and correlation metadata on all reactor paths
    - Normalize error fields and retry context
    - Exit criteria: can trace a failed event end-to-end from logs alone
 
 4. [ ] Metrics + alerts (minimum set)
    - Counters: dispatched, executed, failed, retried, DLQ entered
-   - Gauges: queue depth, in-flight handler count, worker count
-   - Histograms: handler duration, dispatch latency
+   - Gauges: queue depth, in-flight reactor count, worker count
+   - Histograms: reactor duration, dispatch latency
    - Exit criteria: alert on sustained queue growth, failure-rate spike, DLQ growth
 
 ### Phase 3: Load Protection (Week 2)
@@ -933,7 +933,7 @@ async fn test_delayed_handler() {
 7. [ ] Testing utilities
    - Deterministic `TestEngine` execution helper
    - Failure injection hooks (timeout, transient error, permanent error)
-   - Fake clock for retry/backoff and delayed handler tests
+   - Fake clock for retry/backoff and delayed reactor tests
    - Exit criteria: critical safety paths covered by deterministic integration tests
 
 8. [ ] Documentation and operations runbook
