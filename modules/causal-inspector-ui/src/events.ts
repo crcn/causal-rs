@@ -2,6 +2,8 @@ import type { BaseEvent } from "./machine";
 import type {
   InspectorEvent,
   CorrelationSummary,
+  ReactorDependency,
+  AggregateLifecycleEntry,
   FilterState,
   FlowSelection,
   ReactorDescription,
@@ -48,6 +50,9 @@ type OutcomesLoaded = BaseEvent<
   { correlationId: string; outcomes: ReactorOutcome[] }
 >;
 type CorrelationsLoaded = BaseEvent<"events/correlations_loaded", CorrelationSummary[]>;
+type ReactorDependenciesLoaded = BaseEvent<"events/reactor_dependencies_loaded", ReactorDependency[]>;
+type AggregateKeysLoaded = BaseEvent<"events/aggregate_keys_loaded", string[]>;
+type AggregateLifecycleLoaded = BaseEvent<"events/aggregate_lifecycle_loaded", { key: string; entries: AggregateLifecycleEntry[] }>;
 
 // ── UI events ──
 
@@ -64,6 +69,7 @@ type ScrubberMoved = BaseEvent<"ui/scrubber_moved", { position: number | null }>
 type ScrubberPlayToggled = BaseEvent<"ui/scrubber_play_toggled">;
 type ScrubberSpeedChanged = BaseEvent<"ui/scrubber_speed_changed", { speed: number }>;
 type CorrelationsRequested = BaseEvent<"ui/correlations_requested", { search?: string }>;
+type AggregateLifecycleRequested = BaseEvent<"ui/aggregate_lifecycle_requested", { aggregateKey: string }>;
 
 // ── Union ──
 
@@ -92,4 +98,8 @@ export type InspectorMachineEvent =
   | ScrubberMoved
   | ScrubberPlayToggled
   | ScrubberSpeedChanged
-  | CorrelationsRequested;
+  | CorrelationsRequested
+  | ReactorDependenciesLoaded
+  | AggregateKeysLoaded
+  | AggregateLifecycleLoaded
+  | AggregateLifecycleRequested;

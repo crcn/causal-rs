@@ -1,6 +1,8 @@
 import type {
   InspectorEvent,
   CorrelationSummary,
+  ReactorDependency,
+  AggregateLifecycleEntry,
   FilterState,
   FlowSelection,
   ReactorDescription,
@@ -51,6 +53,14 @@ export type InspectorState = {
   correlations: CorrelationSummary[];
   correlationsLoading: boolean;
 
+  // Reactor dependency map
+  reactorDependencies: ReactorDependency[];
+
+  // Aggregate lifecycle
+  aggregateKeys: string[];
+  aggregateLifecycle: AggregateLifecycleEntry[];
+  aggregateLifecycleKey: string | null;
+
   // Subscription status
   subscription: "connected" | "disconnected" | "error";
 
@@ -97,6 +107,12 @@ export const initialState: InspectorState = {
 
   correlations: [],
   correlationsLoading: false,
+
+  reactorDependencies: [],
+
+  aggregateKeys: [],
+  aggregateLifecycle: [],
+  aggregateLifecycleKey: null,
 
   subscription: "disconnected",
 

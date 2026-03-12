@@ -123,6 +123,28 @@ pub struct AggregateStateSnapshotEntry {
     pub state: serde_json::Value,
 }
 
+/// A reactor's input/output dependency edges.
+#[derive(Debug, Clone)]
+pub struct ReactorDependencyEntry {
+    pub reactor_id: String,
+    /// Event types that trigger this reactor (inputs).
+    pub input_event_types: Vec<String>,
+    /// Event types this reactor produces (outputs).
+    pub output_event_types: Vec<String>,
+}
+
+/// An aggregate lifecycle entry — state snapshot across all correlations.
+#[derive(Debug, Clone)]
+pub struct AggregateLifecycleEntry {
+    pub seq: i64,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub ts: DateTime<Utc>,
+    pub correlation_id: String,
+    pub aggregate_key: String,
+    pub state: serde_json::Value,
+}
+
 /// Summary of a correlation chain for the explorer pane.
 #[derive(Debug, Clone)]
 pub struct CorrelationSummaryEntry {
@@ -221,4 +243,22 @@ pub trait InspectorReadModel: Send + Sync {
         search: Option<&str>,
         limit: usize,
     ) -> Result<Vec<CorrelationSummaryEntry>>;
+
+    /// Derive the reactor dependency graph from the event log.
+    ///
+    /// For each reactor, returns the event types it was triggered by (inputs)
+    /// and the event types it produced (outputs).
+    async fn reactor_dependencies(&self) -> Result<Vec<ReactorDependencyEntry>>;
+
+    /// All state snapshots for a specific aggregate across all correlations.
+    ///
+    /// Returns entries ordered by seq ascending.
+    async fn aggregate_lifecycle(
+        &self,
+        aggregate_key: &str,
+        limit: usize,
+    ) -> Result<Vec<AggregateLifecycleEntry>>;
+
+    /// List all known aggregate keys.
+    async fn list_aggregate_keys(&self) -> Result<Vec<String>>;
 }

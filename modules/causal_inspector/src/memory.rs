@@ -10,8 +10,8 @@ use uuid::Uuid;
 use causal::{MemoryStore, ReactorQueue};
 
 use crate::read_model::{
-    InspectorReadModel, EventQuery, AggregateStateSnapshotEntry,
-    CorrelationSummaryEntry,
+    InspectorReadModel, EventQuery, AggregateLifecycleEntry, AggregateStateSnapshotEntry,
+    CorrelationSummaryEntry, ReactorDependencyEntry,
     ReactorDescriptionEntry, ReactorDescriptionSnapshotEntry,
     ReactorLogEntry, ReactorOutcomeEntry, StoredEvent,
 };
@@ -416,5 +416,124 @@ impl InspectorReadModel for MemoryStore {
         results.truncate(limit);
 
         Ok(results)
+    }
+
+    async fn reactor_dependencies(&self) -> Result<Vec<ReactorDependencyEntry>> {
+        let log = self.global_log().lock();
+
+        // For each reactor, track which event types triggered it and which it produced.
+        // A reactor execution is triggered by an event_id — look up its event_type.
+        // Events with a reactor_id set are produced by that reactor.
+        let mut inputs: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        let mut outputs: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+
+        // Build event_id → event_type lookup
+        let event_type_by_id: std::collections::HashMap<Uuid, String> = log
+            .iter()
+            .filter_map(|e| Some((e.event_id, e.event_type.clone())))
+            .collect();
+
+        // Derive inputs from reactor_executions
+        for entry in self.reactor_executions().iter() {
+            let (event_id, reactor_id) = entry.key();
+            if let Some(event_type) = event_type_by_id.get(event_id) {
+                inputs
+                    .entry(reactor_id.clone())
+                    .or_default()
+                    .insert(event_type.clone());
+            }
+        }
+
+        // Derive outputs from events with reactor_id
+        for e in log.iter() {
+            if let Some(rid) = e.metadata.get("reactor_id").and_then(|v| v.as_str()) {
+                outputs
+                    .entry(rid.to_string())
+                    .or_default()
+                    .insert(e.event_type.clone());
+            }
+        }
+
+        // Merge into entries
+        let all_reactor_ids: std::collections::HashSet<String> = inputs
+            .keys()
+            .chain(outputs.keys())
+            .cloned()
+            .collect();
+
+        let mut results: Vec<ReactorDependencyEntry> = all_reactor_ids
+            .into_iter()
+            .map(|reactor_id| {
+                let mut input_types: Vec<String> = inputs
+                    .remove(&reactor_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                input_types.sort();
+                let mut output_types: Vec<String> = outputs
+                    .remove(&reactor_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                output_types.sort();
+                ReactorDependencyEntry {
+                    reactor_id,
+                    input_event_types: input_types,
+                    output_event_types: output_types,
+                }
+            })
+            .collect();
+        results.sort_by(|a, b| a.reactor_id.cmp(&b.reactor_id));
+        Ok(results)
+    }
+
+    async fn aggregate_lifecycle(
+        &self,
+        aggregate_key: &str,
+        limit: usize,
+    ) -> Result<Vec<AggregateLifecycleEntry>> {
+        let snapshots = self.aggregate_state_snapshots().lock();
+
+        // Build lookup: event_id → (event_type, ts)
+        let event_info: std::collections::HashMap<Uuid, (String, chrono::DateTime<chrono::Utc>)> = {
+            let log = self.global_log().lock();
+            log.iter()
+                .map(|e| (e.event_id, (e.event_type.clone(), e.created_at)))
+                .collect()
+        };
+
+        let mut result: Vec<AggregateLifecycleEntry> = snapshots
+            .iter()
+            .filter(|(_, _, _, key, _)| key == aggregate_key)
+            .filter_map(|(corr_id, seq, event_id, key, state)| {
+                let (event_type, ts) = event_info.get(event_id)?;
+                Some(AggregateLifecycleEntry {
+                    seq: *seq as i64,
+                    event_id: *event_id,
+                    event_type: event_type.clone(),
+                    ts: *ts,
+                    correlation_id: corr_id.to_string(),
+                    aggregate_key: key.clone(),
+                    state: state.clone(),
+                })
+            })
+            .collect();
+
+        result.sort_by_key(|e| e.seq);
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    async fn list_aggregate_keys(&self) -> Result<Vec<String>> {
+        let snapshots = self.aggregate_state_snapshots().lock();
+        let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, _, _, key, _) in snapshots.iter() {
+            keys.insert(key.clone());
+        }
+        let mut sorted: Vec<String> = keys.into_iter().collect();
+        sorted.sort();
+        Ok(sorted)
     }
 }

@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use crate::queries;
 use crate::read_model::{
-    InspectorReadModel, EventQuery, AggregateStateSnapshotEntry,
-    CorrelationSummaryEntry,
+    InspectorReadModel, EventQuery, AggregateLifecycleEntry, AggregateStateSnapshotEntry,
+    CorrelationSummaryEntry, ReactorDependencyEntry,
     ReactorDescriptionEntry, ReactorDescriptionSnapshotEntry,
     ReactorLogEntry, ReactorOutcomeEntry, StoredEvent,
 };
@@ -146,6 +146,25 @@ impl InspectorReadModel for PostgresInspectorStore {
         _search: Option<&str>,
         _limit: usize,
     ) -> Result<Vec<CorrelationSummaryEntry>> {
+        // Not yet implemented for Postgres — return empty
+        Ok(vec![])
+    }
+
+    async fn reactor_dependencies(&self) -> Result<Vec<ReactorDependencyEntry>> {
+        // Not yet implemented for Postgres — return empty
+        Ok(vec![])
+    }
+
+    async fn aggregate_lifecycle(
+        &self,
+        _aggregate_key: &str,
+        _limit: usize,
+    ) -> Result<Vec<AggregateLifecycleEntry>> {
+        // Not yet implemented for Postgres — return empty
+        Ok(vec![])
+    }
+
+    async fn list_aggregate_keys(&self) -> Result<Vec<String>> {
         // Not yet implemented for Postgres — return empty
         Ok(vec![])
     }

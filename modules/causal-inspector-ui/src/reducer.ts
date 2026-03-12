@@ -82,6 +82,16 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.correlations = event.payload;
       draft.correlationsLoading = false;
       break;
+    case "events/reactor_dependencies_loaded":
+      draft.reactorDependencies = event.payload;
+      break;
+    case "events/aggregate_keys_loaded":
+      draft.aggregateKeys = event.payload;
+      break;
+    case "events/aggregate_lifecycle_loaded":
+      draft.aggregateLifecycleKey = event.payload.key;
+      draft.aggregateLifecycle = event.payload.entries;
+      break;
 
     // ── UI ──
 

@@ -292,6 +292,73 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
+    /// Derive the reactor dependency graph from the event log.
+    async fn inspector_reactor_dependencies(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<ReactorDependency>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+
+        let entries = read_model
+            .reactor_dependencies()
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!("Failed to load reactor dependencies: {e}"))
+            })?;
+
+        Ok(entries
+            .into_iter()
+            .map(|r| ReactorDependency {
+                reactor_id: r.reactor_id,
+                input_event_types: r.input_event_types,
+                output_event_types: r.output_event_types,
+            })
+            .collect())
+    }
+
+    /// List all known aggregate keys.
+    async fn inspector_aggregate_keys(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+
+        read_model
+            .list_aggregate_keys()
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!("Failed to load aggregate keys: {e}"))
+            })
+    }
+
+    /// Fetch aggregate lifecycle — all state snapshots for a specific aggregate across correlations.
+    async fn inspector_aggregate_lifecycle(
+        &self,
+        ctx: &Context<'_>,
+        aggregate_key: String,
+        limit: Option<i32>,
+    ) -> Result<Vec<AggregateLifecycleEntry>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+        let lim = (limit.unwrap_or(100) as usize).min(500);
+
+        let entries = read_model
+            .aggregate_lifecycle(&aggregate_key, lim)
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!("Failed to load aggregate lifecycle: {e}"))
+            })?;
+
+        Ok(entries
+            .into_iter()
+            .map(|r| AggregateLifecycleEntry {
+                seq: r.seq,
+                event_id: r.event_id.to_string(),
+                event_type: r.event_type,
+                ts: r.ts,
+                correlation_id: r.correlation_id,
+                aggregate_key: r.aggregate_key,
+                state: r.state,
+            })
+            .collect())
+    }
+
     /// Fetch aggregated reactor execution outcomes for a correlation chain.
     async fn inspector_reactor_outcomes(
         &self,

@@ -30,6 +30,8 @@ export type {
   InspectorCausalTree,
   InspectorCausalFlow,
   CorrelationSummary,
+  ReactorDependency,
+  AggregateLifecycleEntry,
   Block,
   ReactorLog,
   ReactorDescription,
@@ -70,6 +72,9 @@ export {
   INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS,
   INSPECTOR_AGGREGATE_TIMELINE,
   INSPECTOR_REACTOR_OUTCOMES,
+  INSPECTOR_REACTOR_DEPENDENCIES,
+  INSPECTOR_AGGREGATE_KEYS,
+  INSPECTOR_AGGREGATE_LIFECYCLE,
 } from "./queries";
 
 // ── Theme ──
@@ -88,7 +93,6 @@ export { formatTs, compactPayload, copyToClipboard } from "./utils";
 export { FilterBar } from "./components/FilterBar";
 export { CopyablePayload } from "./components/CopyablePayload";
 export { JsonSyntax } from "./components/JsonSyntax";
-
 // ── Panes ──
 export { TimelinePane } from "./panes/TimelinePane";
 export type { TimelinePaneProps } from "./panes/TimelinePane";
@@ -101,3 +105,4 @@ export type { CausalFlowPaneProps } from "./panes/CausalFlowPane";
 export { AggregateTimelinePane } from "./panes/AggregateTimelinePane";
 export { WaterfallPane } from "./panes/WaterfallPane";
 export { CorrelationExplorerPane } from "./panes/CorrelationExplorerPane";
+export { ReactorDependencyMapPane } from "./panes/ReactorDependencyMapPane";

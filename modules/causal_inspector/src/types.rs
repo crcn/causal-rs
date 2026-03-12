@@ -93,6 +93,28 @@ pub struct AggregateTimelineEntry {
     pub aggregates: Vec<AggregateStateEntry>,
 }
 
+/// A reactor's input/output dependency edges for the dependency map.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct ReactorDependency {
+    pub reactor_id: String,
+    pub input_event_types: Vec<String>,
+    pub output_event_types: Vec<String>,
+}
+
+/// An aggregate lifecycle entry — state snapshot across all correlations.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct AggregateLifecycleEntry {
+    pub seq: i64,
+    pub event_id: String,
+    pub event_type: String,
+    pub ts: DateTime<Utc>,
+    pub correlation_id: String,
+    pub aggregate_key: String,
+    pub state: serde_json::Value,
+}
+
 /// Summary of a correlation chain for the explorer pane.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]

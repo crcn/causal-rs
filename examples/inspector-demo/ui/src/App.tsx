@@ -23,6 +23,7 @@ import {
   AggregateTimelinePane,
   WaterfallPane,
   CorrelationExplorerPane,
+  ReactorDependencyMapPane,
   type InspectorState,
   type InspectorMachineEvent,
   type PaneLayout,
@@ -94,6 +95,7 @@ const PANE_REGISTRY = [
 { name: "State Timeline", component: "state-timeline", render: () => <AggregateTimelinePane /> },
   { name: "Waterfall", component: "waterfall", render: () => <WaterfallPane /> },
   { name: "Correlations", component: "correlations", render: () => <CorrelationExplorerPane /> },
+  { name: "Reactor Map", component: "reactor-map", render: () => <ReactorDependencyMapPane /> },
 ] as const;
 
 // ── Helpers ────────────────────────────────────────────────────

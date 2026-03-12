@@ -6,6 +6,8 @@ import type {
   InspectorCausalTree,
   InspectorCausalFlow,
   CorrelationSummary,
+  ReactorDependency,
+  AggregateLifecycleEntry,
   ReactorLog,
   ReactorDescription,
   ReactorDescriptionSnapshot,
@@ -18,6 +20,9 @@ import {
   INSPECTOR_CAUSAL_TREE,
   INSPECTOR_CAUSAL_FLOW,
   INSPECTOR_CORRELATIONS,
+  INSPECTOR_REACTOR_DEPENDENCIES,
+  INSPECTOR_AGGREGATE_KEYS,
+  INSPECTOR_AGGREGATE_LIFECYCLE,
   INSPECTOR_REACTOR_LOGS,
   INSPECTOR_REACTOR_LOGS_BY_CORRELATION,
   INSPECTOR_REACTOR_DESCRIPTIONS,
@@ -200,6 +205,48 @@ export const createQueryEngine = (
       }
     };
 
+    const fetchReactorDependencies = async () => {
+      try {
+        const data = await transport.query<{
+          inspectorReactorDependencies: ReactorDependency[];
+        }>(INSPECTOR_REACTOR_DEPENDENCIES);
+        dispatch({
+          type: "events/reactor_dependencies_loaded",
+          payload: data.inspectorReactorDependencies,
+        });
+      } catch (e) {
+        console.error("[causal-inspector] fetch reactor dependencies failed:", e);
+      }
+    };
+
+    const fetchAggregateKeys = async () => {
+      try {
+        const data = await transport.query<{
+          inspectorAggregateKeys: string[];
+        }>(INSPECTOR_AGGREGATE_KEYS);
+        dispatch({
+          type: "events/aggregate_keys_loaded",
+          payload: data.inspectorAggregateKeys,
+        });
+      } catch (e) {
+        console.error("[causal-inspector] fetch aggregate keys failed:", e);
+      }
+    };
+
+    const fetchAggregateLifecycle = async (aggregateKey: string) => {
+      try {
+        const data = await transport.query<{
+          inspectorAggregateLifecycle: AggregateLifecycleEntry[];
+        }>(INSPECTOR_AGGREGATE_LIFECYCLE, { aggregateKey, limit: 200 });
+        dispatch({
+          type: "events/aggregate_lifecycle_loaded",
+          payload: { key: aggregateKey, entries: data.inspectorAggregateLifecycle },
+        });
+      } catch (e) {
+        console.error("[causal-inspector] fetch aggregate lifecycle failed:", e);
+      }
+    };
+
     const startFlowPolling = (correlationId: string) => {
       stopFlowPolling();
       fetchFlowMetadata(correlationId);
@@ -216,6 +263,8 @@ export const createQueryEngine = (
     // Initial load
     fetchEvents();
     fetchCorrelations();
+    fetchReactorDependencies();
+    fetchAggregateKeys();
 
     let correlationPollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -260,6 +309,10 @@ export const createQueryEngine = (
             // Start polling
             if (correlationPollTimer) clearInterval(correlationPollTimer);
             correlationPollTimer = setInterval(() => fetchCorrelations(event.payload.search), 5000);
+            break;
+
+          case "ui/aggregate_lifecycle_requested":
+            fetchAggregateLifecycle(event.payload.aggregateKey);
             break;
         }
       },

@@ -78,6 +78,22 @@ export type AggregateTimelineEntry = {
   aggregates: AggregateStateEntry[];
 };
 
+export type ReactorDependency = {
+  reactorId: string;
+  inputEventTypes: string[];
+  outputEventTypes: string[];
+};
+
+export type AggregateLifecycleEntry = {
+  seq: number;
+  eventId: string;
+  eventType: string;
+  ts: string;
+  correlationId: string;
+  aggregateKey: string;
+  state: unknown;
+};
+
 export type CorrelationSummary = {
   correlationId: string;
   eventCount: number;

@@ -127,6 +127,36 @@ export const INSPECTOR_AGGREGATE_TIMELINE = `
   }
 `;
 
+export const INSPECTOR_REACTOR_DEPENDENCIES = `
+  query InspectorReactorDependencies {
+    inspectorReactorDependencies {
+      reactorId
+      inputEventTypes
+      outputEventTypes
+    }
+  }
+`;
+
+export const INSPECTOR_AGGREGATE_KEYS = `
+  query InspectorAggregateKeys {
+    inspectorAggregateKeys
+  }
+`;
+
+export const INSPECTOR_AGGREGATE_LIFECYCLE = `
+  query InspectorAggregateLifecycle($aggregateKey: String!, $limit: Int) {
+    inspectorAggregateLifecycle(aggregateKey: $aggregateKey, limit: $limit) {
+      seq
+      eventId
+      eventType
+      ts
+      correlationId
+      aggregateKey
+      state
+    }
+  }
+`;
+
 export const INSPECTOR_CORRELATIONS = `
   query InspectorCorrelations($search: String, $limit: Int) {
     inspectorCorrelations(search: $search, limit: $limit) {
