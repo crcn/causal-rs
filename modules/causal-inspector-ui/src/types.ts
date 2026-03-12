@@ -59,6 +59,25 @@ export type ReactorOutcome = {
   triggeringEventIds: string[];
 };
 
+export type ReactorDescriptionSnapshot = {
+  seq: number;
+  eventId: string;
+  reactorId: string;
+  blocks: Block[];
+};
+
+export type AggregateStateEntry = {
+  key: string;
+  state: unknown;
+};
+
+export type AggregateTimelineEntry = {
+  seq: number;
+  eventId: string;
+  eventType: string;
+  aggregates: AggregateStateEntry[];
+};
+
 export type FilterState = {
   search: string;
   from: string | null;

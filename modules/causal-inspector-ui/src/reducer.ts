@@ -45,6 +45,16 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.descriptions[correlationId] = descriptions;
       break;
     }
+    case "events/description_snapshots_loaded": {
+      const { correlationId, snapshots } = event.payload;
+      draft.descriptionSnapshots[correlationId] = snapshots;
+      break;
+    }
+    case "events/aggregate_timeline_loaded": {
+      const { correlationId, entries } = event.payload;
+      draft.aggregateTimeline[correlationId] = entries;
+      break;
+    }
     case "events/outcomes_loaded": {
       const { correlationId, outcomes } = event.payload;
       draft.outcomes[correlationId] = outcomes;
@@ -64,11 +74,22 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.flowCorrelationId = event.payload.correlationId;
       draft.flowData = [];
       draft.flowSelection = null;
+      draft.scrubberPosition = null;
+      draft.scrubberPlaying = false;
+      // Auto-show logs for this correlation
+      draft.logsFilter = {
+        scope: "correlation",
+        eventId: null,
+        reactorId: null,
+        correlationId: event.payload.correlationId,
+      };
       break;
     case "ui/flow_closed":
       draft.flowCorrelationId = null;
       draft.flowData = [];
       draft.flowSelection = null;
+      draft.scrubberPosition = null;
+      draft.scrubberPlaying = false;
       break;
     case "ui/flow_node_selected":
       draft.flowSelection = event.payload;
@@ -84,6 +105,15 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       break;
     case "ui/layout_changed":
       draft.paneLayout = event.payload;
+      break;
+    case "ui/scrubber_moved":
+      draft.scrubberPosition = event.payload.position;
+      break;
+    case "ui/scrubber_play_toggled":
+      draft.scrubberPlaying = !draft.scrubberPlaying;
+      break;
+    case "ui/scrubber_speed_changed":
+      draft.scrubberSpeed = event.payload.speed;
       break;
   }
 };

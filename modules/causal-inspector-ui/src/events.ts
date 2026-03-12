@@ -4,6 +4,8 @@ import type {
   FilterState,
   FlowSelection,
   ReactorDescription,
+  ReactorDescriptionSnapshot,
+  AggregateTimelineEntry,
   ReactorLog,
   ReactorOutcome,
   LogsFilter,
@@ -32,6 +34,14 @@ type DescriptionsLoaded = BaseEvent<
   "events/descriptions_loaded",
   { correlationId: string; descriptions: ReactorDescription[] }
 >;
+type DescriptionSnapshotsLoaded = BaseEvent<
+  "events/description_snapshots_loaded",
+  { correlationId: string; snapshots: ReactorDescriptionSnapshot[] }
+>;
+type AggregateTimelineLoaded = BaseEvent<
+  "events/aggregate_timeline_loaded",
+  { correlationId: string; entries: AggregateTimelineEntry[] }
+>;
 type OutcomesLoaded = BaseEvent<
   "events/outcomes_loaded",
   { correlationId: string; outcomes: ReactorOutcome[] }
@@ -48,6 +58,9 @@ type FilterChanged = BaseEvent<"ui/filter_changed", Partial<FilterState>>;
 type LogsFilterChanged = BaseEvent<"ui/logs_filter_changed", Partial<LogsFilter>>;
 type LoadMoreRequested = BaseEvent<"ui/load_more_requested">;
 type LayoutChanged = BaseEvent<"ui/layout_changed", PaneLayout>;
+type ScrubberMoved = BaseEvent<"ui/scrubber_moved", { position: number | null }>;
+type ScrubberPlayToggled = BaseEvent<"ui/scrubber_play_toggled">;
+type ScrubberSpeedChanged = BaseEvent<"ui/scrubber_speed_changed", { speed: number }>;
 
 // ── Union ──
 
@@ -60,6 +73,8 @@ export type InspectorMachineEvent =
   | FlowLoaded
   | LogsLoaded
   | DescriptionsLoaded
+  | DescriptionSnapshotsLoaded
+  | AggregateTimelineLoaded
   | OutcomesLoaded
   | EventSelected
   | EventDeselected
@@ -69,4 +84,7 @@ export type InspectorMachineEvent =
   | FilterChanged
   | LogsFilterChanged
   | LoadMoreRequested
-  | LayoutChanged;
+  | LayoutChanged
+  | ScrubberMoved
+  | ScrubberPlayToggled
+  | ScrubberSpeedChanged;

@@ -65,6 +65,36 @@ pub struct ReactorDescription {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct ReactorDescriptionSnapshot {
+    pub seq: i64,
+    pub event_id: String,
+    pub reactor_id: String,
+    pub blocks: serde_json::Value,
+}
+
+/// A single aggregate's state at a point in the correlation timeline.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct AggregateStateEntry {
+    /// Aggregate type + ID key (e.g. "pipeline_state:00000000-…").
+    pub key: String,
+    /// Serialized aggregate state JSON.
+    pub state: serde_json::Value,
+}
+
+/// Aggregate state snapshot at a specific event in a correlation.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct AggregateTimelineEntry {
+    pub seq: i64,
+    pub event_id: String,
+    pub event_type: String,
+    /// All aggregate states after this event was applied.
+    pub aggregates: Vec<AggregateStateEntry>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct ReactorOutcome {
     pub reactor_id: String,
     pub status: String,

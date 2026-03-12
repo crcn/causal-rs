@@ -149,6 +149,8 @@ pub struct IntentCommit {
     pub projection_failures: Vec<ProjectionFailure>,
     /// Reactor gate descriptions (reactor_id → serialized describe output).
     pub reactor_descriptions: HashMap<String, serde_json::Value>,
+    /// Aggregate state snapshots (aggregate_key → serialized state).
+    pub aggregate_snapshots: HashMap<String, serde_json::Value>,
     /// Advance checkpoint to this EventLog position.
     pub checkpoint: LogCursor,
     /// Park this event in DLQ (exceeded hops, exceeded retry, etc.)
@@ -166,6 +168,7 @@ impl IntentCommit {
             intents: Vec::new(),
             projection_failures: Vec::new(),
             reactor_descriptions: HashMap::new(),
+            aggregate_snapshots: HashMap::new(),
             checkpoint: event.position,
             park: Some(EventPark {
                 reason: reason.into(),
@@ -183,6 +186,7 @@ impl IntentCommit {
             intents: Vec::new(),
             projection_failures: Vec::new(),
             reactor_descriptions: HashMap::new(),
+            aggregate_snapshots: HashMap::new(),
             checkpoint: event.position,
             park: None,
         }

@@ -104,6 +104,25 @@ pub struct ReactorDescriptionEntry {
     pub description: serde_json::Value,
 }
 
+/// A point-in-time snapshot of a reactor description at a specific event.
+#[derive(Debug, Clone)]
+pub struct ReactorDescriptionSnapshotEntry {
+    pub seq: i64,
+    pub event_id: Uuid,
+    pub reactor_id: String,
+    pub description: serde_json::Value,
+}
+
+/// A point-in-time snapshot of aggregate state at a specific event.
+#[derive(Debug, Clone)]
+pub struct AggregateStateSnapshotEntry {
+    pub seq: i64,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub aggregate_key: String,
+    pub state: serde_json::Value,
+}
+
 /// Store-agnostic read model for the inspector.
 ///
 /// Implement this trait for your store backend (Postgres, in-memory, etc.)
@@ -163,4 +182,22 @@ pub trait InspectorReadModel: Send + Sync {
         &self,
         correlation_id: &str,
     ) -> Result<Vec<ReactorDescriptionEntry>>;
+
+    /// Per-event description snapshots for a correlation chain.
+    ///
+    /// Returns snapshots ordered by seq ascending, showing the state of
+    /// each reactor's description at each event in the correlation.
+    async fn reactor_description_snapshots(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<ReactorDescriptionSnapshotEntry>>;
+
+    /// Per-event aggregate state snapshots for a correlation chain.
+    ///
+    /// Returns snapshots ordered by seq ascending, showing aggregate state
+    /// after each event was applied.
+    async fn aggregate_state_timeline(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<AggregateStateSnapshotEntry>>;
 }

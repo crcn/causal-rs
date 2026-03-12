@@ -17,8 +17,9 @@ import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent, Block, FlowSelection, ReactorDescription, ReactorOutcome } from "../types";
-import { eventBg, eventBorder } from "../theme";
-import { Filter, Search } from "lucide-react";
+import { eventBg, eventBorder, eventTextColor } from "../theme";
+import { formatTs, compactPayload } from "../utils";
+import { Filter, Play, Pause, SkipBack, SkipForward, ChevronsRight, RotateCcw, X } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Flow node data
@@ -424,21 +425,218 @@ function layoutGraph(nodes: Node[], edges: Edge[]): FlowGraph {
 }
 
 // ---------------------------------------------------------------------------
+// Scrubber visibility — compute which nodes/edges are visible at a given seq
+// ---------------------------------------------------------------------------
+
+function computeVisibleIds(
+  allEvents: InspectorEvent[],
+  position: number,
+): { nodeIds: Set<string>; edgeIds: Set<string> } {
+  const visible = allEvents.filter((e) => e.seq <= position);
+  const nodeIds = new Set<string>();
+  const edgeIds = new Set<string>();
+
+  const eventGroups = new Map<string, { events: InspectorEvent[] }>();
+  const eventIdToGroup = new Map<string, string>();
+
+  for (const evt of visible) {
+    const reactor = evt.reactorId ?? "__root__";
+    const groupKey = `${reactor}::${evt.name}`;
+    const group = eventGroups.get(groupKey);
+    if (group) {
+      group.events.push(evt);
+    } else {
+      eventGroups.set(groupKey, { events: [evt] });
+    }
+    if (evt.id) eventIdToGroup.set(evt.id, groupKey);
+  }
+
+  // Event-type nodes
+  for (const groupKey of eventGroups.keys()) {
+    nodeIds.add(`evt:${groupKey}`);
+  }
+
+  // Reactor nodes + edges
+  for (const evt of visible) {
+    if (evt.reactorId) {
+      nodeIds.add(`hdl:${evt.reactorId}`);
+
+      // Reactor -> child event group edge
+      const groupKey = `${evt.reactorId}::${evt.name}`;
+      edgeIds.add(`hdl:${evt.reactorId}->evt:${groupKey}`);
+    }
+
+    // Parent event -> reactor edge
+    if (evt.parentId && evt.reactorId) {
+      const parentGroup = eventIdToGroup.get(evt.parentId);
+      if (parentGroup) {
+        edgeIds.add(`evt:${parentGroup}->hdl:${evt.reactorId}`);
+      }
+    }
+
+    // Root event -> reactor edges (check if any visible event uses this as parent)
+    if (!evt.reactorId && evt.id) {
+      for (const child of visible) {
+        if (child.parentId === evt.id && child.reactorId) {
+          const rootGroup = eventIdToGroup.get(evt.id);
+          if (rootGroup) {
+            edgeIds.add(`evt:${rootGroup}->hdl:${child.reactorId}`);
+          }
+        }
+      }
+    }
+  }
+
+  return { nodeIds, edgeIds };
+}
+
+// ---------------------------------------------------------------------------
+// Time scrubber bar
+// ---------------------------------------------------------------------------
+
+function TimeScrubber({
+  seqs,
+  position,
+  playing,
+  speed,
+  dispatch,
+}: {
+  seqs: number[];
+  position: number | null;
+  playing: boolean;
+  speed: number;
+  dispatch: (event: InspectorMachineEvent) => void;
+}) {
+  const min = seqs[0] ?? 0;
+  const max = seqs[seqs.length - 1] ?? 0;
+  const current = position ?? max;
+  const isAtEnd = position == null || position >= max;
+  const currentIndex = position != null ? seqs.filter((s) => s <= position).length : seqs.length;
+
+  const stepBack = useCallback(() => {
+    const idx = seqs.findIndex((s) => s >= current);
+    const prev = seqs[Math.max(0, idx - 1)];
+    if (prev != null) dispatch({ type: "ui/scrubber_moved", payload: { position: prev } });
+  }, [seqs, current, dispatch]);
+
+  const stepForward = useCallback(() => {
+    const next = seqs.find((s) => s > current);
+    if (next != null) {
+      dispatch({ type: "ui/scrubber_moved", payload: { position: next } });
+    } else {
+      dispatch({ type: "ui/scrubber_moved", payload: { position: null } });
+    }
+  }, [seqs, current, dispatch]);
+
+  const reset = useCallback(() => {
+    if (playing) dispatch({ type: "ui/scrubber_play_toggled" });
+    dispatch({ type: "ui/scrubber_moved", payload: { position: seqs[0] ?? null } });
+  }, [seqs, playing, dispatch]);
+
+  const jumpToEnd = useCallback(() => {
+    if (playing) dispatch({ type: "ui/scrubber_play_toggled" });
+    dispatch({ type: "ui/scrubber_moved", payload: { position: null } });
+  }, [playing, dispatch]);
+
+  const togglePlay = useCallback(() => {
+    // If at end, reset to start before playing
+    if (!playing && isAtEnd && seqs.length > 0) {
+      dispatch({ type: "ui/scrubber_moved", payload: { position: seqs[0] } });
+    }
+    dispatch({ type: "ui/scrubber_play_toggled" });
+  }, [playing, isAtEnd, seqs, dispatch]);
+
+  const cycleSpeed = useCallback(() => {
+    const speeds = [500, 300, 150, 50];
+    const idx = speeds.indexOf(speed);
+    const next = speeds[(idx + 1) % speeds.length];
+    dispatch({ type: "ui/scrubber_speed_changed", payload: { speed: next } });
+  }, [speed, dispatch]);
+
+  const speedLabel = speed <= 50 ? "4x" : speed <= 150 ? "2x" : speed <= 300 ? "1x" : "0.5x";
+
+  return (
+    <div className="flex items-center gap-2 px-3 py-1.5 border-t border-border shrink-0">
+      <button onClick={reset} className="text-muted-foreground hover:text-foreground" title="Reset to start">
+        <RotateCcw size={12} />
+      </button>
+      <button onClick={stepBack} className="text-muted-foreground hover:text-foreground" title="Step back">
+        <SkipBack size={12} />
+      </button>
+      <button onClick={togglePlay} className="text-muted-foreground hover:text-foreground" title={playing ? "Pause" : "Play"}>
+        {playing ? <Pause size={14} /> : <Play size={14} />}
+      </button>
+      <button onClick={stepForward} className="text-muted-foreground hover:text-foreground" title="Step forward">
+        <SkipForward size={12} />
+      </button>
+      <button onClick={jumpToEnd} className="text-muted-foreground hover:text-foreground" title="Jump to end">
+        <ChevronsRight size={12} />
+      </button>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        value={current}
+        onChange={(e) => {
+          const val = Number(e.target.value);
+          // Snap to nearest seq
+          const nearest = seqs.reduce((best, s) =>
+            Math.abs(s - val) < Math.abs(best - val) ? s : best, seqs[0]);
+          dispatch({ type: "ui/scrubber_moved", payload: { position: nearest >= max ? null : nearest } });
+        }}
+        className="flex-1 h-1 accent-foreground cursor-pointer"
+      />
+      <span className="text-xs text-muted-foreground tabular-nums min-w-[4rem] text-right">
+        {currentIndex}/{seqs.length}
+      </span>
+      <button
+        onClick={cycleSpeed}
+        className="text-xs text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded border border-border tabular-nums min-w-[2.5rem] text-center"
+        title="Playback speed"
+      >
+        {speedLabel}
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Auto-center on selection
 // ---------------------------------------------------------------------------
 
-function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: InspectorEvent[] }) {
-  const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
-  const { setCenter, getZoom } = useReactFlow();
+function FitOnLoad() {
+  const { fitView } = useReactFlow();
+  const fitted = useRef(false);
+  const flowData = useSelector<InspectorState, InspectorEvent[]>((s) => s.flowData);
 
   useEffect(() => {
+    if (!fitted.current && flowData.length > 0) {
+      fitted.current = true;
+      // Delay slightly to let ReactFlow measure nodes
+      requestAnimationFrame(() => fitView({ duration: 300 }));
+    }
+  }, [flowData, fitView]);
+
+  return null;
+}
+
+function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: InspectorEvent[] }) {
+  const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
+  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const { setCenter, getZoom } = useReactFlow();
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+
+  useEffect(() => {
+    // Don't recenter while scrubber is active
+    if (scrubberPosition != null) return;
     if (selectedSeq == null || !flowData.length) return;
     const evt = flowData.find(e => e.seq === selectedSeq);
     if (!evt) return;
 
     const reactor = evt.reactorId ?? "__root__";
     const nodeId = `evt:${reactor}::${evt.name}`;
-    const node = nodes.find(n => n.id === nodeId);
+    const node = nodesRef.current.find(n => n.id === nodeId);
     if (!node) return;
 
     const isReactor = node.id.startsWith("hdl:");
@@ -450,7 +648,7 @@ function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: Inspec
       node.position.y + h / 2,
       { zoom: getZoom(), duration: 400 },
     );
-  }, [selectedSeq, flowData, nodes, setCenter, getZoom]);
+  }, [selectedSeq, scrubberPosition, flowData, setCenter, getZoom]);
 
   return null;
 }
@@ -536,6 +734,131 @@ function ReactorFilter({ allReactorIds, hiddenReactors, setHiddenReactors }: {
 }
 
 // ---------------------------------------------------------------------------
+// NodeDetailPanel — overlay showing details for the selected node
+// ---------------------------------------------------------------------------
+
+function NodeDetailPanel({
+  selection,
+  flowData,
+  outcomes,
+  onClose,
+}: {
+  selection: FlowSelection;
+  flowData: InspectorEvent[];
+  outcomes?: Map<string, ReactorOutcome>;
+  onClose: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (!selection) return null;
+
+  if (selection.kind === "event-type") {
+    // Find matching events
+    const events = flowData.filter(
+      (e) => e.name === selection.name && e.reactorId === selection.reactorId,
+    );
+    if (events.length === 0) return null;
+    const evt = events[0];
+
+    return (
+      <div className="absolute bottom-2 right-2 z-10 w-72 bg-card border border-border rounded-lg shadow-lg overflow-hidden">
+        <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-[11px] font-mono font-medium" style={{ color: eventTextColor(evt.name) }}>
+              {evt.name}
+            </span>
+          </div>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground shrink-0">
+            <X size={12} />
+          </button>
+        </div>
+        <div className="px-3 py-2 space-y-1.5">
+          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+            <span>seq {evt.seq}</span>
+            <span>{formatTs(evt.ts)}</span>
+          </div>
+          {evt.summary && (
+            <div className="text-[11px] text-foreground">{evt.summary}</div>
+          )}
+          <button
+            onClick={() => setExpanded((v) => !v)}
+            className="text-[10px] text-muted-foreground hover:text-foreground font-mono truncate block max-w-full text-left"
+          >
+            {expanded ? "Hide payload" : compactPayload(evt.payload)}
+          </button>
+          {expanded && (
+            <pre className="text-[10px] font-mono text-zinc-400 bg-zinc-900/50 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap">
+              {(() => { try { return JSON.stringify(JSON.parse(evt.payload), null, 2); } catch { return evt.payload; } })()}
+            </pre>
+          )}
+          {events.length > 1 && (
+            <div className="text-[10px] text-muted-foreground">
+              +{events.length - 1} more event{events.length > 2 ? "s" : ""}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (selection.kind === "reactor") {
+    const outcome = outcomes?.get(selection.reactorId);
+    const logEvents = flowData.filter((e) => e.reactorId === selection.reactorId);
+    const duration =
+      outcome?.status === "completed" && outcome.startedAt && outcome.completedAt
+        ? formatDuration(outcome.startedAt, outcome.completedAt)
+        : null;
+
+    return (
+      <div className="absolute bottom-2 right-2 z-10 w-72 bg-card border border-border rounded-lg shadow-lg overflow-hidden">
+        <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+          <span className="text-[11px] font-mono text-zinc-300 truncate">{selection.reactorId}</span>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground shrink-0">
+            <X size={12} />
+          </button>
+        </div>
+        <div className="px-3 py-2 space-y-1.5">
+          {outcome && (
+            <div className="flex items-center gap-2 text-[10px]">
+              <span style={{ color: STATUS_BORDER[outcome.status] ?? "#52525b" }} className="font-medium uppercase">
+                {outcome.status}
+              </span>
+              {duration && <span className="text-muted-foreground">{duration}</span>}
+              {outcome.attempts != null && outcome.attempts > 1 && (
+                <span className="text-muted-foreground">
+                  {outcome.attempts} attempts
+                </span>
+              )}
+            </div>
+          )}
+          {outcome?.error && (
+            <div className="text-[10px] text-red-400">{outcome.error}</div>
+          )}
+          <div className="text-[10px] text-muted-foreground">
+            {logEvents.length} event{logEvents.length !== 1 ? "s" : ""} produced
+          </div>
+          {logEvents.length > 0 && (
+            <div className="space-y-0.5">
+              {logEvents.slice(0, 5).map((evt) => (
+                <div key={evt.seq} className="text-[10px] font-mono" style={{ color: eventTextColor(evt.name) }}>
+                  {evt.name}
+                  {evt.summary && <span className="text-muted-foreground ml-1">— {evt.summary}</span>}
+                </div>
+              ))}
+              {logEvents.length > 5 && (
+                <div className="text-[10px] text-muted-foreground">+{logEvents.length - 5} more</div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // CausalFlowPane
 // ---------------------------------------------------------------------------
 
@@ -552,6 +875,9 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
   const descriptionsMap = useSelector<InspectorState, Record<string, ReactorDescription[]>>((s) => s.descriptions);
   const outcomesMap = useSelector<InspectorState, Record<string, ReactorOutcome[]>>((s) => s.outcomes);
+  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const scrubberPlaying = useSelector<InspectorState, boolean>((s) => s.scrubberPlaying);
+  const scrubberSpeed = useSelector<InspectorState, number>((s) => s.scrubberSpeed);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   const flowLoading = flowCorrelationId != null && flowData.length === 0;
@@ -586,10 +912,40 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
     return [...ids].sort();
   }, [flowData, outcomes]);
 
-  const { nodes: rawNodes, edges: rawEdges } = useMemo(() => {
+  // Sorted seq numbers for scrubber range
+  const sortedSeqs = useMemo(
+    () => flowData.map((e) => e.seq).sort((a, b) => a - b),
+    [flowData],
+  );
+
+  // Full graph layout — stable positions computed from ALL events
+  const { nodes: fullNodes, edges: fullEdges } = useMemo(() => {
     if (!flowData || flowData.length === 0) return { nodes: [], edges: [] };
     return buildFlowGraph(flowData, descriptions, outcomes, hiddenReactors);
   }, [flowData, descriptions, outcomes, hiddenReactors]);
+
+  // Compute visible IDs when scrubber is active
+  const visibleIds = useMemo(() => {
+    if (scrubberPosition == null) return null; // show everything
+    return computeVisibleIds(flowData, scrubberPosition);
+  }, [flowData, scrubberPosition]);
+
+  // Apply visibility: hidden nodes get opacity 0, hidden edges are filtered out
+  const rawNodes = useMemo(() => {
+    if (!visibleIds) return fullNodes;
+    return fullNodes.map((n) => ({
+      ...n,
+      hidden: !visibleIds.nodeIds.has(n.id),
+    }));
+  }, [fullNodes, visibleIds]);
+
+  const rawEdges = useMemo(() => {
+    if (!visibleIds) return fullEdges;
+    return fullEdges.map((e) => ({
+      ...e,
+      hidden: !visibleIds.edgeIds.has(e.id),
+    }));
+  }, [fullEdges, visibleIds]);
 
   // Derive selected node ID from flowSelection
   const selectedNodeId = useMemo(() => {
@@ -765,7 +1121,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           setHiddenReactors={setHiddenReactors}
         />
       </div>
-      <div className="flex-1">
+      <div className="flex-1 relative">
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -773,7 +1129,6 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           onNodesChange={onNodesChange}
           onNodeClick={onNodeClick}
           onPaneClick={onPaneClick}
-          fitView
           minZoom={0.25}
           proOptions={{ hideAttribution: true }}
           nodesDraggable={false}
@@ -781,11 +1136,27 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           elevateNodesOnSelect={false}
           colorMode="dark"
         >
+          <FitOnLoad />
           <FocusOnSelection nodes={nodes} flowData={flowData} />
           <Background color="#27272a" gap={20} />
           <Controls showInteractive={false} />
         </ReactFlow>
+        <NodeDetailPanel
+          selection={flowSelection}
+          flowData={flowData}
+          outcomes={outcomes}
+          onClose={() => dispatch({ type: "ui/flow_node_selected", payload: null })}
+        />
       </div>
+      {sortedSeqs.length > 1 && (
+        <TimeScrubber
+          seqs={sortedSeqs}
+          position={scrubberPosition}
+          playing={scrubberPlaying}
+          speed={scrubberSpeed}
+          dispatch={dispatch}
+        />
+      )}
     </div>
   );
 }

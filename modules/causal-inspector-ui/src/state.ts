@@ -3,6 +3,8 @@ import type {
   FilterState,
   FlowSelection,
   ReactorDescription,
+  ReactorDescriptionSnapshot,
+  AggregateTimelineEntry,
   ReactorLog,
   ReactorOutcome,
   LogsFilter,
@@ -23,6 +25,11 @@ export type InspectorState = {
   flowData: InspectorEvent[];
   flowSelection: FlowSelection;
 
+  // Time scrubber — null means show all events
+  scrubberPosition: number | null;
+  scrubberPlaying: boolean;
+  scrubberSpeed: number;
+
   // Causal tree
   causalTree: { events: InspectorEvent[]; rootSeq: number } | null;
 
@@ -35,6 +42,8 @@ export type InspectorState = {
 
   // Reactor metadata (keyed by correlationId)
   descriptions: Record<string, ReactorDescription[]>;
+  descriptionSnapshots: Record<string, ReactorDescriptionSnapshot[]>;
+  aggregateTimeline: Record<string, AggregateTimelineEntry[]>;
   outcomes: Record<string, ReactorOutcome[]>;
 
   // Subscription status
@@ -55,6 +64,10 @@ export const initialState: InspectorState = {
   flowData: [],
   flowSelection: null,
 
+  scrubberPosition: null,
+  scrubberPlaying: false,
+  scrubberSpeed: 300,
+
   causalTree: null,
 
   filters: {
@@ -73,6 +86,8 @@ export const initialState: InspectorState = {
   },
 
   descriptions: {},
+  descriptionSnapshots: {},
+  aggregateTimeline: {},
   outcomes: {},
 
   subscription: "disconnected",

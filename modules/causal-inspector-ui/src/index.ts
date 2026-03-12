@@ -32,6 +32,9 @@ export type {
   Block,
   ReactorLog,
   ReactorDescription,
+  ReactorDescriptionSnapshot,
+  AggregateStateEntry,
+  AggregateTimelineEntry,
   ReactorOutcome,
   FilterState,
   LogsFilter,
@@ -62,6 +65,8 @@ export {
   INSPECTOR_REACTOR_LOGS,
   INSPECTOR_REACTOR_LOGS_BY_CORRELATION,
   INSPECTOR_REACTOR_DESCRIPTIONS,
+  INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS,
+  INSPECTOR_AGGREGATE_TIMELINE,
   INSPECTOR_REACTOR_OUTCOMES,
 } from "./queries";
 
@@ -91,3 +96,6 @@ export { LogsPane } from "./panes/LogsPane";
 export type { LogsPaneProps } from "./panes/LogsPane";
 export { CausalFlowPane } from "./panes/CausalFlowPane";
 export type { CausalFlowPaneProps } from "./panes/CausalFlowPane";
+export { TopologyPane } from "./panes/TopologyPane";
+export { AggregateTimelinePane } from "./panes/AggregateTimelinePane";
+export { WaterfallPane } from "./panes/WaterfallPane";

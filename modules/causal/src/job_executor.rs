@@ -134,7 +134,25 @@ where
             }
         }
 
-        // 4. Create queued reactor intents for ALL matching reactors
+        // 4. Capture aggregate state snapshots for affected aggregates
+        let mut aggregate_snapshots = std::collections::HashMap::new();
+        {
+            let matching_aggs = self.aggregator_registry.find_by_durable_name(&event.event_type);
+            for agg in &matching_aggs {
+                let agg_id = match agg.extract_id_from_json(&event.payload) {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let key = format!("{}:{}", agg.aggregate_type, agg_id);
+                if let Some(state) = self.aggregator_registry.get_state(&key) {
+                    if let Ok(value) = agg.serialize_state(state.as_ref()) {
+                        aggregate_snapshots.insert(key, value);
+                    }
+                }
+            }
+        }
+
+        // 5. Create queued reactor intents for ALL matching reactors
         let hops = event.metadata.get("_hops")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as i32;
@@ -202,7 +220,7 @@ where
             }
         }
 
-        // 6. Return IntentCommit
+        // 7. Return IntentCommit
         Ok(IntentCommit {
             event_id: event.event_id,
             correlation_id: event.correlation_id,
@@ -212,6 +230,7 @@ where
             intents: handler_intents,
             projection_failures,
             reactor_descriptions,
+            aggregate_snapshots,
             park: None,
         })
     }

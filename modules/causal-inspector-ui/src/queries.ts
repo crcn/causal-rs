@@ -102,6 +102,31 @@ export const INSPECTOR_REACTOR_DESCRIPTIONS = `
   }
 `;
 
+export const INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS = `
+  query InspectorReactorDescriptionSnapshots($correlationId: String!) {
+    inspectorReactorDescriptionSnapshots(correlationId: $correlationId) {
+      seq
+      eventId
+      reactorId
+      blocks
+    }
+  }
+`;
+
+export const INSPECTOR_AGGREGATE_TIMELINE = `
+  query InspectorAggregateTimeline($correlationId: String!) {
+    inspectorAggregateTimeline(correlationId: $correlationId) {
+      seq
+      eventId
+      eventType
+      aggregates {
+        key
+        state
+      }
+    }
+  }
+`;
+
 export const INSPECTOR_REACTOR_OUTCOMES = `
   query InspectorReactorOutcomes($correlationId: String!) {
     inspectorReactorOutcomes(correlationId: $correlationId) {

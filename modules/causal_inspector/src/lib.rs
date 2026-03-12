@@ -28,4 +28,5 @@ pub use display::{EventDisplay, DefaultEventDisplay};
 pub use read_model::{
     InspectorReadModel, EventQuery, StoredEvent,
     ReactorLogEntry, ReactorOutcomeEntry, ReactorDescriptionEntry,
+    ReactorDescriptionSnapshotEntry, AggregateStateSnapshotEntry,
 };

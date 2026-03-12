@@ -60,17 +60,30 @@ export type LogsPaneProps = {
 export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   const logs = useSelector<InspectorState, ReactorLog[]>((s) => s.logs);
   const logsFilter = useSelector<InspectorState, LogsFilter>((s) => s.logsFilter);
+  const flowData = useSelector<InspectorState, InspectorState["flowData"]>((s) => s.flowData);
+  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   const [levelFilter, setLevelFilter] = useState<Set<string>>(new Set(["debug", "info", "warn"]));
   const [searchText, setSearchText] = useState("");
 
   const isCorrelationScope = logsFilter.scope === "correlation" && logsFilter.correlationId != null;
-  const hasFilter = logsFilter.eventId != null || logsFilter.reactorId != null;
+  const hasFilter = logsFilter.eventId != null || logsFilter.reactorId != null || isCorrelationScope;
+
+  // Set of event IDs visible at current scrubber position
+  const visibleEventIds = useMemo(() => {
+    if (scrubberPosition == null) return null;
+    return new Set(
+      flowData.filter((e) => e.seq <= scrubberPosition).map((e) => e.id).filter(Boolean),
+    );
+  }, [flowData, scrubberPosition]);
 
   // Client-side filtering
   const filteredLogs = useMemo(() => {
     let filtered = logs.filter((l) => levelFilter.has(l.level));
+    if (visibleEventIds != null) {
+      filtered = filtered.filter((l) => visibleEventIds.has(l.eventId));
+    }
     if (searchText) {
       const lower = searchText.toLowerCase();
       filtered = filtered.filter(
@@ -81,7 +94,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
       );
     }
     return filtered;
-  }, [logs, levelFilter, searchText]);
+  }, [logs, levelFilter, searchText, visibleEventIds]);
 
   if (!hasFilter) {
     return (
@@ -165,8 +178,14 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
 
       {/* Header */}
       <div className="px-3 py-1.5 text-[10px] text-muted-foreground">
-        <span className="font-mono">{logsFilter.reactorId}</span>
-        {isCorrelationScope && <span className="ml-1">(all reactors in correlation)</span>}
+        {logsFilter.reactorId ? (
+          <>
+            <span className="font-mono">{logsFilter.reactorId}</span>
+            {isCorrelationScope && <span className="ml-1">(all reactors in correlation)</span>}
+          </>
+        ) : (
+          <span>All reactors in correlation</span>
+        )}
         <span className="ml-2">{filteredLogs.length} logs</span>
       </div>
 

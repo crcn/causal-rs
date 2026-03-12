@@ -7,6 +7,8 @@ import type {
   InspectorCausalFlow,
   ReactorLog,
   ReactorDescription,
+  ReactorDescriptionSnapshot,
+  AggregateTimelineEntry,
   ReactorOutcome,
   LogsFilter,
 } from "../types";
@@ -17,6 +19,8 @@ import {
   INSPECTOR_REACTOR_LOGS,
   INSPECTOR_REACTOR_LOGS_BY_CORRELATION,
   INSPECTOR_REACTOR_DESCRIPTIONS,
+  INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS,
+  INSPECTOR_AGGREGATE_TIMELINE,
   INSPECTOR_REACTOR_OUTCOMES,
 } from "../queries";
 
@@ -113,10 +117,16 @@ export const createQueryEngine = (
 
     const fetchFlowMetadata = async (correlationId: string) => {
       try {
-        const [descData, outcomeData] = await Promise.all([
+        const [descData, snapshotData, aggTimelineData, outcomeData] = await Promise.all([
           transport.query<{
             inspectorReactorDescriptions: ReactorDescription[];
           }>(INSPECTOR_REACTOR_DESCRIPTIONS, { correlationId }),
+          transport.query<{
+            inspectorReactorDescriptionSnapshots: ReactorDescriptionSnapshot[];
+          }>(INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS, { correlationId }),
+          transport.query<{
+            inspectorAggregateTimeline: AggregateTimelineEntry[];
+          }>(INSPECTOR_AGGREGATE_TIMELINE, { correlationId }),
           transport.query<{
             inspectorReactorOutcomes: ReactorOutcome[];
           }>(INSPECTOR_REACTOR_OUTCOMES, { correlationId }),
@@ -128,6 +138,20 @@ export const createQueryEngine = (
           payload: {
             correlationId,
             descriptions: descData.inspectorReactorDescriptions,
+          },
+        });
+        dispatch({
+          type: "events/description_snapshots_loaded",
+          payload: {
+            correlationId,
+            snapshots: snapshotData.inspectorReactorDescriptionSnapshots,
+          },
+        });
+        dispatch({
+          type: "events/aggregate_timeline_loaded",
+          payload: {
+            correlationId,
+            entries: aggTimelineData.inspectorAggregateTimeline,
           },
         });
         dispatch({
@@ -191,6 +215,7 @@ export const createQueryEngine = (
             const correlationId = event.payload.correlationId;
             fetchFlow(correlationId);
             startFlowPolling(correlationId);
+            fetchLogs(curr.logsFilter);
             break;
           }
 

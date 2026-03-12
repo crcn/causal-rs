@@ -47,6 +47,14 @@ pub struct MemoryStore {
     journal: Arc<DashMap<(String, Uuid), Vec<JournalEntry>>>,
     /// Reactor gate descriptions keyed by correlation_id.
     reactor_descriptions: Arc<DashMap<Uuid, HashMap<String, serde_json::Value>>>,
+    /// Reactor log entries keyed by (event_id, reactor_id).
+    reactor_log_entries: Arc<Mutex<Vec<(Uuid, String, LogEntry)>>>,
+    /// Per-event reactor description snapshots: (correlation_id, event_seq, event_id, reactor_id, description).
+    reactor_description_snapshots: Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
+    /// Per-event aggregate state snapshots: (correlation_id, event_seq, event_id, aggregate_key, state).
+    aggregate_state_snapshots: Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
+    /// Reactor execution timing: (event_id, reactor_id) → (correlation_id, started_at, completed_at, status, error, attempts).
+    reactor_executions: Arc<DashMap<(Uuid, String), (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String, Option<String>, i32)>>,
     /// Checkpoint position for ReactorQueue (last fully processed EventLog position).
     checkpoint: Arc<AtomicU64>,
     /// Optional broadcast channel for live event notifications.
@@ -66,6 +74,10 @@ impl MemoryStore {
             cancel_ttl: std::time::Duration::from_secs(3600),
             journal: Arc::new(DashMap::new()),
             reactor_descriptions: Arc::new(DashMap::new()),
+            reactor_log_entries: Arc::new(Mutex::new(Vec::new())),
+            reactor_description_snapshots: Arc::new(Mutex::new(Vec::new())),
+            aggregate_state_snapshots: Arc::new(Mutex::new(Vec::new())),
+            reactor_executions: Arc::new(DashMap::new()),
             checkpoint: Arc::new(AtomicU64::new(0)),
             event_tx: None,
         }
@@ -109,8 +121,28 @@ impl MemoryStore {
     }
 
     /// Access the global event log (for test assertions).
+    /// Access the stored reactor log entries.
+    pub fn reactor_log_entries(&self) -> &Mutex<Vec<(Uuid, String, LogEntry)>> {
+        &self.reactor_log_entries
+    }
+
     pub fn global_log(&self) -> &Mutex<Vec<PersistedEvent>> {
         &self.global_log
+    }
+
+    /// Access per-event reactor description snapshots.
+    pub fn reactor_description_snapshots(&self) -> &Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>> {
+        &self.reactor_description_snapshots
+    }
+
+    /// Access per-event aggregate state snapshots.
+    pub fn aggregate_state_snapshots(&self) -> &Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>> {
+        &self.aggregate_state_snapshots
+    }
+
+    /// Access reactor execution timing records.
+    pub fn reactor_executions(&self) -> &DashMap<(Uuid, String), (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String, Option<String>, i32)> {
+        &self.reactor_executions
     }
 
     /// Internal journal clear (avoids trait method ambiguity).
@@ -243,11 +275,41 @@ impl ReactorQueue for MemoryStore {
     async fn enqueue(&self, commit: IntentCommit) -> Result<()> {
         // Persist reactor descriptions atomically
         if !commit.reactor_descriptions.is_empty() {
+            // Also store per-event snapshots for the aggregate state timeline
+            let event_seq = commit.checkpoint.raw();
+            {
+                let mut snapshots = self.reactor_description_snapshots.lock();
+                for (reactor_id, description) in &commit.reactor_descriptions {
+                    snapshots.push((
+                        commit.correlation_id,
+                        event_seq,
+                        commit.event_id,
+                        reactor_id.clone(),
+                        description.clone(),
+                    ));
+                }
+            }
+
             let mut entry = self
                 .reactor_descriptions
                 .entry(commit.correlation_id)
                 .or_default();
             entry.extend(commit.reactor_descriptions);
+        }
+
+        // Persist aggregate state snapshots
+        if !commit.aggregate_snapshots.is_empty() {
+            let event_seq = commit.checkpoint.raw();
+            let mut snapshots = self.aggregate_state_snapshots.lock();
+            for (aggregate_key, state) in &commit.aggregate_snapshots {
+                snapshots.push((
+                    commit.correlation_id,
+                    event_seq,
+                    commit.event_id,
+                    aggregate_key.clone(),
+                    state.clone(),
+                ));
+            }
         }
 
         // Handle projection failures as DLQ entries
@@ -311,6 +373,11 @@ impl ReactorQueue for MemoryStore {
                 (execution.event_id, execution.reactor_id.clone()),
                 execution.clone(),
             );
+            // Record execution start time
+            self.reactor_executions.insert(
+                (execution.event_id, execution.reactor_id.clone()),
+                (execution.correlation_id, Utc::now(), None, "running".to_string(), None, execution.attempts),
+            );
             Ok(Some(execution))
         } else {
             Ok(None)
@@ -328,6 +395,22 @@ impl ReactorQueue for MemoryStore {
                 self.in_flight
                     .remove(&(completion.event_id, completion.reactor_id.clone()));
                 self.clear_journal_internal(&completion.reactor_id, completion.event_id);
+                // Record completion time
+                if let Some(mut entry) = self.reactor_executions.get_mut(&(completion.event_id, completion.reactor_id.clone())) {
+                    entry.2 = Some(Utc::now());
+                    entry.3 = "completed".to_string();
+                }
+                // Store log entries for inspector
+                if !completion.log_entries.is_empty() {
+                    let mut logs = self.reactor_log_entries.lock();
+                    for entry in &completion.log_entries {
+                        logs.push((
+                            completion.event_id,
+                            completion.reactor_id.clone(),
+                            entry.clone(),
+                        ));
+                    }
+                }
                 self.completed_reactors
                     .insert((completion.event_id, completion.reactor_id), completion.result);
             }
@@ -345,6 +428,10 @@ impl ReactorQueue for MemoryStore {
                     error,
                     new_attempts
                 );
+                // Update attempt count in execution record
+                if let Some(mut entry) = self.reactor_executions.get_mut(&(event_id, reactor_id.clone())) {
+                    entry.5 = new_attempts;
+                }
                 let key = (event_id, reactor_id.clone());
                 if let Some((_, mut execution)) = self.in_flight.remove(&key) {
                     execution.attempts = new_attempts;
@@ -360,6 +447,13 @@ impl ReactorQueue for MemoryStore {
             ReactorResolution::DeadLetter(dlq) => {
                 self.in_flight
                     .remove(&(dlq.event_id, dlq.reactor_id.clone()));
+                // Record failure
+                if let Some(mut entry) = self.reactor_executions.get_mut(&(dlq.event_id, dlq.reactor_id.clone())) {
+                    entry.2 = Some(Utc::now());
+                    entry.3 = "error".to_string();
+                    entry.4 = Some(dlq.error.clone());
+                    entry.5 = dlq.attempts;
+                }
                 eprintln!(
                     "Reactor sent to DLQ: {}:{} - {} (attempts: {})",
                     dlq.event_id, dlq.reactor_id, dlq.error, dlq.attempts

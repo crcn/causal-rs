@@ -10,8 +10,9 @@ use uuid::Uuid;
 use causal::{MemoryStore, ReactorQueue};
 
 use crate::read_model::{
-    InspectorReadModel, EventQuery, ReactorDescriptionEntry, ReactorLogEntry, ReactorOutcomeEntry,
-    StoredEvent,
+    InspectorReadModel, EventQuery, AggregateStateSnapshotEntry,
+    ReactorDescriptionEntry, ReactorDescriptionSnapshotEntry,
+    ReactorLogEntry, ReactorOutcomeEntry, StoredEvent,
 };
 
 /// Convert a `PersistedEvent` to a `StoredEvent`.
@@ -149,21 +150,110 @@ impl InspectorReadModel for MemoryStore {
 
     async fn reactor_logs(
         &self,
-        _event_id: Uuid,
-        _reactor_id: &str,
+        event_id: Uuid,
+        reactor_id: &str,
     ) -> Result<Vec<ReactorLogEntry>> {
-        Ok(vec![])
+        let logs = self.reactor_log_entries().lock();
+        Ok(logs
+            .iter()
+            .filter(|(eid, rid, _)| *eid == event_id && rid == reactor_id)
+            .map(|(eid, rid, entry)| ReactorLogEntry {
+                event_id: *eid,
+                reactor_id: rid.clone(),
+                level: entry.level.to_string().to_lowercase(),
+                message: entry.message.clone(),
+                data: entry.data.clone(),
+                logged_at: entry.timestamp,
+            })
+            .collect())
     }
 
     async fn reactor_logs_by_correlation(
         &self,
-        _correlation_id: &str,
+        correlation_id: &str,
     ) -> Result<Vec<ReactorLogEntry>> {
-        Ok(vec![])
+        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+            return Ok(vec![]);
+        };
+        // Build set of event IDs in this correlation
+        let event_ids: std::collections::HashSet<Uuid> = {
+            let log = self.global_log().lock();
+            log.iter()
+                .filter(|e| e.correlation_id == cid)
+                .map(|e| e.event_id)
+                .collect()
+        };
+        let logs = self.reactor_log_entries().lock();
+        Ok(logs
+            .iter()
+            .filter(|(eid, _, _)| event_ids.contains(eid))
+            .map(|(eid, rid, entry)| ReactorLogEntry {
+                event_id: *eid,
+                reactor_id: rid.clone(),
+                level: entry.level.to_string().to_lowercase(),
+                message: entry.message.clone(),
+                data: entry.data.clone(),
+                logged_at: entry.timestamp,
+            })
+            .collect())
     }
 
-    async fn reactor_outcomes(&self, _correlation_id: &str) -> Result<Vec<ReactorOutcomeEntry>> {
-        Ok(vec![])
+    async fn reactor_outcomes(&self, correlation_id: &str) -> Result<Vec<ReactorOutcomeEntry>> {
+        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+            return Ok(vec![]);
+        };
+
+        // Group executions by reactor_id for this correlation
+        let mut by_reactor: std::collections::HashMap<
+            String,
+            (String, Option<String>, i32, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Vec<String>),
+        > = std::collections::HashMap::new();
+
+        for entry in self.reactor_executions().iter() {
+            let (event_id, reactor_id) = entry.key();
+            let (corr_id, started_at, completed_at, status, error, attempts) = entry.value();
+            if *corr_id != cid {
+                continue;
+            }
+
+            let row = by_reactor.entry(reactor_id.clone()).or_insert_with(|| {
+                (status.clone(), error.clone(), 0, None, None, Vec::new())
+            });
+            // Aggregate: worst status wins, sum attempts, min started_at, max completed_at
+            if status == "error" {
+                row.0 = "error".to_string();
+                row.1 = error.clone();
+            }
+            row.2 += attempts + 1; // attempts is 0-based retry count
+            match row.3 {
+                Some(existing) if *started_at < existing => row.3 = Some(*started_at),
+                None => row.3 = Some(*started_at),
+                _ => {}
+            }
+            if let Some(ca) = completed_at {
+                match row.4 {
+                    Some(existing) if *ca > existing => row.4 = Some(*ca),
+                    None => row.4 = Some(*ca),
+                    _ => {}
+                }
+            }
+            row.5.push(event_id.to_string());
+        }
+
+        Ok(by_reactor
+            .into_iter()
+            .map(|(reactor_id, (status, error, attempts, started_at, completed_at, triggering_event_ids))| {
+                ReactorOutcomeEntry {
+                    reactor_id,
+                    status,
+                    error,
+                    attempts: attempts as i64,
+                    started_at,
+                    completed_at,
+                    triggering_event_ids,
+                }
+            })
+            .collect())
     }
 
     async fn reactor_descriptions(
@@ -185,5 +275,70 @@ impl InspectorReadModel for MemoryStore {
                 description,
             })
             .collect())
+    }
+
+    async fn reactor_description_snapshots(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<ReactorDescriptionSnapshotEntry>> {
+        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+            return Ok(vec![]);
+        };
+
+        let snapshots = self.reactor_description_snapshots().lock();
+        let mut result: Vec<ReactorDescriptionSnapshotEntry> = snapshots
+            .iter()
+            .filter(|(corr_id, _, _, _, _)| *corr_id == cid)
+            .map(|(_, seq, event_id, reactor_id, description)| {
+                ReactorDescriptionSnapshotEntry {
+                    seq: *seq as i64,
+                    event_id: *event_id,
+                    reactor_id: reactor_id.clone(),
+                    description: description.clone(),
+                }
+            })
+            .collect();
+
+        result.sort_by_key(|s| s.seq);
+        Ok(result)
+    }
+
+    async fn aggregate_state_timeline(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<AggregateStateSnapshotEntry>> {
+        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+            return Ok(vec![]);
+        };
+
+        // Build event_id → event_type lookup from global log
+        let event_types: std::collections::HashMap<Uuid, String> = {
+            let log = self.global_log().lock();
+            log.iter()
+                .filter(|e| e.correlation_id == cid)
+                .map(|e| (e.event_id, e.event_type.clone()))
+                .collect()
+        };
+
+        let snapshots = self.aggregate_state_snapshots().lock();
+        let mut result: Vec<AggregateStateSnapshotEntry> = snapshots
+            .iter()
+            .filter(|(corr_id, _, _, _, _)| *corr_id == cid)
+            .map(|(_, seq, event_id, aggregate_key, state)| {
+                AggregateStateSnapshotEntry {
+                    seq: *seq as i64,
+                    event_id: *event_id,
+                    event_type: event_types
+                        .get(event_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    aggregate_key: aggregate_key.clone(),
+                    state: state.clone(),
+                }
+            })
+            .collect();
+
+        result.sort_by_key(|s| s.seq);
+        Ok(result)
     }
 }

@@ -295,9 +295,14 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
   const flowCorrelationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
+  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
-  const treeEvents = causalTree?.events ?? null;
+  const treeEvents = useMemo(() => {
+    const all = causalTree?.events ?? null;
+    if (all == null || scrubberPosition == null) return all;
+    return all.filter((e) => e.seq <= scrubberPosition);
+  }, [causalTree?.events, scrubberPosition]);
   const treeLoading = selectedSeq != null && causalTree == null;
 
   const onClickReactor = useCallback(

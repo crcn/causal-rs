@@ -188,6 +188,80 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
+    /// Fetch per-event aggregate state timeline for a correlation chain.
+    async fn inspector_aggregate_timeline(
+        &self,
+        ctx: &Context<'_>,
+        correlation_id: String,
+    ) -> Result<Vec<AggregateTimelineEntry>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+
+        let entries = read_model
+            .aggregate_state_timeline(&correlation_id)
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!(
+                    "Failed to load aggregate state timeline: {e}"
+                ))
+            })?;
+
+        // Group by seq → AggregateTimelineEntry with multiple AggregateStateEntry
+        let mut by_seq: std::collections::BTreeMap<
+            i64,
+            (String, String, Vec<AggregateStateEntry>),
+        > = std::collections::BTreeMap::new();
+
+        for entry in entries {
+            let row = by_seq
+                .entry(entry.seq)
+                .or_insert_with(|| (entry.event_id.to_string(), entry.event_type.clone(), Vec::new()));
+            row.2.push(AggregateStateEntry {
+                key: entry.aggregate_key,
+                state: entry.state,
+            });
+        }
+
+        Ok(by_seq
+            .into_iter()
+            .map(|(seq, (event_id, event_type, aggregates))| {
+                AggregateTimelineEntry {
+                    seq,
+                    event_id,
+                    event_type,
+                    aggregates,
+                }
+            })
+            .collect())
+    }
+
+    /// Fetch per-event reactor description snapshots for a correlation chain.
+    async fn inspector_reactor_description_snapshots(
+        &self,
+        ctx: &Context<'_>,
+        correlation_id: String,
+    ) -> Result<Vec<ReactorDescriptionSnapshot>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+
+        let entries = read_model
+            .reactor_description_snapshots(&correlation_id)
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!(
+                    "Failed to load reactor description snapshots: {e}"
+                ))
+            })?;
+
+        Ok(entries
+            .into_iter()
+            .map(|r| ReactorDescriptionSnapshot {
+                seq: r.seq,
+                event_id: r.event_id.to_string(),
+                reactor_id: r.reactor_id,
+                blocks: r.description,
+            })
+            .collect())
+    }
+
     /// Fetch aggregated reactor execution outcomes for a correlation chain.
     async fn inspector_reactor_outcomes(
         &self,

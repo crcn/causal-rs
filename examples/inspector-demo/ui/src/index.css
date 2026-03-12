@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@source "../../../../modules/causal-inspector-ui/src/**/*.tsx";
 @import "@xyflow/react/dist/style.css";
 @import "flexlayout-react/style/dark.css";
 

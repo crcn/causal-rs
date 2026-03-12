@@ -20,6 +20,9 @@ import {
   CausalTreePane,
   CausalFlowPane,
   LogsPane,
+  TopologyPane,
+  AggregateTimelinePane,
+  WaterfallPane,
   type InspectorState,
   type InspectorMachineEvent,
   type PaneLayout,
@@ -88,6 +91,9 @@ const PANE_REGISTRY = [
   { name: "Causal Tree", component: "causal-tree", render: () => <CausalTreePane /> },
   { name: "Flow", component: "causal-flow", render: () => <CausalFlowPane /> },
   { name: "Logs", component: "logs", render: () => <LogsPane /> },
+  { name: "Topology", component: "topology", render: () => <TopologyPane /> },
+  { name: "State Timeline", component: "state-timeline", render: () => <AggregateTimelinePane /> },
+  { name: "Waterfall", component: "waterfall", render: () => <WaterfallPane /> },
 ] as const;
 
 // ── Helpers ────────────────────────────────────────────────────
