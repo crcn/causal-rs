@@ -8,6 +8,7 @@ members = [
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",
+    "examples/admin-demo",
 ]
 resolver = "2"
 

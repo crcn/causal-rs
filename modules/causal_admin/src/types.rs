@@ -1,19 +1,4 @@
 use chrono::{DateTime, Utc};
-use uuid::Uuid;
-
-/// Raw event row from the `events` table.
-pub struct EventRow {
-    pub id: Option<Uuid>,
-    pub parent_id: Option<Uuid>,
-    pub seq: i64,
-    pub ts: DateTime<Utc>,
-    pub event_type: String,
-    pub data: serde_json::Value,
-    pub run_id: Option<String>,
-    pub correlation_id: Option<Uuid>,
-    pub parent_seq: Option<i64>,
-    pub reactor_id: Option<String>,
-}
 
 /// Processed event ready for the admin UI.
 /// Use `EventDisplay` to control `name`, `layer`, and `summary`.
@@ -90,29 +75,4 @@ pub struct ReactorOutcome {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub triggering_event_ids: Vec<String>,
-}
-
-impl AdminEvent {
-    /// Convert an `EventRow` into an `AdminEvent` using the given display.
-    pub fn from_row(row: EventRow, display: &dyn crate::display::EventDisplay) -> Self {
-        let name = display.display_name(&row.event_type, &row.data);
-        let summary = display.summary(&row.event_type, &row.data);
-        let layer = display.layer(&row.event_type).to_string();
-        let payload = serde_json::to_string(&row.data).unwrap_or_default();
-
-        Self {
-            seq: row.seq,
-            ts: row.ts,
-            event_type: row.event_type,
-            name,
-            layer,
-            id: row.id.map(|u| u.to_string()),
-            parent_id: row.parent_id.map(|u| u.to_string()),
-            correlation_id: row.correlation_id.map(|u| u.to_string()),
-            run_id: row.run_id,
-            reactor_id: row.reactor_id,
-            summary,
-            payload,
-        }
-    }
 }

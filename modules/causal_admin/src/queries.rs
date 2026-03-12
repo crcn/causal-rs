@@ -1,49 +1,43 @@
+//! Raw SQL queries for Postgres-backed admin stores.
+//!
+//! These functions return [`StoredEvent`] and raw row types — display
+//! transformation happens in the resolver layer via [`EventDisplay`].
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::display::EventDisplay;
-use crate::types::{AdminEvent, EventRow};
+use crate::read_model::StoredEvent;
 
 // ── Row conversion ──
 
-fn row_to_event(r: &sqlx::postgres::PgRow) -> EventRow {
+fn row_to_stored(r: &sqlx::postgres::PgRow) -> StoredEvent {
     use sqlx::Row;
-    EventRow {
-        id: r.get("id"),
-        parent_id: r.get("parent_id"),
+    StoredEvent {
         seq: r.get("seq"),
         ts: r.get("ts"),
         event_type: r.get("event_type"),
-        data: r.get::<serde_json::Value, _>("data"),
-        run_id: r.get("run_id"),
+        payload: r.get::<serde_json::Value, _>("data"),
+        id: r.get("id"),
+        parent_id: r.get("parent_id"),
         correlation_id: r.get("correlation_id"),
-        parent_seq: r.get("parent_seq"),
+        run_id: r.get("run_id"),
         reactor_id: r.get("reactor_id"),
     }
 }
 
-fn rows_to_admin_events(
-    rows: impl IntoIterator<Item = sqlx::postgres::PgRow>,
-    display: &dyn EventDisplay,
-) -> Vec<AdminEvent> {
-    rows.into_iter()
-        .map(|r| AdminEvent::from_row(row_to_event(&r), display))
-        .collect()
+fn rows_to_stored(rows: impl IntoIterator<Item = sqlx::postgres::PgRow>) -> Vec<StoredEvent> {
+    rows.into_iter().map(|r| row_to_stored(&r)).collect()
 }
 
 // ── Queries ──
 
 /// Single event lookup by sequence number.
-pub async fn get_event_by_seq(
-    pool: &PgPool,
-    seq: i64,
-    display: &dyn EventDisplay,
-) -> anyhow::Result<Option<AdminEvent>> {
+pub async fn get_event_by_seq(pool: &PgPool, seq: i64) -> anyhow::Result<Option<StoredEvent>> {
     let row = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, reactor_id
+               run_id, correlation_id, reactor_id
         FROM events
         WHERE seq = $1
         "#,
@@ -52,7 +46,7 @@ pub async fn get_event_by_seq(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| AdminEvent::from_row(row_to_event(&r), display)))
+    Ok(row.map(|r| row_to_stored(&r)))
 }
 
 /// Fetch events starting from a given seq (for subscription catch-up).
@@ -60,14 +54,13 @@ pub async fn get_events_from_seq(
     pool: &PgPool,
     start_seq: i64,
     limit: i64,
-    display: &dyn EventDisplay,
-) -> anyhow::Result<Vec<AdminEvent>> {
+) -> anyhow::Result<Vec<StoredEvent>> {
     let limit = limit.min(500);
 
     let rows = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, reactor_id
+               run_id, correlation_id, reactor_id
         FROM events
         WHERE seq >= $1
         ORDER BY seq ASC
@@ -79,7 +72,7 @@ pub async fn get_events_from_seq(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows_to_admin_events(rows, display))
+    Ok(rows_to_stored(rows))
 }
 
 /// Paginated reverse-chronological event listing with optional filters.
@@ -91,14 +84,13 @@ pub async fn list_events_paginated(
     to: Option<DateTime<Utc>>,
     run_id: Option<&str>,
     limit: i64,
-    display: &dyn EventDisplay,
-) -> anyhow::Result<Vec<AdminEvent>> {
+) -> anyhow::Result<Vec<StoredEvent>> {
     let limit = limit.min(200);
 
     let rows = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, reactor_id
+               run_id, correlation_id, reactor_id
         FROM events
         WHERE ($1::bigint IS NULL OR seq < $1)
           AND ($2::timestamptz IS NULL OR ts >= $2)
@@ -122,19 +114,15 @@ pub async fn list_events_paginated(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows_to_admin_events(rows, display))
+    Ok(rows_to_stored(rows))
 }
 
 /// Get all events sharing the same correlation_id as the given event.
-pub async fn causal_tree(
-    pool: &PgPool,
-    seq: i64,
-    display: &dyn EventDisplay,
-) -> anyhow::Result<(Vec<AdminEvent>, i64)> {
+pub async fn causal_tree(pool: &PgPool, seq: i64) -> anyhow::Result<(Vec<StoredEvent>, i64)> {
     let rows = sqlx::query(
         r#"
         SELECT e.seq, e.ts, e.event_type, e.payload AS data, e.id, e.parent_id,
-               e.run_id, e.correlation_id, e.parent_seq, e.reactor_id
+               e.run_id, e.correlation_id, e.reactor_id
         FROM events e
         WHERE e.correlation_id = (SELECT correlation_id FROM events WHERE seq = $1)
           AND e.correlation_id IS NOT NULL
@@ -152,19 +140,15 @@ pub async fn causal_tree(
         .map(|r| r.get::<i64, _>("seq"))
         .unwrap_or(seq);
 
-    Ok((rows_to_admin_events(rows, display), root_seq))
+    Ok((rows_to_stored(rows), root_seq))
 }
 
 /// Get all events for a run_id, ordered by seq ascending.
-pub async fn causal_flow(
-    pool: &PgPool,
-    run_id: &str,
-    display: &dyn EventDisplay,
-) -> anyhow::Result<Vec<AdminEvent>> {
+pub async fn causal_flow(pool: &PgPool, run_id: &str) -> anyhow::Result<Vec<StoredEvent>> {
     let rows = sqlx::query(
         r#"
         SELECT seq, ts, event_type, payload AS data, id, parent_id,
-               run_id, correlation_id, parent_seq, reactor_id
+               run_id, correlation_id, reactor_id
         FROM events
         WHERE run_id = $1
         ORDER BY seq ASC
@@ -174,7 +158,7 @@ pub async fn causal_flow(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows_to_admin_events(rows, display))
+    Ok(rows_to_stored(rows))
 }
 
 // ── Reactor queries ──
@@ -190,7 +174,7 @@ pub struct ReactorLogRow {
 }
 
 /// Fetch reactor logs for a specific event + reactor.
-pub async fn handler_logs(
+pub async fn reactor_logs(
     pool: &PgPool,
     event_id: &Uuid,
     reactor_id: &str,
@@ -209,18 +193,13 @@ pub async fn handler_logs(
     Ok(rows
         .into_iter()
         .map(|(event_id, reactor_id, level, message, data, logged_at)| ReactorLogRow {
-            event_id,
-            reactor_id,
-            level,
-            message,
-            data,
-            logged_at,
+            event_id, reactor_id, level, message, data, logged_at,
         })
         .collect())
 }
 
 /// Fetch all reactor logs for a run (by correlation_id).
-pub async fn handler_logs_by_run(
+pub async fn reactor_logs_by_run(
     pool: &PgPool,
     run_id: &str,
 ) -> anyhow::Result<Vec<ReactorLogRow>> {
@@ -240,12 +219,7 @@ pub async fn handler_logs_by_run(
     Ok(rows
         .into_iter()
         .map(|(event_id, reactor_id, level, message, data, logged_at)| ReactorLogRow {
-            event_id,
-            reactor_id,
-            level,
-            message,
-            data,
-            logged_at,
+            event_id, reactor_id, level, message, data, logged_at,
         })
         .collect())
 }
@@ -262,7 +236,7 @@ pub struct ReactorOutcomeRow {
 }
 
 /// Fetch aggregated reactor execution outcomes for a run.
-pub async fn handler_outcomes(
+pub async fn reactor_outcomes(
     pool: &PgPool,
     run_id: &str,
 ) -> anyhow::Result<Vec<ReactorOutcomeRow>> {
@@ -292,12 +266,7 @@ pub async fn handler_outcomes(
     Ok(rows
         .into_iter()
         .map(|(reactor_id, status, error, attempts, started_at, completed_at, triggering_event_ids)| ReactorOutcomeRow {
-            reactor_id,
-            status,
-            error,
-            attempts,
-            started_at,
-            completed_at,
+            reactor_id, status, error, attempts, started_at, completed_at,
             triggering_event_ids: triggering_event_ids.unwrap_or_default(),
         })
         .collect())

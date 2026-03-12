@@ -1,25 +1,37 @@
+//! Store-agnostic GraphQL resolvers for the causal admin UI.
+//!
+//! Queries read from `Arc<dyn AdminReadModel>` (injected into context).
+//! Subscriptions read from `tokio::sync::broadcast::Sender<PersistedEvent>`
+//! (injected into context — how events get broadcast is the consumer's concern).
+
 use std::sync::Arc;
 
 use async_graphql::{Context, Object, Result, Subscription};
 use chrono::{DateTime, Utc};
 use futures::Stream;
-use uuid::Uuid;
 
 use crate::display::EventDisplay;
+use crate::read_model::{AdminReadModel, EventQuery, StoredEvent};
 use crate::types::*;
 
 /// Generic admin query resolvers for causal event tables.
 ///
 /// The `D` parameter controls how events are displayed (names, layers, summaries).
-/// Consumers should compose this into their own schema and add their own auth guards.
+///
+/// # Context requirements
+///
+/// The async-graphql context must contain:
+/// - `Arc<dyn AdminReadModel>` — the store to query
 ///
 /// # Usage
 ///
 /// ```ignore
 /// use causal_admin::{CausalAdminQuery, DefaultEventDisplay};
 ///
-/// let admin = CausalAdminQuery::new(DefaultEventDisplay);
-/// // Merge into your async-graphql schema
+/// let query = CausalAdminQuery::new(DefaultEventDisplay);
+/// let schema = Schema::build(query, EmptyMutation, EmptySubscription)
+///     .data(store as Arc<dyn AdminReadModel>)
+///     .finish();
 /// ```
 pub struct CausalAdminQuery<D: EventDisplay> {
     display: Arc<D>,
@@ -33,10 +45,13 @@ impl<D: EventDisplay> CausalAdminQuery<D> {
     }
 }
 
+fn stored_to_admin(events: Vec<StoredEvent>, display: &dyn EventDisplay) -> Vec<AdminEvent> {
+    events.iter().map(|e| e.to_admin_event(display)).collect()
+}
+
 #[Object]
 impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
     /// Paginated reverse-chronological event listing with optional filters.
-    /// Tries in-memory cache first, falls through to Postgres on miss.
     async fn admin_events(
         &self,
         ctx: &Context<'_>,
@@ -47,64 +62,43 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
         to: Option<DateTime<Utc>>,
         run_id: Option<String>,
     ) -> Result<AdminEventsPage> {
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?;
         let lim = (limit.unwrap_or(50) as usize).min(200);
 
-        #[cfg(feature = "cache")]
-        if let Some(cache) = ctx.data_opt::<crate::cache::SharedEventCache>() {
-            let cache = cache.read().await;
-            let (events, next_cursor) = cache.search(
-                search.as_deref(),
-                cursor,
-                from,
-                to,
-                run_id.as_deref(),
-                lim,
-            );
-            let events: Vec<AdminEvent> = events.into_iter().map(|e| (*e).clone()).collect();
-            return Ok(AdminEventsPage { events, next_cursor });
-        }
-
-        let pool = ctx.data::<sqlx::PgPool>()?;
-
-        let events = crate::queries::list_events_paginated(
-            pool,
-            search.as_deref(),
+        let query = EventQuery {
+            limit: lim,
             cursor,
+            search,
             from,
             to,
-            run_id.as_deref(),
-            lim as i64,
-            self.display.as_ref(),
-        )
-        .await
-        .map_err(|e| async_graphql::Error::new(format!("Failed to load events: {e}")))?;
+            run_id,
+        };
 
-        let next_cursor = if events.len() == lim {
-            events.last().map(|e| e.seq)
+        let stored = read_model
+            .list_events(&query)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("Failed to load events: {e}")))?;
+
+        let next_cursor = if stored.len() == lim {
+            stored.last().map(|e| e.seq)
         } else {
             None
         };
 
+        let events = stored_to_admin(stored, self.display.as_ref());
         Ok(AdminEventsPage { events, next_cursor })
     }
 
     /// Walk the causal tree for an event (ancestors + descendants).
     async fn admin_causal_tree(&self, ctx: &Context<'_>, seq: i64) -> Result<AdminCausalTree> {
-        #[cfg(feature = "cache")]
-        if let Some(cache) = ctx.data_opt::<crate::cache::SharedEventCache>() {
-            let cache = cache.read().await;
-            if let Some((events, root_seq)) = cache.causal_tree(seq) {
-                let events: Vec<AdminEvent> = events.into_iter().map(|e| (*e).clone()).collect();
-                return Ok(AdminCausalTree { events, root_seq });
-            }
-        }
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?;
 
-        let pool = ctx.data::<sqlx::PgPool>()?;
-
-        let (events, root_seq) = crate::queries::causal_tree(pool, seq, self.display.as_ref())
+        let (stored, root_seq) = read_model
+            .causal_tree(seq)
             .await
             .map_err(|e| async_graphql::Error::new(format!("Failed to load causal tree: {e}")))?;
 
+        let events = stored_to_admin(stored, self.display.as_ref());
         Ok(AdminCausalTree { events, root_seq })
     }
 
@@ -114,45 +108,39 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
         ctx: &Context<'_>,
         run_id: String,
     ) -> Result<AdminCausalFlow> {
-        #[cfg(feature = "cache")]
-        if let Some(cache) = ctx.data_opt::<crate::cache::SharedEventCache>() {
-            let cache = cache.read().await;
-            if let Some(events) = cache.causal_flow(&run_id) {
-                let events: Vec<AdminEvent> = events.into_iter().map(|e| (*e).clone()).collect();
-                return Ok(AdminCausalFlow { events });
-            }
-        }
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?;
 
-        let pool = ctx.data::<sqlx::PgPool>()?;
-
-        let events = crate::queries::causal_flow(pool, &run_id, self.display.as_ref())
+        let stored = read_model
+            .causal_flow(&run_id)
             .await
             .map_err(|e| async_graphql::Error::new(format!("Failed to load causal flow: {e}")))?;
 
+        let events = stored_to_admin(stored, self.display.as_ref());
         Ok(AdminCausalFlow { events })
     }
 
     /// Fetch reactor logs for a specific event + reactor.
-    async fn admin_handler_logs(
+    async fn admin_reactor_logs(
         &self,
         ctx: &Context<'_>,
         event_id: String,
         reactor_id: String,
     ) -> Result<Vec<ReactorLog>> {
-        let pool = ctx.data::<sqlx::PgPool>()?;
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?;
 
-        let event_uuid = Uuid::parse_str(&event_id)
+        let event_uuid = uuid::Uuid::parse_str(&event_id)
             .map_err(|e| async_graphql::Error::new(format!("Invalid event_id: {e}")))?;
 
-        let rows = crate::queries::handler_logs(pool, &event_uuid, &reactor_id)
+        let entries = read_model
+            .reactor_logs(event_uuid, &reactor_id)
             .await
             .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor logs: {e}")))?;
 
-        Ok(rows
+        Ok(entries
             .into_iter()
             .map(|r| ReactorLog {
-                event_id: event_id.clone(),
-                reactor_id: reactor_id.clone(),
+                event_id: r.event_id.to_string(),
+                reactor_id: r.reactor_id,
                 level: r.level,
                 message: r.message,
                 data: r.data,
@@ -162,18 +150,19 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
     }
 
     /// Fetch all reactor logs for a run.
-    async fn admin_handler_logs_by_run(
+    async fn admin_reactor_logs_by_run(
         &self,
         ctx: &Context<'_>,
         run_id: String,
     ) -> Result<Vec<ReactorLog>> {
-        let pool = ctx.data::<sqlx::PgPool>()?;
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?;
 
-        let rows = crate::queries::handler_logs_by_run(pool, &run_id)
+        let entries = read_model
+            .reactor_logs_by_run(&run_id)
             .await
             .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor logs: {e}")))?;
 
-        Ok(rows
+        Ok(entries
             .into_iter()
             .map(|r| ReactorLog {
                 event_id: r.event_id.to_string(),
@@ -192,13 +181,16 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
         ctx: &Context<'_>,
         run_id: String,
     ) -> Result<Vec<ReactorDescription>> {
-        let pool = ctx.data::<sqlx::PgPool>()?;
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?;
 
-        let rows = crate::queries::reactor_descriptions(pool, &run_id)
+        let entries = read_model
+            .reactor_descriptions(&run_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor descriptions: {e}")))?;
+            .map_err(|e| {
+                async_graphql::Error::new(format!("Failed to load reactor descriptions: {e}"))
+            })?;
 
-        Ok(rows
+        Ok(entries
             .into_iter()
             .map(|r| ReactorDescription {
                 reactor_id: r.reactor_id,
@@ -208,18 +200,21 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
     }
 
     /// Fetch aggregated reactor execution outcomes for a run.
-    async fn admin_handler_outcomes(
+    async fn admin_reactor_outcomes(
         &self,
         ctx: &Context<'_>,
         run_id: String,
     ) -> Result<Vec<ReactorOutcome>> {
-        let pool = ctx.data::<sqlx::PgPool>()?;
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?;
 
-        let rows = crate::queries::handler_outcomes(pool, &run_id)
+        let entries = read_model
+            .reactor_outcomes(&run_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor outcomes: {e}")))?;
+            .map_err(|e| {
+                async_graphql::Error::new(format!("Failed to load reactor outcomes: {e}"))
+            })?;
 
-        Ok(rows
+        Ok(entries
             .into_iter()
             .map(|r| ReactorOutcome {
                 reactor_id: r.reactor_id,
@@ -234,7 +229,13 @@ impl<D: EventDisplay + 'static> CausalAdminQuery<D> {
     }
 }
 
-/// Generic admin subscription — streams live events via EventBroadcast.
+/// Generic admin subscription — streams live events.
+///
+/// # Context requirements
+///
+/// The async-graphql context must contain:
+/// - `Arc<dyn AdminReadModel>` — for catch-up queries
+/// - `tokio::sync::broadcast::Sender<StoredEvent>` — for live event stream
 pub struct CausalAdminSubscription<D: EventDisplay> {
     display: Arc<D>,
 }
@@ -248,7 +249,6 @@ impl<D: EventDisplay> CausalAdminSubscription<D> {
 }
 
 #[Subscription]
-#[cfg(feature = "broadcast")]
 impl<D: EventDisplay + 'static> CausalAdminSubscription<D> {
     /// Stream live events. If `last_seq` is provided, replays missed events first.
     async fn admin_event_added(
@@ -256,9 +256,11 @@ impl<D: EventDisplay + 'static> CausalAdminSubscription<D> {
         ctx: &Context<'_>,
         last_seq: Option<i64>,
     ) -> Result<impl Stream<Item = AdminEvent>> {
-        let pool = ctx.data::<sqlx::PgPool>()?.clone();
-        let broadcast = ctx.data::<crate::broadcast::EventBroadcast>()?.clone();
-        let mut rx = broadcast.subscribe();
+        let read_model = ctx.data::<Arc<dyn AdminReadModel>>()?.clone();
+        let tx = ctx
+            .data::<tokio::sync::broadcast::Sender<StoredEvent>>()?
+            .clone();
+        let mut rx = tx.subscribe();
         let display = Arc::clone(&self.display);
 
         Ok(async_stream::stream! {
@@ -267,13 +269,13 @@ impl<D: EventDisplay + 'static> CausalAdminSubscription<D> {
             // Catch-up phase
             if let Some(start) = last_seq {
                 let catch_up_start = start + 1;
-                match crate::queries::get_events_from_seq(&pool, catch_up_start, 500, display.as_ref()).await {
+                match read_model.events_from_seq(catch_up_start, 500).await {
                     Ok(events) => {
                         for event in events {
                             if event.seq > high_water {
                                 high_water = event.seq;
                             }
-                            yield event;
+                            yield event.to_admin_event(display.as_ref());
                         }
                     }
                     Err(e) => {
@@ -288,7 +290,7 @@ impl<D: EventDisplay + 'static> CausalAdminSubscription<D> {
                     Ok(event) => {
                         if event.seq > high_water {
                             high_water = event.seq;
-                            yield event;
+                            yield event.to_admin_event(display.as_ref());
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +49,8 @@ pub struct MemoryStore {
     reactor_descriptions: Arc<DashMap<Uuid, HashMap<String, serde_json::Value>>>,
     /// Checkpoint position for ReactorQueue (last fully processed EventLog position).
     checkpoint: Arc<AtomicU64>,
+    /// Optional broadcast channel for live event notifications.
+    event_tx: Option<broadcast::Sender<PersistedEvent>>,
 }
 
 impl MemoryStore {
@@ -64,7 +67,26 @@ impl MemoryStore {
             journal: Arc::new(DashMap::new()),
             reactor_descriptions: Arc::new(DashMap::new()),
             checkpoint: Arc::new(AtomicU64::new(0)),
+            event_tx: None,
         }
+    }
+
+    /// Create a MemoryStore with a broadcast channel for live event notifications.
+    ///
+    /// Returns the store and a receiver. Additional receivers can be obtained
+    /// via [`subscribe()`](Self::subscribe).
+    pub fn with_broadcast(capacity: usize) -> (Self, broadcast::Receiver<PersistedEvent>) {
+        let (tx, rx) = broadcast::channel(capacity);
+        let mut store = Self::new();
+        store.event_tx = Some(tx);
+        (store, rx)
+    }
+
+    /// Subscribe to live event notifications.
+    ///
+    /// Returns `None` if the store was created without a broadcast channel.
+    pub fn subscribe(&self) -> Option<broadcast::Receiver<PersistedEvent>> {
+        self.event_tx.as_ref().map(|tx| tx.subscribe())
     }
 
     /// Set the TTL for cancelled correlation entries.
@@ -132,7 +154,7 @@ impl EventLog for MemoryStore {
             None
         };
 
-        log.push(PersistedEvent {
+        let persisted = PersistedEvent {
             position,
             event_id: event.event_id,
             parent_id: event.parent_id,
@@ -146,7 +168,14 @@ impl EventLog for MemoryStore {
             metadata: event.metadata,
             ephemeral: event.ephemeral,
             persistent: event.persistent,
-        });
+        };
+
+        // Broadcast before pushing (clone is cheap — Arc for ephemeral)
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(persisted.clone());
+        }
+
+        log.push(persisted);
 
         Ok(AppendResult { position, version })
     }

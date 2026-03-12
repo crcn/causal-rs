@@ -7,7 +7,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::display::EventDisplay;
-use crate::types::{AdminEvent, EventRow};
+use crate::read_model::StoredEvent;
+use crate::types::AdminEvent;
 
 const DEFAULT_CAPACITY: usize = 500_000;
 
@@ -35,7 +36,7 @@ impl EventCache {
     }
 
     /// Hydrate from Postgres — loads the most recent N events.
-    #[cfg(feature = "broadcast")]
+    #[cfg(feature = "postgres")]
     pub async fn hydrate(
         pool: &sqlx::PgPool,
         capacity: usize,
@@ -43,23 +44,12 @@ impl EventCache {
     ) -> anyhow::Result<Self> {
         let start = std::time::Instant::now();
 
-        let columns = "seq, ts, event_type, payload AS data, id, parent_id, run_id, correlation_id, parent_seq, reactor_id";
-        let query = format!(
-            "SELECT {columns} FROM events ORDER BY seq DESC LIMIT $1"
-        );
-
-        let rows = sqlx::query(&query)
-            .bind(capacity as i64)
-            .fetch_all(pool)
-            .await?;
+        let stored = crate::queries::get_events_from_seq(pool, 0, capacity as i64).await?;
 
         let mut cache = Self::new(capacity);
-
-        // Rows come in DESC order; iterate in reverse to push oldest first.
-        for row in rows.into_iter().rev() {
-            let event_row = row_to_event(&row);
-            let event = Arc::new(AdminEvent::from_row(event_row, display));
-            cache.push_unchecked(event);
+        for event in stored {
+            let admin = Arc::new(event.to_admin_event(display));
+            cache.push_unchecked(admin);
         }
 
         let elapsed = start.elapsed();
@@ -284,23 +274,6 @@ pub fn spawn_cache_listener(
             }
         }
     });
-}
-
-#[cfg(feature = "broadcast")]
-fn row_to_event(row: &sqlx::postgres::PgRow) -> EventRow {
-    use sqlx::Row;
-    EventRow {
-        id: row.get("id"),
-        parent_id: row.get("parent_id"),
-        seq: row.get("seq"),
-        ts: row.get("ts"),
-        event_type: row.get("event_type"),
-        data: row.get::<serde_json::Value, _>("data"),
-        run_id: row.get("run_id"),
-        correlation_id: row.get("correlation_id"),
-        parent_seq: row.get("parent_seq"),
-        reactor_id: row.get("reactor_id"),
-    }
 }
 
 #[cfg(test)]
