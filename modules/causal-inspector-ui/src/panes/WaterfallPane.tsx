@@ -1,6 +1,7 @@
-import { useMemo } from "react";
-import { useSelector } from "../machine";
+import { useMemo, useCallback } from "react";
+import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
+import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent, ReactorOutcome } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,15 @@ export function WaterfallPane() {
   );
   const flowData = useSelector<InspectorState, InspectorEvent[]>((s) => s.flowData);
   const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const logsFilter = useSelector<InspectorState, { reactorId: string | null }>((s) => s.logsFilter);
+  const dispatch = useDispatch<InspectorMachineEvent>();
+
+  const handleBarClick = useCallback(
+    (bar: WaterfallBar) => {
+      dispatch({ type: "ui/handler_selected", payload: { reactorId: bar.reactorId } });
+    },
+    [dispatch],
+  );
 
   const { bars, minMs, maxMs } = useMemo(() => buildBars(outcomes), [outcomes]);
   const rangeMs = maxMs - minMs || 1;
@@ -185,16 +195,24 @@ export function WaterfallPane() {
             ? ((scrubberMs - minMs) / rangeMs) * 100
             : null;
 
+        const isSelected = logsFilter.reactorId === bar.reactorId;
+
         return (
           <div
             key={bar.reactorId}
+            onClick={() => handleBarClick(bar)}
             style={{
               display: "flex",
               alignItems: "center",
               height: ROW_HEIGHT,
               gap: 0,
               opacity: isFuture ? 0.3 : 1,
-              transition: "opacity 150ms",
+              transition: "opacity 150ms, background 100ms",
+              cursor: "pointer",
+              borderRadius: 4,
+              background: isSelected ? "rgba(59,130,246,0.1)" : "transparent",
+              paddingLeft: 4,
+              paddingRight: 4,
             }}
           >
             {/* Label */}

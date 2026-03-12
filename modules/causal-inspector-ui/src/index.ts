@@ -105,4 +105,4 @@ export type { CausalFlowPaneProps } from "./panes/CausalFlowPane";
 export { AggregateTimelinePane } from "./panes/AggregateTimelinePane";
 export { WaterfallPane } from "./panes/WaterfallPane";
 export { CorrelationExplorerPane } from "./panes/CorrelationExplorerPane";
-export { ReactorDependencyMapPane } from "./panes/ReactorDependencyMapPane";
+

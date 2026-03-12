@@ -112,13 +112,12 @@ export type FilterState = {
 
 export type LogsFilter = {
   scope: "reactor" | "correlation";
-  eventId: string | null;
   reactorId: string | null;
   correlationId: string | null;
 };
 
 export type FlowSelection =
-  | { kind: "event-type"; reactorId: string | null; name: string }
+  | { kind: "event-type"; name: string }
   | { kind: "reactor"; reactorId: string }
   | null;
 

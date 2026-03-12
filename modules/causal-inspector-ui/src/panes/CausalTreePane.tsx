@@ -277,8 +277,7 @@ function TreeNode({
 
 function matchesFlowSelection(event: InspectorEvent, sel: FlowSelection): boolean {
   if (!sel) return true;
-  if (sel.kind === "event-type")
-    return event.reactorId === sel.reactorId && event.name === sel.name;
+  if (sel.kind === "event-type") return event.name === sel.name;
   return event.reactorId === sel.reactorId;
 }
 
@@ -306,14 +305,11 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   const treeLoading = selectedSeq != null && causalTree == null;
 
   const onClickReactor = useCallback(
-    (reactorId: string, parentEventId: string) => {
+    (reactorId: string, _parentEventId: string) => {
       if (flowCorrelationId) {
         dispatch({ type: "ui/flow_node_selected", payload: { kind: "reactor", reactorId } });
       }
-      dispatch({
-        type: "ui/logs_filter_changed",
-        payload: { eventId: parentEventId, reactorId, scope: "reactor" },
-      });
+      dispatch({ type: "ui/handler_selected", payload: { reactorId } });
     },
     [flowCorrelationId, dispatch]
   );
@@ -386,7 +382,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
         <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
           <span>
             {flowSelection.kind === "event-type"
-              ? `${flowSelection.name} from ${flowSelection.reactorId ?? "root"}`
+              ? flowSelection.name
               : `outputs of ${flowSelection.reactorId}`}
           </span>
           <button
@@ -409,7 +405,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
         <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
           <span>
             {flowSelection.kind === "event-type"
-              ? `${flowSelection.name} from ${flowSelection.reactorId ?? "root"}`
+              ? flowSelection.name
               : `outputs of ${flowSelection.reactorId}`}
           </span>
           <button

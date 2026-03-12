@@ -95,7 +95,6 @@ export const initialState: InspectorState = {
   logs: [],
   logsFilter: {
     scope: "reactor",
-    eventId: null,
     reactorId: null,
     correlationId: null,
   },

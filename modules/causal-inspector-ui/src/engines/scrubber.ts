@@ -5,6 +5,8 @@ import type { InspectorState } from "../state";
 /**
  * Scrubber playback engine — advances scrubberPosition on a timer
  * when scrubberPlaying is true.
+ *
+ * State-reactive: watches (curr, prev) diffs instead of specific events.
  */
 export const createScrubberEngine: EngineCreator<
   InspectorState,
@@ -50,19 +52,20 @@ export const createScrubberEngine: EngineCreator<
   }
 
   return {
-    handleEvent: (event, currState) => {
-      if (event.type === "ui/scrubber_play_toggled") {
-        if (currState.scrubberPlaying) {
-          start();
-        } else {
-          stop();
-        }
+    handleEvent: (_event, curr, prev) => {
+      // Playing state changed
+      if (curr.scrubberPlaying !== prev.scrubberPlaying) {
+        if (curr.scrubberPlaying) start();
+        else stop();
       }
-      if (event.type === "ui/scrubber_speed_changed" && currState.scrubberPlaying) {
-        // Restart timer with new speed
+
+      // Speed changed while playing → restart with new interval
+      if (curr.scrubberSpeed !== prev.scrubberSpeed && curr.scrubberPlaying) {
         start();
       }
-      if (event.type === "ui/flow_opened" || event.type === "ui/flow_closed") {
+
+      // Flow changed → stop playback
+      if (curr.flowCorrelationId !== prev.flowCorrelationId) {
         stop();
       }
     },

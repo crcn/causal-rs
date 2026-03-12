@@ -25,13 +25,13 @@ import { Filter, Play, Pause, SkipBack, SkipForward, ChevronsRight, RotateCcw } 
 // ---------------------------------------------------------------------------
 
 type FlowNodeData =
-  | { nodeKind: "event-type"; reactorId: string | null; eventName: string; label: string }
+  | { nodeKind: "event-type"; eventName: string; label: string }
   | { nodeKind: "reactor"; reactorId: string; label: string; blocks?: Block[]; outcome?: ReactorOutcome };
 
 /* eslint-disable-next-line @typescript-eslint/no-redeclare -- shadowing the tree-pane ReactorNode on purpose */
 
-const NODE_WIDTH = 200;
-const NODE_HEIGHT = 50;
+const NODE_WIDTH = 180;
+const NODE_HEIGHT = 36;
 const REACTOR_WIDTH = 180;
 const REACTOR_HEIGHT = 36;
 
@@ -135,7 +135,7 @@ const ReactorNode = memo(({ data }: NodeProps) => {
       fontStyle: "italic",
       animation: isRunning ? "pulse 2s ease-in-out infinite" : undefined,
     }}>
-      <Handle type="target" position={Position.Top} style={{ visibility: "hidden" }} />
+      <Handle type="target" position={Position.Left} style={{ visibility: "hidden" }} />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>{d.label}</span>
         {duration && <span style={{ fontSize: 9, color: "#71717a", fontStyle: "normal", whiteSpace: "nowrap", flexShrink: 0 }}>{duration}</span>}
@@ -144,7 +144,7 @@ const ReactorNode = memo(({ data }: NodeProps) => {
       {outcome?.status === "error" && outcome.error && (
         <div style={{ fontSize: 9, color: "#ef4444", marginTop: 4 }}>{outcome.error}</div>
       )}
-      <Handle type="source" position={Position.Bottom} style={{ visibility: "hidden" }} />
+      <Handle type="source" position={Position.Right} style={{ visibility: "hidden" }} />
     </div>
   );
 });
@@ -166,9 +166,9 @@ const EventNode = memo(({ data }: NodeProps) => {
       direction: "rtl",
       textAlign: "left",
     }}>
-      <Handle type="target" position={Position.Top} style={{ visibility: "hidden" }} />
+      <Handle type="target" position={Position.Left} style={{ visibility: "hidden" }} />
       {d.label}
-      <Handle type="source" position={Position.Bottom} style={{ visibility: "hidden" }} />
+      <Handle type="source" position={Position.Right} style={{ visibility: "hidden" }} />
     </div>
   );
 });
@@ -187,14 +187,14 @@ function buildFlowGraph(
   outcomes?: Map<string, ReactorOutcome>,
   hiddenReactors?: Set<string>,
 ): FlowGraph {
+  // Group events by type name only (merge across reactors)
   const eventGroups = new Map<string, { name: string; count: number; events: InspectorEvent[] }>();
   const reactorIds = new Set<string>();
   const parentToReactor = new Map<string, Set<string>>();
-  const reactorToChildren = new Map<string, Set<string>>();
+  const reactorToChildTypes = new Map<string, Set<string>>();
 
   for (const evt of events) {
-    const reactor = evt.reactorId ?? "__root__";
-    const groupKey = `${reactor}::${evt.name}`;
+    const groupKey = evt.name;
 
     const group = eventGroups.get(groupKey);
     if (group) {
@@ -206,9 +206,9 @@ function buildFlowGraph(
 
     if (evt.reactorId) {
       reactorIds.add(evt.reactorId);
-      const children = reactorToChildren.get(evt.reactorId) ?? new Set();
+      const children = reactorToChildTypes.get(evt.reactorId) ?? new Set();
       children.add(groupKey);
-      reactorToChildren.set(evt.reactorId, children);
+      reactorToChildTypes.set(evt.reactorId, children);
     }
 
     if (evt.parentId && evt.reactorId) {
@@ -229,22 +229,23 @@ function buildFlowGraph(
   const edges: Edge[] = [];
   const edgeSet = new Set<string>();
 
-  // Event-type nodes
+  // Event-type nodes (one per event name)
   for (const [groupKey, group] of eventGroups) {
-    const emittingReactor = group.events[0]?.reactorId;
-    if (emittingReactor && hiddenReactors?.has(emittingReactor)) continue;
+    // Skip if ALL emitting reactors are hidden
+    const emittingReactors = new Set(group.events.map((e) => e.reactorId).filter(Boolean));
+    if (emittingReactors.size > 0 && hiddenReactors && [...emittingReactors].every((r) => hiddenReactors.has(r!))) continue;
+
     nodes.push({
       id: `evt:${groupKey}`,
       type: "event",
       position: { x: 0, y: 0 },
       data: {
-        label: `${group.name} (${group.count})`,
+        label: group.count > 1 ? `${group.name} (${group.count})` : group.name,
         nodeKind: "event-type" as const,
-        reactorId: group.events[0]?.reactorId ?? null,
         eventName: group.name,
       },
-      sourcePosition: Position.Bottom,
-      targetPosition: Position.Top,
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
     });
   }
 
@@ -258,14 +259,14 @@ function buildFlowGraph(
       type: "reactor",
       position: { x: 0, y: 0 },
       data: { label: reactorId, nodeKind: "reactor" as const, reactorId, blocks, outcome },
-      sourcePosition: Position.Bottom,
-      targetPosition: Position.Top,
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
     });
   }
 
   const arrowMarker = { type: MarkerType.ArrowClosed, color: "#52525b", width: 16, height: 16 };
 
-  // Edges: event group -> reactor
+  // Edges: event type -> reactor (event triggers reactor)
   for (const [parentId, reactors] of parentToReactor) {
     const sourceGroupKey = eventIdToGroup.get(parentId);
     if (!sourceGroupKey) continue;
@@ -285,46 +286,20 @@ function buildFlowGraph(
     }
   }
 
-  // Edges: reactor -> child event groups
-  for (const [reactorId, childGroupKeys] of reactorToChildren) {
+  // Edges: reactor -> child event types (reactor produces events)
+  for (const [reactorId, childTypes] of reactorToChildTypes) {
     if (hiddenReactors?.has(reactorId)) continue;
-    for (const groupKey of childGroupKeys) {
-      const edgeKey = `hdl:${reactorId}->evt:${groupKey}`;
+    for (const typeName of childTypes) {
+      const edgeKey = `hdl:${reactorId}->evt:${typeName}`;
       if (!edgeSet.has(edgeKey)) {
         edgeSet.add(edgeKey);
-        const count = eventGroups.get(groupKey)?.count ?? 0;
         edges.push({
           id: edgeKey,
           source: `hdl:${reactorId}`,
-          target: `evt:${groupKey}`,
+          target: `evt:${typeName}`,
           style: { stroke: "#52525b", strokeWidth: 1 },
           markerEnd: arrowMarker,
-          ...(count > 1 ? { label: `x${count}`, labelStyle: { fontSize: 9, fill: "#71717a" } } : {}),
         });
-      }
-    }
-  }
-
-  // Root events -> reactor edges
-  for (const [groupKey, group] of eventGroups) {
-    if (group.events[0]?.reactorId) continue;
-    for (const evt of group.events) {
-      if (!evt.id) continue;
-      const reactors = parentToReactor.get(evt.id);
-      if (!reactors) continue;
-      for (const reactorId of reactors) {
-        if (hiddenReactors?.has(reactorId)) continue;
-        const edgeKey = `evt:${groupKey}->hdl:${reactorId}`;
-        if (!edgeSet.has(edgeKey)) {
-          edgeSet.add(edgeKey);
-          edges.push({
-            id: edgeKey,
-            source: `evt:${groupKey}`,
-            target: `hdl:${reactorId}`,
-            style: { stroke: "#52525b", strokeWidth: 1 },
-            markerEnd: arrowMarker,
-          });
-        }
       }
     }
   }
@@ -390,7 +365,7 @@ function estimateReactorHeight(data: FlowNodeData): number {
 function layoutGraph(nodes: Node[], edges: Edge[]): FlowGraph {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({ rankdir: "TB", ranksep: 60, nodesep: 30 });
+  g.setGraph({ rankdir: "LR", nodesep: 40, ranksep: 80 });
 
   const heights = new Map<string, number>();
   for (const node of nodes) {
@@ -435,24 +410,18 @@ function computeVisibleIds(
   const nodeIds = new Set<string>();
   const edgeIds = new Set<string>();
 
-  const eventGroups = new Map<string, { events: InspectorEvent[] }>();
   const eventIdToGroup = new Map<string, string>();
+  const seenTypes = new Set<string>();
 
   for (const evt of visible) {
-    const reactor = evt.reactorId ?? "__root__";
-    const groupKey = `${reactor}::${evt.name}`;
-    const group = eventGroups.get(groupKey);
-    if (group) {
-      group.events.push(evt);
-    } else {
-      eventGroups.set(groupKey, { events: [evt] });
-    }
+    const groupKey = evt.name;
+    seenTypes.add(groupKey);
     if (evt.id) eventIdToGroup.set(evt.id, groupKey);
   }
 
   // Event-type nodes
-  for (const groupKey of eventGroups.keys()) {
-    nodeIds.add(`evt:${groupKey}`);
+  for (const typeName of seenTypes) {
+    nodeIds.add(`evt:${typeName}`);
   }
 
   // Reactor nodes + edges
@@ -460,9 +429,8 @@ function computeVisibleIds(
     if (evt.reactorId) {
       nodeIds.add(`hdl:${evt.reactorId}`);
 
-      // Reactor -> child event group edge
-      const groupKey = `${evt.reactorId}::${evt.name}`;
-      edgeIds.add(`hdl:${evt.reactorId}->evt:${groupKey}`);
+      // Reactor -> child event type edge
+      edgeIds.add(`hdl:${evt.reactorId}->evt:${evt.name}`);
     }
 
     // Parent event -> reactor edge
@@ -473,7 +441,7 @@ function computeVisibleIds(
       }
     }
 
-    // Root event -> reactor edges (check if any visible event uses this as parent)
+    // Root event -> reactor edges
     if (!evt.reactorId && evt.id) {
       for (const child of visible) {
         if (child.parentId === evt.id && child.reactorId) {
@@ -633,8 +601,7 @@ function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: Inspec
     const evt = flowData.find(e => e.seq === selectedSeq);
     if (!evt) return;
 
-    const reactor = evt.reactorId ?? "__root__";
-    const nodeId = `evt:${reactor}::${evt.name}`;
+    const nodeId = `evt:${evt.name}`;
     const node = nodesRef.current.find(n => n.id === nodeId);
     if (!node) return;
 
@@ -825,8 +792,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
   const selectedNodeId = useMemo(() => {
     if (!flowSelection) return null;
     if (flowSelection.kind === "reactor") return `hdl:${flowSelection.reactorId}`;
-    const reactor = flowSelection.reactorId ?? "__root__";
-    return `evt:${reactor}::${flowSelection.name}`;
+    return `evt:${flowSelection.name}`;
   }, [flowSelection]);
 
   // Walk causal chain for highlighting
@@ -885,42 +851,17 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
     [rawEdges, causalNodeIds],
   );
 
-  const syncTree = useCallback((d: FlowNodeData) => {
-    if (!flowData.length) return;
-    const match = d.nodeKind === "event-type"
-      ? flowData.find(e => e.reactorId === d.reactorId && e.name === d.eventName)
-      : flowData.find(e => e.reactorId === d.reactorId);
-    if (match) {
-      dispatch({ type: "ui/event_selected", payload: { seq: match.seq } });
-    }
-  }, [flowData, dispatch]);
-
-  const openLogsForReactor = useCallback((reactorId: string) => {
-    const evt = flowData.find(e => e.reactorId === reactorId && e.parentId);
-    if (evt) {
-      dispatch({
-        type: "ui/logs_filter_changed",
-        payload: { eventId: evt.parentId!, reactorId, correlationId: evt.correlationId, scope: "reactor" },
-      });
-    }
-  }, [flowData, dispatch]);
-
   const onNodeClick = useCallback((_event: React.MouseEvent, node: Node) => {
     const d = node.data as FlowNodeData;
 
     if (d.nodeKind === "event-type") {
-      if (
-        flowSelection?.kind === "event-type" &&
-        flowSelection.reactorId === d.reactorId &&
-        flowSelection.name === d.eventName
-      ) {
+      if (flowSelection?.kind === "event-type" && flowSelection.name === d.eventName) {
         dispatch({ type: "ui/flow_node_selected", payload: null });
       } else {
         dispatch({
           type: "ui/flow_node_selected",
-          payload: { kind: "event-type", reactorId: d.reactorId, name: d.eventName },
+          payload: { kind: "event-type", name: d.eventName },
         });
-        syncTree(d);
       }
     } else if (d.nodeKind === "reactor") {
       if (flowSelection?.kind === "reactor" && flowSelection.reactorId === d.reactorId) {
@@ -930,11 +871,10 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           type: "ui/flow_node_selected",
           payload: { kind: "reactor", reactorId: d.reactorId },
         });
-        syncTree(d);
-        openLogsForReactor(d.reactorId);
+        dispatch({ type: "ui/handler_selected", payload: { reactorId: d.reactorId } });
       }
     }
-  }, [flowSelection, dispatch, syncTree, openLogsForReactor]);
+  }, [flowSelection, dispatch]);
 
   const onPaneClick = useCallback(() => {
     dispatch({ type: "ui/flow_node_selected", payload: null });
@@ -1000,6 +940,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
+          defaultEdgeOptions={{ type: "smoothstep" }}
           onNodesChange={onNodesChange}
           onNodeClick={onNodeClick}
           onPaneClick={onPaneClick}

@@ -5,6 +5,7 @@ import { createSubscriptionEngine, type SubscriptionTransport } from "./subscrip
 import { createQueryEngine, type QueryTransport } from "./query";
 import { createStorageEngine, type StorageTransport } from "./storage";
 import { createScrubberEngine } from "./scrubber";
+import { createUrlEngine } from "./url";
 
 export type { SubscriptionTransport } from "./subscription";
 export type { QueryTransport } from "./query";
@@ -13,6 +14,7 @@ export { createSubscriptionEngine } from "./subscription";
 export { createQueryEngine } from "./query";
 export { createStorageEngine } from "./storage";
 export { createScrubberEngine } from "./scrubber";
+export { createUrlEngine } from "./url";
 
 export type InspectorTransport = SubscriptionTransport & QueryTransport;
 
@@ -27,6 +29,7 @@ export const createInspectorEngine = (
   storage?: StorageTransport
 ): EngineCreator<InspectorState, InspectorMachineEvent> => {
   const engines: EngineCreator<InspectorState, InspectorMachineEvent>[] = [
+    createUrlEngine,
     createSubscriptionEngine(transport),
     createQueryEngine(transport),
     createScrubberEngine,

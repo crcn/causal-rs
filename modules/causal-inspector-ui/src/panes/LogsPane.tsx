@@ -1,7 +1,6 @@
 import { useState, useMemo } from "react";
-import { useSelector, useDispatch } from "../machine";
+import { useSelector } from "../machine";
 import type { InspectorState } from "../state";
-import type { InspectorMachineEvent } from "../events";
 import type { ReactorLog, LogsFilter } from "../types";
 import { LOG_LEVEL_COLORS } from "../theme";
 import { formatTs } from "../utils";
@@ -62,13 +61,12 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   const logsFilter = useSelector<InspectorState, LogsFilter>((s) => s.logsFilter);
   const flowData = useSelector<InspectorState, InspectorState["flowData"]>((s) => s.flowData);
   const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
-  const dispatch = useDispatch<InspectorMachineEvent>();
 
   const [levelFilter, setLevelFilter] = useState<Set<string>>(new Set(["debug", "info", "warn"]));
   const [searchText, setSearchText] = useState("");
 
   const isCorrelationScope = logsFilter.scope === "correlation" && logsFilter.correlationId != null;
-  const hasFilter = logsFilter.eventId != null || logsFilter.reactorId != null || isCorrelationScope;
+  const hasFilter = logsFilter.reactorId != null || isCorrelationScope;
 
   // Set of event IDs visible at current scrubber position
   const visibleEventIds = useMemo(() => {
@@ -81,6 +79,10 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   // Client-side filtering
   const filteredLogs = useMemo(() => {
     let filtered = logs.filter((l) => levelFilter.has(l.level));
+    // Filter by reactor when handler is selected
+    if (logsFilter.scope === "reactor" && logsFilter.reactorId) {
+      filtered = filtered.filter((l) => l.reactorId === logsFilter.reactorId);
+    }
     if (visibleEventIds != null) {
       filtered = filtered.filter((l) => visibleEventIds.has(l.eventId));
     }
@@ -94,7 +96,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
       );
     }
     return filtered;
-  }, [logs, levelFilter, searchText, visibleEventIds]);
+  }, [logs, logsFilter, levelFilter, searchText, visibleEventIds]);
 
   if (!hasFilter) {
     return (
@@ -117,24 +119,6 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
     <div className="h-full flex flex-col">
       {/* Toolbar */}
       <div className="px-3 py-2 border-b border-border flex items-center gap-3 flex-wrap">
-        {/* Scope toggle */}
-        <div className="flex items-center gap-1 text-[11px]">
-          <button
-            onClick={() => dispatch({ type: "ui/logs_filter_changed", payload: { scope: "reactor" } })}
-            className={`px-2 py-0.5 rounded ${logsFilter.scope === "reactor" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-          >
-            This reactor
-          </button>
-          {logsFilter.correlationId && (
-            <button
-              onClick={() => dispatch({ type: "ui/logs_filter_changed", payload: { scope: "correlation" } })}
-              className={`px-2 py-0.5 rounded ${logsFilter.scope === "correlation" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-            >
-              This correlation
-            </button>
-          )}
-        </div>
-
         {/* Level filters */}
         <div className="flex items-center gap-1 text-[10px]">
           {["debug", "info", "warn"].map((level) => (

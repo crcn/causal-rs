@@ -3,6 +3,53 @@ import type { Reducer } from "./machine";
 import type { InspectorMachineEvent } from "./events";
 import type { InspectorState } from "./state";
 
+/**
+ * Shared navigation logic used by both user-initiated facts
+ * (ui/flow_opened, ui/handler_selected) and browser-initiated
+ * navigation (location/changed from popstate).
+ */
+function applyNavigation(
+  draft: Draft<InspectorState>,
+  correlationId: string | null,
+  handler: string | null,
+) {
+  // Correlation changed → reset flow state
+  if (correlationId !== draft.flowCorrelationId) {
+    if (correlationId) {
+      draft.flowCorrelationId = correlationId;
+      draft.flowData = [];
+      draft.flowSelection = null;
+      draft.scrubberPosition = null;
+      draft.scrubberPlaying = false;
+      draft.logsFilter = {
+        scope: "correlation",
+        reactorId: null,
+        correlationId,
+      };
+    } else {
+      draft.flowCorrelationId = null;
+      draft.flowData = [];
+      draft.flowSelection = null;
+      draft.scrubberPosition = null;
+      draft.scrubberPlaying = false;
+      draft.logsFilter = {
+        scope: "reactor",
+        reactorId: null,
+        correlationId: null,
+      };
+    }
+  }
+
+  // Handler changed → update logs filter
+  if (handler && handler !== draft.logsFilter.reactorId) {
+    draft.logsFilter = {
+      scope: "reactor",
+      reactorId: handler,
+      correlationId: draft.flowCorrelationId,
+    };
+  }
+}
+
 export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
   draft: Draft<InspectorState>,
   event: InspectorMachineEvent
@@ -93,6 +140,21 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.aggregateLifecycle = event.payload.entries;
       break;
 
+    // ── Navigation (user facts + browser popstate) ──
+
+    case "ui/flow_opened":
+      applyNavigation(draft, event.payload.correlationId, null);
+      break;
+    case "ui/flow_closed":
+      applyNavigation(draft, null, null);
+      break;
+    case "ui/handler_selected":
+      applyNavigation(draft, draft.flowCorrelationId, event.payload.reactorId);
+      break;
+    case "location/changed":
+      applyNavigation(draft, event.payload.correlationId, event.payload.handler);
+      break;
+
     // ── UI ──
 
     case "ui/event_selected":
@@ -102,35 +164,11 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.selectedSeq = null;
       draft.causalTree = null;
       break;
-    case "ui/flow_opened":
-      draft.flowCorrelationId = event.payload.correlationId;
-      draft.flowData = [];
-      draft.flowSelection = null;
-      draft.scrubberPosition = null;
-      draft.scrubberPlaying = false;
-      // Auto-show logs for this correlation
-      draft.logsFilter = {
-        scope: "correlation",
-        eventId: null,
-        reactorId: null,
-        correlationId: event.payload.correlationId,
-      };
-      break;
-    case "ui/flow_closed":
-      draft.flowCorrelationId = null;
-      draft.flowData = [];
-      draft.flowSelection = null;
-      draft.scrubberPosition = null;
-      draft.scrubberPlaying = false;
-      break;
     case "ui/flow_node_selected":
       draft.flowSelection = event.payload;
       break;
     case "ui/filter_changed":
       Object.assign(draft.filters, event.payload);
-      break;
-    case "ui/logs_filter_changed":
-      Object.assign(draft.logsFilter, event.payload);
       break;
     case "ui/load_more_requested":
       draft.loading = true;

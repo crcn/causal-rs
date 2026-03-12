@@ -13,7 +13,6 @@ import type {
   ReactorDescriptionSnapshot,
   AggregateTimelineEntry,
   ReactorOutcome,
-  LogsFilter,
 } from "../types";
 import {
   INSPECTOR_EVENTS,
@@ -23,7 +22,6 @@ import {
   INSPECTOR_REACTOR_DEPENDENCIES,
   INSPECTOR_AGGREGATE_KEYS,
   INSPECTOR_AGGREGATE_LIFECYCLE,
-  INSPECTOR_REACTOR_LOGS,
   INSPECTOR_REACTOR_LOGS_BY_CORRELATION,
   INSPECTOR_REACTOR_DESCRIPTIONS,
   INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS,
@@ -40,20 +38,17 @@ export type QueryTransport = {
 };
 
 /**
- * Query engine — fetches data on demand in response to UI events.
+ * Query engine — fetches data in response to state transitions.
  *
- * Reacts to:
- * - `ui/load_more_requested` → fetch next page of events
- * - `ui/event_selected` → fetch causal tree
- * - `ui/flow_opened` → fetch flow data + start polling descriptions/outcomes
- * - `ui/flow_closed` → stop polling
- * - `ui/filter_changed` → refetch events
+ * State-reactive: watches (curr, prev) diffs for navigation state.
+ * Event-reactive: handles explicit requests (load_more, filter_changed, etc.).
  */
 export const createQueryEngine = (
   transport: QueryTransport
 ): EngineCreator<InspectorState, InspectorMachineEvent> => {
   return (dispatch, getState) => {
     let flowPollTimer: ReturnType<typeof setInterval> | null = null;
+    let correlationPollTimer: ReturnType<typeof setInterval> | null = null;
     // Stale-response guards
     let activeCausalSeq: number | null = null;
     let activeFlowCorrelationId: string | null = null;
@@ -173,19 +168,12 @@ export const createQueryEngine = (
       }
     };
 
-    const fetchLogs = async (filter: LogsFilter) => {
+    const fetchLogs = async (correlationId: string) => {
       try {
-        if (filter.scope === "correlation" && filter.correlationId) {
-          const data = await transport.query<{
-            inspectorReactorLogsByCorrelation: ReactorLog[];
-          }>(INSPECTOR_REACTOR_LOGS_BY_CORRELATION, { correlationId: filter.correlationId });
-          dispatch({ type: "events/logs_loaded", payload: data.inspectorReactorLogsByCorrelation });
-        } else if (filter.eventId && filter.reactorId) {
-          const data = await transport.query<{
-            inspectorReactorLogs: ReactorLog[];
-          }>(INSPECTOR_REACTOR_LOGS, { eventId: filter.eventId, reactorId: filter.reactorId });
-          dispatch({ type: "events/logs_loaded", payload: data.inspectorReactorLogs });
-        }
+        const data = await transport.query<{
+          inspectorReactorLogsByCorrelation: ReactorLog[];
+        }>(INSPECTOR_REACTOR_LOGS_BY_CORRELATION, { correlationId });
+        dispatch({ type: "events/logs_loaded", payload: data.inspectorReactorLogsByCorrelation });
       } catch (e) {
         console.error("[causal-inspector] fetch logs failed:", e);
       }
@@ -260,16 +248,38 @@ export const createQueryEngine = (
       }
     };
 
+    const stopCorrelationPolling = () => {
+      if (correlationPollTimer) {
+        clearInterval(correlationPollTimer);
+        correlationPollTimer = null;
+      }
+    };
+
     // Initial load
     fetchEvents();
     fetchCorrelations();
     fetchReactorDependencies();
     fetchAggregateKeys();
 
-    let correlationPollTimer: ReturnType<typeof setInterval> | null = null;
-
     return {
       handleEvent: (event, curr, prev) => {
+        // ── State-reactive: navigation transitions ──
+
+        if (curr.flowCorrelationId !== prev.flowCorrelationId) {
+          if (curr.flowCorrelationId) {
+            // Flow opened
+            fetchFlow(curr.flowCorrelationId);
+            startFlowPolling(curr.flowCorrelationId);
+            fetchLogs(curr.flowCorrelationId);
+            stopCorrelationPolling();
+          } else {
+            // Flow closed
+            stopFlowPolling();
+          }
+        }
+
+        // ── Event-reactive: explicit user requests ──
+
         switch (event.type) {
           case "ui/load_more_requested":
             fetchEvents();
@@ -279,20 +289,7 @@ export const createQueryEngine = (
             fetchCausalTree(event.payload.seq);
             break;
 
-          case "ui/flow_opened": {
-            const correlationId = event.payload.correlationId;
-            fetchFlow(correlationId);
-            startFlowPolling(correlationId);
-            fetchLogs(curr.logsFilter);
-            break;
-          }
-
-          case "ui/flow_closed":
-            stopFlowPolling();
-            break;
-
           case "ui/filter_changed":
-            // Clear existing events and refetch
             dispatch({
               type: "events/page_loaded",
               payload: { events: [], hasMore: true },
@@ -300,14 +297,9 @@ export const createQueryEngine = (
             fetchEvents();
             break;
 
-          case "ui/logs_filter_changed":
-            fetchLogs(curr.logsFilter);
-            break;
-
           case "ui/correlations_requested":
             fetchCorrelations(event.payload.search);
-            // Start polling
-            if (correlationPollTimer) clearInterval(correlationPollTimer);
+            stopCorrelationPolling();
             correlationPollTimer = setInterval(() => fetchCorrelations(event.payload.search), 5000);
             break;
 
@@ -318,7 +310,7 @@ export const createQueryEngine = (
       },
       dispose: () => {
         stopFlowPolling();
-        if (correlationPollTimer) clearInterval(correlationPollTimer);
+        stopCorrelationPolling();
       },
     };
   };

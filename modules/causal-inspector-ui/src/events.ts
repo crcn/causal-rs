@@ -11,7 +11,6 @@ import type {
   AggregateTimelineEntry,
   ReactorLog,
   ReactorOutcome,
-  LogsFilter,
   PaneLayout,
 } from "./types";
 
@@ -62,14 +61,15 @@ type FlowOpened = BaseEvent<"ui/flow_opened", { correlationId: string }>;
 type FlowClosed = BaseEvent<"ui/flow_closed">;
 type FlowNodeSelected = BaseEvent<"ui/flow_node_selected", FlowSelection>;
 type FilterChanged = BaseEvent<"ui/filter_changed", Partial<FilterState>>;
-type LogsFilterChanged = BaseEvent<"ui/logs_filter_changed", Partial<LogsFilter>>;
 type LoadMoreRequested = BaseEvent<"ui/load_more_requested">;
 type LayoutChanged = BaseEvent<"ui/layout_changed", PaneLayout>;
 type ScrubberMoved = BaseEvent<"ui/scrubber_moved", { position: number | null }>;
 type ScrubberPlayToggled = BaseEvent<"ui/scrubber_play_toggled">;
 type ScrubberSpeedChanged = BaseEvent<"ui/scrubber_speed_changed", { speed: number }>;
 type CorrelationsRequested = BaseEvent<"ui/correlations_requested", { search?: string }>;
+type HandlerSelected = BaseEvent<"ui/handler_selected", { reactorId: string }>;
 type AggregateLifecycleRequested = BaseEvent<"ui/aggregate_lifecycle_requested", { aggregateKey: string }>;
+type LocationChanged = BaseEvent<"location/changed", { correlationId: string | null; handler: string | null }>;
 
 // ── Union ──
 
@@ -92,7 +92,6 @@ export type InspectorMachineEvent =
   | FlowClosed
   | FlowNodeSelected
   | FilterChanged
-  | LogsFilterChanged
   | LoadMoreRequested
   | LayoutChanged
   | ScrubberMoved
@@ -101,5 +100,7 @@ export type InspectorMachineEvent =
   | CorrelationsRequested
   | ReactorDependenciesLoaded
   | AggregateKeysLoaded
+  | HandlerSelected
+  | LocationChanged
   | AggregateLifecycleLoaded
   | AggregateLifecycleRequested;
