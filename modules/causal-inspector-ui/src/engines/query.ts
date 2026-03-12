@@ -305,10 +305,6 @@ export const createQueryEngine = (
             break;
 
           case "ui/filter_changed":
-            dispatch({
-              type: "events/page_loaded",
-              payload: { events: [], hasMore: true },
-            });
             fetchEvents();
             break;
 

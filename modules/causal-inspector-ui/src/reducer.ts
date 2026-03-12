@@ -160,6 +160,7 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       break;
     case "location/changed":
       applyNavigation(draft, event.payload.correlationId, event.payload.handler);
+      draft.filters.correlationId = event.payload.correlationId;
       break;
 
     // ── UI ──

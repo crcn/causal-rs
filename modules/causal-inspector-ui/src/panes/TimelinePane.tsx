@@ -130,7 +130,10 @@ export type TimelinePaneProps = {
 };
 
 export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
-  const events = useSelector<InspectorState, InspectorEvent[]>((s) => s.events);
+  const events = useSelector<InspectorState, InspectorEvent[]>((s) => {
+    const cid = s.filters.correlationId;
+    return cid ? s.events.filter((e) => e.correlationId === cid) : s.events;
+  });
   const loading = useSelector<InspectorState, boolean>((s) => s.loading);
   const hasMore = useSelector<InspectorState, boolean>((s) => s.hasMore);
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);

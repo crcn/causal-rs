@@ -23,7 +23,7 @@ function buildSearch(correlationId: string | null, handler: string | null): stri
   else params.delete("handler");
 
   const search = params.toString();
-  return search ? `?${search}` : window.location.pathname;
+  return search ? `${window.location.pathname}?${search}` : window.location.pathname;
 }
 
 /**
@@ -62,6 +62,13 @@ export const createUrlEngine: EngineCreator<InspectorState, InspectorMachineEven
         case "ui/flow_closed":
           window.history.pushState(null, "", buildSearch(null, null));
           break;
+        case "ui/filter_changed": {
+          const payload = event.payload as Partial<{ correlationId: string | null }>;
+          if (payload.correlationId !== undefined) {
+            window.history.pushState(null, "", buildSearch(payload.correlationId, null));
+          }
+          break;
+        }
         case "ui/handler_selected":
           // Replace rather than push — handler changes within a flow are fine as one history entry
           window.history.replaceState(
