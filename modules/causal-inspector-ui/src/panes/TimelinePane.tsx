@@ -5,7 +5,7 @@ import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent } from "../types";
 import { FilterBar } from "../components/FilterBar";
 import { CopyablePayload } from "../components/CopyablePayload";
-import { eventTextColor } from "../theme";
+import { eventTextColor, eventBg, eventBorder } from "../theme";
 import { formatTs, compactPayload } from "../utils";
 import { Search, ChevronRight, ChevronDown } from "lucide-react";
 
@@ -28,43 +28,51 @@ function EventRow({
 
   return (
     <div
-      className={`group w-full text-left px-3 py-2 border-b border-border hover:bg-accent/30 transition-colors ${
-        isSelected ? "bg-accent/50 ring-1 ring-blue-500/50" : ""
+      className={`group w-full text-left px-3 py-2 border-b border-border transition-all duration-150 ${
+        isSelected
+          ? "bg-indigo-500/15"
+          : "hover:bg-white/[0.02]"
       }`}
       style={indent ? { paddingLeft: 28 } : undefined}
     >
       <div onClick={onClick} role="button" tabIndex={0} className="w-full text-left cursor-pointer">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-[10px] font-mono text-muted-foreground w-12 shrink-0 text-right">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span className="text-[10px] font-mono text-muted-foreground/60 w-10 shrink-0 text-right tabular-nums">
             {event.seq}
           </span>
-          <span className="text-[10px] text-muted-foreground shrink-0 w-32">
+          <span className="text-[10px] text-muted-foreground/70 shrink-0 w-32 tabular-nums">
             {formatTs(event.ts)}
           </span>
           {event.correlationId && (
             <button
               onClick={(e) => { e.stopPropagation(); onFilterCorrelation(event.correlationId!); }}
-              className="px-1 py-0.5 rounded text-[10px] font-mono bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 shrink-0 transition-colors"
+              className="px-1.5 py-0.5 rounded-full text-[9px] font-mono bg-purple-500/8 text-purple-400/80 hover:bg-purple-500/15 hover:text-purple-400 shrink-0 transition-all border border-purple-500/10"
               title={`Filter by correlation ${event.correlationId}`}
             >
               {event.correlationId.slice(0, 8)}
             </button>
           )}
-          <span className="text-xs font-mono shrink-0" style={{ color: eventTextColor(event.name) }}>
+          <span
+            className="text-xs font-mono shrink-0 px-1.5 py-0.5 rounded"
+            style={{
+              color: eventTextColor(event.name),
+              background: eventBg(event.name),
+            }}
+          >
             {event.name}
           </span>
           <button
             onClick={(e) => { e.stopPropagation(); setPayloadOpen((v) => !v); }}
-            className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground hover:text-foreground truncate text-left min-w-0"
+            className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground/60 hover:text-muted-foreground truncate text-left min-w-0 transition-colors"
             title="Click to expand payload"
           >
-            <ChevronRight size={10} className={`shrink-0 transition-transform ${payloadOpen ? "rotate-90" : ""}`} />
+            <ChevronRight size={10} className={`shrink-0 transition-transform duration-150 ${payloadOpen ? "rotate-90" : ""}`} />
             <span className="truncate">{event.summary ?? compactPayload(event.payload)}</span>
           </button>
           {onInvestigate && (
             <button
               onClick={(e) => { e.stopPropagation(); onInvestigate(); }}
-              className="opacity-0 group-hover:opacity-100 transition-opacity ml-auto p-1 rounded hover:bg-accent shrink-0 text-muted-foreground"
+              className="opacity-0 group-hover:opacity-100 transition-opacity duration-150 ml-auto p-1 rounded-md hover:bg-white/[0.05] shrink-0 text-muted-foreground"
               title="Investigate"
             >
               <Search size={12} />
@@ -73,7 +81,7 @@ function EventRow({
         </div>
       </div>
       {payloadOpen && (
-        <CopyablePayload payload={event.payload} className="mt-1 ml-14 max-h-64" />
+        <CopyablePayload payload={event.payload} className="mt-2 ml-12 max-h-64" />
       )}
     </div>
   );
@@ -151,7 +159,7 @@ function EventGroupRow({
       <div className="relative">
         <button
           onClick={onToggle}
-          className="absolute left-1 top-2.5 z-10 p-0.5 rounded hover:bg-accent text-muted-foreground"
+          className="absolute left-1 top-2.5 z-10 p-0.5 rounded hover:bg-white/[0.05] text-muted-foreground/60 hover:text-muted-foreground transition-colors"
           title={collapsed ? "Expand group" : "Collapse group"}
         >
           {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
@@ -166,7 +174,7 @@ function EventGroupRow({
           />
           {collapsed && (
             <span
-              className="absolute right-3 top-2.5 text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-700/50 text-zinc-400"
+              className="absolute right-3 top-2.5 text-[9px] font-mono px-1.5 py-0.5 rounded-full bg-white/[0.04] text-muted-foreground/60 border border-border"
             >
               +{group.children.length}
             </span>
@@ -208,8 +216,13 @@ function InfiniteScrollSentinel({ onVisible, loading }: { onVisible: () => void;
   }, []);
 
   return (
-    <div ref={ref} className="flex items-center justify-center py-3">
-      {loading && <span className="text-[10px] text-muted-foreground">Loading...</span>}
+    <div ref={ref} className="flex items-center justify-center py-4">
+      {loading && (
+        <div className="flex items-center gap-2">
+          <div className="w-1.5 h-1.5 rounded-full bg-indigo-500/50 animate-pulse" />
+          <span className="text-[10px] text-muted-foreground/60">Loading</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -265,17 +278,17 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
     <div className="flex flex-col h-full">
       <FilterBar />
       {loading && events.length === 0 ? (
-        <div className="animate-pulse">
+        <div className="animate-pulse p-1">
           {Array.from({ length: 12 }).map((_, i) => (
-            <div key={i} className="flex items-center gap-2 px-3 py-2 border-b border-border">
-              <div className="h-3 w-12 bg-muted rounded shrink-0" />
-              <div className="h-3 w-32 bg-muted rounded shrink-0" />
-              <div className="h-3 bg-muted rounded flex-1" style={{ maxWidth: `${150 + (i * 37) % 200}px` }} />
+            <div key={i} className="flex items-center gap-2 px-3 py-2.5 border-b border-border">
+              <div className="h-3 w-10 bg-white/[0.03] rounded shrink-0" />
+              <div className="h-3 w-32 bg-white/[0.03] rounded shrink-0" />
+              <div className="h-3 bg-white/[0.03] rounded flex-1" style={{ maxWidth: `${150 + (i * 37) % 200}px` }} />
             </div>
           ))}
         </div>
       ) : events.length === 0 ? (
-        <div className="flex items-center justify-center h-32 text-sm text-muted-foreground">
+        <div className="flex items-center justify-center h-32 text-sm text-muted-foreground/60">
           No events found
         </div>
       ) : (

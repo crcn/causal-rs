@@ -24,10 +24,10 @@ function formatDuration(ms: number): string {
 // Colors
 // ---------------------------------------------------------------------------
 
-const STATUS_COLORS: Record<string, { bar: string; text: string }> = {
-  completed: { bar: "#22c55e", text: "#bbf7d0" },
-  running: { bar: "#eab308", text: "#fef08a" },
-  error: { bar: "#ef4444", text: "#fecaca" },
+const STATUS_COLORS: Record<string, { bar: string; barEnd: string; text: string }> = {
+  completed: { bar: "#22c55e", barEnd: "#16a34a", text: "#bbf7d0" },
+  running: { bar: "#eab308", barEnd: "#ca8a04", text: "#fef08a" },
+  error: { bar: "#ef4444", barEnd: "#dc2626", text: "#fecaca" },
 };
 
 function statusColor(status: string) {
@@ -86,7 +86,7 @@ function buildBars(outcomes: ReactorOutcome[]): {
 // Constants
 // ---------------------------------------------------------------------------
 
-const ROW_HEIGHT = 32;
+const ROW_HEIGHT = 36;
 const LABEL_WIDTH = 160;
 const BAR_MIN_WIDTH = 4;
 const PADDING_X = 12;
@@ -136,7 +136,7 @@ export function WaterfallPane() {
 
   if (!correlationId) {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#71717a", fontSize: 13 }}>
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
         Open a flow to see the reactor waterfall
       </div>
     );
@@ -144,18 +144,18 @@ export function WaterfallPane() {
 
   if (bars.length === 0) {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#71717a", fontSize: 13 }}>
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
         No reactor execution data for this correlation
       </div>
     );
   }
 
   return (
-    <div style={{ height: "100%", overflow: "auto", padding: `8px ${PADDING_X}px` }}>
+    <div style={{ height: "100%", overflow: "auto", padding: `10px ${PADDING_X}px` }}>
       {/* Time axis */}
-      <div style={{ display: "flex", marginBottom: 4, marginLeft: LABEL_WIDTH, position: "relative", height: 16 }}>
-        <span style={{ fontSize: 9, color: "#52525b", position: "absolute", left: 0 }}>0ms</span>
-        <span style={{ fontSize: 9, color: "#52525b", position: "absolute", right: 0 }}>
+      <div style={{ display: "flex", marginBottom: 6, marginLeft: LABEL_WIDTH, position: "relative", height: 16 }}>
+        <span style={{ fontSize: 9, color: "#40405a", letterSpacing: "0.04em" }}>0ms</span>
+        <span style={{ fontSize: 9, color: "#40405a", position: "absolute", right: 0, letterSpacing: "0.04em" }}>
           {formatDuration(rangeMs)}
         </span>
         {scrubberMs != null && scrubberMs >= minMs && scrubberMs <= maxMs && (
@@ -166,8 +166,9 @@ export function WaterfallPane() {
               top: 0,
               bottom: -4,
               width: 1,
-              background: "#3b82f6",
+              background: "#6366f1",
               pointerEvents: "none",
+              boxShadow: "0 0 4px rgba(99, 102, 241, 0.4)",
             }}
           />
         )}
@@ -206,11 +207,11 @@ export function WaterfallPane() {
               alignItems: "center",
               height: ROW_HEIGHT,
               gap: 0,
-              opacity: isFuture ? 0.3 : 1,
-              transition: "opacity 150ms, background 100ms",
+              opacity: isFuture ? 0.25 : 1,
+              transition: "opacity 200ms, background 150ms",
               cursor: "pointer",
-              borderRadius: 4,
-              background: isSelected ? "rgba(59,130,246,0.1)" : "transparent",
+              borderRadius: 6,
+              background: isSelected ? "rgba(99, 102, 241, 0.15)" : "transparent",
               paddingLeft: 4,
               paddingRight: 4,
             }}
@@ -221,12 +222,13 @@ export function WaterfallPane() {
                 width: LABEL_WIDTH,
                 flexShrink: 0,
                 fontSize: 11,
-                color: "#e4e4e7",
+                color: "#c0c0d0",
                 fontWeight: 500,
                 overflow: "hidden",
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
-                paddingRight: 8,
+                paddingRight: 10,
+                letterSpacing: "0.01em",
               }}
               title={bar.reactorId}
             >
@@ -238,9 +240,9 @@ export function WaterfallPane() {
               style={{
                 flex: 1,
                 position: "relative",
-                height: 20,
-                background: "#18181b",
-                borderRadius: 4,
+                height: 22,
+                background: "rgba(255, 255, 255, 0.02)",
+                borderRadius: 5,
                 overflow: "hidden",
               }}
             >
@@ -252,13 +254,14 @@ export function WaterfallPane() {
                   width: `${widthPct}%`,
                   minWidth: BAR_MIN_WIDTH,
                   height: "100%",
-                  background: colors.bar,
-                  borderRadius: 3,
-                  opacity: 0.85,
+                  background: `linear-gradient(90deg, ${colors.bar}, ${colors.barEnd})`,
+                  borderRadius: 4,
+                  opacity: 0.8,
                   display: "flex",
                   alignItems: "center",
-                  paddingLeft: 4,
-                  paddingRight: 4,
+                  paddingLeft: 5,
+                  paddingRight: 5,
+                  boxShadow: `0 1px 4px ${colors.bar}30`,
                 }}
                 title={`${bar.reactorId}: ${bar.status} (${formatDuration(duration)})${bar.attempts > 1 ? ` — ${bar.attempts} attempts` : ""}${bar.error ? `\nError: ${bar.error}` : ""}`}
               >
@@ -266,7 +269,7 @@ export function WaterfallPane() {
                   style={{
                     fontSize: 9,
                     fontWeight: 600,
-                    color: "#09090b",
+                    color: "#0a0a0f",
                     whiteSpace: "nowrap",
                     overflow: "hidden",
                     textOverflow: "ellipsis",
@@ -285,8 +288,9 @@ export function WaterfallPane() {
                     top: 0,
                     bottom: 0,
                     width: 1,
-                    background: "#3b82f6",
+                    background: "#6366f1",
                     pointerEvents: "none",
+                    boxShadow: "0 0 4px rgba(99, 102, 241, 0.3)",
                   }}
                 />
               )}
@@ -300,7 +304,7 @@ export function WaterfallPane() {
                 display: "flex",
                 alignItems: "center",
                 gap: 4,
-                paddingLeft: 8,
+                paddingLeft: 10,
               }}
             >
               <span
@@ -308,12 +312,13 @@ export function WaterfallPane() {
                   fontSize: 10,
                   fontWeight: 500,
                   color: colors.text,
+                  opacity: 0.8,
                 }}
               >
                 {bar.status}
               </span>
               {bar.attempts > 1 && (
-                <span style={{ fontSize: 9, color: "#71717a" }}>
+                <span style={{ fontSize: 9, color: "#50506a" }}>
                   x{bar.attempts}
                 </span>
               )}
@@ -323,7 +328,7 @@ export function WaterfallPane() {
       })}
 
       {/* Total duration */}
-      <div style={{ marginTop: 8, fontSize: 10, color: "#52525b", marginLeft: LABEL_WIDTH }}>
+      <div style={{ marginTop: 10, fontSize: 10, color: "#40405a", marginLeft: LABEL_WIDTH, letterSpacing: "0.03em" }}>
         Total wall time: {formatDuration(rangeMs)}
       </div>
     </div>

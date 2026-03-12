@@ -10,9 +10,9 @@ export function FilterBar() {
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   return (
-    <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-border bg-card/50">
+    <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-border" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
       <div className="relative flex items-center">
-        <Search size={12} className="absolute left-2 text-muted-foreground pointer-events-none" />
+        <Search size={12} className="absolute left-2.5 text-muted-foreground pointer-events-none" />
         <input
           type="text"
           placeholder="search events..."
@@ -23,13 +23,13 @@ export function FilterBar() {
               payload: { search: e.target.value },
             })
           }
-          className="pl-7 pr-2 py-1 text-xs rounded bg-background border border-border text-foreground placeholder:text-muted-foreground w-64"
+          className="pl-7 pr-2 py-1.5 text-xs rounded-md bg-background/50 border border-border text-foreground placeholder:text-muted-foreground w-64 focus:outline-none focus:ring-1 focus:ring-indigo-500/40 focus:border-indigo-500/30 transition-all"
         />
       </div>
 
       <span className="w-px h-4 bg-border" />
 
-      <label className="text-xs text-muted-foreground">From</label>
+      <label className="text-[10px] text-muted-foreground uppercase tracking-wider">From</label>
       <input
         type="date"
         value={filters.from ?? ""}
@@ -39,9 +39,9 @@ export function FilterBar() {
             payload: { from: e.target.value || null },
           })
         }
-        className="px-2 py-1 text-xs rounded bg-background border border-border text-foreground w-32"
+        className="px-2 py-1.5 text-xs rounded-md bg-background/50 border border-border text-foreground w-32 focus:outline-none focus:ring-1 focus:ring-indigo-500/40 focus:border-indigo-500/30 transition-all"
       />
-      <label className="text-xs text-muted-foreground">To</label>
+      <label className="text-[10px] text-muted-foreground uppercase tracking-wider">To</label>
       <input
         type="date"
         value={filters.to ?? ""}
@@ -51,14 +51,14 @@ export function FilterBar() {
             payload: { to: e.target.value || null },
           })
         }
-        className="px-2 py-1 text-xs rounded bg-background border border-border text-foreground w-32"
+        className="px-2 py-1.5 text-xs rounded-md bg-background/50 border border-border text-foreground w-32 focus:outline-none focus:ring-1 focus:ring-indigo-500/40 focus:border-indigo-500/30 transition-all"
       />
 
       {filters.correlationId && (
         <>
           <span className="w-px h-4 bg-border" />
-          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-purple-500/20 text-purple-400 text-[10px] font-mono">
-            correlation: {filters.correlationId.slice(0, 8)}...
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400 text-[10px] font-mono">
+            {filters.correlationId.slice(0, 8)}
             <button
               onClick={() =>
                 dispatch({
@@ -66,7 +66,7 @@ export function FilterBar() {
                   payload: { correlationId: null },
                 })
               }
-              className="hover:text-foreground"
+              className="hover:text-foreground transition-colors"
             >
               <X size={10} />
             </button>

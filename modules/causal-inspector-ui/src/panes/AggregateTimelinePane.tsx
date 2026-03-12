@@ -206,9 +206,9 @@ function AggregateCard({
   return (
     <div
       style={{
-        background: "#18181b",
-        border: "1px solid #27272a",
-        borderRadius: 6,
+        background: "rgba(255, 255, 255, 0.02)",
+        border: "1px solid rgba(255, 255, 255, 0.06)",
+        borderRadius: 8,
         overflow: "hidden",
         flex: "1 1 280px",
         maxWidth: 500,
@@ -223,7 +223,7 @@ function AggregateCard({
           padding: "4px 8px",
           cursor: "pointer",
           userSelect: "none",
-          borderBottom: collapsed ? "none" : "1px solid #27272a",
+          borderBottom: collapsed ? "none" : "1px solid rgba(255,255,255,0.06)",
         }}
       >
         <span style={{ fontSize: 9, color: "#52525b", transform: collapsed ? "rotate(-90deg)" : "rotate(0deg)", transition: "transform 100ms" }}>
@@ -298,7 +298,7 @@ export function AggregateTimelinePane() {
 
   if (!correlationId) {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#71717a", fontSize: 13 }}>
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
         Open a flow to see the aggregate state timeline
       </div>
     );
@@ -306,7 +306,7 @@ export function AggregateTimelinePane() {
 
   if (entries.length === 0) {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#71717a", fontSize: 13 }}>
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
         No aggregate state snapshots for this correlation
       </div>
     );
@@ -315,18 +315,20 @@ export function AggregateTimelinePane() {
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
       {/* Toolbar */}
-      <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 12px", borderBottom: "1px solid #27272a", flexShrink: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "6px 12px", borderBottom: "1px solid rgba(255,255,255,0.06)", flexShrink: 0, background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
         <button
           onClick={() => setDiffMode(false)}
           style={{
-            fontSize: 11,
-            padding: "2px 8px",
-            borderRadius: 4,
+            fontSize: 10,
+            padding: "3px 10px",
+            borderRadius: 6,
             border: "1px solid",
-            borderColor: !diffMode ? "#3b82f6" : "#3f3f46",
-            background: !diffMode ? "rgba(59,130,246,0.15)" : "transparent",
-            color: !diffMode ? "#60a5fa" : "#a1a1aa",
+            borderColor: !diffMode ? "rgba(99,102,241,0.3)" : "rgba(255,255,255,0.06)",
+            background: !diffMode ? "rgba(99,102,241,0.12)" : "transparent",
+            color: !diffMode ? "#818cf8" : "#70708a",
             cursor: "pointer",
+            transition: "all 150ms",
+            letterSpacing: "0.02em",
           }}
         >
           Full State
@@ -334,14 +336,16 @@ export function AggregateTimelinePane() {
         <button
           onClick={() => setDiffMode(true)}
           style={{
-            fontSize: 11,
-            padding: "2px 8px",
-            borderRadius: 4,
+            fontSize: 10,
+            padding: "3px 10px",
+            borderRadius: 6,
             border: "1px solid",
-            borderColor: diffMode ? "#3b82f6" : "#3f3f46",
-            background: diffMode ? "rgba(59,130,246,0.15)" : "transparent",
-            color: diffMode ? "#60a5fa" : "#a1a1aa",
+            borderColor: diffMode ? "rgba(99,102,241,0.3)" : "rgba(255,255,255,0.06)",
+            background: diffMode ? "rgba(99,102,241,0.12)" : "transparent",
+            color: diffMode ? "#818cf8" : "#70708a",
             cursor: "pointer",
+            transition: "all 150ms",
+            letterSpacing: "0.02em",
           }}
         >
           Diff
@@ -362,11 +366,10 @@ export function AggregateTimelinePane() {
               onClick={() => handleRowClick(entry.seq)}
               style={{
                 opacity: isFuture ? 0.3 : 1,
-                borderLeft: isCurrent ? "3px solid #3b82f6" : "3px solid transparent",
                 padding: "6px 8px",
                 marginBottom: 4,
-                borderRadius: 4,
-                background: isCurrent ? "rgba(59,130,246,0.1)" : "transparent",
+                borderRadius: 6,
+                background: isCurrent ? "rgba(99,102,241,0.15)" : "transparent",
                 cursor: "pointer",
                 transition: "opacity 150ms, background 150ms",
               }}
@@ -382,7 +385,6 @@ export function AggregateTimelinePane() {
                     fontWeight: 500,
                     color: eventTextColor(entry.eventType),
                     background: eventBg(entry.eventType),
-                    border: `1px solid ${eventBorder(entry.eventType)}`,
                     borderRadius: 4,
                     padding: "1px 6px",
                   }}

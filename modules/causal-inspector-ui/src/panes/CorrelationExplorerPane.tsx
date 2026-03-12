@@ -57,18 +57,18 @@ export function CorrelationExplorerPane() {
   return (
     <div className="flex flex-col h-full">
       {/* Search bar */}
-      <div className="px-3 py-2 border-b border-border">
+      <div className="px-3 py-2.5 border-b border-border" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
         <input
           type="text"
           placeholder="Search by correlation ID or event type..."
           value={search}
           onChange={(e) => handleSearchChange(e.target.value)}
-          className="w-full px-2 py-1 text-xs bg-background border border-border rounded text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+          className="w-full px-3 py-1.5 text-xs bg-background/50 border border-border rounded-md text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-indigo-500/40 focus:border-indigo-500/30 transition-all"
         />
       </div>
 
       {/* Table header */}
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-border text-[9px] font-semibold text-muted-foreground/40 uppercase tracking-widest">
         <span className="w-28 shrink-0">Root Event</span>
         <span className="w-24 shrink-0">Correlation</span>
         <span className="w-12 shrink-0 text-right">Events</span>
@@ -80,15 +80,15 @@ export function CorrelationExplorerPane() {
       {loading && correlations.length === 0 ? (
         <div className="animate-pulse p-3">
           {Array.from({ length: 8 }).map((_, i) => (
-            <div key={i} className="flex items-center gap-2 py-2">
-              <div className="h-3 w-28 bg-muted rounded" />
-              <div className="h-3 w-24 bg-muted rounded" />
-              <div className="h-3 w-12 bg-muted rounded" />
+            <div key={i} className="flex items-center gap-2 py-2.5">
+              <div className="h-3 w-28 bg-white/[0.03] rounded" />
+              <div className="h-3 w-24 bg-white/[0.03] rounded" />
+              <div className="h-3 w-12 bg-white/[0.03] rounded" />
             </div>
           ))}
         </div>
       ) : correlations.length === 0 ? (
-        <div className="flex items-center justify-center h-32 text-sm text-muted-foreground">
+        <div className="flex items-center justify-center h-32 text-xs text-muted-foreground/50 tracking-wide">
           No correlations found
         </div>
       ) : (
@@ -97,15 +97,14 @@ export function CorrelationExplorerPane() {
             <button
               key={corr.correlationId}
               onClick={() => handleRowClick(corr.correlationId)}
-              className="group w-full text-left flex items-center gap-2 px-3 py-2 border-b border-border hover:bg-accent/30 transition-colors"
+              className="group w-full text-left flex items-center gap-2 px-3 py-2.5 border-b border-border hover:bg-indigo-500/8 transition-all duration-150"
             >
               {/* Root event type badge */}
               <span
-                className="text-[11px] font-mono shrink-0 w-28 truncate px-1 py-0.5 rounded"
+                className="text-[10px] font-mono shrink-0 w-28 truncate px-1.5 py-0.5 rounded"
                 style={{
                   color: eventTextColor(corr.rootEventType),
                   background: eventBg(corr.rootEventType),
-                  border: `1px solid ${eventBorder(corr.rootEventType)}`,
                 }}
                 title={corr.rootEventType}
               >
@@ -114,32 +113,33 @@ export function CorrelationExplorerPane() {
 
               {/* Correlation ID */}
               <span
-                className="text-[10px] font-mono text-purple-400 w-24 shrink-0 truncate cursor-pointer hover:text-purple-300"
+                className="text-[10px] font-mono text-purple-400/70 w-24 shrink-0 truncate cursor-pointer hover:text-purple-400 transition-colors"
                 title={`Click to copy: ${corr.correlationId}`}
                 onClick={(e) => { e.stopPropagation(); handleCopy(corr.correlationId); }}
               >
-                {corr.correlationId.slice(0, 8)}...
+                {corr.correlationId.slice(0, 8)}
               </span>
 
               {/* Event count */}
-              <span className="text-[11px] font-mono text-foreground w-12 shrink-0 text-right">
+              <span className="text-[11px] font-mono text-foreground/70 w-12 shrink-0 text-right tabular-nums">
                 {corr.eventCount}
               </span>
 
               {/* Duration */}
-              <span className="text-[10px] text-muted-foreground w-20 shrink-0 text-right font-mono">
+              <span className="text-[10px] text-muted-foreground/50 w-20 shrink-0 text-right font-mono tabular-nums">
                 <RelativeDuration firstTs={corr.firstTs} lastTs={corr.lastTs} />
               </span>
 
               {/* Last activity */}
-              <span className="text-[10px] text-muted-foreground flex-1 truncate">
+              <span className="text-[10px] text-muted-foreground/40 flex-1 truncate tabular-nums">
                 {formatTs(corr.lastTs)}
               </span>
 
               {/* Error indicator */}
               {corr.hasErrors && (
                 <span
-                  className="w-2 h-2 rounded-full bg-red-500 shrink-0"
+                  className="w-2 h-2 rounded-full bg-red-500/80 shrink-0"
+                  style={{ boxShadow: "0 0 6px rgba(239, 68, 68, 0.3)" }}
                   title="This correlation has errors"
                 />
               )}

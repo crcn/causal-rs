@@ -117,7 +117,7 @@ const ReactorNode = memo(({ data }: NodeProps) => {
   const blocks = d.blocks;
   const outcome = d.outcome;
   const hasBlocks = blocks && blocks.length > 0;
-  const borderColor = STATUS_BORDER[outcome?.status ?? "pending"] ?? "#52525b";
+  const borderColor = STATUS_BORDER[outcome?.status ?? "pending"] ?? "#2a2a35";
   const isRunning = outcome?.status === "running";
   const duration = outcome?.status === "completed" && outcome.startedAt && outcome.completedAt
     ? formatDuration(outcome.startedAt, outcome.completedAt)
@@ -125,20 +125,23 @@ const ReactorNode = memo(({ data }: NodeProps) => {
 
   return (
     <div style={{
-      background: "#27272a",
+      background: "linear-gradient(135deg, #1a1a22, #15151d)",
       border: `1px solid ${borderColor}`,
-      borderRadius: hasBlocks ? 8 : 20,
+      borderRadius: hasBlocks ? 10 : 20,
       fontSize: 10,
-      padding: hasBlocks ? "6px 10px" : "4px 12px",
+      padding: hasBlocks ? "8px 12px" : "6px 14px",
       width: REACTOR_WIDTH,
-      color: "#a1a1aa",
+      color: "#9090a0",
       fontStyle: "italic",
       animation: isRunning ? "pulse 2s ease-in-out infinite" : undefined,
+      boxShadow: isRunning
+        ? `0 0 12px ${borderColor}40`
+        : "0 2px 8px rgba(0, 0, 0, 0.3)",
     }}>
       <Handle type="target" position={Position.Left} style={{ visibility: "hidden" }} />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>{d.label}</span>
-        {duration && <span style={{ fontSize: 9, color: "#71717a", fontStyle: "normal", whiteSpace: "nowrap", flexShrink: 0 }}>{duration}</span>}
+        {duration && <span style={{ fontSize: 9, color: "#60608a", fontStyle: "normal", whiteSpace: "nowrap", flexShrink: 0 }}>{duration}</span>}
       </div>
       {hasBlocks && blocks.map((block, i) => <BlockRenderer key={i} block={block} />)}
       {outcome?.status === "error" && outcome.error && (
@@ -155,16 +158,19 @@ const EventNode = memo(({ data }: NodeProps) => {
     <div style={{
       background: eventBg(d.eventName),
       border: `1px solid ${eventBorder(d.eventName)}`,
-      borderRadius: 6,
+      borderRadius: 8,
       fontSize: 11,
-      padding: "6px 10px",
+      padding: "7px 12px",
       width: NODE_WIDTH,
-      color: "#e4e4e7",
+      color: eventTextColor(d.eventName),
       overflow: "hidden",
       textOverflow: "ellipsis",
       whiteSpace: "nowrap",
       direction: "rtl",
       textAlign: "left",
+      boxShadow: `0 2px 8px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.04)`,
+      fontWeight: 500,
+      letterSpacing: "0.01em",
     }}>
       <Handle type="target" position={Position.Left} style={{ visibility: "hidden" }} />
       {d.label}
@@ -264,7 +270,7 @@ function buildFlowGraph(
     });
   }
 
-  const arrowMarker = { type: MarkerType.ArrowClosed, color: "#52525b", width: 16, height: 16 };
+  const arrowMarker = { type: MarkerType.ArrowClosed, color: "#3a3a4a", width: 14, height: 14 };
 
   // Edges: event type -> reactor (event triggers reactor)
   for (const [parentId, reactors] of parentToReactor) {
@@ -279,7 +285,7 @@ function buildFlowGraph(
           id: edgeKey,
           source: `evt:${sourceGroupKey}`,
           target: `hdl:${reactorId}`,
-          style: { stroke: "#52525b", strokeWidth: 1 },
+          style: { stroke: "#3a3a4a", strokeWidth: 1 },
           markerEnd: arrowMarker,
         });
       }
@@ -297,7 +303,7 @@ function buildFlowGraph(
           id: edgeKey,
           source: `hdl:${reactorId}`,
           target: `evt:${typeName}`,
-          style: { stroke: "#52525b", strokeWidth: 1 },
+          style: { stroke: "#3a3a4a", strokeWidth: 1 },
           markerEnd: arrowMarker,
         });
       }
@@ -331,7 +337,7 @@ function buildFlowGraph(
             id: edgeKey,
             source: `evt:${groupKey}`,
             target: `hdl:${reactorId}`,
-            style: { stroke: "#52525b", strokeWidth: 1 },
+            style: { stroke: "#3a3a4a", strokeWidth: 1 },
             markerEnd: arrowMarker,
             animated: isPending,
           });
@@ -522,21 +528,23 @@ function TimeScrubber({
 
   const speedLabel = speed <= 50 ? "4x" : speed <= 150 ? "2x" : speed <= 300 ? "1x" : "0.5x";
 
+  const btnClass = "p-1.5 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-white/[0.05] transition-all duration-150";
+
   return (
-    <div className="flex items-center gap-2 px-3 py-1.5 border-t border-border shrink-0">
-      <button onClick={reset} className="text-muted-foreground hover:text-foreground" title="Reset to start">
+    <div className="flex items-center gap-1.5 px-3 py-2 border-t border-border shrink-0" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
+      <button onClick={reset} className={btnClass} title="Reset to start">
         <RotateCcw size={12} />
       </button>
-      <button onClick={stepBack} className="text-muted-foreground hover:text-foreground" title="Step back">
+      <button onClick={stepBack} className={btnClass} title="Step back">
         <SkipBack size={12} />
       </button>
-      <button onClick={togglePlay} className="text-muted-foreground hover:text-foreground" title={playing ? "Pause" : "Play"}>
+      <button onClick={togglePlay} className={`p-1.5 rounded-md transition-all duration-150 ${playing ? "text-indigo-400 bg-indigo-500/10" : "text-muted-foreground/60 hover:text-foreground hover:bg-white/[0.05]"}`} title={playing ? "Pause" : "Play"}>
         {playing ? <Pause size={14} /> : <Play size={14} />}
       </button>
-      <button onClick={stepForward} className="text-muted-foreground hover:text-foreground" title="Step forward">
+      <button onClick={stepForward} className={btnClass} title="Step forward">
         <SkipForward size={12} />
       </button>
-      <button onClick={jumpToEnd} className="text-muted-foreground hover:text-foreground" title="Jump to end">
+      <button onClick={jumpToEnd} className={btnClass} title="Jump to end">
         <ChevronsRight size={12} />
       </button>
       <input
@@ -546,19 +554,18 @@ function TimeScrubber({
         value={current}
         onChange={(e) => {
           const val = Number(e.target.value);
-          // Snap to nearest seq
           const nearest = seqs.reduce((best, s) =>
             Math.abs(s - val) < Math.abs(best - val) ? s : best, seqs[0]);
           dispatch({ type: "ui/scrubber_moved", payload: { position: nearest >= max ? null : nearest } });
         }}
-        className="flex-1 h-1 accent-foreground cursor-pointer"
+        className="flex-1 cursor-pointer"
       />
-      <span className="text-xs text-muted-foreground tabular-nums min-w-[4rem] text-right">
+      <span className="text-[10px] text-muted-foreground/60 tabular-nums min-w-[4rem] text-right">
         {currentIndex}/{seqs.length}
       </span>
       <button
         onClick={cycleSpeed}
-        className="text-xs text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded border border-border tabular-nums min-w-[2.5rem] text-center"
+        className="text-[10px] text-muted-foreground/60 hover:text-foreground px-2 py-1 rounded-md border border-border hover:border-indigo-500/30 tabular-nums min-w-[2.5rem] text-center transition-all duration-150"
         title="Playback speed"
       >
         {speedLabel}
@@ -660,37 +667,37 @@ function ReactorFilter({ allReactorIds, hiddenReactors, setHiddenReactors }: {
     <div ref={containerRef} className="relative">
       <button
         onClick={() => setOpen(v => !v)}
-        className="text-xs text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded border border-border"
+        className="text-[10px] text-muted-foreground/60 hover:text-foreground px-2 py-1 rounded-md border border-border hover:border-indigo-500/30 transition-all duration-150"
       >
-        <Filter size={12} className="inline mr-1" />
+        <Filter size={11} className="inline mr-1 -mt-px" />
         {hiddenCount > 0 ? `${hiddenCount} hidden` : "Filter"}
       </button>
       {open && (
-        <div className="absolute top-full left-0 mt-1 z-50 bg-background border border-border rounded-md shadow-lg min-w-[240px]">
-          <div className="px-2 py-1.5 border-b border-border">
+        <div className="absolute top-full right-0 mt-1 z-50 border border-border rounded-lg min-w-[240px]" style={{ background: "rgba(17, 17, 22, 0.95)", backdropFilter: "blur(12px)", boxShadow: "0 8px 32px rgba(0, 0, 0, 0.5)" }}>
+          <div className="px-3 py-2 border-b border-border">
             <input
               autoFocus
               type="text"
               value={filter}
               onChange={e => setFilter(e.target.value)}
               placeholder="Search reactors..."
-              className="w-full text-xs bg-transparent border-none outline-none text-foreground placeholder:text-muted-foreground"
+              className="w-full text-xs bg-transparent border-none outline-none text-foreground placeholder:text-muted-foreground/50"
             />
           </div>
           <div className="max-h-64 overflow-y-auto py-1">
             {filtered.map(id => (
-              <label key={id} className="flex items-center gap-2 px-3 py-1 hover:bg-accent cursor-pointer">
+              <label key={id} className="flex items-center gap-2 px-3 py-1.5 hover:bg-white/[0.03] cursor-pointer transition-colors">
                 <input
                   type="checkbox"
                   checked={!hiddenReactors.has(id)}
                   onChange={() => toggle(id)}
-                  className="rounded border-border"
+                  className="rounded border-border accent-indigo-500"
                 />
-                <span className="text-xs font-mono text-foreground truncate">{id}</span>
+                <span className="text-[11px] font-mono text-foreground/80 truncate">{id}</span>
               </label>
             ))}
             {filtered.length === 0 && (
-              <div className="text-xs text-muted-foreground px-3 py-2">No matches</div>
+              <div className="text-xs text-muted-foreground/50 px-3 py-2">No matches</div>
             )}
           </div>
         </div>
@@ -839,12 +846,12 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
         ...base,
         style: {
           ...e.style,
-          stroke: onPath ? "#e879f9" : "#52525b",
+          stroke: onPath ? "#818cf8" : "#3a3a4a",
           strokeWidth: onPath ? 2 : 1,
           opacity: onPath ? 1 : 0.15,
         },
         markerEnd: onPath
-          ? { type: MarkerType.ArrowClosed, color: "#e879f9", width: 16, height: 16 }
+          ? { type: MarkerType.ArrowClosed, color: "#818cf8", width: 14, height: 14 }
           : e.markerEnd,
       };
     }),
@@ -884,7 +891,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
 
   if (!flowCorrelationId) {
     return (
-      <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
+      <div className="flex items-center justify-center h-full text-xs text-muted-foreground/50 tracking-wide">
         Select an event to visualize its causal flow
       </div>
     );
@@ -920,20 +927,22 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
 
   return (
     <div className="h-full flex flex-col">
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border shrink-0">
-        <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+      <div className="flex items-center gap-2.5 px-3 py-2 border-b border-border shrink-0" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
+        <h3 className="text-[10px] font-semibold text-muted-foreground/60 uppercase tracking-widest">
           Flow
         </h3>
-        <span className="text-xs font-mono text-foreground truncate">{flowCorrelationId}</span>
-        <span className="text-xs text-muted-foreground">
-          {flowData.length} events, {nodes.length} nodes
+        <span className="text-[10px] font-mono text-foreground/80 truncate px-1.5 py-0.5 rounded bg-white/[0.03] border border-border">{flowCorrelationId}</span>
+        <span className="text-[10px] text-muted-foreground/50 tabular-nums">
+          {flowData.length} events &middot; {nodes.length} nodes
         </span>
         {headerExtra}
-        <ReactorFilter
-          allReactorIds={allReactorIds}
-          hiddenReactors={hiddenReactors}
-          setHiddenReactors={setHiddenReactors}
-        />
+        <div className="ml-auto">
+          <ReactorFilter
+            allReactorIds={allReactorIds}
+            hiddenReactors={hiddenReactors}
+            setHiddenReactors={setHiddenReactors}
+          />
+        </div>
       </div>
       <div className="flex-1 relative">
         <ReactFlow
@@ -953,7 +962,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
         >
           <FitOnLoad />
           <FocusOnSelection nodes={nodes} flowData={flowData} />
-          <Background color="#27272a" gap={20} />
+          <Background color="rgba(255,255,255,0.03)" gap={24} size={1} />
           <Controls showInteractive={false} />
         </ReactFlow>
       </div>

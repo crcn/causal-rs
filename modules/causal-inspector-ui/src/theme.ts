@@ -5,21 +5,21 @@ export function eventHue(name: string): number {
   return ((hash % 360) + 360) % 360;
 }
 
-/** Background color blended onto dark background. */
+/** Background color blended onto dark background — more saturated. */
 export function eventBg(name: string): string {
   const h = eventHue(name);
-  const [r, g, b] = hslToRgb(h, 70, 50);
-  const br = 9, bg = 9, bb = 11; // #09090b
-  const a = 0.2;
+  const [r, g, b] = hslToRgb(h, 75, 50);
+  const br = 10, bg = 10, bb = 15; // #0a0a0f
+  const a = 0.15;
   return `rgb(${Math.round(br + (r - br) * a)}, ${Math.round(bg + (g - bg) * a)}, ${Math.round(bb + (b - bb) * a)})`;
 }
 
 export function eventBorder(name: string): string {
-  return `hsl(${eventHue(name)}, 70%, 50%)`;
+  return `hsla(${eventHue(name)}, 65%, 55%, 0.5)`;
 }
 
 export function eventTextColor(name: string): string {
-  return `hsl(${eventHue(name)}, 70%, 65%)`;
+  return `hsl(${eventHue(name)}, 70%, 70%)`;
 }
 
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
@@ -32,7 +32,7 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
 }
 
 export const LOG_LEVEL_COLORS: Record<string, string> = {
-  debug: "bg-zinc-600/30 text-zinc-400",
-  info: "bg-blue-500/20 text-blue-400",
-  warn: "bg-amber-500/20 text-amber-400",
+  debug: "bg-zinc-600/20 text-zinc-400",
+  info: "bg-indigo-500/15 text-indigo-400",
+  warn: "bg-amber-500/15 text-amber-400",
 };

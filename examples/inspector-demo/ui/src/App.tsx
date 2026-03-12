@@ -180,14 +180,14 @@ function InspectorLayout() {
             const btn = e.currentTarget as HTMLElement;
             const rect = btn.getBoundingClientRect();
             const menu = document.createElement("div");
-            menu.style.cssText = `position:fixed;z-index:9999;background:#18181b;border:1px solid #27272a;border-radius:6px;padding:4px;box-shadow:0 4px 12px rgba(0,0,0,0.5);top:${rect.bottom + 4}px;right:${window.innerWidth - rect.right}px;`;
+            menu.style.cssText = `position:fixed;z-index:9999;background:rgba(17,17,22,0.95);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:4px;box-shadow:0 8px 32px rgba(0,0,0,0.5);top:${rect.bottom + 6}px;right:${window.innerWidth - rect.right}px;`;
 
             for (const pane of PANE_REGISTRY) {
               const item = document.createElement("button");
               item.textContent = pane.name;
-              item.style.cssText = "display:block;width:100%;text-align:left;padding:6px 12px;font-size:12px;color:#fafafa;background:transparent;border:none;border-radius:4px;cursor:pointer;";
-              item.onmouseenter = () => { item.style.background = "#27272a"; };
-              item.onmouseleave = () => { item.style.background = "transparent"; };
+              item.style.cssText = "display:block;width:100%;text-align:left;padding:7px 14px;font-size:11px;color:rgba(240,240,245,0.7);background:transparent;border:none;border-radius:6px;cursor:pointer;transition:all 100ms;letter-spacing:0.02em;";
+              item.onmouseenter = () => { item.style.background = "rgba(255,255,255,0.04)"; item.style.color = "rgba(240,240,245,0.95)"; };
+              item.onmouseleave = () => { item.style.background = "transparent"; item.style.color = "rgba(240,240,245,0.7)"; };
               item.onclick = () => { addTab(pane.component, pane.name); menu.remove(); };
               menu.appendChild(item);
             }

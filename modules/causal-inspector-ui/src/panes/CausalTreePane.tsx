@@ -73,8 +73,8 @@ function ReactorNode({
     <div className={depth > 0 ? "pl-6" : ""}>
       <div
         ref={isHighlighted ? nodeRef : undefined}
-        className={`group/tree w-full text-left px-2 py-1 rounded transition-colors hover:bg-accent/30 ${
-          isHighlighted ? "bg-zinc-700/40 ring-1 ring-zinc-500/50" : ""
+        className={`group/tree w-full text-left px-2 py-1.5 rounded-md transition-all duration-150 hover:bg-white/[0.03] ${
+          isHighlighted ? "bg-indigo-500/15 ring-1 ring-indigo-500/25" : ""
         }`}
       >
         <div className="flex items-center gap-1.5 min-w-0">
@@ -88,10 +88,10 @@ function ReactorNode({
             onClick={handleClick}
             className="flex items-center gap-1.5 min-w-0"
           >
-            <span className="px-1 py-0.5 rounded text-[10px] font-medium shrink-0 bg-zinc-600/30 text-zinc-400 italic">
+            <span className="px-1.5 py-0.5 rounded text-[9px] font-medium shrink-0 bg-white/[0.04] text-muted-foreground/60 italic border border-border">
               reactor
             </span>
-            <span className="text-[10px] font-mono text-zinc-300 shrink-0">
+            <span className="text-[10px] font-mono text-foreground/60 shrink-0">
               {reactorId}
             </span>
             {collapsed && (
@@ -179,8 +179,8 @@ function TreeNode({
             dispatch({ type: "ui/flow_opened", payload: { correlationId: event.correlationId } });
           }
         }}
-        className={`group/tree w-full text-left px-2 py-1.5 rounded transition-colors cursor-pointer hover:bg-accent/30 ${
-          isSelected ? "bg-accent/50 ring-1 ring-blue-500/50" : ""
+        className={`group/tree w-full text-left px-2 py-1.5 rounded-md transition-all duration-150 cursor-pointer hover:bg-white/[0.03] ${
+          isSelected ? "bg-indigo-500/15 ring-1 ring-indigo-500/25" : ""
         }`}
       >
         <div className="flex items-center gap-1.5 min-w-0">
@@ -214,7 +214,7 @@ function TreeNode({
               setCopied(true);
               setTimeout(() => setCopied(false), 1500);
             }}
-            className="opacity-0 group-hover/tree:opacity-100 transition-opacity ml-auto p-0.5 rounded hover:bg-accent shrink-0 text-[10px] text-muted-foreground"
+            className="opacity-0 group-hover/tree:opacity-100 transition-all duration-150 ml-auto p-1 rounded-md hover:bg-white/[0.05] shrink-0 text-[10px] text-muted-foreground/50"
             title="Copy subtree as JSON"
           >
             {copied ? <Check size={12} /> : <Copy size={12} />}
@@ -222,7 +222,7 @@ function TreeNode({
           {onInvestigate && (
             <button
               onClick={(e) => { e.stopPropagation(); onInvestigate(event); }}
-              className="opacity-0 group-hover/tree:opacity-100 transition-opacity p-0.5 rounded hover:bg-accent shrink-0 text-muted-foreground"
+              className="opacity-0 group-hover/tree:opacity-100 transition-all duration-150 p-1 rounded-md hover:bg-white/[0.05] shrink-0 text-muted-foreground/50"
               title="Investigate"
             >
               <Search size={12} />
@@ -370,7 +370,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
 
   if (!treeEvents) {
     return (
-      <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
+      <div className="flex items-center justify-center h-full text-xs text-muted-foreground/50 tracking-wide">
         Select an event to view its causal tree
       </div>
     );
@@ -379,7 +379,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   if (roots.length === 0 && flowSelection) {
     return (
       <div className="h-full overflow-y-auto p-3">
-        <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
+        <div className="flex items-center gap-2 mb-2 px-2.5 py-1.5 rounded-md bg-indigo-500/8 border border-indigo-500/15 text-xs text-indigo-400">
           <span>
             {flowSelection.kind === "event-type"
               ? flowSelection.name
@@ -402,7 +402,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   return (
     <div className="h-full overflow-y-auto p-3">
       {flowSelection && (
-        <div className="flex items-center gap-2 mb-2 px-2 py-1 rounded bg-blue-500/10 text-xs text-blue-400">
+        <div className="flex items-center gap-2 mb-2 px-2.5 py-1.5 rounded-md bg-indigo-500/8 border border-indigo-500/15 text-xs text-indigo-400">
           <span>
             {flowSelection.kind === "event-type"
               ? flowSelection.name
@@ -416,7 +416,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
           </button>
         </div>
       )}
-      <h3 className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wider">
+      <h3 className="text-[10px] font-semibold text-muted-foreground/50 mb-2 uppercase tracking-widest">
         Causal Tree ({flowSelection ? `${filteredCount} of ${totalCount}` : totalCount} events)
       </h3>
       {roots.map(root => (
