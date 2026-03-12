@@ -9,13 +9,13 @@ use uuid::Uuid;
 
 use crate::aggregator::{Aggregate, AggregatorRegistry};
 use crate::event_log::EventLog;
-use crate::types::{AppendResult, NewEvent, Snapshot};
+use crate::types::{AppendResult, NewEvent, Snapshot, StreamVersion};
 
 /// Wrapper that pairs aggregate state with its stream version.
 #[derive(Debug, Clone)]
 pub struct Versioned<A> {
     pub state: A,
-    pub version: u64,
+    pub version: StreamVersion,
 }
 
 /// Extract the short type name from a full Rust type path.
@@ -95,9 +95,10 @@ pub async fn save_snapshot<A: Aggregate + serde::Serialize + serde::de::Deserial
 
 #[cfg(test)]
 mod tests {
-    use super::{event_type_short_name, NewEvent, Uuid};
+    use super::{event_type_short_name, NewEvent, Uuid, StreamVersion};
     use crate::event_log::EventLog;
     use crate::memory_store::MemoryStore;
+    use crate::types::LogCursor;
     use chrono::Utc;
 
     #[test]
@@ -161,9 +162,9 @@ mod tests {
 
         let events = store.load_stream("Order", id, None).await.unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].version, Some(1));
+        assert_eq!(events[0].version, Some(StreamVersion::from_raw(1)));
         assert_eq!(events[0].event_type, "OrderPlaced");
-        assert_eq!(events[1].version, Some(2));
+        assert_eq!(events[1].version, Some(StreamVersion::from_raw(2)));
         assert_eq!(events[1].event_type, "OrderShipped");
         assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
     }
@@ -173,7 +174,7 @@ mod tests {
         let store = MemoryStore::new();
 
         let result = store.append(make_new_event("SystemStarted", serde_json::json!({"node": "a"}))).await.unwrap();
-        assert!(result.position > 0);
+        assert!(result.position > LogCursor::ZERO);
 
         // Not loadable via load_stream (no aggregate)
         let events = store.load_stream("System", Uuid::new_v4(), None).await.unwrap();
@@ -374,7 +375,7 @@ mod tests {
             store.append(make_new_event(&format!("Event{}", i), serde_json::json!({}))).await.unwrap();
         }
 
-        let events = store.load_from(0, 3).await.unwrap();
+        let events = store.load_from(LogCursor::ZERO, 3).await.unwrap();
         assert_eq!(events.len(), 3);
     }
 

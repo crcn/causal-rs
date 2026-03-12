@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use causal::aggregator::{Aggregate, Apply};
-use causal::{event, events, reactor, Context, Engine, EventLog, Events, ReactorQueue, MemoryStore, NewEvent, Snapshot};
+use causal::{event, events, reactor, Context, Engine, EventLog, Events, LogCursor, ReactorQueue, MemoryStore, NewEvent, Snapshot, StreamVersion};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -846,7 +846,7 @@ async fn auto_persist_events_per_aggregate_stream() -> Result<()> {
     assert_eq!(events[0].aggregate_type.as_deref(), Some("Order"));
     assert_eq!(events[1].event_type, "order_confirmed");
     assert_eq!(events[1].aggregate_type.as_deref(), Some("Order"));
-    assert_eq!(events[1].version.unwrap(), 2);
+    assert_eq!(events[1].version.unwrap(), StreamVersion::from_raw(2));
     Ok(())
 }
 
@@ -1109,7 +1109,7 @@ async fn snapshot_acceleration() -> Result<()> {
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
-            version: 1,
+            version: StreamVersion::from_raw(1),
             state: serde_json::json!({"status": "created", "total": 500}),
             created_at: chrono::Utc::now(),
         })
@@ -1178,11 +1178,11 @@ async fn rapid_fire_events_same_aggregate() -> Result<()> {
 
     let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 50, "all 50 events should be persisted");
-    assert_eq!(events.last().unwrap().version.unwrap(), 50);
+    assert_eq!(events.last().unwrap().version.unwrap(), StreamVersion::from_raw(50));
 
     // Verify versions are sequential
     for (i, e) in events.iter().enumerate() {
-        assert_eq!(e.version.unwrap(), (i + 1) as u64);
+        assert_eq!(e.version.unwrap(), StreamVersion::from_raw((i + 1) as u64));
     }
     Ok(())
 }
@@ -1259,7 +1259,7 @@ async fn stale_snapshot_partial_replay_fills_gap() -> Result<()> {
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
-            version: 5,
+            version: StreamVersion::from_raw(5),
             state: serde_json::json!({"status": "confirmed", "total": 100}),
             created_at: chrono::Utc::now(),
         })
@@ -1398,9 +1398,9 @@ async fn sequential_events_same_aggregate_correct_versions() -> Result<()> {
     // Verify event store has correct sequential versions
     let events = store.load_stream("Order", order_id, None).await?;
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].version.unwrap(), 1);
+    assert_eq!(events[0].version.unwrap(), StreamVersion::from_raw(1));
     assert_eq!(events[0].event_type, "order_created");
-    assert_eq!(events[1].version.unwrap(), 2);
+    assert_eq!(events[1].version.unwrap(), StreamVersion::from_raw(2));
     assert_eq!(events[1].event_type, "order_confirmed");
     Ok(())
 }
@@ -1443,9 +1443,9 @@ async fn mixed_aggregate_types_independent_streams() -> Result<()> {
     assert_eq!(customer_events.len(), 1, "Customer stream: OrderPlaced");
 
     // Verify each stream has correct sequential versions
-    assert_eq!(order_events[0].version.unwrap(), 1);
-    assert_eq!(order_events[1].version.unwrap(), 2);
-    assert_eq!(customer_events[0].version.unwrap(), 1);
+    assert_eq!(order_events[0].version.unwrap(), StreamVersion::from_raw(1));
+    assert_eq!(order_events[1].version.unwrap(), StreamVersion::from_raw(2));
+    assert_eq!(customer_events[0].version.unwrap(), StreamVersion::from_raw(1));
     Ok(())
 }
 
@@ -1579,7 +1579,7 @@ async fn save_snapshot_helper_works() -> Result<()> {
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
-            version: 2,
+            version: StreamVersion::from_raw(2),
             state: serde_json::json!({"status": "confirmed", "total": 999}),
             created_at: chrono::Utc::now(),
         })
@@ -1590,7 +1590,7 @@ async fn save_snapshot_helper_works() -> Result<()> {
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist");
-    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.version, StreamVersion::from_raw(2));
     assert_eq!(loaded.state["status"], "confirmed");
     assert_eq!(loaded.state["total"], 999);
     Ok(())
@@ -1620,7 +1620,7 @@ async fn auto_snapshot_every_n_events() -> Result<()> {
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist at V5");
-    assert_eq!(snap.version, 5);
+    assert_eq!(snap.version, StreamVersion::from_raw(5));
 
     // Emit 5 more (version 6-10)
     for i in 5..10 {
@@ -1635,7 +1635,7 @@ async fn auto_snapshot_every_n_events() -> Result<()> {
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist at V10");
-    assert_eq!(snap.version, 10);
+    assert_eq!(snap.version, StreamVersion::from_raw(10));
 
     Ok(())
 }
@@ -1663,7 +1663,7 @@ async fn auto_snapshot_hydration_uses_checkpoint() -> Result<()> {
         .load_snapshot("Order", order_id)
         .await?
         .expect("snapshot should exist");
-    assert_eq!(snap.version, 10);
+    assert_eq!(snap.version, StreamVersion::from_raw(10));
 
     // New engine (cold start) — should hydrate from snapshot at V10
     let engine2 = Engine::in_memory(Deps)
@@ -1752,7 +1752,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
         .save_snapshot(Snapshot {
             aggregate_type: "Order".to_string(),
             aggregate_id: order_id,
-            version: 50,
+            version: StreamVersion::from_raw(50),
             state: serde_json::json!({"status": "created", "total": 500}),
             created_at: chrono::Utc::now(),
         })
@@ -1774,7 +1774,7 @@ async fn snapshot_at_version_prevents_immediate_re_snapshot() -> Result<()> {
         .load_snapshot("Order", order_id)
         .await?
         .expect("original snapshot should still exist");
-    assert_eq!(snap.version, 50, "snapshot should remain at V50, not V51");
+    assert_eq!(snap.version, StreamVersion::from_raw(50), "snapshot should remain at V50, not V51");
 
     Ok(())
 }
@@ -3653,7 +3653,7 @@ async fn singleton_hydrated_across_event_types_for_handler_filter() -> Result<()
 
     // Mark events as already processed (checkpoint past both events).
     // MemoryStore positions start at 1, so two events are at positions 1 and 2.
-    store.set_checkpoint(2);
+    store.set_checkpoint(LogCursor::from_raw(2));
 
     // Step 2: Inject a reactor into the queue (simulating resume/reclaim)
     let event_type = "scrape_completed".to_string();
@@ -4804,7 +4804,7 @@ async fn ephemeral_events_advance_checkpoint() -> Result<()> {
     // Checkpoint should have advanced past all events
     let checkpoint = store.checkpoint().await?;
     let all = store.global_log().lock().clone();
-    let max_position = all.iter().map(|e| e.position).max().unwrap_or(0);
+    let max_position = all.iter().map(|e| e.position).max().unwrap_or(LogCursor::ZERO);
     assert_eq!(checkpoint, max_position, "Checkpoint should be at max position (no stalling)");
 
     Ok(())

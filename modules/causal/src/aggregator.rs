@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::reactor::extract_prefix;
+use crate::types::StreamVersion;
 use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate + Apply traits ─────────────────────────────────────
@@ -155,10 +156,10 @@ impl Aggregator {
 #[derive(Clone)]
 struct StateEntry {
     state: Arc<dyn Any + Send + Sync>,
-    /// Stream version from the Store (0 = never persisted / unknown).
-    version: u64,
-    /// Version at which last snapshot was taken (0 = never).
-    snapshot_at_version: u64,
+    /// Stream version from the Store (ZERO = never persisted / unknown).
+    version: StreamVersion,
+    /// Version at which last snapshot was taken (ZERO = never).
+    snapshot_at_version: StreamVersion,
 }
 
 /// Registry of aggregators with owned in-memory state.
@@ -232,7 +233,7 @@ impl AggregatorRegistry {
                 None => {
                     // No state yet — create default, store it, and apply
                     let default = Arc::from(agg.default_state());
-                    self.state.insert(key.clone(), StateEntry { state: default, version: 0, snapshot_at_version: 0 });
+                    self.state.insert(key.clone(), StateEntry { state: default, version: StreamVersion::ZERO, snapshot_at_version: StreamVersion::ZERO });
                     return self.apply_event_inner(agg, &key, &prev_key, payload);
                 }
             };
@@ -241,7 +242,7 @@ impl AggregatorRegistry {
             let mut next_state = agg.clone_state(current_state.as_ref());
 
             // Store prev snapshot (cheap Arc clone of existing state)
-            self.state.insert(prev_key, StateEntry { state: current_state, version: 0, snapshot_at_version: 0 });
+            self.state.insert(prev_key, StateEntry { state: current_state, version: StreamVersion::ZERO, snapshot_at_version: StreamVersion::ZERO });
 
             // Apply event to the cloned state
             if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
@@ -251,7 +252,7 @@ impl AggregatorRegistry {
             // Store updated state with incremented version
             self.state.insert(key, StateEntry {
                 state: Arc::from(next_state),
-                version: current_version + 1,
+                version: StreamVersion::from_raw(current_version.raw() + 1),
                 snapshot_at_version: snapshot_at,
             });
         }
@@ -271,8 +272,8 @@ impl AggregatorRegistry {
         // Store prev snapshot
         self.state.insert(prev_key.to_string(), StateEntry {
             state: current_entry.state,
-            version: 0,
-            snapshot_at_version: 0,
+            version: StreamVersion::ZERO,
+            snapshot_at_version: StreamVersion::ZERO,
         });
 
         // Apply event
@@ -283,7 +284,7 @@ impl AggregatorRegistry {
         // Store updated state
         self.state.insert(key.to_string(), StateEntry {
             state: Arc::from(next_state),
-            version: current_entry.version + 1,
+            version: StreamVersion::from_raw(current_entry.version.raw() + 1),
             snapshot_at_version: current_entry.snapshot_at_version,
         });
     }
@@ -420,32 +421,32 @@ impl AggregatorRegistry {
     /// Inject hydrated state + version into the DashMap.
     ///
     /// Used during cold-start hydration from the Store.
-    pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: u64, snapshot_at_version: u64) {
+    pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: StreamVersion, snapshot_at_version: StreamVersion) {
         self.state.insert(key.to_string(), StateEntry { state, version, snapshot_at_version });
     }
 
     /// Read the stream version from the DashMap entry.
     ///
     /// Returns 0 if no state exists (consistent with "version 0 = empty stream").
-    pub fn get_version(&self, key: &str) -> u64 {
+    pub fn get_version(&self, key: &str) -> StreamVersion {
         self.state
             .get(key)
             .map(|entry| entry.version)
-            .unwrap_or(0)
+            .unwrap_or(StreamVersion::ZERO)
     }
 
     /// Read the snapshot_at_version from the DashMap entry.
     ///
     /// Returns 0 if no state exists (consistent with "never snapshotted").
-    pub fn get_snapshot_at_version(&self, key: &str) -> u64 {
+    pub fn get_snapshot_at_version(&self, key: &str) -> StreamVersion {
         self.state
             .get(key)
             .map(|entry| entry.snapshot_at_version)
-            .unwrap_or(0)
+            .unwrap_or(StreamVersion::ZERO)
     }
 
     /// Update snapshot_at_version after saving a snapshot.
-    pub fn update_snapshot_at_version(&self, key: &str, version: u64) {
+    pub fn update_snapshot_at_version(&self, key: &str, version: StreamVersion) {
         if let Some(mut entry) = self.state.get_mut(key) {
             entry.snapshot_at_version = version;
         }

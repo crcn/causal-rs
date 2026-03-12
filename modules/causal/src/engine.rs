@@ -19,9 +19,9 @@ use crate::job_executor::{ReactorStatus, JobExecutor};
 use crate::memory_store::MemoryStore;
 use crate::process::{EmitFuture, ProcessHandle};
 use crate::types::{
-    EmittedEvent, EventWorkerConfig, ReactorCompletion, ReactorDlq,
+    EmittedEvent, EventWorkerConfig, LogCursor, ReactorCompletion, ReactorDlq,
     ReactorResolution, ReactorWorkerConfig, IntentCommit, NewEvent, PersistedEvent,
-    QueuedReactor, Snapshot, NAMESPACE_CAUSAL,
+    QueuedReactor, Snapshot, StreamVersion, NAMESPACE_CAUSAL,
 };
 use crate::upcaster::{Upcaster, UpcasterRegistry};
 
@@ -374,7 +374,7 @@ where
         let handler_config = ReactorWorkerConfig::default();
 
         // In-memory event retry counter (resets on process restart)
-        let mut event_attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut event_attempts: std::collections::HashMap<LogCursor, u32> = std::collections::HashMap::new();
         // Ephemeral cache: populated from PersistedEvent in Phase 1, injected in Phase 2
         let mut ephemerals: std::collections::HashMap<Uuid, Arc<dyn std::any::Any + Send + Sync>> =
             std::collections::HashMap::new();
@@ -799,7 +799,7 @@ where
         aggregate_type: &str,
         aggregate_id: Uuid,
         key: &str,
-        exclude_position: Option<u64>,
+        exclude_position: Option<LogCursor>,
     ) -> Result<()> {
         // Try snapshot first
         if let Some(snapshot) = self
@@ -833,7 +833,11 @@ where
                     )?;
                 }
 
-                let final_version = snapshot.version + remaining.len() as u64;
+                // Use actual stream version from last replayed event, not arithmetic
+                let final_version = remaining
+                    .last()
+                    .and_then(|e| e.version)
+                    .unwrap_or(snapshot.version);
                 self.aggregators
                     .set_state(key, Arc::from(state), final_version, snapshot.version);
                 return Ok(());
@@ -857,7 +861,11 @@ where
             .map(|e| (e.event_type.as_str(), &e.payload))
             .collect();
 
-        let last_version = events.last().unwrap().version.unwrap_or(events.len() as u64);
+        let last_version = events
+            .last()
+            .unwrap()
+            .version
+            .ok_or_else(|| anyhow::anyhow!("aggregate stream event missing version"))?;
 
         if let Some(state) = self.aggregators.replay_events(
             aggregate_type,
@@ -865,7 +873,7 @@ where
             &self.upcasters,
         )? {
             self.aggregators
-                .set_state(key, Arc::from(state), last_version, 0);
+                .set_state(key, Arc::from(state), last_version, StreamVersion::ZERO);
         }
 
         Ok(())
@@ -1042,7 +1050,7 @@ where
             let version = self.aggregators.get_version(&key);
             let snapshot_at = self.aggregators.get_snapshot_at_version(&key);
 
-            if version - snapshot_at >= threshold {
+            if version.raw() - snapshot_at.raw() >= threshold {
                 let state_ref = match self.aggregators.get_state(&key) {
                     Some(s) => s,
                     None => continue,

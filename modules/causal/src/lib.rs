@@ -57,7 +57,7 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 
 // Re-export event store helpers and types
 pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
-pub use types::{AppendResult, NewEvent, PersistedEvent, QueueStatus, Snapshot};
+pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, QueueStatus, Snapshot, StreamVersion};
 
 // Re-export new EventLog + ReactorQueue traits
 pub use event_log::EventLog;

@@ -4,28 +4,30 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use causal::LogCursor;
+
 /// Position tracking for projection streams.
 ///
 /// Two columns: `active` (promoted, used in live mode) and `staged`
 /// (written during replay, promoted on success).
 #[async_trait]
 pub trait PointerStore: Send + Sync {
-    /// Current version — the promoted `active` position.
+    /// Current position — the promoted `active` log cursor.
     ///
-    /// Use at boot to derive the database name (e.g., `neo4j.v{version}`).
-    async fn version(&self) -> Result<Option<u64>>;
+    /// Use at boot to derive the database name (e.g., `neo4j.v{position}`).
+    async fn position(&self) -> Result<Option<LogCursor>>;
 
     /// Save position directly to `active`.
-    async fn save(&self, position: u64) -> Result<()>;
+    async fn save(&self, position: LogCursor) -> Result<()>;
 
     /// Write position to `staged` column only.
-    async fn stage(&self, position: u64) -> Result<()>;
+    async fn stage(&self, position: LogCursor) -> Result<()>;
 
     /// Promote `staged` → `active`. Returns the promoted position.
-    async fn promote(&self) -> Result<u64>;
+    async fn promote(&self) -> Result<LogCursor>;
 
     /// Force-set the `active` position directly.
-    async fn set(&self, position: u64) -> Result<()>;
+    async fn set(&self, position: LogCursor) -> Result<()>;
 
     /// Read current pointer status.
     async fn status(&self) -> Result<PointerStatus>;
@@ -34,8 +36,8 @@ pub trait PointerStore: Send + Sync {
 /// Current state of the replay pointer.
 #[derive(Debug, Clone)]
 pub struct PointerStatus {
-    pub active: u64,
-    pub staged: Option<u64>,
+    pub active: LogCursor,
+    pub staged: Option<LogCursor>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -80,39 +82,39 @@ mod pg {
 
     #[async_trait]
     impl PointerStore for PgPointerStore {
-        async fn version(&self) -> Result<Option<u64>> {
+        async fn position(&self) -> Result<Option<LogCursor>> {
             let row: Option<(i64,)> =
                 sqlx::query_as("SELECT active FROM causal_replay_pointer WHERE id = 1")
                     .fetch_optional(&self.db)
                     .await?;
-            Ok(row.map(|(v,)| v as u64))
+            Ok(row.map(|(v,)| LogCursor::from_raw(v as u64)))
         }
 
-        async fn save(&self, position: u64) -> Result<()> {
+        async fn save(&self, position: LogCursor) -> Result<()> {
             sqlx::query(
                 "UPDATE causal_replay_pointer
                  SET active = $1, updated_at = now()
                  WHERE id = 1",
             )
-            .bind(position as i64)
+            .bind(position.raw() as i64)
             .execute(&self.db)
             .await?;
             Ok(())
         }
 
-        async fn stage(&self, position: u64) -> Result<()> {
+        async fn stage(&self, position: LogCursor) -> Result<()> {
             sqlx::query(
                 "UPDATE causal_replay_pointer
                  SET staged = $1, updated_at = now()
                  WHERE id = 1",
             )
-            .bind(position as i64)
+            .bind(position.raw() as i64)
             .execute(&self.db)
             .await?;
             Ok(())
         }
 
-        async fn promote(&self) -> Result<u64> {
+        async fn promote(&self) -> Result<LogCursor> {
             let row: (i64,) = sqlx::query_as(
                 "UPDATE causal_replay_pointer
                  SET active = staged, staged = NULL, updated_at = now()
@@ -121,16 +123,16 @@ mod pg {
             )
             .fetch_one(&self.db)
             .await?;
-            Ok(row.0 as u64)
+            Ok(LogCursor::from_raw(row.0 as u64))
         }
 
-        async fn set(&self, position: u64) -> Result<()> {
+        async fn set(&self, position: LogCursor) -> Result<()> {
             sqlx::query(
                 "UPDATE causal_replay_pointer
                  SET active = $1, updated_at = now()
                  WHERE id = 1",
             )
-            .bind(position as i64)
+            .bind(position.raw() as i64)
             .execute(&self.db)
             .await?;
             Ok(())
@@ -143,8 +145,8 @@ mod pg {
             .fetch_one(&self.db)
             .await?;
             Ok(PointerStatus {
-                active: row.0 as u64,
-                staged: row.1.map(|v| v as u64),
+                active: LogCursor::from_raw(row.0 as u64),
+                staged: row.1.map(|v| LogCursor::from_raw(v as u64)),
                 updated_at: row.2,
             })
         }

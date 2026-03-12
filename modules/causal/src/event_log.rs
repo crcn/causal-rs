@@ -8,7 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::types::{AppendResult, NewEvent, PersistedEvent, Snapshot};
+use crate::types::{AppendResult, LogCursor, NewEvent, PersistedEvent, Snapshot, StreamVersion};
 
 /// Append-only event log with aggregate stream support.
 ///
@@ -34,7 +34,7 @@ pub trait EventLog: Send + Sync {
     /// new events via checkpoint cursor.
     async fn load_from(
         &self,
-        after_position: u64,
+        after: LogCursor,
         limit: usize,
     ) -> Result<Vec<PersistedEvent>>;
 
@@ -47,11 +47,11 @@ pub trait EventLog: Send + Sync {
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        after_version: Option<u64>,
+        after_version: Option<StreamVersion>,
     ) -> Result<Vec<PersistedEvent>>;
 
-    /// Latest global position in the log (0 if empty).
-    async fn latest_position(&self) -> Result<u64>;
+    /// Latest global position in the log (LogCursor::ZERO if empty).
+    async fn latest_position(&self) -> Result<LogCursor>;
 
     /// Load the latest snapshot for an aggregate.
     async fn load_snapshot(

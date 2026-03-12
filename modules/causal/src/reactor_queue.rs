@@ -37,7 +37,7 @@ pub trait ReactorQueue: Send + Sync {
     ///
     /// The engine uses this to determine where to resume reading from
     /// the EventLog via `load_from(checkpoint, limit)`.
-    async fn checkpoint(&self) -> Result<u64>;
+    async fn checkpoint(&self) -> Result<crate::types::LogCursor>;
 
     /// Claim the next ready reactor execution.
     ///

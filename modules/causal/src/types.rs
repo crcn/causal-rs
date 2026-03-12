@@ -37,6 +37,65 @@ pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
 }
 
+// ── Opaque cursor types ─────────────────────────────────────────
+
+/// Opaque cursor into the global event log.
+///
+/// Represents a monotonically increasing position in the append-only log.
+/// Gaps between values are allowed (e.g. Postgres BIGSERIAL). Consumers
+/// must never perform arithmetic on this value — use it only for
+/// ordering comparisons and as a checkpoint cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct LogCursor(u64);
+
+impl LogCursor {
+    pub const ZERO: LogCursor = LogCursor(0);
+
+    /// Wrap a raw u64 from a storage boundary (e.g. Postgres row).
+    pub fn from_raw(position: u64) -> Self {
+        LogCursor(position)
+    }
+
+    /// Unwrap to raw u64 for storage boundary (e.g. SQL parameter).
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for LogCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Opaque per-aggregate stream version.
+///
+/// Represents the version number within a single aggregate's event stream.
+/// Versions are contiguous within a stream (1, 2, 3, …). Used for
+/// optimistic concurrency, snapshot thresholds, and hydration replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct StreamVersion(u64);
+
+impl StreamVersion {
+    pub const ZERO: StreamVersion = StreamVersion(0);
+
+    /// Wrap a raw u64 from a storage boundary (e.g. Postgres row).
+    pub fn from_raw(version: u64) -> Self {
+        StreamVersion(version)
+    }
+
+    /// Unwrap to raw u64 for storage boundary (e.g. SQL parameter).
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for StreamVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // ── Constants ────────────────────────────────────────────────────
 
 /// UUID v5 namespace for deterministic event ID generation
@@ -91,7 +150,7 @@ pub struct IntentCommit {
     /// Reactor gate descriptions (reactor_id → serialized describe output).
     pub reactor_descriptions: HashMap<String, serde_json::Value>,
     /// Advance checkpoint to this EventLog position.
-    pub checkpoint: u64,
+    pub checkpoint: LogCursor,
     /// Park this event in DLQ (exceeded hops, exceeded retry, etc.)
     pub park: Option<EventPark>,
 }
@@ -264,10 +323,10 @@ pub struct AppendResult {
     /// values are allowed. Consumers must treat this as an opaque cursor for
     /// [`Store::load_global_from`](crate::store::Store::load_global_from) and
     /// should not perform arithmetic or assume a gapless sequence.
-    pub position: u64,
+    pub position: LogCursor,
     /// Per-aggregate stream version at the time of append. `None` for events
     /// that are not scoped to an aggregate.
-    pub version: Option<u64>,
+    pub version: Option<StreamVersion>,
 }
 
 /// A persisted event loaded from the store.
@@ -276,7 +335,7 @@ pub struct PersistedEvent {
     /// Opaque global ordering cursor. Monotonically increasing; gaps between
     /// values are allowed. Used for checkpoint-based cursor tracking —
     /// no arithmetic should be performed on this value.
-    pub position: u64,
+    pub position: LogCursor,
     /// Unique event ID.
     pub event_id: Uuid,
     /// Parent event that caused this event (None for root events).
@@ -294,7 +353,7 @@ pub struct PersistedEvent {
     /// Aggregate instance ID (only present for aggregate-scoped events).
     pub aggregate_id: Option<Uuid>,
     /// Per-aggregate stream version (only present for aggregate-scoped events).
-    pub version: Option<u64>,
+    pub version: Option<StreamVersion>,
     /// Application-level metadata (e.g. run_id, schema_v, actor).
     pub metadata: serde_json::Map<String, serde_json::Value>,
     /// Original typed event, available only during live dispatch in-process.
@@ -378,7 +437,7 @@ impl fmt::Debug for NewEvent {
 pub struct Snapshot {
     pub aggregate_type: String,
     pub aggregate_id: Uuid,
-    pub version: u64,
+    pub version: StreamVersion,
     pub state: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }

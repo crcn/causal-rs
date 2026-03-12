@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use causal::event_log::EventLog;
 use causal::types::NewEvent;
-use causal::MemoryStore;
+use causal::{LogCursor, MemoryStore};
 use causal_replay::{Mode, PointerStatus, PointerStore, ProjectionStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -13,45 +13,45 @@ use uuid::Uuid;
 // ── In-memory PointerStore for tests ────────────────────────────────
 
 struct MemoryPointerStore {
-    active: Mutex<u64>,
-    staged: Mutex<Option<u64>>,
+    active: Mutex<LogCursor>,
+    staged: Mutex<Option<LogCursor>>,
 }
 
 impl MemoryPointerStore {
     fn new() -> Self {
         Self {
-            active: Mutex::new(0),
+            active: Mutex::new(LogCursor::ZERO),
             staged: Mutex::new(None),
         }
     }
 
-    async fn active(&self) -> u64 {
+    async fn active(&self) -> LogCursor {
         *self.active.lock().await
     }
 
-    async fn staged_value(&self) -> Option<u64> {
+    async fn staged_value(&self) -> Option<LogCursor> {
         *self.staged.lock().await
     }
 }
 
 #[async_trait]
 impl PointerStore for MemoryPointerStore {
-    async fn version(&self) -> Result<Option<u64>> {
+    async fn position(&self) -> Result<Option<LogCursor>> {
         let v = *self.active.lock().await;
         Ok(Some(v))
     }
 
-    async fn save(&self, position: u64) -> Result<()> {
+    async fn save(&self, position: LogCursor) -> Result<()> {
         *self.active.lock().await = position;
         Ok(())
     }
 
-    async fn stage(&self, position: u64) -> Result<()> {
+    async fn stage(&self, position: LogCursor) -> Result<()> {
         *self.staged.lock().await = Some(position);
         Ok(())
     }
 
-    async fn promote(&self) -> Result<u64> {
+    async fn promote(&self) -> Result<LogCursor> {
         let staged = self
             .staged
             .lock()
@@ -62,7 +62,7 @@ impl PointerStore for MemoryPointerStore {
         Ok(staged)
     }
 
-    async fn set(&self, position: u64) -> Result<()> {
+    async fn set(&self, position: LogCursor) -> Result<()> {
         *self.active.lock().await = position;
         Ok(())
     }
@@ -121,7 +121,7 @@ async fn replay_processes_all_events_and_promotes() {
 
     assert_eq!(count.load(Ordering::SeqCst), 50);
     // MemoryStore positions start at 1, so last position = 50.
-    assert_eq!(pointer.active().await, 50);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(50));
     // Staged should be cleared after promote.
     assert_eq!(pointer.staged_value().await, None);
 }
@@ -138,7 +138,7 @@ async fn replay_empty_log_still_promotes() {
         .unwrap();
 
     // Position 0 staged and promoted (no events processed).
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
 }
 
 #[tokio::test]
@@ -165,7 +165,7 @@ async fn replay_fail_fast_on_apply_error() {
     assert!(result.is_err());
     assert_eq!(count.load(Ordering::SeqCst), 4); // processed 0,1,2,3 then stopped
     // Should NOT have promoted.
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
 }
 
 #[tokio::test]
@@ -182,7 +182,7 @@ async fn replay_checkpoints_during_progress() {
         .unwrap();
 
     // After replay, active should be final position (promoted).
-    assert_eq!(pointer.active().await, 25);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(25));
 }
 
 #[tokio::test]
@@ -198,7 +198,7 @@ async fn replay_promote_if_gate_passes() {
         .await
         .unwrap();
 
-    assert_eq!(pointer.active().await, 5);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(5));
 }
 
 #[tokio::test]
@@ -219,9 +219,9 @@ async fn replay_promote_if_gate_fails_stays_staged() {
         .to_string()
         .contains("promotion gate failed"));
     // Active should NOT have changed.
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
     // But staged should have the final position.
-    assert_eq!(pointer.staged_value().await, Some(5));
+    assert_eq!(pointer.staged_value().await, Some(LogCursor::from_raw(5)));
 }
 
 #[tokio::test]
@@ -241,7 +241,7 @@ async fn replay_promote_if_gate_error_propagates() {
         .unwrap_err()
         .to_string()
         .contains("health check exploded"));
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
 }
 
 #[tokio::test]
@@ -264,7 +264,7 @@ async fn replay_respects_batch_size() {
         .unwrap();
 
     assert_eq!(count.load(Ordering::SeqCst), 25);
-    assert_eq!(pointer.active().await, 25);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(25));
 }
 
 // ── Live mode tests ─────────────────────────────────────────────────
@@ -276,7 +276,7 @@ async fn live_catches_up_from_pointer() {
     append_events(&log, 20).await;
 
     // Set pointer to position 10 — should only process events after 10.
-    pointer.set(10).await.unwrap();
+    pointer.set(LogCursor::from_raw(10)).await.unwrap();
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_clone = seen.clone();
@@ -303,8 +303,8 @@ async fn live_catches_up_from_pointer() {
     let positions = seen.lock().await;
     // Positions 11..=20 (after position 10). MemoryStore starts at 1.
     assert_eq!(positions.len(), 10);
-    assert_eq!(positions[0], 11);
-    assert_eq!(positions[positions.len() - 1], 20);
+    assert_eq!(positions[0], LogCursor::from_raw(11));
+    assert_eq!(positions[positions.len() - 1], LogCursor::from_raw(20));
 }
 
 #[tokio::test]
@@ -335,7 +335,7 @@ async fn live_log_and_continue_on_error() {
     // All 10 events processed despite errors on 3 and 7.
     assert_eq!(count.load(Ordering::SeqCst), 10);
     // Pointer advanced past all events.
-    assert_eq!(pointer.active().await, 10);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(10));
 }
 
 #[tokio::test]
@@ -353,7 +353,7 @@ async fn live_saves_pointer_after_catchup_batch() {
     )
     .await;
 
-    assert_eq!(pointer.active().await, 5);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(5));
 }
 
 #[tokio::test]
@@ -371,7 +371,7 @@ async fn live_empty_log_enters_tail() {
     .await;
 
     assert!(result.is_err()); // timeout = expected (tailing forever)
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
 }
 
 // ── Edge cases ──────────────────────────────────────────────────────
@@ -394,7 +394,7 @@ async fn replay_single_event() {
         .unwrap();
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    assert_eq!(pointer.active().await, 1);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(1));
 }
 
 #[tokio::test]
@@ -410,7 +410,7 @@ async fn replay_error_on_first_event_processes_nothing() {
 
     assert!(result.is_err());
     // Active should not have changed (never promoted).
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
     // Staged should reflect the error on the first event (position 0, never staged).
     assert_eq!(pointer.staged_value().await, None);
 }
@@ -425,25 +425,25 @@ async fn replay_checkpoint_interval_stages_periodically() {
 
     struct SpyPointer {
         inner: MemoryPointerStore,
-        staged_log: Arc<Mutex<Vec<u64>>>,
+        staged_log: Arc<Mutex<Vec<LogCursor>>>,
     }
 
     #[async_trait]
     impl PointerStore for SpyPointer {
-        async fn version(&self) -> Result<Option<u64>> {
-            self.inner.version().await
+        async fn position(&self) -> Result<Option<LogCursor>> {
+            self.inner.position().await
         }
-        async fn save(&self, position: u64) -> Result<()> {
+        async fn save(&self, position: LogCursor) -> Result<()> {
             self.inner.save(position).await
         }
-        async fn stage(&self, position: u64) -> Result<()> {
+        async fn stage(&self, position: LogCursor) -> Result<()> {
             self.staged_log.lock().await.push(position);
             self.inner.stage(position).await
         }
-        async fn promote(&self) -> Result<u64> {
+        async fn promote(&self) -> Result<LogCursor> {
             self.inner.promote().await
         }
-        async fn set(&self, position: u64) -> Result<()> {
+        async fn set(&self, position: LogCursor) -> Result<()> {
             self.inner.set(position).await
         }
         async fn status(&self) -> Result<PointerStatus> {
@@ -467,9 +467,9 @@ async fn replay_checkpoint_interval_stages_periodically() {
     // MemoryStore positions start at 1.
     // Checkpoint at count 5 (position 5), count 10 (position 10), count 15 (position 15),
     // plus final stage save (also position 15).
-    assert!(stages.contains(&5), "stages: {:?}", *stages);
-    assert!(stages.contains(&10), "stages: {:?}", *stages);
-    assert!(stages.contains(&15), "stages: {:?}", *stages);
+    assert!(stages.contains(&LogCursor::from_raw(5)), "stages: {:?}", *stages);
+    assert!(stages.contains(&LogCursor::from_raw(10)), "stages: {:?}", *stages);
+    assert!(stages.contains(&LogCursor::from_raw(15)), "stages: {:?}", *stages);
 }
 
 #[tokio::test]
@@ -507,83 +507,83 @@ async fn replay_apply_receives_correct_event_data() {
     );
 }
 
-// ── stream.version() tests ──────────────────────────────────────────
+// ── stream.position() tests ──────────────────────────────────────────
 
 #[tokio::test]
-async fn version_live_returns_active_position() {
+async fn position_live_returns_active_position() {
     let log = MemoryStore::new();
     let pointer = MemoryPointerStore::new();
     append_events(&log, 50).await;
 
     // Simulate a previous replay that promoted to position 50.
-    pointer.set(50).await.unwrap();
+    pointer.set(LogCursor::from_raw(50)).await.unwrap();
 
     let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Live);
-    let version = stream.version().await.unwrap();
+    let position = stream.position().await.unwrap();
 
-    assert_eq!(version, 50);
+    assert_eq!(position, LogCursor::from_raw(50));
 }
 
 #[tokio::test]
-async fn version_live_returns_zero_when_no_prior_replay() {
+async fn position_live_returns_zero_when_no_prior_replay() {
     let log = MemoryStore::new();
     let pointer = MemoryPointerStore::new();
 
     let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Live);
-    let version = stream.version().await.unwrap();
+    let position = stream.position().await.unwrap();
 
-    assert_eq!(version, 0);
+    assert_eq!(position, LogCursor::ZERO);
 }
 
 #[tokio::test]
-async fn version_replay_snapshots_latest_position() {
+async fn position_replay_snapshots_latest_position() {
     let log = MemoryStore::new();
     let pointer = MemoryPointerStore::new();
     append_events(&log, 30).await;
 
     let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
-    let version = stream.version().await.unwrap();
+    let position = stream.position().await.unwrap();
 
     // Should return latest_position() from event log, not active.
-    assert_eq!(version, 30);
+    assert_eq!(position, LogCursor::from_raw(30));
 }
 
 #[tokio::test]
-async fn version_replay_stages_the_target() {
+async fn position_replay_stages_the_target() {
     let log = MemoryStore::new();
     let pointer = MemoryPointerStore::new();
     append_events(&log, 25).await;
 
     let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
-    let version = stream.version().await.unwrap();
+    let position = stream.position().await.unwrap();
 
-    assert_eq!(version, 25);
+    assert_eq!(position, LogCursor::from_raw(25));
     // Staged should hold the snapshot.
-    assert_eq!(pointer.staged_value().await, Some(25));
+    assert_eq!(pointer.staged_value().await, Some(LogCursor::from_raw(25)));
     // Active should NOT have changed.
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
 }
 
 #[tokio::test]
-async fn version_replay_empty_log_returns_zero() {
+async fn position_replay_empty_log_returns_zero() {
     let log = MemoryStore::new();
     let pointer = MemoryPointerStore::new();
 
     let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
-    let version = stream.version().await.unwrap();
+    let position = stream.position().await.unwrap();
 
-    assert_eq!(version, 0);
-    assert_eq!(pointer.staged_value().await, Some(0));
+    assert_eq!(position, LogCursor::ZERO);
+    assert_eq!(pointer.staged_value().await, Some(LogCursor::ZERO));
 }
 
 #[tokio::test]
-async fn version_replay_matches_promoted_active_after_run() {
+async fn position_replay_matches_promoted_active_after_run() {
     let log = MemoryStore::new();
     let pointer = MemoryPointerStore::new();
     append_events(&log, 40).await;
 
     let stream = ProjectionStream::new(&log, &pointer).mode(Mode::Replay);
-    let version = stream.version().await.unwrap();
+    let position = stream.position().await.unwrap();
 
     // Run the replay — should process all events and promote.
     stream
@@ -591,19 +591,19 @@ async fn version_replay_matches_promoted_active_after_run() {
         .await
         .unwrap();
 
-    // After promotion, active == the version we got before run().
-    assert_eq!(pointer.active().await, version);
-    assert_eq!(version, 40);
+    // After promotion, active == the position we got before run().
+    assert_eq!(pointer.active().await, position);
+    assert_eq!(position, LogCursor::from_raw(40));
 }
 
 #[tokio::test]
-async fn version_live_then_run_catches_up_from_version() {
+async fn position_live_then_run_catches_up_from_position() {
     let log = MemoryStore::new();
     let pointer = MemoryPointerStore::new();
     append_events(&log, 20).await;
 
     // Simulate prior replay promoted to position 10.
-    pointer.set(10).await.unwrap();
+    pointer.set(LogCursor::from_raw(10)).await.unwrap();
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_clone = seen.clone();
@@ -612,10 +612,10 @@ async fn version_live_then_run_catches_up_from_version() {
         .mode(Mode::Live)
         .poll_interval(std::time::Duration::from_millis(50));
 
-    let version = stream.version().await.unwrap();
-    assert_eq!(version, 10);
+    let position = stream.position().await.unwrap();
+    assert_eq!(position, LogCursor::from_raw(10));
 
-    // Live mode catches up from version (position 10).
+    // Live mode catches up from position (position 10).
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(200),
         stream.run(|event| {
@@ -632,8 +632,8 @@ async fn version_live_then_run_catches_up_from_version() {
     let positions = seen.lock().await;
     // Should have processed events 11..=20 (after position 10).
     assert_eq!(positions.len(), 10);
-    assert_eq!(positions[0], 11);
-    assert_eq!(positions[positions.len() - 1], 20);
+    assert_eq!(positions[0], LogCursor::from_raw(11));
+    assert_eq!(positions[positions.len() - 1], LogCursor::from_raw(20));
 }
 
 // ── run_batch tests ──────────────────────────────────────────────────
@@ -656,7 +656,7 @@ async fn run_batch_replay_processes_all_events_and_promotes() {
         .unwrap();
 
     assert_eq!(count.load(Ordering::SeqCst), 50);
-    assert_eq!(pointer.active().await, 50);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(50));
     assert_eq!(pointer.staged_value().await, None);
 }
 
@@ -686,7 +686,7 @@ async fn run_batch_replay_callback_receives_whole_batch() {
     let sizes = batch_sizes.lock().await;
     // 25 events with batch_size 7: batches of 7, 7, 7, 4
     assert_eq!(*sizes, vec![7, 7, 7, 4]);
-    assert_eq!(pointer.active().await, 25);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(25));
 }
 
 #[tokio::test]
@@ -714,7 +714,7 @@ async fn run_batch_replay_fail_fast_on_batch_error() {
     assert!(result.is_err());
     // 3 batches attempted (0, 1, 2) — failed on third.
     assert_eq!(call_count.load(Ordering::SeqCst), 3);
-    assert_eq!(pointer.active().await, 0); // not promoted
+    assert_eq!(pointer.active().await, LogCursor::ZERO); // not promoted
 }
 
 #[tokio::test]
@@ -727,25 +727,25 @@ async fn run_batch_replay_checkpoints_after_each_batch() {
 
     struct SpyPointer2 {
         inner: MemoryPointerStore,
-        staged_log: Arc<Mutex<Vec<u64>>>,
+        staged_log: Arc<Mutex<Vec<LogCursor>>>,
     }
 
     #[async_trait]
     impl PointerStore for SpyPointer2 {
-        async fn version(&self) -> Result<Option<u64>> {
-            self.inner.version().await
+        async fn position(&self) -> Result<Option<LogCursor>> {
+            self.inner.position().await
         }
-        async fn save(&self, position: u64) -> Result<()> {
+        async fn save(&self, position: LogCursor) -> Result<()> {
             self.inner.save(position).await
         }
-        async fn stage(&self, position: u64) -> Result<()> {
+        async fn stage(&self, position: LogCursor) -> Result<()> {
             self.staged_log.lock().await.push(position);
             self.inner.stage(position).await
         }
-        async fn promote(&self) -> Result<u64> {
+        async fn promote(&self) -> Result<LogCursor> {
             self.inner.promote().await
         }
-        async fn set(&self, position: u64) -> Result<()> {
+        async fn set(&self, position: LogCursor) -> Result<()> {
             self.inner.set(position).await
         }
         async fn status(&self) -> Result<PointerStatus> {
@@ -767,9 +767,9 @@ async fn run_batch_replay_checkpoints_after_each_batch() {
 
     let stages = staged_positions.lock().await;
     // 3 batches: position 5, 10, 15, plus final stage (15 again).
-    assert!(stages.contains(&5), "stages: {:?}", *stages);
-    assert!(stages.contains(&10), "stages: {:?}", *stages);
-    assert!(stages.contains(&15), "stages: {:?}", *stages);
+    assert!(stages.contains(&LogCursor::from_raw(5)), "stages: {:?}", *stages);
+    assert!(stages.contains(&LogCursor::from_raw(10)), "stages: {:?}", *stages);
+    assert!(stages.contains(&LogCursor::from_raw(15)), "stages: {:?}", *stages);
 }
 
 #[tokio::test]
@@ -797,7 +797,7 @@ async fn run_batch_replay_progress_callback_fires() {
     assert!(log.len() >= 3);
     let last = log.last().unwrap();
     assert_eq!(last.0, 20); // processed
-    assert_eq!(last.1, 20); // position
+    assert_eq!(last.1, LogCursor::from_raw(20)); // position
 }
 
 #[tokio::test]
@@ -811,7 +811,7 @@ async fn run_batch_replay_empty_log_still_promotes() {
         .await
         .unwrap();
 
-    assert_eq!(pointer.active().await, 0);
+    assert_eq!(pointer.active().await, LogCursor::ZERO);
 }
 
 #[tokio::test]
@@ -820,7 +820,7 @@ async fn run_batch_live_catches_up_from_pointer() {
     let pointer = MemoryPointerStore::new();
     append_events(&log, 20).await;
 
-    pointer.set(10).await.unwrap();
+    pointer.set(LogCursor::from_raw(10)).await.unwrap();
 
     let batch_sizes = Arc::new(Mutex::new(Vec::new()));
     let batch_sizes_clone = batch_sizes.clone();
@@ -844,7 +844,7 @@ async fn run_batch_live_catches_up_from_pointer() {
     let sizes = batch_sizes.lock().await;
     let total: usize = sizes.iter().sum();
     assert_eq!(total, 10); // events 11..=20
-    assert_eq!(pointer.active().await, 20);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(20));
 }
 
 #[tokio::test]
@@ -876,5 +876,5 @@ async fn run_batch_live_log_and_continue_on_error() {
     // Both batches processed despite first failing.
     assert!(call_count.load(Ordering::SeqCst) >= 2);
     // Pointer still advances past all events.
-    assert_eq!(pointer.active().await, 10);
+    assert_eq!(pointer.active().await, LogCursor::from_raw(10));
 }

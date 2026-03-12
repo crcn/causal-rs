@@ -82,8 +82,8 @@ impl MemoryStore {
     }
 
     /// Set the checkpoint position directly (for test setup / resume simulation).
-    pub fn set_checkpoint(&self, position: u64) {
-        self.checkpoint.store(position, Ordering::SeqCst);
+    pub fn set_checkpoint(&self, position: LogCursor) {
+        self.checkpoint.store(position.raw(), Ordering::SeqCst);
     }
 
     /// Access the global event log (for test assertions).
@@ -114,7 +114,7 @@ impl EventLog for MemoryStore {
             });
         }
 
-        let position = self.global_position.fetch_add(1, Ordering::SeqCst);
+        let position = LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
 
         // Compute per-aggregate version if aggregate metadata is present
         let version = if let (Some(ref agg_type), Some(agg_id)) =
@@ -127,7 +127,7 @@ impl EventLog for MemoryStore {
                         && e.aggregate_id == Some(agg_id)
                 })
                 .count() as u64;
-            Some(count + 1)
+            Some(StreamVersion::from_raw(count + 1))
         } else {
             None
         };
@@ -153,13 +153,13 @@ impl EventLog for MemoryStore {
 
     async fn load_from(
         &self,
-        after_position: u64,
+        after: LogCursor,
         limit: usize,
     ) -> Result<Vec<PersistedEvent>> {
         let log = self.global_log.lock();
         let events = log
             .iter()
-            .filter(|e| e.position > after_position)
+            .filter(|e| e.position > after)
             .take(limit)
             .cloned()
             .collect();
@@ -170,25 +170,25 @@ impl EventLog for MemoryStore {
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        after_version: Option<u64>,
+        after_version: Option<StreamVersion>,
     ) -> Result<Vec<PersistedEvent>> {
         let log = self.global_log.lock();
-        let min_version = after_version.unwrap_or(0);
+        let min_version = after_version.unwrap_or(StreamVersion::ZERO);
         let events = log
             .iter()
             .filter(|e| {
                 e.aggregate_type.as_deref() == Some(aggregate_type)
                     && e.aggregate_id == Some(aggregate_id)
-                    && (after_version.is_none() || e.version.unwrap_or(0) > min_version)
+                    && (after_version.is_none() || e.version.unwrap_or(StreamVersion::ZERO) > min_version)
             })
             .cloned()
             .collect();
         Ok(events)
     }
 
-    async fn latest_position(&self) -> Result<u64> {
+    async fn latest_position(&self) -> Result<LogCursor> {
         let log = self.global_log.lock();
-        Ok(log.last().map(|e| e.position).unwrap_or(0))
+        Ok(log.last().map(|e| e.position).unwrap_or(LogCursor::ZERO))
     }
 
     async fn load_snapshot(
@@ -258,13 +258,13 @@ impl ReactorQueue for MemoryStore {
         }
 
         // Advance checkpoint
-        self.checkpoint.store(commit.checkpoint, Ordering::SeqCst);
+        self.checkpoint.store(commit.checkpoint.raw(), Ordering::SeqCst);
 
         Ok(())
     }
 
-    async fn checkpoint(&self) -> Result<u64> {
-        Ok(self.checkpoint.load(Ordering::SeqCst))
+    async fn checkpoint(&self) -> Result<LogCursor> {
+        Ok(LogCursor::from_raw(self.checkpoint.load(Ordering::SeqCst)))
     }
 
     async fn dequeue(&self) -> Result<Option<QueuedReactor>> {

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use causal::event_log::EventLog;
 use causal::types::PersistedEvent;
+use causal::LogCursor;
 
 use crate::pointer::PointerStore;
 use crate::tail::{PollTailSource, TailSource};
@@ -24,10 +25,10 @@ type ProgressCallback = Box<dyn Fn(ReplayProgress) + Send + Sync>;
 pub struct ReplayProgress {
     /// Events processed so far.
     pub processed: usize,
-    /// Target position (from `version()`).
-    pub target: u64,
+    /// Target position (from `position()`).
+    pub target: LogCursor,
     /// Current position in the event log.
-    pub position: u64,
+    pub position: LogCursor,
 }
 
 /// Mode for projection stream execution.
@@ -144,28 +145,28 @@ impl<'a> ProjectionStream<'a> {
         self
     }
 
-    /// Resolve the current version.
+    /// Resolve the current position.
     ///
     /// - **Live mode**: returns the promoted `active` position from the pointer.
     /// - **Replay mode**: snapshots `latest_position()` from the event log,
-    ///   stages it, and returns it. This is the target version for the replay.
+    ///   stages it, and returns it. This is the target position for the replay.
     ///
     /// Call before `run()` to derive the database name:
     ///
     /// ```ignore
     /// let stream = ProjectionStream::new(&log, &pointer);
-    /// let version = stream.version().await?;
-    /// let neo4j = connect(&format!("neo4j.v{version}"));
-    /// stream.run(|event| apply(event)).await?;
+    /// let position = stream.position().await?;
+    /// let neo4j = connect(&format!("neo4j.v{position}")).await?;
+    /// stream.run(|event| projections.apply(event)).await?;
     /// ```
-    pub async fn version(&self) -> Result<u64> {
+    pub async fn position(&self) -> Result<LogCursor> {
         let mode = self.mode.unwrap_or_else(Mode::from_env);
         match mode {
-            Mode::Live => Ok(self.pointer.version().await?.unwrap_or(0)),
+            Mode::Live => Ok(self.pointer.position().await?.unwrap_or(LogCursor::ZERO)),
             Mode::Replay => {
                 let target = self.log.latest_position().await?;
                 self.pointer.stage(target).await?;
-                tracing::info!(target, "replay target version staged");
+                tracing::info!(target = target.raw(), "replay target position staged");
                 Ok(target)
             }
         }
@@ -214,11 +215,11 @@ impl<'a> ProjectionStream<'a> {
         F: Fn(&PersistedEvent) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let mut position = 0u64;
+        let mut position = LogCursor::ZERO;
         let mut count = 0usize;
         let target = self.log.latest_position().await?;
 
-        tracing::info!(target, "replay starting from position 0");
+        tracing::info!(target = target.raw(), "replay starting from position 0");
 
         loop {
             let events = self.log.load_from(position, self.batch_size).await?;
@@ -234,7 +235,7 @@ impl<'a> ProjectionStream<'a> {
 
                 if count % self.checkpoint_interval == 0 {
                     self.pointer.stage(position).await?;
-                    tracing::info!(position, count, target, "replay progress");
+                    tracing::info!(position = position.raw(), count, target = target.raw(), "replay progress");
 
                     if let Some(ref cb) = self.progress_callback {
                         cb(ReplayProgress { processed: count, target, position });
@@ -252,11 +253,11 @@ impl<'a> ProjectionStream<'a> {
         F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let mut position = 0u64;
+        let mut position = LogCursor::ZERO;
         let mut count = 0usize;
         let target = self.log.latest_position().await?;
 
-        tracing::info!(target, "replay starting from position 0");
+        tracing::info!(target = target.raw(), "replay starting from position 0");
 
         loop {
             let events = self.log.load_from(position, self.batch_size).await?;
@@ -271,7 +272,7 @@ impl<'a> ProjectionStream<'a> {
             position = events.last().unwrap().position;
 
             self.pointer.stage(position).await?;
-            tracing::info!(position, count, target, "replay progress");
+            tracing::info!(position = position.raw(), count, target = target.raw(), "replay progress");
 
             if let Some(ref cb) = self.progress_callback {
                 cb(ReplayProgress { processed: count, target, position });
@@ -282,9 +283,9 @@ impl<'a> ProjectionStream<'a> {
     }
 
     /// Shared replay finish: final stage, progress, promotion.
-    async fn finish_replay(&self, position: u64, count: usize, target: u64) -> Result<()> {
+    async fn finish_replay(&self, position: LogCursor, count: usize, target: LogCursor) -> Result<()> {
         self.pointer.stage(position).await?;
-        tracing::info!(position, count, target, "replay complete");
+        tracing::info!(position = position.raw(), count, target = target.raw(), "replay complete");
 
         if let Some(ref cb) = self.progress_callback {
             cb(ReplayProgress { processed: count, target, position });
@@ -294,15 +295,15 @@ impl<'a> ProjectionStream<'a> {
         if let Some(ref gate) = self.promote_gate {
             if gate().await? {
                 let promoted = self.pointer.promote().await?;
-                tracing::info!(promoted, "promoted");
+                tracing::info!(promoted = promoted.raw(), "promoted");
             } else {
-                tracing::warn!(position, "promotion gate failed, staged only");
+                tracing::warn!(position = position.raw(), "promotion gate failed, staged only");
                 anyhow::bail!("promotion gate failed at position {position}");
             }
         } else {
             // No gate = auto-promote.
             let promoted = self.pointer.promote().await?;
-            tracing::info!(promoted, "promoted");
+            tracing::info!(promoted = promoted.raw(), "promoted");
         }
 
         Ok(())
@@ -314,8 +315,8 @@ impl<'a> ProjectionStream<'a> {
         F: Fn(&PersistedEvent) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let mut position = self.pointer.version().await?.unwrap_or(0);
-        tracing::info!(position, "live mode: catching up");
+        let mut position = self.pointer.position().await?.unwrap_or(LogCursor::ZERO);
+        tracing::info!(position = position.raw(), "live mode: catching up");
 
         // Catch up.
         loop {
@@ -328,7 +329,7 @@ impl<'a> ProjectionStream<'a> {
                 // Log and continue in live mode.
                 if let Err(e) = apply(event).await {
                     tracing::warn!(
-                        position = event.position,
+                        position = event.position.raw(),
                         error = %e,
                         "projection error, skipping"
                     );
@@ -338,7 +339,7 @@ impl<'a> ProjectionStream<'a> {
             self.pointer.save(position).await?;
         }
 
-        tracing::info!(position, "caught up, tailing");
+        tracing::info!(position = position.raw(), "caught up, tailing");
 
         // Build the fallback poll source.
         let poll_source = PollTailSource::new(self.poll_interval);
@@ -366,7 +367,7 @@ impl<'a> ProjectionStream<'a> {
             for event in &events {
                 if let Err(e) = apply(event).await {
                     tracing::warn!(
-                        position = event.position,
+                        position = event.position.raw(),
                         error = %e,
                         "projection error, skipping"
                     );
@@ -385,8 +386,8 @@ impl<'a> ProjectionStream<'a> {
         F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let mut position = self.pointer.version().await?.unwrap_or(0);
-        tracing::info!(position, "live mode: catching up");
+        let mut position = self.pointer.position().await?.unwrap_or(LogCursor::ZERO);
+        tracing::info!(position = position.raw(), "live mode: catching up");
 
         // Catch up.
         loop {
@@ -405,7 +406,7 @@ impl<'a> ProjectionStream<'a> {
             self.pointer.save(position).await?;
         }
 
-        tracing::info!(position, "caught up, tailing");
+        tracing::info!(position = position.raw(), "caught up, tailing");
 
         // Build the fallback poll source.
         let poll_source = PollTailSource::new(self.poll_interval);
