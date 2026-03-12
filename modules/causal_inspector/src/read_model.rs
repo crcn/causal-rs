@@ -252,10 +252,12 @@ pub trait InspectorReadModel: Send + Sync {
     ///
     /// Optionally filter by search string (matches correlation_id or root event type).
     /// Returns most recent correlations first, limited by `limit`.
+    /// Pass `cursor` (last_ts of previous page's last item) for pagination.
     async fn list_correlations(
         &self,
         search: Option<&str>,
         limit: usize,
+        cursor: Option<DateTime<Utc>>,
     ) -> Result<Vec<CorrelationSummaryEntry>>;
 
     /// Derive the reactor dependency graph from the event log.

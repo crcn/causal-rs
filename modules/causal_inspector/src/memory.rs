@@ -360,16 +360,20 @@ impl InspectorReadModel for MemoryStore {
         &self,
         search: Option<&str>,
         limit: usize,
+        cursor: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<CorrelationSummaryEntry>> {
         let log = self.global_log().lock();
 
-        // Group events by correlation_id
+        // Group events by correlation_id, skipping nil UUIDs
         let mut by_corr: std::collections::HashMap<
             Uuid,
             (i64, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, String),
         > = std::collections::HashMap::new();
 
         for e in log.iter() {
+            if e.correlation_id.is_nil() {
+                continue;
+            }
             let entry = by_corr
                 .entry(e.correlation_id)
                 .or_insert_with(|| (0, e.created_at, e.created_at, String::new()));
@@ -426,6 +430,12 @@ impl InspectorReadModel for MemoryStore {
 
         // Sort by last_ts descending (most recent first)
         results.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+
+        // Apply cursor: skip entries with last_ts >= cursor
+        if let Some(cursor_ts) = cursor {
+            results.retain(|r| r.last_ts < cursor_ts);
+        }
+
         results.truncate(limit);
 
         Ok(results)

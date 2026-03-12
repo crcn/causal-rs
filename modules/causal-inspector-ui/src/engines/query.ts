@@ -5,7 +5,7 @@ import type {
   InspectorEventsPage,
   InspectorCausalTree,
   InspectorCausalFlow,
-  CorrelationSummary,
+  CorrelationSummaryPage,
   ReactorDependency,
   AggregateLifecycleEntry,
   ReactorLog,
@@ -178,14 +178,30 @@ export const createQueryEngine = (
       }
     };
 
-    const fetchCorrelations = async (search?: string) => {
+    let correlationCursor: string | null = null;
+
+    const fetchCorrelations = async (opts?: { search?: string; append?: boolean }) => {
+      const append = opts?.append ?? false;
+      const cursor = append ? correlationCursor : undefined;
+
       try {
         const data = await transport.query<{
-          inspectorCorrelations: CorrelationSummary[];
-        }>(INSPECTOR_CORRELATIONS, { search: search || undefined, limit: 100 });
+          inspectorCorrelations: CorrelationSummaryPage;
+        }>(INSPECTOR_CORRELATIONS, {
+          search: opts?.search || undefined,
+          limit: 50,
+          cursor: cursor || undefined,
+        });
+
+        correlationCursor = data.inspectorCorrelations.nextCursor;
+
         dispatch({
           type: "events/correlations_loaded",
-          payload: data.inspectorCorrelations,
+          payload: {
+            correlations: data.inspectorCorrelations.correlations,
+            hasMore: data.inspectorCorrelations.nextCursor != null,
+            append,
+          },
         });
       } catch (e) {
         console.error("[causal-inspector] fetch correlations failed:", e);
@@ -254,8 +270,7 @@ export const createQueryEngine = (
       }
     };
 
-    // Initial load
-    fetchEvents();
+    // Initial load — overview mode: correlations (not raw events)
     fetchCorrelations();
     fetchReactorDependencies();
     fetchAggregateKeys();
@@ -288,18 +303,45 @@ export const createQueryEngine = (
             fetchCausalTree(event.payload.seq);
             break;
 
-          case "ui/filter_changed":
-            dispatch({
-              type: "events/page_loaded",
-              payload: { events: [], hasMore: true },
-            });
-            fetchEvents();
+          case "ui/filter_changed": {
+            const newCorrelationId = (event.payload as Partial<{ correlationId: string | null }>).correlationId;
+            if (newCorrelationId !== undefined) {
+              if (newCorrelationId) {
+                // Entering detail mode: clear events, fetch raw events
+                dispatch({
+                  type: "events/page_loaded",
+                  payload: { events: [], hasMore: true },
+                });
+                fetchEvents();
+              } else {
+                // Returning to overview mode: clear events, refresh correlations
+                dispatch({
+                  type: "events/page_loaded",
+                  payload: { events: [], hasMore: false },
+                });
+                correlationCursor = null;
+                fetchCorrelations();
+              }
+            } else {
+              // Other filter changes (search, aggregateKey) in detail mode
+              dispatch({
+                type: "events/page_loaded",
+                payload: { events: [], hasMore: true },
+              });
+              fetchEvents();
+            }
+            break;
+          }
+
+          case "ui/load_more_correlations_requested":
+            fetchCorrelations({ append: true });
             break;
 
           case "ui/correlations_requested":
-            fetchCorrelations(event.payload.search);
+            correlationCursor = null;
+            fetchCorrelations({ search: event.payload.search });
             stopCorrelationPolling();
-            correlationPollTimer = setInterval(() => fetchCorrelations(event.payload.search), 5000);
+            correlationPollTimer = setInterval(() => fetchCorrelations({ search: event.payload.search }), 5000);
             break;
 
           case "ui/aggregate_lifecycle_requested":

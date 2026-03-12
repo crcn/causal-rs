@@ -106,6 +106,11 @@ export type CorrelationSummary = {
   hasErrors: boolean;
 };
 
+export type CorrelationSummaryPage = {
+  correlations: CorrelationSummary[];
+  nextCursor: string | null;
+};
+
 export type FilterState = {
   search: string;
   correlationId: string | null;

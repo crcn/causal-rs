@@ -143,6 +143,14 @@ pub struct CorrelationSummary {
     pub has_errors: bool,
 }
 
+/// Paginated correlation summary response.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct CorrelationSummaryPage {
+    pub correlations: Vec<CorrelationSummary>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct ReactorOutcome {

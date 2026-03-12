@@ -48,7 +48,7 @@ type OutcomesLoaded = BaseEvent<
   "events/outcomes_loaded",
   { correlationId: string; outcomes: ReactorOutcome[] }
 >;
-type CorrelationsLoaded = BaseEvent<"events/correlations_loaded", CorrelationSummary[]>;
+type CorrelationsLoaded = BaseEvent<"events/correlations_loaded", { correlations: CorrelationSummary[]; hasMore: boolean; append: boolean }>;
 type ReactorDependenciesLoaded = BaseEvent<"events/reactor_dependencies_loaded", ReactorDependency[]>;
 type AggregateKeysLoaded = BaseEvent<"events/aggregate_keys_loaded", string[]>;
 type AggregateLifecycleLoaded = BaseEvent<"events/aggregate_lifecycle_loaded", { key: string; entries: AggregateLifecycleEntry[] }>;
@@ -70,6 +70,7 @@ type ScrubberSpeedChanged = BaseEvent<"ui/scrubber_speed_changed", { speed: numb
 type CorrelationsRequested = BaseEvent<"ui/correlations_requested", { search?: string }>;
 type HandlerSelected = BaseEvent<"ui/handler_selected", { reactorId: string }>;
 type AggregateLifecycleRequested = BaseEvent<"ui/aggregate_lifecycle_requested", { aggregateKey: string }>;
+type LoadMoreCorrelationsRequested = BaseEvent<"ui/load_more_correlations_requested">;
 type LocationChanged = BaseEvent<"location/changed", { correlationId: string | null; handler: string | null }>;
 
 // ── Union ──
@@ -105,4 +106,5 @@ export type InspectorMachineEvent =
   | HandlerSelected
   | LocationChanged
   | AggregateLifecycleLoaded
-  | AggregateLifecycleRequested;
+  | AggregateLifecycleRequested
+  | LoadMoreCorrelationsRequested;

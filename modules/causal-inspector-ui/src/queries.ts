@@ -159,14 +159,17 @@ export const INSPECTOR_AGGREGATE_LIFECYCLE = `
 `;
 
 export const INSPECTOR_CORRELATIONS = `
-  query InspectorCorrelations($search: String, $limit: Int) {
-    inspectorCorrelations(search: $search, limit: $limit) {
-      correlationId
-      eventCount
-      firstTs
-      lastTs
-      rootEventType
-      hasErrors
+  query InspectorCorrelations($search: String, $limit: Int, $cursor: String) {
+    inspectorCorrelations(search: $search, limit: $limit, cursor: $cursor) {
+      correlations {
+        correlationId
+        eventCount
+        firstTs
+        lastTs
+        rootEventType
+        hasErrors
+      }
+      nextCursor
     }
   }
 `;

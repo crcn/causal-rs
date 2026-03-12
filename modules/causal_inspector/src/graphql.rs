@@ -264,24 +264,37 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
-    /// List all correlation chains with summary stats.
+    /// List all correlation chains with summary stats (paginated).
     async fn inspector_correlations(
         &self,
         ctx: &Context<'_>,
         search: Option<String>,
         limit: Option<i32>,
-    ) -> Result<Vec<CorrelationSummary>> {
+        cursor: Option<String>,
+    ) -> Result<CorrelationSummaryPage> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
         let lim = (limit.unwrap_or(50) as usize).min(200);
 
+        let cursor_ts = cursor
+            .as_deref()
+            .map(|s| s.parse::<DateTime<Utc>>())
+            .transpose()
+            .map_err(|e| async_graphql::Error::new(format!("Invalid cursor: {e}")))?;
+
         let entries = read_model
-            .list_correlations(search.as_deref(), lim)
+            .list_correlations(search.as_deref(), lim, cursor_ts)
             .await
             .map_err(|e| {
                 async_graphql::Error::new(format!("Failed to load correlations: {e}"))
             })?;
 
-        Ok(entries
+        let next_cursor = if entries.len() == lim {
+            entries.last().map(|e| e.last_ts.to_rfc3339())
+        } else {
+            None
+        };
+
+        let correlations = entries
             .into_iter()
             .map(|r| CorrelationSummary {
                 correlation_id: r.correlation_id,
@@ -291,7 +304,9 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
                 root_event_type: r.root_event_type,
                 has_errors: r.has_errors,
             })
-            .collect())
+            .collect();
+
+        Ok(CorrelationSummaryPage { correlations, next_cursor })
     }
 
     /// Derive the reactor dependency graph from the event log.

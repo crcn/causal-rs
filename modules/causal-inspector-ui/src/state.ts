@@ -53,6 +53,7 @@ export type InspectorState = {
   // Correlations
   correlations: CorrelationSummary[];
   correlationsLoading: boolean;
+  correlationsHasMore: boolean;
 
   // Reactor dependency map
   reactorDependencies: ReactorDependency[];
@@ -107,6 +108,7 @@ export const initialState: InspectorState = {
 
   correlations: [],
   correlationsLoading: false,
+  correlationsHasMore: true,
 
   reactorDependencies: [],
 
