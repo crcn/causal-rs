@@ -50,6 +50,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
         correlation_id: Option<String>,
+        aggregate_key: Option<String>,
     ) -> Result<InspectorEventsPage> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
         let lim = (limit.unwrap_or(50) as usize).min(200);
@@ -61,6 +62,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             from,
             to,
             correlation_id,
+            aggregate_key,
         };
 
         let stored = read_model

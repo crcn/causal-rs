@@ -19,10 +19,26 @@ pub struct InspectorEvent {
     /// Correlation ID linking the full causal chain.
     pub correlation_id: Option<String>,
     pub reactor_id: Option<String>,
+    /// Aggregate type (e.g. "Order"), if this event matched an aggregator.
+    pub aggregate_type: Option<String>,
+    /// Aggregate instance ID, if this event matched an aggregator.
+    pub aggregate_id: Option<String>,
+    /// Per-stream version, if this event matched an aggregator.
+    pub stream_version: Option<i64>,
     /// Optional one-line summary from `EventDisplay::summary`.
     pub summary: Option<String>,
     /// JSON payload as string.
     pub payload: String,
+}
+
+impl InspectorEvent {
+    /// Composite aggregate key (e.g. "Order:00000000-…"), or `None` if no aggregate identity.
+    pub fn aggregate_key(&self) -> Option<String> {
+        match (&self.aggregate_type, &self.aggregate_id) {
+            (Some(t), Some(id)) => Some(format!("{t}:{id}")),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

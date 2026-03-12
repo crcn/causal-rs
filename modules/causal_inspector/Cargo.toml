@@ -10,10 +10,9 @@ description = "Inspector backend for causal event-driven applications"
 [features]
 default = []
 graphql = ["async-graphql"]
-postgres = ["sqlx"]
+axum = ["dep:axum", "dep:async-graphql-axum", "graphql"]
 memory = ["causal"]
 cache = []
-broadcast = ["postgres"]
 
 [dependencies]
 chrono = { workspace = true }
@@ -25,8 +24,9 @@ uuid = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "chrono", "uuid"], optional = true }
-causal = { version = "0.1.0", path = "../causal", default-features = false, optional = true }
+causal = { version = "0.1.2", path = "../causal", default-features = false, optional = true }
 async-graphql = { version = "7", features = ["chrono"], optional = true }
+async-graphql-axum = { version = "7", optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
 async-stream = "0.3"
 futures = { workspace = true }

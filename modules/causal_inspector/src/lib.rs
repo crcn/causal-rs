@@ -2,26 +2,23 @@ pub mod types;
 pub mod display;
 pub mod read_model;
 
-#[cfg(feature = "postgres")]
-pub mod queries;
-
-#[cfg(feature = "postgres")]
-pub mod postgres;
-
 #[cfg(feature = "memory")]
 pub mod memory;
 
 #[cfg(feature = "cache")]
 pub mod cache;
 
-#[cfg(feature = "broadcast")]
-pub mod broadcast;
-
 #[cfg(feature = "graphql")]
 pub mod graphql;
 
 #[cfg(feature = "graphql")]
 pub use graphql::{CausalInspectorQuery, CausalInspectorSubscription};
+
+#[cfg(feature = "axum")]
+mod axum_router;
+
+#[cfg(feature = "axum")]
+pub use axum_router::router;
 
 pub use types::*;
 pub use display::{EventDisplay, DefaultEventDisplay};

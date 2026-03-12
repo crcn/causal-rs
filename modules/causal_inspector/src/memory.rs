@@ -31,6 +31,9 @@ fn to_stored(e: &causal::types::PersistedEvent) -> StoredEvent {
             .get("reactor_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        aggregate_type: e.aggregate_type.clone(),
+        aggregate_id: e.aggregate_id,
+        stream_version: e.version.map(|v| v.raw()),
     }
 }
 
@@ -64,6 +67,16 @@ impl InspectorReadModel for MemoryStore {
                 // Correlation ID filter
                 if let Some(ref cid) = query.correlation_id {
                     if e.correlation_id.to_string() != *cid {
+                        return false;
+                    }
+                }
+                // Aggregate key filter (e.g. "Order:00000000-…")
+                if let Some(ref key) = query.aggregate_key {
+                    let event_key = match (&e.aggregate_type, &e.aggregate_id) {
+                        (Some(t), Some(id)) => format!("{t}:{id}"),
+                        _ => return false,
+                    };
+                    if event_key != *key {
                         return false;
                     }
                 }

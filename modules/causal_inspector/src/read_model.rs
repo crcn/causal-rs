@@ -33,6 +33,12 @@ pub struct StoredEvent {
     pub correlation_id: Option<Uuid>,
     /// Reactor that produced this event.
     pub reactor_id: Option<String>,
+    /// Aggregate type (e.g. "Order"), if this event matched an aggregator.
+    pub aggregate_type: Option<String>,
+    /// Aggregate instance ID, if this event matched an aggregator.
+    pub aggregate_id: Option<Uuid>,
+    /// Per-stream version, if this event matched an aggregator.
+    pub stream_version: Option<u64>,
 }
 
 impl StoredEvent {
@@ -51,8 +57,19 @@ impl StoredEvent {
             parent_id: self.parent_id.map(|u| u.to_string()),
             correlation_id: self.correlation_id.map(|u| u.to_string()),
             reactor_id: self.reactor_id.clone(),
+            aggregate_type: self.aggregate_type.clone(),
+            aggregate_id: self.aggregate_id.map(|u| u.to_string()),
+            stream_version: self.stream_version.map(|v| v as i64),
             summary,
             payload: payload_str,
+        }
+    }
+
+    /// Composite aggregate key (e.g. "Order:00000000-…"), or `None` if no aggregate identity.
+    pub fn aggregate_key(&self) -> Option<String> {
+        match (&self.aggregate_type, &self.aggregate_id) {
+            (Some(t), Some(id)) => Some(format!("{t}:{id}")),
+            _ => None,
         }
     }
 }
@@ -72,6 +89,8 @@ pub struct EventQuery {
     pub to: Option<DateTime<Utc>>,
     /// Filter to a specific correlation chain.
     pub correlation_id: Option<String>,
+    /// Filter to a specific aggregate stream (e.g. "Order:00000000-…").
+    pub aggregate_key: Option<String>,
 }
 
 /// A reactor log entry.
@@ -164,13 +183,8 @@ pub struct CorrelationSummaryEntry {
 /// # Example
 ///
 /// ```ignore
-/// // In-memory (dev/testing)
 /// let store = Arc::new(MemoryStore::new());
 /// schema_builder.data(store.clone() as Arc<dyn InspectorReadModel>);
-///
-/// // Postgres (production)
-/// let pg = Arc::new(PostgresInspectorStore::new(pool));
-/// schema_builder.data(pg as Arc<dyn InspectorReadModel>);
 /// ```
 #[async_trait]
 pub trait InspectorReadModel: Send + Sync {

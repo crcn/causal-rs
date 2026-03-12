@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::types::InspectorEvent;
@@ -17,6 +16,8 @@ pub struct EventCache {
     by_seq: HashMap<i64, Arc<InspectorEvent>>,
     by_correlation: HashMap<Uuid, Vec<i64>>,
     by_handler: HashMap<String, Vec<i64>>,
+    /// Index by composite aggregate key ("Type:id") for stream filtering.
+    by_stream: HashMap<String, Vec<i64>>,
     capacity: usize,
 }
 
@@ -27,35 +28,9 @@ impl EventCache {
             by_seq: HashMap::new(),
             by_correlation: HashMap::new(),
             by_handler: HashMap::new(),
+            by_stream: HashMap::new(),
             capacity,
         }
-    }
-
-    /// Hydrate from Postgres — loads the most recent N events.
-    #[cfg(feature = "postgres")]
-    pub async fn hydrate(
-        pool: &sqlx::PgPool,
-        capacity: usize,
-        display: &dyn crate::display::EventDisplay,
-    ) -> anyhow::Result<Self> {
-        let start = std::time::Instant::now();
-
-        let stored = crate::queries::get_events_from_seq(pool, 0, capacity as i64).await?;
-
-        let mut cache = Self::new(capacity);
-        for event in stored {
-            let evt = Arc::new(event.to_inspector_event(display));
-            cache.push_unchecked(evt);
-        }
-
-        let elapsed = start.elapsed();
-        info!(
-            events = cache.events.len(),
-            elapsed_ms = elapsed.as_millis(),
-            "Event cache hydrated"
-        );
-
-        Ok(cache)
     }
 
     /// Push a new event into the cache. Evicts the oldest if at capacity.
@@ -77,6 +52,10 @@ impl EventCache {
 
         if let Some(ref reactor_id) = event.reactor_id {
             self.by_handler.entry(reactor_id.clone()).or_default().push(seq);
+        }
+
+        if let Some(key) = event.aggregate_key() {
+            self.by_stream.entry(key).or_default().push(seq);
         }
 
         self.events.push_back(event);
@@ -111,6 +90,17 @@ impl EventCache {
                 }
             }
         }
+
+        if let Some(key) = evicted.aggregate_key() {
+            if let Some(bucket) = self.by_stream.get_mut(&key) {
+                if let Ok(pos) = bucket.binary_search(&seq) {
+                    bucket.remove(pos);
+                }
+                if bucket.is_empty() {
+                    self.by_stream.remove(&key);
+                }
+            }
+        }
     }
 
     /// Get a single event by seq.
@@ -126,6 +116,7 @@ impl EventCache {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
         correlation_id: Option<&str>,
+        aggregate_key: Option<&str>,
         limit: usize,
     ) -> (Vec<Arc<InspectorEvent>>, Option<i64>) {
         let term_lower = term.map(|t| t.to_lowercase());
@@ -134,9 +125,14 @@ impl EventCache {
             .and_then(|cid| Uuid::parse_str(cid).ok())
             .and_then(|uuid| self.by_correlation.get(&uuid));
 
+        let stream_seqs: Option<&Vec<i64>> = aggregate_key
+            .and_then(|key| self.by_stream.get(key));
+
         let mut results = Vec::with_capacity(limit);
 
-        let iter: Box<dyn Iterator<Item = &Arc<InspectorEvent>>> = if let Some(seqs) = correlation_seqs {
+        let iter: Box<dyn Iterator<Item = &Arc<InspectorEvent>>> = if let Some(seqs) = stream_seqs {
+            Box::new(seqs.iter().rev().filter_map(|s| self.by_seq.get(s)))
+        } else if let Some(seqs) = correlation_seqs {
             Box::new(seqs.iter().rev().filter_map(|s| self.by_seq.get(s)))
         } else {
             Box::new(self.events.iter().rev())
@@ -231,34 +227,6 @@ impl EventCache {
 /// Thread-safe wrapper for the event cache.
 pub type SharedEventCache = Arc<RwLock<EventCache>>;
 
-/// Spawn a background task that listens to an `EventBroadcast` and feeds
-/// new events into the cache.
-#[cfg(feature = "broadcast")]
-pub fn spawn_cache_listener(
-    cache: SharedEventCache,
-    broadcast: &crate::broadcast::EventBroadcast,
-    display: Arc<dyn crate::display::EventDisplay>,
-) {
-    let mut rx = broadcast.subscribe();
-
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(stored) => {
-                    let event = Arc::new(stored.to_inspector_event(display.as_ref()));
-                    cache.write().await.push(event);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(skipped = n, "Event cache listener lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    warn!("Event broadcast channel closed — cache listener stopping");
-                    break;
-                }
-            }
-        }
-    });
-}
 
 #[cfg(test)]
 mod tests {
@@ -282,6 +250,9 @@ mod tests {
             parent_id: parent_id.map(String::from),
             correlation_id: correlation_id.map(String::from),
             reactor_id: reactor_id.map(String::from),
+            aggregate_type: None,
+            aggregate_id: None,
+            stream_version: None,
             summary: None,
             payload: payload.to_string(),
         }
@@ -323,7 +294,7 @@ mod tests {
         cache.push(Arc::new(make_event(1, "WorldEvent", r#"{"type":"meeting","title":"Community Meeting"}"#, None, None, None)));
         cache.push(Arc::new(make_event(2, "ScrapeEvent", r#"{"type":"scraped","url":"http://example.com"}"#, None, None, None)));
 
-        let (results, _) = cache.search(Some("community"), None, None, None, None, 50);
+        let (results, _) = cache.search(Some("community"), None, None, None, None, None, 50);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].seq, 1);
     }
@@ -363,12 +334,12 @@ mod tests {
             cache.push(Arc::new(make_event(i, "TestEvent", "{}", None, None, None)));
         }
 
-        let (page1, cursor1) = cache.search(None, None, None, None, None, 3);
+        let (page1, cursor1) = cache.search(None, None, None, None, None, None, 3);
         assert_eq!(page1.len(), 3);
         assert_eq!(page1[0].seq, 10);
         assert_eq!(cursor1, Some(8));
 
-        let (page2, _) = cache.search(None, cursor1, None, None, None, 3);
+        let (page2, _) = cache.search(None, cursor1, None, None, None, None, 3);
         assert_eq!(page2[0].seq, 7);
     }
 }
