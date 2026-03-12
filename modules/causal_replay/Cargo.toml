@@ -12,7 +12,7 @@ default = []
 postgres = ["dep:sqlx"]
 
 [dependencies]
-causal = { version = "0.1.1", path = "../causal" }
+causal = { version = "0.1.2", path = "../causal" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

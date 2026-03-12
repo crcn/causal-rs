@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 use causal::aggregator::{Aggregate, Apply};
-use causal::{event, events, reactor, Context, Engine, EventLog, Events, LogCursor, ReactorQueue, MemoryStore, NewEvent, Snapshot, StreamVersion};
+use causal::{aggregator, aggregators, event, events, reactor, Context, Engine, EventLog, Events, LogCursor, ReactorQueue, MemoryStore, NewEvent, Snapshot, StreamVersion};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -5292,6 +5292,96 @@ async fn journal_isolation_across_different_events() -> Result<()> {
             pe.event_id
         );
     }
+
+    Ok(())
+}
+
+// ── Bug: with_aggregators does not register codecs ───────────────
+
+#[event]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AggOnlyEvent {
+    id: Uuid,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct AggOnlyState {
+    seen: bool,
+}
+
+impl Aggregate for AggOnlyState {
+    fn aggregate_type() -> &'static str {
+        "AggOnlyState"
+    }
+}
+
+#[aggregators]
+mod agg_only_aggregators {
+    use super::*;
+
+    #[aggregator(id = "id")]
+    fn on_event(state: &mut AggOnlyState, event: AggOnlyEvent) {
+        state.seen = true;
+        let _ = event;
+    }
+}
+
+/// Regression: `with_aggregators` (bulk/macro path) must register event codecs
+/// so that `on_any` handlers can downcast events during cold-start replay.
+///
+/// `engine.emit()` and `events![]` both auto-register codecs at runtime, masking
+/// the bug. The real failure occurs when replaying historical events from the store
+/// on cold start — no ephemeral sidecar, no prior emit to register the codec.
+#[tokio::test]
+async fn with_aggregators_registers_codec_for_on_any_downcast() -> Result<()> {
+    use causal::reactor::AnyEvent;
+
+    let store = Arc::new(MemoryStore::new());
+
+    // Pre-seed the store with an AggOnlyEvent (simulates historical data)
+    let agg_event_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    store.append(NewEvent {
+        event_id: agg_event_id,
+        parent_id: None,
+        correlation_id,
+        event_type: "agg_only_event".to_string(),
+        payload: serde_json::json!({ "id": Uuid::new_v4().to_string() }),
+        created_at: chrono::Utc::now(),
+        aggregate_type: None,
+        aggregate_id: None,
+        metadata: serde_json::Map::new(),
+        ephemeral: None,
+        persistent: true,
+    }).await?;
+
+    let downcast_ok = Arc::new(AtomicUsize::new(0));
+    let downcast_ok2 = downcast_ok.clone();
+
+    // Build engine with aggregators (bulk path) — no typed reactor for AggOnlyEvent
+    let engine = Engine::with_backends(Deps, store.clone(), store.clone())
+        .with_aggregators(agg_only_aggregators::aggregators())
+        .with_reactor(
+            reactor::on_any()
+                .id("agg_only_any")
+                .then(move |event: AnyEvent, _ctx: Context<Deps>| {
+                    let flag = downcast_ok2.clone();
+                    async move {
+                        if event.downcast::<AggOnlyEvent>().is_some() {
+                            flag.store(1, Ordering::SeqCst);
+                        }
+                        Ok(events![])
+                    }
+                }),
+        );
+
+    engine.settle().await?;
+
+    assert_eq!(
+        downcast_ok.load(Ordering::SeqCst),
+        1,
+        "on_any handler should be able to downcast event registered only via with_aggregators"
+    );
 
     Ok(())
 }

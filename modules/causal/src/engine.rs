@@ -237,22 +237,13 @@ where
         A: Aggregate + Apply<E> + serde::Serialize + serde::de::DeserializeOwned,
         F: Fn(&E) -> Uuid + Send + Sync + 'static,
     {
-        // Register event codec so emitted events of this type can be deserialized
-        let codec = Arc::new(crate::event_codec::EventCodec {
-            event_prefix: E::event_prefix().to_string(),
-            type_id: std::any::TypeId::of::<E>(),
-            decode: Arc::new(|payload| {
-                let event: E = serde_json::from_value(payload.clone())?;
-                Ok(Arc::new(event))
-            }),
-        });
+        let aggregator = Aggregator::new::<E, A, F>(extract_id);
         Arc::get_mut(&mut self.reactors)
             .expect("Cannot add aggregator after cloning")
-            .register_codec(codec);
-
+            .register_codec(aggregator.codec().clone());
         Arc::get_mut(&mut self.aggregators)
             .expect("Cannot add aggregator after cloning")
-            .register(Aggregator::new::<E, A, F>(extract_id));
+            .register(aggregator);
         self
     }
 
@@ -261,10 +252,13 @@ where
     where
         I: IntoIterator<Item = Aggregator>,
     {
-        let registry = Arc::get_mut(&mut self.aggregators)
+        let reactor_registry = Arc::get_mut(&mut self.reactors)
+            .expect("Cannot add aggregators after cloning");
+        let agg_registry = Arc::get_mut(&mut self.aggregators)
             .expect("Cannot add aggregators after cloning");
         for aggregator in aggregators {
-            registry.register(aggregator);
+            reactor_registry.register_codec(aggregator.codec().clone());
+            agg_registry.register(aggregator);
         }
         self
     }
