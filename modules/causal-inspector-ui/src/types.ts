@@ -1,0 +1,86 @@
+/** Processed event from the causal inspector backend. */
+export type InspectorEvent = {
+  seq: number;
+  ts: string;
+  type: string;
+  name: string;
+  id: string | null;
+  parentId: string | null;
+  correlationId: string | null;
+  reactorId: string | null;
+  summary: string | null;
+  payload: string;
+};
+
+export type InspectorEventsPage = {
+  events: InspectorEvent[];
+  nextCursor: number | null;
+};
+
+export type InspectorCausalTree = {
+  events: InspectorEvent[];
+  rootSeq: number;
+};
+
+export type InspectorCausalFlow = {
+  events: InspectorEvent[];
+};
+
+export type ReactorLog = {
+  eventId: string;
+  reactorId: string;
+  level: string;
+  message: string;
+  data: unknown;
+  loggedAt: string;
+};
+
+/** Structured block within a reactor description (mirrors causal reactor DSL). */
+export type Block =
+  | { type: "label"; text: string }
+  | { type: "counter"; label: string; value: number; total: number }
+  | { type: "progress"; label: string; fraction: number }
+  | { type: "checklist"; label: string; items: { text: string; done: boolean }[] }
+  | { type: "key_value"; key: string; value: string }
+  | { type: "status"; label: string; state: "waiting" | "running" | "done" | "error" };
+
+export type ReactorDescription = {
+  reactorId: string;
+  blocks: Block[];
+};
+
+export type ReactorOutcome = {
+  reactorId: string;
+  status: string;
+  error: string | null;
+  attempts: number;
+  startedAt: string | null;
+  completedAt: string | null;
+  triggeringEventIds: string[];
+};
+
+export type FilterState = {
+  search: string;
+  from: string | null;
+  to: string | null;
+  correlationId: string | null;
+};
+
+export type LogsFilter = {
+  scope: "reactor" | "correlation";
+  eventId: string | null;
+  reactorId: string | null;
+  correlationId: string | null;
+};
+
+export type FlowSelection =
+  | { kind: "event-type"; reactorId: string | null; name: string }
+  | { kind: "reactor"; reactorId: string }
+  | null;
+
+/**
+ * Serialized pane layout — opaque JSON structure stored in state.
+ * Consumers (e.g. flexlayout-react) interpret this; the inspector
+ * just stores and round-trips it.
+ */
+export type PaneLayout = Record<string, unknown>;
