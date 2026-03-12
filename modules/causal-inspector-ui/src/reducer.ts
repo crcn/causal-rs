@@ -12,7 +12,25 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
 
     case "events/received": {
       const newEvents = event.payload;
-      draft.events.unshift(...newEvents);
+      // Filter subscription events against active filters so they don't
+      // pollute the view when the user has a search or correlation filter.
+      const filtered = newEvents.filter((e) => {
+        if (draft.filters.correlationId && e.correlationId !== draft.filters.correlationId) {
+          return false;
+        }
+        if (draft.filters.search) {
+          const s = draft.filters.search.toLowerCase();
+          const matches =
+            e.name.toLowerCase().includes(s) ||
+            e.payload.toLowerCase().includes(s) ||
+            (e.correlationId ?? "").toLowerCase().includes(s);
+          if (!matches) return false;
+        }
+        return true;
+      });
+      if (filtered.length > 0) {
+        draft.events.unshift(...filtered);
+      }
       break;
     }
     case "events/subscription_connected":

@@ -18,8 +18,7 @@ import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent, Block, FlowSelection, ReactorDescription, ReactorOutcome } from "../types";
 import { eventBg, eventBorder, eventTextColor } from "../theme";
-import { formatTs, compactPayload } from "../utils";
-import { Filter, Play, Pause, SkipBack, SkipForward, ChevronsRight, RotateCcw, X } from "lucide-react";
+import { Filter, Play, Pause, SkipBack, SkipForward, ChevronsRight, RotateCcw } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Flow node data
@@ -734,131 +733,6 @@ function ReactorFilter({ allReactorIds, hiddenReactors, setHiddenReactors }: {
 }
 
 // ---------------------------------------------------------------------------
-// NodeDetailPanel — overlay showing details for the selected node
-// ---------------------------------------------------------------------------
-
-function NodeDetailPanel({
-  selection,
-  flowData,
-  outcomes,
-  onClose,
-}: {
-  selection: FlowSelection;
-  flowData: InspectorEvent[];
-  outcomes?: Map<string, ReactorOutcome>;
-  onClose: () => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-
-  if (!selection) return null;
-
-  if (selection.kind === "event-type") {
-    // Find matching events
-    const events = flowData.filter(
-      (e) => e.name === selection.name && e.reactorId === selection.reactorId,
-    );
-    if (events.length === 0) return null;
-    const evt = events[0];
-
-    return (
-      <div className="absolute bottom-2 right-2 z-10 w-72 bg-card border border-border rounded-lg shadow-lg overflow-hidden">
-        <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-          <div className="flex items-center gap-2 min-w-0">
-            <span className="text-[11px] font-mono font-medium" style={{ color: eventTextColor(evt.name) }}>
-              {evt.name}
-            </span>
-          </div>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground shrink-0">
-            <X size={12} />
-          </button>
-        </div>
-        <div className="px-3 py-2 space-y-1.5">
-          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-            <span>seq {evt.seq}</span>
-            <span>{formatTs(evt.ts)}</span>
-          </div>
-          {evt.summary && (
-            <div className="text-[11px] text-foreground">{evt.summary}</div>
-          )}
-          <button
-            onClick={() => setExpanded((v) => !v)}
-            className="text-[10px] text-muted-foreground hover:text-foreground font-mono truncate block max-w-full text-left"
-          >
-            {expanded ? "Hide payload" : compactPayload(evt.payload)}
-          </button>
-          {expanded && (
-            <pre className="text-[10px] font-mono text-zinc-400 bg-zinc-900/50 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap">
-              {(() => { try { return JSON.stringify(JSON.parse(evt.payload), null, 2); } catch { return evt.payload; } })()}
-            </pre>
-          )}
-          {events.length > 1 && (
-            <div className="text-[10px] text-muted-foreground">
-              +{events.length - 1} more event{events.length > 2 ? "s" : ""}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  if (selection.kind === "reactor") {
-    const outcome = outcomes?.get(selection.reactorId);
-    const logEvents = flowData.filter((e) => e.reactorId === selection.reactorId);
-    const duration =
-      outcome?.status === "completed" && outcome.startedAt && outcome.completedAt
-        ? formatDuration(outcome.startedAt, outcome.completedAt)
-        : null;
-
-    return (
-      <div className="absolute bottom-2 right-2 z-10 w-72 bg-card border border-border rounded-lg shadow-lg overflow-hidden">
-        <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-          <span className="text-[11px] font-mono text-zinc-300 truncate">{selection.reactorId}</span>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground shrink-0">
-            <X size={12} />
-          </button>
-        </div>
-        <div className="px-3 py-2 space-y-1.5">
-          {outcome && (
-            <div className="flex items-center gap-2 text-[10px]">
-              <span style={{ color: STATUS_BORDER[outcome.status] ?? "#52525b" }} className="font-medium uppercase">
-                {outcome.status}
-              </span>
-              {duration && <span className="text-muted-foreground">{duration}</span>}
-              {outcome.attempts != null && outcome.attempts > 1 && (
-                <span className="text-muted-foreground">
-                  {outcome.attempts} attempts
-                </span>
-              )}
-            </div>
-          )}
-          {outcome?.error && (
-            <div className="text-[10px] text-red-400">{outcome.error}</div>
-          )}
-          <div className="text-[10px] text-muted-foreground">
-            {logEvents.length} event{logEvents.length !== 1 ? "s" : ""} produced
-          </div>
-          {logEvents.length > 0 && (
-            <div className="space-y-0.5">
-              {logEvents.slice(0, 5).map((evt) => (
-                <div key={evt.seq} className="text-[10px] font-mono" style={{ color: eventTextColor(evt.name) }}>
-                  {evt.name}
-                  {evt.summary && <span className="text-muted-foreground ml-1">— {evt.summary}</span>}
-                </div>
-              ))}
-              {logEvents.length > 5 && (
-                <div className="text-[10px] text-muted-foreground">+{logEvents.length - 5} more</div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  return null;
-}
-
-// ---------------------------------------------------------------------------
 // CausalFlowPane
 // ---------------------------------------------------------------------------
 
@@ -1141,12 +1015,6 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           <Background color="#27272a" gap={20} />
           <Controls showInteractive={false} />
         </ReactFlow>
-        <NodeDetailPanel
-          selection={flowSelection}
-          flowData={flowData}
-          outcomes={outcomes}
-          onClose={() => dispatch({ type: "ui/flow_node_selected", payload: null })}
-        />
       </div>
       {sortedSeqs.length > 1 && (
         <TimeScrubber
