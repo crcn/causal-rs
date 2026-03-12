@@ -219,7 +219,12 @@ function InfiniteScrollSentinel({ onVisible, loading }: { onVisible: () => void;
   const onVisibleRef = useRef(onVisible);
   onVisibleRef.current = onVisible;
 
+  // Re-create observer when loading finishes so it re-checks visibility.
+  // Without this, if loaded events collapse into one group row the sentinel
+  // stays visible but the observer never fires again (it only fires on
+  // enter/leave transitions).
   useEffect(() => {
+    if (loading) return;
     const el = ref.current;
     if (!el) return;
     const observer = new IntersectionObserver(
@@ -228,7 +233,7 @@ function InfiniteScrollSentinel({ onVisible, loading }: { onVisible: () => void;
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, []);
+  }, [loading]);
 
   return (
     <div ref={ref} className="flex items-center justify-center py-4">
