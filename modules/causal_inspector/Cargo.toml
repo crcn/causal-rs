@@ -24,7 +24,7 @@ uuid = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 
-causal = { version = "0.1.3", path = "../causal", default-features = false, optional = true }
+causal = { version = "0.1.4", path = "../causal", default-features = false, optional = true }
 async-graphql = { version = "7", features = ["chrono"], optional = true }
 async-graphql-axum = { version = "7", optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }
