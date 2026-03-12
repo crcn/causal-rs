@@ -60,6 +60,10 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.outcomes[correlationId] = outcomes;
       break;
     }
+    case "events/correlations_loaded":
+      draft.correlations = event.payload;
+      draft.correlationsLoading = false;
+      break;
 
     // ── UI ──
 
@@ -114,6 +118,9 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       break;
     case "ui/scrubber_speed_changed":
       draft.scrubberSpeed = event.payload.speed;
+      break;
+    case "ui/correlations_requested":
+      draft.correlationsLoading = true;
       break;
   }
 };

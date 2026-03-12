@@ -1,6 +1,7 @@
 import type { BaseEvent } from "./machine";
 import type {
   InspectorEvent,
+  CorrelationSummary,
   FilterState,
   FlowSelection,
   ReactorDescription,
@@ -46,6 +47,7 @@ type OutcomesLoaded = BaseEvent<
   "events/outcomes_loaded",
   { correlationId: string; outcomes: ReactorOutcome[] }
 >;
+type CorrelationsLoaded = BaseEvent<"events/correlations_loaded", CorrelationSummary[]>;
 
 // ── UI events ──
 
@@ -61,6 +63,7 @@ type LayoutChanged = BaseEvent<"ui/layout_changed", PaneLayout>;
 type ScrubberMoved = BaseEvent<"ui/scrubber_moved", { position: number | null }>;
 type ScrubberPlayToggled = BaseEvent<"ui/scrubber_play_toggled">;
 type ScrubberSpeedChanged = BaseEvent<"ui/scrubber_speed_changed", { speed: number }>;
+type CorrelationsRequested = BaseEvent<"ui/correlations_requested", { search?: string }>;
 
 // ── Union ──
 
@@ -76,6 +79,7 @@ export type InspectorMachineEvent =
   | DescriptionSnapshotsLoaded
   | AggregateTimelineLoaded
   | OutcomesLoaded
+  | CorrelationsLoaded
   | EventSelected
   | EventDeselected
   | FlowOpened
@@ -87,4 +91,5 @@ export type InspectorMachineEvent =
   | LayoutChanged
   | ScrubberMoved
   | ScrubberPlayToggled
-  | ScrubberSpeedChanged;
+  | ScrubberSpeedChanged
+  | CorrelationsRequested;

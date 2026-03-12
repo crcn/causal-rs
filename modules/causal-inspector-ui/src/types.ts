@@ -78,6 +78,15 @@ export type AggregateTimelineEntry = {
   aggregates: AggregateStateEntry[];
 };
 
+export type CorrelationSummary = {
+  correlationId: string;
+  eventCount: number;
+  firstTs: string;
+  lastTs: string;
+  rootEventType: string;
+  hasErrors: boolean;
+};
+
 export type FilterState = {
   search: string;
   from: string | null;

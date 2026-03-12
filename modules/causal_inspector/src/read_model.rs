@@ -123,6 +123,17 @@ pub struct AggregateStateSnapshotEntry {
     pub state: serde_json::Value,
 }
 
+/// Summary of a correlation chain for the explorer pane.
+#[derive(Debug, Clone)]
+pub struct CorrelationSummaryEntry {
+    pub correlation_id: String,
+    pub event_count: i64,
+    pub first_ts: DateTime<Utc>,
+    pub last_ts: DateTime<Utc>,
+    pub root_event_type: String,
+    pub has_errors: bool,
+}
+
 /// Store-agnostic read model for the inspector.
 ///
 /// Implement this trait for your store backend (Postgres, in-memory, etc.)
@@ -200,4 +211,14 @@ pub trait InspectorReadModel: Send + Sync {
         &self,
         correlation_id: &str,
     ) -> Result<Vec<AggregateStateSnapshotEntry>>;
+
+    /// List all correlation chains with summary stats.
+    ///
+    /// Optionally filter by search string (matches correlation_id or root event type).
+    /// Returns most recent correlations first, limited by `limit`.
+    async fn list_correlations(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CorrelationSummaryEntry>>;
 }

@@ -93,6 +93,18 @@ pub struct AggregateTimelineEntry {
     pub aggregates: Vec<AggregateStateEntry>,
 }
 
+/// Summary of a correlation chain for the explorer pane.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct CorrelationSummary {
+    pub correlation_id: String,
+    pub event_count: i64,
+    pub first_ts: DateTime<Utc>,
+    pub last_ts: DateTime<Utc>,
+    pub root_event_type: String,
+    pub has_errors: bool,
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct ReactorOutcome {

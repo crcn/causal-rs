@@ -262,6 +262,36 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
+    /// List all correlation chains with summary stats.
+    async fn inspector_correlations(
+        &self,
+        ctx: &Context<'_>,
+        search: Option<String>,
+        limit: Option<i32>,
+    ) -> Result<Vec<CorrelationSummary>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+        let lim = (limit.unwrap_or(50) as usize).min(200);
+
+        let entries = read_model
+            .list_correlations(search.as_deref(), lim)
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!("Failed to load correlations: {e}"))
+            })?;
+
+        Ok(entries
+            .into_iter()
+            .map(|r| CorrelationSummary {
+                correlation_id: r.correlation_id,
+                event_count: r.event_count,
+                first_ts: r.first_ts,
+                last_ts: r.last_ts,
+                root_event_type: r.root_event_type,
+                has_errors: r.has_errors,
+            })
+            .collect())
+    }
+
     /// Fetch aggregated reactor execution outcomes for a correlation chain.
     async fn inspector_reactor_outcomes(
         &self,

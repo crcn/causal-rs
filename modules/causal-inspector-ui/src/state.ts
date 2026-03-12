@@ -1,5 +1,6 @@
 import type {
   InspectorEvent,
+  CorrelationSummary,
   FilterState,
   FlowSelection,
   ReactorDescription,
@@ -46,6 +47,10 @@ export type InspectorState = {
   aggregateTimeline: Record<string, AggregateTimelineEntry[]>;
   outcomes: Record<string, ReactorOutcome[]>;
 
+  // Correlations
+  correlations: CorrelationSummary[];
+  correlationsLoading: boolean;
+
   // Subscription status
   subscription: "connected" | "disconnected" | "error";
 
@@ -89,6 +94,9 @@ export const initialState: InspectorState = {
   descriptionSnapshots: {},
   aggregateTimeline: {},
   outcomes: {},
+
+  correlations: [],
+  correlationsLoading: false,
 
   subscription: "disconnected",
 

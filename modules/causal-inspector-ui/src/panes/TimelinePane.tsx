@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
@@ -7,7 +7,7 @@ import { FilterBar } from "../components/FilterBar";
 import { CopyablePayload } from "../components/CopyablePayload";
 import { eventTextColor } from "../theme";
 import { formatTs, compactPayload } from "../utils";
-import { Search, ChevronRight } from "lucide-react";
+import { Search, ChevronRight, ChevronDown } from "lucide-react";
 
 function EventRow({
   event,
@@ -15,12 +15,14 @@ function EventRow({
   onClick,
   onFilterCorrelation,
   onInvestigate,
+  indent,
 }: {
   event: InspectorEvent;
   isSelected: boolean;
   onClick: () => void;
   onFilterCorrelation: (correlationId: string) => void;
   onInvestigate?: () => void;
+  indent?: boolean;
 }) {
   const [payloadOpen, setPayloadOpen] = useState(false);
 
@@ -29,6 +31,7 @@ function EventRow({
       className={`group w-full text-left px-3 py-2 border-b border-border hover:bg-accent/30 transition-colors ${
         isSelected ? "bg-accent/50 ring-1 ring-blue-500/50" : ""
       }`}
+      style={indent ? { paddingLeft: 28 } : undefined}
     >
       <div onClick={onClick} role="button" tabIndex={0} className="w-full text-left cursor-pointer">
         <div className="flex items-center gap-2 min-w-0">
@@ -76,6 +79,118 @@ function EventRow({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Event grouping by correlation
+// ---------------------------------------------------------------------------
+
+type EventGroup = {
+  correlationId: string;
+  root: InspectorEvent;
+  children: InspectorEvent[];
+};
+
+function groupEventsByCorrelation(events: InspectorEvent[]): (InspectorEvent | EventGroup)[] {
+  const result: (InspectorEvent | EventGroup)[] = [];
+  let i = 0;
+
+  while (i < events.length) {
+    const event = events[i];
+
+    if (!event.correlationId) {
+      result.push(event);
+      i++;
+      continue;
+    }
+
+    // Collect consecutive events with the same correlationId
+    const cid = event.correlationId;
+    const groupEvents: InspectorEvent[] = [event];
+    let j = i + 1;
+    while (j < events.length && events[j].correlationId === cid) {
+      groupEvents.push(events[j]);
+      j++;
+    }
+
+    if (groupEvents.length === 1) {
+      // Single event — render flat
+      result.push(event);
+    } else {
+      // Find the root event (no reactorId) or fall back to first
+      const rootIdx = groupEvents.findIndex((e) => !e.reactorId);
+      const root = rootIdx >= 0 ? groupEvents[rootIdx] : groupEvents[0];
+      const children = groupEvents.filter((e) => e !== root);
+      result.push({ correlationId: cid, root, children });
+    }
+
+    i = j;
+  }
+
+  return result;
+}
+
+function EventGroupRow({
+  group,
+  selectedSeq,
+  collapsed,
+  onToggle,
+  onSelect,
+  onFilterCorrelation,
+  onInvestigate,
+}: {
+  group: EventGroup;
+  selectedSeq: number | null;
+  collapsed: boolean;
+  onToggle: () => void;
+  onSelect: (event: InspectorEvent) => void;
+  onFilterCorrelation: (correlationId: string) => void;
+  onInvestigate?: (event: InspectorEvent) => void;
+}) {
+  return (
+    <div>
+      {/* Group header */}
+      <div className="relative">
+        <button
+          onClick={onToggle}
+          className="absolute left-1 top-2.5 z-10 p-0.5 rounded hover:bg-accent text-muted-foreground"
+          title={collapsed ? "Expand group" : "Collapse group"}
+        >
+          {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+        </button>
+        <div className="relative">
+          <EventRow
+            event={group.root}
+            isSelected={group.root.seq === selectedSeq}
+            onClick={() => onSelect(group.root)}
+            onFilterCorrelation={onFilterCorrelation}
+            onInvestigate={onInvestigate ? () => onInvestigate(group.root) : undefined}
+          />
+          {collapsed && (
+            <span
+              className="absolute right-3 top-2.5 text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-700/50 text-zinc-400"
+            >
+              +{group.children.length}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Child events */}
+      {!collapsed &&
+        group.children.map((child) => (
+          <EventRow
+            key={child.seq}
+            event={child}
+            isSelected={child.seq === selectedSeq}
+            onClick={() => onSelect(child)}
+            onFilterCorrelation={onFilterCorrelation}
+            onInvestigate={onInvestigate ? () => onInvestigate(child) : undefined}
+            indent
+          />
+        ))}
+    </div>
+  );
+}
+
 function InfiniteScrollSentinel({ onVisible, loading }: { onVisible: () => void; loading: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const onVisibleRef = useRef(onVisible);
@@ -110,6 +225,20 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
   const hasMore = useSelector<InspectorState, boolean>((s) => s.hasMore);
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const dispatch = useDispatch<InspectorMachineEvent>();
+
+  // Default collapsed — this set tracks which groups are *expanded*
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
+
+  const grouped = useMemo(() => groupEventsByCorrelation(events), [events]);
+
+  const toggleGroup = useCallback((correlationId: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(correlationId)) next.delete(correlationId);
+      else next.add(correlationId);
+      return next;
+    });
+  }, []);
 
   const handleSelect = useCallback(
     (event: InspectorEvent) => {
@@ -151,16 +280,36 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto">
-          {events.map((event) => (
-            <EventRow
-              key={event.seq}
-              event={event}
-              isSelected={event.seq === selectedSeq}
-              onClick={() => handleSelect(event)}
-              onFilterCorrelation={handleFilterCorrelation}
-              onInvestigate={onInvestigate ? () => onInvestigate(event) : undefined}
-            />
-          ))}
+          {grouped.map((item) => {
+            if ("correlationId" in item && "root" in item) {
+              // EventGroup
+              const group = item as EventGroup;
+              return (
+                <EventGroupRow
+                  key={`group-${group.correlationId}-${group.root.seq}`}
+                  group={group}
+                  selectedSeq={selectedSeq}
+                  collapsed={!expandedGroups.has(group.correlationId)}
+                  onToggle={() => toggleGroup(group.correlationId)}
+                  onSelect={handleSelect}
+                  onFilterCorrelation={handleFilterCorrelation}
+                  onInvestigate={onInvestigate}
+                />
+              );
+            }
+            // Single event
+            const event = item as InspectorEvent;
+            return (
+              <EventRow
+                key={event.seq}
+                event={event}
+                isSelected={event.seq === selectedSeq}
+                onClick={() => handleSelect(event)}
+                onFilterCorrelation={handleFilterCorrelation}
+                onInvestigate={onInvestigate ? () => onInvestigate(event) : undefined}
+              />
+            );
+          })}
           {hasMore && (
             <InfiniteScrollSentinel onVisible={handleLoadMore} loading={loading} />
           )}

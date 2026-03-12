@@ -5,6 +5,7 @@ import type {
   InspectorEventsPage,
   InspectorCausalTree,
   InspectorCausalFlow,
+  CorrelationSummary,
   ReactorLog,
   ReactorDescription,
   ReactorDescriptionSnapshot,
@@ -16,6 +17,7 @@ import {
   INSPECTOR_EVENTS,
   INSPECTOR_CAUSAL_TREE,
   INSPECTOR_CAUSAL_FLOW,
+  INSPECTOR_CORRELATIONS,
   INSPECTOR_REACTOR_LOGS,
   INSPECTOR_REACTOR_LOGS_BY_CORRELATION,
   INSPECTOR_REACTOR_DESCRIPTIONS,
@@ -184,6 +186,20 @@ export const createQueryEngine = (
       }
     };
 
+    const fetchCorrelations = async (search?: string) => {
+      try {
+        const data = await transport.query<{
+          inspectorCorrelations: CorrelationSummary[];
+        }>(INSPECTOR_CORRELATIONS, { search: search || undefined, limit: 100 });
+        dispatch({
+          type: "events/correlations_loaded",
+          payload: data.inspectorCorrelations,
+        });
+      } catch (e) {
+        console.error("[causal-inspector] fetch correlations failed:", e);
+      }
+    };
+
     const startFlowPolling = (correlationId: string) => {
       stopFlowPolling();
       fetchFlowMetadata(correlationId);
@@ -199,6 +215,9 @@ export const createQueryEngine = (
 
     // Initial load
     fetchEvents();
+    fetchCorrelations();
+
+    let correlationPollTimer: ReturnType<typeof setInterval> | null = null;
 
     return {
       handleEvent: (event, curr, prev) => {
@@ -235,10 +254,18 @@ export const createQueryEngine = (
           case "ui/logs_filter_changed":
             fetchLogs(curr.logsFilter);
             break;
+
+          case "ui/correlations_requested":
+            fetchCorrelations(event.payload.search);
+            // Start polling
+            if (correlationPollTimer) clearInterval(correlationPollTimer);
+            correlationPollTimer = setInterval(() => fetchCorrelations(event.payload.search), 5000);
+            break;
         }
       },
       dispose: () => {
         stopFlowPolling();
+        if (correlationPollTimer) clearInterval(correlationPollTimer);
       },
     };
   };

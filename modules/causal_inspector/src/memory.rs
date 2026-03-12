@@ -11,6 +11,7 @@ use causal::{MemoryStore, ReactorQueue};
 
 use crate::read_model::{
     InspectorReadModel, EventQuery, AggregateStateSnapshotEntry,
+    CorrelationSummaryEntry,
     ReactorDescriptionEntry, ReactorDescriptionSnapshotEntry,
     ReactorLogEntry, ReactorOutcomeEntry, StoredEvent,
 };
@@ -340,5 +341,80 @@ impl InspectorReadModel for MemoryStore {
 
         result.sort_by_key(|s| s.seq);
         Ok(result)
+    }
+
+    async fn list_correlations(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CorrelationSummaryEntry>> {
+        let log = self.global_log().lock();
+
+        // Group events by correlation_id
+        let mut by_corr: std::collections::HashMap<
+            Uuid,
+            (i64, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, String),
+        > = std::collections::HashMap::new();
+
+        for e in log.iter() {
+            let entry = by_corr
+                .entry(e.correlation_id)
+                .or_insert_with(|| (0, e.created_at, e.created_at, String::new()));
+            entry.0 += 1;
+            if e.created_at < entry.1 {
+                entry.1 = e.created_at;
+            }
+            if e.created_at > entry.2 {
+                entry.2 = e.created_at;
+            }
+            // Root event = no parent_id
+            if e.parent_id.is_none() && entry.3.is_empty() {
+                entry.3 = e.event_type.clone();
+            }
+        }
+
+        // Check for errors via reactor_executions
+        let error_correlations: std::collections::HashSet<Uuid> = self
+            .reactor_executions()
+            .iter()
+            .filter(|entry| {
+                let (_corr_id, _started_at, _completed_at, status, _error, _attempts) = entry.value();
+                status == "error"
+            })
+            .map(|entry| {
+                let (_corr_id, _started_at, _completed_at, _status, _error, _attempts) = entry.value();
+                *_corr_id
+            })
+            .collect();
+
+        let search_lower = search.map(|s| s.to_lowercase());
+
+        let mut results: Vec<CorrelationSummaryEntry> = by_corr
+            .into_iter()
+            .filter(|(cid, (_, _, _, root_type))| {
+                if let Some(ref s) = search_lower {
+                    cid.to_string().to_lowercase().contains(s)
+                        || root_type.to_lowercase().contains(s)
+                } else {
+                    true
+                }
+            })
+            .map(|(cid, (count, first_ts, last_ts, root_event_type))| {
+                CorrelationSummaryEntry {
+                    correlation_id: cid.to_string(),
+                    event_count: count,
+                    first_ts,
+                    last_ts,
+                    root_event_type,
+                    has_errors: error_correlations.contains(&cid),
+                }
+            })
+            .collect();
+
+        // Sort by last_ts descending (most recent first)
+        results.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        results.truncate(limit);
+
+        Ok(results)
     }
 }

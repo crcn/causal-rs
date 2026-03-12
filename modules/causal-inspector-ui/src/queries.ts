@@ -127,6 +127,19 @@ export const INSPECTOR_AGGREGATE_TIMELINE = `
   }
 `;
 
+export const INSPECTOR_CORRELATIONS = `
+  query InspectorCorrelations($search: String, $limit: Int) {
+    inspectorCorrelations(search: $search, limit: $limit) {
+      correlationId
+      eventCount
+      firstTs
+      lastTs
+      rootEventType
+      hasErrors
+    }
+  }
+`;
+
 export const INSPECTOR_REACTOR_OUTCOMES = `
   query InspectorReactorOutcomes($correlationId: String!) {
     inspectorReactorOutcomes(correlationId: $correlationId) {
