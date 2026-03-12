@@ -16,9 +16,9 @@ import dagre from "@dagrejs/dagre";
 import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
-import type { InspectorEvent, Block, FlowSelection, ReactorDescription, ReactorOutcome } from "../types";
+import type { InspectorEvent, Block, FlowSelection, ReactorDescription, ReactorOutcome, ReactorDependency } from "../types";
 import { eventBg, eventBorder, eventTextColor } from "../theme";
-import { Filter, Play, Pause, SkipBack, SkipForward, ChevronsRight, RotateCcw } from "lucide-react";
+import { Filter, Play, Pause, SkipBack, SkipForward, ChevronsRight, RotateCcw, Network } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Flow node data
@@ -733,6 +733,156 @@ function ReactorFilter({ allReactorIds, hiddenReactors, setHiddenReactors }: {
 }
 
 // ---------------------------------------------------------------------------
+// Topology view — abstract type-level graph from reactor dependencies
+// ---------------------------------------------------------------------------
+
+const TOPO_EVENT_W = 160;
+const TOPO_EVENT_H = 36;
+const TOPO_REACTOR_W = 180;
+const TOPO_REACTOR_H = 40;
+
+const TopoEventNode = memo(({ data }: NodeProps) => {
+  const d = data as { nodeKind: "event-type"; eventType: string };
+  return (
+    <div
+      style={{
+        width: TOPO_EVENT_W,
+        height: TOPO_EVENT_H,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: 6,
+        border: `1px solid ${eventBorder(d.eventType)}`,
+        background: eventBg(d.eventType),
+        color: eventTextColor(d.eventType),
+        fontSize: 11,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontWeight: 500,
+        padding: "0 8px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+      title={d.eventType}
+    >
+      <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
+      {d.eventType}
+      <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
+    </div>
+  );
+});
+TopoEventNode.displayName = "TopoEventNode";
+
+const TopoReactorNode = memo(({ data }: NodeProps) => {
+  const d = data as { nodeKind: "reactor"; reactorId: string };
+  return (
+    <div
+      style={{
+        width: TOPO_REACTOR_W,
+        height: TOPO_REACTOR_H,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: 8,
+        border: "1px solid #3f3f46",
+        background: "#18181b",
+        color: "#e4e4e7",
+        fontSize: 11,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontWeight: 600,
+        padding: "0 8px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+      title={d.reactorId}
+    >
+      <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
+      {d.reactorId}
+      <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
+    </div>
+  );
+});
+TopoReactorNode.displayName = "TopoReactorNode";
+
+const topoNodeTypes = { "topo-event": TopoEventNode, "topo-reactor": TopoReactorNode };
+
+function buildTopologyGraph(deps: ReactorDependency[]): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = [];
+  const edges: Edge[] = [];
+  const eventTypeSet = new Set<string>();
+
+  for (const dep of deps) {
+    for (const et of dep.inputEventTypes) eventTypeSet.add(et);
+    for (const et of dep.outputEventTypes) eventTypeSet.add(et);
+  }
+
+  for (const et of eventTypeSet) {
+    nodes.push({
+      id: `et:${et}`,
+      type: "topo-event",
+      position: { x: 0, y: 0 },
+      data: { nodeKind: "event-type", eventType: et },
+    });
+  }
+
+  for (const dep of deps) {
+    const rid = `r:${dep.reactorId}`;
+    nodes.push({
+      id: rid,
+      type: "topo-reactor",
+      position: { x: 0, y: 0 },
+      data: { nodeKind: "reactor", reactorId: dep.reactorId },
+    });
+
+    for (const et of dep.inputEventTypes) {
+      edges.push({
+        id: `${et}→${dep.reactorId}`,
+        source: `et:${et}`,
+        target: rid,
+        markerEnd: { type: MarkerType.ArrowClosed, width: 12, height: 12, color: "#52525b" },
+        style: { stroke: "#52525b", strokeWidth: 1.5 },
+        animated: true,
+      });
+    }
+
+    for (const et of dep.outputEventTypes) {
+      edges.push({
+        id: `${dep.reactorId}→${et}`,
+        source: rid,
+        target: `et:${et}`,
+        markerEnd: { type: MarkerType.ArrowClosed, width: 12, height: 12, color: "#3b82f6" },
+        style: { stroke: "#3b82f6", strokeWidth: 1.5 },
+      });
+    }
+  }
+
+  const g = new dagre.graphlib.Graph();
+  g.setDefaultEdgeLabel(() => ({}));
+  g.setGraph({ rankdir: "LR", nodesep: 40, ranksep: 80 });
+
+  for (const node of nodes) {
+    const isReactor = node.type === "topo-reactor";
+    g.setNode(node.id, {
+      width: isReactor ? TOPO_REACTOR_W : TOPO_EVENT_W,
+      height: isReactor ? TOPO_REACTOR_H : TOPO_EVENT_H,
+    });
+  }
+  for (const edge of edges) g.setEdge(edge.source, edge.target);
+  dagre.layout(g);
+
+  for (const node of nodes) {
+    const pos = g.node(node.id);
+    const isReactor = node.type === "topo-reactor";
+    const w = isReactor ? TOPO_REACTOR_W : TOPO_EVENT_W;
+    const h = isReactor ? TOPO_REACTOR_H : TOPO_EVENT_H;
+    node.position = { x: pos.x - w / 2, y: pos.y - h / 2 };
+  }
+
+  return { nodes, edges };
+}
+
+// ---------------------------------------------------------------------------
 // CausalFlowPane
 // ---------------------------------------------------------------------------
 
@@ -752,9 +902,14 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
   const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
   const scrubberPlaying = useSelector<InspectorState, boolean>((s) => s.scrubberPlaying);
   const scrubberSpeed = useSelector<InspectorState, number>((s) => s.scrubberSpeed);
+  const reactorDeps = useSelector<InspectorState, ReactorDependency[]>((s) => s.reactorDependencies);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
+  const [showTopology, setShowTopology] = useState(false);
   const flowLoading = flowCorrelationId != null && flowData.length === 0;
+
+  // Topology graph (global, not per-correlation)
+  const topoGraph = useMemo(() => buildTopologyGraph(reactorDeps), [reactorDeps]);
 
   // Build typed maps from state
   const descriptions = useMemo(() => {
@@ -942,12 +1097,54 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
 
   const onNodesChange = useCallback((_changes: NodeChange[]) => {}, []);
 
-  if (!flowCorrelationId) {
-    return (
-      <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
-        Select an event to visualize its causal flow
-      </div>
-    );
+  // Show topology when no flow is selected, or when topology toggle is on
+  if (!flowCorrelationId || showTopology) {
+    if (reactorDeps.length === 0 && !flowCorrelationId) {
+      return (
+        <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
+          Select an event to visualize its causal flow
+        </div>
+      );
+    }
+
+    if (showTopology || !flowCorrelationId) {
+      return (
+        <div className="h-full flex flex-col">
+          <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border shrink-0">
+            <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              Topology
+            </h3>
+            <span className="text-xs text-muted-foreground">
+              {reactorDeps.length} reactor{reactorDeps.length !== 1 ? "s" : ""}
+            </span>
+            {flowCorrelationId && (
+              <button
+                onClick={() => setShowTopology(false)}
+                className="ml-auto text-xs text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded border border-border flex items-center gap-1"
+              >
+                <Network size={12} />
+                Flow
+              </button>
+            )}
+          </div>
+          <div className="flex-1">
+            <ReactFlow
+              nodes={topoGraph.nodes}
+              edges={topoGraph.edges}
+              nodeTypes={topoNodeTypes}
+              fitView
+              nodesDraggable
+              nodesConnectable={false}
+              colorMode="dark"
+              proOptions={{ hideAttribution: true }}
+            >
+              <Background color="#27272a" gap={20} />
+              <Controls showInteractive={false} />
+            </ReactFlow>
+          </div>
+        </div>
+      );
+    }
   }
 
   if (flowLoading) {
@@ -994,6 +1191,16 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           hiddenReactors={hiddenReactors}
           setHiddenReactors={setHiddenReactors}
         />
+        {reactorDeps.length > 0 && (
+          <button
+            onClick={() => setShowTopology(true)}
+            className="text-xs text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded border border-border flex items-center gap-1"
+            title="Show system topology"
+          >
+            <Network size={12} />
+            Topology
+          </button>
+        )}
       </div>
       <div className="flex-1 relative">
         <ReactFlow
