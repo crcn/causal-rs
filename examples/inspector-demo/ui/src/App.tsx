@@ -176,9 +176,11 @@ function InspectorLayout() {
           key="add-pane"
           className="flexlayout__tab_toolbar_button"
           title="Add pane"
-          onClick={() => {
+          onClick={(e) => {
+            const btn = e.currentTarget as HTMLElement;
+            const rect = btn.getBoundingClientRect();
             const menu = document.createElement("div");
-            menu.style.cssText = "position:fixed;z-index:9999;background:#18181b;border:1px solid #27272a;border-radius:6px;padding:4px;box-shadow:0 4px 12px rgba(0,0,0,0.5);top:32px;right:8px;";
+            menu.style.cssText = `position:fixed;z-index:9999;background:#18181b;border:1px solid #27272a;border-radius:6px;padding:4px;box-shadow:0 4px 12px rgba(0,0,0,0.5);top:${rect.bottom + 4}px;right:${window.innerWidth - rect.right}px;`;
 
             for (const pane of PANE_REGISTRY) {
               const item = document.createElement("button");
