@@ -2,16 +2,12 @@ import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
-import type { InspectorEvent, CorrelationSummary } from "../types";
+import type { InspectorEvent } from "../types";
 import { FilterBar } from "../components/FilterBar";
 import { CopyablePayload } from "../components/CopyablePayload";
 import { eventTextColor, eventBg } from "../theme";
 import { formatTs, compactPayload, aggregateKey, inScrubberRange } from "../utils";
-import { Search, ChevronRight, AlertCircle } from "lucide-react";
-
-// ---------------------------------------------------------------------------
-// Shared: EventRow (used in detail mode)
-// ---------------------------------------------------------------------------
+import { Search, ChevronRight } from "lucide-react";
 
 function EventRow({
   event,
@@ -99,68 +95,6 @@ function EventRow({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Overview mode: CorrelationRow
-// ---------------------------------------------------------------------------
-
-function relativeTime(ts: string): string {
-  const diff = Date.now() - new Date(ts).getTime();
-  if (diff < 1000) return "just now";
-  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
-}
-
-function CorrelationRow({
-  correlation,
-  onClick,
-}: {
-  correlation: CorrelationSummary;
-  onClick: () => void;
-}) {
-  return (
-    <div
-      onClick={onClick}
-      role="button"
-      tabIndex={0}
-      className="group w-full text-left px-3 py-2.5 border-b border-border hover:bg-white/[0.02] cursor-pointer transition-all duration-150"
-    >
-      <div className="flex items-center gap-2.5 min-w-0">
-        <span
-          className="text-xs font-mono shrink-0 px-1.5 py-0.5 rounded"
-          style={{
-            color: eventTextColor(correlation.rootEventType),
-            background: eventBg(correlation.rootEventType),
-          }}
-        >
-          {correlation.rootEventType}
-        </span>
-        <button
-          className="px-1.5 py-0.5 rounded-full text-[9px] font-mono bg-purple-500/8 text-purple-400/80 hover:bg-purple-500/15 hover:text-purple-400 shrink-0 transition-all border border-purple-500/10"
-          title={correlation.correlationId}
-        >
-          {correlation.correlationId.slice(0, 8)}
-        </button>
-        <span className="text-[10px] font-mono text-muted-foreground/60 shrink-0 tabular-nums">
-          {correlation.eventCount} event{correlation.eventCount !== 1 ? "s" : ""}
-        </span>
-        <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">
-          {relativeTime(correlation.lastTs)}
-        </span>
-        {correlation.hasErrors && (
-          <AlertCircle size={12} className="text-red-400 shrink-0" />
-        )}
-        <ChevronRight size={12} className="ml-auto text-muted-foreground/30 group-hover:text-muted-foreground/60 shrink-0 transition-colors" />
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// InfiniteScrollSentinel
-// ---------------------------------------------------------------------------
-
 function InfiniteScrollSentinel({ onVisible, loading }: { onVisible: () => void; loading: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const onVisibleRef = useRef(onVisible);
@@ -190,52 +124,19 @@ function InfiniteScrollSentinel({ onVisible, loading }: { onVisible: () => void;
   );
 }
 
-// ---------------------------------------------------------------------------
-// Skeleton loader
-// ---------------------------------------------------------------------------
-
-function SkeletonRows() {
-  return (
-    <div className="animate-pulse p-1">
-      {Array.from({ length: 12 }).map((_, i) => (
-        <div key={i} className="flex items-center gap-2 px-3 py-2.5 border-b border-border">
-          <div className="h-3 w-10 bg-white/[0.03] rounded shrink-0" />
-          <div className="h-3 w-32 bg-white/[0.03] rounded shrink-0" />
-          <div className="h-3 bg-white/[0.03] rounded flex-1" style={{ maxWidth: `${150 + (i * 37) % 200}px` }} />
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// TimelinePane
-// ---------------------------------------------------------------------------
-
 export type TimelinePaneProps = {
   /** Optional callback when user wants to investigate an event. */
   onInvestigate?: (event: InspectorEvent) => void;
 };
 
 export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
-  // Shared state
-  const filters = useSelector<InspectorState, InspectorState["filters"]>((s) => s.filters);
-  const dispatch = useDispatch<InspectorMachineEvent>();
-
-  const isDetailMode = filters.correlationId != null;
-
-  // Detail mode state
   const events = useSelector<InspectorState, InspectorEvent[]>((s) => s.events);
-  const eventsLoading = useSelector<InspectorState, boolean>((s) => s.loading);
-  const eventsHasMore = useSelector<InspectorState, boolean>((s) => s.hasMore);
+  const loading = useSelector<InspectorState, boolean>((s) => s.loading);
+  const hasMore = useSelector<InspectorState, boolean>((s) => s.hasMore);
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
-
-  // Overview mode state
-  const correlations = useSelector<InspectorState, CorrelationSummary[]>((s) => s.correlations);
-  const correlationsLoading = useSelector<InspectorState, boolean>((s) => s.correlationsLoading);
-  const correlationsHasMore = useSelector<InspectorState, boolean>((s) => s.correlationsHasMore);
+  const dispatch = useDispatch<InspectorMachineEvent>();
 
   const displayedEvents = useMemo(() => {
     if (scrubberStart == null && scrubberEnd == null) return events;
@@ -266,72 +167,44 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
     [dispatch]
   );
 
-  const handleLoadMoreEvents = useCallback(() => {
+  const handleLoadMore = useCallback(() => {
     dispatch({ type: "ui/load_more_requested" });
   }, [dispatch]);
-
-  const handleLoadMoreCorrelations = useCallback(() => {
-    dispatch({ type: "ui/load_more_correlations_requested" });
-  }, [dispatch]);
-
-  const handleCorrelationClick = useCallback(
-    (correlationId: string) => {
-      dispatch({ type: "ui/filter_changed", payload: { correlationId } });
-    },
-    [dispatch]
-  );
 
   return (
     <div className="flex flex-col h-full">
       <FilterBar />
-      {isDetailMode ? (
-        // Detail mode: flat event list
-        eventsLoading && events.length === 0 ? (
-          <SkeletonRows />
-        ) : events.length === 0 ? (
-          <div className="flex items-center justify-center h-32 text-sm text-muted-foreground/60">
-            No events found
-          </div>
-        ) : (
-          <div className="flex-1 overflow-y-auto">
-            {displayedEvents.map((event) => (
-              <EventRow
-                key={event.seq}
-                event={event}
-                isSelected={event.seq === selectedSeq}
-                onClick={() => handleSelect(event)}
-                onFilterCorrelation={handleFilterCorrelation}
-                onFilterStream={handleFilterStream}
-                onInvestigate={onInvestigate ? () => onInvestigate(event) : undefined}
-              />
-            ))}
-            {eventsHasMore && (
-              <InfiniteScrollSentinel onVisible={handleLoadMoreEvents} loading={eventsLoading} />
-            )}
-          </div>
-        )
+      {loading && events.length === 0 ? (
+        <div className="animate-pulse p-1">
+          {Array.from({ length: 12 }).map((_, i) => (
+            <div key={i} className="flex items-center gap-2 px-3 py-2.5 border-b border-border">
+              <div className="h-3 w-10 bg-white/[0.03] rounded shrink-0" />
+              <div className="h-3 w-32 bg-white/[0.03] rounded shrink-0" />
+              <div className="h-3 bg-white/[0.03] rounded flex-1" style={{ maxWidth: `${150 + (i * 37) % 200}px` }} />
+            </div>
+          ))}
+        </div>
+      ) : events.length === 0 ? (
+        <div className="flex items-center justify-center h-32 text-sm text-muted-foreground/60">
+          No events found
+        </div>
       ) : (
-        // Overview mode: correlation summary rows
-        correlationsLoading && correlations.length === 0 ? (
-          <SkeletonRows />
-        ) : correlations.length === 0 ? (
-          <div className="flex items-center justify-center h-32 text-sm text-muted-foreground/60">
-            No correlations found
-          </div>
-        ) : (
-          <div className="flex-1 overflow-y-auto">
-            {correlations.map((c) => (
-              <CorrelationRow
-                key={c.correlationId}
-                correlation={c}
-                onClick={() => handleCorrelationClick(c.correlationId)}
-              />
-            ))}
-            {correlationsHasMore && (
-              <InfiniteScrollSentinel onVisible={handleLoadMoreCorrelations} loading={correlationsLoading} />
-            )}
-          </div>
-        )
+        <div className="flex-1 overflow-y-auto">
+          {displayedEvents.map((event) => (
+            <EventRow
+              key={event.seq}
+              event={event}
+              isSelected={event.seq === selectedSeq}
+              onClick={() => handleSelect(event)}
+              onFilterCorrelation={handleFilterCorrelation}
+              onFilterStream={handleFilterStream}
+              onInvestigate={onInvestigate ? () => onInvestigate(event) : undefined}
+            />
+          ))}
+          {hasMore && (
+            <InfiniteScrollSentinel onVisible={handleLoadMore} loading={loading} />
+          )}
+        </div>
       )}
     </div>
   );

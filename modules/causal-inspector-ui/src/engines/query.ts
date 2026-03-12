@@ -270,7 +270,8 @@ export const createQueryEngine = (
       }
     };
 
-    // Initial load — overview mode: correlations (not raw events)
+    // Initial load
+    fetchEvents();
     fetchCorrelations();
     fetchReactorDependencies();
     fetchAggregateKeys();
@@ -303,35 +304,13 @@ export const createQueryEngine = (
             fetchCausalTree(event.payload.seq);
             break;
 
-          case "ui/filter_changed": {
-            const newCorrelationId = (event.payload as Partial<{ correlationId: string | null }>).correlationId;
-            if (newCorrelationId !== undefined) {
-              if (newCorrelationId) {
-                // Entering detail mode: clear events, fetch raw events
-                dispatch({
-                  type: "events/page_loaded",
-                  payload: { events: [], hasMore: true },
-                });
-                fetchEvents();
-              } else {
-                // Returning to overview mode: clear events, refresh correlations
-                dispatch({
-                  type: "events/page_loaded",
-                  payload: { events: [], hasMore: false },
-                });
-                correlationCursor = null;
-                fetchCorrelations();
-              }
-            } else {
-              // Other filter changes (search, aggregateKey) in detail mode
-              dispatch({
-                type: "events/page_loaded",
-                payload: { events: [], hasMore: true },
-              });
-              fetchEvents();
-            }
+          case "ui/filter_changed":
+            dispatch({
+              type: "events/page_loaded",
+              payload: { events: [], hasMore: true },
+            });
+            fetchEvents();
             break;
-          }
 
           case "ui/load_more_correlations_requested":
             fetchCorrelations({ append: true });

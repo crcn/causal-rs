@@ -61,48 +61,22 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
 
     case "events/received": {
       const newEvents = event.payload;
-
-      if (!draft.filters.correlationId) {
-        // Overview mode: update correlation summaries instead of raw events
-        const NIL_UUID = "00000000-0000-0000-0000-000000000000";
-        for (const e of newEvents) {
-          if (!e.correlationId || e.correlationId === NIL_UUID) continue;
-          const existing = draft.correlations.find(
-            (c) => c.correlationId === e.correlationId
-          );
-          if (existing) {
-            existing.eventCount += 1;
-            if (e.ts > existing.lastTs) existing.lastTs = e.ts;
-          } else {
-            draft.correlations.unshift({
-              correlationId: e.correlationId,
-              eventCount: 1,
-              firstTs: e.ts,
-              lastTs: e.ts,
-              rootEventType: e.name,
-              hasErrors: false,
-            });
-          }
+      const filtered = newEvents.filter((e) => {
+        if (draft.filters.correlationId && e.correlationId !== draft.filters.correlationId) {
+          return false;
         }
-      } else {
-        // Detail mode: filter and prepend matching raw events
-        const filtered = newEvents.filter((e) => {
-          if (draft.filters.correlationId && e.correlationId !== draft.filters.correlationId) {
-            return false;
-          }
-          if (draft.filters.search) {
-            const s = draft.filters.search.toLowerCase();
-            const matches =
-              e.name.toLowerCase().includes(s) ||
-              e.payload.toLowerCase().includes(s) ||
-              (e.correlationId ?? "").toLowerCase().includes(s);
-            if (!matches) return false;
-          }
-          return true;
-        });
-        if (filtered.length > 0) {
-          draft.events.unshift(...filtered);
+        if (draft.filters.search) {
+          const s = draft.filters.search.toLowerCase();
+          const matches =
+            e.name.toLowerCase().includes(s) ||
+            e.payload.toLowerCase().includes(s) ||
+            (e.correlationId ?? "").toLowerCase().includes(s);
+          if (!matches) return false;
         }
+        return true;
+      });
+      if (filtered.length > 0) {
+        draft.events.unshift(...filtered);
       }
       break;
     }
