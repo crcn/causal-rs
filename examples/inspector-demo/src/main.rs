@@ -24,8 +24,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
-use async_graphql::{EmptyMutation, Schema};
-use axum::{Router, routing::get};
+use axum::routing::get;
 use tower_http::services::ServeDir;
 use tokio::sync::broadcast;
 
@@ -33,7 +32,7 @@ use causal::{
     event, events, reactor, Aggregate, Apply, Context, Engine, MemoryStore,
 };
 use causal_inspector::{
-    CausalInspectorQuery, CausalInspectorSubscription, InspectorReadModel, StoredEvent,
+    InspectorReadModel, StoredEvent,
     display::EventDisplay,
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +40,7 @@ use uuid::Uuid;
 
 // ── Event display ────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct DemoEventDisplay;
 
 impl EventDisplay for DemoEventDisplay {
@@ -228,32 +228,7 @@ impl Apply<CategoriesTagged> for PipelineState {
 #[derive(Clone)]
 struct Deps;
 
-// ── GraphQL wiring ──────────────────────────────────────────────
-
-type InspectorSchema = Schema<
-    CausalInspectorQuery<DemoEventDisplay>,
-    EmptyMutation,
-    CausalInspectorSubscription<DemoEventDisplay>,
->;
-
-async fn graphql_handler(
-    schema: axum::extract::State<InspectorSchema>,
-    req: async_graphql_axum::GraphQLRequest,
-) -> async_graphql_axum::GraphQLResponse {
-    schema.execute(req.into_inner()).await.into()
-}
-
-async fn graphql_ws_handler(
-    schema: axum::extract::State<InspectorSchema>,
-    protocol: async_graphql_axum::GraphQLProtocol,
-    ws: axum::extract::WebSocketUpgrade,
-) -> axum::response::Response {
-    ws.protocols(["graphql-transport-ws", "graphql-ws"])
-        .on_upgrade(move |stream| {
-            let stream = async_graphql_axum::GraphQLWebSocket::new(stream, schema.0, protocol);
-            async move { stream.serve().await }
-        })
-}
+// ── GraphiQL UI ─────────────────────────────────────────────────
 
 async fn graphiql() -> axum::response::Html<String> {
     axum::response::Html(
@@ -298,6 +273,20 @@ async fn main() -> Result<()> {
                             .get("reactor_id")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
+                        aggregate_type: persisted
+                            .metadata
+                            .get("aggregate_type")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        aggregate_id: persisted
+                            .metadata
+                            .get("aggregate_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                        stream_version: persisted
+                            .metadata
+                            .get("stream_version")
+                            .and_then(|v| v.as_u64()),
                     };
                     let _ = bridge_tx.send(stored);
                 }
@@ -577,27 +566,22 @@ async fn main() -> Result<()> {
                 }),
         );
 
-    // 4. Build GraphQL schema
-    let schema = Schema::build(
-        CausalInspectorQuery::new(DemoEventDisplay),
-        EmptyMutation,
-        CausalInspectorSubscription::new(DemoEventDisplay),
-    )
-    .data(store.clone() as Arc<dyn InspectorReadModel>)
-    .data(inspector_tx)
-    .finish();
+    // 4. Build inspector router (GraphQL + WebSocket)
+    let inspector = causal_inspector::router(
+        store.clone() as Arc<dyn InspectorReadModel>,
+        DemoEventDisplay,
+        inspector_tx,
+    );
 
     // 5. Start HTTP server
     let ui_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/dist");
-    let app = Router::new()
-        .route("/ws", get(graphql_ws_handler))
-        .route("/", get(graphiql).post(graphql_handler))
+    let app = inspector
+        .route("/", get(graphiql))
         .nest_service(
             "/causal",
             ServeDir::new(&ui_dir)
                 .fallback(tower_http::services::ServeFile::new(ui_dir.join("index.html"))),
-        )
-        .with_state(schema.clone());
+        );
 
     // 6. Spawn article generation
     let engine = Arc::new(engine);

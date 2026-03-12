@@ -9,6 +9,9 @@ const EVENT_FIELDS = `
   parentId
   correlationId
   reactorId
+  aggregateType
+  aggregateId
+  streamVersion
   summary
   payload
 `;
@@ -26,17 +29,15 @@ export const INSPECTOR_EVENTS = `
     $limit: Int!
     $cursor: Int
     $search: String
-    $from: DateTime
-    $to: DateTime
     $correlationId: String
+    $aggregateKey: String
   ) {
     inspectorEvents(
       limit: $limit
       cursor: $cursor
       search: $search
-      from: $from
-      to: $to
       correlationId: $correlationId
+      aggregateKey: $aggregateKey
     ) {
       events {
         ${EVENT_FIELDS}

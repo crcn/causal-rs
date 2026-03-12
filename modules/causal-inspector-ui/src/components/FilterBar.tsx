@@ -27,33 +27,6 @@ export function FilterBar() {
         />
       </div>
 
-      <span className="w-px h-4 bg-border" />
-
-      <label className="text-[10px] text-muted-foreground uppercase tracking-wider">From</label>
-      <input
-        type="date"
-        value={filters.from ?? ""}
-        onChange={(e) =>
-          dispatch({
-            type: "ui/filter_changed",
-            payload: { from: e.target.value || null },
-          })
-        }
-        className="px-2 py-1.5 text-xs rounded-md bg-background/50 border border-border text-foreground w-32 focus:outline-none focus:ring-1 focus:ring-indigo-500/40 focus:border-indigo-500/30 transition-all"
-      />
-      <label className="text-[10px] text-muted-foreground uppercase tracking-wider">To</label>
-      <input
-        type="date"
-        value={filters.to ?? ""}
-        onChange={(e) =>
-          dispatch({
-            type: "ui/filter_changed",
-            payload: { to: e.target.value || null },
-          })
-        }
-        className="px-2 py-1.5 text-xs rounded-md bg-background/50 border border-border text-foreground w-32 focus:outline-none focus:ring-1 focus:ring-indigo-500/40 focus:border-indigo-500/30 transition-all"
-      />
-
       {filters.correlationId && (
         <>
           <span className="w-px h-4 bg-border" />
@@ -64,6 +37,26 @@ export function FilterBar() {
                 dispatch({
                   type: "ui/filter_changed",
                   payload: { correlationId: null },
+                })
+              }
+              className="hover:text-foreground transition-colors"
+            >
+              <X size={10} />
+            </button>
+          </span>
+        </>
+      )}
+
+      {filters.aggregateKey && (
+        <>
+          <span className="w-px h-4 bg-border" />
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-teal-500/10 border border-teal-500/20 text-teal-400 text-[10px] font-mono">
+            {filters.aggregateKey.split(":")[0]}:{filters.aggregateKey.split(":").slice(1).join(":").slice(0, 8)}
+            <button
+              onClick={() =>
+                dispatch({
+                  type: "ui/filter_changed",
+                  payload: { aggregateKey: null },
                 })
               }
               className="hover:text-foreground transition-colors"

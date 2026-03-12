@@ -67,9 +67,8 @@ export const createQueryEngine = (
             limit: 50,
             cursor,
             search: state.filters.search || undefined,
-            from: state.filters.from || undefined,
-            to: state.filters.to || undefined,
             correlationId: state.filters.correlationId || undefined,
+            aggregateKey: state.filters.aggregateKey || undefined,
           }
         );
 

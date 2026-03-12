@@ -89,10 +89,15 @@ export {
 // ── Utilities ──
 export { formatTs, compactPayload, copyToClipboard } from "./utils";
 
+// ── Drop-in component ──
+export { CausalInspector } from "./CausalInspector";
+export type { CausalInspectorProps } from "./CausalInspector";
+
 // ── Components ──
 export { FilterBar } from "./components/FilterBar";
 export { CopyablePayload } from "./components/CopyablePayload";
 export { JsonSyntax } from "./components/JsonSyntax";
+export { GlobalScrubber } from "./components/GlobalScrubber";
 // ── Panes ──
 export { TimelinePane } from "./panes/TimelinePane";
 export type { TimelinePaneProps } from "./panes/TimelinePane";

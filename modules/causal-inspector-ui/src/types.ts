@@ -8,6 +8,9 @@ export type InspectorEvent = {
   parentId: string | null;
   correlationId: string | null;
   reactorId: string | null;
+  aggregateType: string | null;
+  aggregateId: string | null;
+  streamVersion: number | null;
   summary: string | null;
   payload: string;
 };
@@ -105,9 +108,8 @@ export type CorrelationSummary = {
 
 export type FilterState = {
   search: string;
-  from: string | null;
-  to: string | null;
   correlationId: string | null;
+  aggregateKey: string | null;
 };
 
 export type LogsFilter = {

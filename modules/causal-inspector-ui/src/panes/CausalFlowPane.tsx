@@ -18,7 +18,8 @@ import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent, Block, FlowSelection, ReactorDescription, ReactorOutcome } from "../types";
 import { eventBg, eventBorder, eventTextColor } from "../theme";
-import { Filter, Play, Pause, SkipBack, SkipForward, ChevronsRight, RotateCcw } from "lucide-react";
+import { Filter } from "lucide-react";
+import { inScrubberRange } from "../utils";
 
 // ---------------------------------------------------------------------------
 // Flow node data
@@ -410,9 +411,10 @@ function layoutGraph(nodes: Node[], edges: Edge[]): FlowGraph {
 
 function computeVisibleIds(
   allEvents: InspectorEvent[],
-  position: number,
+  start: number | null,
+  end: number | null,
 ): { nodeIds: Set<string>; edgeIds: Set<string> } {
-  const visible = allEvents.filter((e) => e.seq <= position);
+  const visible = allEvents.filter((e) => inScrubberRange(e.seq, start, end));
   const nodeIds = new Set<string>();
   const edgeIds = new Set<string>();
 
@@ -464,117 +466,6 @@ function computeVisibleIds(
 }
 
 // ---------------------------------------------------------------------------
-// Time scrubber bar
-// ---------------------------------------------------------------------------
-
-function TimeScrubber({
-  seqs,
-  position,
-  playing,
-  speed,
-  dispatch,
-}: {
-  seqs: number[];
-  position: number | null;
-  playing: boolean;
-  speed: number;
-  dispatch: (event: InspectorMachineEvent) => void;
-}) {
-  const min = seqs[0] ?? 0;
-  const max = seqs[seqs.length - 1] ?? 0;
-  const current = position ?? max;
-  const isAtEnd = position == null || position >= max;
-  const currentIndex = position != null ? seqs.filter((s) => s <= position).length : seqs.length;
-
-  const stepBack = useCallback(() => {
-    const idx = seqs.findIndex((s) => s >= current);
-    const prev = seqs[Math.max(0, idx - 1)];
-    if (prev != null) dispatch({ type: "ui/scrubber_moved", payload: { position: prev } });
-  }, [seqs, current, dispatch]);
-
-  const stepForward = useCallback(() => {
-    const next = seqs.find((s) => s > current);
-    if (next != null) {
-      dispatch({ type: "ui/scrubber_moved", payload: { position: next } });
-    } else {
-      dispatch({ type: "ui/scrubber_moved", payload: { position: null } });
-    }
-  }, [seqs, current, dispatch]);
-
-  const reset = useCallback(() => {
-    if (playing) dispatch({ type: "ui/scrubber_play_toggled" });
-    dispatch({ type: "ui/scrubber_moved", payload: { position: seqs[0] ?? null } });
-  }, [seqs, playing, dispatch]);
-
-  const jumpToEnd = useCallback(() => {
-    if (playing) dispatch({ type: "ui/scrubber_play_toggled" });
-    dispatch({ type: "ui/scrubber_moved", payload: { position: null } });
-  }, [playing, dispatch]);
-
-  const togglePlay = useCallback(() => {
-    // If at end, reset to start before playing
-    if (!playing && isAtEnd && seqs.length > 0) {
-      dispatch({ type: "ui/scrubber_moved", payload: { position: seqs[0] } });
-    }
-    dispatch({ type: "ui/scrubber_play_toggled" });
-  }, [playing, isAtEnd, seqs, dispatch]);
-
-  const cycleSpeed = useCallback(() => {
-    const speeds = [500, 300, 150, 50];
-    const idx = speeds.indexOf(speed);
-    const next = speeds[(idx + 1) % speeds.length];
-    dispatch({ type: "ui/scrubber_speed_changed", payload: { speed: next } });
-  }, [speed, dispatch]);
-
-  const speedLabel = speed <= 50 ? "4x" : speed <= 150 ? "2x" : speed <= 300 ? "1x" : "0.5x";
-
-  const btnClass = "p-1.5 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-white/[0.05] transition-all duration-150";
-
-  return (
-    <div className="flex items-center gap-1.5 px-3 py-2 border-t border-border shrink-0" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
-      <button onClick={reset} className={btnClass} title="Reset to start">
-        <RotateCcw size={12} />
-      </button>
-      <button onClick={stepBack} className={btnClass} title="Step back">
-        <SkipBack size={12} />
-      </button>
-      <button onClick={togglePlay} className={`p-1.5 rounded-md transition-all duration-150 ${playing ? "text-indigo-400 bg-indigo-500/10" : "text-muted-foreground/60 hover:text-foreground hover:bg-white/[0.05]"}`} title={playing ? "Pause" : "Play"}>
-        {playing ? <Pause size={14} /> : <Play size={14} />}
-      </button>
-      <button onClick={stepForward} className={btnClass} title="Step forward">
-        <SkipForward size={12} />
-      </button>
-      <button onClick={jumpToEnd} className={btnClass} title="Jump to end">
-        <ChevronsRight size={12} />
-      </button>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        value={current}
-        onChange={(e) => {
-          const val = Number(e.target.value);
-          const nearest = seqs.reduce((best, s) =>
-            Math.abs(s - val) < Math.abs(best - val) ? s : best, seqs[0]);
-          dispatch({ type: "ui/scrubber_moved", payload: { position: nearest >= max ? null : nearest } });
-        }}
-        className="flex-1 cursor-pointer"
-      />
-      <span className="text-[10px] text-muted-foreground/60 tabular-nums min-w-[4rem] text-right">
-        {currentIndex}/{seqs.length}
-      </span>
-      <button
-        onClick={cycleSpeed}
-        className="text-[10px] text-muted-foreground/60 hover:text-foreground px-2 py-1 rounded-md border border-border hover:border-indigo-500/30 tabular-nums min-w-[2.5rem] text-center transition-all duration-150"
-        title="Playback speed"
-      >
-        {speedLabel}
-      </button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Auto-center on selection
 // ---------------------------------------------------------------------------
 
@@ -596,14 +487,14 @@ function FitOnLoad() {
 
 function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: InspectorEvent[] }) {
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
-  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const { setCenter, getZoom } = useReactFlow();
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
 
   useEffect(() => {
     // Don't recenter while scrubber is active
-    if (scrubberPosition != null) return;
+    if (scrubberEnd != null) return;
     if (selectedSeq == null || !flowData.length) return;
     const evt = flowData.find(e => e.seq === selectedSeq);
     if (!evt) return;
@@ -621,7 +512,7 @@ function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: Inspec
       node.position.y + h / 2,
       { zoom: getZoom(), duration: 400 },
     );
-  }, [selectedSeq, scrubberPosition, flowData, setCenter, getZoom]);
+  }, [selectedSeq, scrubberEnd, flowData, setCenter, getZoom]);
 
   return null;
 }
@@ -723,9 +614,8 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
   const descriptionsMap = useSelector<InspectorState, Record<string, ReactorDescription[]>>((s) => s.descriptions);
   const outcomesMap = useSelector<InspectorState, Record<string, ReactorOutcome[]>>((s) => s.outcomes);
-  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
-  const scrubberPlaying = useSelector<InspectorState, boolean>((s) => s.scrubberPlaying);
-  const scrubberSpeed = useSelector<InspectorState, number>((s) => s.scrubberSpeed);
+  const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
+  const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   const flowLoading = flowCorrelationId != null && flowData.length === 0;
@@ -760,23 +650,17 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
     return [...ids].sort();
   }, [flowData, outcomes]);
 
-  // Sorted seq numbers for scrubber range
-  const sortedSeqs = useMemo(
-    () => flowData.map((e) => e.seq).sort((a, b) => a - b),
-    [flowData],
-  );
-
   // Full graph layout — stable positions computed from ALL events
   const { nodes: fullNodes, edges: fullEdges } = useMemo(() => {
     if (!flowData || flowData.length === 0) return { nodes: [], edges: [] };
     return buildFlowGraph(flowData, descriptions, outcomes, hiddenReactors);
   }, [flowData, descriptions, outcomes, hiddenReactors]);
 
-  // Compute visible IDs when scrubber is active
+  // Compute visible IDs when scrubber range is active
   const visibleIds = useMemo(() => {
-    if (scrubberPosition == null) return null; // show everything
-    return computeVisibleIds(flowData, scrubberPosition);
-  }, [flowData, scrubberPosition]);
+    if (scrubberStart == null && scrubberEnd == null) return null; // show everything
+    return computeVisibleIds(flowData, scrubberStart, scrubberEnd);
+  }, [flowData, scrubberStart, scrubberEnd]);
 
   // Apply visibility: hidden nodes get opacity 0, hidden edges are filtered out
   const rawNodes = useMemo(() => {
@@ -966,15 +850,6 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           <Controls showInteractive={false} />
         </ReactFlow>
       </div>
-      {sortedSeqs.length > 1 && (
-        <TimeScrubber
-          seqs={sortedSeqs}
-          position={scrubberPosition}
-          playing={scrubberPlaying}
-          speed={scrubberSpeed}
-          dispatch={dispatch}
-        />
-      )}
     </div>
   );
 }

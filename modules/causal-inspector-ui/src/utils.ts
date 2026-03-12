@@ -1,3 +1,34 @@
+import type { InspectorState } from "./state";
+import type { InspectorEvent } from "./types";
+
+/** Check if a seq falls within the scrubber range. */
+export function inScrubberRange(seq: number, start: number | null, end: number | null): boolean {
+  if (start != null && seq < start) return false;
+  if (end != null && seq > end) return false;
+  return true;
+}
+
+/** Derive the walkable seq list based on current context (flow, selection, or global). */
+export function getScrubberSequence(state: InspectorState): number[] {
+  let events: InspectorEvent[];
+
+  if (state.flowCorrelationId) {
+    events = state.flowData;
+    const sel = state.flowSelection;
+    if (sel) {
+      if (sel.kind === "event-type") {
+        events = events.filter(e => e.name === sel.name);
+      } else {
+        events = events.filter(e => e.reactorId === sel.reactorId);
+      }
+    }
+  } else {
+    events = state.events;
+  }
+
+  return events.map(e => e.seq).sort((a, b) => a - b);
+}
+
 /** Format a timestamp for compact display. */
 export function formatTs(ts: string): string {
   return new Date(ts).toLocaleString(undefined, {
@@ -37,6 +68,13 @@ export function compactPayload(raw: string, maxLen = 200): string {
   } catch {
     return raw.slice(0, maxLen);
   }
+}
+
+/** Composite aggregate key from event fields, or null. */
+export function aggregateKey(event: InspectorEvent): string | null {
+  return event.aggregateType && event.aggregateId
+    ? `${event.aggregateType}:${event.aggregateId}`
+    : null;
 }
 
 /** Copy text to clipboard with fallback for older browsers. */

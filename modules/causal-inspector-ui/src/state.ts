@@ -28,8 +28,9 @@ export type InspectorState = {
   flowData: InspectorEvent[];
   flowSelection: FlowSelection;
 
-  // Time scrubber — null means show all events
-  scrubberPosition: number | null;
+  // Time scrubber — range window into events
+  scrubberStart: number | null;   // null = beginning (no lower bound)
+  scrubberEnd: number | null;     // null = show all (no upper bound)
   scrubberPlaying: boolean;
   scrubberSpeed: number;
 
@@ -79,7 +80,8 @@ export const initialState: InspectorState = {
   flowData: [],
   flowSelection: null,
 
-  scrubberPosition: null,
+  scrubberStart: null,
+  scrubberEnd: null,
   scrubberPlaying: false,
   scrubberSpeed: 300,
 
@@ -87,9 +89,8 @@ export const initialState: InspectorState = {
 
   filters: {
     search: "",
-    from: null,
-    to: null,
     correlationId: null,
+    aggregateKey: null,
   },
 
   logs: [],

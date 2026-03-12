@@ -5,7 +5,7 @@ import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent, FlowSelection } from "../types";
 import { CopyablePayload } from "../components/CopyablePayload";
 import { eventTextColor } from "../theme";
-import { formatTs, compactPayload, copyToClipboard } from "../utils";
+import { formatTs, compactPayload, copyToClipboard, inScrubberRange } from "../utils";
 import { Copy, Check, Search, X, ChevronRight, ChevronDown } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -294,14 +294,15 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
   const flowCorrelationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
-  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
+  const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   const treeEvents = useMemo(() => {
     const all = causalTree?.events ?? null;
-    if (all == null || scrubberPosition == null) return all;
-    return all.filter((e) => e.seq <= scrubberPosition);
-  }, [causalTree?.events, scrubberPosition]);
+    if (all == null || (scrubberStart == null && scrubberEnd == null)) return all;
+    return all.filter((e) => inScrubberRange(e.seq, scrubberStart, scrubberEnd));
+  }, [causalTree?.events, scrubberStart, scrubberEnd]);
   const treeLoading = selectedSeq != null && causalTree == null;
 
   const onClickReactor = useCallback(

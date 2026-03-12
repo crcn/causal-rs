@@ -6,12 +6,11 @@ publish = false
 
 [dependencies]
 causal = { path = "../../modules/causal" }
-causal_inspector = { path = "../../modules/causal_inspector", features = ["memory", "graphql"] }
+causal_inspector = { path = "../../modules/causal_inspector", features = ["memory", "axum"] }
 anyhow = "1.0"
 axum = { version = "0.8", features = ["default"] }
 tower-http = { version = "0.6", features = ["fs"] }
 async-graphql = "7"
-async-graphql-axum = "7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["full"] }

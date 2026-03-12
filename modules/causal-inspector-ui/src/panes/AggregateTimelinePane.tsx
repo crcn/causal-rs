@@ -2,8 +2,10 @@ import { useMemo, useCallback, useEffect, useRef, useState } from "react";
 import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
-import type { AggregateTimelineEntry } from "../types";
+import type { AggregateTimelineEntry, InspectorEvent } from "../types";
 import { eventBg, eventBorder, eventTextColor } from "../theme";
+import { inScrubberRange } from "../utils";
+import { X } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Inline JSON syntax highlighting (inline styles — no Tailwind dependency)
@@ -262,10 +264,24 @@ export function AggregateTimelinePane() {
   const entries = useSelector<InspectorState, AggregateTimelineEntry[]>((s) =>
     correlationId ? s.aggregateTimeline[correlationId] ?? [] : [],
   );
-  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
+  const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
+  const logsFilter = useSelector<InspectorState, { reactorId: string | null }>((s) => s.logsFilter);
+  const flowData = useSelector<InspectorState, InspectorEvent[]>((s) => s.flowData);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   const [diffMode, setDiffMode] = useState(false);
+
+  // Map eventId → reactorId for handler selection highlighting
+  const eventReactorMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const e of flowData) {
+      if (e.id && e.reactorId) map.set(e.id, e.reactorId);
+    }
+    return map;
+  }, [flowData]);
+
+  const hasReactorFilter = logsFilter.reactorId != null;
 
   // Build a lookup: seq → { aggKey → state } for computing diffs
   const prevStateMap = useMemo(() => {
@@ -284,14 +300,14 @@ export function AggregateTimelinePane() {
   // Auto-scroll to current row when scrubber moves
   const currentRowRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (scrubberPosition != null && currentRowRef.current) {
+    if (scrubberEnd != null && currentRowRef.current) {
       currentRowRef.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
-  }, [scrubberPosition]);
+  }, [scrubberEnd]);
 
   const handleRowClick = useCallback(
     (seq: number) => {
-      dispatch({ type: "ui/scrubber_moved", payload: { position: seq } });
+      dispatch({ type: "ui/scrubber_end_changed", payload: { end: seq } });
     },
     [dispatch],
   );
@@ -350,14 +366,31 @@ export function AggregateTimelinePane() {
         >
           Diff
         </button>
+        {hasReactorFilter && (
+          <>
+            <div style={{ width: 1, height: 14, background: "rgba(255,255,255,0.06)", marginLeft: 4, marginRight: 4 }} />
+            <span style={{ fontSize: 10, color: "#818cf8", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+              {logsFilter.reactorId}
+            </span>
+            <button
+              onClick={() => dispatch({ type: "ui/flow_node_selected", payload: null })}
+              style={{ background: "none", border: "none", cursor: "pointer", color: "#70708a", padding: 2, borderRadius: 4, display: "flex", alignItems: "center" }}
+              title="Clear selection"
+            >
+              <X size={12} />
+            </button>
+          </>
+        )}
       </div>
 
       {/* Timeline entries */}
       <div style={{ flex: 1, overflow: "auto", padding: "8px 12px" }}>
         {entries.map((entry, entryIdx) => {
-          const isFuture = scrubberPosition != null && entry.seq > scrubberPosition;
-          const isCurrent = scrubberPosition === entry.seq;
+          const isOutside = (scrubberStart != null || scrubberEnd != null) && !inScrubberRange(entry.seq, scrubberStart, scrubberEnd);
+          const isCurrent = scrubberEnd === entry.seq;
           const prevAggs = prevStateMap.get(entry.seq);
+          const entryReactorId = entry.eventId ? eventReactorMap.get(entry.eventId) : null;
+          const isReactorMatch = !hasReactorFilter || entryReactorId === logsFilter.reactorId;
 
           return (
             <div
@@ -365,11 +398,11 @@ export function AggregateTimelinePane() {
               ref={isCurrent ? currentRowRef : undefined}
               onClick={() => handleRowClick(entry.seq)}
               style={{
-                opacity: isFuture ? 0.3 : 1,
+                opacity: isOutside ? 0.3 : !isReactorMatch ? 0.35 : 1,
                 padding: "6px 8px",
                 marginBottom: 4,
                 borderRadius: 6,
-                background: isCurrent ? "rgba(99,102,241,0.15)" : "transparent",
+                background: isCurrent ? "rgba(99,102,241,0.15)" : isReactorMatch && hasReactorFilter ? "rgba(99,102,241,0.06)" : "transparent",
                 cursor: "pointer",
                 transition: "opacity 150ms, background 150ms",
               }}

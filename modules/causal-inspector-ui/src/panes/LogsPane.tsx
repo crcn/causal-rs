@@ -3,7 +3,7 @@ import { useSelector } from "../machine";
 import type { InspectorState } from "../state";
 import type { ReactorLog, LogsFilter } from "../types";
 import { LOG_LEVEL_COLORS } from "../theme";
-import { formatTs } from "../utils";
+import { formatTs, inScrubberRange } from "../utils";
 import { Search, ChevronRight, ChevronDown } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,8 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   const logs = useSelector<InspectorState, ReactorLog[]>((s) => s.logs);
   const logsFilter = useSelector<InspectorState, LogsFilter>((s) => s.logsFilter);
   const flowData = useSelector<InspectorState, InspectorState["flowData"]>((s) => s.flowData);
-  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
+  const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
 
   const [levelFilter, setLevelFilter] = useState<Set<string>>(new Set(["debug", "info", "warn"]));
   const [searchText, setSearchText] = useState("");
@@ -68,13 +69,13 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   const isCorrelationScope = logsFilter.scope === "correlation" && logsFilter.correlationId != null;
   const hasFilter = logsFilter.reactorId != null || isCorrelationScope;
 
-  // Set of event IDs visible at current scrubber position
+  // Set of event IDs visible within scrubber range
   const visibleEventIds = useMemo(() => {
-    if (scrubberPosition == null) return null;
+    if (scrubberStart == null && scrubberEnd == null) return null;
     return new Set(
-      flowData.filter((e) => e.seq <= scrubberPosition).map((e) => e.id).filter(Boolean),
+      flowData.filter((e) => inScrubberRange(e.seq, scrubberStart, scrubberEnd)).map((e) => e.id).filter(Boolean),
     );
-  }, [flowData, scrubberPosition]);
+  }, [flowData, scrubberStart, scrubberEnd]);
 
   // Client-side filtering
   const filteredLogs = useMemo(() => {

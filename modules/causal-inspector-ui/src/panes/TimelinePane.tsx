@@ -6,7 +6,7 @@ import type { InspectorEvent } from "../types";
 import { FilterBar } from "../components/FilterBar";
 import { CopyablePayload } from "../components/CopyablePayload";
 import { eventTextColor, eventBg, eventBorder } from "../theme";
-import { formatTs, compactPayload } from "../utils";
+import { formatTs, compactPayload, aggregateKey, inScrubberRange } from "../utils";
 import { Search, ChevronRight, ChevronDown } from "lucide-react";
 
 function EventRow({
@@ -14,6 +14,7 @@ function EventRow({
   isSelected,
   onClick,
   onFilterCorrelation,
+  onFilterStream,
   onInvestigate,
   indent,
 }: {
@@ -21,6 +22,7 @@ function EventRow({
   isSelected: boolean;
   onClick: () => void;
   onFilterCorrelation: (correlationId: string) => void;
+  onFilterStream: (aggregateKey: string) => void;
   onInvestigate?: () => void;
   indent?: boolean;
 }) {
@@ -50,6 +52,15 @@ function EventRow({
               title={`Filter by correlation ${event.correlationId}`}
             >
               {event.correlationId.slice(0, 8)}
+            </button>
+          )}
+          {event.aggregateType && event.aggregateId && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onFilterStream(aggregateKey(event)!); }}
+              className="opacity-0 group-hover:opacity-100 px-1.5 py-0.5 rounded-full text-[9px] font-mono bg-teal-500/8 text-teal-400/80 hover:bg-teal-500/15 hover:text-teal-400 shrink-0 transition-all border border-teal-500/10"
+              title={`Filter by stream ${event.aggregateType}:${event.aggregateId}`}
+            >
+              {event.aggregateType}:{event.aggregateId!.slice(0, 8)}
             </button>
           )}
           <span
@@ -143,6 +154,7 @@ function EventGroupRow({
   onToggle,
   onSelect,
   onFilterCorrelation,
+  onFilterStream,
   onInvestigate,
 }: {
   group: EventGroup;
@@ -151,6 +163,7 @@ function EventGroupRow({
   onToggle: () => void;
   onSelect: (event: InspectorEvent) => void;
   onFilterCorrelation: (correlationId: string) => void;
+  onFilterStream: (aggregateKey: string) => void;
   onInvestigate?: (event: InspectorEvent) => void;
 }) {
   return (
@@ -170,6 +183,7 @@ function EventGroupRow({
             isSelected={group.root.seq === selectedSeq}
             onClick={() => onSelect(group.root)}
             onFilterCorrelation={onFilterCorrelation}
+            onFilterStream={onFilterStream}
             onInvestigate={onInvestigate ? () => onInvestigate(group.root) : undefined}
           />
           {collapsed && (
@@ -191,6 +205,7 @@ function EventGroupRow({
             isSelected={child.seq === selectedSeq}
             onClick={() => onSelect(child)}
             onFilterCorrelation={onFilterCorrelation}
+            onFilterStream={onFilterStream}
             onInvestigate={onInvestigate ? () => onInvestigate(child) : undefined}
             indent
           />
@@ -237,12 +252,19 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
   const loading = useSelector<InspectorState, boolean>((s) => s.loading);
   const hasMore = useSelector<InspectorState, boolean>((s) => s.hasMore);
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
+  const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
+  const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   // Default collapsed — this set tracks which groups are *expanded*
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
 
-  const grouped = useMemo(() => groupEventsByCorrelation(events), [events]);
+  const displayedEvents = useMemo(() => {
+    if (scrubberStart == null && scrubberEnd == null) return events;
+    return events.filter(e => inScrubberRange(e.seq, scrubberStart, scrubberEnd));
+  }, [events, scrubberStart, scrubberEnd]);
+
+  const grouped = useMemo(() => groupEventsByCorrelation(displayedEvents), [displayedEvents]);
 
   const toggleGroup = useCallback((correlationId: string) => {
     setExpandedGroups((prev) => {
@@ -266,6 +288,13 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
   const handleFilterCorrelation = useCallback(
     (correlationId: string) => {
       dispatch({ type: "ui/filter_changed", payload: { correlationId } });
+    },
+    [dispatch]
+  );
+
+  const handleFilterStream = useCallback(
+    (aggregateKey: string) => {
+      dispatch({ type: "ui/filter_changed", payload: { aggregateKey } });
     },
     [dispatch]
   );
@@ -306,6 +335,7 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
                   onToggle={() => toggleGroup(group.correlationId)}
                   onSelect={handleSelect}
                   onFilterCorrelation={handleFilterCorrelation}
+                  onFilterStream={handleFilterStream}
                   onInvestigate={onInvestigate}
                 />
               );
@@ -319,6 +349,7 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
                 isSelected={event.seq === selectedSeq}
                 onClick={() => handleSelect(event)}
                 onFilterCorrelation={handleFilterCorrelation}
+                onFilterStream={handleFilterStream}
                 onInvestigate={onInvestigate ? () => onInvestigate(event) : undefined}
               />
             );

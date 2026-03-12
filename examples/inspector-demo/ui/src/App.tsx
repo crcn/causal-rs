@@ -23,6 +23,7 @@ import {
   AggregateTimelinePane,
   WaterfallPane,
   CorrelationExplorerPane,
+  GlobalScrubber,
   type InspectorState,
   type InspectorMachineEvent,
   type PaneLayout,
@@ -160,9 +161,6 @@ function InspectorLayout() {
     dispatch({ type: "ui/layout_changed", payload: model.toJson() as PaneLayout });
 
     if (action.type === Actions.DELETE_TAB) {
-      if (!findTab(model, "logs")) {
-        dispatch({ type: "ui/logs_filter_changed", payload: { eventId: null, reactorId: null, correlationId: null, scope: "reactor" } });
-      }
       if (!findTab(model, "causal-flow")) {
         dispatch({ type: "ui/flow_closed" });
       }
@@ -207,14 +205,17 @@ function InspectorLayout() {
   );
 
   return (
-    <div className="h-screen w-screen">
-      <Layout
-        ref={layoutRef}
-        model={modelRef.current}
-        factory={factory}
-        onModelChange={onModelChange}
-        onRenderTabSet={onRenderTabSet}
-      />
+    <div className="h-screen w-screen flex flex-col">
+      <div className="flex-1 min-h-0">
+        <Layout
+          ref={layoutRef}
+          model={modelRef.current}
+          factory={factory}
+          onModelChange={onModelChange}
+          onRenderTabSet={onRenderTabSet}
+        />
+      </div>
+      <GlobalScrubber />
     </div>
   );
 }

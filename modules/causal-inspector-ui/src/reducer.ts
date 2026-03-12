@@ -19,7 +19,8 @@ function applyNavigation(
       draft.flowCorrelationId = correlationId;
       draft.flowData = [];
       draft.flowSelection = null;
-      draft.scrubberPosition = null;
+      draft.scrubberStart = null;
+      draft.scrubberEnd = null;
       draft.scrubberPlaying = false;
       draft.logsFilter = {
         scope: "correlation",
@@ -30,7 +31,8 @@ function applyNavigation(
       draft.flowCorrelationId = null;
       draft.flowData = [];
       draft.flowSelection = null;
-      draft.scrubberPosition = null;
+      draft.scrubberStart = null;
+      draft.scrubberEnd = null;
       draft.scrubberPlaying = false;
       draft.logsFilter = {
         scope: "reactor",
@@ -166,6 +168,14 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       break;
     case "ui/flow_node_selected":
       draft.flowSelection = event.payload;
+      // Clear reactor filter when deselecting a node
+      if (event.payload == null && draft.logsFilter.reactorId != null) {
+        draft.logsFilter = {
+          scope: "correlation",
+          reactorId: null,
+          correlationId: draft.flowCorrelationId,
+        };
+      }
       break;
     case "ui/filter_changed":
       Object.assign(draft.filters, event.payload);
@@ -176,8 +186,11 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
     case "ui/layout_changed":
       draft.paneLayout = event.payload;
       break;
-    case "ui/scrubber_moved":
-      draft.scrubberPosition = event.payload.position;
+    case "ui/scrubber_start_changed":
+      draft.scrubberStart = event.payload.start;
+      break;
+    case "ui/scrubber_end_changed":
+      draft.scrubberEnd = event.payload.end;
       break;
     case "ui/scrubber_play_toggled":
       draft.scrubberPlaying = !draft.scrubberPlaying;

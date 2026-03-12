@@ -1,20 +1,23 @@
 {
-  "name": "@causal/inspector-ui",
+  "name": "causal-inspector",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
   "scripts": {
+    "build": "tsc && cp src/*.css dist/",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "graphql-ws": "^6.0.0",
     "immer": "^10.0.0",
     "lucide-react": "^0.575.0"
   },
   "peerDependencies": {
     "@dagrejs/dagre": "^1.0.0",
     "@xyflow/react": "^12.0.0",
+    "flexlayout-react": ">=0.7.0",
     "react": "^18.0.0 || ^19.0.0",
     "react-dom": "^18.0.0 || ^19.0.0"
   },
@@ -24,6 +27,9 @@
     },
     "@dagrejs/dagre": {
       "optional": true
+    },
+    "flexlayout-react": {
+      "optional": true
     }
   },
   "devDependencies": {
@@ -31,6 +37,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.2.3",
     "@xyflow/react": "^12.10.1",
+    "flexlayout-react": "^0.8.19",
     "typescript": "^5.0.0"
   }
 }

@@ -3,6 +3,8 @@ import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent, ReactorOutcome } from "../types";
+import { inScrubberRange } from "../utils";
+import { X } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Timing helpers
@@ -103,7 +105,8 @@ export function WaterfallPane() {
     correlationId ? s.outcomes[correlationId] ?? [] : [],
   );
   const flowData = useSelector<InspectorState, InspectorEvent[]>((s) => s.flowData);
-  const scrubberPosition = useSelector<InspectorState, number | null>((s) => s.scrubberPosition);
+  const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
+  const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const logsFilter = useSelector<InspectorState, { reactorId: string | null }>((s) => s.logsFilter);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
@@ -126,13 +129,13 @@ export function WaterfallPane() {
     return map;
   }, [flowData]);
 
-  // Map scrubber seq → timestamp for cursor line
+  // Map scrubber end seq → timestamp for cursor line
   const scrubberMs = useMemo(() => {
-    if (scrubberPosition == null) return null;
-    const event = flowData.find((e) => e.seq === scrubberPosition);
+    if (scrubberEnd == null) return null;
+    const event = flowData.find((e) => e.seq === scrubberEnd);
     if (!event) return null;
     return new Date(event.ts).getTime();
-  }, [scrubberPosition, flowData]);
+  }, [scrubberEnd, flowData]);
 
   if (!correlationId) {
     return (
@@ -150,8 +153,29 @@ export function WaterfallPane() {
     );
   }
 
+  const hasReactorFilter = logsFilter.reactorId != null;
+
   return (
-    <div style={{ height: "100%", overflow: "auto", padding: `10px ${PADDING_X}px` }}>
+    <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+      {/* Selection indicator */}
+      {hasReactorFilter && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderBottom: "1px solid rgba(255,255,255,0.06)", flexShrink: 0, background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
+          <span style={{ fontSize: 10, color: "#818cf8", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+            {logsFilter.reactorId}
+          </span>
+          <button
+            onClick={() => {
+              dispatch({ type: "ui/flow_node_selected", payload: null });
+            }}
+            style={{ marginLeft: "auto", background: "none", border: "none", cursor: "pointer", color: "#70708a", padding: 2, borderRadius: 4, display: "flex", alignItems: "center" }}
+            title="Clear selection"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
+
+      <div style={{ flex: 1, overflow: "auto", padding: `10px ${PADDING_X}px` }}>
       {/* Time axis */}
       <div style={{ display: "flex", marginBottom: 6, marginLeft: LABEL_WIDTH, position: "relative", height: 16 }}>
         <span style={{ fontSize: 9, color: "#40405a", letterSpacing: "0.04em" }}>0ms</span>
@@ -181,13 +205,13 @@ export function WaterfallPane() {
         const colors = statusColor(bar.status);
         const duration = bar.endMs - bar.startMs;
 
-        // Scrubber sync: dim bars whose triggering events are all after scrubber
+        // Scrubber sync: dim bars whose triggering events are all outside range
         const isFuture =
-          scrubberPosition != null &&
+          (scrubberStart != null || scrubberEnd != null) &&
           bar.triggeringEventIds.length > 0 &&
           bar.triggeringEventIds.every((eid) => {
             const seq = eventIdToSeq.get(eid);
-            return seq != null && seq > scrubberPosition;
+            return seq != null && !inScrubberRange(seq, scrubberStart, scrubberEnd);
           });
 
         // Scrubber cursor position within this bar's track
@@ -207,7 +231,7 @@ export function WaterfallPane() {
               alignItems: "center",
               height: ROW_HEIGHT,
               gap: 0,
-              opacity: isFuture ? 0.25 : 1,
+              opacity: isFuture ? 0.25 : (hasReactorFilter && !isSelected) ? 0.35 : 1,
               transition: "opacity 200ms, background 150ms",
               cursor: "pointer",
               borderRadius: 6,
@@ -330,6 +354,7 @@ export function WaterfallPane() {
       {/* Total duration */}
       <div style={{ marginTop: 10, fontSize: 10, color: "#40405a", marginLeft: LABEL_WIDTH, letterSpacing: "0.03em" }}>
         Total wall time: {formatDuration(rangeMs)}
+      </div>
       </div>
     </div>
   );

@@ -63,7 +63,8 @@ type FlowNodeSelected = BaseEvent<"ui/flow_node_selected", FlowSelection>;
 type FilterChanged = BaseEvent<"ui/filter_changed", Partial<FilterState>>;
 type LoadMoreRequested = BaseEvent<"ui/load_more_requested">;
 type LayoutChanged = BaseEvent<"ui/layout_changed", PaneLayout>;
-type ScrubberMoved = BaseEvent<"ui/scrubber_moved", { position: number | null }>;
+type ScrubberStartChanged = BaseEvent<"ui/scrubber_start_changed", { start: number | null }>;
+type ScrubberEndChanged = BaseEvent<"ui/scrubber_end_changed", { end: number | null }>;
 type ScrubberPlayToggled = BaseEvent<"ui/scrubber_play_toggled">;
 type ScrubberSpeedChanged = BaseEvent<"ui/scrubber_speed_changed", { speed: number }>;
 type CorrelationsRequested = BaseEvent<"ui/correlations_requested", { search?: string }>;
@@ -94,7 +95,8 @@ export type InspectorMachineEvent =
   | FilterChanged
   | LoadMoreRequested
   | LayoutChanged
-  | ScrubberMoved
+  | ScrubberStartChanged
+  | ScrubberEndChanged
   | ScrubberPlayToggled
   | ScrubberSpeedChanged
   | CorrelationsRequested

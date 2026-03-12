@@ -1,0 +1,128 @@
+/* ── CausalInspector scoped styles ───────────────────────────── */
+
+.causal-inspector {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: #0a0a0f;
+  color: #e0e0f0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────── */
+.causal-inspector ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.causal-inspector ::-webkit-scrollbar-track {
+  background: transparent;
+}
+.causal-inspector ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+.causal-inspector ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* ── Flexlayout overrides ─────────────────────────────────── */
+.causal-inspector .flexlayout__tabset-selected,
+.causal-inspector .flexlayout__tabset-maximized {
+  background-image: none;
+}
+.causal-inspector .flexlayout__tabset_tabbar_outer {
+  background: rgba(15, 15, 20, 0.8) !important;
+  backdrop-filter: blur(12px) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+}
+.causal-inspector .flexlayout__tab_button--selected {
+  background: rgba(99, 102, 241, 0.12) !important;
+  color: #c7c7ff !important;
+}
+.causal-inspector .flexlayout__tab_button {
+  color: #70708a !important;
+  font-size: 11px !important;
+  letter-spacing: 0.02em !important;
+  transition: color 150ms, background 150ms !important;
+}
+.causal-inspector .flexlayout__tab_button:hover {
+  color: #b0b0c0 !important;
+  background: rgba(255, 255, 255, 0.04) !important;
+}
+.causal-inspector .flexlayout__splitter {
+  background: rgba(255, 255, 255, 0.03) !important;
+}
+.causal-inspector .flexlayout__splitter:hover {
+  background: rgba(99, 102, 241, 0.2) !important;
+}
+.causal-inspector .flexlayout__splitter_drag {
+  background: rgba(99, 102, 241, 0.3) !important;
+}
+
+/* ── Flow diagram ─────────────────────────────────────────── */
+.causal-inspector .react-flow .react-flow__edges {
+  z-index: 0 !important;
+}
+.causal-inspector .react-flow .react-flow__nodes {
+  position: relative;
+  z-index: 1 !important;
+}
+.causal-inspector .react-flow__controls {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+}
+.causal-inspector .react-flow__controls-button {
+  background: rgba(15, 15, 20, 0.9) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+  fill: #70708a !important;
+}
+.causal-inspector .react-flow__controls-button:hover {
+  background: rgba(99, 102, 241, 0.15) !important;
+  fill: #c7c7ff !important;
+}
+
+/* ── Selection ring ───────────────────────────────────────── */
+.causal-inspector *:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.4);
+  border-radius: 4px;
+}
+
+/* ── Range input ──────────────────────────────────────────── */
+.causal-inspector input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+.causal-inspector input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #6366f1;
+  cursor: pointer;
+  box-shadow: 0 0 6px rgba(99, 102, 241, 0.4);
+  transition: transform 100ms;
+}
+.causal-inspector input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+/* ── Pulse animation for running reactors ─────────────────── */
+@keyframes causal-inspector-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+@keyframes causal-inspector-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(99, 102, 241, 0.2); }
+  50% { box-shadow: 0 0 12px rgba(99, 102, 241, 0.4); }
+}
