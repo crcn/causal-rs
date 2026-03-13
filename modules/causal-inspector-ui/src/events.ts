@@ -11,6 +11,7 @@ import type {
   AggregateTimelineEntry,
   ReactorLog,
   ReactorOutcome,
+  ReactorAttempt,
   PaneLayout,
 } from "./types";
 
@@ -47,6 +48,10 @@ type AggregateTimelineLoaded = BaseEvent<
 type OutcomesLoaded = BaseEvent<
   "events/outcomes_loaded",
   { correlationId: string; outcomes: ReactorOutcome[] }
+>;
+type AttemptsLoaded = BaseEvent<
+  "events/attempts_loaded",
+  { correlationId: string; attempts: ReactorAttempt[] }
 >;
 type CorrelationsLoaded = BaseEvent<"events/correlations_loaded", { correlations: CorrelationSummary[]; hasMore: boolean; append: boolean }>;
 type ReactorDependenciesLoaded = BaseEvent<"events/reactor_dependencies_loaded", ReactorDependency[]>;
@@ -87,6 +92,7 @@ export type InspectorMachineEvent =
   | DescriptionSnapshotsLoaded
   | AggregateTimelineLoaded
   | OutcomesLoaded
+  | AttemptsLoaded
   | CorrelationsLoaded
   | EventSelected
   | EventDeselected

@@ -162,3 +162,17 @@ pub struct ReactorOutcome {
     pub completed_at: Option<DateTime<Utc>>,
     pub triggering_event_ids: Vec<String>,
 }
+
+/// Per-attempt execution record for the waterfall / debugging view.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct ReactorAttempt {
+    pub event_id: String,
+    pub reactor_id: String,
+    pub correlation_id: String,
+    pub attempt: i32,
+    pub status: String,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+}

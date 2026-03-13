@@ -187,3 +187,18 @@ export const INSPECTOR_REACTOR_OUTCOMES = `
     }
   }
 `;
+
+export const INSPECTOR_REACTOR_ATTEMPTS = `
+  query InspectorReactorAttempts($correlationId: String!) {
+    inspectorReactorAttempts(correlationId: $correlationId) {
+      eventId
+      reactorId
+      correlationId
+      attempt
+      status
+      error
+      startedAt
+      completedAt
+    }
+  }
+`;

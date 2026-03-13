@@ -55,6 +55,8 @@ pub struct MemoryStore {
     aggregate_state_snapshots: Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
     /// Reactor execution timing: (event_id, reactor_id) → (correlation_id, started_at, completed_at, status, error, attempts).
     reactor_executions: Arc<DashMap<(Uuid, String), (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String, Option<String>, i32)>>,
+    /// Per-attempt execution history: (event_id, reactor_id, correlation_id, attempt, status, error, started_at, completed_at).
+    reactor_attempt_history: Arc<Mutex<Vec<(Uuid, String, Uuid, i32, String, Option<String>, DateTime<Utc>, DateTime<Utc>)>>>,
     /// Checkpoint position for ReactorQueue (last fully processed EventLog position).
     checkpoint: Arc<AtomicU64>,
     /// Optional broadcast channel for live event notifications.
@@ -78,6 +80,7 @@ impl MemoryStore {
             reactor_description_snapshots: Arc::new(Mutex::new(Vec::new())),
             aggregate_state_snapshots: Arc::new(Mutex::new(Vec::new())),
             reactor_executions: Arc::new(DashMap::new()),
+            reactor_attempt_history: Arc::new(Mutex::new(Vec::new())),
             checkpoint: Arc::new(AtomicU64::new(0)),
             event_tx: None,
         }
@@ -143,6 +146,11 @@ impl MemoryStore {
     /// Access reactor execution timing records.
     pub fn reactor_executions(&self) -> &DashMap<(Uuid, String), (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String, Option<String>, i32)> {
         &self.reactor_executions
+    }
+
+    /// Access the per-attempt execution history.
+    pub fn reactor_attempt_history(&self) -> &Mutex<Vec<(Uuid, String, Uuid, i32, String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
+        &self.reactor_attempt_history
     }
 
     /// Internal journal clear (avoids trait method ambiguity).
@@ -395,9 +403,24 @@ impl ReactorQueue for MemoryStore {
                 self.in_flight
                     .remove(&(completion.event_id, completion.reactor_id.clone()));
                 self.clear_journal_internal(&completion.reactor_id, completion.event_id);
+                // Record attempt history before updating execution record
+                let now = Utc::now();
+                if let Some(entry) = self.reactor_executions.get(&(completion.event_id, completion.reactor_id.clone())) {
+                    let (corr_id, started_at, _, _, _, attempts) = entry.value();
+                    self.reactor_attempt_history.lock().push((
+                        completion.event_id,
+                        completion.reactor_id.clone(),
+                        *corr_id,
+                        *attempts,
+                        "completed".to_string(),
+                        None,
+                        *started_at,
+                        now,
+                    ));
+                }
                 // Record completion time
                 if let Some(mut entry) = self.reactor_executions.get_mut(&(completion.event_id, completion.reactor_id.clone())) {
-                    entry.2 = Some(Utc::now());
+                    entry.2 = Some(now);
                     entry.3 = "completed".to_string();
                 }
                 // Store log entries for inspector
@@ -420,6 +443,7 @@ impl ReactorQueue for MemoryStore {
                 error,
                 new_attempts,
                 next_execute_at,
+                log_entries,
             } => {
                 tracing::warn!(
                     "Reactor retry: {}:{} - {} (attempt {})",
@@ -428,9 +452,35 @@ impl ReactorQueue for MemoryStore {
                     error,
                     new_attempts
                 );
+                // Record attempt history before updating execution record
+                let now = Utc::now();
+                if let Some(entry) = self.reactor_executions.get(&(event_id, reactor_id.clone())) {
+                    let (corr_id, started_at, _, _, _, _) = entry.value();
+                    self.reactor_attempt_history.lock().push((
+                        event_id,
+                        reactor_id.clone(),
+                        *corr_id,
+                        new_attempts - 1, // this attempt number (0-based)
+                        "retry".to_string(),
+                        Some(error.clone()),
+                        *started_at,
+                        now,
+                    ));
+                }
                 // Update attempt count in execution record
                 if let Some(mut entry) = self.reactor_executions.get_mut(&(event_id, reactor_id.clone())) {
                     entry.5 = new_attempts;
+                }
+                // Store log entries for inspector
+                if !log_entries.is_empty() {
+                    let mut logs = self.reactor_log_entries.lock();
+                    for entry in &log_entries {
+                        logs.push((
+                            event_id,
+                            reactor_id.clone(),
+                            entry.clone(),
+                        ));
+                    }
                 }
                 let key = (event_id, reactor_id.clone());
                 if let Some((_, mut execution)) = self.in_flight.remove(&key) {
@@ -447,12 +497,38 @@ impl ReactorQueue for MemoryStore {
             ReactorResolution::DeadLetter(dlq) => {
                 self.in_flight
                     .remove(&(dlq.event_id, dlq.reactor_id.clone()));
+                // Record attempt history before updating execution record
+                let now = Utc::now();
+                if let Some(entry) = self.reactor_executions.get(&(dlq.event_id, dlq.reactor_id.clone())) {
+                    let (corr_id, started_at, _, _, _, _) = entry.value();
+                    self.reactor_attempt_history.lock().push((
+                        dlq.event_id,
+                        dlq.reactor_id.clone(),
+                        *corr_id,
+                        dlq.attempts,
+                        "error".to_string(),
+                        Some(dlq.error.clone()),
+                        *started_at,
+                        now,
+                    ));
+                }
                 // Record failure
                 if let Some(mut entry) = self.reactor_executions.get_mut(&(dlq.event_id, dlq.reactor_id.clone())) {
-                    entry.2 = Some(Utc::now());
+                    entry.2 = Some(now);
                     entry.3 = "error".to_string();
                     entry.4 = Some(dlq.error.clone());
                     entry.5 = dlq.attempts;
+                }
+                // Store log entries for inspector (same as Complete path)
+                if !dlq.log_entries.is_empty() {
+                    let mut logs = self.reactor_log_entries.lock();
+                    for entry in &dlq.log_entries {
+                        logs.push((
+                            dlq.event_id,
+                            dlq.reactor_id.clone(),
+                            entry.clone(),
+                        ));
+                    }
                 }
                 eprintln!(
                     "Reactor sent to DLQ: {}:{} - {} (attempts: {})",

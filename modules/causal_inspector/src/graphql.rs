@@ -376,6 +376,36 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
+    /// Fetch per-attempt execution history for a correlation chain.
+    async fn inspector_reactor_attempts(
+        &self,
+        ctx: &Context<'_>,
+        correlation_id: String,
+    ) -> Result<Vec<ReactorAttempt>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+
+        let entries = read_model
+            .reactor_attempt_history(&correlation_id)
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!("Failed to load reactor attempts: {e}"))
+            })?;
+
+        Ok(entries
+            .into_iter()
+            .map(|r| ReactorAttempt {
+                event_id: r.event_id.to_string(),
+                reactor_id: r.reactor_id,
+                correlation_id: r.correlation_id,
+                attempt: r.attempt,
+                status: r.status,
+                error: r.error,
+                started_at: r.started_at,
+                completed_at: r.completed_at,
+            })
+            .collect())
+    }
+
     /// Fetch aggregated reactor execution outcomes for a correlation chain.
     async fn inspector_reactor_outcomes(
         &self,

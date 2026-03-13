@@ -11,7 +11,7 @@ use causal::{MemoryStore, ReactorQueue};
 
 use crate::read_model::{
     InspectorReadModel, EventQuery, AggregateLifecycleEntry, AggregateStateSnapshotEntry,
-    CorrelationSummaryEntry, ReactorDependencyEntry,
+    CorrelationSummaryEntry, ReactorAttemptEntry, ReactorDependencyEntry,
     ReactorDescriptionEntry, ReactorDescriptionSnapshotEntry,
     ReactorLogEntry, ReactorOutcomeEntry, StoredEvent,
 };
@@ -268,6 +268,34 @@ impl InspectorReadModel for MemoryStore {
                 }
             })
             .collect())
+    }
+
+    async fn reactor_attempt_history(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<ReactorAttemptEntry>> {
+        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+            return Ok(vec![]);
+        };
+        let history = self.reactor_attempt_history().lock();
+        let mut result: Vec<ReactorAttemptEntry> = history
+            .iter()
+            .filter(|(_, _, corr_id, _, _, _, _, _)| *corr_id == cid)
+            .map(|(event_id, reactor_id, corr_id, attempt, status, error, started_at, completed_at)| {
+                ReactorAttemptEntry {
+                    event_id: *event_id,
+                    reactor_id: reactor_id.clone(),
+                    correlation_id: corr_id.to_string(),
+                    attempt: *attempt,
+                    status: status.clone(),
+                    error: error.clone(),
+                    started_at: *started_at,
+                    completed_at: *completed_at,
+                }
+            })
+            .collect();
+        result.sort_by_key(|a| a.started_at);
+        Ok(result)
     }
 
     async fn reactor_descriptions(

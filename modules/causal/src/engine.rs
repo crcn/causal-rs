@@ -639,6 +639,7 @@ where
                                         error,
                                         new_attempts: attempts + 1,
                                         next_execute_at,
+                                        log_entries: result.log_entries,
                                     })
                                     .await?;
                             }

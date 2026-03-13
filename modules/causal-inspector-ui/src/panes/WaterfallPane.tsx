@@ -2,7 +2,7 @@ import { useMemo, useCallback } from "react";
 import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
-import type { InspectorEvent, ReactorOutcome } from "../types";
+import type { InspectorEvent, ReactorOutcome, ReactorAttempt } from "../types";
 import { inScrubberRange } from "../utils";
 import { X } from "lucide-react";
 
@@ -30,6 +30,7 @@ const STATUS_COLORS: Record<string, { bar: string; barEnd: string; text: string 
   completed: { bar: "#22c55e", barEnd: "#16a34a", text: "#bbf7d0" },
   running: { bar: "#eab308", barEnd: "#ca8a04", text: "#fef08a" },
   error: { bar: "#ef4444", barEnd: "#dc2626", text: "#fecaca" },
+  retry: { bar: "#f97316", barEnd: "#ea580c", text: "#fed7aa" },
 };
 
 function statusColor(status: string) {
@@ -85,10 +86,47 @@ function buildBars(outcomes: ReactorOutcome[]): {
 }
 
 // ---------------------------------------------------------------------------
+// Attempt helpers
+// ---------------------------------------------------------------------------
+
+/** Group attempts by reactorId, sorted by attempt number. */
+function groupAttempts(attempts: ReactorAttempt[]): Map<string, ReactorAttempt[]> {
+  const map = new Map<string, ReactorAttempt[]>();
+  for (const a of attempts) {
+    let list = map.get(a.reactorId);
+    if (!list) {
+      list = [];
+      map.set(a.reactorId, list);
+    }
+    list.push(a);
+  }
+  for (const list of map.values()) {
+    list.sort((a, b) => a.attempt - b.attempt);
+  }
+  return map;
+}
+
+/** Factor attempts into the global min/max time range. */
+function expandRange(
+  attempts: ReactorAttempt[],
+  minMs: number,
+  maxMs: number,
+): { minMs: number; maxMs: number } {
+  for (const a of attempts) {
+    const s = new Date(a.startedAt).getTime();
+    const e = new Date(a.completedAt).getTime();
+    if (s < minMs) minMs = s;
+    if (e > maxMs) maxMs = e;
+  }
+  return { minMs, maxMs };
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const ROW_HEIGHT = 36;
+const ATTEMPT_ROW_HEIGHT = 26;
 const LABEL_WIDTH = 160;
 const BAR_MIN_WIDTH = 4;
 const PADDING_X = 12;
@@ -104,6 +142,9 @@ export function WaterfallPane() {
   const outcomes = useSelector<InspectorState, ReactorOutcome[]>((s) =>
     correlationId ? s.outcomes[correlationId] ?? [] : [],
   );
+  const attempts = useSelector<InspectorState, ReactorAttempt[]>((s) =>
+    correlationId ? s.attempts[correlationId] ?? [] : [],
+  );
   const flowData = useSelector<InspectorState, InspectorEvent[]>((s) => s.flowData);
   const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
@@ -117,7 +158,19 @@ export function WaterfallPane() {
     [dispatch],
   );
 
-  const { bars, minMs, maxMs } = useMemo(() => buildBars(outcomes), [outcomes]);
+  const attemptsByReactor = useMemo(() => groupAttempts(attempts), [attempts]);
+
+  const { bars, minMs, maxMs } = useMemo(() => {
+    const result = buildBars(outcomes);
+    // Expand range to include attempt times
+    if (attempts.length > 0) {
+      const expanded = expandRange(attempts, result.minMs, result.maxMs);
+      result.minMs = expanded.minMs;
+      result.maxMs = expanded.maxMs;
+    }
+    return result;
+  }, [outcomes, attempts]);
+
   const rangeMs = maxMs - minMs || 1;
 
   // Map event id → seq for scrubber sync
@@ -221,6 +274,8 @@ export function WaterfallPane() {
             : null;
 
         const isSelected = logsFilter.reactorId === bar.reactorId;
+        const reactorAttempts = attemptsByReactor.get(bar.reactorId) ?? [];
+        const hasMultipleAttempts = reactorAttempts.length > 1;
 
         return (
           <div key={bar.reactorId}>
@@ -364,6 +419,106 @@ export function WaterfallPane() {
                 {bar.error}
               </div>
             )}
+            {/* Per-attempt sub-rows */}
+            {hasMultipleAttempts && reactorAttempts.map((att) => {
+              const attStartMs = new Date(att.startedAt).getTime();
+              const attEndMs = new Date(att.completedAt).getTime();
+              const attOffsetPct = ((attStartMs - minMs) / rangeMs) * 100;
+              const attWidthPct = Math.max(((attEndMs - attStartMs) / rangeMs) * 100, 0.3);
+              const attColors = statusColor(att.status);
+              const attDuration = attEndMs - attStartMs;
+
+              return (
+                <div
+                  key={`${att.reactorId}-attempt-${att.attempt}`}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    height: ATTEMPT_ROW_HEIGHT,
+                    opacity: isFuture ? 0.25 : (hasReactorFilter && !isSelected) ? 0.35 : 0.7,
+                    paddingLeft: 4,
+                    paddingRight: 4,
+                  }}
+                >
+                  {/* Indented label */}
+                  <div
+                    style={{
+                      width: LABEL_WIDTH,
+                      flexShrink: 0,
+                      fontSize: 9,
+                      color: "#70708a",
+                      paddingLeft: 16,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      paddingRight: 10,
+                    }}
+                  >
+                    attempt {att.attempt + 1}
+                  </div>
+
+                  {/* Attempt bar track */}
+                  <div
+                    style={{
+                      flex: 1,
+                      position: "relative",
+                      height: 14,
+                      borderRadius: 3,
+                    }}
+                  >
+                    <div
+                      style={{
+                        position: "absolute",
+                        left: `${attOffsetPct}%`,
+                        width: `${attWidthPct}%`,
+                        minWidth: 3,
+                        height: "100%",
+                        background: `linear-gradient(90deg, ${attColors.bar}, ${attColors.barEnd})`,
+                        borderRadius: 3,
+                        opacity: 0.6,
+                        display: "flex",
+                        alignItems: "center",
+                        paddingLeft: 4,
+                        paddingRight: 4,
+                      }}
+                      title={`Attempt ${att.attempt + 1}: ${att.status} (${formatDuration(attDuration)})${att.error ? `\n${att.error}` : ""}`}
+                    >
+                      <span
+                        style={{
+                          fontSize: 8,
+                          fontWeight: 600,
+                          color: "#0a0a0f",
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {formatDuration(attDuration)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Attempt status */}
+                  <div
+                    style={{
+                      width: 80,
+                      flexShrink: 0,
+                      paddingLeft: 10,
+                      fontSize: 9,
+                      color: attColors.text,
+                      opacity: 0.6,
+                    }}
+                  >
+                    {att.status}
+                    {att.error && (
+                      <span style={{ color: "#70708a", marginLeft: 4 }} title={att.error}>
+                        !
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         );
       })}

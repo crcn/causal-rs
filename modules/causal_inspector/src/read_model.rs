@@ -116,6 +116,19 @@ pub struct ReactorOutcomeEntry {
     pub triggering_event_ids: Vec<String>,
 }
 
+/// Per-attempt execution record for a reactor.
+#[derive(Debug, Clone)]
+pub struct ReactorAttemptEntry {
+    pub event_id: Uuid,
+    pub reactor_id: String,
+    pub correlation_id: String,
+    pub attempt: i32,
+    pub status: String,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+}
+
 /// Reactor description blocks for the inspector.
 #[derive(Debug, Clone)]
 pub struct ReactorDescriptionEntry {
@@ -223,6 +236,14 @@ pub trait InspectorReadModel: Send + Sync {
 
     /// Aggregated reactor execution outcomes for a correlation chain.
     async fn reactor_outcomes(&self, correlation_id: &str) -> Result<Vec<ReactorOutcomeEntry>>;
+
+    /// Per-attempt execution history for a correlation chain.
+    ///
+    /// Returns individual attempt records ordered by started_at ascending.
+    async fn reactor_attempt_history(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<ReactorAttemptEntry>>;
 
     /// Reactor description blocks for a correlation chain.
     async fn reactor_descriptions(

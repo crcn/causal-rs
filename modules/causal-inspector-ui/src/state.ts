@@ -10,6 +10,7 @@ import type {
   AggregateTimelineEntry,
   ReactorLog,
   ReactorOutcome,
+  ReactorAttempt,
   LogsFilter,
   PaneLayout,
 } from "./types";
@@ -49,6 +50,7 @@ export type InspectorState = {
   descriptionSnapshots: Record<string, ReactorDescriptionSnapshot[]>;
   aggregateTimeline: Record<string, AggregateTimelineEntry[]>;
   outcomes: Record<string, ReactorOutcome[]>;
+  attempts: Record<string, ReactorAttempt[]>;
 
   // Correlations
   correlations: CorrelationSummary[];
@@ -105,6 +107,7 @@ export const initialState: InspectorState = {
   descriptionSnapshots: {},
   aggregateTimeline: {},
   outcomes: {},
+  attempts: {},
 
   correlations: [],
   correlationsLoading: false,

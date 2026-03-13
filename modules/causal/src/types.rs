@@ -313,6 +313,8 @@ pub enum ReactorResolution {
         error: String,
         new_attempts: i32,
         next_execute_at: DateTime<Utc>,
+        /// Log entries captured during this attempt.
+        log_entries: Vec<LogEntry>,
     },
     /// Reactor exhausted retries — send to dead letter queue.
     DeadLetter(ReactorDlq),

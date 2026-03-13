@@ -13,6 +13,7 @@ import type {
   ReactorDescriptionSnapshot,
   AggregateTimelineEntry,
   ReactorOutcome,
+  ReactorAttempt,
 } from "../types";
 import {
   INSPECTOR_EVENTS,
@@ -27,6 +28,7 @@ import {
   INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS,
   INSPECTOR_AGGREGATE_TIMELINE,
   INSPECTOR_REACTOR_OUTCOMES,
+  INSPECTOR_REACTOR_ATTEMPTS,
 } from "../queries";
 
 export type QueryTransport = {
@@ -118,7 +120,7 @@ export const createQueryEngine = (
 
     const fetchFlowMetadata = async (correlationId: string) => {
       try {
-        const [descData, snapshotData, aggTimelineData, outcomeData] = await Promise.all([
+        const [descData, snapshotData, aggTimelineData, outcomeData, attemptData] = await Promise.all([
           transport.query<{
             inspectorReactorDescriptions: ReactorDescription[];
           }>(INSPECTOR_REACTOR_DESCRIPTIONS, { correlationId }),
@@ -131,6 +133,9 @@ export const createQueryEngine = (
           transport.query<{
             inspectorReactorOutcomes: ReactorOutcome[];
           }>(INSPECTOR_REACTOR_OUTCOMES, { correlationId }),
+          transport.query<{
+            inspectorReactorAttempts: ReactorAttempt[];
+          }>(INSPECTOR_REACTOR_ATTEMPTS, { correlationId }),
         ]);
         if (activeFlowCorrelationId !== correlationId) return; // stale
 
@@ -160,6 +165,13 @@ export const createQueryEngine = (
           payload: {
             correlationId,
             outcomes: outcomeData.inspectorReactorOutcomes,
+          },
+        });
+        dispatch({
+          type: "events/attempts_loaded",
+          payload: {
+            correlationId,
+            attempts: attemptData.inspectorReactorAttempts,
           },
         });
       } catch (e) {

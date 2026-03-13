@@ -125,6 +125,11 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.outcomes[correlationId] = outcomes;
       break;
     }
+    case "events/attempts_loaded": {
+      const { correlationId, attempts } = event.payload;
+      draft.attempts[correlationId] = attempts;
+      break;
+    }
     case "events/correlations_loaded": {
       const { correlations, hasMore, append } = event.payload;
       if (append) {

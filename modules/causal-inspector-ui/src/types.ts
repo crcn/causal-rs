@@ -62,6 +62,17 @@ export type ReactorOutcome = {
   triggeringEventIds: string[];
 };
 
+export type ReactorAttempt = {
+  eventId: string;
+  reactorId: string;
+  correlationId: string;
+  attempt: number;
+  status: string;
+  error: string | null;
+  startedAt: string;
+  completedAt: string;
+};
+
 export type ReactorDescriptionSnapshot = {
   seq: number;
   eventId: string;
