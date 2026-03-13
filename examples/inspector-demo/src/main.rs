@@ -349,9 +349,21 @@ async fn main() -> Result<()> {
         .with_reactor(
             reactor::on::<ArticleSubmitted>()
                 .id("check_plagiarism")
+                .retry(3)
                 .then(|event, ctx: Context<Deps>| async move {
                     ctx.logger.info("Checking plagiarism");
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                    // ~30% chance of failure to demonstrate error handling
+                    let hash = event.article_id.as_bytes()[0];
+                    if hash % 3 == 0 {
+                        ctx.logger.warn("Plagiarism API returned 503");
+                        anyhow::bail!(
+                            "Plagiarism service unavailable (upstream 503 for article {})",
+                            &event.article_id.to_string()[..8]
+                        );
+                    }
+
                     let similarity = 0.05 + (event.body.len() as f64 * 0.001).min(0.15);
                     ctx.logger.info_with("Plagiarism check complete", &serde_json::json!({
                         "similarity": similarity,

@@ -6,7 +6,7 @@ import type { InspectorEvent } from "../types";
 import { FilterBar } from "../components/FilterBar";
 import { CopyablePayload } from "../components/CopyablePayload";
 import { eventTextColor, eventBg } from "../theme";
-import { formatTs, compactPayload, aggregateKey, inScrubberRange } from "../utils";
+import { formatTs, compactPayload, inScrubberRange } from "../utils";
 import { Search, ChevronRight } from "lucide-react";
 
 function EventRow({
@@ -14,14 +14,12 @@ function EventRow({
   isSelected,
   onClick,
   onFilterCorrelation,
-  onFilterStream,
   onInvestigate,
 }: {
   event: InspectorEvent;
   isSelected: boolean;
   onClick: () => void;
   onFilterCorrelation: (correlationId: string) => void;
-  onFilterStream: (aggregateKey: string) => void;
   onInvestigate?: () => void;
 }) {
   const [payloadOpen, setPayloadOpen] = useState(false);
@@ -49,15 +47,6 @@ function EventRow({
               title={`Filter by correlation ${event.correlationId}`}
             >
               {event.correlationId.slice(0, 8)}
-            </button>
-          )}
-          {event.aggregateType && event.aggregateId && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onFilterStream(aggregateKey(event)!); }}
-              className="opacity-0 group-hover:opacity-100 px-1.5 py-0.5 rounded-full text-[9px] font-mono bg-teal-500/8 text-teal-400/80 hover:bg-teal-500/15 hover:text-teal-400 shrink-0 transition-all border border-teal-500/10"
-              title={`Filter by stream ${event.aggregateType}:${event.aggregateId}`}
-            >
-              {event.aggregateType}:{event.aggregateId!.slice(0, 8)}
             </button>
           )}
           <span
@@ -131,8 +120,18 @@ export type TimelinePaneProps = {
 
 export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
   const events = useSelector<InspectorState, InspectorEvent[]>((s) => {
+    let result = s.events;
     const cid = s.filters.correlationId;
-    return cid ? s.events.filter((e) => e.correlationId === cid) : s.events;
+    if (cid) result = result.filter((e) => e.correlationId === cid);
+    const search = s.filters.search?.toLowerCase();
+    if (search) {
+      result = result.filter((e) =>
+        e.name.toLowerCase().includes(search) ||
+        e.payload.toLowerCase().includes(search) ||
+        (e.correlationId ?? "").toLowerCase().includes(search)
+      );
+    }
+    return result;
   });
   const loading = useSelector<InspectorState, boolean>((s) => s.loading);
   const hasMore = useSelector<InspectorState, boolean>((s) => s.hasMore);
@@ -159,13 +158,6 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
   const handleFilterCorrelation = useCallback(
     (correlationId: string) => {
       dispatch({ type: "ui/filter_changed", payload: { correlationId } });
-    },
-    [dispatch]
-  );
-
-  const handleFilterStream = useCallback(
-    (aggregateKey: string) => {
-      dispatch({ type: "ui/filter_changed", payload: { aggregateKey } });
     },
     [dispatch]
   );
@@ -200,7 +192,6 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
               isSelected={event.seq === selectedSeq}
               onClick={() => handleSelect(event)}
               onFilterCorrelation={handleFilterCorrelation}
-              onFilterStream={handleFilterStream}
               onInvestigate={onInvestigate ? () => onInvestigate(event) : undefined}
             />
           ))}

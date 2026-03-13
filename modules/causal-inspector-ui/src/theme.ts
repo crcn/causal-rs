@@ -35,4 +35,5 @@ export const LOG_LEVEL_COLORS: Record<string, string> = {
   debug: "bg-zinc-600/20 text-zinc-400",
   info: "bg-indigo-500/15 text-indigo-400",
   warn: "bg-amber-500/15 text-amber-400",
+  error: "bg-red-500/15 text-red-400",
 };

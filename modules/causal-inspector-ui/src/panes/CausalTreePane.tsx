@@ -2,11 +2,11 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
-import type { InspectorEvent, FlowSelection } from "../types";
+import type { InspectorEvent, FlowSelection, ReactorOutcome } from "../types";
 import { CopyablePayload } from "../components/CopyablePayload";
 import { eventTextColor } from "../theme";
 import { formatTs, compactPayload, copyToClipboard, inScrubberRange } from "../utils";
-import { Copy, Check, Search, X, ChevronRight, ChevronDown } from "lucide-react";
+import { Copy, Check, Search, X, ChevronRight, ChevronDown, AlertTriangle } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Tree JSON export
@@ -47,6 +47,8 @@ function ReactorNode({
   depth,
   isHighlighted,
   onClickReactor,
+  outcome,
+  outcomesByReactor,
 }: {
   reactorId: string;
   parentEventId: string;
@@ -55,6 +57,8 @@ function ReactorNode({
   depth: number;
   isHighlighted: boolean;
   onClickReactor: (reactorId: string, parentEventId: string) => void;
+  outcome?: ReactorOutcome;
+  outcomesByReactor?: Map<string, ReactorOutcome>;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const nodeRef = useRef<HTMLDivElement>(null);
@@ -69,13 +73,16 @@ function ReactorNode({
     onClickReactor(reactorId, parentEventId);
   }, [onClickReactor, parentEventId, reactorId]);
 
+  const isError = outcome?.status === "error";
+  const isRunning = outcome?.status === "running";
+
   return (
     <div className={depth > 0 ? "pl-6" : ""}>
       <div
         ref={isHighlighted ? nodeRef : undefined}
         className={`group/tree w-full text-left px-2 py-1.5 rounded-md transition-all duration-150 hover:bg-white/[0.03] ${
           isHighlighted ? "bg-indigo-500/15 ring-1 ring-indigo-500/25" : ""
-        }`}
+        } ${isError ? "bg-red-500/8" : ""}`}
       >
         <div className="flex items-center gap-1.5 min-w-0">
           <button
@@ -88,12 +95,24 @@ function ReactorNode({
             onClick={handleClick}
             className="flex items-center gap-1.5 min-w-0"
           >
-            <span className="px-1.5 py-0.5 rounded text-[9px] font-medium shrink-0 bg-white/[0.04] text-muted-foreground/60 italic border border-border">
+            <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium shrink-0 italic border ${
+              isError
+                ? "bg-red-500/10 text-red-400/80 border-red-500/20"
+                : isRunning
+                  ? "bg-yellow-500/10 text-yellow-400/80 border-yellow-500/20"
+                  : "bg-white/[0.04] text-muted-foreground/60 border-border"
+            }`}>
               reactor
             </span>
             <span className="text-[10px] font-mono text-foreground/60 shrink-0">
               {reactorId}
             </span>
+            {isError && (
+              <span className="flex items-center gap-1 text-[9px] text-red-400/80 shrink-0" title={outcome.error ?? "Error"}>
+                <AlertTriangle size={10} />
+                {outcome.attempts > 1 && <span>x{outcome.attempts}</span>}
+              </span>
+            )}
             {collapsed && (
               <span className="text-[10px] text-muted-foreground shrink-0">
                 ({children.length})
@@ -101,6 +120,11 @@ function ReactorNode({
             )}
           </button>
         </div>
+        {isError && outcome.error && (
+          <div className="mt-1 ml-7 text-[9px] text-red-400/70 truncate" title={outcome.error}>
+            {outcome.error}
+          </div>
+        )}
       </div>
 
       {!collapsed && children.map((child) => (
@@ -110,6 +134,7 @@ function ReactorNode({
           childrenMap={childrenMap}
           depth={depth + 1}
           onClickReactor={onClickReactor}
+          outcomesByReactor={outcomesByReactor}
         />
       ))}
     </div>
@@ -126,12 +151,14 @@ function TreeNode({
   depth,
   onClickReactor,
   onInvestigate,
+  outcomesByReactor,
 }: {
   event: InspectorEvent;
   childrenMap: Map<string, InspectorEvent[]>;
   depth: number;
   onClickReactor: (reactorId: string, parentEventId: string) => void;
   onInvestigate?: (event: InspectorEvent) => void;
+  outcomesByReactor?: Map<string, ReactorOutcome>;
 }) {
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
@@ -251,6 +278,7 @@ function TreeNode({
               depth={depth + 1}
               onClickReactor={onClickReactor}
               onInvestigate={onInvestigate}
+              outcomesByReactor={outcomesByReactor}
             />
           ))}
           {[...reactorGroups.entries()].map(([hid, group]) => (
@@ -263,6 +291,8 @@ function TreeNode({
               depth={depth + 1}
               isHighlighted={hid === highlightedReactorId}
               onClickReactor={onClickReactor}
+              outcome={outcomesByReactor?.get(hid)}
+              outcomesByReactor={outcomesByReactor}
             />
           ))}
         </>
@@ -296,7 +326,18 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   const flowCorrelationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
   const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
+  const outcomesMap = useSelector<InspectorState, Record<string, ReactorOutcome[]>>((s) => s.outcomes);
   const dispatch = useDispatch<InspectorMachineEvent>();
+
+  // Build reactor outcome lookup for current flow
+  const outcomesByReactor = useMemo(() => {
+    if (!flowCorrelationId) return new Map<string, ReactorOutcome>();
+    const raw = outcomesMap[flowCorrelationId];
+    if (!raw) return new Map<string, ReactorOutcome>();
+    const map = new Map<string, ReactorOutcome>();
+    for (const o of raw) map.set(o.reactorId, o);
+    return map;
+  }, [outcomesMap, flowCorrelationId]);
 
   const treeEvents = useMemo(() => {
     const all = causalTree?.events ?? null;
@@ -428,6 +469,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
           depth={0}
           onClickReactor={onClickReactor}
           onInvestigate={onInvestigate}
+          outcomesByReactor={outcomesByReactor}
         />
       ))}
     </div>

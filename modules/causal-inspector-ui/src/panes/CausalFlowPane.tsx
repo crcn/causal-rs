@@ -18,16 +18,18 @@ import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
 import type { InspectorEvent, Block, FlowSelection, ReactorDescription, ReactorOutcome } from "../types";
 import { eventBg, eventBorder, eventTextColor } from "../theme";
-import { Filter } from "lucide-react";
+import { Filter, ArrowRight, ArrowDown } from "lucide-react";
 import { inScrubberRange } from "../utils";
 
 // ---------------------------------------------------------------------------
 // Flow node data
 // ---------------------------------------------------------------------------
 
+type FlowDirection = "LR" | "TB";
+
 type FlowNodeData =
-  | { nodeKind: "event-type"; eventName: string; label: string }
-  | { nodeKind: "reactor"; reactorId: string; label: string; blocks?: Block[]; outcome?: ReactorOutcome };
+  | { nodeKind: "event-type"; eventName: string; label: string; direction?: FlowDirection }
+  | { nodeKind: "reactor"; reactorId: string; label: string; blocks?: Block[]; outcome?: ReactorOutcome; direction?: FlowDirection };
 
 /* eslint-disable-next-line @typescript-eslint/no-redeclare -- shadowing the tree-pane ReactorNode on purpose */
 
@@ -117,6 +119,7 @@ const ReactorNode = memo(({ data }: NodeProps) => {
   const d = data as FlowNodeData & { nodeKind: "reactor" };
   const blocks = d.blocks;
   const outcome = d.outcome;
+  const dir = d.direction ?? "LR";
   const hasBlocks = blocks && blocks.length > 0;
   const borderColor = STATUS_BORDER[outcome?.status ?? "pending"] ?? "#2a2a35";
   const isRunning = outcome?.status === "running";
@@ -139,7 +142,7 @@ const ReactorNode = memo(({ data }: NodeProps) => {
         ? `0 0 12px ${borderColor}40`
         : "0 2px 8px rgba(0, 0, 0, 0.3)",
     }}>
-      <Handle type="target" position={Position.Left} style={{ visibility: "hidden" }} />
+      <Handle type="target" position={dir === "LR" ? Position.Left : Position.Top} style={{ visibility: "hidden" }} />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>{d.label}</span>
         {duration && <span style={{ fontSize: 9, color: "#60608a", fontStyle: "normal", whiteSpace: "nowrap", flexShrink: 0 }}>{duration}</span>}
@@ -148,13 +151,14 @@ const ReactorNode = memo(({ data }: NodeProps) => {
       {outcome?.status === "error" && outcome.error && (
         <div style={{ fontSize: 9, color: "#ef4444", marginTop: 4 }}>{outcome.error}</div>
       )}
-      <Handle type="source" position={Position.Right} style={{ visibility: "hidden" }} />
+      <Handle type="source" position={dir === "LR" ? Position.Right : Position.Bottom} style={{ visibility: "hidden" }} />
     </div>
   );
 });
 
 const EventNode = memo(({ data }: NodeProps) => {
   const d = data as FlowNodeData & { nodeKind: "event-type" };
+  const dir = d.direction ?? "LR";
   return (
     <div style={{
       background: eventBg(d.eventName),
@@ -173,9 +177,9 @@ const EventNode = memo(({ data }: NodeProps) => {
       fontWeight: 500,
       letterSpacing: "0.01em",
     }}>
-      <Handle type="target" position={Position.Left} style={{ visibility: "hidden" }} />
+      <Handle type="target" position={dir === "LR" ? Position.Left : Position.Top} style={{ visibility: "hidden" }} />
       {d.label}
-      <Handle type="source" position={Position.Right} style={{ visibility: "hidden" }} />
+      <Handle type="source" position={dir === "LR" ? Position.Right : Position.Bottom} style={{ visibility: "hidden" }} />
     </div>
   );
 });
@@ -193,6 +197,7 @@ function buildFlowGraph(
   descriptions?: Map<string, Block[]>,
   outcomes?: Map<string, ReactorOutcome>,
   hiddenReactors?: Set<string>,
+  direction: FlowDirection = "LR",
 ): FlowGraph {
   // Group events by type name only (merge across reactors)
   const eventGroups = new Map<string, { name: string; count: number; events: InspectorEvent[] }>();
@@ -250,9 +255,10 @@ function buildFlowGraph(
         label: group.count > 1 ? `${group.name} (${group.count})` : group.name,
         nodeKind: "event-type" as const,
         eventName: group.name,
+        direction,
       },
-      sourcePosition: Position.Right,
-      targetPosition: Position.Left,
+      sourcePosition: direction === "LR" ? Position.Right : Position.Bottom,
+      targetPosition: direction === "LR" ? Position.Left : Position.Top,
     });
   }
 
@@ -265,9 +271,9 @@ function buildFlowGraph(
       id: `hdl:${reactorId}`,
       type: "reactor",
       position: { x: 0, y: 0 },
-      data: { label: reactorId, nodeKind: "reactor" as const, reactorId, blocks, outcome },
-      sourcePosition: Position.Right,
-      targetPosition: Position.Left,
+      data: { label: reactorId, nodeKind: "reactor" as const, reactorId, blocks, outcome, direction },
+      sourcePosition: direction === "LR" ? Position.Right : Position.Bottom,
+      targetPosition: direction === "LR" ? Position.Left : Position.Top,
     });
   }
 
@@ -322,9 +328,9 @@ function buildFlowGraph(
         id: `hdl:${reactorId}`,
         type: "reactor",
         position: { x: 0, y: 0 },
-        data: { label: reactorId, nodeKind: "reactor" as const, reactorId, blocks, outcome },
-        sourcePosition: Position.Bottom,
-        targetPosition: Position.Top,
+        data: { label: reactorId, nodeKind: "reactor" as const, reactorId, blocks, outcome, direction },
+        sourcePosition: direction === "LR" ? Position.Right : Position.Bottom,
+        targetPosition: direction === "LR" ? Position.Left : Position.Top,
       });
 
       const isPending = outcome.status === "pending" || outcome.status === "running";
@@ -347,7 +353,7 @@ function buildFlowGraph(
     }
   }
 
-  return layoutGraph(nodes, edges);
+  return layoutGraph(nodes, edges, direction);
 }
 
 function estimateReactorHeight(data: FlowNodeData): number {
@@ -369,10 +375,10 @@ function estimateReactorHeight(data: FlowNodeData): number {
   return h;
 }
 
-function layoutGraph(nodes: Node[], edges: Edge[]): FlowGraph {
+function layoutGraph(nodes: Node[], edges: Edge[], direction: FlowDirection = "LR"): FlowGraph {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({ rankdir: "LR", nodesep: 40, ranksep: 80 });
+  g.setGraph({ rankdir: direction, nodesep: 40, ranksep: 80 });
 
   const heights = new Map<string, number>();
   for (const node of nodes) {
@@ -642,6 +648,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
   const [hiddenReactors, setHiddenReactors] = useState<Set<string>>(
     () => defaultHiddenReactors ?? new Set()
   );
+  const [direction, setDirection] = useState<FlowDirection>("LR");
 
   const allReactorIds = useMemo(() => {
     const ids = new Set<string>();
@@ -653,8 +660,8 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
   // Full graph layout — stable positions computed from ALL events
   const { nodes: fullNodes, edges: fullEdges } = useMemo(() => {
     if (!flowData || flowData.length === 0) return { nodes: [], edges: [] };
-    return buildFlowGraph(flowData, descriptions, outcomes, hiddenReactors);
-  }, [flowData, descriptions, outcomes, hiddenReactors]);
+    return buildFlowGraph(flowData, descriptions, outcomes, hiddenReactors, direction);
+  }, [flowData, descriptions, outcomes, hiddenReactors, direction]);
 
   // Compute visible IDs when scrubber range is active
   const visibleIds = useMemo(() => {
@@ -820,7 +827,14 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
           {flowData.length} events &middot; {nodes.length} nodes
         </span>
         {headerExtra}
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-1.5">
+          <button
+            onClick={() => setDirection(d => d === "LR" ? "TB" : "LR")}
+            className="text-[10px] text-muted-foreground/60 hover:text-foreground px-2 py-1 rounded-md border border-border hover:border-indigo-500/30 transition-all duration-150"
+            title={direction === "LR" ? "Switch to vertical layout" : "Switch to horizontal layout"}
+          >
+            {direction === "LR" ? <ArrowDown size={11} className="inline" /> : <ArrowRight size={11} className="inline" />}
+          </button>
           <ReactorFilter
             allReactorIds={allReactorIds}
             hiddenReactors={hiddenReactors}

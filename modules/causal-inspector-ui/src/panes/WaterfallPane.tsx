@@ -223,130 +223,147 @@ export function WaterfallPane() {
         const isSelected = logsFilter.reactorId === bar.reactorId;
 
         return (
-          <div
-            key={bar.reactorId}
-            onClick={() => handleBarClick(bar)}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              height: ROW_HEIGHT,
-              gap: 0,
-              opacity: isFuture ? 0.25 : (hasReactorFilter && !isSelected) ? 0.35 : 1,
-              transition: "opacity 200ms, background 150ms",
-              cursor: "pointer",
-              borderRadius: 6,
-              background: isSelected ? "rgba(99, 102, 241, 0.15)" : "transparent",
-              paddingLeft: 4,
-              paddingRight: 4,
-            }}
-          >
-            {/* Label */}
+          <div key={bar.reactorId}>
             <div
+              onClick={() => handleBarClick(bar)}
               style={{
-                width: LABEL_WIDTH,
-                flexShrink: 0,
-                fontSize: 11,
-                color: "#c0c0d0",
-                fontWeight: 500,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                paddingRight: 10,
-                letterSpacing: "0.01em",
-              }}
-              title={bar.reactorId}
-            >
-              {bar.reactorId}
-            </div>
-
-            {/* Bar track */}
-            <div
-              style={{
-                flex: 1,
-                position: "relative",
-                height: 22,
-                background: "rgba(255, 255, 255, 0.02)",
-                borderRadius: 5,
-                overflow: "hidden",
+                display: "flex",
+                alignItems: "center",
+                height: ROW_HEIGHT,
+                gap: 0,
+                opacity: isFuture ? 0.25 : (hasReactorFilter && !isSelected) ? 0.35 : 1,
+                transition: "opacity 200ms, background 150ms",
+                cursor: "pointer",
+                borderRadius: 6,
+                background: isSelected ? "rgba(99, 102, 241, 0.15)" : "transparent",
+                paddingLeft: 4,
+                paddingRight: 4,
               }}
             >
-              {/* Bar */}
+              {/* Label */}
               <div
                 style={{
-                  position: "absolute",
-                  left: `${offsetPct}%`,
-                  width: `${widthPct}%`,
-                  minWidth: BAR_MIN_WIDTH,
-                  height: "100%",
-                  background: `linear-gradient(90deg, ${colors.bar}, ${colors.barEnd})`,
-                  borderRadius: 4,
-                  opacity: 0.8,
-                  display: "flex",
-                  alignItems: "center",
-                  paddingLeft: 5,
-                  paddingRight: 5,
-                  boxShadow: `0 1px 4px ${colors.bar}30`,
+                  width: LABEL_WIDTH,
+                  flexShrink: 0,
+                  fontSize: 11,
+                  color: "#c0c0d0",
+                  fontWeight: 500,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  paddingRight: 10,
+                  letterSpacing: "0.01em",
                 }}
-                title={`${bar.reactorId}: ${bar.status} (${formatDuration(duration)})${bar.attempts > 1 ? ` — ${bar.attempts} attempts` : ""}${bar.error ? `\nError: ${bar.error}` : ""}`}
+                title={bar.reactorId}
               >
-                <span
-                  style={{
-                    fontSize: 9,
-                    fontWeight: 600,
-                    color: "#0a0a0f",
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {formatDuration(duration)}
-                </span>
+                {bar.reactorId}
               </div>
 
-              {/* Scrubber cursor line */}
-              {cursorPct != null && (
+              {/* Bar track */}
+              <div
+                style={{
+                  flex: 1,
+                  position: "relative",
+                  height: 22,
+                  background: "rgba(255, 255, 255, 0.02)",
+                  borderRadius: 5,
+                  overflow: "hidden",
+                }}
+              >
+                {/* Bar */}
                 <div
                   style={{
                     position: "absolute",
-                    left: `${cursorPct}%`,
-                    top: 0,
-                    bottom: 0,
-                    width: 1,
-                    background: "#6366f1",
-                    pointerEvents: "none",
-                    boxShadow: "0 0 4px rgba(99, 102, 241, 0.3)",
+                    left: `${offsetPct}%`,
+                    width: `${widthPct}%`,
+                    minWidth: BAR_MIN_WIDTH,
+                    height: "100%",
+                    background: `linear-gradient(90deg, ${colors.bar}, ${colors.barEnd})`,
+                    borderRadius: 4,
+                    opacity: 0.8,
+                    display: "flex",
+                    alignItems: "center",
+                    paddingLeft: 5,
+                    paddingRight: 5,
+                    boxShadow: `0 1px 4px ${colors.bar}30`,
                   }}
-                />
-              )}
-            </div>
+                  title={`${bar.reactorId}: ${bar.status} (${formatDuration(duration)})${bar.attempts > 1 ? ` — ${bar.attempts} attempts` : ""}${bar.error ? `\nError: ${bar.error}` : ""}`}
+                >
+                  <span
+                    style={{
+                      fontSize: 9,
+                      fontWeight: 600,
+                      color: "#0a0a0f",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {formatDuration(duration)}
+                  </span>
+                </div>
 
-            {/* Status + attempts */}
-            <div
-              style={{
-                width: 80,
-                flexShrink: 0,
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-                paddingLeft: 10,
-              }}
-            >
-              <span
+                {/* Scrubber cursor line */}
+                {cursorPct != null && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      left: `${cursorPct}%`,
+                      top: 0,
+                      bottom: 0,
+                      width: 1,
+                      background: "#6366f1",
+                      pointerEvents: "none",
+                      boxShadow: "0 0 4px rgba(99, 102, 241, 0.3)",
+                    }}
+                  />
+                )}
+              </div>
+
+              {/* Status + attempts */}
+              <div
                 style={{
-                  fontSize: 10,
-                  fontWeight: 500,
-                  color: colors.text,
-                  opacity: 0.8,
+                  width: 80,
+                  flexShrink: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                  paddingLeft: 10,
                 }}
               >
-                {bar.status}
-              </span>
-              {bar.attempts > 1 && (
-                <span style={{ fontSize: 9, color: "#50506a" }}>
-                  x{bar.attempts}
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 500,
+                    color: colors.text,
+                    opacity: 0.8,
+                  }}
+                >
+                  {bar.status}
                 </span>
-              )}
+                {bar.attempts > 1 && (
+                  <span style={{ fontSize: 9, color: "#50506a" }}>
+                    x{bar.attempts}
+                  </span>
+                )}
+              </div>
             </div>
+            {/* Error message inline */}
+            {bar.status === "error" && bar.error && (
+              <div style={{
+                marginLeft: LABEL_WIDTH + 4,
+                marginTop: -2,
+                marginBottom: 4,
+                fontSize: 10,
+                color: "#f87171",
+                paddingLeft: 4,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }} title={bar.error}>
+                {bar.error}
+              </div>
+            )}
           </div>
         );
       })}

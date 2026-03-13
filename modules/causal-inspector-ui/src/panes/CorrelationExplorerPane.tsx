@@ -138,10 +138,12 @@ export function CorrelationExplorerPane() {
               {/* Error indicator */}
               {corr.hasErrors && (
                 <span
-                  className="w-2 h-2 rounded-full bg-red-500/80 shrink-0"
-                  style={{ boxShadow: "0 0 6px rgba(239, 68, 68, 0.3)" }}
+                  className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold shrink-0 bg-red-500/10 text-red-400/80 border border-red-500/20"
+                  style={{ boxShadow: "0 0 6px rgba(239, 68, 68, 0.15)" }}
                   title="This correlation has errors"
-                />
+                >
+                  error
+                </span>
               )}
             </button>
           ))}

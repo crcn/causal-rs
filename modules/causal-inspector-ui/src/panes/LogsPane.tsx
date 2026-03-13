@@ -63,7 +63,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
 
-  const [levelFilter, setLevelFilter] = useState<Set<string>>(new Set(["debug", "info", "warn"]));
+  const [levelFilter, setLevelFilter] = useState<Set<string>>(new Set(["debug", "info", "warn", "error"]));
   const [searchText, setSearchText] = useState("");
 
   const isCorrelationScope = logsFilter.scope === "correlation" && logsFilter.correlationId != null;
@@ -122,7 +122,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
       <div className="px-3 py-2 border-b border-border flex items-center gap-3 flex-wrap" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
         {/* Level filters */}
         <div className="flex items-center gap-1 text-[10px]">
-          {["debug", "info", "warn"].map((level) => (
+          {["debug", "info", "warn", "error"].map((level) => (
             <button
               key={level}
               onClick={() => toggleLevel(level)}
@@ -138,7 +138,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
         </div>
 
         {/* Search */}
-        <div className="relative flex items-center ml-auto">
+        <div className="relative flex items-center">
           <Search size={10} className="absolute left-2.5 text-muted-foreground/40 pointer-events-none" />
           <input
             type="text"
