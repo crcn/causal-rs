@@ -75,7 +75,8 @@ where
         event: &PersistedEvent,
         _config: &EventWorkerConfig,
     ) -> Result<IntentCommit> {
-        self.process_event_inner(event, _config, false).await
+        let snapshots = crate::aggregator::TransitionSnapshots::empty();
+        self.process_event_inner(event, _config, false, &snapshots).await
     }
 
     pub async fn process_event_inner(
@@ -83,6 +84,7 @@ where
         event: &PersistedEvent,
         _config: &EventWorkerConfig,
         skip_projections: bool,
+        transition_snapshots: &crate::aggregator::TransitionSnapshots,
     ) -> Result<IntentCommit> {
         info!(
             "Processing event: type={}, correlation={}, position={}",
@@ -152,12 +154,59 @@ where
             }
         }
 
-        // 5. Create queued reactor intents for ALL matching reactors
+        // 5. Create queued reactor intents for matching reactors whose Phase-1
+        // intent filter (if any) passes against per-event post-fold state.
+        // Filters MUST be evaluated here, not inside the reactor closure: Phase 2
+        // closures run concurrently via join_all and all see the same shared
+        // aggregator state, so a state-based filter inside the closure can't
+        // suppress siblings in the same batch. See
+        // `tests/fan_in_races.rs::filter_fires_exactly_once_*`.
         let hops = event.metadata.get("_hops")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as i32;
         let mut handler_intents = Vec::new();
         for reactor in &matching_handlers {
+            let ctx = self.make_context(
+                reactor.id.clone(),
+                format!("filter::{}", reactor.id),
+                event.correlation_id,
+                event.event_id,
+                event.parent_id,
+            );
+            let passes_filter = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reactor.passes_intent_filter(&typed_event, event_type_id, &ctx)
+            })) {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!(
+                        reactor_id = %reactor.id,
+                        event_type = %event.event_type,
+                        "intent filter panicked, suppressing intent"
+                    );
+                    false
+                }
+            };
+            if !passes_filter {
+                continue;
+            }
+
+            let passes_transition = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reactor.passes_intent_transition(&typed_event, event_type_id, transition_snapshots)
+            })) {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!(
+                        reactor_id = %reactor.id,
+                        event_type = %event.event_type,
+                        "intent transition guard panicked, suppressing intent"
+                    );
+                    false
+                }
+            };
+            if !passes_transition {
+                continue;
+            }
+
             let execute_at = match reactor.delay {
                 Some(delay) => {
                     chrono::Utc::now()

@@ -456,21 +456,28 @@ where
                 // Ephemeral events: skip aggregators/projections (not domain facts)
                 let skip_projections = !event.persistent;
 
-                if event.persistent {
+                let transition_snapshots = if event.persistent {
                     // Hydrate cold aggregates before processing
                     self.hydrate_for_event(&event).await?;
 
                     // Apply event to live aggregator state
-                    self.apply_to_aggregators(&event);
+                    let snapshots = self.apply_to_aggregators(&event);
 
                     // Auto-checkpoint snapshots if configured
                     if let Some(threshold) = self.snapshot_every {
                         self.maybe_auto_snapshot(&event, threshold).await?;
                     }
-                }
+
+                    snapshots
+                } else {
+                    crate::aggregator::TransitionSnapshots::empty()
+                };
 
                 // Process event: match reactors, run projections, build intents
-                match executor.process_event_inner(&event, &event_config, skip_projections).await {
+                match executor
+                    .process_event_inner(&event, &event_config, skip_projections, &transition_snapshots)
+                    .await
+                {
                     Ok(commit) => {
                         self.queue.enqueue(commit).await?;
                         event_attempts.remove(&event.position);
@@ -1070,10 +1077,15 @@ where
         Ok(())
     }
 
-    /// Apply event to aggregator state.
-    fn apply_to_aggregators(&self, event: &PersistedEvent) {
+    /// Apply event to aggregator state, returning the per-event `(pre, post)`
+    /// snapshots so transition guards can evaluate against this fold's actual
+    /// transition (rather than racing on the shared `:prev` slot).
+    fn apply_to_aggregators(
+        &self,
+        event: &PersistedEvent,
+    ) -> crate::aggregator::TransitionSnapshots {
         self.aggregators
-            .apply_event(&event.event_type, &event.payload);
+            .apply_event(&event.event_type, &event.payload)
     }
 
     /// Build `NewEvent`s from `EmittedEvent`s with deterministic IDs and routing metadata.

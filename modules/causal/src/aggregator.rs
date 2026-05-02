@@ -39,6 +39,48 @@ pub trait Apply<E> {
     fn apply(&mut self, event: E);
 }
 
+/// Per-event `(prev, next)` aggregate snapshots produced by a single fold.
+///
+/// Captured as stack-local pairs around `apply_event`, so transition guards
+/// can read the actual prev/next for *this* event — not the racing `:prev`
+/// DashMap slot, which is overwritten by every subsequent fold in the same
+/// Phase 1 batch. See `tests/fan_in_races.rs::transition_*`.
+#[derive(Default)]
+pub struct TransitionSnapshots {
+    inner: std::collections::HashMap<
+        String,
+        (Arc<dyn Any + Send + Sync>, Arc<dyn Any + Send + Sync>),
+    >,
+}
+
+impl TransitionSnapshots {
+    /// Empty snapshot map — used for ephemeral events that don't fold.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Look up `(prev, next)` for an aggregate `A` at the given id.
+    ///
+    /// Returns `None` if this event did not affect `A` for that id, which
+    /// transition guards should treat as "no transition — don't fire."
+    pub fn get_pair<A: Aggregate + 'static>(&self, id: Uuid) -> Option<(&A, &A)> {
+        let key = format!("{}:{}", A::aggregate_type(), id);
+        let (pre, post) = self.inner.get(&key)?;
+        let pre_a = (**pre).downcast_ref::<A>()?;
+        let post_a = (**post).downcast_ref::<A>()?;
+        Some((pre_a, post_a))
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        key: String,
+        prev: Arc<dyn Any + Send + Sync>,
+        next: Arc<dyn Any + Send + Sync>,
+    ) {
+        self.inner.insert(key, (prev, next));
+    }
+}
+
 // ── Aggregator (type-erased event→aggregate applier) ────────────────
 
 /// A type-erased aggregator that maps an event to an aggregate and applies it.
@@ -227,7 +269,8 @@ impl AggregatorRegistry {
         &self,
         event_type: &str,
         payload: &serde_json::Value,
-    ) {
+    ) -> TransitionSnapshots {
+        let mut snapshots = TransitionSnapshots::empty();
         let prefix = extract_prefix(event_type);
         let matching: Vec<&Aggregator> = self
             .aggregators
@@ -244,67 +287,61 @@ impl AggregatorRegistry {
             let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
             let prev_key = format!("{}:prev", key);
 
-            // Get current entry, or create default.
-            let current_entry = self.state.get(&key).map(|v| v.value().clone());
-            let (current_state, current_version, snapshot_at) = match current_entry {
-                Some(entry) => (entry.state, entry.version, entry.snapshot_at_version),
+            // Read pre-fold state. If no entry exists, materialise the default
+            // *now* so we have an Arc to capture as `prev`.
+            let (pre_state, current_version, snapshot_at) = match self.state.get(&key) {
+                Some(entry) => (
+                    entry.state.clone(),
+                    entry.version,
+                    entry.snapshot_at_version,
+                ),
                 None => {
-                    // No state yet — create default, store it, and apply
-                    let default = Arc::from(agg.default_state());
-                    self.state.insert(key.clone(), StateEntry { state: default, version: StreamVersion::ZERO, snapshot_at_version: StreamVersion::ZERO });
-                    return self.apply_event_inner(agg, &key, &prev_key, payload);
+                    let default: Arc<dyn Any + Send + Sync> = Arc::from(agg.default_state());
+                    self.state.insert(
+                        key.clone(),
+                        StateEntry {
+                            state: default.clone(),
+                            version: StreamVersion::ZERO,
+                            snapshot_at_version: StreamVersion::ZERO,
+                        },
+                    );
+                    (default, StreamVersion::ZERO, StreamVersion::ZERO)
                 }
             };
 
-            // Clone current state for mutation
-            let mut next_state = agg.clone_state(current_state.as_ref());
-
-            // Store prev snapshot (cheap Arc clone of existing state)
-            self.state.insert(prev_key, StateEntry { state: current_state, version: StreamVersion::ZERO, snapshot_at_version: StreamVersion::ZERO });
-
-            // Apply event to the cloned state
+            // Clone pre-fold for mutation, apply, freeze as Arc.
+            let mut next_state = agg.clone_state(pre_state.as_ref());
             if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
                 tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
             }
+            let post_state: Arc<dyn Any + Send + Sync> = Arc::from(next_state);
 
-            // Store updated state with incremented version
-            self.state.insert(key, StateEntry {
-                state: Arc::from(next_state),
-                version: StreamVersion::from_raw(current_version.raw() + 1),
-                snapshot_at_version: snapshot_at,
-            });
-        }
-    }
+            // Update the registry:
+            //   :prev slot — kept for backward compat with `get_transition_*`
+            //   readers, but it is racy under fan-in. New code reads from the
+            //   `TransitionSnapshots` returned by this function instead.
+            self.state.insert(
+                prev_key,
+                StateEntry {
+                    state: pre_state.clone(),
+                    version: StreamVersion::ZERO,
+                    snapshot_at_version: StreamVersion::ZERO,
+                },
+            );
+            self.state.insert(
+                key.clone(),
+                StateEntry {
+                    state: post_state.clone(),
+                    version: StreamVersion::from_raw(current_version.raw() + 1),
+                    snapshot_at_version: snapshot_at,
+                },
+            );
 
-    /// Helper for the case where we just created default state and need to re-read.
-    fn apply_event_inner(
-        &self,
-        agg: &Aggregator,
-        key: &str,
-        prev_key: &str,
-        payload: &serde_json::Value,
-    ) {
-        let current_entry = self.state.get(key).map(|v| v.value().clone()).unwrap();
-        let mut next_state = agg.clone_state(current_entry.state.as_ref());
-
-        // Store prev snapshot
-        self.state.insert(prev_key.to_string(), StateEntry {
-            state: current_entry.state,
-            version: StreamVersion::ZERO,
-            snapshot_at_version: StreamVersion::ZERO,
-        });
-
-        // Apply event
-        if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
-            tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
+            // Capture per-event (pre, post) for transition guards.
+            snapshots.insert(key, pre_state, post_state);
         }
 
-        // Store updated state
-        self.state.insert(key.to_string(), StateEntry {
-            state: Arc::from(next_state),
-            version: StreamVersion::from_raw(current_entry.version.raw() + 1),
-            snapshot_at_version: current_entry.snapshot_at_version,
-        });
+        snapshots
     }
 
     /// Replay a sequence of persisted events to reconstruct aggregate state.

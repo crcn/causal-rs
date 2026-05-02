@@ -992,6 +992,7 @@ mod tests {
                 error: "transient".into(),
                 new_attempts: 2,
                 next_execute_at: chrono::Utc::now(),
+                log_entries: Vec::new(),
             })
             .await
             .unwrap();

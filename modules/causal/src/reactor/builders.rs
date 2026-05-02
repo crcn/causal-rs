@@ -482,6 +482,8 @@ where
                     None => Box::pin(async { Ok(Vec::new()) }),
                 }
             }),
+            intent_filter: None,
+            intent_transition: None,
 
             dlq_terminal_mapper,
             queued: self.queued,
@@ -519,6 +521,8 @@ impl ReactorBuilder<Untyped, NoFilter, NoStarted> {
                     Ok(events.into_outputs())
                 })
             }),
+            intent_filter: None,
+            intent_transition: None,
 
             dlq_terminal_mapper: None,
             queued: self.queued,
@@ -563,6 +567,8 @@ where
                     Ok(events.into_outputs())
                 })
             }),
+            intent_filter: None,
+            intent_transition: None,
 
             dlq_terminal_mapper: None,
             queued: self.queued,
@@ -648,6 +654,22 @@ where
             .id
             .unwrap_or_else(|| default_reactor_id(std::any::type_name::<E>()));
 
+        // Lift the user-supplied filter into a type-erased Phase-1 intent filter.
+        // Phase 2 closures run concurrently against shared aggregate state, so a
+        // state-based filter inside the reactor closure can't suppress siblings
+        // in the same batch — it has to run at intent-build time.
+        let intent_filter: Arc<
+            dyn Fn(&Arc<dyn std::any::Any + Send + Sync>, TypeId, &Context<D>) -> bool
+                + Send
+                + Sync,
+        > = Arc::new(move |value, _type_id, ctx| {
+            let typed = value
+                .clone()
+                .downcast::<E>()
+                .expect("type checked by can_handle");
+            filter_fn(&typed, ctx)
+        });
+
         Reactor {
             id,
             codecs: vec![input_codec],
@@ -655,17 +677,14 @@ where
             started: self.inner.started.into_started(),
             reactor: Arc::new(move |value, _, ctx| {
                 let typed = value.downcast::<E>().expect("type checked by can_handle");
-
-                if !filter_fn(&typed, &ctx) {
-                    return Box::pin(async { Ok(Vec::new()) });
-                }
-
                 let fut = reactor(typed, ctx);
                 Box::pin(async move {
                     let events: Events = fut.await?;
                     Ok(events.into_outputs())
                 })
             }),
+            intent_filter: Some(intent_filter),
+            intent_transition: None,
 
             dlq_terminal_mapper,
             queued: self.inner.queued,
@@ -762,7 +781,7 @@ where
         let target = TypeId::of::<E>();
         let extractor: Arc<dyn Fn(&E) -> Option<uuid::Uuid> + Send + Sync> =
             Arc::from(self.extractor);
-        let guard = Arc::new(self.guard);
+        let guard: Arc<dyn Fn(&A, &A) -> bool + Send + Sync> = Arc::new(self.guard);
         let reactor = Arc::new(reactor);
 
         let id = self
@@ -772,6 +791,35 @@ where
 
         let codec = self.inner.codec;
 
+        // Lift the transition guard into a Phase-1 intent gate. We read the
+        // per-event `(pre, post)` from the snapshots — *not* from the
+        // registry's `:prev` slot, which is overwritten by every fold in the
+        // batch. If this event didn't fold the watched aggregate, treat it as
+        // "no transition" and skip.
+        let intent_extractor = extractor.clone();
+        let intent_transition: Arc<
+            dyn Fn(
+                    &Arc<dyn std::any::Any + Send + Sync>,
+                    TypeId,
+                    &crate::aggregator::TransitionSnapshots,
+                ) -> bool
+                + Send
+                + Sync,
+        > = Arc::new(move |value, _type_id, snapshots| {
+            let typed = value
+                .clone()
+                .downcast::<E>()
+                .expect("type checked by can_handle");
+            let aggregate_id = match intent_extractor(&typed) {
+                Some(id) => id,
+                None => return false,
+            };
+            match snapshots.get_pair::<A>(aggregate_id) {
+                Some((prev, next)) => guard(prev, next),
+                None => false,
+            }
+        });
+
         Reactor {
             id,
             codecs: codec.into_iter().collect(),
@@ -779,31 +827,19 @@ where
             started: self.inner.started.into_started(),
             reactor: Arc::new(move |value, _, ctx: Context<D>| {
                 let typed = value.downcast::<E>().expect("type checked by can_handle");
-                let extractor = extractor.clone();
-                let guard = guard.clone();
+                let aggregate_id = extractor(&typed);
                 let reactor = reactor.clone();
 
-                match extractor(&typed) {
-                    Some(aggregate_id) => {
-                        Box::pin(async move {
-                            let registry = ctx.aggregator_registry().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "transition guard requires aggregator registry on context"
-                                )
-                            })?;
-
-                            let (prev, next) = registry.get_transition::<A>(aggregate_id);
-                            if !guard(&prev, &next) {
-                                return Ok(Vec::new());
-                            }
-
-                            let events: Events = reactor(aggregate_id, ctx).await?;
-                            Ok(events.into_outputs())
-                        })
-                    }
+                match aggregate_id {
+                    Some(aggregate_id) => Box::pin(async move {
+                        let events: Events = reactor(aggregate_id, ctx).await?;
+                        Ok(events.into_outputs())
+                    }),
                     None => Box::pin(async { Ok(Vec::new()) }),
                 }
             }),
+            intent_filter: None,
+            intent_transition: Some(intent_transition),
 
             dlq_terminal_mapper: self.inner.dlq_terminal_mapper,
             queued: self.inner.queued,

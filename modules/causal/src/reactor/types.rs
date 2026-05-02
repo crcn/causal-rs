@@ -364,6 +364,46 @@ where
             + Sync,
     >,
 
+    /// Phase-1 filter: evaluated at intent-build time, against per-event
+    /// post-fold aggregator state. Returning `false` suppresses the intent
+    /// entirely — no row is enqueued, no Phase-2 closure runs.
+    ///
+    /// This must run in Phase 1 (not inside the reactor closure) because
+    /// Phase 2 reactors execute concurrently via `join_all`, all reading the
+    /// same shared aggregator state — so a state-based filter inside the
+    /// closure can't suppress siblings in the same batch. See
+    /// `tests/fan_in_races.rs::filter_fires_exactly_once_*`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) intent_filter: Option<
+        Arc<
+            dyn Fn(&Arc<dyn Any + Send + Sync>, TypeId, &Context<D>) -> bool
+                + Send
+                + Sync,
+        >,
+    >,
+
+    /// Phase-1 transition guard: evaluated at intent-build time, against the
+    /// per-event `(pre, post)` snapshots captured around the fold. Returning
+    /// `false` suppresses the intent.
+    ///
+    /// Must run in Phase 1 for the same fan-in reasons as `intent_filter`,
+    /// *and* must read from the per-event snapshots (not the registry's
+    /// `:prev` slot, which is a single DashMap entry overwritten by every
+    /// fold in the batch). See
+    /// `tests/fan_in_races.rs::transition_fires_once_*`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) intent_transition: Option<
+        Arc<
+            dyn Fn(
+                    &Arc<dyn Any + Send + Sync>,
+                    TypeId,
+                    &crate::aggregator::TransitionSnapshots,
+                ) -> bool
+                + Send
+                + Sync,
+        >,
+    >,
+
     /// Optional mapper for creating terminal events when an execution moves to DLQ.
     pub(crate) dlq_terminal_mapper: Option<DlqTerminalMapper>,
 
@@ -395,6 +435,8 @@ where
             can_handle: self.can_handle.clone(),
             started: self.started.clone(),
             reactor: self.reactor.clone(),
+            intent_filter: self.intent_filter.clone(),
+            intent_transition: self.intent_transition.clone(),
             dlq_terminal_mapper: self.dlq_terminal_mapper.clone(),
             queued: self.queued,
             delay: self.delay,
@@ -414,6 +456,40 @@ where
     /// Check if this reactor handles the given event type.
     pub fn can_handle(&self, type_id: TypeId) -> bool {
         (self.can_handle)(type_id)
+    }
+
+    /// Evaluate the Phase-1 intent filter for this reactor, if any.
+    ///
+    /// Returns `true` if the reactor should be queued for this event. With no
+    /// filter, always returns `true`. The caller is expected to have called
+    /// `can_handle` first.
+    pub fn passes_intent_filter(
+        &self,
+        value: &Arc<dyn Any + Send + Sync>,
+        type_id: TypeId,
+        ctx: &Context<D>,
+    ) -> bool {
+        match &self.intent_filter {
+            Some(f) => f(value, type_id, ctx),
+            None => true,
+        }
+    }
+
+    /// Evaluate the Phase-1 transition guard against per-event snapshots.
+    ///
+    /// Returns `true` if no transition guard is configured. Returns `false`
+    /// when the guard rejects (or when the event did not fold the watched
+    /// aggregate).
+    pub fn passes_intent_transition(
+        &self,
+        value: &Arc<dyn Any + Send + Sync>,
+        type_id: TypeId,
+        snapshots: &crate::aggregator::TransitionSnapshots,
+    ) -> bool {
+        match &self.intent_transition {
+            Some(f) => f(value, type_id, snapshots),
+            None => true,
+        }
     }
 
     /// Call the started reactor if present.
