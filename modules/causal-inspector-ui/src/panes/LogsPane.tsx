@@ -15,28 +15,32 @@ function LogRow({ log, showReactor }: { log: ReactorLog; showReactor: boolean })
   const levelColor = LOG_LEVEL_COLORS[log.level] ?? "bg-zinc-600/20 text-zinc-400";
 
   return (
-    <div className="px-2 py-1.5 hover:bg-white/[0.02] rounded-md transition-colors duration-100">
-      <div className="flex items-center gap-2 min-w-0">
+    <div
+      onClick={() => setExpanded((v) => !v)}
+      className="px-2 py-1.5 hover:bg-white/[0.02] rounded-md transition-colors duration-100 cursor-pointer"
+    >
+      <div className="flex items-start gap-2 min-w-0">
         <span className={`px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase shrink-0 ${levelColor}`}>
           {log.level}
         </span>
-        <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">
+        <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums leading-[1.4]">
           {formatTs(log.loggedAt)}
         </span>
         {showReactor && (
-          <span className="text-[10px] font-mono text-muted-foreground/40 shrink-0">
+          <span className="text-[10px] font-mono text-muted-foreground/40 shrink-0 leading-[1.4]">
             {log.reactorId}
           </span>
         )}
-        <span className="text-[11px] text-foreground/80 truncate">{log.message}</span>
-        {log.data != null && (
-          <button
-            onClick={() => setExpanded((v) => !v)}
-            className="ml-auto text-[10px] p-1 rounded-md hover:bg-white/[0.05] shrink-0 text-muted-foreground/50 hover:text-foreground transition-colors"
-          >
-            {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-          </button>
-        )}
+        <span
+          className={`text-[11px] text-foreground/80 leading-[1.4] ${
+            expanded ? "break-words whitespace-pre-wrap" : "truncate"
+          }`}
+        >
+          {log.message}
+        </span>
+        <span className="ml-auto shrink-0 text-muted-foreground/50">
+          {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+        </span>
       </div>
       {expanded && log.data != null && (
         <pre className="mt-1.5 ml-4 text-[10px] font-mono text-muted-foreground/70 bg-white/[0.02] rounded-md p-2.5 max-h-32 overflow-auto whitespace-pre-wrap border border-border">
