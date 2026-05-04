@@ -37,6 +37,7 @@ pub mod aggregator;
 pub mod event;
 pub mod event_log;
 pub mod event_store;
+pub mod projection;
 pub mod reactor;
 pub mod reactor_queue;
 pub mod job_executor;
@@ -63,6 +64,15 @@ pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, QueueStatus, 
 pub use event_log::EventLog;
 pub use reactor_queue::ReactorQueue;
 pub use types::{EventPark, IntentCommit};
+
+// Re-export projection configuration types and persistence trait.
+// The runtime that uses these (engine integration, ProjectionRunner) is
+// not yet implemented — see
+// `docs/plans/2026-05-04-feat-async-projections-plan.md`.
+pub use projection::{
+    Backoff, FailureBehavior, ProjectionMode, ProjectionStatus, ProjectionStore,
+    RetryPolicy, StartPosition,
+};
 
 // Re-export in-memory implementation
 pub use memory_store::MemoryStore;
