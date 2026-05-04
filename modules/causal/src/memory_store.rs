@@ -61,6 +61,9 @@ pub struct MemoryStore {
     checkpoint: Arc<AtomicU64>,
     /// Optional broadcast channel for live event notifications.
     event_tx: Option<broadcast::Sender<PersistedEvent>>,
+    /// Parked events recorded via `IntentCommit::park`. Each entry is
+    /// `(event_id, reason)`. Cleared only by re-creating the store.
+    parked: Arc<Mutex<Vec<(Uuid, String)>>>,
 }
 
 impl MemoryStore {
@@ -83,7 +86,17 @@ impl MemoryStore {
             reactor_attempt_history: Arc::new(Mutex::new(Vec::new())),
             checkpoint: Arc::new(AtomicU64::new(0)),
             event_tx: None,
+            parked: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Snapshot of events parked in this store via `IntentCommit::park`.
+    ///
+    /// Returns a `Vec<(event_id, reason)>` in park order. Useful for tests
+    /// asserting that an event parked and inspecting the park reason. The
+    /// underlying log is not cleared by reading.
+    pub fn parked_events(&self) -> Vec<(Uuid, String)> {
+        self.parked.lock().clone()
     }
 
     /// Create a MemoryStore with a broadcast channel for live event notifications.
@@ -320,12 +333,15 @@ impl ReactorQueue for MemoryStore {
             }
         }
 
-        // Handle park (DLQ for events)
+        // Handle park (DLQ for events): record for programmatic inspection
+        // via `parked_events()`, plus a trace log for visibility.
         if let Some(park) = &commit.park {
-            eprintln!(
-                "Event parked: {} - {}",
-                commit.event_id, park.reason
+            tracing::warn!(
+                event_id = %commit.event_id,
+                reason = %park.reason,
+                "event parked"
             );
+            self.parked.lock().push((commit.event_id, park.reason.clone()));
         }
 
         // Create reactor intents

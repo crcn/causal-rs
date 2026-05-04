@@ -2790,6 +2790,94 @@ async fn projection_recovery_succeeds_after_transient_failure() -> Result<()> {
     Ok(())
 }
 
+/// REGRESSION: aggregators must not be double-applied across projection-failure retries.
+///
+/// Pre-fix flow in 0.2.0:
+///   - Phase 1 hydrates aggregator state, applies the event, optionally snapshots
+///   - Then runs projections
+///   - If a projection fails, the engine `break`s and retries on next iteration
+///   - On retry, hydrate sees state already exists → no rehydrate
+///   - apply runs AGAIN on top of mutated state
+///   - After max_event_retry_attempts retries, the event parks but the aggregator
+///     has the event applied N+1 times
+///
+/// For idempotent UPSERT-style aggregates, this is invisible. For accumulator-
+/// style aggregates (counters, totals), it's silent state corruption.
+///
+/// Correct semantics: each event applied to the aggregate exactly once,
+/// regardless of how many times the dispatch loop retried before parking.
+#[tokio::test]
+async fn aggregator_not_double_applied_when_projection_fails() -> Result<()> {
+    let engine = Engine::in_memory(Deps)
+        // Customer.order_count is `+= 1` on apply — corruption is visible.
+        .with_aggregator::<CustomerOrderPlaced, Customer, _>(|e| e.customer_id)
+        .with_projection(
+            causal::project("always_fails")
+                .then(|_event: causal::AnyEvent, _ctx: Context<Deps>| async move {
+                    anyhow::bail!("projection always fails");
+                }),
+        );
+
+    let customer_id = Uuid::new_v4();
+    engine
+        .emit(CustomerOrderPlaced {
+            customer_id,
+            order_id: Uuid::new_v4(),
+        })
+        .settled()
+        .await?;
+
+    let customer = engine.aggregate::<Customer>(customer_id);
+    assert_eq!(
+        customer.order_count, 1,
+        "event must be applied to the aggregate exactly once, even though \
+         the dispatch loop retried max_event_retry_attempts (3) times before \
+         parking. A value of 4 indicates the pre-fix double-apply regression."
+    );
+    Ok(())
+}
+
+/// REGRESSION: park reason must surface the underlying projection error.
+///
+/// Pre-fix: `engine.rs:485-489` did `Err(_e) => break;` — the projection
+/// error from `process_event_inner` was discarded. After retries, the event
+/// parked with a generic "Event failed after 3 retry attempts" reason.
+/// Operators querying the DLQ surface had no signal about WHICH projection
+/// failed or what error it returned.
+///
+/// Correct: capture the last projection error, surface it in the park reason.
+#[tokio::test]
+async fn park_reason_carries_projection_error_message() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let log: Arc<dyn EventLog> = store.clone();
+    let queue: Arc<dyn ReactorQueue> = store.clone();
+
+    let engine = Engine::with_backends(Deps, log.clone(), queue.clone())
+        .with_projection(
+            causal::project("schedule_state")
+                .then(|_event: causal::AnyEvent, _ctx: Context<Deps>| async move {
+                    anyhow::bail!("connection refused: postgres unreachable");
+                }),
+        );
+
+    engine.emit(Ping { msg: "x".into() }).settled().await?;
+
+    let parked = store.parked_events();
+    assert_eq!(parked.len(), 1, "exactly one event should be parked");
+    let reason = &parked[0].1;
+    assert!(
+        reason.contains("schedule_state"),
+        "park reason should name the failed projection; got: {}",
+        reason
+    );
+    assert!(
+        reason.contains("connection refused"),
+        "park reason should include the underlying error; got: {}",
+        reason
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn on_dlq_mapper_error_does_not_crash_engine() -> Result<()> {
     // The on_dlq mapper itself panics — engine should still settle

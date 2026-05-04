@@ -222,6 +222,23 @@ struct StateEntry {
     snapshot_at_version: StreamVersion,
 }
 
+/// Captured aggregator state for rollback after a failed event-processing attempt.
+///
+/// Produced by [`AggregatorRegistry::capture_for_rollback`] before
+/// `apply_event` mutates state, consumed by
+/// [`AggregatorRegistry::restore_state`] when the engine needs to undo the
+/// mutation (e.g. projection failure → retry).
+pub(crate) struct AggregatorRollback {
+    entries: Vec<RollbackEntry>,
+}
+
+struct RollbackEntry {
+    key: String,
+    prev_key: String,
+    key_entry: Option<StateEntry>,
+    prev_entry: Option<StateEntry>,
+}
+
 /// Registry of aggregators with owned in-memory state.
 pub struct AggregatorRegistry {
     aggregators: Vec<Aggregator>,
@@ -540,6 +557,64 @@ impl AggregatorRegistry {
         self.aggregators
             .iter()
             .find(|a| a.aggregate_type == aggregate_type)
+    }
+
+    /// Capture pre-mutation state for the aggregates that would be affected
+    /// by `apply_event(event_type, payload)`. The returned handle can be
+    /// passed to [`restore_state`](Self::restore_state) to undo the mutation
+    /// — used by the engine to roll back aggregator state when
+    /// `process_event_inner` fails after `apply_event` already ran.
+    ///
+    /// Captures the existing entry for both `key` and `key:prev` (or absence).
+    pub(crate) fn capture_for_rollback(
+        &self,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> AggregatorRollback {
+        let prefix = extract_prefix(event_type);
+        let mut entries = Vec::new();
+        for agg in self.aggregators.iter().filter(|a| a.event_prefix == prefix) {
+            let aggregate_id = match agg.extract_id_from_json(payload) {
+                Some(id) => id,
+                None => continue,
+            };
+            let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
+            let prev_key = format!("{}:prev", key);
+            let key_entry = self.state.get(&key).map(|e| e.clone());
+            let prev_entry = self.state.get(&prev_key).map(|e| e.clone());
+            entries.push(RollbackEntry {
+                key,
+                prev_key,
+                key_entry,
+                prev_entry,
+            });
+        }
+        AggregatorRollback { entries }
+    }
+
+    /// Restore aggregator state captured by [`capture_for_rollback`](Self::capture_for_rollback).
+    ///
+    /// Each captured entry is restored to its prior value, or removed if it
+    /// did not exist before. Idempotent if called twice with the same handle.
+    pub(crate) fn restore_state(&self, rollback: AggregatorRollback) {
+        for entry in rollback.entries {
+            match entry.key_entry {
+                Some(state_entry) => {
+                    self.state.insert(entry.key, state_entry);
+                }
+                None => {
+                    self.state.remove(&entry.key);
+                }
+            }
+            match entry.prev_entry {
+                Some(state_entry) => {
+                    self.state.insert(entry.prev_key, state_entry);
+                }
+                None => {
+                    self.state.remove(&entry.prev_key);
+                }
+            }
+        }
     }
 
     /// Replay events onto an existing state (for snapshot + partial replay).

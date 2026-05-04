@@ -369,6 +369,10 @@ where
 
         // In-memory event retry counter (resets on process restart)
         let mut event_attempts: std::collections::HashMap<LogCursor, u32> = std::collections::HashMap::new();
+        // In-memory last-error capture for surfacing in park reasons. Keyed
+        // by the event's log position so it pairs with `event_attempts`.
+        // Cleared on success or on park.
+        let mut last_errors: std::collections::HashMap<LogCursor, String> = std::collections::HashMap::new();
         // Ephemeral cache: populated from PersistedEvent in Phase 1, injected in Phase 2
         let mut ephemerals: std::collections::HashMap<Uuid, Arc<dyn std::any::Any + Send + Sync>> =
             std::collections::HashMap::new();
@@ -439,14 +443,36 @@ where
                 let attempts = event_attempts.entry(event.position).or_insert(0);
                 *attempts += 1;
                 if *attempts > event_config.max_event_retry_attempts as u32 {
+                    let reason = match last_errors.remove(&event.position) {
+                        Some(err) => format!(
+                            "Event failed after {} retry attempts: {}",
+                            event_config.max_event_retry_attempts, err
+                        ),
+                        None => format!(
+                            "Event failed after {} retry attempts",
+                            event_config.max_event_retry_attempts
+                        ),
+                    };
+
+                    // The event is in the log permanently and cold-start
+                    // replay would fold it into aggregator state via
+                    // `hydrate_aggregate`. To keep live state consistent
+                    // with replay, apply it now even though it's parking.
+                    // Snapshot too if configured. This is the one path
+                    // where we apply without `process_event_inner`
+                    // succeeding — the alternative is divergence between
+                    // live aggregator state and what cold-start would
+                    // reconstruct from the log.
+                    if event.persistent {
+                        self.hydrate_for_event(&event).await?;
+                        let _ = self.apply_to_aggregators(&event);
+                        if let Some(threshold) = self.snapshot_every {
+                            self.maybe_auto_snapshot(&event, threshold).await?;
+                        }
+                    }
+
                     self.queue
-                        .enqueue(IntentCommit::park(
-                            &event,
-                            format!(
-                                "Event failed after {} retry attempts",
-                                event_config.max_event_retry_attempts
-                            ),
-                        ))
+                        .enqueue(IntentCommit::park(&event, reason))
                         .await?;
                     event_attempts.remove(&event.position);
                     continue;
@@ -456,21 +482,24 @@ where
                 // Ephemeral events: skip aggregators/projections (not domain facts)
                 let skip_projections = !event.persistent;
 
-                let transition_snapshots = if event.persistent {
-                    // Hydrate cold aggregates before processing
+                // Aggregator state is mutated *before* projections run because
+                // process_event_inner's filter and transition guards need the
+                // post-fold snapshots. To preserve correctness when
+                // process_event_inner fails, we capture a rollback handle and
+                // restore the pre-mutation state on Err — otherwise retries
+                // would re-apply the event on top of already-mutated state,
+                // producing N-fold application for non-idempotent
+                // accumulators. See
+                // `aggregator_not_double_applied_when_projection_fails`.
+                let (transition_snapshots, rollback_handle) = if event.persistent {
                     self.hydrate_for_event(&event).await?;
-
-                    // Apply event to live aggregator state
+                    let rollback = self
+                        .aggregators
+                        .capture_for_rollback(&event.event_type, &event.payload);
                     let snapshots = self.apply_to_aggregators(&event);
-
-                    // Auto-checkpoint snapshots if configured
-                    if let Some(threshold) = self.snapshot_every {
-                        self.maybe_auto_snapshot(&event, threshold).await?;
-                    }
-
-                    snapshots
+                    (snapshots, Some(rollback))
                 } else {
-                    crate::aggregator::TransitionSnapshots::empty()
+                    (crate::aggregator::TransitionSnapshots::empty(), None)
                 };
 
                 // Process event: match reactors, run projections, build intents
@@ -479,10 +508,30 @@ where
                     .await
                 {
                     Ok(commit) => {
+                        // Snapshot is deferred to the success path so a failed
+                        // attempt doesn't poison the EventLog with a snapshot
+                        // that includes the not-yet-committed event.
+                        if event.persistent {
+                            if let Some(threshold) = self.snapshot_every {
+                                self.maybe_auto_snapshot(&event, threshold).await?;
+                            }
+                        }
                         self.queue.enqueue(commit).await?;
                         event_attempts.remove(&event.position);
+                        last_errors.remove(&event.position);
                     }
-                    Err(_e) => {
+                    Err(e) => {
+                        if let Some(rollback) = rollback_handle {
+                            self.aggregators.restore_state(rollback);
+                        }
+                        let err_str = format!("{:#}", e);
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            "process_event_inner failed: {}",
+                            err_str
+                        );
+                        last_errors.insert(event.position, err_str);
                         // Error will be retried on next loop (retry counter tracks attempts)
                         break;
                     }

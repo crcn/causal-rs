@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-05-04
+
+### Fixed
+
+**Aggregator double-apply across projection-failure retries (regression in 0.2.0).**
+
+In 0.2.0, when a projection returned `Err`, the engine would `break` and retry
+the event on the next settle iteration. But the per-event flow applied the
+event to aggregator state *before* `process_event_inner` ran:
+
+```
+hydrate_for_event → apply_to_aggregators (mutates state) → process_event_inner
+```
+
+On retry, `hydrate_for_event` saw state already existed (no rehydrate) and
+`apply_to_aggregators` ran *again* on the post-mutation state. After
+`max_event_retry_attempts` retries, the aggregate had the event applied
+N+1 times — silent state corruption for accumulator-style aggregates
+(counters, totals). Idempotent UPSERT-style aggregates were unaffected.
+
+The fix:
+
+1. **Capture rollback before apply.** A new `AggregatorRegistry::capture_for_rollback`
+   snapshots pre-mutation state; on `Err` from `process_event_inner`, the
+   engine restores it via `restore_state`. Retries see the correct
+   pre-mutation state and apply exactly once per attempt.
+2. **Apply on park.** When the retry budget exhausts and the event parks,
+   the engine applies the event one final time (without rollback) so live
+   aggregator state matches what cold-start replay would reconstruct from
+   the event log. The log is the source of truth — parked events are still
+   facts that happened.
+3. **Defer snapshots to success path.** `maybe_auto_snapshot` previously
+   ran inside the per-event mutation block, which could write a snapshot
+   reflecting an event that subsequently failed. Now snapshots are taken
+   only in the success branch and the park branch — never during a
+   transient retry.
+
+**Park reason now carries the underlying projection error.**
+
+Pre-fix: `process_event_inner` returned `Err`, the engine did `Err(_e) => break;`,
+the error was discarded. After retries, the event parked with a generic
+`"Event failed after 3 retry attempts"` reason. Operators querying the
+DLQ surface had no signal about which projection failed or what error
+it returned.
+
+Now: the engine captures the last error string per event position and
+includes it in the park reason. Park reasons read like
+`"Event failed after 3 retry attempts: 1 projection(s) failed for event
+<uuid>: schedule_state: connection refused"`.
+
+The error is also logged via `tracing::warn!` on each Err so it's visible
+in traces during retry attempts, not just at park time.
+
+### Added
+
+- `MemoryStore::parked_events() -> Vec<(Uuid, String)>` — returns the
+  list of `(event_id, park_reason)` pairs recorded by `IntentCommit::park`.
+  Useful for tests asserting park behavior; also surfaces the same data
+  that downstream backends would persist to a DLQ table.
+
+### Internal
+
+- `AggregatorRegistry::capture_for_rollback(event_type, payload) -> AggregatorRollback`
+  and `AggregatorRegistry::restore_state(rollback)` — `pub(crate)` API
+  used by the engine to roll back aggregator state on transient
+  `process_event_inner` failures. Not part of the public API; the surface
+  to expose this for downstream backends will be designed if needed.
+
+### Tests
+
+- `aggregator_not_double_applied_when_projection_fails` — regression test
+  that fails on 0.2.0 (counter=3) and passes on 0.2.1 (counter=1).
+- `park_reason_carries_projection_error_message` — proves the park reason
+  contains the failing projection id and underlying error.
+
+### Migration from 0.2.0
+
+No code changes for callers. **Strongly recommended** to upgrade if you
+have aggregators that accumulate state (counters, sums, lists, etc.) —
+0.2.0 silently corrupts them on projection failure. UPSERT-style
+aggregates (status fields, last-write-wins) are safe in both versions.
+
 ## [0.2.0] - 2026-05-04
 
 ### Breaking
