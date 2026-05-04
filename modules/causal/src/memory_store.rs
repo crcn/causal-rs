@@ -16,8 +16,21 @@ use uuid::Uuid;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::event_log::EventLog;
+use crate::projection::{
+    ProjectionFailure, ProjectionStatus, ProjectionStore,
+};
 use crate::reactor_queue::ReactorQueue;
 use crate::types::*;
+
+/// In-memory cursor row for one async projection.
+#[derive(Clone)]
+struct ProjectionCursorEntry {
+    cursor: LogCursor,
+    paused: bool,
+    last_error: Option<String>,
+    last_attempt_at: Option<DateTime<Utc>>,
+    consecutive_failures: u32,
+}
 
 /// In-memory EventLog + ReactorQueue for the Engine's settle loop.
 ///
@@ -64,6 +77,13 @@ pub struct MemoryStore {
     /// Parked events recorded via `IntentCommit::park`. Each entry is
     /// `(event_id, reason)`. Cleared only by re-creating the store.
     parked: Arc<Mutex<Vec<(Uuid, String)>>>,
+    /// Per-projection cursor + status for the `ProjectionStore` trait.
+    projection_cursors: Arc<DashMap<String, ProjectionCursorEntry>>,
+    /// Per-projection DLQ rows recorded by `advance_past_failure`.
+    /// Idempotent on `(projection_id, event_id)` — duplicate calls
+    /// are no-ops, matching the contract on backends with a unique
+    /// constraint.
+    projection_failures: Arc<Mutex<Vec<ProjectionFailure>>>,
 }
 
 impl MemoryStore {
@@ -87,6 +107,8 @@ impl MemoryStore {
             checkpoint: Arc::new(AtomicU64::new(0)),
             event_tx: None,
             parked: Arc::new(Mutex::new(Vec::new())),
+            projection_cursors: Arc::new(DashMap::new()),
+            projection_failures: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -638,5 +660,208 @@ impl ReactorQueue for MemoryStore {
             .get(&correlation_id)
             .map(|e| e.value().clone())
             .unwrap_or_default())
+    }
+}
+
+#[async_trait]
+impl ProjectionStore for MemoryStore {
+    async fn init_projection_cursor(
+        &self,
+        projection_id: &str,
+        start: LogCursor,
+    ) -> Result<bool> {
+        use dashmap::mapref::entry::Entry;
+        match self.projection_cursors.entry(projection_id.to_string()) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(slot) => {
+                slot.insert(ProjectionCursorEntry {
+                    cursor: start,
+                    paused: false,
+                    last_error: None,
+                    last_attempt_at: None,
+                    consecutive_failures: 0,
+                });
+                Ok(true)
+            }
+        }
+    }
+
+    async fn get_projection_cursor(
+        &self,
+        projection_id: &str,
+    ) -> Result<Option<LogCursor>> {
+        Ok(self
+            .projection_cursors
+            .get(projection_id)
+            .map(|e| e.cursor))
+    }
+
+    async fn advance_projection_cursor(
+        &self,
+        projection_id: &str,
+        expected_from: LogCursor,
+        to: LogCursor,
+    ) -> Result<bool> {
+        let Some(mut entry) = self.projection_cursors.get_mut(projection_id) else {
+            return Ok(false);
+        };
+        if entry.cursor != expected_from {
+            return Ok(false);
+        }
+        entry.cursor = to;
+        entry.last_error = None;
+        entry.consecutive_failures = 0;
+        Ok(true)
+    }
+
+    async fn advance_past_failure(
+        &self,
+        projection_id: &str,
+        expected_from: LogCursor,
+        to: LogCursor,
+        event_id: Uuid,
+        error: &str,
+        attempts: u32,
+    ) -> Result<bool> {
+        // Acquire cursor entry first (per-entry lock), then DLQ vec lock.
+        // Order is consistent across all callers — this is the only method
+        // that takes both locks, so no deadlock window.
+        let Some(mut entry) = self.projection_cursors.get_mut(projection_id) else {
+            return Ok(false);
+        };
+        if entry.cursor != expected_from {
+            return Ok(false);
+        }
+
+        // Idempotent DLQ write on (projection_id, event_id), matching the
+        // primary-key contract documented on the trait.
+        let mut failures = self.projection_failures.lock();
+        let already_present = failures.iter().any(|f| {
+            f.projection_id == projection_id && f.event_id == event_id
+        });
+        if !already_present {
+            failures.push(ProjectionFailure {
+                projection_id: projection_id.to_string(),
+                event_id,
+                error: error.to_string(),
+                attempts,
+                failed_at: Utc::now(),
+            });
+        }
+        drop(failures);
+
+        // Atomic with the DLQ write because both succeed before this method
+        // returns and a panic between them is impossible (no .await points).
+        entry.cursor = to;
+        entry.last_error = None;
+        entry.consecutive_failures = 0;
+        Ok(true)
+    }
+
+    async fn set_projection_error(
+        &self,
+        projection_id: &str,
+        error: Option<&str>,
+        consecutive_failures: u32,
+    ) -> Result<()> {
+        if let Some(mut entry) = self.projection_cursors.get_mut(projection_id) {
+            entry.last_error = error.map(|s| s.to_string());
+            entry.consecutive_failures = consecutive_failures;
+            entry.last_attempt_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn projection_status(
+        &self,
+        projection_id: &str,
+    ) -> Result<Option<ProjectionStatus>> {
+        Ok(self.projection_cursors.get(projection_id).map(|e| {
+            ProjectionStatus {
+                projection_id: projection_id.to_string(),
+                cursor: e.cursor,
+                paused: e.paused,
+                last_error: e.last_error.clone(),
+                last_attempt_at: e.last_attempt_at,
+                consecutive_failures: e.consecutive_failures,
+            }
+        }))
+    }
+
+    async fn list_projections(&self) -> Result<Vec<ProjectionStatus>> {
+        Ok(self
+            .projection_cursors
+            .iter()
+            .map(|entry| ProjectionStatus {
+                projection_id: entry.key().clone(),
+                cursor: entry.cursor,
+                paused: entry.paused,
+                last_error: entry.last_error.clone(),
+                last_attempt_at: entry.last_attempt_at,
+                consecutive_failures: entry.consecutive_failures,
+            })
+            .collect())
+    }
+
+    async fn set_projection_paused(
+        &self,
+        projection_id: &str,
+        paused: bool,
+    ) -> Result<()> {
+        if let Some(mut entry) = self.projection_cursors.get_mut(projection_id) {
+            entry.paused = paused;
+        }
+        Ok(())
+    }
+
+    async fn reset_projection(
+        &self,
+        projection_id: &str,
+        to: LogCursor,
+    ) -> Result<()> {
+        if let Some(mut entry) = self.projection_cursors.get_mut(projection_id) {
+            entry.cursor = to;
+            entry.last_error = None;
+            entry.consecutive_failures = 0;
+            entry.last_attempt_at = None;
+        }
+        Ok(())
+    }
+
+    async fn delete_projection(&self, projection_id: &str) -> Result<()> {
+        self.projection_cursors.remove(projection_id);
+        let mut failures = self.projection_failures.lock();
+        failures.retain(|f| f.projection_id != projection_id);
+        Ok(())
+    }
+
+    async fn list_projection_failures(
+        &self,
+        projection_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectionFailure>> {
+        let failures = self.projection_failures.lock();
+        let mut matching: Vec<_> = failures
+            .iter()
+            .filter(|f| f.projection_id == projection_id)
+            .cloned()
+            .collect();
+        // Most-recent first
+        matching.sort_by(|a, b| b.failed_at.cmp(&a.failed_at));
+        matching.truncate(limit);
+        Ok(matching)
+    }
+
+    async fn delete_projection_failure(
+        &self,
+        projection_id: &str,
+        event_id: Uuid,
+    ) -> Result<bool> {
+        let mut failures = self.projection_failures.lock();
+        let before = failures.len();
+        failures.retain(|f| {
+            !(f.projection_id == projection_id && f.event_id == event_id)
+        });
+        Ok(failures.len() < before)
     }
 }

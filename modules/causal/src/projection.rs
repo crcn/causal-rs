@@ -1,17 +1,46 @@
 //! Projection configuration types and persistence trait.
 //!
-//! This module defines the public types needed to configure a projection
-//! and the persistence trait backends implement to support per-projection
-//! cursors. The runtime (`ProjectionRunner`, engine integration, sync-vs-
-//! async dispatch) is not yet implemented — see
-//! `docs/plans/2026-05-04-feat-async-projections-plan.md` for the design
-//! these types belong to.
+//! This module defines the public API for configuring projections (mode,
+//! retry policy, start position) and the persistence trait
+//! (`ProjectionStore`) that backends implement to support per-projection
+//! cursors. The runtime (`ProjectionRunner`, engine integration,
+//! sync-vs-async dispatch) is implemented separately and consumes this
+//! trait — see `docs/plans/2026-05-04-feat-async-projections-plan.md`.
 //!
-//! The types are `pub` and stable as part of the 0.3 API surface; backend
-//! implementers (e.g. a Postgres `ProjectionStore`) can develop against
-//! them in parallel with the engine-side runtime work. The trait has
-//! default `unimplemented!()` impls to keep early consumers from
-//! accidentally depending on un-finished behavior.
+//! Backends implement `ProjectionStore` against their own storage. An
+//! in-memory implementation is provided on `MemoryStore` for tests and
+//! single-process use cases.
+//!
+//! ## Recommended schema (Postgres backends)
+//!
+//! ```sql
+//! CREATE TABLE causal_projection_cursors (
+//!     projection_id        TEXT PRIMARY KEY,
+//!     cursor_position      BIGINT NOT NULL,
+//!     paused               BOOL NOT NULL DEFAULT FALSE,
+//!     last_error           TEXT,
+//!     last_attempt_at      TIMESTAMPTZ,
+//!     consecutive_failures INT NOT NULL DEFAULT 0,
+//!     -- Forward-compat columns for future multi-process leases (D3
+//!     -- in the plan). Unused in 0.3; reserved so adding leases later
+//!     -- is a column-population change, not a schema migration.
+//!     leased_by            TEXT,
+//!     leased_until         TIMESTAMPTZ,
+//!     fencing_token        BIGINT
+//! );
+//!
+//! CREATE TABLE causal_projection_failures (
+//!     projection_id  TEXT NOT NULL,
+//!     event_id       UUID NOT NULL,
+//!     error          TEXT NOT NULL,
+//!     attempts       INT NOT NULL,
+//!     failed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+//!     PRIMARY KEY (projection_id, event_id)
+//! );
+//! ```
+//!
+//! The DLQ table's primary key on `(projection_id, event_id)` is
+//! load-bearing — it makes `advance_past_failure` idempotent on retry.
 
 use std::time::Duration;
 
@@ -23,20 +52,17 @@ use uuid::Uuid;
 use crate::types::LogCursor;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Configuration types (D1, D4, D5 from the plan)
+// Configuration types (D1, D4, D5)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Whether a projection runs inline with dispatch (`Sync`) or in an
 /// independent runner with its own cursor (`Async`).
 ///
-/// **D1 (no default).** Every `register_projection` call site declares
-/// its mode explicitly. Both extremes — defaulting Sync (preserves the
-/// pre-0.2.0 silent-coupling bug for new projections) and defaulting
-/// Async (silently breaks read-your-writes consumers) — are wrong; the
-/// API refuses to choose so the caller has to.
-///
-/// See `register_sync_projection` / `register_async_projection` on
-/// `Engine` for ergonomic shorthand once the runtime lands.
+/// **D1: no default.** Every `register_projection` call site declares
+/// its mode explicitly. Both extremes — defaulting `Sync` (preserves
+/// the pre-0.2.0 silent-coupling bug for new projections) and
+/// defaulting `Async` (silently breaks read-your-writes consumers) —
+/// are wrong; the API refuses to choose so the caller has to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionMode {
     /// Runs inline in the dispatch loop, before reactors. Failure
@@ -56,8 +82,8 @@ pub enum Backoff {
     None,
     /// Constant delay between attempts.
     Linear { base: Duration },
-    /// `min(max, base * 2^attempt)` with optional jitter. The default
-    /// for async projections.
+    /// `min(max, base * 2^attempt)` with optional jitter. Default for
+    /// async projections.
     Exponential {
         base: Duration,
         max: Duration,
@@ -77,15 +103,11 @@ impl Default for Backoff {
 
 /// What happens when a projection keeps failing.
 ///
-/// **D4.** Default `BlockUntilFixed`. Reasoning: preserves the
-/// event-sourcing invariant (projection state == fold(log)). Operator
-/// pauses, fixes, resumes for permanent failures. The escape hatch
-/// (`AdvanceAfter`) is real — some consumers prefer skip-and-continue
-/// over stuck-and-block — but it's a deliberate opt-in, not a default.
-///
-/// Switching `BlockUntilFixed → AdvanceAfter` is reversible at runtime;
-/// switching the other direction doesn't recover lost events. Default
-/// to the recoverable choice.
+/// **D4: default `BlockUntilFixed`.** Preserves the event-sourcing
+/// invariant (projection state == fold(log)). Switching
+/// `BlockUntilFixed → AdvanceAfter` is reversible at runtime; switching
+/// the other direction doesn't recover lost events. Default to the
+/// recoverable choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureBehavior {
     /// Retry forever with backoff. Cursor does not advance past the
@@ -115,17 +137,17 @@ pub struct RetryPolicy {
 /// Where an async projection should start when its runner first comes
 /// up.
 ///
-/// **D5 (no default).** Refusing to default forces a per-site decision
-/// the same way mode does. The "obvious" defaults are both wrong in some
-/// case: `ResumeOrLatest` silently makes historical events invisible to
-/// a freshly-added projection; `Zero` is catastrophically expensive for
-/// redeploys of long-running projections.
+/// **D5: no default.** Refusing to default forces a per-site decision
+/// the same way mode does. The "obvious" defaults are both wrong in
+/// some case: `ResumeOrLatest` silently makes historical events
+/// invisible to a freshly-added projection; `Zero` is catastrophically
+/// expensive for redeploys of long-running projections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartPosition {
     /// Use the existing cursor if one is persisted for this
     /// `projection_id`; otherwise start at the current
-    /// `latest_position()`. The pragmatic production choice for
-    /// projections that already have history.
+    /// `latest_position()`. Pragmatic production choice for projections
+    /// that already have history.
     ResumeOrLatest,
     /// Always start at the current `latest_position()`, ignoring any
     /// persisted cursor. New projection that should NOT backfill.
@@ -140,15 +162,15 @@ pub enum StartPosition {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Persistence trait (cursor + per-projection ops)
+// Status + DLQ row types
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Status snapshot of an async projection.
+/// Status snapshot of a projection.
 ///
 /// Returned by `ProjectionStore::projection_status` and
-/// `Engine::projection_status`. Used by the inspector UI and operational
-/// tooling.
-#[derive(Debug, Clone)]
+/// `Engine::projection_status`. Used by the inspector UI and
+/// operational tooling.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionStatus {
     pub projection_id: String,
     pub cursor: LogCursor,
@@ -158,78 +180,140 @@ pub struct ProjectionStatus {
     pub consecutive_failures: u32,
 }
 
-/// Persistence backend for async projection cursors.
+/// One DLQ row recorded by `advance_past_failure` when an async
+/// projection in `FailureBehavior::AdvanceAfter` mode skips an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionFailure {
+    pub projection_id: String,
+    pub event_id: Uuid,
+    pub error: String,
+    pub attempts: u32,
+    pub failed_at: DateTime<Utc>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Persistence trait
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Persistence backend for async projection cursors and DLQ.
 ///
-/// Implemented by storage backends (Postgres, KurrentDB, in-memory).
 /// The engine's `ProjectionRunner` calls these methods to claim the
-/// next batch of events, advance the cursor on success, and record
-/// failures on persistent error.
+/// next batch of events, advance the cursor on success, or skip the
+/// failing event on terminal failure.
 ///
-/// **Forward-compatibility:** the underlying schema (in Postgres
-/// backends, a `causal_projection_cursors` table) reserves
-/// `leased_by`, `leased_until`, and `fencing_token` columns for the
-/// future multi-process leader election story (D3). They are unused
-/// by 0.3 — per-batch `SELECT ... FOR UPDATE SKIP LOCKED` is the only
-/// concurrency primitive at this stage. Adding lease semantics later
-/// is a column-population change, not a schema redesign.
+/// ## Concurrency contract
 ///
-/// All methods are required (no defaults). Incomplete backend impls fail
-/// at compile time, not at 3am when an unimplemented branch first runs.
+/// The cursor-advancing methods (`advance_projection_cursor`,
+/// `advance_past_failure`) take an `expected_from: LogCursor`
+/// parameter and return `Result<bool>` — `true` if the update happened,
+/// `false` if `expected_from` did not match the persisted cursor (i.e.,
+/// another runner advanced it). Backends implement this as
+/// optimistic-concurrency CAS: `UPDATE ... WHERE cursor_position =
+/// $expected_from RETURNING cursor_position`. Postgres backends should
+/// wrap this in a `SELECT ... FOR UPDATE SKIP LOCKED` claim so the
+/// `false` return distinguishes "row was locked by another engine"
+/// from "row had a different cursor."
+///
+/// ## Atomicity contract
+///
+/// `advance_past_failure` writes a DLQ row and advances the cursor
+/// **atomically** (single transaction in backends with transactions).
+/// A runner crash between the two writes is impossible by construction
+/// — either both happened or neither did.
+///
+/// `record_projection_failure` is NOT a separate method; the failure
+/// write is bundled into `advance_past_failure` precisely to enforce
+/// this atomicity.
+///
+/// ## Idempotency contract
+///
+/// The DLQ primary key `(projection_id, event_id)` ensures
+/// `advance_past_failure` is idempotent on retry-of-retry: if the
+/// cursor advance succeeded but the runner died before the next read,
+/// a redundant call writes the same DLQ row (`ON CONFLICT DO NOTHING`)
+/// and the second cursor advance fails the CAS check (returning
+/// `false`). No duplicate DLQ rows.
+///
+/// ## Forward-compat
+///
+/// The recommended schema reserves `leased_by` / `leased_until` /
+/// `fencing_token` columns for future multi-process leader election
+/// (deferred per D3). 0.3 does not use them; adding lease semantics
+/// later is a column-population change, not a schema redesign.
+///
+/// ## No defaults
+///
+/// All methods are required (no default bodies). Incomplete backend
+/// impls fail at compile time.
 #[async_trait]
 pub trait ProjectionStore: Send + Sync {
     /// Initialize a cursor for a projection if one does not exist.
     ///
-    /// `start` is the resolved starting position (after the engine has
-    /// resolved `StartPosition` against the current log state).
-    /// Idempotent: if the `projection_id` already has a cursor, this
-    /// method preserves the existing cursor unchanged.
+    /// Returns `true` if a new cursor row was created, `false` if a
+    /// cursor already existed (in which case the existing cursor is
+    /// preserved unchanged). Used by `ProjectionMode::Async`
+    /// registration with `StartPosition::ResumeOrLatest`.
     async fn init_projection_cursor(
         &self,
         projection_id: &str,
         start: LogCursor,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Read the current cursor for a projection. Returns `None` if
-    /// `init_projection_cursor` was never called for this id.
+    /// `init_projection_cursor` was never called for this id (or the
+    /// projection was deleted).
     async fn get_projection_cursor(
         &self,
         projection_id: &str,
     ) -> Result<Option<LogCursor>>;
 
-    /// Atomically advance a projection's cursor.
+    /// CAS-advance a projection's cursor on successful batch apply.
     ///
-    /// Called by the runner per-batch. Backends should claim the row
-    /// via `SELECT ... FOR UPDATE SKIP LOCKED` so two engines never
-    /// advance the same cursor concurrently.
+    /// Returns `true` if the cursor was updated, `false` if
+    /// `expected_from` did not match the persisted value (i.e.,
+    /// another runner advanced it concurrently, or this runner's read
+    /// is stale). Caller should re-read and retry on `false`.
+    ///
+    /// Also clears `last_error` and `consecutive_failures` on success.
     async fn advance_projection_cursor(
         &self,
         projection_id: &str,
+        expected_from: LogCursor,
         to: LogCursor,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
-    /// Record a per-projection failure that exceeded its retry budget.
+    /// CAS-advance a projection's cursor past a failing event,
+    /// recording a DLQ row in the same transaction.
     ///
-    /// Called only when `FailureBehavior::AdvanceAfter` decides to skip
-    /// the failing event after exhausting `max_attempts`. Backends
-    /// write a per-projection DLQ row capturing the event_id, error
-    /// message, and attempt count. The cursor is advanced separately
-    /// via `advance_projection_cursor`.
-    async fn record_projection_failure(
+    /// Used only by `FailureBehavior::AdvanceAfter` after the retry
+    /// budget exhausts. The DLQ write and cursor advance are atomic;
+    /// the DLQ row is idempotent on `(projection_id, event_id)`.
+    ///
+    /// Returns `true` if both writes happened, `false` if
+    /// `expected_from` did not match.
+    ///
+    /// Also clears `last_error` and `consecutive_failures` on
+    /// successful skip.
+    async fn advance_past_failure(
         &self,
         projection_id: &str,
+        expected_from: LogCursor,
+        to: LogCursor,
         event_id: Uuid,
         error: &str,
         attempts: u32,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
-    /// Update the failure-state columns for live status reporting.
+    /// Update the live failure-state fields without advancing the
+    /// cursor. Called by the runner after each failed attempt
+    /// (regardless of `FailureBehavior` mode) to surface live status.
     ///
-    /// Pass `Some(error)` after a failed attempt; pass `None` after a
-    /// successful apply to clear. `consecutive_failures` is the count
-    /// of consecutive failures since the last success (0 on success).
-    /// Distinct from `record_projection_failure` — this does NOT
-    /// advance the cursor and is called by the runner regardless of
-    /// `FailureBehavior` mode.
+    /// Pass `Some(error)` after a failure; pass `None` after a
+    /// successful apply to clear. Note that
+    /// `advance_projection_cursor` and `advance_past_failure` already
+    /// clear the error state on success — this method exists for the
+    /// in-flight case where the runner wants to update status without
+    /// committing a cursor advance.
     async fn set_projection_error(
         &self,
         projection_id: &str,
@@ -237,11 +321,17 @@ pub trait ProjectionStore: Send + Sync {
         consecutive_failures: u32,
     ) -> Result<()>;
 
-    /// Return the operational status of a projection.
+    /// Return the operational status of a projection. Returns `None`
+    /// if no cursor exists for this id.
     async fn projection_status(
         &self,
         projection_id: &str,
     ) -> Result<Option<ProjectionStatus>>;
+
+    /// Return statuses for all known projections. Used by ops
+    /// dashboards. Order is unspecified; callers sort if they need
+    /// stable ordering.
+    async fn list_projections(&self) -> Result<Vec<ProjectionStatus>>;
 
     /// Set the paused flag for a projection. Runners check this
     /// before each batch and skip work while `paused = true`.
@@ -253,15 +343,48 @@ pub trait ProjectionStore: Send + Sync {
         paused: bool,
     ) -> Result<()>;
 
-    /// Reset a projection's cursor to a specific position. Forces
-    /// backfill or rewind. Operator-initiated only — the runner does
-    /// not call this. Distinct from `advance_projection_cursor`
-    /// because backends may want different concurrency semantics
-    /// (e.g., a reset shouldn't be `SKIP LOCKED`-claimed; it's an
-    /// authoritative override).
+    /// Reset a projection's cursor to a specific position
+    /// unconditionally. Forces backfill or rewind. Operator-initiated
+    /// only — the runner does not call this.
+    ///
+    /// Distinct from `advance_projection_cursor` because resets bypass
+    /// the optimistic-concurrency check (it's an authoritative
+    /// override). Backends should NOT use SKIP LOCKED here — a reset
+    /// blocks until it acquires the row lock.
+    ///
+    /// Also clears `last_error` and `consecutive_failures`.
     async fn reset_projection(
         &self,
         projection_id: &str,
         to: LogCursor,
     ) -> Result<()>;
+
+    /// Delete a projection's cursor row and all its DLQ rows.
+    /// Operator cleanup when a projection is removed from the
+    /// registration list. Idempotent: succeeds even if the
+    /// projection_id doesn't exist.
+    async fn delete_projection(
+        &self,
+        projection_id: &str,
+    ) -> Result<()>;
+
+    /// List DLQ rows for a projection, most-recent first, limited to
+    /// `limit` rows.
+    async fn list_projection_failures(
+        &self,
+        projection_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectionFailure>>;
+
+    /// Delete one DLQ row. Used by operator workflows that fix the
+    /// underlying bug then remove the failure record before replaying
+    /// (typically followed by `reset_projection` to rewind the cursor
+    /// past the deletion).
+    ///
+    /// Returns `true` if a row was deleted, `false` if no row matched.
+    async fn delete_projection_failure(
+        &self,
+        projection_id: &str,
+        event_id: Uuid,
+    ) -> Result<bool>;
 }
