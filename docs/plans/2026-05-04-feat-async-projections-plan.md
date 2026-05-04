@@ -2,16 +2,19 @@
 title: "feat: Async projections with per-projection cursors"
 type: feat
 date: 2026-05-04
-status: accepted-design-pending
+status: accepted-implementation-pending
 target_release: 0.3.0
 estimate: ~5 weeks (engine 2-3w + consumer migration 1w + testing 1w)
 ---
 
-# Async projections with per-projection cursors — ACCEPTED, design pending
+# Async projections with per-projection cursors — ACCEPTED, implementation pending
 
 ## Status
 
-**ACCEPTED, design pending.** Position flipped 2026-05-04 after a second
+**ACCEPTED, implementation pending.** Design complete: five decisions
+resolved (D1-D5 below). No code yet — implementation starts after the
+consumer-side audit deliverable (downstream-consumer mapping per
+projection) lands. Position flipped 2026-05-04 after a second
 pressure-test from a consumer-side review. The original rejection (deferring
 to `causal_replay::ProjectionStream`) was correct on the principle of
 "single concern per crate" but applied along the wrong axis. The right
@@ -23,9 +26,9 @@ crate makes the dangerous mode (coupled-to-dispatch via
 `engine.with_projection`) the easy default, and the safe mode the one
 behind a doc pointer. That's the wrong API shape.
 
-This document captures the accepted direction. Three design decisions are
-resolved (below); two remain open. Implementation does not start until the
-design doc lands.
+This document captures the accepted direction with all five design
+decisions resolved (D1-D5). Implementation can begin once the consumer-
+side audit deliverable lands.
 
 ## Position history
 
@@ -103,55 +106,92 @@ without a schema redesign — just column population.
 Multi-process scaling (long-lived leases, heartbeat protocol, region-
 aware leader election) is deferred to a separate RFC. Don't pre-build it.
 
-## Open design questions
+### D4: Per-projection failure handling — `BlockUntilFixed` default, opt-in `AdvanceAfter`
 
-These still need answers before implementation starts.
+Two valid behaviors when an async projection fails repeatedly. Default is
+the safe one; opt-in escapes are available.
 
-### Q1: Per-projection retry policy granularity
+```rust
+pub enum FailureBehavior {
+    /// Retry forever with exponential backoff. The cursor does not advance
+    /// past the failing event until either (a) the projection succeeds or
+    /// (b) an operator intervenes via `pause_projection` + fix + resume.
+    /// Lag grows visibly while stuck — surfaced via `projection_status`
+    /// and the inspector UI. This is the default and matches the
+    /// event-sourcing invariant: projection state == fold(log).
+    BlockUntilFixed,
+    /// Retry `max_attempts` times, then advance the cursor past the
+    /// failed event and record a per-projection DLQ row. Use when
+    /// occasional event-skip is preferable to a stuck cursor (e.g.,
+    /// schema-drift between historical events and current code).
+    /// Operator manually replays via `reset_projection(id, position)`
+    /// after fixing the issue.
+    AdvanceAfter { max_attempts: u32 },
+}
+```
 
-The original proposal had per-projection `RetryPolicy { max_attempts,
-backoff }`. Sensible default: `Exponential { base: 100ms, max: 30s,
-jitter: true }`, max_attempts unbounded for async (catches up eventually)
-or some finite number that triggers DLQ (per-projection failure stream).
+Default `BlockUntilFixed`. Reasoning:
 
-Question: is the DLQ for async projections (a) per-projection failure
-stream, indefinite retry above it, or (b) finite attempts then move-on
-(advance cursor past the failed event)?
+- Event-sourcing invariant — projection state SHOULD equal `fold(events)`.
+  Skipping events silently is a violation that creates ghost state. The
+  default should preserve the invariant.
+- Operationally observable — `BlockUntilFixed` produces an obvious signal
+  (lag growing on the inspector dashboard, `projection_status` shows
+  `last_error`). `AdvanceAfter` is silent unless someone queries the DLQ.
+- Reversible — operator can always switch a `BlockUntilFixed` projection
+  to `AdvanceAfter` at runtime if a bug turns out to be unfixable.
+  Switching the other way doesn't recover lost events.
 
-Marten goes with (a): retry forever, surface lag. EventStoreDB allows
-either via the `subscription` config. Recommend (a) for async + structured
-per-projection DLQ rows for failed-events visibility, but explicit decision
-needed before traits land.
+`AdvanceAfter` is real — some consumers genuinely prefer skip-and-continue
+over stuck-and-block — but it's the kind of choice that should be
+deliberate at registration time, not the default.
 
-### Q2: Backfill-vs-skip on registration
+Per-projection retry policy uses `RetryPolicy { backoff: Backoff,
+failure: FailureBehavior }` with default
+`Backoff::Exponential { base: 100ms, max: 30s, jitter: true }`. Backoff
+applies to both modes; `FailureBehavior` decides what happens after the
+backoff ceiling is reached (in `BlockUntilFixed`, retry continues at
+`max` interval; in `AdvanceAfter`, the retry counter is consulted).
 
-When `register_projection` is called for a projection_id whose cursor
-already exists, two valid behaviors:
+### D5: Backfill-vs-skip on registration — `StartPosition` enum
 
-- Use existing cursor. Caller intent: "resume where I left off."
-- Reset to `Latest` or `Zero`. Caller intent: "fresh start" or "backfill."
-
-Proposal: registration takes a `start_position: StartPosition` enum:
+Registration takes an explicit `start_position: StartPosition` argument.
+No default — the caller decides.
 
 ```rust
 pub enum StartPosition {
-    /// Use existing cursor if present, else Latest. Sane default for prod.
+    /// Use the existing cursor if one is persisted for this projection_id;
+    /// otherwise start at the current `latest_position()`. The pragmatic
+    /// production choice: redeploys resume where they left off, new
+    /// projections start fresh.
     ResumeOrLatest,
-    /// Always start at current dispatch position. New projections, no backfill.
+    /// Always start at the current `latest_position()`, ignoring any
+    /// persisted cursor. New projection that should NOT backfill.
     Latest,
-    /// Always start at LogCursor::ZERO. Force backfill from beginning.
+    /// Always start at `LogCursor::ZERO`. Force backfill from the
+    /// beginning of the event log. Search-index rebuild, analytics
+    /// reset, etc.
     Zero,
-    /// Specific position. Manual rewind.
+    /// Specific position. Manual rewind for debugging or partial replay.
     Specific(LogCursor),
 }
 ```
 
-Default `ResumeOrLatest`. Forces caller to think about backfill the moment
-they add a projection that needs historical state.
+Why no default: this is the consumer's "migration footgun" concern made
+load-bearing. Defaulting to `ResumeOrLatest` is reasonable in steady
+state but silently makes historical events invisible to a freshly-added
+projection. Defaulting to `Zero` is correct for new projections but
+catastrophically expensive for redeploys of long-running projections.
+Refusing to default forces a per-site decision the same way mode does.
 
-This is the answer to the migration footgun the consumer flagged. Without
-this, "first boot of new code initializes cursor at current dispatch
-position" silently makes historical events invisible to new projections.
+Naming: the enum lives in `causal::projection` (new module) alongside
+`ProjectionMode`, `RetryPolicy`, `Backoff`, and `FailureBehavior`. Keep
+public projection types together, not scattered across `engine.rs` /
+`reactor/types.rs`.
+
+## Open design questions
+
+None remaining. All decisions resolved. Implementation can start.
 
 ## Audit deliverable (consumer-side, prerequisite to migration)
 
