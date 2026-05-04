@@ -5,6 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-05-04
+
+### Breaking
+
+**Projection failure no longer silently advances the dispatch cursor.**
+
+Prior to this release, when a projection returned `Err`, the engine recorded
+the failure into `IntentCommit::projection_failures`, advanced the dispatch
+cursor anyway, and `MemoryStore::enqueue` printed and discarded the failure.
+The event was treated as "processed" even though its derived state was never
+written. For event-sourced consumers using projections to maintain queryable
+state (e.g. updating `next_run_at` in response to `ScheduleTriggered`), this
+caused silent state divergence: the event was durable but the derived state
+wasn't, and no retry happened.
+
+Now: any projection returning `Err` causes `JobExecutor::process_event_inner`
+to return `Err`. The dispatch cursor does not advance. The engine retries
+the event via the existing event-retry budget
+(`EventWorkerConfig::max_event_retry_attempts`, default 3); after the budget
+is exhausted, the event parks with a descriptive reason. Reactors never fire
+for parked events.
+
+#### Migration
+
+1. **Audit projections for idempotency.** Projections were always required
+   to be idempotent (the existing `queue.enqueue`-fails-after-projection-
+   succeeds path also required it), but the contract was rarely exercised.
+   The new fail-closed semantics exercise it on every projection error.
+   Any projection that does blind `INSERT`, increments a counter, or sends
+   a notification must be fixed before upgrading. Notifications belong in
+   reactors with `ctx.run()`, not projections.
+
+2. **Watch the parked-event count after deploy.** Projection failures that
+   were previously silent now surface as parked events. A previously-quiet
+   broken system may produce a burst of parks on first deploy.
+
+3. **No code changes required for compliant consumers.** The success path
+   is unchanged. Only the failure path differs.
+
+If you want a side effect that should NOT block dispatch on failure, use a
+reactor — reactors have their own retry/DLQ and don't block the cursor. An
+opt-in async projection mode is being designed; see
+`docs/plans/2026-05-04-feat-async-projections-plan.md`.
+
+### Removed
+
+- `causal::types::ProjectionFailure` (was a public re-export). Projections
+  now signal failure via `Err` from their reactor function; the engine
+  routes failures through the normal event-retry path.
+- `IntentCommit::projection_failures` field. The type now has a single
+  responsibility: atomically enqueue intents and advance the dispatch
+  cursor.
+
+### Changed
+
+- `Projection` rustdoc now states the idempotency contract and failure
+  semantics explicitly.
+- `JobExecutor::process_event_inner` returns `Err` when any projection
+  fails, with a summary error message listing the failed projection IDs.
+
+### Known limitations (filed as follow-ups)
+
+- The event-retry counter at `engine.rs:371` is in-memory and resets on
+  process restart. Under CrashLoopBackoff, a persistent projection bug
+  could retry forever and never park.
+- No backoff between event retries — transient failures can burn the retry
+  budget in milliseconds.
+- No per-event-per-projection success ledger — when one of several
+  projections fails, all projections re-run on retry (idempotency is
+  load-bearing for correctness, not just cleanliness).
+
+These are tracked separately and will be addressed in subsequent releases.
+
 ## [0.1.7] - 2026-05-02
 
 ### Fixed

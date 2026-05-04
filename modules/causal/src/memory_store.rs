@@ -320,14 +320,6 @@ impl ReactorQueue for MemoryStore {
             }
         }
 
-        // Handle projection failures as DLQ entries
-        for failure in commit.projection_failures {
-            eprintln!(
-                "Projection DLQ: {}:{} - {} ({})",
-                commit.event_id, failure.reactor_id, failure.error, failure.reason
-            );
-        }
-
         // Handle park (DLQ for events)
         if let Some(park) = &commit.park {
             eprintln!(

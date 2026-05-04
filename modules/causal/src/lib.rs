@@ -119,7 +119,7 @@ pub use process::{EmitFuture, ProcessHandle, SettleFuture};
 pub use types::{
     EmittedEvent, EventWorkerConfig, ReactorCompletion,
     ReactorDlq, ReactorIntent, ReactorResolution, ReactorWorkerConfig,
-    JournalEntry, LogEntry, LogLevel, ProjectionFailure, QueuedReactor,
+    JournalEntry, LogEntry, LogLevel, QueuedReactor,
     NAMESPACE_CAUSAL,
 };
 

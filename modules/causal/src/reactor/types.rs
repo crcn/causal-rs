@@ -311,6 +311,33 @@ impl AnyEvent {
 /// - They return `Result<()>` (no emitted events)
 /// - They run sequentially before other reactors
 /// - They have no retry/timeout/delay semantics
+///
+/// # Idempotency contract
+///
+/// Projections **MUST** be idempotent. Re-applying the same event must
+/// produce the same final state. Use `UPDATE ... WHERE id = $1` or
+/// `INSERT ... ON CONFLICT DO UPDATE` patterns; never blind `INSERT` or
+/// numeric accumulation.
+///
+/// This is enforced by retry semantics: when any projection for an event
+/// returns `Err`, the engine does NOT advance the dispatch cursor. On the
+/// next settle pass, *every* projection for that event runs again —
+/// including ones that already succeeded. Non-idempotent projections will
+/// double-write.
+///
+/// # Failure semantics
+///
+/// A projection returning `Err` blocks dispatch for that event. The engine
+/// retries up to `EventWorkerConfig::max_event_retry_attempts` (default 3),
+/// after which the event parks with reason `Event failed after N retry
+/// attempts`. Reactors never fire for parked events.
+///
+/// If you want a side effect that should NOT block dispatch on failure
+/// (e.g., a search index update where lag is acceptable), use a reactor
+/// instead — reactors have their own retry/DLQ semantics that don't block
+/// the dispatch cursor. See the followup plan for an opt-in async
+/// projection mode at
+/// `docs/plans/2026-05-04-feat-async-projections-plan.md`.
 pub struct Projection<D>
 where
     D: Send + Sync + 'static,

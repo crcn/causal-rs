@@ -2599,8 +2599,14 @@ async fn on_dlq_fires_on_queued_handler_panic() -> Result<()> {
     Ok(())
 }
 
+/// A failing projection MUST block reactor dispatch for the failing event.
+///
+/// Prior to v0.2.0 the engine swallowed projection failures and advanced the
+/// dispatch cursor anyway, causing silent state divergence. This test pins
+/// the new behavior: cursor stays put, retries run, event eventually parks,
+/// the reactor never fires for the parked event.
 #[tokio::test]
-async fn projection_error_does_not_stop_other_handlers() -> Result<()> {
+async fn projection_failure_blocks_reactor_dispatch() -> Result<()> {
     let handler_counter = Arc::new(AtomicUsize::new(0));
     let hc = handler_counter.clone();
 
@@ -2625,18 +2631,21 @@ async fn projection_error_does_not_stop_other_handlers() -> Result<()> {
 
     assert_eq!(
         handler_counter.load(Ordering::SeqCst),
-        1,
-        "reactor should still fire even when projection errors"
+        0,
+        "reactor must not fire when its dispatch event was parked due to \
+         projection failure — pre-v0.2.0 buggy behavior was 1, correct is 0"
     );
     Ok(())
 }
 
+/// Two projections, A and B. A always fails. B is checked for re-run on retry.
+///
+/// On each retry attempt, B re-runs even though B itself succeeded — this is
+/// the consequence of the per-event idempotency contract on projections (no
+/// per-projection success ledger yet, see followup plan). This test pins the
+/// expected behavior so consumers know what to design around.
 #[tokio::test]
-async fn projection_error_recorded_as_projection_failure() -> Result<()> {
-    // Projection errors are recorded as ProjectionFailure and routed through DeadLetter,
-    // but MemoryStore.queue_status() doesn't track dead_lettered count.
-    // This test verifies the engine settles successfully despite the projection error
-    // and a second projection still runs.
+async fn projection_re_runs_on_retry_when_sibling_fails() -> Result<()> {
     let second_projection_counter = Arc::new(AtomicUsize::new(0));
     let spc = second_projection_counter.clone();
 
@@ -2662,10 +2671,121 @@ async fn projection_error_recorded_as_projection_failure() -> Result<()> {
 
     engine.emit(Ping { msg: "hi".into() }).settled().await?;
 
+    // `EventWorkerConfig::default().max_event_retry_attempts` is 3 — the event
+    // is processed 3 times before parking. Each attempt runs both projections
+    // in priority order, so the passing projection runs exactly 3 times. If
+    // this assertion ever breaks, check whether the default retry count
+    // changed; the contract under test is "passing projection runs once per
+    // retry attempt", not the specific number 3.
     assert_eq!(
         second_projection_counter.load(Ordering::SeqCst),
+        3,
+        "passing projection should run exactly max_event_retry_attempts times \
+         before the event parks"
+    );
+    Ok(())
+}
+
+/// Cursor must not advance past an event whose projection failed — except via
+/// park after the retry budget exhausts.
+///
+/// Pre-v0.2.0 buggy behavior: cursor advanced silently on first failure
+/// (1 projection invocation). Correct behavior: cursor only advances when
+/// the event parks, by which time the projection has been re-invoked
+/// `max_event_retry_attempts` times. Counting invocations distinguishes
+/// the two.
+#[tokio::test]
+async fn projection_failure_does_not_advance_cursor_until_park() -> Result<()> {
+    let store = Arc::new(MemoryStore::new());
+    let log: Arc<dyn EventLog> = store.clone();
+    let queue: Arc<dyn ReactorQueue> = store.clone();
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let invocations_in_proj = invocations.clone();
+
+    let engine = Engine::with_backends(Deps, log.clone(), queue.clone())
+        .with_projection(
+            causal::project("perma_fail")
+                .then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
+                    let invocations = invocations_in_proj.clone();
+                    async move {
+                        invocations.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("never");
+                    }
+                }),
+        );
+
+    let cursor_before = queue.checkpoint().await?;
+    engine.emit(Ping { msg: "stuck".into() }).settled().await?;
+    let latest = log.latest_position().await?;
+    let cursor_after = queue.checkpoint().await?;
+
+    // The projection ran `max_event_retry_attempts` times — proving the
+    // retry budget was exercised, not silently skipped.
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        3,
+        "projection must be re-invoked across all retry attempts before park; \
+         a value of 1 would indicate the pre-v0.2.0 silent-advance bug"
+    );
+
+    // Cursor advanced past the parked event (park advances the checkpoint
+    // explicitly, see IntentCommit::park).
+    assert!(
+        cursor_after.raw() > cursor_before.raw(),
+        "cursor should advance past parked event"
+    );
+    assert!(
+        cursor_after.raw() >= latest.raw(),
+        "cursor caught up after park"
+    );
+    Ok(())
+}
+
+/// Transient projection failures must not lose the event: once the projection
+/// recovers, the cursor advances and reactors fire normally.
+#[tokio::test]
+async fn projection_recovery_succeeds_after_transient_failure() -> Result<()> {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_in_proj = attempts.clone();
+
+    let reactor_fired = Arc::new(AtomicUsize::new(0));
+    let rf = reactor_fired.clone();
+
+    let engine = Engine::in_memory(Deps)
+        .with_projection(
+            causal::project("transient")
+                .then(move |_event: causal::AnyEvent, _ctx: Context<Deps>| {
+                    let attempts = attempts_in_proj.clone();
+                    async move {
+                        let n = attempts.fetch_add(1, Ordering::SeqCst);
+                        if n < 1 {
+                            anyhow::bail!("transient");
+                        }
+                        Ok(())
+                    }
+                }),
+        )
+        .with_reactor(reactor::on::<Ping>().then(
+            move |_event: Arc<Ping>, _ctx: Context<Deps>| {
+                let rf = rf.clone();
+                async move {
+                    rf.fetch_add(1, Ordering::SeqCst);
+                    Ok(events![])
+                }
+            },
+        ));
+
+    engine.emit(Ping { msg: "recover".into() }).settled().await?;
+
+    assert_eq!(
+        reactor_fired.load(Ordering::SeqCst),
         1,
-        "second projection should still run despite first projection error"
+        "reactor should fire exactly once after projection recovers"
+    );
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "projection should be retried after transient failure"
     );
     Ok(())
 }

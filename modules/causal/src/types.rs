@@ -120,22 +120,18 @@ pub struct EmittedEvent {
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
 }
 
-/// Captured projection failure to persist in DLQ at commit time.
-#[derive(Debug, Clone)]
-pub struct ProjectionFailure {
-    pub reactor_id: String,
-    pub error: String,
-    pub reason: String,
-    pub attempts: i32,
-}
-
 // ── New types (EventLog + ReactorQueue split) ─────────────────────
 
 /// Atomic intent creation payload.
 ///
 /// Produced by the engine's `process_event` during Phase 1 of the settle
-/// loop. Contains reactor intents to enqueue, projection failures to DLQ,
-/// and the checkpoint position to advance to.
+/// loop. Single job: atomically enqueue reactor intents and advance the
+/// dispatch cursor.
+///
+/// Projection failures are NOT carried here. A projection failure causes
+/// `process_event_inner` to return `Err`; the engine retries the event via
+/// the existing event-retry budget. See
+/// `docs/plans/2026-05-04-fix-projection-failure-cursor-advance-plan.md`.
 #[derive(Debug)]
 pub struct IntentCommit {
     /// Source event identifiers.
@@ -145,8 +141,6 @@ pub struct IntentCommit {
     pub event_payload: serde_json::Value,
     /// Queued reactor intents to persist.
     pub intents: Vec<ReactorIntent>,
-    /// Projection failures to persist to DLQ.
-    pub projection_failures: Vec<ProjectionFailure>,
     /// Reactor gate descriptions (reactor_id → serialized describe output).
     pub reactor_descriptions: HashMap<String, serde_json::Value>,
     /// Aggregate state snapshots (aggregate_key → serialized state).
@@ -166,7 +160,6 @@ impl IntentCommit {
             event_type: event.event_type.clone(),
             event_payload: event.payload.clone(),
             intents: Vec::new(),
-            projection_failures: Vec::new(),
             reactor_descriptions: HashMap::new(),
             aggregate_snapshots: HashMap::new(),
             checkpoint: event.position,
@@ -184,7 +177,6 @@ impl IntentCommit {
             event_type: event.event_type.clone(),
             event_payload: event.payload.clone(),
             intents: Vec::new(),
-            projection_failures: Vec::new(),
             reactor_descriptions: HashMap::new(),
             aggregate_snapshots: HashMap::new(),
             checkpoint: event.position,

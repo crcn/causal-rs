@@ -16,7 +16,7 @@ use crate::reactor_queue::ReactorQueue;
 use crate::reactor_registry::ReactorRegistry;
 use crate::types::{
     EmittedEvent, EventWorkerConfig, ReactorIntent, ReactorWorkerConfig,
-    IntentCommit, PersistedEvent, ProjectionFailure, QueuedReactor, NAMESPACE_CAUSAL,
+    IntentCommit, PersistedEvent, QueuedReactor, NAMESPACE_CAUSAL,
 };
 use crate::upcaster::UpcasterRegistry;
 
@@ -231,11 +231,17 @@ where
             });
         }
 
-        // 5. Execute projections sequentially (projections are observers, not reactors)
+        // 6. Execute projections sequentially (projections are observers, not reactors).
         //    Skipped for ephemeral events.
-        let mut projection_failures = Vec::new();
-
+        //
+        //    Failure semantics: any projection returning Err causes this entire
+        //    method to return Err. The engine retries the event via its event-
+        //    retry budget; after max_event_retry_attempts the event parks.
+        //    Projections must therefore be idempotent — a re-attempt re-runs
+        //    every projection, including those that succeeded on a prior pass.
+        //    See docs/plans/2026-05-04-fix-projection-failure-cursor-advance-plan.md.
         let projections = if skip_projections { Vec::new() } else { self.reactors.projections() };
+        let mut projection_errors: Vec<(String, String)> = Vec::new();
         for projection in &projections {
             let any_event = crate::reactor::AnyEvent {
                 value: typed_event.clone(),
@@ -260,13 +266,22 @@ where
                     "Projection reactor failed: event_id={}, projection_id={}, error={}",
                     event.event_id, projection.id, error_string
                 );
-                projection_failures.push(ProjectionFailure {
-                    reactor_id: projection.id.clone(),
-                    error: error_string,
-                    reason: "projection_failed".to_string(),
-                    attempts: 1,
-                });
+                projection_errors.push((projection.id.clone(), error_string));
             }
+        }
+
+        if !projection_errors.is_empty() {
+            let summary = projection_errors
+                .iter()
+                .map(|(id, err)| format!("{}: {}", id, err))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(anyhow::anyhow!(
+                "{} projection(s) failed for event {}: {}",
+                projection_errors.len(),
+                event.event_id,
+                summary
+            ));
         }
 
         // 7. Return IntentCommit
@@ -277,7 +292,6 @@ where
             event_payload: event.payload.clone(),
             checkpoint: event.position,
             intents: handler_intents,
-            projection_failures,
             reactor_descriptions,
             aggregate_snapshots,
             park: None,
