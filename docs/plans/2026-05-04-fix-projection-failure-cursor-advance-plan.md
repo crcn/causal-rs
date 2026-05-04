@@ -198,8 +198,7 @@ Three known limitations, all deferred:
    Wasteful for expensive projections; a correctness footgun for any consumer
    with a non-idempotent projection that slipped past the contract. The right
    primitive is a `(event_id, projection_id) → succeeded` ledger that lets
-   the engine skip already-succeeded projections on retry. This also overlaps
-   with the async-projection design (see followup plan). Follow-up issue.
+   the engine skip already-succeeded projections on retry. Follow-up issue.
 
 These three are filed as follow-up issues. None block this fix.
 
@@ -220,9 +219,14 @@ Consumers upgrading from 0.1.x to 0.2.0:
    same on the success path. Failure path now blocks dispatch instead of
    silently dropping.
 
-The follow-up async-projection plan (`2026-05-04-feat-async-projections-plan.md`)
-introduces an opt-in `Async` mode for projections that should NOT block
-dispatch. That plan is deferred; this PR is sync-only.
+For read models that should NOT block dispatch on failure, the answer is
+not an "async projection mode" inside the engine — it's
+`causal_replay::ProjectionStream`, which already exists as a separate
+primitive in the `causal_replay` crate. It runs an independent cursor, tails
+the event log, and tolerates lag by design. See
+`docs/brainstorms/2026-03-09-replay-projection-library.md` for the full
+design and `docs/plans/2026-05-04-feat-async-projections-plan.md` for why
+adding async-projection mode to the engine was rejected.
 
 ## Definition of done
 
@@ -249,6 +253,8 @@ dispatch. That plan is deferred; this PR is sync-only.
   takes over after this fix).
 - `modules/causal/tests/engine_integration.rs:2603, 2635` — the two tests
   that lock in the buggy behavior.
-- `docs/plans/2026-05-04-feat-async-projections-plan.md` — followup design
-  for the async-projection mode that lets consumers opt out of "failure
-  blocks dispatch."
+- `docs/plans/2026-05-04-feat-async-projections-plan.md` — pressure-test
+  that rejected adding async-projection mode to the engine; defers to
+  `causal_replay::ProjectionStream` for the async use case.
+- `modules/causal_replay/` — the existing async projection primitive
+  (independent cursor, catch-up + tail, replay mode with promote gates).

@@ -332,12 +332,18 @@ impl AnyEvent {
 /// after which the event parks with reason `Event failed after N retry
 /// attempts`. Reactors never fire for parked events.
 ///
-/// If you want a side effect that should NOT block dispatch on failure
-/// (e.g., a search index update where lag is acceptable), use a reactor
-/// instead — reactors have their own retry/DLQ semantics that don't block
-/// the dispatch cursor. See the followup plan for an opt-in async
-/// projection mode at
-/// `docs/plans/2026-05-04-feat-async-projections-plan.md`.
+/// If you want a derived view that should NOT block dispatch on failure
+/// (e.g., a search index, an analytics rollup, anything that tolerates
+/// lag), do NOT use `Projection`. Use `causal_replay::ProjectionStream`
+/// instead — it runs against the event log with its own independent
+/// cursor, catches up + tails, and supports full replay for blue-green
+/// rebuilds. Its design is documented at
+/// `docs/brainstorms/2026-03-09-replay-projection-library.md`.
+///
+/// For per-event side effects that should retry without blocking dispatch
+/// (e.g., calling an external service), use a reactor with `on_any()` and
+/// `.background().retry(...)` — reactors have their own retry/DLQ semantics
+/// that don't share the dispatch cursor.
 pub struct Projection<D>
 where
     D: Send + Sync + 'static,
