@@ -221,9 +221,28 @@ pub struct ProjectionFailure {
 /// A runner crash between the two writes is impossible by construction
 /// — either both happened or neither did.
 ///
+/// **Ordering is part of the contract:** the CAS check on
+/// `expected_from` happens *before* any DLQ write. If the CAS check
+/// fails, no DLQ row is written. Backends MUST NOT write the DLQ row
+/// first — doing so would leave a permanent failure record for an
+/// event whose cursor never advanced, which the runner will retry and
+/// possibly succeed at, producing a misleading DLQ entry. Reference
+/// implementation order:
+///
+/// ```sql
+/// BEGIN;
+///   SELECT cursor_position FROM causal_projection_cursors
+///     WHERE projection_id = $1 FOR UPDATE SKIP LOCKED;
+///   -- if cursor_position != $expected_from, ROLLBACK and return false
+///   INSERT INTO causal_projection_failures (...)
+///     ON CONFLICT (projection_id, event_id) DO NOTHING;
+///   UPDATE causal_projection_cursors SET cursor_position = $to ...;
+/// COMMIT;
+/// ```
+///
 /// `record_projection_failure` is NOT a separate method; the failure
 /// write is bundled into `advance_past_failure` precisely to enforce
-/// this atomicity.
+/// this atomicity and ordering.
 ///
 /// ## Idempotency contract
 ///

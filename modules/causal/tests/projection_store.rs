@@ -457,6 +457,157 @@ async fn delete_failure_only_removes_matching_row() -> Result<()> {
     Ok(())
 }
 
+// ─── Concurrent CAS semantics ────────────────────────────────────────
+//
+// These tests are the load-bearing ones for multi-process backend
+// correctness. The whole point of taking `expected_from` and returning
+// `Result<bool>` is that simultaneous attempts produce one winner and
+// the others see `false` — verifying that under actual concurrency.
+// Sequential tests don't cover this; even if every sequential test
+// passes, a buggy CAS impl could still corrupt under concurrent load.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_advance_only_one_succeeds() -> Result<()> {
+    // Two tasks racing to advance the same cursor from the same expected_from
+    // to different `to` positions. Exactly one should succeed; the other
+    // should see CAS failure (false) and observe the winner's cursor.
+    let s = store();
+    s.init_projection_cursor("p", cursor(0)).await?;
+
+    let s1 = s.clone();
+    let s2 = s.clone();
+
+    let (r1, r2) = tokio::join!(
+        async move { s1.advance_projection_cursor("p", cursor(0), cursor(1)).await },
+        async move { s2.advance_projection_cursor("p", cursor(0), cursor(2)).await },
+    );
+    let r1 = r1?;
+    let r2 = r2?;
+
+    assert!(
+        r1 ^ r2,
+        "exactly one concurrent CAS must succeed; got r1={} r2={}",
+        r1, r2
+    );
+
+    let final_cursor = s.get_projection_cursor("p").await?.unwrap();
+    assert!(
+        final_cursor == cursor(1) || final_cursor == cursor(2),
+        "cursor must equal the winner's target; got {:?}",
+        final_cursor
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_advance_high_contention() -> Result<()> {
+    // 16 tasks all racing to advance from cursor(0) to cursor(N+1) where N
+    // is each task's index. Exactly one should win on each generation;
+    // losers re-read and retry. Verifies that under heavy contention, no
+    // updates are lost and no double-applies happen.
+    let s = store();
+    s.init_projection_cursor("p", cursor(0)).await?;
+
+    const TASKS: u64 = 16;
+    let mut handles = Vec::new();
+    for i in 0..TASKS {
+        let s = s.clone();
+        handles.push(tokio::spawn(async move {
+            // Each task tries up to 100 times to advance the cursor by 1.
+            // It should eventually succeed (the loser re-reads and retries).
+            let _ = i;
+            for _ in 0..100 {
+                let from = s.get_projection_cursor("p").await.unwrap().unwrap();
+                let to = LogCursor::from_raw(from.raw() + 1);
+                if s.advance_projection_cursor("p", from, to).await.unwrap() {
+                    return; // succeeded
+                }
+                // CAS failed — another task advanced. Re-read on next loop.
+            }
+            panic!("task did not converge after 100 retries");
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // After all tasks complete, cursor should be exactly TASKS (each task
+    // contributed one successful advance, no duplicates, no losses).
+    let final_cursor = s.get_projection_cursor("p").await?.unwrap();
+    assert_eq!(
+        final_cursor.raw(),
+        TASKS,
+        "exactly one advance per task should have committed"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_advance_past_failure_only_one_writes_dlq() -> Result<()> {
+    // Two tasks race to advance_past_failure with the SAME event_id.
+    // Exactly one CAS succeeds. Even though both attempted to write a
+    // DLQ row, the loser's CAS rejection prevents its DLQ write entirely
+    // (per the ordering contract: CAS check first, then DLQ write).
+    // Result: one DLQ row.
+    let s = store();
+    s.init_projection_cursor("p", cursor(0)).await?;
+    let event_id = Uuid::new_v4();
+
+    let s1 = s.clone();
+    let s2 = s.clone();
+
+    let (r1, r2) = tokio::join!(
+        async move {
+            s1.advance_past_failure("p", cursor(0), cursor(1), event_id, "err-a", 3)
+                .await
+        },
+        async move {
+            s2.advance_past_failure("p", cursor(0), cursor(1), event_id, "err-b", 3)
+                .await
+        },
+    );
+    let r1 = r1?;
+    let r2 = r2?;
+
+    assert!(r1 ^ r2, "exactly one of the concurrent skips must succeed");
+    let dlq = s.list_projection_failures("p", 100).await?;
+    assert_eq!(
+        dlq.len(),
+        1,
+        "exactly one DLQ row even under concurrent skip attempts; \
+         loser's CAS rejection prevents DLQ write entirely (ordering contract)"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_init_only_one_creates() -> Result<()> {
+    // Two tasks race to init_projection_cursor with different start
+    // positions. Exactly one should report `true` (created); the other
+    // sees `false` (already exists). The persisted cursor reflects the
+    // winner's start position.
+    let s = store();
+
+    let s1 = s.clone();
+    let s2 = s.clone();
+
+    let (r1, r2) = tokio::join!(
+        async move { s1.init_projection_cursor("p", cursor(100)).await },
+        async move { s2.init_projection_cursor("p", cursor(200)).await },
+    );
+    let r1 = r1?;
+    let r2 = r2?;
+
+    assert!(r1 ^ r2, "exactly one init must report creation");
+    let final_cursor = s.get_projection_cursor("p").await?.unwrap();
+    assert!(
+        final_cursor == cursor(100) || final_cursor == cursor(200),
+        "cursor must equal the winner's start position; got {:?}",
+        final_cursor
+    );
+    Ok(())
+}
+
 // ─── Cross-method invariants ─────────────────────────────────────────
 
 #[tokio::test]
