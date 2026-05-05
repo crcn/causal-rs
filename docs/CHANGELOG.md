@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-05-04
+
+### Added
+
+- New module `causal::projection` exposing the public API surface for
+  the upcoming async-projection runtime (target release 0.3.0). Backend
+  implementers can develop a `ProjectionStore` impl against these types
+  in parallel with the engine-side runtime work.
+- `ProjectionMode` enum (Sync, Async) — explicit mode declaration, no
+  default. Rationale in
+  `docs/plans/2026-05-04-feat-async-projections-plan.md` (D1).
+- `RetryPolicy` with `Backoff` (Linear, Exponential with jitter) and
+  `FailureBehavior` (BlockUntilFixed default, AdvanceAfter opt-in).
+- `StartPosition` enum (ResumeOrLatest, Latest, Zero, Specific) — no
+  default. Forces explicit backfill decision at registration time (D5).
+- `ProjectionStatus` and `ProjectionFailure` row types for status
+  queries and DLQ inspection.
+- `ProjectionStore` trait with CAS semantics (`expected_from`
+  parameter, `Result<bool>` return) and atomicity contract on
+  `advance_past_failure` (DLQ write + cursor advance in one
+  transaction, CAS check first). Twelve methods covering registration,
+  cursor management, status reporting, ops (pause/resume/reset),
+  deletion, and DLQ listing.
+- `MemoryStore` implements `ProjectionStore`, including correct lock
+  ordering and CAS-on-DashMap-entry-write-lock semantics.
+- 35 conformance tests for the trait at
+  `modules/causal/tests/projection_store.rs`. Includes 4 multi-threaded
+  tests verifying CAS correctness under concurrent access (the
+  load-bearing tests for multi-process backend correctness).
+
+### Status: API stub, no runtime yet
+
+The runtime that consumes these types (engine integration,
+`ProjectionRunner`, `Engine::register_projection` and friends) is not
+implemented in this release. Async projections cannot yet be registered
+against a live engine — they will be in 0.3.0. This release ships the
+type surface so backend implementers (notably the Postgres
+`ProjectionStore` consumer-side impl) can develop in parallel.
+
+Sync projections continue to use the existing `engine.with_projection(...)`
+path with the failure semantics from 0.2.1 (cursor blocks on failure,
+event parks after retry budget).
+
+### Yanked
+
+`causal` v0.2.0 (and the rest of the workspace at 0.2.0) was yanked
+from crates.io after the aggregator double-apply correctness regression
+was discovered and fixed in 0.2.1. Existing pinned consumers are
+unaffected; new resolutions skip 0.2.0.
+
 ## [0.2.1] - 2026-05-04
 
 ### Fixed
