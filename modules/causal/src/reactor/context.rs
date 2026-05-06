@@ -113,6 +113,18 @@ where
     pub event_id: Uuid,
     /// Parent event ID for causal tracking.
     pub parent_event_id: Option<Uuid>,
+    /// Wall-clock time the current event was originally persisted to the
+    /// log. Stable across replay and retries — projections that need a
+    /// timestamp tied to the event MUST use this instead of `Utc::now()`.
+    ///
+    /// **Use only for projection-shaped writes** (folding event-derived
+    /// timestamps into target state). Do NOT use for reactor decision-
+    /// making that branches on event age (`if event_created_at < threshold`)
+    /// — that re-introduces wall-clock coupling from the original projection
+    /// bug, just one layer up. Reactors making time-dependent decisions
+    /// should emit observation facts whose payloads carry the relevant
+    /// time, not consult `event_created_at` from ctx.
+    pub event_created_at: chrono::DateTime<chrono::Utc>,
     pub(crate) deps: Arc<D>,
     /// Structured logger — entries are drained into `ReactorCompletion` after execution.
     pub logger: Logger,
@@ -133,6 +145,7 @@ where
             correlation_id: self.correlation_id,
             event_id: self.event_id,
             parent_event_id: self.parent_event_id,
+            event_created_at: self.event_created_at,
             deps: self.deps.clone(),
             logger: self.logger.clone(),
             aggregator_registry: self.aggregator_registry.clone(),
@@ -151,6 +164,7 @@ where
         correlation_id: Uuid,
         event_id: Uuid,
         parent_event_id: Option<Uuid>,
+        event_created_at: chrono::DateTime<chrono::Utc>,
         deps: Arc<D>,
     ) -> Self {
         Self {
@@ -159,11 +173,21 @@ where
             correlation_id,
             event_id,
             parent_event_id,
+            event_created_at,
             deps,
             logger: Logger::new(),
             aggregator_registry: None,
             journal: None,
         }
+    }
+
+    /// The current event's `created_at` from the persisted envelope.
+    /// Stable across replay and retries.
+    ///
+    /// See the field-level docstring for usage constraints — this is for
+    /// projection-shaped writes only, not reactor decision-making.
+    pub fn event_created_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.event_created_at
     }
 
     /// Attach journal state for `ctx.run()` replay.
@@ -318,8 +342,27 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             None,
+            chrono::DateTime::<chrono::Utc>::default(),
             deps,
         )
+    }
+
+    #[tokio::test]
+    async fn context_exposes_event_created_at_from_envelope() {
+        let deps = Arc::new(TestDeps::default());
+        let created_at = chrono::TimeZone::with_ymd_and_hms(
+            &chrono::Utc, 2026, 5, 5, 12, 0, 0,
+        ).unwrap();
+        let ctx = Context::new(
+            "test".into(),
+            "key".into(),
+            Uuid::nil(),
+            Uuid::nil(),
+            None,
+            created_at,
+            deps,
+        );
+        assert_eq!(ctx.event_created_at(), created_at);
     }
 
     fn create_journaled_context(entries: Vec<JournalEntry>) -> Context<TestDeps> {
@@ -672,6 +715,7 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             None,
+            chrono::DateTime::<chrono::Utc>::default(),
             Arc::new(TestDeps::default()),
         )
         .with_journal(store.clone(), vec![]);
@@ -701,6 +745,7 @@ mod tests {
             Uuid::nil(),
             event_1,
             None,
+            chrono::DateTime::<chrono::Utc>::default(),
             Arc::new(TestDeps::default()),
         )
         .with_journal(store.clone(), vec![]);
@@ -973,6 +1018,7 @@ mod tests {
             event_type: "Test".into(),
             event_payload: serde_json::json!({}),
             parent_event_id: None,
+            event_created_at: chrono::DateTime::<chrono::Utc>::default(),
             execute_at: chrono::Utc::now(),
             timeout_seconds: 30,
             max_attempts: 3,

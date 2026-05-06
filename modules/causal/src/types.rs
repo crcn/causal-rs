@@ -139,6 +139,9 @@ pub struct IntentCommit {
     pub correlation_id: Uuid,
     pub event_type: String,
     pub event_payload: serde_json::Value,
+    /// Source event's `created_at`. Carried through so queued reactors
+    /// see a stable, replay-deterministic timestamp via `Context::event_created_at`.
+    pub event_created_at: DateTime<Utc>,
     /// Queued reactor intents to persist.
     pub intents: Vec<ReactorIntent>,
     /// Reactor gate descriptions (reactor_id → serialized describe output).
@@ -159,6 +162,7 @@ impl IntentCommit {
             correlation_id: event.correlation_id,
             event_type: event.event_type.clone(),
             event_payload: event.payload.clone(),
+            event_created_at: event.created_at,
             intents: Vec::new(),
             reactor_descriptions: HashMap::new(),
             aggregate_snapshots: HashMap::new(),
@@ -176,6 +180,7 @@ impl IntentCommit {
             correlation_id: event.correlation_id,
             event_type: event.event_type.clone(),
             event_payload: event.payload.clone(),
+            event_created_at: event.created_at,
             intents: Vec::new(),
             reactor_descriptions: HashMap::new(),
             aggregate_snapshots: HashMap::new(),
@@ -219,6 +224,10 @@ pub struct QueuedReactor {
     pub event_type: String,
     pub event_payload: serde_json::Value,
     pub parent_event_id: Option<Uuid>,
+    /// Original event's `created_at` from the persisted log envelope.
+    /// Carried through the queue so reactors fired async still see a
+    /// stable, replay-deterministic timestamp via `ctx.event_created_at()`.
+    pub event_created_at: DateTime<Utc>,
     pub execute_at: DateTime<Utc>,
     pub timeout_seconds: i32,
     pub max_attempts: i32,

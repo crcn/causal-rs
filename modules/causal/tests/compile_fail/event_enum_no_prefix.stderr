@@ -10,4 +10,4 @@ warning: unused imports: `Deserialize` and `Serialize`
 1 | use serde::{Serialize, Deserialize};
   |             ^^^^^^^^^  ^^^^^^^^^^^
   |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+  = note: `#[warn(unused_imports)]` on by default

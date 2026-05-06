@@ -13,8 +13,9 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use crate::checkpoint_store::{InsertableOutboxRow, OutboxRow, ReactorOutbox};
 use crate::event_log::EventLog;
 use crate::projection::{
     ProjectionFailure, ProjectionStatus, ProjectionStore,
@@ -84,6 +85,13 @@ pub struct MemoryStore {
     /// are no-ops, matching the contract on backends with a unique
     /// constraint.
     projection_failures: Arc<Mutex<Vec<ProjectionFailure>>>,
+    /// Reactor outbox rows pending drain to the log. Inserted by
+    /// `commit_reactor_batch`, drained by `outbox_pending` /
+    /// `outbox_delete`. Per C12, inserts here AND `set` on the cursor
+    /// happen under the same Mutex lock for atomicity.
+    outbox: Arc<Mutex<Vec<OutboxRow>>>,
+    /// Monotonic id generator for outbox rows (BIGSERIAL equivalent).
+    next_outbox_id: Arc<AtomicI64>,
 }
 
 impl MemoryStore {
@@ -109,6 +117,8 @@ impl MemoryStore {
             parked: Arc::new(Mutex::new(Vec::new())),
             projection_cursors: Arc::new(DashMap::new()),
             projection_failures: Arc::new(Mutex::new(Vec::new())),
+            outbox: Arc::new(Mutex::new(Vec::new())),
+            next_outbox_id: Arc::new(AtomicI64::new(1)),
         }
     }
 
@@ -295,6 +305,71 @@ impl EventLog for MemoryStore {
         Ok(log.last().map(|e| e.position).unwrap_or(LogCursor::ZERO))
     }
 
+    /// Atomic CAS append for aggregate streams. Holds the global log
+    /// mutex for the duration of the version check + insert so two
+    /// concurrent callers can't both pass the check.
+    async fn append_to_stream(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+        expected: StreamVersion,
+        event: NewEvent,
+    ) -> Result<AppendResult> {
+        let mut log = self.global_log.lock();
+
+        // Idempotency: if event_id already exists, return existing
+        // result regardless of expected_version. Matches the C1
+        // contract: append is totally idempotent on event_id.
+        if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
+            return Ok(AppendResult {
+                position: existing.position,
+                version:  existing.version,
+            });
+        }
+
+        let current_count = log
+            .iter()
+            .filter(|e| {
+                e.aggregate_type.as_deref() == Some(aggregate_type)
+                    && e.aggregate_id == Some(aggregate_id)
+            })
+            .count() as u64;
+        let current = StreamVersion::from_raw(current_count);
+        if current != expected {
+            return Err(anyhow::Error::new(crate::event_log::ConflictError {
+                expected,
+                current,
+            }));
+        }
+
+        let position = LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
+        let new_version = StreamVersion::from_raw(current_count + 1);
+
+        let persisted = PersistedEvent {
+            position,
+            event_id: event.event_id,
+            parent_id: event.parent_id,
+            correlation_id: event.correlation_id,
+            event_type: event.event_type,
+            payload: event.payload,
+            created_at: event.created_at,
+            aggregate_type: Some(aggregate_type.to_string()),
+            aggregate_id: Some(aggregate_id),
+            version: Some(new_version),
+            metadata: event.metadata,
+            ephemeral: event.ephemeral,
+            persistent: event.persistent,
+        };
+
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(persisted.clone());
+        }
+
+        log.push(persisted);
+
+        Ok(AppendResult { position, version: Some(new_version) })
+    }
+
     async fn load_snapshot(
         &self,
         aggregate_type: &str,
@@ -375,6 +450,7 @@ impl ReactorQueue for MemoryStore {
                 event_type: commit.event_type.clone(),
                 event_payload: commit.event_payload.clone(),
                 parent_event_id: intent.parent_event_id,
+                event_created_at: commit.event_created_at,
                 execute_at: intent.execute_at,
                 timeout_seconds: intent.timeout_seconds,
                 max_attempts: intent.max_attempts,
@@ -863,5 +939,207 @@ impl ProjectionStore for MemoryStore {
             !(f.projection_id == projection_id && f.event_id == event_id)
         });
         Ok(failures.len() < before)
+    }
+}
+
+// ── ReactorOutbox implementation (C12 atomicity) ────────────────────
+
+#[async_trait]
+impl ReactorOutbox for MemoryStore {
+    async fn commit_reactor_batch(
+        &self,
+        rows: Vec<InsertableOutboxRow>,
+        cursor: Option<(String, LogCursor)>,
+    ) -> Result<()> {
+        // Atomicity is via single Mutex lock spanning both writes.
+        // Postgres equivalent is BEGIN; INSERT ...; UPDATE cursor; COMMIT.
+        let mut outbox = self.outbox.lock();
+        for row in rows {
+            let assigned_id = self.next_outbox_id.fetch_add(1, Ordering::SeqCst);
+            outbox.push(OutboxRow {
+                id:              assigned_id,
+                reactor_id:      row.reactor_id,
+                source_event_id: row.source_event_id,
+                output_index:    row.output_index,
+                event_id:        row.event_id,
+                event_type:      row.event_type,
+                fact_payload:    row.fact_payload,
+                correlation_id:  row.correlation_id,
+                created_at:      Utc::now(),
+            });
+        }
+        if let Some((consumer_id, pos)) = cursor {
+            // Mirror the ProjectionStore semantics for cursor write —
+            // upsert-with-create-on-missing.
+            match self.projection_cursors.entry(consumer_id) {
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(ProjectionCursorEntry {
+                        cursor: pos,
+                        paused: false,
+                        last_error: None,
+                        last_attempt_at: None,
+                        consecutive_failures: 0,
+                    });
+                }
+                dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                    let entry = slot.get_mut();
+                    entry.cursor = pos;
+                    entry.last_error = None;
+                    entry.consecutive_failures = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn outbox_pending(&self, limit: usize) -> Result<Vec<OutboxRow>> {
+        let outbox = self.outbox.lock();
+        // Already FIFO by insertion (created_at ascending then id).
+        Ok(outbox.iter().take(limit).cloned().collect())
+    }
+
+    async fn outbox_delete(&self, id: i64) -> Result<()> {
+        let mut outbox = self.outbox.lock();
+        outbox.retain(|r| r.id != id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+    use crate::checkpoint_store::CheckpointStore;
+
+    fn row(reactor_id: &str, idx: u32) -> InsertableOutboxRow {
+        InsertableOutboxRow {
+            reactor_id:      reactor_id.into(),
+            source_event_id: Uuid::nil(),
+            output_index:    idx,
+            event_id:        Uuid::nil(),
+            event_type:      "test.payload".into(),
+            fact_payload:    serde_json::json!({"test": idx}),
+            correlation_id:  Uuid::nil(),
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_reactor_batch_inserts_rows_and_advances_cursor() {
+        let store = MemoryStore::new();
+        let pos = LogCursor::from_raw(42);
+
+        store.commit_reactor_batch(
+            vec![row("r1", 0), row("r1", 1), row("r1", 2)],
+            Some(("r1".into(), pos)),
+        ).await.unwrap();
+
+        // Cursor advanced
+        let cursor = CheckpointStore::get(&store, "r1").await.unwrap();
+        assert_eq!(cursor, Some(pos));
+
+        // Three rows pending
+        let pending = store.outbox_pending(10).await.unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].output_index, 0);
+        assert_eq!(pending[1].output_index, 1);
+        assert_eq!(pending[2].output_index, 2);
+
+        // Backend assigned monotonic ids
+        assert!(pending[0].id < pending[1].id);
+        assert!(pending[1].id < pending[2].id);
+    }
+
+    #[tokio::test]
+    async fn commit_reactor_batch_with_no_cursor_just_inserts_rows() {
+        let store = MemoryStore::new();
+
+        store.commit_reactor_batch(
+            vec![row("r2", 0)],
+            None,
+        ).await.unwrap();
+
+        assert!(CheckpointStore::get(&store, "r2").await.unwrap().is_none());
+        assert_eq!(store.outbox_pending(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn outbox_pending_respects_limit() {
+        let store = MemoryStore::new();
+        let rows: Vec<InsertableOutboxRow> = (0..5).map(|i| row("r", i)).collect();
+        store.commit_reactor_batch(rows, None).await.unwrap();
+
+        let pending = store.outbox_pending(3).await.unwrap();
+        assert_eq!(pending.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn outbox_pending_returns_oldest_first() {
+        let store = MemoryStore::new();
+        store.commit_reactor_batch(vec![row("r", 0)], None).await.unwrap();
+        store.commit_reactor_batch(vec![row("r", 1)], None).await.unwrap();
+        store.commit_reactor_batch(vec![row("r", 2)], None).await.unwrap();
+
+        let pending = store.outbox_pending(10).await.unwrap();
+        assert_eq!(pending[0].output_index, 0);
+        assert_eq!(pending[1].output_index, 1);
+        assert_eq!(pending[2].output_index, 2);
+    }
+
+    #[tokio::test]
+    async fn outbox_delete_removes_specific_row() {
+        let store = MemoryStore::new();
+        store.commit_reactor_batch(
+            vec![row("r", 0), row("r", 1), row("r", 2)],
+            None,
+        ).await.unwrap();
+
+        let pending = store.outbox_pending(10).await.unwrap();
+        let target_id = pending[1].id;
+
+        store.outbox_delete(target_id).await.unwrap();
+
+        let after = store.outbox_pending(10).await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].output_index, 0);
+        assert_eq!(after[1].output_index, 2);
+    }
+
+    #[tokio::test]
+    async fn outbox_delete_idempotent_on_missing_id() {
+        // Per the trait contract, deleting an already-deleted id MUST
+        // succeed — the relay may retry after a partial crash.
+        let store = MemoryStore::new();
+        store.outbox_delete(999_999).await.unwrap();
+        store.outbox_delete(999_999).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_set_and_get_round_trips() {
+        let store = MemoryStore::new();
+        let pos = LogCursor::from_raw(100);
+
+        CheckpointStore::set(&store, "consumer_a", pos).await.unwrap();
+        assert_eq!(
+            CheckpointStore::get(&store, "consumer_a").await.unwrap(),
+            Some(pos),
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_reactor_batch_clears_consumer_error_state() {
+        let store = MemoryStore::new();
+        // Seed a cursor with error state via ProjectionStore
+        store.init_projection_cursor("r3", LogCursor::ZERO).await.unwrap();
+        store.set_projection_error("r3", Some("prior failure"), 3).await.unwrap();
+
+        let new_pos = LogCursor::from_raw(7);
+        store.commit_reactor_batch(
+            vec![row("r3", 0)],
+            Some(("r3".into(), new_pos)),
+        ).await.unwrap();
+
+        let status = store.projection_status("r3").await.unwrap().unwrap();
+        assert_eq!(status.cursor, new_pos);
+        assert!(status.last_error.is_none());
+        assert_eq!(status.consecutive_failures, 0);
     }
 }

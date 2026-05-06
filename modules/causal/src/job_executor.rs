@@ -118,6 +118,7 @@ where
                     event.correlation_id,
                     event.event_id,
                     event.parent_id,
+                    event.created_at,
                 );
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     reactor.call_describe(&ctx)
@@ -172,6 +173,7 @@ where
                 event.correlation_id,
                 event.event_id,
                 event.parent_id,
+                event.created_at,
             );
             let passes_filter = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 reactor.passes_intent_filter(&typed_event, event_type_id, &ctx)
@@ -258,6 +260,7 @@ where
                 event.correlation_id,
                 event.event_id,
                 event.parent_id,
+                event.created_at,
             );
 
             if let Err(error) = (projection.reactor)(any_event, ctx).await {
@@ -290,6 +293,7 @@ where
             correlation_id: event.correlation_id,
             event_type: event.event_type.clone(),
             event_payload: event.payload.clone(),
+            event_created_at: event.created_at,
             checkpoint: event.position,
             intents: handler_intents,
             reactor_descriptions,
@@ -360,6 +364,7 @@ where
                 execution.correlation_id,
                 execution.event_id,
                 execution.parent_event_id,
+                execution.event_created_at,
             )
             .with_journal(self.queue.clone(), journal_entries);
 
@@ -492,6 +497,7 @@ where
                 Uuid::nil(),
                 Uuid::nil(),
                 None,
+                chrono::Utc::now(),
             );
 
             h.call_started(ctx)
@@ -515,6 +521,7 @@ where
         correlation_id: Uuid,
         event_id: Uuid,
         parent_event_id: Option<Uuid>,
+        event_created_at: chrono::DateTime<chrono::Utc>,
     ) -> Context<D> {
         Context::new(
             reactor_id,
@@ -522,6 +529,7 @@ where
             correlation_id,
             event_id,
             parent_event_id,
+            event_created_at,
             self.deps.clone(),
         )
         .with_aggregator_registry(self.aggregator_registry.clone())

@@ -33,14 +33,26 @@
 extern crate self as causal;
 
 // Module structure
+pub mod aggregate_v3;
 pub mod aggregator;
+pub mod any_materializer;
+pub mod checkpoint_store;
+pub mod contexts;
+pub mod engine_v3;
 pub mod event;
 pub mod event_log;
 pub mod event_store;
+pub mod fact;
+pub mod materializer;
 pub mod projection;
+pub mod projection_runner;
 pub mod reactor;
 pub mod reactor_queue;
+pub mod reactor_runner;
+pub mod reactor_v3;
+pub mod relay;
 pub mod job_executor;
+pub mod snapshot_store;
 pub mod types;
 
 mod engine;
@@ -60,9 +72,28 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
 pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, QueueStatus, Snapshot, StreamVersion};
 
-// Re-export new EventLog + ReactorQueue traits
-pub use event_log::EventLog;
+// Re-export v0.3 trait surface
+pub use checkpoint_store::{CheckpointStore, InsertableOutboxRow, OutboxRow, ReactorOutbox};
+pub use contexts::{Ctx, Metadata};
+pub use event_log::{EventLog, EventLogBackend};
+pub use fact::{Fact, StreamRef};
+#[allow(deprecated)]
+pub use any_materializer::{AnyMaterializer, AnyMaterializerRunner};
+pub use materializer::Materializer;
+pub use projection_runner::{ProjectionRunner, StepOutcome};
 pub use reactor_queue::ReactorQueue;
+pub use reactor_runner::{derive_output_event_id, ReactorRunner, NS_REACTOR_OUTPUT};
+pub use relay::RelayLoop;
+// Note: `crate::engine::Engine<D>` is the legacy engine. The new v0.3
+// engine is `crate::engine_v3::{Engine, EngineBuilder}` — fully-
+// qualified to avoid the name collision until Phase 9.
+pub use engine_v3::{EmitError, WriteOptions};
+// Note: `crate::aggregator::Aggregate` is the legacy trait. The new
+// v0.3 trait lives at `crate::aggregate_v3::Aggregate`.
+pub use snapshot_store::SnapshotStore;
+// Note: `crate::reactor::Reactor` is the legacy builder struct.
+// The new v0.3 trait is `crate::reactor_v3::Reactor` — accessed by
+// fully-qualified path to avoid the name collision until Phase 9.
 pub use types::{EventPark, IntentCommit};
 
 // Re-export projection configuration types and persistence trait.

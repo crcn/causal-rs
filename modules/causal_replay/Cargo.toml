@@ -12,19 +12,50 @@ default = []
 postgres = ["dep:sqlx"]
 
 [dependencies]
-causal = { version = "0.2.2", path = "../causal" }
+causal = { version = "0.3.5", path = "../causal" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+parking_lot.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [dependencies.sqlx]
 version = "0.8"
-features = ["runtime-tokio", "postgres", "chrono"]
+features = ["runtime-tokio", "postgres", "chrono", "json", "uuid"]
 optional = true
+
+[[test]]
+name = "stream_tests"
+path = "tests/stream_tests.rs"
+
+[[test]]
+name = "pg_event_log_test"
+path = "tests/pg_event_log_test.rs"
+required-features = ["postgres"]
+
+[[test]]
+name = "pg_reactor_outbox_test"
+path = "tests/pg_reactor_outbox_test.rs"
+required-features = ["postgres"]
+
+[[test]]
+name = "pg_snapshot_store_test"
+path = "tests/pg_snapshot_store_test.rs"
+required-features = ["postgres"]
+
+[[test]]
+name = "v03_smoke_test"
+path = "tests/v03_smoke_test.rs"
+required-features = ["postgres"]
+
+[[test]]
+name = "mirroring_test"
+path = "tests/mirroring_test.rs"

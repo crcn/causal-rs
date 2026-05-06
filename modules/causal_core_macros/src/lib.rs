@@ -1991,20 +1991,49 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct EventArgs {
     prefix: Option<String>,
     ephemeral: bool,
+    /// v0.3 Fact: stream category. When both `stream_category` and
+    /// `stream_id` are set, the macro additionally generates
+    /// `impl ::causal::Fact` with `stream()` returning a `StreamRef`
+    /// built from the named field on each variant.
+    stream_category: Option<String>,
+    /// v0.3 Fact: name of the field carrying the stream id. Must be
+    /// present on every variant. Type must be `Uuid`.
+    stream_id: Option<String>,
+    /// v0.3 Fact: name of the field carrying the logical occurrence
+    /// time. Defaults to `"occurred_at"`. Must be present on every
+    /// variant when generating Fact. Type must be `DateTime<Utc>`.
+    occurred_at_field: Option<String>,
 }
 
 fn parse_event_args(tokens: TokenStream2) -> EventArgs {
     let mut prefix = None;
     let mut ephemeral = false;
+    let mut stream_category = None;
+    let mut stream_id = None;
+    let mut occurred_at_field = None;
 
     if tokens.is_empty() {
-        return EventArgs { prefix, ephemeral };
+        return EventArgs {
+            prefix,
+            ephemeral,
+            stream_category,
+            stream_id,
+            occurred_at_field,
+        };
     }
 
     let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
     let metas = match parser.parse2(tokens) {
         Ok(m) => m,
-        Err(_) => return EventArgs { prefix, ephemeral },
+        Err(_) => {
+            return EventArgs {
+                prefix,
+                ephemeral,
+                stream_category,
+                stream_id,
+                occurred_at_field,
+            };
+        }
     };
 
     for meta in &metas {
@@ -2019,11 +2048,44 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             Meta::Path(path) if path.is_ident("ephemeral") => {
                 ephemeral = true;
             }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("stream_category") =>
+            {
+                if let Expr::Lit(expr_lit) = value {
+                    if let Lit::Str(lit) = &expr_lit.lit {
+                        stream_category = Some(lit.value());
+                    }
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("stream_id") =>
+            {
+                if let Expr::Lit(expr_lit) = value {
+                    if let Lit::Str(lit) = &expr_lit.lit {
+                        stream_id = Some(lit.value());
+                    }
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("occurred_at_field") =>
+            {
+                if let Expr::Lit(expr_lit) = value {
+                    if let Lit::Str(lit) = &expr_lit.lit {
+                        occurred_at_field = Some(lit.value());
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    EventArgs { prefix, ephemeral }
+    EventArgs {
+        prefix,
+        ephemeral,
+        stream_category,
+        stream_id,
+        occurred_at_field,
+    }
 }
 
 fn expand_event(args: EventArgs, input: DeriveInput) -> Result<TokenStream2, syn::Error> {
@@ -2099,6 +2161,98 @@ fn expand_event_enum(
         match_arms.push(quote! { #pattern => #durable });
     }
 
+    // ─── v0.3 Fact impl, when stream_category + stream_id supplied ──
+    let fact_impl = if args.stream_category.is_some() && args.stream_id.is_some() {
+        let category = args.stream_category.as_ref().unwrap();
+        let id_field = args.stream_id.as_ref().unwrap();
+        let id_field_ident = format_ident!("{}", id_field);
+        let occurred_field = args
+            .occurred_at_field
+            .clone()
+            .unwrap_or_else(|| "occurred_at".to_string());
+        let occurred_field_ident = format_ident!("{}", occurred_field);
+
+        // Build per-variant arms for stream() and occurred_at(). Every
+        // variant MUST have a named-fields shape with both the stream
+        // id field and the occurred-at field; tuple/unit variants are
+        // rejected with a clear compile error.
+        let mut stream_arms = Vec::new();
+        let mut occurred_arms = Vec::new();
+        for variant in &data_enum.variants {
+            let variant_name = &variant.ident;
+            match &variant.fields {
+                Fields::Named(fields) => {
+                    let has_id = fields
+                        .named
+                        .iter()
+                        .any(|f| f.ident.as_ref().map(|i| i == &id_field_ident).unwrap_or(false));
+                    let has_occurred = fields.named.iter().any(|f| {
+                        f.ident
+                            .as_ref()
+                            .map(|i| i == &occurred_field_ident)
+                            .unwrap_or(false)
+                    });
+                    if !has_id {
+                        return Err(syn::Error::new_spanned(
+                            variant_name,
+                            format!(
+                                "#[event(stream_id = \"{}\")] requires every variant to have a `{}` field",
+                                id_field, id_field
+                            ),
+                        ));
+                    }
+                    if !has_occurred {
+                        return Err(syn::Error::new_spanned(
+                            variant_name,
+                            format!(
+                                "#[event] Fact generation requires every variant to have an `{}` field (override with `occurred_at_field = \"...\"`)",
+                                occurred_field
+                            ),
+                        ));
+                    }
+                    stream_arms.push(quote! {
+                        #name::#variant_name { #id_field_ident, .. } => *#id_field_ident
+                    });
+                    occurred_arms.push(quote! {
+                        #name::#variant_name { #occurred_field_ident, .. } => *#occurred_field_ident
+                    });
+                }
+                Fields::Unnamed(_) | Fields::Unit => {
+                    return Err(syn::Error::new_spanned(
+                        variant_name,
+                        "#[event] Fact generation requires named-fields variants when stream_id/occurred_at_field are used",
+                    ));
+                }
+            }
+        }
+
+        quote! {
+            impl ::causal::Fact for #name {
+                fn type_name(&self) -> &str {
+                    <Self as ::causal::event::Event>::durable_name(self)
+                }
+                fn type_prefix() -> &'static str {
+                    <Self as ::causal::event::Event>::event_prefix()
+                }
+                fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
+                    ::core::option::Option::Some(match self {
+                        #(#occurred_arms,)*
+                    })
+                }
+                fn stream(&self) -> ::causal::StreamRef {
+                    ::causal::StreamRef {
+                        category: #category,
+                        id: match self {
+                            #(#stream_arms,)*
+                        },
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         #input
 
@@ -2117,6 +2271,8 @@ fn expand_event_enum(
                 #ephemeral
             }
         }
+
+        #fact_impl
     })
 }
 
@@ -2137,6 +2293,40 @@ fn expand_event_struct(
 
     let prefix_str = durable.clone();
 
+    // v0.3 Fact impl for structs: requires stream_category + stream_id.
+    let fact_impl = if args.stream_category.is_some() && args.stream_id.is_some() {
+        let category = args.stream_category.as_ref().unwrap();
+        let id_field_ident = format_ident!("{}", args.stream_id.as_ref().unwrap());
+        let occurred_field_ident = format_ident!(
+            "{}",
+            args.occurred_at_field
+                .clone()
+                .unwrap_or_else(|| "occurred_at".to_string())
+        );
+
+        quote! {
+            impl ::causal::Fact for #name {
+                fn type_name(&self) -> &str {
+                    <Self as ::causal::event::Event>::durable_name(self)
+                }
+                fn type_prefix() -> &'static str {
+                    <Self as ::causal::event::Event>::event_prefix()
+                }
+                fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
+                    ::core::option::Option::Some(self.#occurred_field_ident)
+                }
+                fn stream(&self) -> ::causal::StreamRef {
+                    ::causal::StreamRef {
+                        category: #category,
+                        id: self.#id_field_ident,
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         #input
 
@@ -2153,6 +2343,8 @@ fn expand_event_struct(
                 #ephemeral
             }
         }
+
+        #fact_impl
     })
 }
 

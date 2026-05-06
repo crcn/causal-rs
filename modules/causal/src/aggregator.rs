@@ -84,6 +84,10 @@ impl TransitionSnapshots {
 // ── Aggregator (type-erased event→aggregate applier) ────────────────
 
 /// A type-erased aggregator that maps an event to an aggregate and applies it.
+///
+/// Clone is cheap — every non-trivial field is `Arc<dyn Fn>`. Used by
+/// the v0.3 `EngineBuilder` to materialize per-runner registry copies.
+#[derive(Clone)]
 pub struct Aggregator {
     /// The event prefix for matching (e.g. "scrape", "order_placed").
     pub event_prefix: String,
@@ -240,6 +244,17 @@ struct RollbackEntry {
 }
 
 /// Registry of aggregators with owned in-memory state.
+///
+/// Holds `Aggregator` definitions plus the current folded state for
+/// each `(aggregate_type, aggregate_id)` key. State lives in memory
+/// for the registry's lifetime — there is no built-in persistence.
+///
+/// The v0.2.x engine includes snapshot integration on top of this
+/// registry (`replay_events_onto`, `set_state`, `get_version`,
+/// `update_snapshot_at_version`) for long-lived aggregates that span
+/// engine instances. The v0.3 runners deliberately do NOT use that
+/// integration — see `docs/aggregate-state-scope.md` for the design
+/// rationale and the conditions under which it should be added back.
 pub struct AggregatorRegistry {
     aggregators: Vec<Aggregator>,
     state: DashMap<String, StateEntry>,

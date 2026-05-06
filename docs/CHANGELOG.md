@@ -5,6 +5,360 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-05-06
+
+Operational hardening + documentation. Zero public API changes;
+nothing for downstream callers to migrate.
+
+### Fixed
+
+- **Supervisor catches consumer panics.** Before: a panic inside
+  `Materializer::materialize`, `Reactor::react`, or
+  `AnyMaterializer::materialize` (e.g. `ctx.aggregate` called without
+  aggregators registered) would unwind the spawned tokio supervisor
+  task and `Engine` would silently lose the consumer — cursor never
+  advanced, no log event surfaced, only discoverable by noticing
+  consumer lag in production. Now: `supervise_one` wraps each
+  `step()` call in `AssertUnwindSafe + catch_unwind`, emits an
+  ERROR-level `tracing` event with the panic message, and applies
+  the same backoff retry as the existing `Err(_)` recovery path.
+
+### Documentation
+
+- **`Fact::occurred_at` determinism contract.** Override values MUST
+  be reproducible from the fact's serde representation. Reading from
+  `#[serde(skip)]` fields, computed-on-construction values, or
+  non-deterministic sources (`Utc::now()`) silently breaks replay
+  determinism. Doc updated with the formal invariant and concrete
+  guidance.
+
+- **`EventLogBackend::append` `created_at` semantics.** The
+  client-supplied `NewEvent::created_at` is a hint, not authoritative.
+  Backends MAY override with a server-assigned timestamp on write —
+  KurrentDB does this unconditionally; `MemoryStore` preserves the
+  client value. Replay determinism follows from the persisted value.
+  Doc spec'd to prevent surprises when a Kurrent backend lands.
+
+- **`Reactor` self-feedback footgun.** A reactor whose output Events
+  include a fact matching its own `Trigger::type_prefix()` reacts to
+  its own output ad infinitum. Framework does not detect this;
+  consumer discipline required. Doc lists two mitigation patterns
+  (disjoint prefixes; metadata flag).
+
+### Tests
+
+`supervisor_recovers_from_consumer_panic` — TDD'd: materializer
+panics on first call, succeeds on retry. Failed RED before the fix
+("supervisor died on panic; consumer never recovered"), passes GREEN
+after.
+
+`with_aggregators_chainable_accumulation` — regression guard for the
+two-call pattern rootsignal uses
+(`pipeline_aggregators::aggregators()` + `curiosity_aggregators::aggregators()`).
+Both must fold; second call must not replace first.
+
+357 total (was 355).
+
+### Net public-API delta: zero
+
+No trait signatures changed, no methods added/removed, no behavior
+on the healthy path changed. Operational hardening only.
+
+## [0.3.4] - 2026-05-06
+
+A Kurrent-alignment release. Two changes that move v0.3 closer to
+the subscription model real event stores expose: an opt-in
+`Fact::occurred_at` and a deprecation of `AnyMaterializer`.
+
+### Changed (breaking, mechanical)
+
+- **`Fact::occurred_at` now returns `Option<DateTime<Utc>>` with a
+  `None` default.** Producer-claimed time stays expressible —
+  override the method when your domain has backdating, batch
+  historical import, or out-of-order arrival from external
+  producers (Stripe webhooks, Slack delivery delay, mobile offline
+  buffer). For domains where logical time *is* log time, leave the
+  default and skip the carrier-event payload bloat.
+
+  Runner-side fallback: `ctx.now()` resolves to
+  `fact.occurred_at().unwrap_or(event.created_at)`. The
+  `event.created_at` envelope timestamp is set by `Engine::emit_in`
+  / `Engine::append_in` from `fact.occurred_at().unwrap_or_else(Utc::now)`
+  at write time — same value either way for events emitted in this
+  process; the difference matters only when externally-imported
+  events flow through a backend's append API.
+
+  **Migration for existing impls:** wrap returns in `Some(...)`.
+  Trivial mechanical change; the `#[event(stream_category, stream_id)]`
+  macro now emits the wrapped form automatically.
+
+### Deprecated
+
+- **`AnyMaterializer`, `AnyMaterializerRunner`,
+  `EngineBuilder::with_any_materializer`** — marked
+  `#[deprecated(since = "0.3.4")]`. The trait was a migration shim
+  for legacy `Projection<D>` bodies that pattern-match across event
+  types; it reads every event from the log without a declared
+  subscription, which doesn't compose with Kurrent's stream/type
+  subscription model.
+
+  **Migration:** typed `Materializer<Fact = F>` consumers declare
+  their subscription via `Fact::type_prefix()`, which maps to
+  `$et-{prefix}` Kurrent subscriptions. Cross-domain consumers
+  split into one typed materializer per consumed enum, all
+  delegating to a shared body. ~15-line stubs each, no framework
+  surface change required.
+
+  Removal scheduled for 0.4.0. Existing call sites continue to
+  compile and run unchanged through the 0.3.x line; they emit
+  deprecation warnings as a migration nudge.
+
+### Tests
+
+`fact_without_occurred_at_falls_back_to_event_created_at` —
+verifies the runner-side fallback when a Fact uses the trait
+default. 355 total (was 354).
+
+## [0.3.3] - 2026-05-06
+
+Patch release restoring `ctx.aggregate()` access to v0.3 consumer
+bodies. The accessor was cut from initial v0.3; this release brings
+it back with **per-runner registry copies** (each consumer gets its
+own `AggregatorRegistry` clone) so parallel runners no longer race
+on shared folds.
+
+### Added
+
+- **`Ctx::aggregate::<A>() -> AggregateState<A>`** and
+  **`Ctx::aggregate_of::<A>(id) -> AggregateState<A>`** —
+  `(prev, curr)` snapshots around the per-event fold. `curr`
+  reflects state INCLUDING the current event because the runner
+  folds before invoking the consumer body. Same shape as 0.2.x; no
+  `Option` wrapper. **Panics** with a clear message if no
+  aggregators were registered — calling `aggregate()` without
+  configuration is a programmer error worth surfacing loudly.
+
+- **`EngineBuilder::with_aggregators<I: IntoIterator<Item = Aggregator>>(I) -> Self`** —
+  chainable, accumulating. Mirrors the legacy
+  `causal::Engine::with_aggregators` shape so call sites migrate
+  unchanged. Typically fed by the `#[aggregators]` macro:
+  ```rust
+  EngineBuilder::new(...)
+      .with_aggregators(my_aggs::aggregators())
+      .with_aggregators(other_aggs::aggregators())
+  ```
+
+- **Per-runner `Aggregator` clones.** `Aggregator` now derives
+  `Clone` (cheap — every non-trivial field is `Arc<dyn Fn>`). Each
+  consumer's `AggregatorRegistry` is independent state with shared
+  `Aggregator` definitions; folds in `ProjectionRunner`,
+  `ReactorRunner`, `AnyMaterializerRunner` no longer contend.
+
+- **Per-runner cold-start hydration.** On the first `step()` past
+  cursor 0, each runner replays the log into its registry so
+  consumers picking up at a non-zero cursor see correct
+  pre-cursor state. Cost is one O(log size) sweep per runner
+  lifetime; snapshot-based acceleration is a future enhancement.
+
+### Behavior
+
+- **Capture/restore around fold.** Each runner captures aggregator
+  state before applying the event, then restores it if the consumer
+  body returns `Err`. Mirrors the legacy engine's
+  `capture_for_rollback` / `restore_state` discipline so retried
+  events don't double-fold non-idempotent `Apply<E>` impls.
+
+### Tests
+
+3 new tests verifying: materializer `ctx.aggregate.curr` includes
+the current event; reactor sees the `(prev, curr)` transition each
+event; `ctx.aggregate` panics with the configured message when no
+aggregators registered. Plus 3 previously-broken context tests that
+now compile under the new struct layout. 351 total (was 345).
+
+### Compatibility note for rootsignal
+
+Shapes match the existing `causal::Engine` surface so consumers
+migrating to v0.3 don't have to rewrite call sites:
+- `ctx.aggregate::<X>().curr` — same accessor shape
+- `.with_aggregators(my_mod::aggregators())` — same builder API
+- `#[aggregators]` macro output drops in unchanged
+
+## [0.3.2] - 2026-05-05
+
+Patch release continuing the audit cleanup.
+
+### Fixed
+
+- **`commit_reactor_batch` now takes `Vec<InsertableOutboxRow>`** instead
+  of `Vec<OutboxRow>`. The new type is the input shape — same fields
+  minus `id` and `created_at`, which are backend-assigned. Eliminates
+  the awkward "construct OutboxRow with placeholder values that get
+  immediately overwritten" pattern. `OutboxRow` (the read-shape with
+  `id` + `created_at`) remains the return type of `outbox_pending`.
+
+  Breaking change for any external `ReactorOutbox` implementor — the
+  trait method signature changed. Internal-only types (`MemoryStore`)
+  updated. Pre-1.0 SemVer allows this in patch releases; the change
+  is strictly an ergonomic improvement.
+
+### Added
+
+- **2 new tests** verifying correlation_id propagation through the
+  reactor → outbox → relay → log chain, and Materializer ctx
+  carrying the persisted event's correlation_id (not regenerated).
+  Previously-untested invariants now made explicit.
+
+### Documentation
+
+- **C11 honest restatement.** Framework does NOT structurally enforce
+  that Reactor outputs target only OpenAppend streams. If a Reactor
+  emits a fact whose `stream().category` was registered as
+  OCC-required, the relay drains it unchallenged. C11 is a consumer-
+  side discipline; future enhancement could register category-per-
+  output-event-type at builder time so the runner rejects pre-commit.
+
+- **C13 honest restatement.** Framework cannot structurally enforce
+  purity in `materialize()` bodies. `Ctx` exposes a narrow surface
+  but consumer bodies can still query foreign state and produce
+  non-deterministic output on replay. C13 is a discipline backed by
+  `Ctx`'s narrowness, not a guarantee.
+
+## [0.3.1] - 2026-05-05
+
+Patch release fixing three audit-flagged issues from 0.3.0. All
+changes are additive; existing 0.3.0 callers continue to work.
+
+### Fixed
+
+- **`Engine::emit_in` and `Engine::append_in`** added — caller-supplied
+  `correlation_id`, `parent_id`, and `metadata` for command-handler use
+  cases. The existing `emit` / `append` methods are now thin wrappers
+  over `*_in` with `WriteOptions::default()` (auto-generated
+  correlation_id, no parent, empty metadata). Critical for any consumer
+  responding to upstream requests where causal-chain tracing matters.
+
+- **`Engine::await_observed_by` signature simplified.** Was:
+  `await_observed_by(&self, checkpoint: &Arc<dyn CheckpointStore>, id, pos)`.
+  Now: `await_observed_by(&self, id, pos)`. The engine stores its
+  checkpoint store internally (added a field), so callers don't need to
+  pass it. **This is a breaking change** to the 0.3.0 method signature
+  — but 0.3.0 was published just hours before 0.3.1, and the previous
+  signature was an oversight.
+
+- **`derive_output_event_id` uses NUL-byte separator** instead of pipe
+  delimiter. Robustness against pathological reactor_ids that contain
+  the separator character. UUIDs as deterministic outputs of
+  `(reactor_id, trigger_event_id, output_index)` are now unambiguous
+  regardless of reactor_id contents.
+
+### Tests
+
+`Engine::emit_in` correlation propagation, parent + metadata
+propagation, `append_in` per-batch correlation propagation, and
+`await_observed_by` without checkpoint param — 4 new tests; 345 total.
+
+## [0.3.0] - 2026-05-05
+
+A redesign that adds a database-agnostic, ES-aligned, KurrentDB-compatible
+trait surface alongside the existing 0.2.x API. All 0.2.x code continues
+to work unchanged; v0.3 is additive.
+
+### New traits (application-facing)
+
+- **`Fact`** — value-level event trait with `type_name`, `type_prefix`,
+  `occurred_at` (logical clock), and `stream` (mandatory `StreamRef` for
+  Kurrent compatibility). The `#[event]` macro now optionally generates
+  `impl Fact` when `stream_category` and `stream_id` attributes are
+  supplied.
+- **`Aggregate`** (at `crate::aggregate_v3::Aggregate`) — write-side
+  consistency boundary with single-Fact-per-aggregate, `apply` on the
+  trait directly. Coexists with the legacy `crate::aggregator::Aggregate`
+  until removal in a future release.
+- **`Materializer`** — typed external-state writer. Idempotent at-least-once
+  delivery; runtime calls `materialize(fact, ctx)` per fact.
+- **`AnyMaterializer`** — heterogeneous-event consumer (sees every event,
+  takes `PersistedEvent` directly). Migration target for legacy
+  `Projection<D>` bodies that pattern-match across multiple event types.
+- **`Reactor`** (at `crate::reactor_v3::Reactor`) — pure decision
+  producing `Events`. Forward-only; outputs go through the runtime-side
+  outbox. Coexists with the legacy `crate::reactor::Reactor<D>` builder
+  struct.
+
+### New backend traits
+
+- **`EventLogBackend`** — splits `EventLog` minus the snapshot methods,
+  adds `append_to_stream` (CAS-protected aggregate writes). Default impl
+  forwards to existing methods (non-atomic); `MemoryStore` overrides
+  with single-mutex CAS.
+- **`CheckpointStore`** — minimal per-consumer cursor (`get`/`set`).
+  Blanket-implemented for any `ProjectionStore`.
+- **`ReactorOutbox`** (extends `CheckpointStore`) — atomic batch primitive
+  (`commit_reactor_batch`, `outbox_pending`, `outbox_delete`) for runtime-
+  side reactor outbox per the C12 contract.
+- **`SnapshotStore`** — extracted snapshot read/write. Blanket-implemented
+  for any `EventLog`.
+
+### New runtime
+
+- **`Engine` + `EngineBuilder`** at `crate::engine_v3` — the v0.3 engine
+  driving Materializers, Reactors, and AnyMaterializers via per-consumer
+  supervisor tasks plus a relay loop draining the reactor outbox into
+  the log.
+- **`ProjectionRunner<M>`**, **`ReactorRunner<R>`**, **`AnyMaterializerRunner<M>`** —
+  per-consumer runners with per-fact cursor advance (C2), `DEPENDS_ON`
+  fence (C2b), and BlockUntilFixed failure semantics.
+- **`RelayLoop`** — drains reactor outbox via at-least-once delivery
+  with deterministic `event_id` (uuid v5 over `(reactor_id, trigger_id,
+  output_index)`) so retried reactor runs collapse into one log entry
+  via the log's idempotent-append-on-event-id contract.
+
+### Single context type
+
+- **`Ctx<'a>`** (at `crate::contexts::Ctx`) — passed to every consumer
+  body. Exposes `event_id`, `log_position`, `occurred_at`, `correlation_id`,
+  `metadata`. Critically, **no wall-clock accessor**: `ctx.now()` returns
+  `occurred_at`. Replay reproduces byte-identical state.
+
+### Macro extensions
+
+- `#[event(prefix = "...", stream_category = "...", stream_id = "...")]`
+  now additionally generates `impl Fact` when both `stream_category` and
+  `stream_id` are supplied. Per-variant `occurred_at` field expected by
+  default; override with `occurred_at_field = "..."`.
+
+### Runtime contracts
+
+13 contracts documented in the `2026-05-05-causal-v03-api-design-plan.md`
+design doc (see repository). Verified via 341 tests including
+crash-injection covering C2 (per-fact cursor advance) and C12
+(atomic outbox + cursor commit) under failure.
+
+### Known limitations
+
+- **BS1 partial closure:** `Engine::emit` rejects writes to streams
+  registered as OCC-required (via `with_aggregate<A>`), but unregistered
+  streams default to permissive. Closing BS1 fully needs a future release
+  that flips the default to "reject unregistered."
+- **No `#[materializer]` macro yet.** Materializer impls are hand-rolled
+  for now; a builder-style macro is planned for 0.3.x.
+- **Postgres backend optimizations app-side.** The framework provides
+  `EventLogBackend::append_to_stream` with a non-atomic default; backends
+  with native CAS primitives (Postgres `SELECT FOR UPDATE`) should
+  override. `ReactorOutbox` and `CheckpointStore` impls for Postgres
+  are application-side until upstream `causal_replay` adds reference
+  impls.
+
+### Backward compatibility
+
+- All 0.2.x traits and APIs continue to work unchanged.
+- Legacy `Engine<D>`, `Projection<D>`, `Reactor<D>` builder struct,
+  `aggregator::Aggregate`, `reactor::Context<D>` all coexist with the
+  v0.3 surface.
+- Existing `#[event]` enums without stream attributes generate only
+  `impl Event`, not `impl Fact`. No breaking change.
+- Removal of legacy traits planned for a future major release.
+
 ## [0.2.2] - 2026-05-04
 
 ### Added

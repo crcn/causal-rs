@@ -30,16 +30,31 @@
 //! $ REPLAY=1 REPLAY_TARGETS=neo4j server    # replay neo4j only
 //! ```
 
+pub mod event_log;
+pub mod mirroring;
 pub mod pointer;
+pub mod reactor_outbox;
+pub mod snapshot_store;
 pub mod stream;
 pub mod tail;
+
+pub use mirroring::MirroringEventLogBackend;
 
 pub use pointer::{PointerStatus, PointerStore};
 pub use stream::{Mode, ProjectionStream, ReplayProgress};
 pub use tail::{PollTailSource, TailSource};
 
 #[cfg(feature = "postgres")]
+pub use event_log::PgEventLogBackend;
+
+#[cfg(feature = "postgres")]
 pub use pointer::PgPointerStore;
+
+#[cfg(feature = "postgres")]
+pub use reactor_outbox::PgReactorOutbox;
+
+#[cfg(feature = "postgres")]
+pub use snapshot_store::PgSnapshotStore;
 
 #[cfg(feature = "postgres")]
 pub use tail::PgNotifyTailSource;
