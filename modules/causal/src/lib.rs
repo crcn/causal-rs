@@ -44,6 +44,7 @@ pub mod event_log;
 pub mod event_store;
 pub mod fact;
 pub mod materializer;
+pub mod multi_prefix_materializer;
 pub mod projection;
 pub mod projection_runner;
 pub mod reactor;
@@ -80,6 +81,7 @@ pub use fact::{Fact, StreamRef};
 #[allow(deprecated)]
 pub use any_materializer::{AnyMaterializer, AnyMaterializerRunner};
 pub use materializer::Materializer;
+pub use multi_prefix_materializer::{MultiPrefixMaterializer, MultiPrefixMaterializerRunner};
 pub use projection_runner::{ProjectionRunner, StepOutcome};
 pub use reactor_queue::ReactorQueue;
 pub use reactor_runner::{derive_output_event_id, ReactorRunner, NS_REACTOR_OUTPUT};

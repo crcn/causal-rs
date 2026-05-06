@@ -29,6 +29,7 @@ use crate::aggregator::{Aggregator, AggregatorRegistry};
 #[allow(deprecated)]
 use crate::any_materializer::{AnyMaterializer, AnyMaterializerRunner};
 use crate::checkpoint_store::{CheckpointStore, ReactorOutbox};
+use crate::multi_prefix_materializer::{MultiPrefixMaterializer, MultiPrefixMaterializerRunner};
 use crate::contexts::Metadata;
 use crate::event_log::EventLogBackend;
 use crate::fact::Fact;
@@ -85,6 +86,14 @@ impl<M: AnyMaterializer + 'static> Supervisable for AnyMaterializerRunner<M> {
         AnyMaterializerRunner::step(self, batch).await
     }
     fn consumer_id(&self) -> &str { AnyMaterializerRunner::consumer_id(self) }
+}
+
+#[async_trait]
+impl<M: MultiPrefixMaterializer + 'static> Supervisable for MultiPrefixMaterializerRunner<M> {
+    async fn step(&self, batch: usize) -> Result<StepOutcome> {
+        MultiPrefixMaterializerRunner::step(self, batch).await
+    }
+    fn consumer_id(&self) -> &str { MultiPrefixMaterializerRunner::consumer_id(self) }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -257,10 +266,11 @@ impl EngineBuilder {
     #[deprecated(
         since = "0.3.4",
         note = "AnyMaterializer doesn't compose with Kurrent's stream/type \
-                subscription model. Migrate to typed `Materializer<Fact = F>` \
-                via `with_materializer`. Cross-domain consumers split into \
-                one typed materializer per consumed enum, all delegating to \
-                a shared body."
+                subscription model. Single-prefix consumers: migrate to \
+                `Materializer<Fact = F>` via `with_materializer`. \
+                Cross-domain consumers (raw &PersistedEvent body, multiple \
+                consumed prefixes): migrate to `MultiPrefixMaterializer` via \
+                `with_multi_prefix_materializer` (added in 0.3.6)."
     )]
     #[allow(deprecated)]
     pub fn with_any_materializer<M: AnyMaterializer + 'static>(
@@ -273,6 +283,35 @@ impl EngineBuilder {
         let id = id.into();
         self.consumers.push(Box::new(move |aggs| {
             let mut runner = AnyMaterializerRunner::new(m, id, log, checkpoint);
+            if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
+            Arc::new(runner) as Arc<dyn Supervisable>
+        }));
+        self
+    }
+
+    /// Register a [`MultiPrefixMaterializer`] — cross-domain projection
+    /// consumer with declared subscription. The runner filters events
+    /// to those whose `event_type` matches any prefix in
+    /// `M::TYPE_PREFIXES` before invoking the body. Body receives raw
+    /// `&PersistedEvent` for cross-domain payload routing.
+    ///
+    /// Use when:
+    /// - Body needs raw `&PersistedEvent` (heterogeneous payload routing
+    ///   that no single typed enum captures), AND
+    /// - Subscription is a known-bounded set of prefixes.
+    ///
+    /// For single-prefix consumers, use
+    /// [`Self::with_materializer`] — it deserializes for you.
+    pub fn with_multi_prefix_materializer<M: MultiPrefixMaterializer + 'static>(
+        mut self,
+        m: M,
+        id: impl Into<String>,
+    ) -> Self {
+        let log = self.log.clone();
+        let checkpoint = self.checkpoint.clone();
+        let id = id.into();
+        self.consumers.push(Box::new(move |aggs| {
+            let mut runner = MultiPrefixMaterializerRunner::new(m, id, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
@@ -1757,6 +1796,85 @@ mod tests {
         assert_eq!(*ob.lock(), vec![1, 2],
                    "OtherCounter (2nd with_aggregators) folded each event — \
                     accumulation, not replacement");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    // ── 0.3.6 — MultiPrefixMaterializer end-to-end ──────────────────
+
+    #[tokio::test]
+    async fn engine_drives_multi_prefix_materializer_filtering_subscription() {
+        // End-to-end: register a multi-prefix materializer subscribed
+        // to `ticker:` only, emit a Tick (matches), emit a non-Tick
+        // fact (different prefix, must be filtered before body sees
+        // it). Materializer's seen-list reflects only the subscribed
+        // events.
+        use crate::multi_prefix_materializer::MultiPrefixMaterializer;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct OtherFact {
+            id: Uuid,
+            occurred_at: DateTime<Utc>,
+        }
+        impl Fact for OtherFact {
+            fn type_name(&self) -> &str { "other:happening" }
+            fn type_prefix() -> &'static str { "other" }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+            fn stream(&self) -> StreamRef {
+                StreamRef { category: "other", id: self.id }
+            }
+        }
+
+        #[derive(Clone)]
+        struct OnlyTickRouter {
+            seen: Arc<parking_lot::Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl MultiPrefixMaterializer for OnlyTickRouter {
+            const TYPE_PREFIXES: &'static [&'static str] = &["ticker:"];
+            async fn materialize(
+                &self,
+                event: &crate::types::PersistedEvent,
+                _ctx: Ctx<'_>,
+            ) -> Result<()> {
+                self.seen.lock().push(event.event_type.clone());
+                Ok(())
+            }
+        }
+
+        let store = store();
+        let router = OnlyTickRouter {
+            seen: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        };
+        let seen = router.seen.clone();
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_multi_prefix_materializer(router, "tick.only")
+        .build();
+
+        engine.emit(Tick { seq: 0, occurred_at: Utc::now() }).await.unwrap();
+        engine.emit(OtherFact { id: Uuid::new_v4(), occurred_at: Utc::now() }).await.unwrap();
+        engine.emit(Tick { seq: 1, occurred_at: Utc::now() }).await.unwrap();
+
+        // Wait for the cursor to advance past all 3 events. We don't
+        // know the ticker count up-front because of timing — but we
+        // do know exactly 2 ticker events should be delivered.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if seen.lock().len() == 2 { break; }
+            assert!(std::time::Instant::now() < deadline,
+                    "materializer didn't see expected 2 ticker events");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let s = seen.lock();
+        assert_eq!(s.len(), 2, "exactly 2 events delivered (the OtherFact filtered)");
+        assert!(s.iter().all(|t| t.starts_with("ticker:")),
+                "every delivered event matches the declared subscription");
 
         engine.shutdown().await.unwrap();
     }

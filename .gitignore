@@ -33,3 +33,4 @@ test_emit*
 # Environment
 .env
 .env.local
+.claude/

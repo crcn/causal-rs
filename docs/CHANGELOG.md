@@ -5,6 +5,116 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-05-06
+
+Closes the framework gap that
+[`AnyMaterializer`'s deprecation](#034---2026-05-06) implied but
+didn't fill: a declared-subscription consumer that takes raw
+`&PersistedEvent` for genuinely cross-domain projections.
+
+### Added
+
+- **`MultiPrefixMaterializer` trait** + `MultiPrefixMaterializerRunner`
+  — the migration target the v0.3.4 `AnyMaterializer` deprecation note
+  pointed to but didn't actually have. Body shape mirrors
+  `AnyMaterializer::materialize` (`&PersistedEvent` + `Ctx`) so cross-
+  domain projections that route by `event_type` internally don't have
+  to re-architect; the difference is the mandatory subscription
+  declaration:
+
+  ```rust
+  #[async_trait]
+  impl MultiPrefixMaterializer for GraphProjectorMaterializer {
+      const TYPE_PREFIXES: &'static [&'static str] = &[
+          "world:", "system:", "telemetry:", "discovery:", "pipeline:",
+      ];
+
+      async fn materialize(&self, event: &PersistedEvent, _ctx: Ctx<'_>)
+          -> Result<()>
+      {
+          self.projector.project(event).await?;
+          Ok(())
+      }
+  }
+  ```
+
+  Use this when (a) the body needs raw `&PersistedEvent` because no
+  single typed enum captures all consumed events, AND (b) the
+  subscription is bounded to a known set of prefixes. For
+  single-prefix consumers, use the typed
+  `Materializer<Fact = F>` instead — it deserializes for you.
+
+- **`EngineBuilder::with_multi_prefix_materializer<M>(m, id)`** —
+  registers the new trait with the engine. Same supervisor +
+  capture/restore + hydration semantics as the typed
+  `with_materializer` and the deprecated `with_any_materializer`.
+
+### Backend mapping
+
+- Polling backends (Postgres, MemoryStore): runner reads via
+  `EventLogBackend::load_from` and applies the prefix-list filter
+  client-side. Same query shape as the typed runner — no new backend
+  primitive.
+- Future KurrentDB backend: runner subscribes to `$et-{prefix}.*`
+  per listed prefix and merges by commit position. Native
+  subscription primitive — no `$all` permission escalation, no
+  ad-hoc filter layer.
+
+### Why this isn't covered by the existing typed `Materializer`
+
+Splitting a cross-domain consumer (e.g., a graph projector
+consuming 5 prefixes) into 5 typed `Materializer<Fact = F>`
+consumers fragments a coherent unit of work — each adapter must
+re-serialize the deserialized fact to call back into shared
+projector code that takes `&PersistedEvent`, and each runs as its
+own runner with its own checkpoint, losing cross-domain
+processing-order guarantees that a single consumer with one
+checkpoint preserves. The typed `Materializer` is correct for
+single-prefix consumers; the multi-prefix shape was the missing
+piece.
+
+### Deprecation note updated
+
+`EngineBuilder::with_any_materializer`'s deprecation note now points
+at the right migration target: typed `Materializer` for single-prefix,
+`MultiPrefixMaterializer` for cross-domain. The previous "split into
+N typed materializers" advice was wrong for genuinely cross-domain
+consumers.
+
+### Tests
+
+- `multi_prefix_materializer.rs` unit suite (5 tests):
+  prefix-filter delivery, cursor-advance-on-filtered-events, idle on
+  empty log, `DEPENDS_ON` fence, runtime panic on empty
+  `TYPE_PREFIXES`.
+- `engine_v3.rs` integration test
+  (`engine_drives_multi_prefix_materializer_filtering_subscription`):
+  end-to-end via `EngineBuilder` — emit subscribed + non-subscribed
+  facts, verify only subscribed reach the body.
+
+380 total (was 374).
+
+### What this doesn't do (deferred)
+
+The three runners (`ProjectionRunner`, `MultiPrefixMaterializerRunner`,
+`AnyMaterializerRunner`) share ~95% of their `step()` body but
+differ in body-invocation shape (typed deserialize vs raw passthrough).
+Unifying behind a `Subscription` enum would require a new internal
+`ConsumerBody` trait family + adapters for the typed/raw split — more
+abstraction than the duplication being eliminated. Decision deferred
+until 0.4.0 when `AnyMaterializer` is removed and only two runner
+shapes remain.
+
+### Net public-API delta
+
+Additive only:
+- `pub trait MultiPrefixMaterializer`
+- `pub struct MultiPrefixMaterializerRunner<M>`
+- `EngineBuilder::with_multi_prefix_materializer<M>`
+
+Existing `Materializer`, `AnyMaterializer`, `Reactor`, all engine
+methods, all `Ctx` accessors — unchanged.
+
 ## [0.3.5] - 2026-05-06
 
 Operational hardening + documentation. Zero public API changes;
