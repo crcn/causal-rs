@@ -1239,6 +1239,70 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    /// Regression test for the RelayLoop → engine-aggregator fold path.
+    ///
+    /// Before this path existed, `engine.snapshot::<A>(stream_id)`
+    /// reflected only caller-emitted facts; reactor-emitted facts
+    /// updated each consumer's private registry clone but were
+    /// invisible to out-of-band readers. That made the saga-style
+    /// "one aggregate, many fact types" pattern unusable from tests —
+    /// you could emit a trigger and verify its direct effect on state,
+    /// but not the effect of downstream reactor outputs.
+    ///
+    /// The fix attaches the engine aggregator registry to RelayLoop so
+    /// every drained outbox row folds into it after `log.append`. This
+    /// test pins that contract: emit a UserCreated, the reactor emits
+    /// a WelcomeQueued, settle, then `engine.snapshot::<ChainCount>` on
+    /// the user_id stream reflects BOTH (one UserCreated, one
+    /// WelcomeQueued — total = 2).
+    ///
+    /// If a future refactor of RelayLoop omits the `apply_event` call
+    /// (or wires it to the wrong registry), this assertion drops to 1.
+    #[tokio::test]
+    async fn engine_snapshot_sees_reactor_emitted_facts() {
+        use crate::aggregate_v3::{Aggregate, Apply};
+
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct ChainCount { applied: u32 }
+        impl Aggregate for ChainCount {
+            const NAME: &'static str = "ChainCount";
+        }
+        impl Apply<UserCreated> for ChainCount {
+            fn apply(&mut self, _: &UserCreated) { self.applied += 1; }
+        }
+        impl Apply<WelcomeQueued> for ChainCount {
+            fn apply(&mut self, _: &WelcomeQueued) { self.applied += 1; }
+        }
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators([
+            Aggregator::for_type::<ChainCount, UserCreated>(),
+            Aggregator::for_type::<ChainCount, WelcomeQueued>(),
+        ])
+        .with_reactor(WelcomeReactor)
+        .build();
+
+        let user_id = Uuid::new_v4();
+        engine.emit(UserCreated {
+            user_id,
+            occurred_at: Utc::now(),
+        }).settled().await.unwrap();
+
+        let state: ChainCount = engine
+            .snapshot::<ChainCount>(user_id)
+            .expect("snapshot must exist after settled emit");
+        assert_eq!(state.applied, 2,
+            "engine.snapshot must reflect BOTH caller-emitted UserCreated \
+             AND reactor-emitted WelcomeQueued — relay-side fold contract");
+
+        engine.shutdown().await.unwrap();
+    }
+
     // ── Phase 5a — Aggregate-stream emit gating ──
 
     /// Aggregate registered for stream-policy testing.
