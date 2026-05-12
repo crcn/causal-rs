@@ -33,9 +33,8 @@ use crate::types::LogCursor;
 /// them via `ctx.metadata`.
 pub type Metadata = serde_json::Map<String, serde_json::Value>;
 
-/// Context passed to every v0.3 consumer body
-/// (`Materializer::materialize`, `Reactor::react`,
-/// `AnyMaterializer::materialize`).
+/// Context passed to every v0.4 consumer body
+/// (`Projector::project`, `Reactor::react`, `MultiProjector::project`).
 ///
 /// Deliberately absent: any wall-clock accessor. `ctx.now()` returns
 /// `occurred_at`, never the system clock.
@@ -79,7 +78,7 @@ impl<'a> Ctx<'a> {
     ///
     /// Restores the v0.2.x `ctx.aggregate::<A>()` accessor. Used for
     /// incrementally-built read-only state shared across reactors /
-    /// materializers (saga-style PipelineState pattern).
+    /// projectors (saga-style PipelineState pattern).
     ///
     /// # Panics
     /// Panics if no aggregators were registered with the engine via

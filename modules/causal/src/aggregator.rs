@@ -86,7 +86,7 @@ impl TransitionSnapshots {
 /// A type-erased aggregator that maps an event to an aggregate and applies it.
 ///
 /// Clone is cheap — every non-trivial field is `Arc<dyn Fn>`. Used by
-/// the v0.3 `EngineBuilder` to materialize per-runner registry copies.
+/// the `EngineBuilder` to build per-runner registry copies.
 #[derive(Clone)]
 pub struct Aggregator {
     /// The event prefix for matching (e.g. "scrape", "order_placed").

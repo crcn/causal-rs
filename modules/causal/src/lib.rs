@@ -35,7 +35,6 @@ extern crate self as causal;
 // Module structure
 pub mod aggregate_v3;
 pub mod aggregator;
-pub mod any_materializer;
 pub mod checkpoint_store;
 pub mod contexts;
 pub mod engine_v3;
@@ -43,10 +42,10 @@ pub mod event;
 pub mod event_log;
 pub mod event_store;
 pub mod fact;
-pub mod materializer;
-pub mod multi_prefix_materializer;
+pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
+pub mod projector;
 pub mod reactor;
 pub mod reactor_queue;
 pub mod reactor_runner;
@@ -78,11 +77,9 @@ pub use checkpoint_store::{CheckpointStore, InsertableOutboxRow, OutboxRow, Reac
 pub use contexts::{Ctx, Metadata};
 pub use event_log::{EventLog, EventLogBackend};
 pub use fact::Fact;
-#[allow(deprecated)]
-pub use any_materializer::{AnyMaterializer, AnyMaterializerRunner};
-pub use materializer::Materializer;
-pub use multi_prefix_materializer::{MultiPrefixMaterializer, MultiPrefixMaterializerRunner};
+pub use multi_projector::{MultiProjector, MultiProjectorRunner};
 pub use projection_runner::{ProjectionRunner, StepOutcome};
+pub use projector::Projector;
 pub use reactor_queue::ReactorQueue;
 pub use reactor_runner::{derive_output_event_id, ReactorRunner, NS_REACTOR_OUTPUT};
 pub use relay::RelayLoop;

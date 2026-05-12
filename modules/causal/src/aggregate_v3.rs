@@ -4,7 +4,7 @@
 //! the legacy `crate::aggregator::Aggregate` (which uses per-event
 //! `Apply<E>` impls and an `AggregatorRegistry`). The v0.3 form is
 //! single-Fact-per-aggregate with apply on the trait itself, mirroring
-//! the rest of the v0.3 trait taxonomy (View / Materializer / Reactor).
+//! the rest of the v0.4 trait taxonomy (Projector / Reactor).
 //!
 //! Aggregates are the consistency boundary on the write path — the
 //! place where command-time invariants are enforced before facts hit

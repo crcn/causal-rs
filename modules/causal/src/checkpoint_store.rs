@@ -3,7 +3,7 @@
 //! Two traits live here:
 //!
 //! - [`CheckpointStore`] — minimal cursor read/write. Used by
-//!   Materializer and View runners that only need "where is consumer X?".
+//!   Projector and View runners that only need "where is consumer X?".
 //!   Any `ProjectionStore` automatically satisfies this via blanket
 //!   impl, so existing backends keep working unchanged.
 //!

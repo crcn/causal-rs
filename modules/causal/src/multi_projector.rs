@@ -1,32 +1,27 @@
-//! `MultiPrefixMaterializer` — declared-subscription cross-domain
-//! event consumer.
+//! `MultiProjector` — declared-subscription cross-domain event consumer.
 //!
-//! Fills the gap left by [`crate::AnyMaterializer`]'s deprecation
-//! (see `any_materializer.rs:1-11`): genuinely cross-domain
-//! projections (graph projector, search index, audit log, activity
-//! stream) want raw `&PersistedEvent` access AND a declared
-//! subscription set. v0.3's typed `Materializer<Fact = F>` covers the
-//! single-prefix case; `AnyMaterializer` covered the
-//! no-subscription case but doesn't compose with KurrentDB's
-//! `$et-{prefix}.*` subscription model. This trait covers the middle
-//! ground.
+//! Single-Fact subscription is covered by [`crate::Projector`]; the
+//! middle ground (multiple declared categories, body wants raw
+//! `&PersistedEvent` access for cross-domain payload routing) is
+//! `MultiProjector`. Common consumers: graph projector, search
+//! index, audit log, activity stream.
 //!
-//! Body shape mirrors `AnyMaterializer::materialize` — `&PersistedEvent`
-//! plus `Ctx`. The runner filters to events whose `event_type` starts
-//! with any prefix in `TYPE_PREFIXES` before invoking the body, so
-//! the consumer never sees events outside its declared subscription.
+//! Body shape: `&PersistedEvent` plus `Ctx`. The runner filters to
+//! events whose `event_type` matches `format!("{CATEGORY}:*")` for any
+//! `CATEGORY` in `CATEGORIES` before invoking the body, so the
+//! consumer never sees events outside its declared subscription.
 //!
 //! Backend mapping:
 //! - Polling backends (Postgres, MemoryStore): runner reads via
-//!   `EventLogBackend::load_from` and applies the prefix-list filter
+//!   `EventLogBackend::load_from` and applies the category-list filter
 //!   client-side. Same query shape as the typed runner.
-//! - KurrentDB (future): runner subscribes to `$et-{prefix}.*` per
-//!   listed prefix and merges by commit position. Native subscription
+//! - KurrentDB (future): runner subscribes to `$et-{CATEGORY}:*` per
+//!   listed category and merges by commit position. Native subscription
 //!   primitive — no `$all` permission escalation.
 //!
 //! Same C2 (per-event cursor advance on Ok), C2b (`DEPENDS_ON` fence),
 //! C8 (caller idempotency on `event.event_id`) semantics as
-//! `ProjectionRunner<M>` and `AnyMaterializerRunner<M>`.
+//! `ProjectionRunner<P>`.
 
 use std::sync::Arc;
 
@@ -47,28 +42,29 @@ use crate::types::{LogCursor, PersistedEvent};
 /// - Body needs raw `&PersistedEvent` (heterogeneous payload routing
 ///   inside the body, no single typed enum captures all consumed
 ///   events), AND
-/// - Subscription is bounded to a known set of `event_type` prefixes
+/// - Subscription is bounded to a known set of `CATEGORY` values
 ///   (not "every event").
 ///
-/// If you have exactly one prefix, use the typed
-/// [`crate::Materializer`] trait instead — it deserializes the
-/// payload for you. If you genuinely need every event in the log
-/// regardless of type, you don't have a declared subscription and
-/// likely shouldn't be running as a Kurrent-compatible consumer.
+/// If you have exactly one Fact type, use [`crate::Projector`]
+/// instead — it deserializes the payload for you. If you genuinely
+/// need every event in the log regardless of type, you don't have a
+/// declared subscription and likely shouldn't be running as a
+/// Kurrent-compatible consumer.
 ///
 /// Idempotent on `event.event_id` per C8 — at-least-once delivery.
 #[async_trait]
-pub trait MultiPrefixMaterializer: Send + Sync {
-    /// Declared subscription. Non-empty. Each entry is a prefix
-    /// matched against `event.event_type` via `starts_with`
-    /// (e.g., `"world:"`, `"discovery:"`). Compile-time const so the
-    /// runner can plan subscriptions at registration time without
-    /// needing an instance.
+pub trait MultiProjector: Send + Sync {
+    /// Declared subscription. Non-empty. Each entry is a bare
+    /// `Fact::CATEGORY` value (e.g. `"world"`, `"discovery"`). The
+    /// runner matches events whose `event_type` starts with
+    /// `format!("{CATEGORY}:")`. Compile-time const so the runner can
+    /// plan subscriptions at registration time without needing an
+    /// instance.
     ///
     /// Runtime panic at runner construction if empty (Rust's stable
     /// const generics can't yet express `where N >= 1`; this is the
     /// strongest enforcement available).
-    const TYPE_PREFIXES: &'static [&'static str];
+    const CATEGORIES: &'static [&'static str];
 
     /// Cross-consumer dependency declaration (per C2b). Default empty.
     const DEPENDS_ON: &'static [&'static str] = &[];
@@ -76,15 +72,15 @@ pub trait MultiPrefixMaterializer: Send + Sync {
     /// Apply an event to external state. The body deserializes the
     /// payload into whichever typed enum matches `event.event_type`,
     /// or routes by string. MUST be idempotent on `event.event_id`.
-    async fn materialize(
+    async fn project(
         &self,
         event: &PersistedEvent,
         ctx: Ctx<'_>,
     ) -> Result<()>;
 }
 
-pub struct MultiPrefixMaterializerRunner<M: MultiPrefixMaterializer> {
-    materializer: M,
+pub struct MultiProjectorRunner<P: MultiProjector> {
+    projector:    P,
     consumer_id:  String,
     log:          Arc<dyn EventLogBackend>,
     checkpoint:   Arc<dyn CheckpointStore>,
@@ -92,26 +88,26 @@ pub struct MultiPrefixMaterializerRunner<M: MultiPrefixMaterializer> {
     hydrated:     OnceCell<()>,
 }
 
-impl<M: MultiPrefixMaterializer> MultiPrefixMaterializerRunner<M> {
+impl<P: MultiProjector> MultiProjectorRunner<P> {
     /// # Panics
-    /// Panics if `M::TYPE_PREFIXES` is empty. An empty subscription
-    /// declaration is a programmer error — use the typed
-    /// [`crate::Materializer`] trait for single-prefix consumers, or
-    /// reconsider whether you need a consumer at all.
+    /// Panics if `P::CATEGORIES` is empty. An empty subscription
+    /// declaration is a programmer error — use [`crate::Projector`]
+    /// for single-Fact consumers, or reconsider whether you need a
+    /// consumer at all.
     pub fn new(
-        materializer: M,
+        projector: P,
         consumer_id: impl Into<String>,
         log: Arc<dyn EventLogBackend>,
         checkpoint: Arc<dyn CheckpointStore>,
     ) -> Self {
         assert!(
-            !M::TYPE_PREFIXES.is_empty(),
-            "MultiPrefixMaterializer::TYPE_PREFIXES must be non-empty. \
-             For single-prefix consumers, use the typed `Materializer<Fact = F>` \
+            !P::CATEGORIES.is_empty(),
+            "MultiProjector::CATEGORIES must be non-empty. \
+             For single-Fact consumers, use the typed `Projector` \
              trait instead."
         );
         Self {
-            materializer,
+            projector,
             consumer_id: consumer_id.into(),
             log,
             checkpoint,
@@ -134,7 +130,7 @@ impl<M: MultiPrefixMaterializer> MultiPrefixMaterializerRunner<M> {
         let cursor = self.checkpoint.get(&self.consumer_id).await?
             .unwrap_or(LogCursor::ZERO);
 
-        for dep in M::DEPENDS_ON {
+        for dep in P::DEPENDS_ON {
             let dep_cursor = self.checkpoint.get(dep).await?
                 .unwrap_or(LogCursor::ZERO);
             if dep_cursor < cursor {
@@ -157,19 +153,20 @@ impl<M: MultiPrefixMaterializer> MultiPrefixMaterializerRunner<M> {
         for event in events {
             // Fold every event into the aggregator registry (capture/
             // restore around the body call) regardless of subscription
-            // match, so aggregators that span prefixes still see all
-            // events. Mirrors ProjectionRunner / AnyMaterializerRunner.
+            // match, so aggregators that span categories still see all
+            // events. Mirrors ProjectionRunner.
             let rollback = self.aggregators.as_ref().map(|reg| {
                 let r = reg.capture_for_rollback(&event.event_type, &event.payload);
                 reg.apply_event(&event.event_type, &event.payload);
                 r
             });
 
-            // Subscription filter: skip + advance for events that
-            // don't match any declared prefix. Body never sees them.
-            let matches_subscription = M::TYPE_PREFIXES
+            // Subscription filter: skip + advance for events whose
+            // category doesn't match any declared CATEGORY. Body never
+            // sees them.
+            let matches_subscription = P::CATEGORIES
                 .iter()
-                .any(|p| event.event_type.starts_with(p));
+                .any(|c| starts_with_category(&event.event_type, c));
             if !matches_subscription {
                 self.checkpoint.set(&self.consumer_id, event.position).await?;
                 continue;
@@ -184,7 +181,7 @@ impl<M: MultiPrefixMaterializer> MultiPrefixMaterializerRunner<M> {
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
             };
-            match self.materializer.materialize(&event, ctx).await {
+            match self.projector.project(&event, ctx).await {
                 Ok(()) => {
                     self.checkpoint.set(&self.consumer_id, event.position).await?;
                     applied += 1;
@@ -229,6 +226,15 @@ impl<M: MultiPrefixMaterializer> MultiPrefixMaterializerRunner<M> {
     }
 }
 
+/// True iff `event_type` matches `format!("{category}:*")`. Avoids
+/// the false-positive that plain `starts_with` has when one category
+/// is a prefix of another (e.g. `"world"` matching `"worldwide:..."`).
+fn starts_with_category(event_type: &str, category: &str) -> bool {
+    event_type.len() > category.len()
+        && event_type.as_bytes()[category.len()] == b':'
+        && event_type.starts_with(category)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,7 +245,7 @@ mod tests {
     use parking_lot::Mutex;
     use uuid::Uuid;
 
-    /// Test materializer that records every event_id + event_type the
+    /// Test projector that records every event_id + event_type the
     /// runner delivers (i.e., post-filter — only subscribed events).
     #[derive(Default, Clone)]
     struct AuditTrail {
@@ -251,10 +257,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl MultiPrefixMaterializer for AuditTrail {
-        const TYPE_PREFIXES: &'static [&'static str] = &["world:", "system:"];
+    impl MultiProjector for AuditTrail {
+        const CATEGORIES: &'static [&'static str] = &["world", "system"];
 
-        async fn materialize(
+        async fn project(
             &self,
             event: &PersistedEvent,
             _ctx: Ctx<'_>,
@@ -284,7 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivers_only_events_matching_declared_prefixes() {
+    async fn delivers_only_events_matching_declared_categories() {
         let store = Arc::new(MemoryStore::new());
         let id_world  = append_event(&store, "world:thing_happened").await;
         let _ignored1 = append_event(&store, "discovery:source_seen").await;
@@ -293,7 +299,7 @@ mod tests {
 
         let trail = AuditTrail::new();
         let seen = trail.seen.clone();
-        let runner = MultiPrefixMaterializerRunner::new(
+        let runner = MultiProjectorRunner::new(
             trail,
             "graph",
             store.clone() as Arc<dyn EventLogBackend>,
@@ -314,8 +320,6 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_advances_past_filtered_events() {
-        // Filtered (non-matching-prefix) events still advance the
-        // cursor — they don't get re-delivered on the next step.
         let store = Arc::new(MemoryStore::new());
         append_event(&store, "discovery:a").await;          // skip
         append_event(&store, "world:b").await;              // deliver
@@ -323,7 +327,7 @@ mod tests {
 
         let trail = AuditTrail::new();
         let seen = trail.seen.clone();
-        let runner = MultiPrefixMaterializerRunner::new(
+        let runner = MultiProjectorRunner::new(
             trail,
             "graph",
             store.clone() as Arc<dyn EventLogBackend>,
@@ -332,8 +336,6 @@ mod tests {
 
         runner.step(10).await.unwrap();
 
-        // Cursor at the LAST event's position, not at the last
-        // matched event — proves filtered events advanced cursor too.
         let cursor = store.get("graph").await.unwrap().unwrap();
         let last_pos = EventLogBackend::load_from(
             store.as_ref(), LogCursor::ZERO, 10,
@@ -348,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn idle_when_caught_up_with_no_matching_events_pending() {
         let store = Arc::new(MemoryStore::new());
-        let runner = MultiPrefixMaterializerRunner::new(
+        let runner = MultiProjectorRunner::new(
             AuditTrail::new(),
             "graph",
             store.clone() as Arc<dyn EventLogBackend>,
@@ -362,10 +364,10 @@ mod tests {
     async fn dep_fence_holds() {
         struct DepM { seen: Arc<Mutex<Vec<Uuid>>> }
         #[async_trait]
-        impl MultiPrefixMaterializer for DepM {
-            const TYPE_PREFIXES: &'static [&'static str] = &["world:"];
+        impl MultiProjector for DepM {
+            const CATEGORIES: &'static [&'static str] = &["world"];
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
-            async fn materialize(
+            async fn project(
                 &self,
                 event: &PersistedEvent,
                 _ctx: Ctx<'_>,
@@ -384,7 +386,7 @@ mod tests {
         ).await.unwrap()[0].position;
         store.set("downstream", last_pos).await.unwrap();
 
-        let runner = MultiPrefixMaterializerRunner::new(
+        let runner = MultiProjectorRunner::new(
             DepM { seen: Arc::new(Mutex::new(Vec::new())) },
             "downstream",
             store.clone() as Arc<dyn EventLogBackend>,
@@ -396,13 +398,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "TYPE_PREFIXES must be non-empty")]
-    async fn empty_type_prefixes_panics_at_construction() {
+    #[should_panic(expected = "CATEGORIES must be non-empty")]
+    async fn empty_categories_panics_at_construction() {
         struct BadlyDeclared;
         #[async_trait]
-        impl MultiPrefixMaterializer for BadlyDeclared {
-            const TYPE_PREFIXES: &'static [&'static str] = &[];
-            async fn materialize(
+        impl MultiProjector for BadlyDeclared {
+            const CATEGORIES: &'static [&'static str] = &[];
+            async fn project(
                 &self,
                 _event: &PersistedEvent,
                 _ctx: Ctx<'_>,
@@ -410,7 +412,7 @@ mod tests {
         }
 
         let store = Arc::new(MemoryStore::new());
-        let _runner = MultiPrefixMaterializerRunner::new(
+        let _runner = MultiProjectorRunner::new(
             BadlyDeclared,
             "bad",
             store.clone() as Arc<dyn EventLogBackend>,

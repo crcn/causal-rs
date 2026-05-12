@@ -26,14 +26,12 @@ use uuid::Uuid;
 
 use crate::aggregate_v3::Aggregate;
 use crate::aggregator::{Aggregator, AggregatorRegistry};
-#[allow(deprecated)]
-use crate::any_materializer::{AnyMaterializer, AnyMaterializerRunner};
 use crate::checkpoint_store::{CheckpointStore, ReactorOutbox};
-use crate::multi_prefix_materializer::{MultiPrefixMaterializer, MultiPrefixMaterializerRunner};
+use crate::multi_projector::{MultiProjector, MultiProjectorRunner};
 use crate::contexts::Metadata;
 use crate::event_log::EventLogBackend;
 use crate::fact::Fact;
-use crate::materializer::Materializer;
+use crate::projector::Projector;
 use crate::projection_runner::{ProjectionRunner, StepOutcome};
 use crate::reactor_runner::ReactorRunner;
 use crate::reactor_v3::Reactor;
@@ -58,9 +56,9 @@ trait Supervisable: Send + Sync {
 }
 
 #[async_trait]
-impl<M: Materializer + 'static> Supervisable for ProjectionRunner<M>
+impl<P: Projector + 'static> Supervisable for ProjectionRunner<P>
 where
-    M::Fact: DeserializeOwned,
+    P::Fact: DeserializeOwned,
 {
     async fn step(&self, batch: usize) -> Result<StepOutcome> {
         ProjectionRunner::step(self, batch).await
@@ -79,21 +77,12 @@ where
     fn consumer_id(&self) -> &str { ReactorRunner::consumer_id(self) }
 }
 
-#[allow(deprecated)]
 #[async_trait]
-impl<M: AnyMaterializer + 'static> Supervisable for AnyMaterializerRunner<M> {
+impl<P: MultiProjector + 'static> Supervisable for MultiProjectorRunner<P> {
     async fn step(&self, batch: usize) -> Result<StepOutcome> {
-        AnyMaterializerRunner::step(self, batch).await
+        MultiProjectorRunner::step(self, batch).await
     }
-    fn consumer_id(&self) -> &str { AnyMaterializerRunner::consumer_id(self) }
-}
-
-#[async_trait]
-impl<M: MultiPrefixMaterializer + 'static> Supervisable for MultiPrefixMaterializerRunner<M> {
-    async fn step(&self, batch: usize) -> Result<StepOutcome> {
-        MultiPrefixMaterializerRunner::step(self, batch).await
-    }
-    fn consumer_id(&self) -> &str { MultiPrefixMaterializerRunner::consumer_id(self) }
+    fn consumer_id(&self) -> &str { MultiProjectorRunner::consumer_id(self) }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -144,8 +133,8 @@ pub struct WriteOptions {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Constructs an `Arc<dyn Supervisable>` runner once a per-consumer
-/// aggregator registry has been materialized. Stored on the builder
-/// so registry creation can happen at `build()` time after every
+/// aggregator registry has been built. Stored on the builder so
+/// registry creation can happen at `build()` time after every
 /// `.with_aggregators(...)` call has accumulated.
 type RunnerFactory = Box<
     dyn FnOnce(Option<Arc<AggregatorRegistry>>) -> Arc<dyn Supervisable> + Send,
@@ -222,19 +211,19 @@ impl EngineBuilder {
         self
     }
 
-    pub fn with_materializer<M: Materializer + 'static>(
+    pub fn with_projector<P: Projector + 'static>(
         mut self,
-        m: M,
+        p: P,
         id: impl Into<String>,
     ) -> Self
     where
-        M::Fact: DeserializeOwned,
+        P::Fact: DeserializeOwned,
     {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let id = id.into();
         self.consumers.push(Box::new(move |aggs| {
-            let mut runner = ProjectionRunner::new(m, id, log, checkpoint);
+            let mut runner = ProjectionRunner::new(p, id, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
@@ -260,58 +249,30 @@ impl EngineBuilder {
         self
     }
 
-    /// Register an `AnyMaterializer` — heterogeneous-event consumer
-    /// migration shim for legacy `Projection<D>` bodies that pattern-
-    /// match across multiple event types.
-    #[deprecated(
-        since = "0.3.4",
-        note = "AnyMaterializer doesn't compose with Kurrent's stream/type \
-                subscription model. Single-prefix consumers: migrate to \
-                `Materializer<Fact = F>` via `with_materializer`. \
-                Cross-domain consumers (raw &PersistedEvent body, multiple \
-                consumed prefixes): migrate to `MultiPrefixMaterializer` via \
-                `with_multi_prefix_materializer` (added in 0.3.6)."
-    )]
-    #[allow(deprecated)]
-    pub fn with_any_materializer<M: AnyMaterializer + 'static>(
-        mut self,
-        m: M,
-        id: impl Into<String>,
-    ) -> Self {
-        let log = self.log.clone();
-        let checkpoint = self.checkpoint.clone();
-        let id = id.into();
-        self.consumers.push(Box::new(move |aggs| {
-            let mut runner = AnyMaterializerRunner::new(m, id, log, checkpoint);
-            if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
-            Arc::new(runner) as Arc<dyn Supervisable>
-        }));
-        self
-    }
-
-    /// Register a [`MultiPrefixMaterializer`] — cross-domain projection
+    /// Register a [`MultiProjector`] — cross-domain projection
     /// consumer with declared subscription. The runner filters events
-    /// to those whose `event_type` matches any prefix in
-    /// `M::TYPE_PREFIXES` before invoking the body. Body receives raw
-    /// `&PersistedEvent` for cross-domain payload routing.
+    /// to those whose `event_type` matches any category in
+    /// `P::CATEGORIES` (matching `{CATEGORY}:*`) before invoking the
+    /// body. Body receives raw `&PersistedEvent` for cross-domain
+    /// payload routing.
     ///
     /// Use when:
     /// - Body needs raw `&PersistedEvent` (heterogeneous payload routing
     ///   that no single typed enum captures), AND
-    /// - Subscription is a known-bounded set of prefixes.
+    /// - Subscription is a known-bounded set of categories.
     ///
-    /// For single-prefix consumers, use
-    /// [`Self::with_materializer`] — it deserializes for you.
-    pub fn with_multi_prefix_materializer<M: MultiPrefixMaterializer + 'static>(
+    /// For single-Fact consumers, use [`Self::with_projector`] — it
+    /// deserializes for you.
+    pub fn with_multi_projector<P: MultiProjector + 'static>(
         mut self,
-        m: M,
+        p: P,
         id: impl Into<String>,
     ) -> Self {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let id = id.into();
         self.consumers.push(Box::new(move |aggs| {
-            let mut runner = MultiPrefixMaterializerRunner::new(m, id, log, checkpoint);
+            let mut runner = MultiProjectorRunner::new(p, id, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
@@ -676,15 +637,15 @@ mod tests {
         fn event_prefix() -> &'static str { "welcome" }
     }
 
-    /// Materializer that records every user_id it sees.
+    /// Projector that records every user_id it sees.
     #[derive(Default, Clone)]
     struct UserRoster {
         seen: Arc<parking_lot::Mutex<Vec<Uuid>>>,
     }
     #[async_trait]
-    impl Materializer for UserRoster {
+    impl Projector for UserRoster {
         type Fact = UserCreated;
-        async fn materialize(
+        async fn project(
             &self, fact: &UserCreated, _ctx: Ctx<'_>,
         ) -> Result<()> {
             self.seen.lock().push(fact.user_id);
@@ -709,7 +670,7 @@ mod tests {
     fn store() -> Arc<MemoryStore> { Arc::new(MemoryStore::new()) }
 
     #[tokio::test]
-    async fn engine_drives_materializer_end_to_end() {
+    async fn engine_drives_projector_end_to_end() {
         let store = store();
         let roster = UserRoster::default();
         let seen = roster.seen.clone();
@@ -719,7 +680,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_materializer(roster, "users")
+        .with_projector(roster, "users")
         .build();
 
         // Emit 3 facts.
@@ -730,12 +691,12 @@ mod tests {
             }).await.unwrap();
         }
 
-        // Wait for the materializer to catch up. Brittle but bounded.
+        // Wait for the projector to catch up. Brittle but bounded.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             if seen.lock().len() == 3 { break; }
             assert!(std::time::Instant::now() < deadline,
-                    "materializer did not catch up within 3s");
+                    "projector did not catch up within 3s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(seen.lock().len(), 3);
@@ -749,10 +710,10 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_for_assertion = counter.clone();
 
-        // A second materializer that observes the WelcomeQueued facts
+        // A second projector that observes the WelcomeQueued facts
         // emitted by the reactor — verifies the full chain:
         //   emit UserCreated → reactor emits WelcomeQueued → relay
-        //   drains to log → second materializer sees WelcomeQueued.
+        //   drains to log → second projector sees WelcomeQueued.
         struct WelcomeCounter(Arc<AtomicUsize>);
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct WelcomeQueuedFact { user_id: Uuid }
@@ -762,9 +723,9 @@ mod tests {
             fn stream_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
-        impl Materializer for WelcomeCounter {
+        impl Projector for WelcomeCounter {
             type Fact = WelcomeQueuedFact;
-            async fn materialize(
+            async fn project(
                 &self, _fact: &WelcomeQueuedFact, _ctx: Ctx<'_>,
             ) -> Result<()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
@@ -778,7 +739,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorOutbox>,
         )
         .with_reactor(WelcomeReactor, "welcome.reactor")
-        .with_materializer(WelcomeCounter(counter), "welcome.counter")
+        .with_projector(WelcomeCounter(counter), "welcome.counter")
         .build();
 
         engine.emit(UserCreated {
@@ -786,7 +747,7 @@ mod tests {
             occurred_at: Utc::now(),
         }).await.unwrap();
 
-        // Wait for the reactor → relay → materializer chain.
+        // Wait for the reactor → relay → projector chain.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             if counter_for_assertion.load(Ordering::SeqCst) == 1 { break; }
@@ -1087,20 +1048,21 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    // ── Phase 7 — AnyMaterializer engine integration ──
+    // ── Phase 7 — MultiProjector engine integration ──
 
     #[tokio::test]
-    #[allow(deprecated)] // exercising the deprecated AnyMaterializer surface intentionally
-    async fn engine_drives_any_materializer_seeing_heterogeneous_events() {
-        use crate::any_materializer::AnyMaterializer;
+    async fn engine_drives_multi_projector_seeing_heterogeneous_events() {
+        use crate::multi_projector::MultiProjector;
 
         #[derive(Default, Clone)]
         struct AuditAll {
             seen: Arc<parking_lot::Mutex<Vec<String>>>,
         }
         #[async_trait]
-        impl AnyMaterializer for AuditAll {
-            async fn materialize(
+        impl MultiProjector for AuditAll {
+            const CATEGORIES: &'static [&'static str] = &["alpha", "beta"];
+
+            async fn project(
                 &self,
                 event: &crate::types::PersistedEvent,
                 _ctx: Ctx<'_>,
@@ -1110,7 +1072,6 @@ mod tests {
             }
         }
 
-        // Two unrelated Fact types in different categories.
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct A { a_id: Uuid, occurred_at: DateTime<Utc> }
         impl Fact for A {
@@ -1137,7 +1098,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_any_materializer(auditor, "audit")
+        .with_multi_projector(auditor, "audit")
         .build();
 
         engine.emit(A { a_id: Uuid::new_v4(), occurred_at: Utc::now() }).await.unwrap();
@@ -1148,7 +1109,7 @@ mod tests {
         loop {
             if seen.lock().len() == 3 { break; }
             assert!(std::time::Instant::now() < deadline,
-                    "any_materializer did not see all 3 events within 3s");
+                    "multi_projector did not see all 3 events within 3s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let names = seen.lock().clone();
@@ -1284,7 +1245,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_materializer(UserRoster::default(), "users")
+        .with_projector(UserRoster::default(), "users")
         .build();
 
         let pos = engine.emit(UserCreated {
@@ -1306,7 +1267,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_materializer(UserRoster::default(), "users")
+        .with_projector(UserRoster::default(), "users")
         .build();
 
         let start = std::time::Instant::now();
@@ -1347,17 +1308,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materializer_ctx_aggregate_curr_includes_current_event() {
-        // Materializer reads ctx.aggregate during materialize() and
+    async fn projector_ctx_aggregate_curr_includes_current_event() {
+        // Projector reads ctx.aggregate during project() and
         // captures `curr.count` for each event. After 3 ticks it
         // should see [1, 2, 3] — runner folds the event into the
-        // registry BEFORE invoking materialize.
+        // registry BEFORE invoking project.
         #[derive(Clone)]
         struct Capture { snaps: Arc<parking_lot::Mutex<Vec<u32>>> }
         #[async_trait]
-        impl Materializer for Capture {
+        impl Projector for Capture {
             type Fact = Tick;
-            async fn materialize(
+            async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
                 let s = ctx.aggregate::<TickCounter>().curr;
@@ -1376,7 +1337,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorOutbox>,
         )
         .with_aggregators(vec![tick_aggregator()])
-        .with_materializer(cap, "ticks")
+        .with_projector(cap, "ticks")
         .build();
 
         for i in 0..3 {
@@ -1387,7 +1348,7 @@ mod tests {
         loop {
             if snaps.lock().len() == 3 { break; }
             assert!(std::time::Instant::now() < deadline,
-                    "materializer did not catch up within 3s");
+                    "projector did not catch up within 3s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(*snaps.lock(), vec![1, 2, 3],
@@ -1475,16 +1436,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_failure_rolls_back_aggregator_fold() {
-        // Materializer succeeds on event 1, errors on event 2. After
+    async fn project_failure_rolls_back_aggregator_fold() {
+        // Projector succeeds on event 1, errors on event 2. After
         // the failed step, the aggregator registry should hold count=1
         // — event 2's fold was rolled back via capture/restore. Without
         // rollback, count would be 2.
         struct FailsOnSecond { calls: Arc<AtomicUsize> }
         #[async_trait]
-        impl Materializer for FailsOnSecond {
+        impl Projector for FailsOnSecond {
             type Fact = Tick;
-            async fn materialize(
+            async fn project(
                 &self, _f: &Tick, _ctx: Ctx<'_>,
             ) -> Result<()> {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1505,7 +1466,7 @@ mod tests {
         ).with_aggregators(aggs.clone());
 
         let result = runner.step(10).await;
-        assert!(result.is_err(), "step propagates the materialize error");
+        assert!(result.is_err(), "step propagates the project error");
 
         let (_, curr) = aggs.get_singleton_arc::<TickCounter>();
         assert_eq!(curr.count, 1,
@@ -1519,15 +1480,15 @@ mod tests {
         // subsequent step (now at cursor>0) doesn't re-replay events
         // that were already folded by step 1.
         //
-        // Without the fix, materializer sees curr.count = [1, 3, 5]
+        // Without the fix, projector sees curr.count = [1, 3, 5]
         // (each step after the first re-folds prior events). With the
         // fix, [1, 2, 3].
         #[derive(Clone)]
         struct Capture { snaps: Arc<parking_lot::Mutex<Vec<u32>>> }
         #[async_trait]
-        impl Materializer for Capture {
+        impl Projector for Capture {
             type Fact = Tick;
-            async fn materialize(
+            async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
                 self.snaps.lock().push(ctx.aggregate::<TickCounter>().curr.count);
@@ -1575,9 +1536,9 @@ mod tests {
         #[derive(Clone)]
         struct Capture { snap: Arc<parking_lot::Mutex<Option<u32>>> }
         #[async_trait]
-        impl Materializer for Capture {
+        impl Projector for Capture {
             type Fact = Tick;
-            async fn materialize(
+            async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
                 *self.snap.lock() = Some(ctx.aggregate::<TickCounter>().curr.count);
@@ -1604,16 +1565,16 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "no aggregators were registered")]
     async fn ctx_aggregate_panics_without_registered_aggregators() {
-        // Materializer body calls ctx.aggregate but engine has no
+        // Projector body calls ctx.aggregate but engine has no
         // aggregator registry — must panic with a clear message rather
         // than silently returning default state. Drives a runner
         // directly (skip the engine + supervisor) so the panic
         // propagates to the test task.
         struct Reader;
         #[async_trait]
-        impl Materializer for Reader {
+        impl Projector for Reader {
             type Fact = Tick;
-            async fn materialize(
+            async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
                 let _ = ctx.aggregate::<TickCounter>().curr;
@@ -1645,7 +1606,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
         );
-        // The step() future will panic when materialize calls
+        // The step() future will panic when project calls
         // ctx.aggregate without an aggregator registry attached.
         let _ = runner.step(10).await;
     }
@@ -1654,13 +1615,13 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_recovers_from_consumer_panic() {
-        // Materializer panics on the 1st call, succeeds on the 2nd.
+        // Projector panics on the 1st call, succeeds on the 2nd.
         // Without panic handling in supervise_one, the spawned tokio
         // task dies on panic, the consumer never advances cursor, and
         // the engine has a silent dead consumer.
         //
         // With the supervisor catching panics, the supervisor logs at
-        // ERROR, backs off, then retries — and the materializer
+        // ERROR, backs off, then retries — and the projector
         // eventually catches up. This test fails without the catch
         // (deadline elapses with seen.len() == 0).
         #[derive(Clone)]
@@ -1669,9 +1630,9 @@ mod tests {
             seen:  Arc<parking_lot::Mutex<Vec<Uuid>>>,
         }
         #[async_trait]
-        impl Materializer for PanicsThenSucceeds {
+        impl Projector for PanicsThenSucceeds {
             type Fact = Tick;
-            async fn materialize(
+            async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1693,7 +1654,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_materializer(m, "panic.recovery")
+        .with_projector(m, "panic.recovery")
         .build();
 
         engine.emit(Tick { seq: 0, occurred_at: Utc::now() }).await.unwrap();
@@ -1733,9 +1694,9 @@ mod tests {
             b: Arc<parking_lot::Mutex<Vec<u32>>>,
         }
         #[async_trait]
-        impl Materializer for VerifyBoth {
+        impl Projector for VerifyBoth {
             type Fact = Tick;
-            async fn materialize(
+            async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
                 self.a.lock().push(ctx.aggregate::<TickCounter>().curr.count);
@@ -1762,7 +1723,7 @@ mod tests {
         )
         .with_aggregators(vec![agg_a])     // first call
         .with_aggregators(vec![agg_b])     // second call — must accumulate
-        .with_materializer(v, "accum.test")
+        .with_projector(v, "accum.test")
         .build();
 
         for i in 0..2 {
@@ -1773,7 +1734,7 @@ mod tests {
         loop {
             if oa.lock().len() == 2 { break; }
             assert!(std::time::Instant::now() < deadline,
-                    "materializer didn't catch up");
+                    "projector didn't catch up");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -1786,16 +1747,15 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    // ── 0.3.6 — MultiPrefixMaterializer end-to-end ──────────────────
+    // ── 0.4 — MultiProjector end-to-end ──────────────────────────
 
     #[tokio::test]
-    async fn engine_drives_multi_prefix_materializer_filtering_subscription() {
-        // End-to-end: register a multi-prefix materializer subscribed
-        // to `ticker:` only, emit a Tick (matches), emit a non-Tick
-        // fact (different prefix, must be filtered before body sees
-        // it). Materializer's seen-list reflects only the subscribed
-        // events.
-        use crate::multi_prefix_materializer::MultiPrefixMaterializer;
+    async fn engine_drives_multi_projector_filtering_subscription() {
+        // End-to-end: register a multi-projector subscribed to
+        // category `ticker` only, emit a Tick (matches), emit a
+        // different-category fact (filtered before body sees it).
+        // Projector's seen-list reflects only the subscribed events.
+        use crate::multi_projector::MultiProjector;
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct OtherFact {
@@ -1814,9 +1774,9 @@ mod tests {
             seen: Arc<parking_lot::Mutex<Vec<String>>>,
         }
         #[async_trait]
-        impl MultiPrefixMaterializer for OnlyTickRouter {
-            const TYPE_PREFIXES: &'static [&'static str] = &["ticker:"];
-            async fn materialize(
+        impl MultiProjector for OnlyTickRouter {
+            const CATEGORIES: &'static [&'static str] = &["ticker"];
+            async fn project(
                 &self,
                 event: &crate::types::PersistedEvent,
                 _ctx: Ctx<'_>,
@@ -1837,7 +1797,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_multi_prefix_materializer(router, "tick.only")
+        .with_multi_projector(router, "tick.only")
         .build();
 
         engine.emit(Tick { seq: 0, occurred_at: Utc::now() }).await.unwrap();
@@ -1851,7 +1811,7 @@ mod tests {
         loop {
             if seen.lock().len() == 2 { break; }
             assert!(std::time::Instant::now() < deadline,
-                    "materializer didn't see expected 2 ticker events");
+                    "projector didn't see expected 2 ticker events");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 

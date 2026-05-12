@@ -33,7 +33,7 @@ use causal::checkpoint_store::{
 use causal::contexts::Ctx;
 use causal::event_log::EventLogBackend;
 use causal::fact::Fact;
-use causal::materializer::Materializer;
+use causal::projector::Projector;
 use causal::memory_store::MemoryStore;
 use causal::projection_runner::{ProjectionRunner, StepOutcome};
 use causal::reactor::Events;
@@ -195,14 +195,14 @@ async fn append_n(store: &MemoryStore, n: usize) {
 }
 
 #[derive(Default, Clone)]
-struct CountingMaterializer {
+struct CountingProjector {
     seen_event_ids: Arc<Mutex<Vec<Uuid>>>,
 }
 
 #[async_trait]
-impl Materializer for CountingMaterializer {
+impl Projector for CountingProjector {
     type Fact = Recorded;
-    async fn materialize(
+    async fn project(
         &self, _fact: &Recorded, ctx: Ctx<'_>,
     ) -> Result<()> {
         // Idempotent: track unique event_ids; record every call too.
@@ -216,15 +216,15 @@ impl Materializer for CountingMaterializer {
 // ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn cursor_set_failure_after_materialize_redelivers_idempotently() {
-    // Models: materialize() returned Ok, then process crashed before
+async fn cursor_set_failure_after_project_redelivers_idempotently() {
+    // Models: project() returned Ok, then process crashed before
     // cursor.set persisted. On restart, the fact redelivers; idempotent
-    // materialize absorbs the duplicate.
+    // project absorbs the duplicate.
     let inner = Arc::new(MemoryStore::new());
     append_n(&inner, 3).await;
     let injector = FaultInjector::new(inner.clone());
 
-    let m = CountingMaterializer::default();
+    let m = CountingProjector::default();
     let runner = ProjectionRunner::new(
         m.clone(),
         "m1",
@@ -233,7 +233,7 @@ async fn cursor_set_failure_after_materialize_redelivers_idempotently() {
     );
 
     // Arm fault on the FIRST checkpoint.set — happens after fact[0]
-    // materialized successfully.
+    // was projected successfully.
     injector.arm(FaultPoint::CheckpointSet);
 
     let result = runner.step(10).await;
@@ -247,7 +247,7 @@ async fn cursor_set_failure_after_materialize_redelivers_idempotently() {
     );
 
     // Next step (no fault armed) should redeliver fact[0] AND continue
-    // through fact[1], fact[2]. Idempotent materializer absorbs the
+    // through fact[1], fact[2]. Idempotent projector absorbs the
     // duplicate fact[0] call without ill effect.
     let outcome = runner.step(10).await.unwrap();
     assert!(matches!(outcome, StepOutcome::Progressed { applied: 3 }));
