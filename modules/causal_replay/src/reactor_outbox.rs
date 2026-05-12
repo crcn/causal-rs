@@ -15,10 +15,14 @@
 
 #[cfg(feature = "postgres")]
 mod pg {
+    use std::sync::Arc;
+
     use anyhow::Result;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
+    use dashmap::DashMap;
     use sqlx::{PgPool, Row};
+    use uuid::Uuid;
 
     use causal::checkpoint_store::{
         CheckpointStore, InsertableOutboxRow, OutboxRow, ReactorOutbox,
@@ -29,13 +33,26 @@ mod pg {
     ///
     /// Constructor takes a `PgPool` already wired to a database where
     /// migration 054 has been applied.
+    ///
+    /// Reactor-attempt counters are held in-memory in a DashMap (not
+    /// persisted). Survives within one PgReactorOutbox instance;
+    /// process restart resets counts. Acceptable for the DLQ
+    /// retry-budget use case — restarting a process effectively
+    /// retries everything from scratch anyway, and re-incrementing
+    /// the counter from zero hits the cap again before too long.
+    /// A future schema migration can promote this to a real table
+    /// if persistence becomes a hard requirement.
     pub struct PgReactorOutbox {
         pool: PgPool,
+        reactor_attempts: Arc<DashMap<(String, Uuid), u32>>,
     }
 
     impl PgReactorOutbox {
         pub fn new(pool: PgPool) -> Self {
-            Self { pool }
+            Self {
+                pool,
+                reactor_attempts: Arc::new(DashMap::new()),
+            }
         }
     }
 
@@ -151,6 +168,27 @@ mod pg {
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
+            Ok(())
+        }
+
+        async fn record_reactor_attempt(
+            &self,
+            consumer_id: &str,
+            source_event_id: Uuid,
+        ) -> Result<u32> {
+            let key = (consumer_id.to_string(), source_event_id);
+            let mut entry = self.reactor_attempts.entry(key).or_insert(0);
+            *entry += 1;
+            Ok(*entry)
+        }
+
+        async fn clear_reactor_attempts(
+            &self,
+            consumer_id: &str,
+            source_event_id: Uuid,
+        ) -> Result<()> {
+            self.reactor_attempts
+                .remove(&(consumer_id.to_string(), source_event_id));
             Ok(())
         }
     }

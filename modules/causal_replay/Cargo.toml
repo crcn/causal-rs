@@ -9,10 +9,10 @@ readme = "README.md"
 
 [features]
 default = []
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "dep:dashmap"]
 
 [dependencies]
-causal = { version = "0.4.0", path = "../causal" }
+causal = { version = "0.4.1", path = "../causal" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -20,6 +20,7 @@ serde_json.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
+dashmap = { workspace = true, optional = true }
 
 [dev-dependencies]
 parking_lot.workspace = true
