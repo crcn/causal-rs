@@ -2075,6 +2075,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observer_captures_reactor_execution_and_aggregate_fold() {
+        // End-to-end smoke test for the ReactorObserver pipeline.
+        // Registers MemoryStore as the observer; emits a fact that
+        // both folds into an aggregator AND triggers a reactor;
+        // asserts every observability table was populated.
+        use crate::reactor_v3::{Events, Reactor};
+        use std::sync::atomic::AtomicUsize;
+
+        struct EchoReactor {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Reactor for EchoReactor {
+            type Trigger = UserCreated;
+            const GROUP_NAME: &'static str = "observer-echo";
+            async fn react(
+                &self,
+                _t: &UserCreated,
+                ctx: Ctx<'_>,
+            ) -> Result<Events> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ctx.log(crate::types::LogLevel::Info, "echo fired");
+                Ok(Events::new())
+            }
+            fn describe(&self, t: &UserCreated) -> Option<serde_json::Value> {
+                Some(serde_json::json!({ "action": "echo", "user_id": t.user_id }))
+            }
+        }
+
+        let store = store();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_observer(store.clone())
+        .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
+        .with_reactor(EchoReactor { calls: calls.clone() })
+        .build();
+
+        let user_id = Uuid::new_v4();
+        engine.emit(UserCreated {
+            user_id,
+            occurred_at: Utc::now(),
+        }).settled().await.unwrap();
+
+        // Reactor ran.
+        assert!(calls.load(Ordering::SeqCst) >= 1, "reactor fired");
+
+        // Observer hook #1: reactor_started + reactor_completed populated
+        // reactor_executions for (event_id, GROUP_NAME).
+        let execs = store.reactor_executions();
+        assert!(
+            execs.iter().any(|e| {
+                let (_eid, rid) = e.key();
+                rid == "observer-echo"
+            }),
+            "reactor_executions populated with the reactor's GROUP_NAME"
+        );
+
+        // Observer hook #2: reactor_completed pushed the attempt row.
+        let attempts = store.reactor_attempt_history().lock();
+        assert!(
+            attempts.iter().any(|(_, rid, _, _, status, _, _, _)| {
+                rid == "observer-echo" && status == "completed"
+            }),
+            "reactor_attempt_history has a completed row"
+        );
+        drop(attempts);
+
+        // Observer hook #3: ctx.log entries drained into reactor_log_entries.
+        let logs = store.reactor_log_entries().lock();
+        assert!(
+            logs.iter().any(|(_, rid, entry)| {
+                rid == "observer-echo" && entry.message == "echo fired"
+            }),
+            "ctx.log() captured in reactor_log_entries"
+        );
+        drop(logs);
+
+        // Observer hook #4: aggregate_folded ran from the engine-level
+        // fold path AND the reactor-runner-side fold (per-consumer mirror).
+        let agg_snaps = store.aggregate_state_snapshots().lock();
+        assert!(
+            !agg_snaps.is_empty(),
+            "aggregate_state_snapshots populated by aggregate_folded"
+        );
+        assert!(
+            agg_snaps.iter().any(|(_, _, _, key, _)| key.starts_with("UserAgg:")),
+            "snapshot key is `{{NAME}}:{{id}}`"
+        );
+        drop(agg_snaps);
+
+        // Observer hook #5: describe() output captured as a description snapshot.
+        let descrs = store.reactor_description_snapshots().lock();
+        assert!(
+            descrs.iter().any(|(_, _, _, rid, descr)| {
+                rid == "observer-echo"
+                    && descr.get("action").and_then(|v| v.as_str()) == Some("echo")
+            }),
+            "describe() output captured in reactor_description_snapshots"
+        );
+        drop(descrs);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn snapshot_returns_none_for_id_with_no_facts() {
         // Snapshot is for inspection only. When no facts have been
         // emitted for a given stream_id, the aggregate hasn't been
