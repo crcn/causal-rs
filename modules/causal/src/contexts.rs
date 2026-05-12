@@ -23,7 +23,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::aggregator::{Aggregate as LegacyAggregate, AggregatorRegistry};
+use crate::aggregate_v3::Aggregate;
+use crate::aggregator::AggregatorRegistry;
 use crate::types::LogCursor;
 
 /// Aggregate state snapshot pair returned by [`Ctx::aggregate`] and
@@ -95,7 +96,7 @@ impl<'a> Ctx<'a> {
     /// — the panic surfaces it loudly at the offending call site.
     pub fn aggregate<A>(&self) -> AggregateState<A>
     where
-        A: LegacyAggregate + 'static,
+        A: Aggregate,
     {
         let reg = self.aggregators.expect(
             "ctx.aggregate::<A>() called but no aggregators were registered \
@@ -113,7 +114,7 @@ impl<'a> Ctx<'a> {
     /// Panics if no aggregators were registered. See [`Self::aggregate`].
     pub fn aggregate_of<A>(&self, id: Uuid) -> AggregateState<A>
     where
-        A: LegacyAggregate + 'static,
+        A: Aggregate,
     {
         let reg = self.aggregators.expect(
             "ctx.aggregate_of::<A>(id) called but no aggregators were registered \

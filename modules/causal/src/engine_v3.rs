@@ -876,9 +876,10 @@ mod tests {
     struct WelcomeQueued {
         user_id: Uuid,
     }
-    impl crate::event::Event for WelcomeQueued {
-        fn durable_name(&self) -> &str { "welcome:welcome_queued" }
-        fn event_prefix() -> &'static str { "welcome" }
+    impl Fact for WelcomeQueued {
+        const CATEGORY: &'static str = "welcome";
+        fn name(&self) -> &str { "welcome_queued" }
+        fn stream_id(&self) -> Uuid { self.user_id }
     }
 
     /// Projector that records every user_id it sees.
@@ -1661,22 +1662,21 @@ mod tests {
         fn stream_id(&self) -> Uuid { Uuid::nil() }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
-    impl crate::event::Event for Tick {
-        fn durable_name(&self) -> &str { "ticker:tick" }
-        fn event_prefix() -> &'static str { "ticker" }
-    }
 
     #[derive(Debug, Default, Clone, Serialize, Deserialize)]
     struct TickCounter { count: u32 }
-    impl crate::aggregator::Aggregate for TickCounter {
-        fn aggregate_type() -> &'static str { "TickCounter" }
+    impl crate::aggregate_v3::Aggregate for TickCounter {
+        const NAME: &'static str = "TickCounter";
     }
-    impl crate::aggregator::Apply<Tick> for TickCounter {
-        fn apply(&mut self, _e: Tick) { self.count += 1; }
+    impl crate::aggregate_v3::Apply<Tick> for TickCounter {
+        fn apply(&mut self, _t: &Tick) { self.count += 1; }
     }
 
     fn tick_aggregator() -> crate::aggregator::Aggregator {
-        crate::aggregator::Aggregator::new::<Tick, TickCounter, _>(|_t| Uuid::nil())
+        // `fold` not `for_type` — these tests emit Tick freely;
+        // TickCounter is a read-only derived counter, not the
+        // aggregate-as-consistency-boundary case.
+        crate::aggregator::Aggregator::fold::<TickCounter, Tick>()
     }
 
     #[tokio::test]
@@ -2060,11 +2060,11 @@ mod tests {
 
         #[derive(Debug, Default, Clone, Serialize, Deserialize)]
         struct OtherCounter { count: u32 }
-        impl crate::aggregator::Aggregate for OtherCounter {
-            fn aggregate_type() -> &'static str { "OtherCounter" }
+        impl crate::aggregate_v3::Aggregate for OtherCounter {
+            const NAME: &'static str = "OtherCounter";
         }
-        impl crate::aggregator::Apply<Tick> for OtherCounter {
-            fn apply(&mut self, _: Tick) { self.count += 1; }
+        impl crate::aggregate_v3::Apply<Tick> for OtherCounter {
+            fn apply(&mut self, _: &Tick) { self.count += 1; }
         }
 
         #[derive(Clone)]
@@ -2085,8 +2085,8 @@ mod tests {
             }
         }
 
-        let agg_a = crate::aggregator::Aggregator::new::<Tick, TickCounter, _>(|_| Uuid::nil());
-        let agg_b = crate::aggregator::Aggregator::new::<Tick, OtherCounter, _>(|_| Uuid::nil());
+        let agg_a = crate::aggregator::Aggregator::fold::<TickCounter, Tick>();
+        let agg_b = crate::aggregator::Aggregator::fold::<OtherCounter, Tick>();
 
         let store = store();
         let v = VerifyBoth {

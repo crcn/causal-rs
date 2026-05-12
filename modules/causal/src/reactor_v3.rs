@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::contexts::Ctx;
 use crate::event_codec::EventCodec;
@@ -67,66 +68,72 @@ pub trait Reactor: Send + Sync {
 //
 // `Events` is the universal `Reactor::react` return type — a
 // type-erased collection of output facts that the runtime persists
-// through the outbox. The shape currently builds on the legacy
-// `crate::event::Event` trait (via `EventOutput::new<E: Event>`);
-// P11.d migrates this to `<F: Fact>` so the v0.4 reactor output is
-// fully Fact-aligned. Until then, reactors that emit through this
-// surface need their output types to impl both `Event` and `Fact`.
+// through the outbox. `EventOutput::new<F: Fact>` derives the
+// canonical `{CATEGORY}:{name}` event_type from the Fact's trait
+// methods, matching what `Engine::emit` writes for caller-emitted
+// facts.
 
 /// One unit of reactor output. Eagerly serialized so the runtime can
 /// journal it without re-walking the type.
 #[derive(Clone)]
 pub struct EventOutput {
     pub type_id: TypeId,
-    /// Fully-qualified Rust type name (legacy, for Debug).
-    pub event_type: String,
-    /// Stable durable name from `Event::durable_name()`.
+    /// Canonical event_type: `format!("{CATEGORY}:{name}")` — same
+    /// shape `Engine::emit` writes on the producer side. Field name
+    /// kept as `durable_name` for backend-impl compatibility; the
+    /// value is the v0.4 event_type string.
     pub durable_name: String,
-    /// Event prefix for codec/aggregator lookup.
+    /// `Fact::CATEGORY`. The stream category this output belongs to.
     pub event_prefix: String,
-    /// Whether this event is persistent (vs in-process-only).
-    pub persistent: bool,
+    /// Stream id from `Fact::stream_id()` — which stream within
+    /// `event_prefix` this output targets.
+    pub stream_id: Uuid,
     pub payload: serde_json::Value,
     pub(crate) codec: Option<Arc<EventCodec>>,
-    /// Original typed event (live dispatch only).
+    /// Original typed fact (live dispatch only).
     pub ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl EventOutput {
-    /// Create from a typed event implementing the legacy `Event` trait.
-    pub fn new<E: crate::event::Event>(event: E) -> Self {
-        let durable_name = event.durable_name().to_string();
-        let event_prefix = E::event_prefix().to_string();
-        let persistent = !E::is_ephemeral();
-        let payload = serde_json::to_value(&event).expect("Event must be serializable");
-        let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(event);
+    /// Create from a typed Fact. The durable_name is composed as
+    /// `format!("{CATEGORY}:{name}")` to match the Kurrent-aligned
+    /// event_type shape.
+    pub fn new<F: crate::fact::Fact>(fact: F) -> Self {
+        let event_prefix = <F as crate::fact::Fact>::CATEGORY.to_string();
+        let durable_name = format!("{}:{}", event_prefix, fact.name());
+        let stream_id = fact.stream_id();
+        let payload = serde_json::to_value(&fact).expect("Fact must be serializable");
+        let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(fact);
         Self {
-            type_id: TypeId::of::<E>(),
-            event_type: std::any::type_name::<E>().to_string(),
+            type_id: TypeId::of::<F>(),
             durable_name,
             event_prefix: event_prefix.clone(),
-            persistent,
+            stream_id,
             payload,
             codec: Some(Arc::new(EventCodec {
                 event_prefix,
-                type_id: TypeId::of::<E>(),
+                type_id: TypeId::of::<F>(),
                 decode: Arc::new(|payload| {
-                    let event: E = serde_json::from_value(payload.clone())?;
-                    Ok(Arc::new(event))
+                    let fact: F = serde_json::from_value(payload.clone())?;
+                    Ok(Arc::new(fact))
                 }),
             })),
             ephemeral: Some(ephemeral),
         }
     }
 
-    /// Reconstruct from a serialized form (replay path; no codec).
-    pub fn from_serialized(event_type: String, payload: serde_json::Value) -> Self {
+    /// Reconstruct from a serialized form (replay path; no codec,
+    /// no live ephemeral copy).
+    pub fn from_serialized(
+        event_type: String,
+        stream_id: Uuid,
+        payload: serde_json::Value,
+    ) -> Self {
         Self {
             type_id: TypeId::of::<()>(),
-            durable_name: event_type.clone(),
             event_prefix: extract_prefix(&event_type).to_string(),
-            persistent: true,
-            event_type,
+            durable_name: event_type,
+            stream_id,
             payload,
             codec: None,
             ephemeral: None,
@@ -134,10 +141,13 @@ impl EventOutput {
     }
 }
 
-/// Extract the category prefix from an event_type / durable_name.
+/// Extract the category prefix from an event_type.
 ///
 /// `"scrape:web_scrape_completed"` → `"scrape"`
 /// `"order_placed"` → `"order_placed"` (no colon = whole string)
+///
+/// For the common consumer-side case, prefer
+/// [`PersistedEvent::category`](crate::PersistedEvent::category).
 pub fn extract_prefix(event_type: &str) -> &str {
     event_type.split(':').next().unwrap_or(event_type)
 }
@@ -153,13 +163,13 @@ pub struct Events {
 impl Events {
     pub fn new() -> Self { Self { outputs: Vec::new() } }
 
-    pub fn add<E: crate::event::Event>(mut self, event: E) -> Self {
-        self.outputs.push(EventOutput::new(event));
+    pub fn add<F: crate::fact::Fact>(mut self, fact: F) -> Self {
+        self.outputs.push(EventOutput::new(fact));
         self
     }
 
-    pub fn push<E: crate::event::Event>(&mut self, event: E) {
-        self.outputs.push(EventOutput::new(event));
+    pub fn push<F: crate::fact::Fact>(&mut self, fact: F) {
+        self.outputs.push(EventOutput::new(fact));
     }
 
     pub fn extend(&mut self, other: Events) {
@@ -169,7 +179,7 @@ impl Events {
     pub fn len(&self) -> usize { self.outputs.len() }
     pub fn is_empty(&self) -> bool { self.outputs.is_empty() }
 
-    pub fn batch<E: crate::event::Event>(items: impl IntoIterator<Item = E>) -> Self {
+    pub fn batch<F: crate::fact::Fact>(items: impl IntoIterator<Item = F>) -> Self {
         Self {
             outputs: items.into_iter().map(EventOutput::new).collect(),
         }

@@ -277,9 +277,10 @@ impl Fact for Trigger {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Echoed;
-impl causal::event::Event for Echoed {
-    fn durable_name(&self) -> &str { "test.echoed" }
-    fn event_prefix() -> &'static str { "test" }
+impl Fact for Echoed {
+    const CATEGORY: &'static str = "test";
+    fn name(&self) -> &str { "echoed" }
+    fn stream_id(&self) -> Uuid { Uuid::nil() }
 }
 
 struct EmitOne;
@@ -416,7 +417,7 @@ async fn relay_outbox_delete_failure_redelivers_with_log_dedup() {
     ).await.unwrap();
     let echoed_count = log_events
         .iter()
-        .filter(|e| e.event_type == "test.echoed")
+        .filter(|e| e.event_type == "test:echoed")
         .count();
     assert_eq!(echoed_count, 1);
     assert_eq!(inner.outbox_pending(10).await.unwrap().len(), 1);
@@ -431,7 +432,7 @@ async fn relay_outbox_delete_failure_redelivers_with_log_dedup() {
     ).await.unwrap();
     let echoed_count = log_events
         .iter()
-        .filter(|e| e.event_type == "test.echoed")
+        .filter(|e| e.event_type == "test:echoed")
         .count();
     assert_eq!(echoed_count, 1, "log dedups duplicate event_id (C1)");
     assert!(inner.outbox_pending(10).await.unwrap().is_empty());

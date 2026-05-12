@@ -15,29 +15,12 @@ use crate::reactor_v3::extract_prefix;
 use crate::types::StreamVersion;
 use crate::upcaster::UpcasterRegistry;
 
-// ── Aggregate + Apply traits ─────────────────────────────────────
-
-/// Domain aggregate whose state is maintained by the AggregatorRegistry.
-///
-/// No event type association — use `Apply<E>` to define per-event state transitions.
-pub trait Aggregate: Default + Clone + Send + Sync + 'static {
-    /// Unique string identifying this aggregate type.
-    fn aggregate_type() -> &'static str;
-}
-
-/// Per-event state transition. Implement once per (Aggregate, Event) pair.
-///
-/// ```ignore
-/// impl Apply<OrderPlaced> for Order {
-///     fn apply(&mut self, event: OrderPlaced) {
-///         self.status = Status::Placed;
-///         self.total = event.total;
-///     }
-/// }
-/// ```
-pub trait Apply<E> {
-    fn apply(&mut self, event: E);
-}
+// ── Aggregate state snapshots ────────────────────────────────────
+//
+// The `Aggregate` marker + `Apply<F: Fact>` extension traits live in
+// `crate::aggregate_v3` (the v0.4 home). This module focuses on the
+// registry-side machinery — type-erased dispatch, state storage,
+// rollback, snapshots.
 
 /// Per-event `(prev, next)` aggregate snapshots produced by a single fold.
 ///
@@ -63,8 +46,8 @@ impl TransitionSnapshots {
     ///
     /// Returns `None` if this event did not affect `A` for that id, which
     /// transition guards should treat as "no transition — don't fire."
-    pub fn get_pair<A: Aggregate + 'static>(&self, id: Uuid) -> Option<(&A, &A)> {
-        let key = format!("{}:{}", A::aggregate_type(), id);
+    pub fn get_pair<A: crate::aggregate_v3::Aggregate>(&self, id: Uuid) -> Option<(&A, &A)> {
+        let key = format!("{}:{}", A::NAME, id);
         let (pre, post) = self.inner.get(&key)?;
         let pre_a = (**pre).downcast_ref::<A>()?;
         let post_a = (**post).downcast_ref::<A>()?;
@@ -126,70 +109,15 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
-    /// Create a new aggregator for event type `E` folding into aggregate `A`.
+    /// Construct an Aggregator that acts as both an OCC-gated stream
+    /// (write-side: `Engine::emit` requires `.expecting()`) and a
+    /// read-side fold (consumers see folded state via
+    /// `ctx.aggregate::<A>()`).
     ///
-    /// `extract_id` maps the event to the aggregate ID it belongs to.
-    pub fn new<E, A, F>(extract_id: F) -> Self
-    where
-        E: crate::event::Event,
-        A: Aggregate + Apply<E> + serde::Serialize + serde::de::DeserializeOwned,
-        F: Fn(&E) -> Uuid + Send + Sync + 'static,
-    {
-        let event_prefix = E::event_prefix().to_string();
-        let event_type_id = TypeId::of::<E>();
-        let aggregate_type = A::aggregate_type().to_string();
-
-        let codec = Arc::new(EventCodec {
-            event_prefix: event_prefix.clone(),
-            type_id: event_type_id,
-            decode: Arc::new(|payload| {
-                let event: E = serde_json::from_value(payload.clone())?;
-                Ok(Arc::new(event))
-            }),
-        });
-
-        Self {
-            event_prefix,
-            event_type_id,
-            aggregate_type,
-            occ_required: false,
-            codec,
-            json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
-                let event: E = serde_json::from_value(payload.clone()).ok()?;
-                Some(extract_id(&event))
-            }),
-            apply_to: Arc::new(|state: &mut dyn Any, data: serde_json::Value| -> Result<()> {
-                let state = state
-                    .downcast_mut::<A>()
-                    .ok_or_else(|| anyhow::anyhow!("aggregate type mismatch in apply_to"))?;
-                let event: E = serde_json::from_value(data)?;
-                state.apply(event);
-                Ok(())
-            }),
-            clone_state: Arc::new(|state: &dyn Any| -> Box<dyn Any + Send + Sync> {
-                let s = state.downcast_ref::<A>().unwrap();
-                Box::new(s.clone())
-            }),
-            default_state: Arc::new(|| -> Box<dyn Any + Send + Sync> { Box::new(A::default()) }),
-            serialize_state: Arc::new(|state: &dyn Any| -> Result<serde_json::Value> {
-                let s = state
-                    .downcast_ref::<A>()
-                    .ok_or_else(|| anyhow::anyhow!("aggregate type mismatch in serialize_state"))?;
-                Ok(serde_json::to_value(s)?)
-            }),
-            deserialize_state: Arc::new(
-                |value: serde_json::Value| -> Result<Box<dyn Any + Send + Sync>> {
-                    let s: A = serde_json::from_value(value)?;
-                    Ok(Box::new(s))
-                },
-            ),
-        }
-    }
-
-    /// Construct a v0.4 Aggregator from `A: aggregate_v3::Aggregate +
-    /// Apply<F>` and `F: Fact`. Sets `occ_required = true` so
-    /// registration via `EngineBuilder::with_aggregators` also marks
-    /// `F::CATEGORY` as OCC-required on the write side.
+    /// This is the canonical "aggregate IS the consistency boundary"
+    /// case (per C6). For read-only folds that should NOT gate
+    /// writes (saga-style derived state, statistics counters), use
+    /// [`Self::fold`] instead.
     ///
     /// Stream id comes from `Fact::stream_id`; aggregate type string
     /// comes from `A::NAME` — explicit, stable across refactorings,
@@ -252,6 +180,31 @@ impl Aggregator {
                 },
             ),
         }
+    }
+
+    /// Construct a read-only fold Aggregator — same shape as
+    /// [`Self::for_type`] but **without** the write-side OCC gate.
+    ///
+    /// Use this for derived state that lives in the registry but
+    /// doesn't make `F`'s stream an aggregate. Common cases:
+    /// statistics counters, saga-style read state shared across
+    /// reactors / projectors, debugging snapshots.
+    ///
+    /// `Engine::emit(fact)` still works freely against `F::CATEGORY`
+    /// — `with_aggregators([Aggregator::fold::<A, F>()])` does not
+    /// mark the stream as OCC-required.
+    pub fn fold<A, F>() -> Self
+    where
+        A: crate::aggregate_v3::Aggregate
+            + crate::aggregate_v3::Apply<F>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned,
+        F: crate::fact::Fact,
+    {
+        let mut agg = Self::for_type::<A, F>();
+        agg.occ_required = false;
+        agg
     }
 
     /// Get the event codec for this aggregator's event type.
@@ -511,15 +464,12 @@ impl AggregatorRegistry {
     }
 
     /// Get the (prev, next) transition for an aggregate from internal state.
-    ///
-    /// Returns `(prev_state, current_state)` by reading from the internal DashMap
-    /// and downcasting to the concrete aggregate type. Zero serialization.
-    /// If no state exists, returns `(A::default(), A::default())`.
+    /// Returns `(A::default(), A::default())` if no state exists.
     pub fn get_transition<A>(&self, id: Uuid) -> (A, A)
     where
-        A: Aggregate + 'static,
+        A: crate::aggregate_v3::Aggregate + Clone,
     {
-        let key = format!("{}:{}", A::aggregate_type(), id);
+        let key = format!("{}:{}", A::NAME, id);
         let prev_key = format!("{}:prev", key);
 
         let next = self
@@ -538,15 +488,11 @@ impl AggregatorRegistry {
     }
 
     /// Get the (prev, next) transition as `Arc<A>` — zero-clone read access.
-    ///
-    /// Prefer this over [`get_transition`] when the aggregate is expensive to
-    /// clone (e.g. contains `HashMap`s). Returns `Arc::new(A::default())` when
-    /// no state exists.
     pub fn get_transition_arc<A>(&self, id: Uuid) -> (Arc<A>, Arc<A>)
     where
-        A: Aggregate + 'static,
+        A: crate::aggregate_v3::Aggregate,
     {
-        let key = format!("{}:{}", A::aggregate_type(), id);
+        let key = format!("{}:{}", A::NAME, id);
         let prev_key = format!("{}:prev", key);
 
         let next = self
@@ -567,7 +513,7 @@ impl AggregatorRegistry {
     /// Get the (prev, next) transition for a singleton aggregate (uses `Uuid::nil()`).
     pub fn get_singleton<A>(&self) -> (A, A)
     where
-        A: Aggregate + 'static,
+        A: crate::aggregate_v3::Aggregate + Clone,
     {
         self.get_transition::<A>(Uuid::nil())
     }
@@ -575,7 +521,7 @@ impl AggregatorRegistry {
     /// Get the (prev, next) transition for a singleton aggregate as `Arc<A>`.
     pub fn get_singleton_arc<A>(&self) -> (Arc<A>, Arc<A>)
     where
-        A: Aggregate + 'static,
+        A: crate::aggregate_v3::Aggregate,
     {
         self.get_transition_arc::<A>(Uuid::nil())
     }

@@ -229,8 +229,7 @@ where
 mod tests {
     use super::*;
     use crate::checkpoint_store::CheckpointStore;
-    use crate::event::Event;
-        use crate::memory_store::MemoryStore;
+    use crate::memory_store::MemoryStore;
     use crate::reactor_v3::Events;
     use crate::types::NewEvent;
     use anyhow::anyhow;
@@ -253,14 +252,15 @@ mod tests {
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 
-    // ── Output fact (also impl Event so Events::push works) ──
+    // ── Output fact ──
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct ShippedNotification {
         order_id: Uuid,
     }
-    impl Event for ShippedNotification {
-        fn durable_name(&self) -> &str { "test.shipped_notification" }
-        fn event_prefix() -> &'static str { "test" }
+    impl Fact for ShippedNotification {
+        const CATEGORY: &'static str = "shipping";
+        fn name(&self) -> &str { "shipped_notification" }
+        fn stream_id(&self) -> Uuid { self.order_id }
     }
 
     fn append_trigger(store: &MemoryStore, payload: &OrderPlaced) -> Uuid {
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(row.reactor_id, "r.shipper");
         assert_eq!(row.source_event_id, trigger_event_id);
         assert_eq!(row.output_index, 0);
-        assert_eq!(row.event_type, "test.shipped_notification");
+        assert_eq!(row.event_type, "shipping:shipped_notification");
         // Deterministic id matches the helper's output.
         assert_eq!(
             row.event_id,
@@ -435,7 +435,7 @@ mod tests {
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         let output_event = all_events.iter()
-            .find(|e| e.event_type == "test.shipped_notification")
+            .find(|e| e.event_type == "shipping:shipped_notification")
             .expect("relay-drained output present in log");
         assert_eq!(output_event.correlation_id, trigger_correlation,
                    "relay-drained output MUST carry trigger's correlation_id");

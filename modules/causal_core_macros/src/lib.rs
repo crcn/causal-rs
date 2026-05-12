@@ -1949,7 +1949,7 @@ fn expand_aggregators_module(
 
 // ── #[event] proc macro ─────────────────────────────────────────────
 
-/// Marks a type as a causal Event, generating a `causal::event::Event` impl.
+/// Marks a type as a causal Fact, generating a `causal::Fact` impl.
 ///
 /// # Usage
 ///
@@ -2253,24 +2253,13 @@ fn expand_event_enum(
         quote! {}
     };
 
+    // Legacy `Event` impl emission removed in P11.d — only `Fact`
+    // is generated now. The `prefix`/`durable_name`/`is_ephemeral`
+    // metadata is captured on the `Fact` impl: prefix → `CATEGORY`,
+    // bare variant name → `name()`. Ephemerals dropped per P1.5.
+    let _ = (prefix, match_arms, ephemeral);
     Ok(quote! {
         #input
-
-        impl ::causal::event::Event for #name {
-            fn durable_name(&self) -> &str {
-                match self {
-                    #(#match_arms,)*
-                }
-            }
-
-            fn event_prefix() -> &'static str {
-                #prefix
-            }
-
-            fn is_ephemeral() -> bool {
-                #ephemeral
-            }
-        }
 
         #fact_impl
     })
@@ -2326,22 +2315,11 @@ fn expand_event_struct(
         quote! {}
     };
 
+    // Legacy `Event` impl emission removed in P11.d — see the enum
+    // path above for rationale.
+    let _ = (durable, prefix_str, ephemeral);
     Ok(quote! {
         #input
-
-        impl ::causal::event::Event for #name {
-            fn durable_name(&self) -> &str {
-                #durable
-            }
-
-            fn event_prefix() -> &'static str {
-                #prefix_str
-            }
-
-            fn is_ephemeral() -> bool {
-                #ephemeral
-            }
-        }
 
         #fact_impl
     })

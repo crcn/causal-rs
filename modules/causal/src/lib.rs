@@ -38,9 +38,7 @@ pub mod aggregator;
 pub mod checkpoint_store;
 pub mod contexts;
 pub mod engine_v3;
-pub mod event;
 pub mod event_log;
-pub mod event_store;
 pub mod fact;
 pub mod multi_projector;
 pub mod projection;
@@ -115,12 +113,9 @@ pub use memory_store::MemoryStore;
 // Schema migration helpers
 pub use upcaster::{Upcaster, UpcasterRegistry};
 
-// ── Legacy carryover ──────────────────────────────────────────────
-// `Event` trait stays until P11.d migrates `Events::push<E: Event>`
-// to take `F: Fact`. `ProjectionStore` and legacy `aggregator::Aggregate`/
-// `Apply<E>` stay until P11.e. Re-exported here so the transition
-// doesn't force users onto deep module paths before the migration.
-pub use event::Event;
+// `ProjectionStore` stays until P11.e — it's the legacy persistence
+// trait that the v0.4 `ProjectionOps + CheckpointStore` split
+// replaces; current backends still implement it.
 pub use projection::ProjectionStore;
 
 /// Universal return macro for [`Reactor::react`]. Builds an
