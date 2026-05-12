@@ -43,8 +43,10 @@ execution. Missing rows = events stuck in old format that v0.4 code
 can't deserialize.
 
 **Status: skeleton.** Rows for the 5 known-explicit Facts are filled
-in. The other 10 enums (legacy-Event-only path today) need v0.4
-Fact impls during P12; their rows get filled in concurrently.
+in. The 4 ephemeral domains have provisional CATEGORY assigned (per
+P1.5 decision — see "Ephemeral-event domains" section below). The
+other 6 enums (legacy-Event-only path today) need v0.4 Fact impls
+during P12; their rows get filled in concurrently.
 
 | Fact enum | v0.3 type_prefix | v0.3 stream categories | v0.4 CATEGORY | v0.4 split into | Notes |
 |---|---|---|---|---|---|
@@ -55,13 +57,13 @@ Fact impls during P12; their rows get filled in concurrently.
 | `SchedulingEvent` | `scheduling` | `schedule`, `scrape_schedule` | (split) | `ScheduleEvent` (CATEGORY=`schedule`) + `ScrapeScheduleEvent` (CATEGORY=`scrape_schedule`) | **event_type rewrite + split**: `scheduling:schedule_*` → `schedule:*`, `scheduling:scrape_scheduled` → `scrape_schedule:scheduled` |
 | `SignalEvent` | `signal` | (no manual Fact impl) | TBD | (decide in P12) | Choose CATEGORY during P12; if `signal` then no rewrite. |
 | `CuriosityEvent` | `curiosity` | (no manual Fact impl) | TBD | (decide in P12) | — |
-| `CoalescingEvent` | `coalescing` | (no manual Fact impl) | TBD | — | — |
-| `ClusterWeavingEvent` | `cluster_weaving` | (no manual Fact impl) | TBD | — | — |
+| `CoalescingEvent` | `coalescing` | (ephemeral — never persisted) | `coalescing` | — | **P1.5: ephemeral → persistent.** Add `run_id: Uuid` to each variant. No SQL rewrite — no v0.3 rows exist. See "Ephemeral-event domains" section. |
+| `ClusterWeavingEvent` | `cluster_weaving` | (ephemeral — never persisted) | `cluster_weaving` | — | **P1.5: ephemeral → persistent.** Same recipe as CoalescingEvent. |
 | `EnrichmentEvent` | `enrichment` | (no manual Fact impl) | TBD | — | — |
 | `ExpansionEvent` | `expansion` | (no manual Fact impl) | TBD | — | — |
 | `SynthesisEvent` | `synthesis` | (no manual Fact impl) | TBD | — | — |
-| `SituationWeavingEvent` | `situation_weaving` | (no manual Fact impl) | TBD | — | — |
-| `SupervisorEvent` | `supervisor` | (no manual Fact impl) | TBD | — | — |
+| `SituationWeavingEvent` | `situation_weaving` | (ephemeral — never persisted) | `situation_weaving` | — | **P1.5: ephemeral → persistent.** Same recipe. |
+| `SupervisorEvent` | `supervisor` | (ephemeral — never persisted) | `supervisor` | — | **P1.5: ephemeral → persistent.** `SupervisionCompleted` is a unit variant today; will gain `run_id: Uuid`. |
 | `SystemEvent` | (in `rootsignal-common`) | — | TBD | — | — |
 | `WorldEvent` | `world` (in `rootsignal-world`) | — | TBD | — | — |
 
@@ -304,6 +306,47 @@ Then restart v0.3 consumers (Stage 6 with v0.3 binaries).
 **Rollback is impossible after Stage 5** because new events
 written by v0.4 code use the new format; reverting them requires a
 manual case-by-case rewrite that defeats the point.
+
+## Ephemeral-event domains — v0.4 conversion (P12)
+
+**Decision (P1.5, 2026-05-11): drop ephemerals entirely.** v0.4 has
+no `.ephemeral()` mode; the Fact trait requires `stream_id()`. The
+four domains currently emitting ephemeral events become persistent
+Facts during P12.
+
+The audit found **4 ephemeral event types** in
+`modules/rootsignal-scout/src/domains/`:
+
+| Domain              | Type                    | Today (v0.3)                                                | Under v0.4                                                            |
+|---------------------|-------------------------|-------------------------------------------------------------|-----------------------------------------------------------------------|
+| `coalescing`        | `CoalescingEvent`       | `#[causal::event(prefix = "coalescing", ephemeral)]`        | `CATEGORY = "coalescing"`, all variants gain `run_id: Uuid`           |
+| `supervisor`        | `SupervisorEvent`       | `#[causal::event(prefix = "supervisor", ephemeral)]`        | `CATEGORY = "supervisor"`, all variants gain `run_id: Uuid`           |
+| `cluster_weaving`   | `ClusterWeavingEvent`   | `#[causal::event(prefix = "cluster_weaving", ephemeral)]`   | `CATEGORY = "cluster_weaving"`, all variants gain `run_id: Uuid`      |
+| `situation_weaving` | `SituationWeavingEvent` | `#[causal::event(prefix = "situation_weaving", ephemeral)]` | `CATEGORY = "situation_weaving"`, all variants gain `run_id: Uuid`    |
+
+**Per-domain mechanical rewrite recipe (P12):**
+
+1. Add `run_id: Uuid` to every variant that doesn't already have it
+   (`SupervisorEvent::SupervisionCompleted` is the most affected —
+   it's currently a unit variant).
+2. Drop `, ephemeral` from the `#[causal::event(...)]` macro args.
+3. Update `stream_id()` to return `run_id`.
+4. Update the emitters in each `mod.rs` (`coalescing/mod.rs`,
+   `supervisor/mod.rs`, etc.) to pass `run_id` from
+   `ctx.deps().run_id` or `ctx.aggregate::<PipelineState>()`.
+5. Update reactor filters that match on these variants — the match
+   patterns now bind `run_id, ..` instead of nothing.
+
+**Storage impact.** These four domains emit at most ~4-8 stage
+signals per region per run plus per-group `GroupFeedCompleted`
+events. At rootsignal launch scale this is well under 1% of total
+log volume. The trade-off: extra log rows for a complete pipeline
+timeline that's queryable post-hoc.
+
+**No SQL needed.** Since these events were ephemeral in v0.3, they
+were never persisted — there are no v0.3 rows in the log to rewrite.
+The conversion is purely a source-code change in rootsignal-scout,
+applied during P12 alongside the other domain refactors.
 
 ## Cursor continuity test plan
 
