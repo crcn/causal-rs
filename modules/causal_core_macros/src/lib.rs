@@ -2164,9 +2164,20 @@ fn expand_event_enum(
         name_arms.push(quote! { #pattern => #bare });
     }
 
-    // ─── v0.3 Fact impl, when stream_category + stream_id supplied ──
-    let fact_impl = if args.stream_category.is_some() && args.stream_id.is_some() {
-        let category = args.stream_category.as_ref().unwrap();
+    // ─── v0.4 Fact impl ──
+    //
+    // Emit a Fact impl in all cases. CATEGORY comes from
+    // `stream_category` if supplied, otherwise from `prefix`.
+    // stream_id() uses the variant field named by `stream_id` if
+    // supplied, otherwise defaults to `Uuid::nil()` (acceptable for
+    // category-singleton facts like telemetry where every variant
+    // shares one logical "stream"). occurred_at() uses the
+    // `occurred_at_field` when supplied, otherwise returns None.
+    let fact_impl = if args.stream_id.is_some() {
+        // Per-variant stream_id + occurred_at extraction. Each
+        // variant MUST have the stream_id field; occurred_at is
+        // optional (variants without it get None).
+        let category = args.stream_category.as_ref().unwrap_or(&prefix);
         let id_field = args.stream_id.as_ref().unwrap();
         let id_field_ident = format_ident!("{}", id_field);
         let occurred_field = args
@@ -2250,14 +2261,28 @@ fn expand_event_enum(
             }
         }
     } else {
-        quote! {}
+        // No `stream_id` arg: emit a Fact impl with the prefix as
+        // CATEGORY, bare variant name as `name()`, and
+        // `Uuid::nil()` as stream_id (category-singleton). Used by
+        // operational/telemetry events that aren't per-aggregate.
+        quote! {
+            impl ::causal::Fact for #name {
+                const CATEGORY: &'static str = #prefix;
+                fn name(&self) -> &str {
+                    match self {
+                        #(#name_arms,)*
+                    }
+                }
+                fn stream_id(&self) -> ::uuid::Uuid {
+                    ::uuid::Uuid::nil()
+                }
+            }
+        }
     };
 
     // Legacy `Event` impl emission removed in P11.d — only `Fact`
-    // is generated now. The `prefix`/`durable_name`/`is_ephemeral`
-    // metadata is captured on the `Fact` impl: prefix → `CATEGORY`,
-    // bare variant name → `name()`. Ephemerals dropped per P1.5.
-    let _ = (prefix, match_arms, ephemeral);
+    // is generated now.
+    let _ = (match_arms, ephemeral);
     Ok(quote! {
         #input
 
@@ -2282,27 +2307,25 @@ fn expand_event_struct(
 
     let prefix_str = durable.clone();
 
-    // v0.3 Fact impl for structs: requires stream_category + stream_id.
-    let fact_impl = if args.stream_category.is_some() && args.stream_id.is_some() {
-        let category = args.stream_category.as_ref().unwrap();
-        let id_field_ident = format_ident!("{}", args.stream_id.as_ref().unwrap());
+    // v0.4 Fact impl for structs. CATEGORY = `stream_category` if
+    // supplied, else `prefix` (or the snake-cased struct name).
+    // stream_id uses the `stream_id` field name if supplied, else
+    // `Uuid::nil()` (category-singleton). occurred_at uses
+    // `occurred_at_field` if supplied, else None.
+    let bare_name = prefix_str.clone();
+    let fact_impl = if let Some(id_field) = args.stream_id.as_ref() {
+        let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
+        let id_field_ident = format_ident!("{}", id_field);
         let occurred_field_ident = format_ident!(
             "{}",
             args.occurred_at_field
                 .clone()
                 .unwrap_or_else(|| "occurred_at".to_string())
         );
-
-        // For structs, the durable_name is `prefix_str` itself (no
-        // per-variant suffix). Under v0.4, `name()` returns the same
-        // bare slug; the runtime composes `category:name`.
-        let bare_name = prefix_str.clone();
         quote! {
             impl ::causal::Fact for #name {
                 const CATEGORY: &'static str = #category;
-                fn name(&self) -> &str {
-                    #bare_name
-                }
+                fn name(&self) -> &str { #bare_name }
                 fn stream_id(&self) -> ::uuid::Uuid {
                     self.#id_field_ident
                 }
@@ -2312,7 +2335,16 @@ fn expand_event_struct(
             }
         }
     } else {
-        quote! {}
+        let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
+        quote! {
+            impl ::causal::Fact for #name {
+                const CATEGORY: &'static str = #category;
+                fn name(&self) -> &str { #bare_name }
+                fn stream_id(&self) -> ::uuid::Uuid {
+                    ::uuid::Uuid::nil()
+                }
+            }
+        }
     };
 
     // Legacy `Event` impl emission removed in P11.d — see the enum
