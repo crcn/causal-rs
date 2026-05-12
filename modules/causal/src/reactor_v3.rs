@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::contexts::Ctx;
-use crate::event_codec::EventCodec;
 use crate::fact::Fact;
 
 /// Pure decision producing `Events`. Forward-only; outputs go through
@@ -89,7 +88,6 @@ pub struct EventOutput {
     /// `event_prefix` this output targets.
     pub stream_id: Uuid,
     pub payload: serde_json::Value,
-    pub(crate) codec: Option<Arc<EventCodec>>,
     /// Original typed fact (live dispatch only).
     pub ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -107,23 +105,15 @@ impl EventOutput {
         Self {
             type_id: TypeId::of::<F>(),
             durable_name,
-            event_prefix: event_prefix.clone(),
+            event_prefix,
             stream_id,
             payload,
-            codec: Some(Arc::new(EventCodec {
-                event_prefix,
-                type_id: TypeId::of::<F>(),
-                decode: Arc::new(|payload| {
-                    let fact: F = serde_json::from_value(payload.clone())?;
-                    Ok(Arc::new(fact))
-                }),
-            })),
             ephemeral: Some(ephemeral),
         }
     }
 
-    /// Reconstruct from a serialized form (replay path; no codec,
-    /// no live ephemeral copy).
+    /// Reconstruct from a serialized form (replay path; no live
+    /// ephemeral copy).
     pub fn from_serialized(
         event_type: String,
         stream_id: Uuid,
@@ -135,7 +125,6 @@ impl EventOutput {
             durable_name: event_type,
             stream_id,
             payload,
-            codec: None,
             ephemeral: None,
         }
     }

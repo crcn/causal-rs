@@ -1,28 +1,22 @@
 //! Per-consumer cursor storage + reactor outbox traits.
 //!
-//! Two traits live here:
-//!
-//! - [`CheckpointStore`] — minimal cursor read/write. Used by
-//!   Projector and View runners that only need "where is consumer X?".
-//!   Any `ProjectionStore` automatically satisfies this via blanket
-//!   impl, so existing backends keep working unchanged.
-//!
+//! - [`CheckpointStore`] — minimal cursor read/write. Required by
+//!   `Projector` / `MultiProjector` / `Reactor` runners.
 //! - [`ReactorOutbox`] — extends `CheckpointStore` with the atomic
 //!   commit primitive that codifies C12 (runtime-side outbox + cursor
-//!   advance in one transaction). Backends opt in by implementing this
-//!   trait; only the Phase 4c `ReactorRunner` requires it.
+//!   advance in one transaction). Required only for engines hosting
+//!   reactors.
 //!
-//! Splitting the surface this way keeps `CheckpointStore` minimal for
-//! consumers that don't host reactors (read-only view backends, ops
-//! tooling, etc.) while preserving the C12 atomicity guarantee for
-//! reactor execution.
+//! Backends implement these directly. The legacy
+//! `impl<T: ProjectionStore> CheckpointStore for T` blanket is gone
+//! as of P11.e — backends must provide a direct `CheckpointStore`
+//! impl.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::projection::ProjectionStore;
 use crate::types::LogCursor;
 
 /// Minimal cursor read/write surface.
@@ -30,26 +24,6 @@ use crate::types::LogCursor;
 pub trait CheckpointStore: Send + Sync {
     async fn get(&self, consumer_id: &str) -> Result<Option<LogCursor>>;
     async fn set(&self, consumer_id: &str, pos: LogCursor) -> Result<()>;
-}
-
-#[async_trait]
-impl<T: ProjectionStore + ?Sized> CheckpointStore for T {
-    async fn get(&self, consumer_id: &str) -> Result<Option<LogCursor>> {
-        ProjectionStore::get_projection_cursor(self, consumer_id).await
-    }
-
-    /// Upsert via init + reset. `init_projection_cursor` creates the
-    /// row if missing (no-op if present); `reset_projection` then
-    /// unconditionally overwrites to `pos`. Together this provides the
-    /// simple CheckpointStore::set semantic against a backend that
-    /// distinguishes "create" from "overwrite" at the ProjectionStore
-    /// layer. The Phase 4 runtime uses `advance_projection_cursor`
-    /// directly when CAS semantics matter; this trait is for the
-    /// simpler get/set use case.
-    async fn set(&self, consumer_id: &str, pos: LogCursor) -> Result<()> {
-        ProjectionStore::init_projection_cursor(self, consumer_id, pos).await?;
-        ProjectionStore::reset_projection(self, consumer_id, pos).await
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

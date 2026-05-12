@@ -16,10 +16,8 @@ use uuid::Uuid;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::checkpoint_store::{InsertableOutboxRow, OutboxRow, ReactorOutbox};
-use crate::event_log::EventLog;
-use crate::projection::{
-    ProjectionFailure, ProjectionStatus, ProjectionStore,
-};
+use crate::event_log::EventLogBackend;
+use crate::projection::{ProjectionFailure, ProjectionStatus};
 use crate::reactor_queue::ReactorQueue;
 use crate::types::*;
 
@@ -209,7 +207,7 @@ impl MemoryStore {
 // ── EventLog implementation ─────────────────────────────────────────
 
 #[async_trait]
-impl EventLog for MemoryStore {
+impl crate::event_log::EventLogBackend for MemoryStore {
     async fn append(&self, event: NewEvent) -> Result<AppendResult> {
         let mut log = self.global_log.lock();
 
@@ -370,6 +368,10 @@ impl EventLog for MemoryStore {
         Ok(AppendResult { position, version: Some(new_version) })
     }
 
+}
+
+#[async_trait]
+impl crate::snapshot_store::SnapshotStore for MemoryStore {
     async fn load_snapshot(
         &self,
         aggregate_type: &str,
@@ -382,6 +384,30 @@ impl EventLog for MemoryStore {
     async fn save_snapshot(&self, snapshot: Snapshot) -> Result<()> {
         let key = (snapshot.aggregate_type.clone(), snapshot.aggregate_id);
         self.snapshots.insert(key, snapshot);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::checkpoint_store::CheckpointStore for MemoryStore {
+    async fn get(&self, consumer_id: &str) -> Result<Option<LogCursor>> {
+        Ok(self.projection_cursors.get(consumer_id).map(|e| e.cursor))
+    }
+
+    async fn set(&self, consumer_id: &str, pos: LogCursor) -> Result<()> {
+        use dashmap::mapref::entry::Entry;
+        match self.projection_cursors.entry(consumer_id.to_string()) {
+            Entry::Occupied(mut slot) => { slot.get_mut().cursor = pos; }
+            Entry::Vacant(slot) => {
+                slot.insert(ProjectionCursorEntry {
+                    cursor: pos,
+                    paused: false,
+                    last_error: None,
+                    last_attempt_at: None,
+                    consecutive_failures: 0,
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -739,215 +765,26 @@ impl ReactorQueue for MemoryStore {
     }
 }
 
-#[async_trait]
-impl ProjectionStore for MemoryStore {
-    async fn init_projection_cursor(
-        &self,
-        projection_id: &str,
-        start: LogCursor,
-    ) -> Result<bool> {
-        use dashmap::mapref::entry::Entry;
-        match self.projection_cursors.entry(projection_id.to_string()) {
-            Entry::Occupied(_) => Ok(false),
-            Entry::Vacant(slot) => {
-                slot.insert(ProjectionCursorEntry {
-                    cursor: start,
-                    paused: false,
-                    last_error: None,
-                    last_attempt_at: None,
-                    consecutive_failures: 0,
-                });
-                Ok(true)
-            }
-        }
-    }
-
-    async fn get_projection_cursor(
-        &self,
-        projection_id: &str,
-    ) -> Result<Option<LogCursor>> {
-        Ok(self
-            .projection_cursors
-            .get(projection_id)
-            .map(|e| e.cursor))
-    }
-
-    async fn advance_projection_cursor(
-        &self,
-        projection_id: &str,
-        expected_from: LogCursor,
-        to: LogCursor,
-    ) -> Result<bool> {
-        let Some(mut entry) = self.projection_cursors.get_mut(projection_id) else {
-            return Ok(false);
-        };
-        if entry.cursor != expected_from {
-            return Ok(false);
-        }
-        entry.cursor = to;
-        entry.last_error = None;
-        entry.consecutive_failures = 0;
-        Ok(true)
-    }
-
-    async fn advance_past_failure(
-        &self,
-        projection_id: &str,
-        expected_from: LogCursor,
-        to: LogCursor,
-        event_id: Uuid,
-        error: &str,
-        attempts: u32,
-    ) -> Result<bool> {
-        // Acquire cursor entry first (per-entry lock), then DLQ vec lock.
-        // Order is consistent across all callers — this is the only method
-        // that takes both locks, so no deadlock window.
-        let Some(mut entry) = self.projection_cursors.get_mut(projection_id) else {
-            return Ok(false);
-        };
-        if entry.cursor != expected_from {
-            return Ok(false);
-        }
-
-        // Idempotent DLQ write on (projection_id, event_id), matching the
-        // primary-key contract documented on the trait.
-        let mut failures = self.projection_failures.lock();
-        let already_present = failures.iter().any(|f| {
-            f.projection_id == projection_id && f.event_id == event_id
-        });
-        if !already_present {
-            failures.push(ProjectionFailure {
-                projection_id: projection_id.to_string(),
-                event_id,
-                error: error.to_string(),
-                attempts,
-                failed_at: Utc::now(),
-            });
-        }
-        drop(failures);
-
-        // Atomic with the DLQ write because both succeed before this method
-        // returns and a panic between them is impossible (no .await points).
-        entry.cursor = to;
-        entry.last_error = None;
-        entry.consecutive_failures = 0;
-        Ok(true)
-    }
-
-    async fn set_projection_error(
-        &self,
-        projection_id: &str,
-        error: Option<&str>,
-        consecutive_failures: u32,
-    ) -> Result<()> {
-        if let Some(mut entry) = self.projection_cursors.get_mut(projection_id) {
-            entry.last_error = error.map(|s| s.to_string());
-            entry.consecutive_failures = consecutive_failures;
-            entry.last_attempt_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn projection_status(
-        &self,
-        projection_id: &str,
-    ) -> Result<Option<ProjectionStatus>> {
-        Ok(self.projection_cursors.get(projection_id).map(|e| {
-            ProjectionStatus {
-                projection_id: projection_id.to_string(),
-                cursor: e.cursor,
-                paused: e.paused,
-                last_error: e.last_error.clone(),
-                last_attempt_at: e.last_attempt_at,
-                consecutive_failures: e.consecutive_failures,
-            }
-        }))
-    }
-
-    async fn list_projections(&self) -> Result<Vec<ProjectionStatus>> {
-        Ok(self
-            .projection_cursors
-            .iter()
-            .map(|entry| ProjectionStatus {
-                projection_id: entry.key().clone(),
-                cursor: entry.cursor,
-                paused: entry.paused,
-                last_error: entry.last_error.clone(),
-                last_attempt_at: entry.last_attempt_at,
-                consecutive_failures: entry.consecutive_failures,
-            })
-            .collect())
-    }
-
-    async fn set_projection_paused(
-        &self,
-        projection_id: &str,
-        paused: bool,
-    ) -> Result<()> {
-        if let Some(mut entry) = self.projection_cursors.get_mut(projection_id) {
-            entry.paused = paused;
-        }
-        Ok(())
-    }
-
-    async fn reset_projection(
-        &self,
-        projection_id: &str,
-        to: LogCursor,
-    ) -> Result<()> {
-        if let Some(mut entry) = self.projection_cursors.get_mut(projection_id) {
-            entry.cursor = to;
-            entry.last_error = None;
-            entry.consecutive_failures = 0;
-            entry.last_attempt_at = None;
-        }
-        Ok(())
-    }
-
-    async fn delete_projection(&self, projection_id: &str) -> Result<()> {
-        self.projection_cursors.remove(projection_id);
-        let mut failures = self.projection_failures.lock();
-        failures.retain(|f| f.projection_id != projection_id);
-        Ok(())
-    }
-
-    async fn list_projection_failures(
-        &self,
-        projection_id: &str,
-        limit: usize,
-    ) -> Result<Vec<ProjectionFailure>> {
-        let failures = self.projection_failures.lock();
-        let mut matching: Vec<_> = failures
-            .iter()
-            .filter(|f| f.projection_id == projection_id)
-            .cloned()
-            .collect();
-        // Most-recent first
-        matching.sort_by(|a, b| b.failed_at.cmp(&a.failed_at));
-        matching.truncate(limit);
-        Ok(matching)
-    }
-
-    async fn delete_projection_failure(
-        &self,
-        projection_id: &str,
-        event_id: Uuid,
-    ) -> Result<bool> {
-        let mut failures = self.projection_failures.lock();
-        let before = failures.len();
-        failures.retain(|f| {
-            !(f.projection_id == projection_id && f.event_id == event_id)
-        });
-        Ok(failures.len() < before)
-    }
-}
 
 // ── ProjectionOps (v0.4 ops surface) ────────────────────────────────
 
 #[async_trait]
 impl causal::projection::ProjectionOps for MemoryStore {
     async fn set_paused(&self, group_name: &str, paused: bool) -> Result<()> {
-        ProjectionStore::set_projection_paused(self, group_name, paused).await
+        use dashmap::mapref::entry::Entry;
+        match self.projection_cursors.entry(group_name.to_string()) {
+            Entry::Occupied(mut slot) => { slot.get_mut().paused = paused; }
+            Entry::Vacant(slot) => {
+                slot.insert(ProjectionCursorEntry {
+                    cursor: LogCursor::ZERO,
+                    paused,
+                    last_error: None,
+                    last_attempt_at: None,
+                    consecutive_failures: 0,
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn record_failure(
@@ -957,8 +794,10 @@ impl causal::projection::ProjectionOps for MemoryStore {
         error: &str,
         attempts: u32,
     ) -> Result<()> {
-        // Direct DLQ write — bypasses the legacy `advance_past_failure`
-        // path's cursor coupling. Idempotent on (group_name, event_id).
+        // Direct DLQ write. Idempotent on (group_name, event_id) —
+        // matches the unique-constraint contract documented on the
+        // trait. See trait docs re: atomicity (not bundled with
+        // cursor advance under v0.4).
         let mut failures = self.projection_failures.lock();
         let already_present = failures.iter().any(|f| {
             f.projection_id == group_name && f.event_id == event_id
@@ -980,11 +819,24 @@ impl causal::projection::ProjectionOps for MemoryStore {
         group_name: &str,
         limit: usize,
     ) -> Result<Vec<ProjectionFailure>> {
-        ProjectionStore::list_projection_failures(self, group_name, limit).await
+        let failures = self.projection_failures.lock();
+        Ok(failures.iter()
+            .rev()
+            .filter(|f| f.projection_id == group_name)
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     async fn status(&self, group_name: &str) -> Result<Option<ProjectionStatus>> {
-        ProjectionStore::projection_status(self, group_name).await
+        Ok(self.projection_cursors.get(group_name).map(|e| ProjectionStatus {
+            projection_id: group_name.to_string(),
+            cursor: e.cursor,
+            paused: e.paused,
+            last_error: e.last_error.clone(),
+            last_attempt_at: e.last_attempt_at,
+            consecutive_failures: e.consecutive_failures,
+        }))
     }
 
     async fn delete_failure(
@@ -992,7 +844,12 @@ impl causal::projection::ProjectionOps for MemoryStore {
         group_name: &str,
         event_id: Uuid,
     ) -> Result<bool> {
-        ProjectionStore::delete_projection_failure(self, group_name, event_id).await
+        let mut failures = self.projection_failures.lock();
+        let before = failures.len();
+        failures.retain(|f| {
+            !(f.projection_id == group_name && f.event_id == event_id)
+        });
+        Ok(failures.len() < before)
     }
 }
 
@@ -1180,10 +1037,20 @@ mod outbox_tests {
 
     #[tokio::test]
     async fn commit_reactor_batch_clears_consumer_error_state() {
+        use causal::checkpoint_store::CheckpointStore;
+        use causal::projection::ProjectionOps;
+
         let store = MemoryStore::new();
-        // Seed a cursor with error state via ProjectionStore
-        store.init_projection_cursor("r3", LogCursor::ZERO).await.unwrap();
-        store.set_projection_error("r3", Some("prior failure"), 3).await.unwrap();
+        // Seed a cursor with error state. Use CheckpointStore::set to
+        // establish the cursor row, then poke the error fields
+        // directly (the v0.4 ProjectionOps surface doesn't expose
+        // an in-flight error-state setter — `record_failure` writes
+        // DLQ rows, not live consecutive-failure counters).
+        CheckpointStore::set(&store, "r3", LogCursor::ZERO).await.unwrap();
+        if let Some(mut entry) = store.projection_cursors.get_mut("r3") {
+            entry.last_error = Some("prior failure".into());
+            entry.consecutive_failures = 3;
+        }
 
         let new_pos = LogCursor::from_raw(7);
         store.commit_reactor_batch(
@@ -1191,7 +1058,7 @@ mod outbox_tests {
             Some(("r3".into(), new_pos)),
         ).await.unwrap();
 
-        let status = store.projection_status("r3").await.unwrap().unwrap();
+        let status = ProjectionOps::status(&store, "r3").await.unwrap().unwrap();
         assert_eq!(status.cursor, new_pos);
         assert!(status.last_error.is_none());
         assert_eq!(status.consecutive_failures, 0);

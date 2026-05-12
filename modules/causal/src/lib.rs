@@ -51,7 +51,6 @@ pub mod relay;
 pub mod snapshot_store;
 pub mod types;
 
-mod event_codec;
 pub mod memory_store;
 pub mod upcaster;
 
@@ -113,10 +112,6 @@ pub use memory_store::MemoryStore;
 // Schema migration helpers
 pub use upcaster::{Upcaster, UpcasterRegistry};
 
-// `ProjectionStore` stays until P11.e — it's the legacy persistence
-// trait that the v0.4 `ProjectionOps + CheckpointStore` split
-// replaces; current backends still implement it.
-pub use projection::ProjectionStore;
 
 /// Universal return macro for [`Reactor::react`]. Builds an
 /// [`Events`] collection from one or more output facts.

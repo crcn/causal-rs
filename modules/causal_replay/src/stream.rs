@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use causal::event_log::EventLog;
+use causal::event_log::EventLogBackend;
 use causal::types::PersistedEvent;
 use causal::LogCursor;
 
@@ -61,7 +61,7 @@ impl Mode {
 ///
 /// Same `apply()` function in both modes. The app code doesn't branch.
 pub struct ProjectionStream<'a> {
-    log: &'a dyn EventLog,
+    log: &'a dyn EventLogBackend,
     pointer: &'a dyn PointerStore,
     tail_source: Option<Box<dyn TailSource>>,
     promote_gate: Option<PromoteGate>,
@@ -74,7 +74,7 @@ pub struct ProjectionStream<'a> {
 
 impl<'a> ProjectionStream<'a> {
     /// Create a new projection stream.
-    pub fn new(log: &'a dyn EventLog, pointer: &'a dyn PointerStore) -> Self {
+    pub fn new(log: &'a dyn EventLogBackend, pointer: &'a dyn PointerStore) -> Self {
         Self {
             log,
             pointer,

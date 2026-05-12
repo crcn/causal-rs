@@ -41,7 +41,6 @@ use causal::reactor_runner::ReactorRunner;
 use causal::reactor_v3::Reactor;
 use causal::relay::RelayLoop;
 use causal::types::{AppendResult, LogCursor, NewEvent, PersistedEvent, StreamVersion};
-use causal::event_log::EventLog;
 
 // ─────────────────────────────────────────────────────────────────────
 // Fault injector — wraps MemoryStore; lets tests arm one Err per fault
@@ -117,7 +116,7 @@ impl EventLogBackend for FaultInjector {
         expected: StreamVersion,
         event: NewEvent,
     ) -> Result<AppendResult> {
-        EventLog::append_to_stream(
+        EventLogBackend::append_to_stream(
             self.inner.as_ref(), aggregate_type, aggregate_id, expected, event,
         ).await
     }

@@ -10,7 +10,6 @@ use anyhow::Result;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::event_codec::EventCodec;
 use crate::reactor_v3::extract_prefix;
 use crate::types::StreamVersion;
 use crate::upcaster::UpcasterRegistry;
@@ -104,8 +103,6 @@ pub struct Aggregator {
     /// Deserialize aggregate state from JSON (for durable runtimes).
     deserialize_state:
         Arc<dyn Fn(serde_json::Value) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>,
-    /// Event codec for this aggregator's event type.
-    codec: Arc<EventCodec>,
 }
 
 impl Aggregator {
@@ -135,21 +132,11 @@ impl Aggregator {
         let event_type_id = TypeId::of::<F>();
         let aggregate_type = <A as crate::aggregate_v3::Aggregate>::NAME.to_string();
 
-        let codec = Arc::new(EventCodec {
-            event_prefix: event_prefix.clone(),
-            type_id: event_type_id,
-            decode: Arc::new(|payload| {
-                let fact: F = serde_json::from_value(payload.clone())?;
-                Ok(Arc::new(fact))
-            }),
-        });
-
         Self {
             event_prefix,
             event_type_id,
             aggregate_type,
             occ_required: true,
-            codec,
             json_extract_id: Arc::new(|payload: &serde_json::Value| -> Option<Uuid> {
                 let fact: F = serde_json::from_value(payload.clone()).ok()?;
                 Some(<F as crate::fact::Fact>::stream_id(&fact))
@@ -207,12 +194,7 @@ impl Aggregator {
         agg
     }
 
-    /// Get the event codec for this aggregator's event type.
-    pub(crate) fn codec(&self) -> &Arc<EventCodec> {
-        &self.codec
-    }
-
-    /// Extract the aggregate ID from a JSON event payload.
+/// Extract the aggregate ID from a JSON event payload.
     pub fn extract_id_from_json(&self, payload: &serde_json::Value) -> Option<Uuid> {
         (self.json_extract_id)(payload)
     }

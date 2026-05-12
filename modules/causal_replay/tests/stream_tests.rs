@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use causal::event_log::EventLog;
+use causal::event_log::EventLogBackend;
 use causal::types::NewEvent;
 use causal::{LogCursor, MemoryStore};
 use causal_replay::{Mode, PointerStatus, PointerStore, ProjectionStream};
