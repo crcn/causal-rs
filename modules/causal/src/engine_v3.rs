@@ -86,6 +86,57 @@ impl<P: MultiProjector + 'static> Supervisable for MultiProjectorRunner<P> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Bulk registration — trait objects produced by module macros.
+// ─────────────────────────────────────────────────────────────────────
+//
+// `with_projectors`, `with_reactors`, `with_multi_projectors` consume
+// `Box<dyn *Registration>` so a module-level helper can return one
+// uniform `Vec` of mixed consumer types. The blanket impls below cover
+// every `Projector` / `Reactor` / `MultiProjector` automatically — the
+// macro just boxes its instances and the bulk method walks the vector.
+
+pub trait ProjectorRegistration: Send + 'static {
+    fn register(self: Box<Self>, builder: EngineBuilder) -> EngineBuilder;
+}
+
+impl<P> ProjectorRegistration for P
+where
+    P: Projector + 'static,
+    P::Fact: DeserializeOwned,
+{
+    fn register(self: Box<Self>, builder: EngineBuilder) -> EngineBuilder {
+        builder.with_projector(*self)
+    }
+}
+
+pub trait ReactorRegistration: Send + 'static {
+    fn register(self: Box<Self>, builder: EngineBuilder) -> EngineBuilder;
+}
+
+impl<R> ReactorRegistration for R
+where
+    R: Reactor + 'static,
+    R::Trigger: DeserializeOwned,
+{
+    fn register(self: Box<Self>, builder: EngineBuilder) -> EngineBuilder {
+        builder.with_reactor(*self)
+    }
+}
+
+pub trait MultiProjectorRegistration: Send + 'static {
+    fn register(self: Box<Self>, builder: EngineBuilder) -> EngineBuilder;
+}
+
+impl<P> MultiProjectorRegistration for P
+where
+    P: MultiProjector + 'static,
+{
+    fn register(self: Box<Self>, builder: EngineBuilder) -> EngineBuilder {
+        builder.with_multi_projector(*self)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Aggregate-stream gate (partial BS1 closure)
 // ─────────────────────────────────────────────────────────────────────
 //
@@ -388,6 +439,34 @@ impl EngineBuilder {
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
+    }
+
+    /// Bulk-register projectors yielded by an iterator — typically
+    /// from a macro-generated `module::projectors()` helper that
+    /// returns `Vec<Box<dyn ProjectorRegistration>>`.
+    pub fn with_projectors<I>(self, projectors: I) -> Self
+    where
+        I: IntoIterator<Item = Box<dyn ProjectorRegistration>>,
+    {
+        projectors.into_iter().fold(self, |b, p| p.register(b))
+    }
+
+    /// Bulk-register reactors yielded by an iterator — typically
+    /// from a macro-generated `module::reactors()` helper that
+    /// returns `Vec<Box<dyn ReactorRegistration>>`.
+    pub fn with_reactors<I>(self, reactors: I) -> Self
+    where
+        I: IntoIterator<Item = Box<dyn ReactorRegistration>>,
+    {
+        reactors.into_iter().fold(self, |b, r| r.register(b))
+    }
+
+    /// Bulk-register multi-projectors yielded by an iterator.
+    pub fn with_multi_projectors<I>(self, multi_projectors: I) -> Self
+    where
+        I: IntoIterator<Item = Box<dyn MultiProjectorRegistration>>,
+    {
+        multi_projectors.into_iter().fold(self, |b, p| p.register(b))
     }
 
     pub fn build(self) -> Engine {
@@ -1381,6 +1460,69 @@ mod tests {
         )
         .with_projector(UserRoster::default())
         .with_projector(UserRoster::default()); // <- panic here
+    }
+
+    #[tokio::test]
+    async fn with_projectors_registers_a_vec_of_boxed_projectors() {
+        // The macro-generated `module::projectors() -> Vec<Box<dyn
+        // ProjectorRegistration>>` shape. Two heterogeneous projector
+        // types, registered in one go.
+        #[derive(Default)]
+        struct A { hit: Arc<AtomicUsize> }
+        #[async_trait]
+        impl Projector for A {
+            type Fact = UserCreated;
+            const GROUP_NAME: &'static str = "bulk.a";
+            async fn project(&self, _f: &UserCreated, _: Ctx<'_>) -> Result<()> {
+                self.hit.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        #[derive(Default)]
+        struct B { hit: Arc<AtomicUsize> }
+        #[async_trait]
+        impl Projector for B {
+            type Fact = UserCreated;
+            const GROUP_NAME: &'static str = "bulk.b";
+            async fn project(&self, _f: &UserCreated, _: Ctx<'_>) -> Result<()> {
+                self.hit.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let a = A::default();
+        let b = B::default();
+        let a_hit = a.hit.clone();
+        let b_hit = b.hit.clone();
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_projectors(vec![
+            Box::new(a) as Box<dyn ProjectorRegistration>,
+            Box::new(b) as Box<dyn ProjectorRegistration>,
+        ])
+        .build();
+
+        engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if a_hit.load(Ordering::SeqCst) >= 1 && b_hit.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                    "both bulk-registered projectors didn't see the event");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
