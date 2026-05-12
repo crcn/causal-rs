@@ -89,8 +89,9 @@ impl<P: MultiProjector + 'static> Supervisable for MultiProjectorRunner<P> {
 // Aggregate-stream gate (partial BS1 closure)
 // ─────────────────────────────────────────────────────────────────────
 //
-// `with_aggregate::<A, F>()` records `F::CATEGORY` as an OCC-required
-// stream. `Engine::emit` rejects writes to those streams with
+// `with_aggregators([Aggregator::for_type::<A, F>()])` records
+// `F::CATEGORY` as an OCC-required stream. `Engine::emit` rejects
+// writes to those streams without `.expecting()` with
 // `EmitError::OccStreamMisuse`. Streams not in the set are accepted
 // (default permissive — preserves Phase 4d behavior).
 //
@@ -188,7 +189,8 @@ pub struct EmitBuilder<'a> {
 impl<'a> EmitBuilder<'a> {
     /// Opt-in CAS: the write errors if the target stream moved past
     /// `version`. Required for streams registered via
-    /// `EngineBuilder::with_aggregate::<A, F>`; optional but allowed
+    /// `EngineBuilder::with_aggregators([Aggregator::for_type::<A, F>()])`;
+    /// optional but allowed
     /// on any stream.
     pub fn expecting(mut self, version: StreamVersion) -> Self {
         self.expected = Some(version);
@@ -290,26 +292,12 @@ impl EngineBuilder {
         );
     }
 
-    /// Register an aggregate-on-stream binding. Marks `F::CATEGORY`
-    /// as OCC-required so `Engine::emit` rejects writes to that
-    /// stream — only `Engine::append<A, F>(expected, ...)` writes
-    /// (per C11). The `Engine::load<A, F>` and
-    /// `Engine::append<A, F>` methods wire the command-handler path.
-    ///
-    /// `A: Aggregate + Apply<F>` says "this aggregate folds this
-    /// Fact"; `F: Fact` provides the stream category.
-    pub fn with_aggregate<A, F>(mut self) -> Self
-    where
-        A: Aggregate + Apply<F>,
-        F: Fact,
-    {
-        self.occ_required_streams.insert(F::CATEGORY.into());
-        self
-    }
-
     /// Register [`crate::Aggregator`] definitions so consumers can read
     /// folded singleton/keyed aggregate state via `ctx.aggregate::<A>()`
-    /// and `ctx.aggregate_of::<A>(id)`.
+    /// and `ctx.aggregate_of::<A>(id)`. Aggregators built via
+    /// [`Aggregator::for_type`] also mark `F::CATEGORY` as OCC-required
+    /// on the write side (`Engine::emit` rejects emits without
+    /// `.expecting()` for those categories).
     ///
     /// Aggregator state is **per-engine, in-memory**. It does NOT
     /// persist across `Engine` instances. For saga-pattern read-only
@@ -333,7 +321,16 @@ impl EngineBuilder {
     where
         I: IntoIterator<Item = Aggregator>,
     {
-        self.aggregators.extend(aggregators);
+        for agg in aggregators {
+            // v0.4 aggregators (via Aggregator::for_type) carry an OCC
+            // marker — registration also flips the stream's write
+            // policy. Legacy aggregators (via Aggregator::new) leave
+            // it unset, registering for read-side fold only.
+            if agg.occ_required {
+                self.occ_required_streams.insert(agg.event_prefix.clone());
+            }
+            self.aggregators.push(agg);
+        }
         self
     }
 
@@ -481,7 +478,7 @@ impl Engine {
     ///
     /// `.expecting()` opts into per-stream CAS: the write errors if
     /// the stream moved past `expected`. Streams registered via
-    /// `EngineBuilder::with_aggregate::<A, F>` *require* `.expecting()`
+    /// `Aggregator::for_type::<A, F>` *require* `.expecting()`
     /// — emit without it errors with `EmitError::OccStreamMisuse`.
     pub fn emit<I: Into<EmitInput>>(&self, input: I) -> EmitBuilder<'_> {
         EmitBuilder {
@@ -893,7 +890,7 @@ mod tests {
     // ── Phase 5a — Aggregate-stream emit gating ──
 
     /// Aggregate registered for stream-policy testing.
-    #[derive(Default)]
+    #[derive(Default, Clone, Serialize, Deserialize)]
     struct UserAgg;
     impl crate::aggregate_v3::Aggregate for UserAgg {}
     impl crate::aggregate_v3::Apply<UserCreated> for UserAgg {
@@ -927,7 +924,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<UserAgg, UserCreated>()
+        .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .build();
 
         let result = engine.emit(UserCreated {
@@ -952,7 +949,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<UserAgg, UserCreated>()
+        .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .build();
 
         // OrderPlaced lives in category "order" — unregistered, default
@@ -1011,7 +1008,7 @@ mod tests {
         }
     }
 
-    #[derive(Default, Debug, PartialEq)]
+    #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
     struct Counter { value: i32 }
     impl crate::aggregate_v3::Aggregate for Counter {}
     impl crate::aggregate_v3::Apply<CounterFact> for Counter {
@@ -1031,7 +1028,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter, CounterFact>()
+        .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
 
         let id = Uuid::new_v4();
@@ -1049,7 +1046,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter, CounterFact>()
+        .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
 
         let id = Uuid::new_v4();
@@ -1075,7 +1072,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter, CounterFact>()
+        .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
 
         let id = Uuid::new_v4();
@@ -1113,7 +1110,7 @@ mod tests {
                 store.clone() as Arc<dyn CheckpointStore>,
                 store.clone() as Arc<dyn ReactorOutbox>,
             )
-            .with_aggregate::<Counter, CounterFact>()
+            .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
             .build()
         );
 
@@ -1156,7 +1153,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter, CounterFact>()
+        .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
 
         let id = Uuid::new_v4();
@@ -1321,7 +1318,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter, CounterFact>()
+        .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
 
         let id = Uuid::new_v4();

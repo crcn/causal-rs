@@ -95,6 +95,12 @@ pub struct Aggregator {
     pub event_type_id: TypeId,
     /// The aggregate type string.
     pub aggregate_type: String,
+    /// `true` for v0.4 aggregators constructed via
+    /// [`Aggregator::for_type`] — `EngineBuilder::with_aggregators`
+    /// marks `event_prefix` (= `F::CATEGORY`) as OCC-required so
+    /// `Engine::emit` rejects writes without `.expecting()`. Legacy
+    /// constructors leave it `false` for read-only fold registration.
+    pub occ_required: bool,
     /// Extract the aggregate ID from JSON payload (deserializes internally).
     json_extract_id: Arc<dyn Fn(&serde_json::Value) -> Option<Uuid> + Send + Sync>,
     /// Deserialize JSON and apply to a type-erased aggregate (&mut dyn Any = &mut A).
@@ -139,6 +145,7 @@ impl Aggregator {
             event_prefix,
             event_type_id,
             aggregate_type,
+            occ_required: false,
             codec,
             json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
                 let event: E = serde_json::from_value(payload.clone()).ok()?;
@@ -150,6 +157,74 @@ impl Aggregator {
                     .ok_or_else(|| anyhow::anyhow!("aggregate type mismatch in apply_to"))?;
                 let event: E = serde_json::from_value(data)?;
                 state.apply(event);
+                Ok(())
+            }),
+            clone_state: Arc::new(|state: &dyn Any| -> Box<dyn Any + Send + Sync> {
+                let s = state.downcast_ref::<A>().unwrap();
+                Box::new(s.clone())
+            }),
+            default_state: Arc::new(|| -> Box<dyn Any + Send + Sync> { Box::new(A::default()) }),
+            serialize_state: Arc::new(|state: &dyn Any| -> Result<serde_json::Value> {
+                let s = state
+                    .downcast_ref::<A>()
+                    .ok_or_else(|| anyhow::anyhow!("aggregate type mismatch in serialize_state"))?;
+                Ok(serde_json::to_value(s)?)
+            }),
+            deserialize_state: Arc::new(
+                |value: serde_json::Value| -> Result<Box<dyn Any + Send + Sync>> {
+                    let s: A = serde_json::from_value(value)?;
+                    Ok(Box::new(s))
+                },
+            ),
+        }
+    }
+
+    /// Construct a v0.4 Aggregator from `A: aggregate_v3::Aggregate +
+    /// Apply<F>` and `F: Fact`. Sets `occ_required = true` so
+    /// registration via `EngineBuilder::with_aggregators` also marks
+    /// `F::CATEGORY` as OCC-required on the write side.
+    ///
+    /// Stream id comes from `Fact::stream_id`; aggregate type string
+    /// comes from `std::any::type_name::<A>()` (deterministic within
+    /// a binary, sufficient for the in-memory registry).
+    pub fn for_type<A, F>() -> Self
+    where
+        A: crate::aggregate_v3::Aggregate
+            + crate::aggregate_v3::Apply<F>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned,
+        F: crate::fact::Fact,
+    {
+        let event_prefix = <F as crate::fact::Fact>::CATEGORY.to_string();
+        let event_type_id = TypeId::of::<F>();
+        let aggregate_type = std::any::type_name::<A>().to_string();
+
+        let codec = Arc::new(EventCodec {
+            event_prefix: event_prefix.clone(),
+            type_id: event_type_id,
+            decode: Arc::new(|payload| {
+                let fact: F = serde_json::from_value(payload.clone())?;
+                Ok(Arc::new(fact))
+            }),
+        });
+
+        Self {
+            event_prefix,
+            event_type_id,
+            aggregate_type,
+            occ_required: true,
+            codec,
+            json_extract_id: Arc::new(|payload: &serde_json::Value| -> Option<Uuid> {
+                let fact: F = serde_json::from_value(payload.clone()).ok()?;
+                Some(<F as crate::fact::Fact>::stream_id(&fact))
+            }),
+            apply_to: Arc::new(|state: &mut dyn Any, data: serde_json::Value| -> Result<()> {
+                let state = state
+                    .downcast_mut::<A>()
+                    .ok_or_else(|| anyhow::anyhow!("aggregate type mismatch in apply_to"))?;
+                let fact: F = serde_json::from_value(data)?;
+                <A as crate::aggregate_v3::Apply<F>>::apply(state, &fact);
                 Ok(())
             }),
             clone_state: Arc::new(|state: &dyn Any| -> Box<dyn Any + Send + Sync> {
