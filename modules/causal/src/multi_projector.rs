@@ -54,8 +54,9 @@ use crate::types::{LogCursor, PersistedEvent};
 /// Idempotent on `event.event_id` per C8 — at-least-once delivery.
 #[async_trait]
 pub trait MultiProjector: Send + Sync {
-    /// Persistent-subscription group name. See [`crate::Projector::GROUP_NAME`]
-    /// for semantics — same uniqueness and cursor-key role.
+    /// Persistent-subscription group name. See
+    /// [`crate::Projector::GROUP_NAME`] for the full uniqueness
+    /// contract (in-builder enforcement, cross-engine caveat).
     const GROUP_NAME: &'static str;
 
     /// Declared subscription. Non-empty. Each entry is a bare

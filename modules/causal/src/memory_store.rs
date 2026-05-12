@@ -49,6 +49,11 @@ pub struct MemoryStore {
     outbox: Arc<Mutex<Vec<OutboxRow>>>,
     /// Monotonic id generator for outbox rows.
     next_outbox_id: Arc<AtomicI64>,
+    /// DLQ attempt counter keyed by (consumer_id, source_event_id).
+    /// Survives ReactorRunner reconstruction within the store's
+    /// lifetime; lost on process crash (matches MemoryStore's
+    /// "no durability" position).
+    reactor_attempts: Arc<DashMap<(String, Uuid), u32>>,
 }
 
 impl MemoryStore {
@@ -61,6 +66,7 @@ impl MemoryStore {
             projection_failures: Arc::new(Mutex::new(Vec::new())),
             outbox: Arc::new(Mutex::new(Vec::new())),
             next_outbox_id: Arc::new(AtomicI64::new(1)),
+            reactor_attempts: Arc::new(DashMap::new()),
         }
     }
 
@@ -417,6 +423,27 @@ impl ReactorOutbox for MemoryStore {
     async fn outbox_delete(&self, id: i64) -> Result<()> {
         let mut outbox = self.outbox.lock();
         outbox.retain(|r| r.id != id);
+        Ok(())
+    }
+
+    async fn record_reactor_attempt(
+        &self,
+        consumer_id: &str,
+        source_event_id: Uuid,
+    ) -> Result<u32> {
+        let key = (consumer_id.to_string(), source_event_id);
+        let mut entry = self.reactor_attempts.entry(key).or_insert(0);
+        *entry += 1;
+        Ok(*entry)
+    }
+
+    async fn clear_reactor_attempts(
+        &self,
+        consumer_id: &str,
+        source_event_id: Uuid,
+    ) -> Result<()> {
+        let key = (consumer_id.to_string(), source_event_id);
+        self.reactor_attempts.remove(&key);
         Ok(())
     }
 }

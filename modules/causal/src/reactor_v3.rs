@@ -45,8 +45,9 @@ use crate::fact::Fact;
 pub trait Reactor: Send + Sync {
     type Trigger: Fact;
 
-    /// Persistent-subscription group name. See [`crate::Projector::GROUP_NAME`]
-    /// for semantics — same uniqueness and cursor-key role.
+    /// Persistent-subscription group name. See
+    /// [`crate::Projector::GROUP_NAME`] for the full uniqueness
+    /// contract (in-builder enforcement, cross-engine caveat).
     const GROUP_NAME: &'static str;
 
     /// Decide on output facts in response to a trigger. Pure — no I/O

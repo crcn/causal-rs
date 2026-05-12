@@ -72,7 +72,10 @@ pub struct OutboxRow {
 }
 
 /// Reactor outbox storage. Extends `CheckpointStore` with the atomic
-/// commit primitive that backs C12.
+/// commit primitive that backs C12, plus the DLQ attempt-counter
+/// surface that lets `ReactorRunner` track retries across step
+/// boundaries — and across engine restarts when backed by a durable
+/// store.
 #[async_trait]
 pub trait ReactorOutbox: CheckpointStore {
     /// Atomically: insert N outbox rows AND optionally advance a
@@ -101,4 +104,34 @@ pub trait ReactorOutbox: CheckpointStore {
     /// id MUST succeed (Ok), as the relay may retry after a partial
     /// crash.
     async fn outbox_delete(&self, id: i64) -> Result<()>;
+
+    /// Increment the attempt counter for a `(consumer_id,
+    /// source_event_id)` pair and return the new count. Called by
+    /// `ReactorRunner` on every `react()` failure to track retries
+    /// for the DLQ path. Idempotent semantics — backends with
+    /// transactions SHOULD `INSERT ... ON CONFLICT DO UPDATE SET
+    /// count = count + 1 RETURNING count`. The returned value is the
+    /// count INCLUDING this attempt (first failure returns 1).
+    ///
+    /// **Persistence contract**: durable backends MUST persist this
+    /// across process restarts. In-memory backends (MemoryStore)
+    /// trivially persist within the store's lifetime; process crash
+    /// loses state, which matches MemoryStore's documented "no
+    /// durability" position.
+    async fn record_reactor_attempt(
+        &self,
+        consumer_id: &str,
+        source_event_id: Uuid,
+    ) -> Result<u32>;
+
+    /// Clear the attempt counter for a `(consumer_id,
+    /// source_event_id)` pair. Called on successful `react()` (the
+    /// next failure should start fresh) and after the DLQ mapper
+    /// has fired (the next time this event is seen — if ever — is
+    /// a fresh decision). Idempotent.
+    async fn clear_reactor_attempts(
+        &self,
+        consumer_id: &str,
+        source_event_id: Uuid,
+    ) -> Result<()>;
 }

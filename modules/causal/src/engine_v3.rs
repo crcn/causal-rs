@@ -471,10 +471,35 @@ impl EngineBuilder {
         for agg in aggregators {
             // v0.4 aggregators (via Aggregator::for_type) carry an OCC
             // marker — registration also flips the stream's write
-            // policy. Legacy aggregators (via Aggregator::new) leave
+            // policy. Legacy aggregators (via Aggregator::fold) leave
             // it unset, registering for read-side fold only.
             if agg.occ_required {
                 self.occ_required_streams.insert(agg.event_prefix.clone());
+            }
+            // Reject duplicate Aggregate::NAME within one builder —
+            // two aggregators sharing the registry key
+            // `{NAME}:{id}` would silently overwrite each other's
+            // state. Same protective pattern as `claim_group_name`.
+            //
+            // Multiple aggregators with the same NAME folding
+            // DIFFERENT Fact types into one Aggregate (the multi-Fact
+            // Apply<F1> + Apply<F2> case) is legitimate — those
+            // SHOULD share a NAME by construction (same A). To
+            // distinguish that case from a true collision: assert
+            // also that event_prefix differs.
+            if let Some(existing) = self.aggregators.iter().find(|a| {
+                a.aggregate_type == agg.aggregate_type
+                    && a.event_prefix == agg.event_prefix
+            }) {
+                panic!(
+                    "duplicate Aggregate::NAME `{}` registered against the \
+                     same Fact CATEGORY `{}` — two aggregators MUST NOT \
+                     share a registry key. Multi-Fact aggregates folding \
+                     different Fact streams are fine (Apply<F1> + Apply<F2> \
+                     with the same A::NAME); same Fact registered twice \
+                     is not.",
+                    agg.aggregate_type, existing.event_prefix,
+                );
             }
             self.aggregators.push(agg);
         }
@@ -609,6 +634,9 @@ impl EngineBuilder {
 pub struct Engine {
     log:                   Arc<dyn EventLogBackend>,
     checkpoint:            Arc<dyn CheckpointStore>,
+    /// Held alongside the relay's handle so `settle` can check
+    /// `outbox_pending` for race-free quiescence detection.
+    outbox:                Arc<dyn ReactorOutbox>,
     shutdown_tx:           broadcast::Sender<()>,
     handles:               Vec<JoinHandle<()>>,
     occ_required_streams:  std::collections::HashSet<String>,
@@ -657,7 +685,7 @@ impl Engine {
         handles.push(relay_task);
 
         Self {
-            log, checkpoint, shutdown_tx, handles,
+            log, checkpoint, outbox, shutdown_tx, handles,
             occ_required_streams, default_metadata,
             aggregators, consumer_ids,
         }
@@ -728,11 +756,13 @@ impl Engine {
     }
 
     async fn execute_emit(&self, b: EmitBuilder<'_>) -> Result<EmitResult> {
-        // Empty batch is a successful no-op. Callers that build a
-        // `Vec<F>` from `.filter()` results shouldn't have to special-
-        // case the empty case at the emit site.
+        // Empty batch is a successful no-op. Returns the log's
+        // current latest position so a downstream `settle(result)`
+        // waits for any pre-existing pending work to drain (rather
+        // than returning trivially against `LogCursor::ZERO`).
         if b.input.facts.is_empty() {
-            return Ok(EmitResult { position: LogCursor::ZERO, version: None });
+            let position = self.log.latest_position().await?;
+            return Ok(EmitResult { position, version: None });
         }
 
         // Stream-policy gate: OCC-required streams demand `.expecting()`.
@@ -868,22 +898,55 @@ impl Engine {
         curr
     }
 
-    /// Wait until every registered consumer has caught up to the
-    /// position recorded in `emit_result`. Composes over
-    /// [`await_observed_by`](Self::await_observed_by) — one cursor
-    /// poll per consumer until they all clear.
+    /// Wait until every reactor chain triggered by `emit_result`
+    /// has fully quiesced — every consumer caught up, every reactor
+    /// output drained through the outbox to the log, no pending
+    /// work remaining.
     ///
-    /// **Semantic vs. legacy v0.3 `.settled()`**: v0.3's settled was
-    /// an in-process synchronous wait — emit triggered an inline
-    /// settle that ran reactors in the same task. v0.4's settle is
-    /// a cursor-poll loop with bounded latency based on consumer
-    /// batch size + supervisor poll interval. The end state is the
-    /// same; the wait mechanism is different.
-    pub async fn settle(&self, result: EmitResult) -> Result<()> {
-        for id in &self.consumer_ids {
-            self.await_observed_by(id, result.position).await?;
+    /// Algorithm:
+    ///
+    ///   1. Read `latest = log.latest_position()`.
+    ///   2. Wait for every consumer cursor to reach `latest`.
+    ///   3. Wait for the outbox to drain (`outbox_pending().len()
+    ///      == 0`).
+    ///   4. Re-read latest. If unchanged from step 1, the chain has
+    ///      quiesced — return Ok. Otherwise loop (new events
+    ///      appeared while waiting).
+    ///
+    /// This terminates for well-formed reactor topologies because
+    /// each input event produces a bounded number of outputs; the
+    /// outbox eventually empties; consumers eventually catch up;
+    /// no new events can appear. Self-feedback reactors (a reactor
+    /// whose output triggers itself) are NOT well-formed under
+    /// v0.4 (see [`Reactor`] doc) and will loop forever here too.
+    ///
+    /// **Semantic vs. legacy v0.3 `.settled()`**: same end-state
+    /// (the full causal chain has run), different mechanism. v0.3
+    /// ran reactors inline in the emitting task; v0.4 runs them
+    /// asynchronously in supervisor tasks and `settle` polls their
+    /// cursors. Bounded latency depends on consumer batch size +
+    /// supervisor poll interval.
+    pub async fn settle(&self, _result: EmitResult) -> Result<()> {
+        loop {
+            let p1 = self.log.latest_position().await?;
+
+            // Wait for every consumer to catch up to p1.
+            for id in &self.consumer_ids {
+                self.await_observed_by(id, p1).await?;
+            }
+
+            // Wait for the relay to drain everything consumers
+            // produced while we were waiting. Bounded by relay's
+            // poll interval; one sleep usually enough.
+            while !self.outbox.outbox_pending(1).await?.is_empty() {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+
+            // If no new events landed in the log during the above
+            // waits, the chain has quiesced. Otherwise loop.
+            let p2 = self.log.latest_position().await?;
+            if p1 == p2 { return Ok(()); }
         }
-        Ok(())
     }
 
     /// Block until consumer `id` has caught up to `pos`. Polls the
@@ -1663,6 +1726,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registering_one_aggregate_against_two_facts_is_allowed() {
+        // Multi-Fact aggregates: same A::NAME registered with two
+        // distinct Apply<F> impls is legitimate (e.g. PipelineState
+        // folding ScrapeEvent + LifecycleEvent). The collision check
+        // distinguishes "same NAME + same Fact CATEGORY" (panic)
+        // from "same NAME + different Fact CATEGORYs" (allowed).
+
+        #[derive(Default, Debug, Clone, Serialize, Deserialize)]
+        struct Multi { hits: u32 }
+        impl crate::aggregate_v3::Aggregate for Multi {
+            const NAME: &'static str = "Multi";
+        }
+        impl crate::aggregate_v3::Apply<Tick> for Multi {
+            fn apply(&mut self, _t: &Tick) { self.hits += 1; }
+        }
+        // Second Fact type for the same Aggregate.
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Pong { pong_id: Uuid, occurred_at: DateTime<Utc> }
+        impl Fact for Pong {
+            const CATEGORY: &'static str = "pong";
+            fn name(&self) -> &str { "pong" }
+            fn stream_id(&self) -> Uuid { self.pong_id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+        impl crate::aggregate_v3::Apply<Pong> for Multi {
+            fn apply(&mut self, _p: &Pong) { self.hits += 1; }
+        }
+
+        let store = store();
+        let _engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators(vec![
+            crate::aggregator::Aggregator::fold::<Multi, Tick>(),
+            crate::aggregator::Aggregator::fold::<Multi, Pong>(),
+        ])
+        .build();
+        // No panic — different Fact CATEGORYs.
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "duplicate Aggregate::NAME `TickCounter`")]
+    async fn registering_two_aggregators_with_same_name_panics() {
+        // Two aggregators with the same Aggregate::NAME would collide
+        // on the registry key `{NAME}:{id}` and silently overwrite
+        // each other's state. EngineBuilder catches this at
+        // registration time.
+        //
+        // Pattern: legacy `Aggregator::new(...)` returned non-OCC
+        // aggregators that pre-v0.4 tests register two of. Under
+        // v0.4 both would need distinct A::NAME consts. The check
+        // protects users from naming both `"TickCounter"` by mistake.
+        let store = store();
+        let _engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators(vec![
+            crate::aggregator::Aggregator::fold::<TickCounter, Tick>(),
+            crate::aggregator::Aggregator::fold::<TickCounter, Tick>(),
+            // ↑ same NAME twice — panic here.
+        ]);
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "duplicate GROUP_NAME `users`")]
     async fn registering_two_consumers_with_same_group_name_panics() {
         // Two UserRoster instances would share a cursor key — silent
@@ -1849,6 +1980,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_settle_waits_for_reactor_chains_to_quiesce() {
+        // The bug: settle waited only for direct consumers to reach
+        // the emit position. Reactor outputs flowing through the
+        // relay → log → downstream consumers weren't covered.
+        //
+        // Setup:
+        //   emit UserCreated
+        //   → WelcomeReactor reacts, emits WelcomeQueued (via outbox)
+        //   → relay drains WelcomeQueued to log
+        //   → WelcomeCounter projector observes WelcomeQueued
+        //
+        // After fix: settle waits until log position stabilizes AND
+        // every consumer has caught up to that stable position.
+        let store = store();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_c = counter.clone();
+
+        struct WelcomeCounter(Arc<AtomicUsize>);
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct WelcomeQueuedFact { user_id: Uuid }
+        impl Fact for WelcomeQueuedFact {
+            const CATEGORY: &'static str = "welcome";
+            fn name(&self) -> &str { "welcome_queued" }
+            fn stream_id(&self) -> Uuid { self.user_id }
+        }
+        #[async_trait]
+        impl Projector for WelcomeCounter {
+            type Fact = WelcomeQueuedFact;
+            const GROUP_NAME: &'static str = "settle.chain.counter";
+            async fn project(
+                &self, _f: &WelcomeQueuedFact, _ctx: Ctx<'_>,
+            ) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_reactor(WelcomeReactor)
+        .with_projector(WelcomeCounter(counter_c))
+        .build();
+
+        let result = engine.emit(UserCreated {
+            user_id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).await.unwrap();
+
+        engine.settle(result).await.unwrap();
+
+        // Without chain-aware settle: this assert is flaky — the
+        // WelcomeCounter may not have observed the reactor's
+        // downstream output yet.
+        // With chain-aware settle: the assert is deterministic.
+        assert_eq!(counter.load(Ordering::SeqCst), 1,
+                   "settle should wait until the WelcomeReactor → \
+                    relay → WelcomeCounter chain quiesces");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn engine_settle_waits_for_every_consumer_to_catch_up() {
         // After emit + settle, every registered consumer's cursor is
         // ≥ the emit position. Pin the contract.
@@ -1874,6 +2070,49 @@ mod tests {
         // After settle, the projector has definitely processed the
         // event — no polling sleep needed.
         assert_eq!(seen.lock().len(), 1);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_emit_followed_by_settle_waits_for_pre_existing_work() {
+        // The bug: empty emit returned EmitResult { position: ZERO,
+        // version: None }. settle(result) trivially returned because
+        // every consumer cursor was >= ZERO — even if a previous emit
+        // had pending work the consumer hadn't processed yet.
+        //
+        // After fix: empty emit returns the log's current latest
+        // position, so settle waits for pending work to drain.
+        let store = store();
+        let roster = UserRoster::default();
+        let seen = roster.seen.clone();
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_projector(roster)
+        .build();
+
+        // Emit some real work — consumer hasn't necessarily processed
+        // it yet (async runner).
+        let _ = engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).await.unwrap();
+
+        // Now an empty emit. Returns the log's current latest
+        // position, NOT ZERO.
+        let empty_result = engine.emit(Vec::<UserCreated>::new()).await.unwrap();
+        let latest = EventLogBackend::latest_position(store.as_ref()).await.unwrap();
+        assert_eq!(empty_result.position, latest,
+                   "empty emit returns log.latest_position(), not ZERO");
+
+        // settle on the empty result waits for the pre-existing work.
+        engine.settle(empty_result).await.unwrap();
+        assert_eq!(seen.lock().len(), 1,
+                   "settle after empty emit drained the prior UserCreated");
 
         engine.shutdown().await.unwrap();
     }

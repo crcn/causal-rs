@@ -21,11 +21,9 @@
 //! — but that initialization is the engine builder's job, not the
 //! runner's. The runner just consumes from the cursor it finds.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -86,11 +84,6 @@ pub struct ReactorRunner<R: Reactor> {
     /// Retry budget — applies only when `dlq_mapper` is set. Without
     /// a mapper, reactors retry indefinitely (supervisor backoff).
     max_attempts: u32,
-    /// Per-trigger attempt counter. In-memory; survives across
-    /// step boundaries within one runner's lifetime, resets on
-    /// engine restart. Postgres-backed backends would persist this
-    /// in a `causal_handler_attempts` table for crash-safe DLQ.
-    attempts: Mutex<HashMap<Uuid, u32>>,
 }
 
 impl<R: Reactor> ReactorRunner<R>
@@ -112,7 +105,6 @@ where
             hydrated: OnceCell::new(),
             dlq_mapper: None,
             max_attempts: 0,
-            attempts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -190,7 +182,11 @@ where
             //    the failing event, and clear the attempt counter.
             let emitted = match self.reactor.react(&trigger, ctx).await {
                 Ok(events) => {
-                    self.attempts.lock().remove(&event.event_id);
+                    // Clear persisted attempt count on success so a
+                    // future failure starts fresh.
+                    self.outbox
+                        .clear_reactor_attempts(&self.consumer_id, event.event_id)
+                        .await?;
                     events
                 }
                 Err(e) => {
@@ -198,14 +194,12 @@ where
                         reg.restore_state(r);
                     }
 
-                    // Increment attempts BEFORE checking — first
-                    // failure → attempts = 1.
-                    let attempts = {
-                        let mut a = self.attempts.lock();
-                        let entry = a.entry(event.event_id).or_insert(0);
-                        *entry += 1;
-                        *entry
-                    };
+                    // Increment via the persistent store. Survives
+                    // ReactorRunner reconstruction; durable backends
+                    // (Postgres, etc.) survive process crashes too.
+                    let attempts = self.outbox
+                        .record_reactor_attempt(&self.consumer_id, event.event_id)
+                        .await?;
 
                     if let Some(mapper) = self.dlq_mapper.as_ref() {
                         if attempts >= self.max_attempts {
@@ -217,7 +211,9 @@ where
                                 attempts,
                             };
                             let mapped = mapper(info);
-                            self.attempts.lock().remove(&event.event_id);
+                            self.outbox
+                                .clear_reactor_attempts(&self.consumer_id, event.event_id)
+                                .await?;
 
                             // Build outbox row (if mapper returned a
                             // Fact) and atomically commit + advance.
@@ -700,6 +696,66 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(anyhow!("boom"))
         }
+    }
+
+    #[tokio::test]
+    async fn dlq_attempt_count_persists_across_runner_instances() {
+        // The bug: ReactorRunner tracked attempts in an in-memory
+        // HashMap. Process crash → on restart attempts reset to 0
+        // → retry storm.
+        //
+        // After fix: attempts live in the ReactorOutbox via
+        // `record_reactor_attempt` / `clear_reactor_attempts`. A
+        // new ReactorRunner pointing at the same outbox sees the
+        // same persisted count.
+        let store = Arc::new(MemoryStore::new());
+        let payload = OrderPlaced {
+            order_id:    Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        };
+        let _ = append_trigger(&store, &payload);
+
+        let dlq_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mk_mapper = || -> DlqMapperArc {
+            let dlq_calls = dlq_calls.clone();
+            std::sync::Arc::new(move |info: DlqInfo| {
+                dlq_calls.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new(HandlerFailed {
+                    group_name: info.group_name,
+                    attempts:   info.attempts,
+                }) as Box<dyn crate::engine_v3::ErasedFact>)
+            })
+        };
+
+        // Runner A: fail twice. Attempts persist to outbox.
+        let runner_a = ReactorRunner::new(
+            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            "persist-attempts",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        ).with_dlq(mk_mapper(), 3);
+        assert!(runner_a.step(10).await.is_err());
+        assert!(runner_a.step(10).await.is_err());
+        assert_eq!(dlq_calls.load(Ordering::SeqCst), 0,
+                   "no DLQ yet (2 attempts < 3)");
+
+        // Drop runner_a — simulates engine restart.
+        drop(runner_a);
+
+        // Runner B: same backend, same consumer_id, fresh in-memory
+        // state. With persistent attempts, one more failure triggers
+        // the mapper.
+        let runner_b = ReactorRunner::new(
+            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            "persist-attempts",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        ).with_dlq(mk_mapper(), 3);
+
+        let outcome = runner_b.step(10).await.unwrap();
+        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        assert_eq!(dlq_calls.load(Ordering::SeqCst), 1,
+                   "third attempt across runners triggers mapper");
     }
 
     #[tokio::test]

@@ -34,10 +34,18 @@ pub trait Projector: Send + Sync {
     /// Persistent-subscription group name (= Kurrent persistent
     /// subscription group identity). Used as the consumer's cursor
     /// key in `CheckpointStore`, and as the group name when subscribing
-    /// to `$et-{CATEGORY}:*` against a Kurrent backend. MUST be
-    /// globally unique within an `EngineBuilder` — duplicates would
-    /// silently share a cursor. The builder panics on registration
-    /// if two consumers share a GROUP_NAME.
+    /// to `$et-{CATEGORY}:*` against a Kurrent backend.
+    ///
+    /// **Uniqueness contract:**
+    /// - Within one `EngineBuilder`: enforced. Builder panics on
+    ///   duplicate registration.
+    /// - Across engines sharing one `CheckpointStore`: **NOT
+    ///   enforced by the framework.** Two engines concurrently
+    ///   running with the same `GROUP_NAME` against the same backend
+    ///   will silently corrupt each other's cursors. Backends that
+    ///   support advisory locks (Postgres) should acquire one keyed
+    ///   on `GROUP_NAME` at engine build time. Single-process
+    ///   deployments (one engine per process) are unaffected.
     const GROUP_NAME: &'static str;
 
     /// Cross-consumer dependency declaration. The runner refuses to
