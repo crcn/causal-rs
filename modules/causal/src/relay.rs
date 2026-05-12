@@ -18,13 +18,19 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
+use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::{OutboxRow, ReactorOutbox};
 use crate::event_log::EventLogBackend;
 use crate::types::NewEvent;
 
 pub struct RelayLoop {
-    log:    Arc<dyn EventLogBackend>,
-    outbox: Arc<dyn ReactorOutbox>,
+    log:                 Arc<dyn EventLogBackend>,
+    outbox:              Arc<dyn ReactorOutbox>,
+    /// Engine-level aggregator registry. Folded after each successful
+    /// log.append so reactor-emitted events update the same out-of-band
+    /// state that `engine.snapshot::<A>(stream_id)` reads from.
+    /// `None` if the engine has no aggregators registered.
+    engine_aggregators:  Option<Arc<AggregatorRegistry>>,
 }
 
 impl RelayLoop {
@@ -32,7 +38,19 @@ impl RelayLoop {
         log: Arc<dyn EventLogBackend>,
         outbox: Arc<dyn ReactorOutbox>,
     ) -> Self {
-        Self { log, outbox }
+        Self { log, outbox, engine_aggregators: None }
+    }
+
+    /// Attach the engine's aggregator registry so reactor outputs fold
+    /// into it after `log.append`. Without this, `engine.snapshot()`
+    /// only sees caller-emitted events; reactor side effects on
+    /// `PipelineState`-style cross-fact aggregates stay invisible.
+    pub fn with_engine_aggregators(
+        mut self,
+        aggregators: Option<Arc<AggregatorRegistry>>,
+    ) -> Self {
+        self.engine_aggregators = aggregators;
+        self
     }
 
     /// Drain up to `batch` outbox rows. Returns the number of rows
@@ -46,8 +64,13 @@ impl RelayLoop {
         let mut delivered = 0;
         for row in pending {
             let new_event = self.row_to_new_event(&row);
+            let event_type = new_event.event_type.clone();
+            let payload = new_event.payload.clone();
             self.log.append(new_event).await
                 .with_context(|| format!("append outbox row id={}", row.id))?;
+            if let Some(reg) = &self.engine_aggregators {
+                reg.apply_event(&event_type, &payload);
+            }
             self.outbox.outbox_delete(row.id).await
                 .with_context(|| format!("outbox_delete id={}", row.id))?;
             delivered += 1;

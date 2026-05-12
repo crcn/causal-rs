@@ -709,8 +709,13 @@ impl Engine {
             handles.push(task);
         }
 
-        // Relay supervisor: drain reactor outbox into the log.
-        let relay = RelayLoop::new(log.clone(), outbox.clone());
+        // Relay supervisor: drain reactor outbox into the log. The
+        // engine's aggregator registry is folded after every successful
+        // append so reactor-emitted events become visible via
+        // `engine.snapshot()` — without this, only caller-emitted
+        // events update the engine-level state.
+        let relay = RelayLoop::new(log.clone(), outbox.clone())
+            .with_engine_aggregators(aggregators.clone());
         let mut relay_rx = shutdown_tx.subscribe();
         let relay_task = tokio::spawn(async move {
             supervise_relay(relay, &mut relay_rx).await;
