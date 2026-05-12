@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
@@ -110,22 +110,127 @@ pub enum EmitError {
     OccStreamMisuse { category: String },
 }
 
-/// Caller-supplied envelope fields for `emit_in` / `append_in`.
+/// Result of a successful `emit(...).await`.
 ///
-/// `Engine::emit` and `Engine::append` (without `_in`) auto-generate
-/// `correlation_id` and leave `parent_id` + `metadata` empty — fine
-/// for ingestion gateways that originate events. Command handlers
-/// responding to upstream requests SHOULD use `_in` and propagate
-/// `correlation_id` + `parent_id` from the trigger so causal-chain
-/// tracing works across the system.
-#[derive(Debug, Clone, Default)]
-pub struct WriteOptions {
-    /// `None` → engine generates a fresh `Uuid::new_v4()`.
-    pub correlation_id: Option<Uuid>,
-    /// `None` → no parent (root event).
-    pub parent_id:      Option<Uuid>,
-    /// Empty by default. Stamp `_run_id`, `_schema_v`, `_phase` etc. here.
-    pub metadata:       Metadata,
+/// `position` is the global log cursor of the last event written
+/// (single emits and batches alike). `version` is the per-stream
+/// version after the write — `None` for streams that aren't
+/// aggregate-scoped (the global log accepts the write but doesn't
+/// track a per-stream cursor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmitResult {
+    pub position: LogCursor,
+    pub version:  Option<StreamVersion>,
+}
+
+/// Type-erased view of a [`Fact`] for the emit builder.
+///
+/// `EmitInput` stores facts behind this trait so [`EmitBuilder`] is
+/// non-generic — one builder type handles any Fact, single or
+/// batched. The blanket impl below covers every `Fact` automatically;
+/// downstream code never names this trait.
+trait ErasedFact: Send + Sync {
+    fn category(&self) -> &'static str;
+    fn variant_name(&self) -> &str;
+    fn stream_id(&self) -> Uuid;
+    fn occurred_at(&self) -> Option<DateTime<Utc>>;
+    fn to_value(&self) -> Result<serde_json::Value>;
+}
+
+impl<F: Fact> ErasedFact for F {
+    fn category(&self) -> &'static str { <F as Fact>::CATEGORY }
+    fn variant_name(&self) -> &str { Fact::name(self) }
+    fn stream_id(&self) -> Uuid { Fact::stream_id(self) }
+    fn occurred_at(&self) -> Option<DateTime<Utc>> { Fact::occurred_at(self) }
+    fn to_value(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self).map_err(Into::into)
+    }
+}
+
+/// What `Engine::emit` accepts: a single Fact, or a batch of Facts
+/// of the same type. Both produced automatically via `Into` impls —
+/// callers write `engine.emit(fact)` or `engine.emit(vec![f1, f2])`.
+pub struct EmitInput {
+    facts: Vec<Box<dyn ErasedFact>>,
+}
+
+impl<F: Fact> From<F> for EmitInput {
+    fn from(f: F) -> Self {
+        Self { facts: vec![Box::new(f) as Box<dyn ErasedFact>] }
+    }
+}
+
+impl<F: Fact> From<Vec<F>> for EmitInput {
+    fn from(v: Vec<F>) -> Self {
+        Self {
+            facts: v.into_iter()
+                .map(|f| Box::new(f) as Box<dyn ErasedFact>)
+                .collect(),
+        }
+    }
+}
+
+/// Chainable per-emit envelope. Construct via [`Engine::emit`]; finish
+/// with `.await`. Methods return `self` so chains compose freely.
+///
+/// `EmitBuilder` is non-generic — Facts are type-erased at construction
+/// time via the `Into<EmitInput>` impls, so one builder type handles
+/// any Fact, single or batched.
+pub struct EmitBuilder<'a> {
+    engine:         &'a Engine,
+    input:          EmitInput,
+    expected:       Option<StreamVersion>,
+    correlation_id: Option<Uuid>,
+    parent_id:      Option<Uuid>,
+    metadata:       Metadata,
+}
+
+impl<'a> EmitBuilder<'a> {
+    /// Opt-in CAS: the write errors if the target stream moved past
+    /// `version`. Required for streams registered via
+    /// `EngineBuilder::with_aggregate::<A, F>`; optional but allowed
+    /// on any stream.
+    pub fn expecting(mut self, version: StreamVersion) -> Self {
+        self.expected = Some(version);
+        self
+    }
+
+    /// Stamp `correlation_id` on every fact in the batch. Defaults to
+    /// a fresh UUID per emit; command handlers should propagate the
+    /// trigger's `correlation_id` here so causal-chain tracing works
+    /// across the system.
+    pub fn correlation_id(mut self, id: Uuid) -> Self {
+        self.correlation_id = Some(id);
+        self
+    }
+
+    /// Stamp `parent_id` on every fact in the batch. Defaults to
+    /// `None` (root event). Command handlers should pass the trigger's
+    /// `event_id` here.
+    pub fn parent_id(mut self, id: Uuid) -> Self {
+        self.parent_id = Some(id);
+        self
+    }
+
+    /// Add a metadata key/value to every fact in the batch. Multiple
+    /// `.metadata(...)` calls accumulate. Application code uses this
+    /// for `_run_id`, `_schema_v`, `_phase`, etc.
+    pub fn metadata<V: Into<serde_json::Value>>(mut self, key: &str, value: V) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+}
+
+impl<'a> std::future::IntoFuture for EmitBuilder<'a> {
+    type Output = Result<EmitResult>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmitResult>> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let engine = self.engine;
+            engine.execute_emit(self).await
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -354,61 +459,49 @@ impl Engine {
         Self { log, checkpoint, shutdown_tx, handles, occ_required_streams }
     }
 
-    /// Emit a fact to the log with auto-generated correlation_id and
-    /// no parent / metadata. Convenience for ingestion gateways or
-    /// tests. Command handlers responding to upstream requests should
-    /// use [`emit_in`](Self::emit_in) to propagate correlation_id /
-    /// parent_id from the trigger.
-    pub async fn emit<F: Fact>(&self, fact: F) -> Result<LogCursor> {
-        self.emit_in(fact, WriteOptions::default()).await
-    }
-
-    /// Emit a fact with explicit envelope fields. Rejects with
-    /// `EmitError::OccStreamMisuse` if the fact's stream category
-    /// was registered as OCC-required (via
-    /// `EngineBuilder::with_aggregate`). Partially closes BS1 — see
-    /// the BS table in the design doc.
-    pub async fn emit_in<F: Fact>(
-        &self,
-        fact: F,
-        opts: WriteOptions,
-    ) -> Result<LogCursor> {
-        let category = F::CATEGORY;
-        if self.occ_required_streams.contains(category) {
-            return Err(anyhow!(EmitError::OccStreamMisuse {
-                category: category.into(),
-            }));
+    /// Emit one or more Facts to the log.
+    ///
+    /// Returns an [`EmitBuilder`] — chain `.expecting()`, `.metadata()`,
+    /// `.correlation_id()`, `.parent_id()` and finally `.await` to run
+    /// the write. `await` directly to use defaults.
+    ///
+    /// ```ignore
+    /// // simplest:
+    /// engine.emit(fact).await?;
+    /// // CAS to an aggregate stream:
+    /// engine.emit(fact).expecting(version).await?;
+    /// // command-handler envelope:
+    /// engine.emit(out)
+    ///     .correlation_id(trigger_corr)
+    ///     .parent_id(trigger_event_id)
+    ///     .await?;
+    /// // batch:
+    /// engine.emit(vec![f1, f2]).expecting(v).await?;
+    /// ```
+    ///
+    /// `.expecting()` opts into per-stream CAS: the write errors if
+    /// the stream moved past `expected`. Streams registered via
+    /// `EngineBuilder::with_aggregate::<A, F>` *require* `.expecting()`
+    /// — emit without it errors with `EmitError::OccStreamMisuse`.
+    pub fn emit<I: Into<EmitInput>>(&self, input: I) -> EmitBuilder<'_> {
+        EmitBuilder {
+            engine: self,
+            input: input.into(),
+            expected: None,
+            correlation_id: None,
+            parent_id: None,
+            metadata: Metadata::new(),
         }
-        let event_type = format!("{}:{}", category, fact.name());
-        // Producer-claimed time wins; otherwise persistence stamps now.
-        let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
-        let stream_id = fact.stream_id();
-        let payload = serde_json::to_value(&fact)?;
-        let new_event = NewEvent {
-            event_id:        Uuid::new_v4(),
-            parent_id:       opts.parent_id,
-            correlation_id:  opts.correlation_id.unwrap_or_else(Uuid::new_v4),
-            event_type,
-            payload,
-            created_at:      occurred_at,
-            aggregate_type:  Some(category.to_string()),
-            aggregate_id:    Some(stream_id),
-            metadata:        opts.metadata,
-            ephemeral:       None,
-            persistent:      true,
-        };
-        let result = self.log.append(new_event).await?;
-        Ok(result.position)
     }
 
     /// Hydrate an aggregate by folding its stream from version 0.
     /// Returns the aggregate state and the current stream version
-    /// (for use as `expected` in a subsequent `append`).
+    /// (for use as `expected` in a subsequent `emit(...).expecting(v)`).
     ///
     /// Stream identity comes from `F::CATEGORY` + `id`; the same
-    /// convention `Engine::append<A, F>` uses on write. Caller picks
-    /// both type params so the same `Aggregate` impl can fold
-    /// different Fact streams (e.g. `load::<PipelineState, ScrapeEvent>`).
+    /// convention `Engine::emit` uses on write. Caller picks both
+    /// type params so the same `Aggregate` impl can fold different
+    /// Fact streams (e.g. `load::<PipelineState, ScrapeEvent>`).
     pub async fn load<A, F>(
         &self,
         id: Uuid,
@@ -430,69 +523,81 @@ impl Engine {
         Ok((agg, version))
     }
 
-    /// CAS-protected append to an aggregate stream (per C6).
-    /// Convenience over [`append_in`](Self::append_in) with default
-    /// envelope (auto correlation_id, no parent, empty metadata).
-    pub async fn append<A, F>(
-        &self,
-        id: Uuid,
-        expected: StreamVersion,
-        facts: Vec<F>,
-    ) -> Result<StreamVersion>
-    where
-        A: Aggregate + Apply<F>,
-        F: Fact,
-    {
-        self.append_in::<A, F>(id, expected, facts, WriteOptions::default()).await
-    }
+    async fn execute_emit(&self, b: EmitBuilder<'_>) -> Result<EmitResult> {
+        if b.input.facts.is_empty() {
+            anyhow::bail!("emit called with an empty batch");
+        }
 
-    /// CAS-protected append with explicit envelope fields. Each fact
-    /// in the batch carries the same `correlation_id` and `parent_id`
-    /// from `opts`. Errors with `ConflictError` if the stream has
-    /// moved past `expected`. The standard recovery is to `load<A, F>`
-    /// again, re-decide on the new state, and retry. On failure
-    /// mid-batch, prior appends remain durable.
-    pub async fn append_in<A, F>(
-        &self,
-        id: Uuid,
-        expected: StreamVersion,
-        facts: Vec<F>,
-        opts: WriteOptions,
-    ) -> Result<StreamVersion>
-    where
-        A: Aggregate + Apply<F>,
-        F: Fact,
-    {
-        // A: Apply<F> is the contract that this Fact belongs to this
-        // Aggregate. Caller-facing — unused at runtime here.
-        let _ = std::marker::PhantomData::<A>;
-        let correlation = opts.correlation_id.unwrap_or_else(Uuid::new_v4);
-        let mut current_expected = expected;
-        let mut last_version = expected;
-        for fact in facts {
-            let event_type = format!("{}:{}", F::CATEGORY, fact.name());
+        // Stream-policy gate: OCC-required streams demand `.expecting()`.
+        // We check on the FIRST fact's category — all facts in a batch
+        // share the same Fact type, so they share CATEGORY.
+        let category = b.input.facts[0].category();
+        let is_occ_required = self.occ_required_streams.contains(category);
+        if is_occ_required && b.expected.is_none() {
+            return Err(anyhow!(EmitError::OccStreamMisuse {
+                category: category.into(),
+            }));
+        }
+
+        // For CAS batches, all facts must target the same stream_id
+        // — there is one expected_version per stream, not per fact.
+        if let Some(_) = b.expected {
+            let first_id = b.input.facts[0].stream_id();
+            for f in b.input.facts.iter().skip(1) {
+                if f.stream_id() != first_id {
+                    anyhow::bail!(
+                        "emit(...).expecting(...): batch facts must share \
+                         stream_id (CAS targets a single stream); first={}, \
+                         conflicting={}",
+                        first_id,
+                        f.stream_id(),
+                    );
+                }
+            }
+        }
+
+        let correlation = b.correlation_id.unwrap_or_else(Uuid::new_v4);
+        let mut current_expected = b.expected.unwrap_or(StreamVersion::ZERO);
+        let mut last_position = LogCursor::ZERO;
+        let mut last_version: Option<StreamVersion> = None;
+
+        for fact in b.input.facts {
+            let event_type = format!("{}:{}", fact.category(), fact.variant_name());
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
-            let payload = serde_json::to_value(&fact)?;
+            let stream_id = fact.stream_id();
+            let payload = fact.to_value()?;
             let new_event = NewEvent {
                 event_id:        Uuid::new_v4(),
-                parent_id:       opts.parent_id,
+                parent_id:       b.parent_id,
                 correlation_id:  correlation,
                 event_type,
                 payload,
                 created_at:      occurred_at,
-                aggregate_type:  Some(F::CATEGORY.to_string()),
-                aggregate_id:    Some(id),
-                metadata:        opts.metadata.clone(),
+                aggregate_type:  Some(fact.category().to_string()),
+                aggregate_id:    Some(stream_id),
+                metadata:        b.metadata.clone(),
                 ephemeral:       None,
                 persistent:      true,
             };
-            let result = self.log
-                .append_to_stream(F::CATEGORY, id, current_expected, new_event)
-                .await?;
-            last_version = result.version.unwrap_or(current_expected);
-            current_expected = last_version;
+
+            let result = if b.expected.is_some() {
+                let r = self.log
+                    .append_to_stream(fact.category(), stream_id, current_expected, new_event)
+                    .await?;
+                if let Some(v) = r.version {
+                    current_expected = v;
+                    last_version = Some(v);
+                }
+                r
+            } else {
+                self.log.append(new_event).await?
+            };
+            last_position = result.position;
+            if last_version.is_none() {
+                last_version = result.version;
+            }
         }
-        Ok(last_version)
+        Ok(EmitResult { position: last_position, version: last_version })
     }
 
     /// Block until consumer `id` has caught up to `pos`. Polls the
@@ -948,10 +1053,10 @@ mod tests {
         .build();
 
         let id = Uuid::new_v4();
-        let v1 = engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
+        let v1 = engine.emit(vec![
             CounterFact::Inc { by: 3, occurred_at: Utc::now(), counter_id: id },
             CounterFact::Inc { by: 5, occurred_at: Utc::now(), counter_id: id },
-        ]).await.unwrap();
+        ]).expecting(StreamVersion::ZERO).await.unwrap().version.unwrap();
         assert_eq!(v1, StreamVersion::from_raw(2),
                    "version is 2 after appending 2 facts");
 
@@ -976,14 +1081,14 @@ mod tests {
         let id = Uuid::new_v4();
 
         // First append moves version to 1.
-        engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
+        engine.emit(vec![
             CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-        ]).await.unwrap();
+        ]).expecting(StreamVersion::ZERO).await.unwrap();
 
         // Stale expected (still ZERO) → ConflictError.
-        let result = engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
+        let result = engine.emit(vec![
             CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-        ]).await;
+        ]).expecting(StreamVersion::ZERO).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let conflict = err.downcast_ref::<crate::event_log::ConflictError>()
@@ -1017,14 +1122,14 @@ mod tests {
         let e1 = engine.clone();
         let e2 = engine.clone();
         let h1 = tokio::spawn(async move {
-            e1.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
+            e1.emit(vec![
                 CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-            ]).await
+            ]).expecting(StreamVersion::ZERO).await
         });
         let h2 = tokio::spawn(async move {
-            e2.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
+            e2.emit(vec![
                 CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-            ]).await
+            ]).expecting(StreamVersion::ZERO).await
         });
         let (r1, r2) = tokio::join!(h1, h2);
         let r1 = r1.unwrap();
@@ -1057,9 +1162,9 @@ mod tests {
         let id = Uuid::new_v4();
         let pinned = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap().with_timezone(&Utc);
-        engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
+        engine.emit(vec![
             CounterFact::Inc { by: 1, occurred_at: pinned, counter_id: id },
-        ]).await.unwrap();
+        ]).expecting(StreamVersion::ZERO).await.unwrap();
 
         let events = EventLogBackend::load_stream(
             store.as_ref(), <CounterFact as Fact>::CATEGORY, id, None,
@@ -1145,7 +1250,7 @@ mod tests {
     // ── 0.3.1 fixes — caller-supplied envelope fields ──
 
     #[tokio::test]
-    async fn emit_in_uses_caller_supplied_correlation_id() {
+    async fn emit_with_correlation_id_stamps_envelope() {
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -1155,17 +1260,12 @@ mod tests {
 
         let cmd_correlation = Uuid::new_v4();
 
-        engine.emit_in(
-            UserCreated {
-                user_id:     Uuid::new_v4(),
-                occurred_at: Utc::now(),
-            },
-            WriteOptions {
-                correlation_id: Some(cmd_correlation),
-                parent_id:      None,
-                metadata:       Metadata::new(),
-            },
-        ).await.unwrap();
+        engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        })
+        .correlation_id(cmd_correlation)
+        .await.unwrap();
 
         let events = EventLogBackend::load_from(
             store.as_ref(), LogCursor::ZERO, 10,
@@ -1178,7 +1278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_in_uses_caller_supplied_parent_and_metadata() {
+    async fn emit_with_parent_and_metadata_stamps_envelope() {
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -1187,21 +1287,15 @@ mod tests {
         ).build();
 
         let parent = Uuid::new_v4();
-        let mut meta = Metadata::new();
-        meta.insert("_run_id".into(), serde_json::json!("run-abc"));
-        meta.insert("_schema_v".into(), serde_json::json!(2));
 
-        engine.emit_in(
-            UserCreated {
-                user_id:     Uuid::new_v4(),
-                occurred_at: Utc::now(),
-            },
-            WriteOptions {
-                correlation_id: None,
-                parent_id:      Some(parent),
-                metadata:       meta.clone(),
-            },
-        ).await.unwrap();
+        engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        })
+        .parent_id(parent)
+        .metadata("_run_id", "run-abc")
+        .metadata("_schema_v", 2)
+        .await.unwrap();
 
         let events = EventLogBackend::load_from(
             store.as_ref(), LogCursor::ZERO, 10,
@@ -1220,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_in_propagates_correlation_id_to_every_emitted_fact() {
+    async fn emit_batch_propagates_correlation_id_to_every_fact() {
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -1233,19 +1327,13 @@ mod tests {
         let id = Uuid::new_v4();
         let cmd_correlation = Uuid::new_v4();
 
-        engine.append_in::<Counter, CounterFact>(
-            id,
-            StreamVersion::ZERO,
-            vec![
-                CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-                CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
-            ],
-            WriteOptions {
-                correlation_id: Some(cmd_correlation),
-                parent_id:      None,
-                metadata:       Metadata::new(),
-            },
-        ).await.unwrap();
+        engine.emit(vec![
+            CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
+            CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
+        ])
+        .expecting(StreamVersion::ZERO)
+        .correlation_id(cmd_correlation)
+        .await.unwrap();
 
         let events = EventLogBackend::load_stream(
             store.as_ref(), <CounterFact as Fact>::CATEGORY, id, None,
@@ -1275,7 +1363,7 @@ mod tests {
         let pos = engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
             occurred_at: Utc::now(),
-        }).await.unwrap();
+        }).await.unwrap().position;
 
         // 0.3.1 signature: no checkpoint param.
         engine.await_observed_by("users", pos).await.unwrap();

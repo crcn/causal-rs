@@ -135,12 +135,12 @@ pub trait EventLogBackend: Send + Sync {
     /// the backend persisted, and replay determinism follows from
     /// THAT value (not from the client's pre-write hint).
     ///
-    /// `Engine::emit_in` and `Engine::append_in` derive
-    /// `NewEvent::created_at` from `fact.occurred_at().unwrap_or_else
-    /// (Utc::now)`. For backends that override server-side, the
-    /// producer-claimed `Fact::occurred_at` value (when set) must be
-    /// stamped into `NewEvent::metadata` if a consumer needs to
-    /// distinguish event-time from commit-time post-write.
+    /// `Engine::emit` derives `NewEvent::created_at` from
+    /// `fact.occurred_at().unwrap_or_else(Utc::now)`. For backends
+    /// that override server-side, the producer-claimed
+    /// `Fact::occurred_at` value (when set) must be stamped into
+    /// `NewEvent::metadata` if a consumer needs to distinguish
+    /// event-time from commit-time post-write.
     async fn append(&self, event: NewEvent) -> Result<AppendResult>;
 
     async fn load_from(

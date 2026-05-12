@@ -86,7 +86,7 @@ pub use relay::RelayLoop;
 // Note: `crate::engine::Engine<D>` is the legacy engine. The new v0.3
 // engine is `crate::engine_v3::{Engine, EngineBuilder}` — fully-
 // qualified to avoid the name collision until Phase 9.
-pub use engine_v3::{EmitError, WriteOptions};
+pub use engine_v3::{EmitBuilder, EmitError, EmitInput, EmitResult};
 // Note: `crate::aggregator::Aggregate` is the legacy trait. The new
 // v0.3 trait lives at `crate::aggregate_v3::Aggregate`.
 pub use snapshot_store::SnapshotStore;
