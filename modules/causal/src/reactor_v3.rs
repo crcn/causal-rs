@@ -42,6 +42,10 @@ use crate::reactor::Events;
 pub trait Reactor: Send + Sync {
     type Trigger: Fact;
 
+    /// Persistent-subscription group name. See [`crate::Projector::GROUP_NAME`]
+    /// for semantics — same uniqueness and cursor-key role.
+    const GROUP_NAME: &'static str;
+
     /// Decide on output facts in response to a trigger. Pure — no I/O
     /// to external systems beyond what's exposed via the trigger and
     /// `ctx`. Output type is heterogeneous (`Events`) to accommodate
@@ -83,6 +87,7 @@ mod tests {
     #[async_trait]
     impl Reactor for NoopReactor {
         type Trigger = OrderPlaced;
+        const GROUP_NAME: &'static str = "noop-reactor";
         async fn react(
             &self,
             _trigger: &OrderPlaced,

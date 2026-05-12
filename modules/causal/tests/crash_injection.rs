@@ -202,6 +202,7 @@ struct CountingProjector {
 #[async_trait]
 impl Projector for CountingProjector {
     type Fact = Recorded;
+    const GROUP_NAME: &'static str = "counting";
     async fn project(
         &self, _fact: &Recorded, ctx: Ctx<'_>,
     ) -> Result<()> {
@@ -285,6 +286,7 @@ struct EmitOne;
 #[async_trait]
 impl Reactor for EmitOne {
     type Trigger = Trigger;
+    const GROUP_NAME: &'static str = "emit-one";
     async fn react(
         &self, _trigger: &Trigger, _ctx: Ctx<'_>,
     ) -> Result<Events> {

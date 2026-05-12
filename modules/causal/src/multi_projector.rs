@@ -54,6 +54,10 @@ use crate::types::{LogCursor, PersistedEvent};
 /// Idempotent on `event.event_id` per C8 — at-least-once delivery.
 #[async_trait]
 pub trait MultiProjector: Send + Sync {
+    /// Persistent-subscription group name. See [`crate::Projector::GROUP_NAME`]
+    /// for semantics — same uniqueness and cursor-key role.
+    const GROUP_NAME: &'static str;
+
     /// Declared subscription. Non-empty. Each entry is a bare
     /// `Fact::CATEGORY` value (e.g. `"world"`, `"discovery"`). The
     /// runner matches events whose `event_type` starts with
@@ -258,6 +262,7 @@ mod tests {
 
     #[async_trait]
     impl MultiProjector for AuditTrail {
+        const GROUP_NAME: &'static str = "audit-trail";
         const CATEGORIES: &'static [&'static str] = &["world", "system"];
 
         async fn project(
@@ -365,6 +370,7 @@ mod tests {
         struct DepM { seen: Arc<Mutex<Vec<Uuid>>> }
         #[async_trait]
         impl MultiProjector for DepM {
+            const GROUP_NAME: &'static str = "downstream";
             const CATEGORIES: &'static [&'static str] = &["world"];
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
             async fn project(
@@ -403,6 +409,7 @@ mod tests {
         struct BadlyDeclared;
         #[async_trait]
         impl MultiProjector for BadlyDeclared {
+            const GROUP_NAME: &'static str = "badly-declared";
             const CATEGORIES: &'static [&'static str] = &[];
             async fn project(
                 &self,

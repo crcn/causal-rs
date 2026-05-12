@@ -147,6 +147,7 @@ pub struct EngineBuilder {
     consumers:             Vec<RunnerFactory>,
     occ_required_streams:  std::collections::HashSet<String>,
     aggregators:           Vec<Aggregator>,
+    group_names:           std::collections::HashSet<String>,
 }
 
 impl EngineBuilder {
@@ -168,7 +169,20 @@ impl EngineBuilder {
             consumers: Vec::new(),
             occ_required_streams: std::collections::HashSet::new(),
             aggregators: Vec::new(),
+            group_names: std::collections::HashSet::new(),
         }
+    }
+
+    /// Reserve a `GROUP_NAME` for a consumer. Panics if another
+    /// consumer in this builder already claimed it — two consumers
+    /// sharing a cursor key would silently corrupt each other.
+    fn claim_group_name(&mut self, group_name: &'static str) {
+        assert!(
+            self.group_names.insert(group_name.into()),
+            "duplicate GROUP_NAME `{}` registered on EngineBuilder — \
+             two consumers MUST NOT share a cursor key",
+            group_name,
+        );
     }
 
     /// Register an aggregate. Marks `A::CATEGORY` as OCC-required so
@@ -211,38 +225,30 @@ impl EngineBuilder {
         self
     }
 
-    pub fn with_projector<P: Projector + 'static>(
-        mut self,
-        p: P,
-        id: impl Into<String>,
-    ) -> Self
+    pub fn with_projector<P: Projector + 'static>(mut self, p: P) -> Self
     where
         P::Fact: DeserializeOwned,
     {
+        self.claim_group_name(P::GROUP_NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
-        let id = id.into();
         self.consumers.push(Box::new(move |aggs| {
-            let mut runner = ProjectionRunner::new(p, id, log, checkpoint);
+            let mut runner = ProjectionRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
     }
 
-    pub fn with_reactor<R: Reactor + 'static>(
-        mut self,
-        r: R,
-        id: impl Into<String>,
-    ) -> Self
+    pub fn with_reactor<R: Reactor + 'static>(mut self, r: R) -> Self
     where
         R::Trigger: DeserializeOwned,
     {
+        self.claim_group_name(R::GROUP_NAME);
         let log = self.log.clone();
         let outbox = self.outbox.clone();
-        let id = id.into();
         self.consumers.push(Box::new(move |aggs| {
-            let mut runner = ReactorRunner::new(r, id, log, outbox);
+            let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, outbox);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
@@ -263,16 +269,12 @@ impl EngineBuilder {
     ///
     /// For single-Fact consumers, use [`Self::with_projector`] — it
     /// deserializes for you.
-    pub fn with_multi_projector<P: MultiProjector + 'static>(
-        mut self,
-        p: P,
-        id: impl Into<String>,
-    ) -> Self {
+    pub fn with_multi_projector<P: MultiProjector + 'static>(mut self, p: P) -> Self {
+        self.claim_group_name(P::GROUP_NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
-        let id = id.into();
         self.consumers.push(Box::new(move |aggs| {
-            let mut runner = MultiProjectorRunner::new(p, id, log, checkpoint);
+            let mut runner = MultiProjectorRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
@@ -645,6 +647,7 @@ mod tests {
     #[async_trait]
     impl Projector for UserRoster {
         type Fact = UserCreated;
+        const GROUP_NAME: &'static str = "users";
         async fn project(
             &self, fact: &UserCreated, _ctx: Ctx<'_>,
         ) -> Result<()> {
@@ -658,6 +661,7 @@ mod tests {
     #[async_trait]
     impl Reactor for WelcomeReactor {
         type Trigger = UserCreated;
+        const GROUP_NAME: &'static str = "welcome.reactor";
         async fn react(
             &self, trigger: &UserCreated, _ctx: Ctx<'_>,
         ) -> Result<Events> {
@@ -680,7 +684,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_projector(roster, "users")
+        .with_projector(roster)
         .build();
 
         // Emit 3 facts.
@@ -725,6 +729,7 @@ mod tests {
         #[async_trait]
         impl Projector for WelcomeCounter {
             type Fact = WelcomeQueuedFact;
+            const GROUP_NAME: &'static str = "welcome.counter";
             async fn project(
                 &self, _fact: &WelcomeQueuedFact, _ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -738,8 +743,8 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_reactor(WelcomeReactor, "welcome.reactor")
-        .with_projector(WelcomeCounter(counter), "welcome.counter")
+        .with_reactor(WelcomeReactor)
+        .with_projector(WelcomeCounter(counter))
         .build();
 
         engine.emit(UserCreated {
@@ -1060,6 +1065,7 @@ mod tests {
         }
         #[async_trait]
         impl MultiProjector for AuditAll {
+            const GROUP_NAME: &'static str = "audit";
             const CATEGORIES: &'static [&'static str] = &["alpha", "beta"];
 
             async fn project(
@@ -1098,7 +1104,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_multi_projector(auditor, "audit")
+        .with_multi_projector(auditor)
         .build();
 
         engine.emit(A { a_id: Uuid::new_v4(), occurred_at: Utc::now() }).await.unwrap();
@@ -1245,7 +1251,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_projector(UserRoster::default(), "users")
+        .with_projector(UserRoster::default())
         .build();
 
         let pos = engine.emit(UserCreated {
@@ -1260,6 +1266,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "duplicate GROUP_NAME `users`")]
+    async fn registering_two_consumers_with_same_group_name_panics() {
+        // Two UserRoster instances would share a cursor key — silent
+        // corruption. EngineBuilder catches this at registration time.
+        let store = store();
+        let _engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_projector(UserRoster::default())
+        .with_projector(UserRoster::default()); // <- panic here
+    }
+
+    #[tokio::test]
     async fn shutdown_completes_within_a_reasonable_window() {
         let store = store();
         let engine = EngineBuilder::new(
@@ -1267,7 +1288,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_projector(UserRoster::default(), "users")
+        .with_projector(UserRoster::default())
         .build();
 
         let start = std::time::Instant::now();
@@ -1318,6 +1339,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Fact = Tick;
+            const GROUP_NAME: &'static str = "ticks";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -1337,7 +1359,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorOutbox>,
         )
         .with_aggregators(vec![tick_aggregator()])
-        .with_projector(cap, "ticks")
+        .with_projector(cap)
         .build();
 
         for i in 0..3 {
@@ -1370,6 +1392,7 @@ mod tests {
         #[async_trait]
         impl Reactor for Capture {
             type Trigger = Tick;
+            const GROUP_NAME: &'static str = "ticker.reactor";
             async fn react(
                 &self, _t: &Tick, ctx: Ctx<'_>,
             ) -> Result<crate::reactor::Events> {
@@ -1389,7 +1412,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorOutbox>,
         )
         .with_aggregators(vec![tick_aggregator()])
-        .with_reactor(cap, "ticker.reactor")
+        .with_reactor(cap)
         .build();
 
         for i in 0..3 {
@@ -1445,6 +1468,7 @@ mod tests {
         #[async_trait]
         impl Projector for FailsOnSecond {
             type Fact = Tick;
+            const GROUP_NAME: &'static str = "rollback.test";
             async fn project(
                 &self, _f: &Tick, _ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -1488,6 +1512,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Fact = Tick;
+            const GROUP_NAME: &'static str = "hydration.bug";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -1538,6 +1563,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Fact = Tick;
+            const GROUP_NAME: &'static str = "hydrate.cold";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -1574,6 +1600,7 @@ mod tests {
         #[async_trait]
         impl Projector for Reader {
             type Fact = Tick;
+            const GROUP_NAME: &'static str = "reader";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -1632,6 +1659,7 @@ mod tests {
         #[async_trait]
         impl Projector for PanicsThenSucceeds {
             type Fact = Tick;
+            const GROUP_NAME: &'static str = "panic.recovery";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -1654,7 +1682,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_projector(m, "panic.recovery")
+        .with_projector(m)
         .build();
 
         engine.emit(Tick { seq: 0, occurred_at: Utc::now() }).await.unwrap();
@@ -1696,6 +1724,7 @@ mod tests {
         #[async_trait]
         impl Projector for VerifyBoth {
             type Fact = Tick;
+            const GROUP_NAME: &'static str = "accum.test";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -1723,7 +1752,7 @@ mod tests {
         )
         .with_aggregators(vec![agg_a])     // first call
         .with_aggregators(vec![agg_b])     // second call — must accumulate
-        .with_projector(v, "accum.test")
+        .with_projector(v)
         .build();
 
         for i in 0..2 {
@@ -1775,6 +1804,7 @@ mod tests {
         }
         #[async_trait]
         impl MultiProjector for OnlyTickRouter {
+            const GROUP_NAME: &'static str = "tick.only";
             const CATEGORIES: &'static [&'static str] = &["ticker"];
             async fn project(
                 &self,
@@ -1797,7 +1827,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_multi_projector(router, "tick.only")
+        .with_multi_projector(router)
         .build();
 
         engine.emit(Tick { seq: 0, occurred_at: Utc::now() }).await.unwrap();

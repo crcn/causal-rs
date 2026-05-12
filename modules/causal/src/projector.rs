@@ -31,6 +31,15 @@ use crate::fact::Fact;
 pub trait Projector: Send + Sync {
     type Fact: Fact;
 
+    /// Persistent-subscription group name (= Kurrent persistent
+    /// subscription group identity). Used as the consumer's cursor
+    /// key in `CheckpointStore`, and as the group name when subscribing
+    /// to `$et-{CATEGORY}:*` against a Kurrent backend. MUST be
+    /// globally unique within an `EngineBuilder` — duplicates would
+    /// silently share a cursor. The builder panics on registration
+    /// if two consumers share a GROUP_NAME.
+    const GROUP_NAME: &'static str;
+
     /// Cross-consumer dependency declaration. The runner refuses to
     /// advance this projector's cursor past position P until every
     /// id in `DEPENDS_ON` has cursor ≥ P. Defaults to no deps.
@@ -81,6 +90,7 @@ mod tests {
     #[async_trait]
     impl Projector for CountingSink {
         type Fact = Recorded;
+        const GROUP_NAME: &'static str = "counting-sink";
 
         async fn project(
             &self,

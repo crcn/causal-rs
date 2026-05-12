@@ -290,6 +290,7 @@ mod tests {
     #[async_trait]
     impl Reactor for EmitOne {
         type Trigger = OrderPlaced;
+        const GROUP_NAME: &'static str = "emit-one";
         async fn react(
             &self,
             trigger: &OrderPlaced,
@@ -306,6 +307,7 @@ mod tests {
     #[async_trait]
     impl Reactor for EmitN {
         type Trigger = OrderPlaced;
+        const GROUP_NAME: &'static str = "emit-n";
         async fn react(
             &self,
             trigger: &OrderPlaced,
@@ -324,6 +326,7 @@ mod tests {
     #[async_trait]
     impl Reactor for FailsOnNth {
         type Trigger = OrderPlaced;
+        const GROUP_NAME: &'static str = "fails-on-nth";
         async fn react(
             &self,
             _trigger: &OrderPlaced,
@@ -446,6 +449,7 @@ mod tests {
         #[async_trait]
         impl Reactor for Silent {
             type Trigger = OrderPlaced;
+            const GROUP_NAME: &'static str = "silent";
             async fn react(
                 &self,
                 _trigger: &OrderPlaced,
