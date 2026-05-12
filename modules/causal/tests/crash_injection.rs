@@ -32,7 +32,7 @@ use causal::checkpoint_store::{
 };
 use causal::contexts::Ctx;
 use causal::event_log::EventLogBackend;
-use causal::fact::{Fact, StreamRef};
+use causal::fact::Fact;
 use causal::materializer::Materializer;
 use causal::memory_store::MemoryStore;
 use causal::projection_runner::{ProjectionRunner, StepOutcome};
@@ -168,12 +168,10 @@ impl ReactorOutbox for FaultInjector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Recorded { id: Uuid, occurred_at: DateTime<Utc> }
 impl Fact for Recorded {
-    fn type_name(&self) -> &str { "test.recorded" }
-    fn type_prefix() -> &'static str { "test" }
+    const CATEGORY: &'static str = "test";
+    fn name(&self) -> &str { "recorded" }
+    fn stream_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-    fn stream(&self) -> StreamRef {
-        StreamRef { category: "records", id: self.id }
-    }
 }
 
 async fn append_n(store: &MemoryStore, n: usize) {
@@ -183,7 +181,7 @@ async fn append_n(store: &MemoryStore, n: usize) {
             event_id: Uuid::new_v4(),
             parent_id: None,
             correlation_id: Uuid::new_v4(),
-            event_type: payload.type_name().to_string(),
+            event_type: format!("{}:{}", <Recorded as Fact>::CATEGORY, payload.name()),
             payload: serde_json::to_value(&payload).unwrap(),
             created_at: Utc::now(),
             aggregate_type: None,
@@ -270,12 +268,10 @@ async fn cursor_set_failure_after_materialize_redelivers_idempotently() {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Trigger { id: Uuid, occurred_at: DateTime<Utc> }
 impl Fact for Trigger {
-    fn type_name(&self) -> &str { "test.trigger" }
-    fn type_prefix() -> &'static str { "test" }
+    const CATEGORY: &'static str = "test";
+    fn name(&self) -> &str { "trigger" }
+    fn stream_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-    fn stream(&self) -> StreamRef {
-        StreamRef { category: "triggers", id: self.id }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,7 +301,7 @@ async fn append_trigger(store: &MemoryStore) -> Uuid {
         event_id,
         parent_id: None,
         correlation_id: Uuid::new_v4(),
-        event_type: payload.type_name().to_string(),
+        event_type: format!("{}:{}", <Trigger as Fact>::CATEGORY, payload.name()),
         payload: serde_json::to_value(&payload).unwrap(),
         created_at: Utc::now(),
         aggregate_type: None,

@@ -117,7 +117,7 @@ where
             return Ok(StepOutcome::Idle);
         }
 
-        let prefix = R::Trigger::type_prefix();
+        let prefix = <R::Trigger as Fact>::CATEGORY;
         let mut applied = 0usize;
         for event in events {
             // Fold every event into the aggregator registry, with
@@ -230,8 +230,7 @@ mod tests {
     use super::*;
     use crate::checkpoint_store::CheckpointStore;
     use crate::event::Event;
-    use crate::fact::StreamRef;
-    use crate::memory_store::MemoryStore;
+        use crate::memory_store::MemoryStore;
     use crate::reactor::Events;
     use crate::types::NewEvent;
     use anyhow::anyhow;
@@ -248,12 +247,10 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
     impl Fact for OrderPlaced {
-        fn type_name(&self) -> &str { "test.order_placed" }
-        fn type_prefix() -> &'static str { "test" }
+        const CATEGORY: &'static str = "order";
+        fn name(&self) -> &str { "order_placed" }
+        fn stream_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-        fn stream(&self) -> StreamRef {
-            StreamRef { category: "order", id: self.order_id }
-        }
     }
 
     // ── Output fact (also impl Event so Events::push works) ──
@@ -272,7 +269,7 @@ mod tests {
             event_id,
             parent_id:       None,
             correlation_id:  Uuid::new_v4(),
-            event_type:      payload.type_name().to_string(),
+            event_type:      format!("{}:{}", <OrderPlaced as Fact>::CATEGORY, payload.name()),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             aggregate_type:  None,

@@ -46,8 +46,7 @@ pub trait Materializer: Send + Sync {
 mod tests {
     use super::*;
     use crate::contexts::Metadata;
-    use crate::fact::StreamRef;
-    use crate::types::LogCursor;
+        use crate::types::LogCursor;
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,12 +60,10 @@ mod tests {
     }
 
     impl Fact for Recorded {
-        fn type_name(&self) -> &str { "test.recorded" }
-        fn type_prefix() -> &'static str { "test" }
+        const CATEGORY: &'static str = "records";
+        fn name(&self) -> &str { "recorded" }
+        fn stream_id(&self) -> Uuid { self.id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-        fn stream(&self) -> StreamRef {
-            StreamRef { category: "records", id: self.id }
-        }
     }
 
     /// Mock materializer that counts apply calls. Idempotent on event_id —

@@ -259,20 +259,22 @@ pub enum SchedulingFact {
 }
 
 #[test]
-fn enum_event_fact_impl_provides_type_name() {
+fn enum_event_fact_impl_provides_bare_name() {
     use causal::Fact;
     let f = SchedulingFact::ScheduleCreated {
         schedule_id: uuid::Uuid::nil(),
         occurred_at: chrono::Utc::now(),
         timeout: 60,
     };
-    assert_eq!(f.type_name(), "scheduling:schedule_created");
+    // v0.4: name() returns the bare variant slug; runtime composes
+    // the stored event_type as "{CATEGORY}:{name}".
+    assert_eq!(f.name(), "schedule_created");
 }
 
 #[test]
-fn enum_event_fact_impl_provides_type_prefix() {
+fn enum_event_fact_impl_provides_category() {
     use causal::Fact;
-    assert_eq!(<SchedulingFact as Fact>::type_prefix(), "scheduling");
+    assert_eq!(<SchedulingFact as Fact>::CATEGORY, "schedule");
 }
 
 #[test]
@@ -290,7 +292,7 @@ fn enum_event_fact_impl_extracts_occurred_at() {
 }
 
 #[test]
-fn enum_event_fact_impl_builds_stream_ref() {
+fn enum_event_fact_impl_returns_stream_id() {
     use causal::Fact;
     let id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
     let f = SchedulingFact::ScheduleCreated {
@@ -298,10 +300,11 @@ fn enum_event_fact_impl_builds_stream_ref() {
         occurred_at: chrono::Utc::now(),
         timeout: 60,
     };
-    let s = f.stream();
-    assert_eq!(s.category, "schedule");
-    assert_eq!(s.id, id);
-    assert_eq!(s.name(), format!("schedule-{}", id));
+    // v0.4: stream_id() returns the per-variant id; runtime composes
+    // the stream name as "{CATEGORY}-{stream_id}".
+    assert_eq!(f.stream_id(), id);
+    let stream_name = format!("{}-{}", <SchedulingFact as Fact>::CATEGORY, f.stream_id());
+    assert_eq!(stream_name, format!("schedule-{}", id));
 }
 
 // Override occurred_at_field name.
@@ -358,12 +361,10 @@ fn struct_event_fact_impl_works() {
         occurred_at: pinned,
         total_cents: 1234,
     };
-    assert_eq!(f.type_name(), "fulfillment");
-    assert_eq!(<ShipmentDispatched as Fact>::type_prefix(), "fulfillment");
+    assert_eq!(f.name(), "fulfillment");
+    assert_eq!(<ShipmentDispatched as Fact>::CATEGORY, "fulfillment");
     assert_eq!(f.occurred_at(), Some(pinned));
-    let s = f.stream();
-    assert_eq!(s.category, "fulfillment");
-    assert_eq!(s.id, id);
+    assert_eq!(f.stream_id(), id);
 }
 
 // Without stream_category + stream_id, no Fact impl is generated.

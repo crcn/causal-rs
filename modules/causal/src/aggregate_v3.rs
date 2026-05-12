@@ -44,7 +44,6 @@ pub trait Aggregate: Default + Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fact::StreamRef;
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
@@ -56,25 +55,24 @@ mod tests {
     }
 
     impl Fact for CounterFact {
-        fn type_name(&self) -> &str {
+        const CATEGORY: &'static str = "counter";
+        fn name(&self) -> &str {
             match self {
-                CounterFact::Incremented { .. } => "test.counter_incremented",
-                CounterFact::Reset { .. }       => "test.counter_reset",
+                CounterFact::Incremented { .. } => "incremented",
+                CounterFact::Reset { .. }       => "reset",
             }
         }
-        fn type_prefix() -> &'static str { "test" }
+        fn stream_id(&self) -> Uuid {
+            match self {
+                CounterFact::Incremented { counter_id, .. } => *counter_id,
+                CounterFact::Reset { counter_id, .. }       => *counter_id,
+            }
+        }
         fn occurred_at(&self) -> Option<DateTime<Utc>> {
             Some(match self {
                 CounterFact::Incremented { occurred_at, .. } => *occurred_at,
                 CounterFact::Reset { occurred_at, .. }       => *occurred_at,
             })
-        }
-        fn stream(&self) -> StreamRef {
-            let id = match self {
-                CounterFact::Incremented { counter_id, .. } => *counter_id,
-                CounterFact::Reset { counter_id, .. }       => *counter_id,
-            };
-            StreamRef { category: "counter", id }
         }
     }
 
@@ -111,11 +109,11 @@ mod tests {
     #[test]
     fn aggregate_category_drives_stream_name() {
         let cid = Uuid::new_v4();
-        let fact = CounterFact::Incremented {
+        let _fact = CounterFact::Incremented {
             by: 1, occurred_at: Utc::now(), counter_id: cid,
         };
-        // Stream category is set per-fact; aggregate CATEGORY is the
-        // type-level constant. They MUST agree by convention.
-        assert_eq!(fact.stream().category, <Counter as Aggregate>::CATEGORY);
+        // Under v0.4, the Fact's CATEGORY const is the type-level
+        // constant; aggregate Fact::CATEGORY matches it by trait.
+        assert_eq!(<CounterFact as Fact>::CATEGORY, <Counter as Aggregate>::CATEGORY);
     }
 }

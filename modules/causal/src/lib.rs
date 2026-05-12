@@ -77,7 +77,7 @@ pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, QueueStatus, 
 pub use checkpoint_store::{CheckpointStore, InsertableOutboxRow, OutboxRow, ReactorOutbox};
 pub use contexts::{Ctx, Metadata};
 pub use event_log::{EventLog, EventLogBackend};
-pub use fact::{Fact, StreamRef};
+pub use fact::Fact;
 #[allow(deprecated)]
 pub use any_materializer::{AnyMaterializer, AnyMaterializerRunner};
 pub use materializer::Materializer;

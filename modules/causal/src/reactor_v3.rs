@@ -58,8 +58,7 @@ pub trait Reactor: Send + Sync {
 mod tests {
     use super::*;
     use crate::contexts::Metadata;
-    use crate::fact::StreamRef;
-    use crate::types::LogCursor;
+        use crate::types::LogCursor;
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
@@ -71,12 +70,10 @@ mod tests {
     }
 
     impl Fact for OrderPlaced {
-        fn type_name(&self) -> &str { "test.order_placed" }
-        fn type_prefix() -> &'static str { "test" }
+        const CATEGORY: &'static str = "order";
+        fn name(&self) -> &str { "order_placed" }
+        fn stream_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-        fn stream(&self) -> StreamRef {
-            StreamRef { category: "order", id: self.order_id }
-        }
     }
 
     /// Mock reactor that returns an empty Events collection.

@@ -403,15 +403,16 @@ impl Engine {
         fact: F,
         opts: WriteOptions,
     ) -> Result<LogCursor> {
-        let stream = fact.stream();
-        if self.occ_required_streams.contains(stream.category) {
+        let category = F::CATEGORY;
+        if self.occ_required_streams.contains(category) {
             return Err(anyhow!(EmitError::OccStreamMisuse {
-                category: stream.category.into(),
+                category: category.into(),
             }));
         }
-        let event_type = fact.type_name().to_string();
+        let event_type = format!("{}:{}", category, fact.name());
         // Producer-claimed time wins; otherwise persistence stamps now.
         let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
+        let stream_id = fact.stream_id();
         let payload = serde_json::to_value(&fact)?;
         let new_event = NewEvent {
             event_id:        Uuid::new_v4(),
@@ -420,8 +421,8 @@ impl Engine {
             event_type,
             payload,
             created_at:      occurred_at,
-            aggregate_type:  Some(stream.category.to_string()),
-            aggregate_id:    Some(stream.id),
+            aggregate_type:  Some(category.to_string()),
+            aggregate_id:    Some(stream_id),
             metadata:        opts.metadata,
             ephemeral:       None,
             persistent:      true,
@@ -486,7 +487,7 @@ impl Engine {
         let mut current_expected = expected;
         let mut last_version = expected;
         for fact in facts {
-            let event_type = fact.type_name().to_string();
+            let event_type = format!("{}:{}", <A::Fact as Fact>::CATEGORY, fact.name());
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let payload = serde_json::to_value(&fact)?;
             let new_event = NewEvent {
@@ -648,8 +649,7 @@ async fn supervise_relay(
 mod tests {
     use super::*;
     use crate::contexts::Ctx;
-    use crate::fact::StreamRef;
-    use crate::memory_store::MemoryStore;
+        use crate::memory_store::MemoryStore;
     use crate::reactor::Events;
     use chrono::DateTime;
     use serde::{Deserialize, Serialize};
@@ -661,12 +661,10 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
     impl Fact for UserCreated {
-        fn type_name(&self) -> &str { "test.user_created" }
-        fn type_prefix() -> &'static str { "test" }
+        const CATEGORY: &'static str = "user";
+        fn name(&self) -> &str { "user_created" }
+        fn stream_id(&self) -> Uuid { self.user_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-        fn stream(&self) -> StreamRef {
-            StreamRef { category: "user", id: self.user_id }
-        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,8 +672,8 @@ mod tests {
         user_id: Uuid,
     }
     impl crate::event::Event for WelcomeQueued {
-        fn durable_name(&self) -> &str { "test.welcome_queued" }
-        fn event_prefix() -> &'static str { "test" }
+        fn durable_name(&self) -> &str { "welcome:welcome_queued" }
+        fn event_prefix() -> &'static str { "welcome" }
     }
 
     /// Materializer that records every user_id it sees.
@@ -757,14 +755,11 @@ mod tests {
         //   drains to log → second materializer sees WelcomeQueued.
         struct WelcomeCounter(Arc<AtomicUsize>);
         #[derive(Debug, Clone, Serialize, Deserialize)]
-        struct WelcomeQueuedFact { user_id: Uuid, occurred_at: DateTime<Utc> }
+        struct WelcomeQueuedFact { user_id: Uuid }
         impl Fact for WelcomeQueuedFact {
-            fn type_name(&self) -> &str { "test.welcome_queued" }
-            fn type_prefix() -> &'static str { "test" }
-            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-            fn stream(&self) -> StreamRef {
-                StreamRef { category: "welcome", id: self.user_id }
-            }
+            const CATEGORY: &'static str = "welcome";
+            fn name(&self) -> &str { "welcome_queued" }
+            fn stream_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
         impl Materializer for WelcomeCounter {
@@ -875,12 +870,10 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct OrderPlaced { order_id: Uuid, occurred_at: DateTime<Utc> }
         impl Fact for OrderPlaced {
-            fn type_name(&self) -> &str { "test.order_placed" }
-            fn type_prefix() -> &'static str { "test" }
+            const CATEGORY: &'static str = "order";
+            fn name(&self) -> &str { "order_placed" }
+            fn stream_id(&self) -> Uuid { self.order_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-            fn stream(&self) -> StreamRef {
-                StreamRef { category: "order", id: self.order_id }
-            }
         }
 
         engine.emit(OrderPlaced {
@@ -907,25 +900,24 @@ mod tests {
         Reset { occurred_at: DateTime<Utc>, counter_id: Uuid },
     }
     impl Fact for CounterFact {
-        fn type_name(&self) -> &str {
+        const CATEGORY: &'static str = "counter";
+        fn name(&self) -> &str {
             match self {
-                CounterFact::Inc { .. }   => "test.counter_inc",
-                CounterFact::Reset { .. } => "test.counter_reset",
+                CounterFact::Inc { .. }   => "inc",
+                CounterFact::Reset { .. } => "reset",
             }
         }
-        fn type_prefix() -> &'static str { "test" }
+        fn stream_id(&self) -> Uuid {
+            match self {
+                CounterFact::Inc { counter_id, .. }
+              | CounterFact::Reset { counter_id, .. } => *counter_id,
+            }
+        }
         fn occurred_at(&self) -> Option<DateTime<Utc>> {
             Some(match self {
                 CounterFact::Inc { occurred_at, .. }
               | CounterFact::Reset { occurred_at, .. } => *occurred_at,
             })
-        }
-        fn stream(&self) -> StreamRef {
-            let id = match self {
-                CounterFact::Inc { counter_id, .. }
-              | CounterFact::Reset { counter_id, .. } => *counter_id,
-            };
-            StreamRef { category: "counter", id }
         }
     }
 
@@ -1122,22 +1114,18 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct A { a_id: Uuid, occurred_at: DateTime<Utc> }
         impl Fact for A {
-            fn type_name(&self) -> &str { "test.a" }
-            fn type_prefix() -> &'static str { "test" }
+            const CATEGORY: &'static str = "alpha";
+            fn name(&self) -> &str { "a" }
+            fn stream_id(&self) -> Uuid { self.a_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-            fn stream(&self) -> StreamRef {
-                StreamRef { category: "alpha", id: self.a_id }
-            }
         }
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct B { b_id: Uuid, occurred_at: DateTime<Utc> }
         impl Fact for B {
-            fn type_name(&self) -> &str { "other.b" }
-            fn type_prefix() -> &'static str { "other" }
+            const CATEGORY: &'static str = "beta";
+            fn name(&self) -> &str { "b" }
+            fn stream_id(&self) -> Uuid { self.b_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-            fn stream(&self) -> StreamRef {
-                StreamRef { category: "beta", id: self.b_id }
-            }
         }
 
         let store = store();
@@ -1164,7 +1152,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let names = seen.lock().clone();
-        assert_eq!(names, vec!["test.a", "other.b", "test.a"]);
+        assert_eq!(names, vec!["alpha:a", "beta:b", "alpha:a"]);
 
         engine.shutdown().await.unwrap();
     }
@@ -1335,12 +1323,10 @@ mod tests {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Tick { seq: u32, occurred_at: DateTime<Utc> }
     impl Fact for Tick {
-        fn type_name(&self) -> &str { "ticker:tick" }
-        fn type_prefix() -> &'static str { "ticker" }
+        const CATEGORY: &'static str = "ticker";
+        fn name(&self) -> &str { "tick" }
+        fn stream_id(&self) -> Uuid { Uuid::nil() }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-        fn stream(&self) -> StreamRef {
-            StreamRef { category: "ticker", id: Uuid::nil() }
-        }
     }
     impl crate::event::Event for Tick {
         fn durable_name(&self) -> &str { "ticker:tick" }
@@ -1817,12 +1803,10 @@ mod tests {
             occurred_at: DateTime<Utc>,
         }
         impl Fact for OtherFact {
-            fn type_name(&self) -> &str { "other:happening" }
-            fn type_prefix() -> &'static str { "other" }
+            const CATEGORY: &'static str = "other";
+            fn name(&self) -> &str { "happening" }
+            fn stream_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-            fn stream(&self) -> StreamRef {
-                StreamRef { category: "other", id: self.id }
-            }
         }
 
         #[derive(Clone)]

@@ -2138,6 +2138,7 @@ fn expand_event_enum(
 
     // Build match arms for durable_name
     let mut match_arms = Vec::new();
+    let mut name_arms = Vec::new();
     for variant in &data_enum.variants {
         let variant_name = &variant.ident;
 
@@ -2151,6 +2152,7 @@ fn expand_event_enum(
         };
 
         let durable = format!("{}:{}", prefix, variant_str);
+        let bare = variant_str.clone();
 
         let pattern = match &variant.fields {
             Fields::Named(_) => quote! { #name::#variant_name { .. } },
@@ -2159,6 +2161,7 @@ fn expand_event_enum(
         };
 
         match_arms.push(quote! { #pattern => #durable });
+        name_arms.push(quote! { #pattern => #bare });
     }
 
     // ─── v0.3 Fact impl, when stream_category + stream_id supplied ──
@@ -2228,24 +2231,21 @@ fn expand_event_enum(
 
         quote! {
             impl ::causal::Fact for #name {
-                fn type_name(&self) -> &str {
-                    <Self as ::causal::event::Event>::durable_name(self)
+                const CATEGORY: &'static str = #category;
+                fn name(&self) -> &str {
+                    match self {
+                        #(#name_arms,)*
+                    }
                 }
-                fn type_prefix() -> &'static str {
-                    <Self as ::causal::event::Event>::event_prefix()
+                fn stream_id(&self) -> ::uuid::Uuid {
+                    match self {
+                        #(#stream_arms,)*
+                    }
                 }
                 fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
                     ::core::option::Option::Some(match self {
                         #(#occurred_arms,)*
                     })
-                }
-                fn stream(&self) -> ::causal::StreamRef {
-                    ::causal::StreamRef {
-                        category: #category,
-                        id: match self {
-                            #(#stream_arms,)*
-                        },
-                    }
                 }
             }
         }
@@ -2304,22 +2304,21 @@ fn expand_event_struct(
                 .unwrap_or_else(|| "occurred_at".to_string())
         );
 
+        // For structs, the durable_name is `prefix_str` itself (no
+        // per-variant suffix). Under v0.4, `name()` returns the same
+        // bare slug; the runtime composes `category:name`.
+        let bare_name = prefix_str.clone();
         quote! {
             impl ::causal::Fact for #name {
-                fn type_name(&self) -> &str {
-                    <Self as ::causal::event::Event>::durable_name(self)
+                const CATEGORY: &'static str = #category;
+                fn name(&self) -> &str {
+                    #bare_name
                 }
-                fn type_prefix() -> &'static str {
-                    <Self as ::causal::event::Event>::event_prefix()
+                fn stream_id(&self) -> ::uuid::Uuid {
+                    self.#id_field_ident
                 }
                 fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
                     ::core::option::Option::Some(self.#occurred_field_ident)
-                }
-                fn stream(&self) -> ::causal::StreamRef {
-                    ::causal::StreamRef {
-                        category: #category,
-                        id: self.#id_field_ident,
-                    }
                 }
             }
         }

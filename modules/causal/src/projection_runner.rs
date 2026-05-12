@@ -120,7 +120,7 @@ where
             return Ok(StepOutcome::Idle);
         }
 
-        let prefix = M::Fact::type_prefix();
+        let prefix = <M::Fact as Fact>::CATEGORY;
         let mut applied = 0usize;
         for event in events {
             // Fold into the per-runner aggregator registry BEFORE
@@ -222,7 +222,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fact::StreamRef;
     use crate::memory_store::MemoryStore;
     use crate::types::NewEvent;
     use anyhow::anyhow;
@@ -239,12 +238,10 @@ mod tests {
     }
 
     impl Fact for Recorded {
-        fn type_name(&self) -> &str { "test.recorded" }
-        fn type_prefix() -> &'static str { "test" }
+        const CATEGORY: &'static str = "test";
+        fn name(&self) -> &str { "recorded" }
+        fn stream_id(&self) -> Uuid { self.id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
-        fn stream(&self) -> StreamRef {
-            StreamRef { category: "records", id: self.id }
-        }
     }
 
     /// Materializer that records every event_id it sees in a Vec.
@@ -295,7 +292,7 @@ mod tests {
             event_id:        Uuid::new_v4(),
             parent_id:       None,
             correlation_id:  Uuid::new_v4(),
-            event_type:      payload.type_name().to_string(),
+            event_type:      format!("{}:{}", <Recorded as Fact>::CATEGORY, payload.name()),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             aggregate_type:  None,
@@ -354,7 +351,7 @@ mod tests {
             event_id,
             parent_id:       None,
             correlation_id:  cmd_correlation,
-            event_type:      payload.type_name().to_string(),
+            event_type:      format!("{}:{}", <Recorded as Fact>::CATEGORY, payload.name()),
             payload:         serde_json::to_value(&payload).unwrap(),
             created_at:      Utc::now(),
             aggregate_type:  None,
@@ -578,12 +575,10 @@ mod tests {
         struct NoTimeFact { id: Uuid }
 
         impl Fact for NoTimeFact {
-            fn type_name(&self) -> &str { "test.notime" }
-            fn type_prefix() -> &'static str { "test" }
+            const CATEGORY: &'static str = "test";
+            fn name(&self) -> &str { "notime" }
+            fn stream_id(&self) -> Uuid { self.id }
             // occurred_at — uses trait default returning None
-            fn stream(&self) -> StreamRef {
-                StreamRef { category: "test", id: self.id }
-            }
         }
 
         #[derive(Clone)]
@@ -610,7 +605,7 @@ mod tests {
             event_id:        Uuid::new_v4(),
             parent_id:       None,
             correlation_id:  Uuid::new_v4(),
-            event_type:      fact.type_name().to_string(),
+            event_type:      format!("{}:{}", <NoTimeFact as Fact>::CATEGORY, fact.name()),
             payload:         serde_json::to_value(&fact).unwrap(),
             created_at:      pinned,
             aggregate_type:  None,
