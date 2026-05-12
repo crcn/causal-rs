@@ -306,6 +306,7 @@ pub struct EngineBuilder {
     occ_required_streams:  std::collections::HashSet<String>,
     aggregators:           Vec<Aggregator>,
     group_names:           std::collections::HashSet<String>,
+    default_metadata:      Metadata,
 }
 
 impl EngineBuilder {
@@ -328,7 +329,20 @@ impl EngineBuilder {
             occ_required_streams: std::collections::HashSet::new(),
             aggregators: Vec::new(),
             group_names: std::collections::HashSet::new(),
+            default_metadata: Metadata::new(),
         }
+    }
+
+    /// Stamp these metadata keys on every emit through this engine.
+    /// Per-emit `EmitBuilder::metadata(...)` calls override defaults
+    /// on key collision; non-colliding keys merge.
+    ///
+    /// Typical use: `_run_id`, `_actor`, `_schema_v` — values that
+    /// belong to every event a service produces, set once at engine
+    /// construction.
+    pub fn with_default_metadata(mut self, defaults: Metadata) -> Self {
+        self.default_metadata = defaults;
+        self
     }
 
     /// Reserve a `GROUP_NAME` for a consumer. Panics if another
@@ -489,6 +503,7 @@ impl EngineBuilder {
             self.outbox,
             consumers,
             self.occ_required_streams,
+            self.default_metadata,
         )
     }
 }
@@ -503,6 +518,7 @@ pub struct Engine {
     shutdown_tx:           broadcast::Sender<()>,
     handles:               Vec<JoinHandle<()>>,
     occ_required_streams:  std::collections::HashSet<String>,
+    default_metadata:      Metadata,
 }
 
 impl Engine {
@@ -512,6 +528,7 @@ impl Engine {
         outbox: Arc<dyn ReactorOutbox>,
         consumers: Vec<Arc<dyn Supervisable>>,
         occ_required_streams: std::collections::HashSet<String>,
+        default_metadata: Metadata,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len() + 1);
@@ -532,7 +549,7 @@ impl Engine {
         });
         handles.push(relay_task);
 
-        Self { log, checkpoint, shutdown_tx, handles, occ_required_streams }
+        Self { log, checkpoint, shutdown_tx, handles, occ_required_streams, default_metadata }
     }
 
     /// Emit one or more Facts to the log.
@@ -637,6 +654,16 @@ impl Engine {
         let mut last_position = LogCursor::ZERO;
         let mut last_version: Option<StreamVersion> = None;
 
+        // Merge engine defaults under per-emit metadata. Per-emit
+        // overrides on key collision; non-colliding keys merge.
+        let merged_metadata = {
+            let mut m = self.default_metadata.clone();
+            for (k, v) in b.metadata.iter() {
+                m.insert(k.clone(), v.clone());
+            }
+            m
+        };
+
         for fact in b.input.facts {
             let event_type = format!("{}:{}", fact.category(), fact.variant_name());
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
@@ -651,7 +678,7 @@ impl Engine {
                 created_at:      occurred_at,
                 aggregate_type:  Some(fact.category().to_string()),
                 aggregate_id:    Some(stream_id),
-                metadata:        b.metadata.clone(),
+                metadata:        merged_metadata.clone(),
                 ephemeral:       None,
                 persistent:      true,
             };
@@ -1522,6 +1549,45 @@ mod tests {
                     "both bulk-registered projectors didn't see the event");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_default_metadata_merges_under_per_emit_metadata() {
+        let store = store();
+        let mut defaults = Metadata::new();
+        defaults.insert("_run_id".into(), serde_json::json!("run-default"));
+        defaults.insert("_actor".into(), serde_json::json!("service-a"));
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_default_metadata(defaults)
+        .build();
+
+        // Per-emit override: _run_id should win; _actor inherited; new
+        // key _trace merges in.
+        engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        })
+        .metadata("_run_id", "run-override")
+        .metadata("_trace", "abc123")
+        .await.unwrap();
+
+        let events = EventLogBackend::load_from(
+            store.as_ref(), LogCursor::ZERO, 10,
+        ).await.unwrap();
+        let m = &events[0].metadata;
+        assert_eq!(m.get("_run_id").and_then(|v| v.as_str()), Some("run-override"),
+                   "per-emit overrides engine default");
+        assert_eq!(m.get("_actor").and_then(|v| v.as_str()), Some("service-a"),
+                   "engine default flows through when no per-emit override");
+        assert_eq!(m.get("_trace").and_then(|v| v.as_str()), Some("abc123"),
+                   "per-emit-only keys merge in");
+
         engine.shutdown().await.unwrap();
     }
 
