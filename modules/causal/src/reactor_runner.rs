@@ -21,9 +21,11 @@
 //! — but that initialization is the engine builder's job, not the
 //! runner's. The runner just consumes from the cursor it finds.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -31,6 +33,7 @@ use uuid::Uuid;
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::{InsertableOutboxRow, ReactorOutbox};
 use crate::contexts::Ctx;
+use crate::engine_v3::{DlqInfo, DlqMapperArc};
 use crate::event_log::EventLogBackend;
 use crate::fact::Fact;
 use crate::projection_runner::StepOutcome;
@@ -74,6 +77,20 @@ pub struct ReactorRunner<R: Reactor> {
     outbox:      Arc<dyn ReactorOutbox>,
     aggregators: Option<Arc<AggregatorRegistry>>,
     hydrated:    OnceCell<()>,
+    /// DLQ mapper for terminal-failure handling. When `react()`
+    /// errors `max_attempts` times on the same trigger, the mapper
+    /// is invoked; if it returns `Some(fact)`, the synthesized
+    /// fact is emitted through the outbox and the cursor advances
+    /// past the failing event.
+    dlq_mapper:  Option<DlqMapperArc>,
+    /// Retry budget — applies only when `dlq_mapper` is set. Without
+    /// a mapper, reactors retry indefinitely (supervisor backoff).
+    max_attempts: u32,
+    /// Per-trigger attempt counter. In-memory; survives across
+    /// step boundaries within one runner's lifetime, resets on
+    /// engine restart. Postgres-backed backends would persist this
+    /// in a `causal_handler_attempts` table for crash-safe DLQ.
+    attempts: Mutex<HashMap<Uuid, u32>>,
 }
 
 impl<R: Reactor> ReactorRunner<R>
@@ -93,6 +110,9 @@ where
             outbox,
             aggregators: None,
             hydrated: OnceCell::new(),
+            dlq_mapper: None,
+            max_attempts: 0,
+            attempts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -101,6 +121,17 @@ where
     /// for semantics.
     pub fn with_aggregators(mut self, aggregators: Arc<AggregatorRegistry>) -> Self {
         self.aggregators = Some(aggregators);
+        self
+    }
+
+    /// Configure terminal-failure DLQ handling. After `max_attempts`
+    /// consecutive `react()` errors on the same trigger, the mapper
+    /// is invoked; on `Some(fact)`, the fact is emitted through the
+    /// outbox and the cursor advances past the failing event.
+    /// Without this, errored reactors retry indefinitely.
+    pub fn with_dlq(mut self, mapper: DlqMapperArc, max_attempts: u32) -> Self {
+        self.dlq_mapper = Some(mapper);
+        self.max_attempts = max_attempts;
         self
     }
 
@@ -152,11 +183,75 @@ where
             // ── Decision. On Err, cursor stays where it was; no rows
             //    persisted. The whole batch from this trigger forward
             //    is retried on next step.
+            //
+            //    UNLESS a DLQ mapper is configured AND attempts have
+            //    reached max — then synthesize the mapper's fact,
+            //    commit it through the outbox, advance the cursor past
+            //    the failing event, and clear the attempt counter.
             let emitted = match self.reactor.react(&trigger, ctx).await {
-                Ok(events) => events,
+                Ok(events) => {
+                    self.attempts.lock().remove(&event.event_id);
+                    events
+                }
                 Err(e) => {
                     if let (Some(reg), Some(r)) = (self.aggregators.as_ref(), rollback) {
                         reg.restore_state(r);
+                    }
+
+                    // Increment attempts BEFORE checking — first
+                    // failure → attempts = 1.
+                    let attempts = {
+                        let mut a = self.attempts.lock();
+                        let entry = a.entry(event.event_id).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+
+                    if let Some(mapper) = self.dlq_mapper.as_ref() {
+                        if attempts >= self.max_attempts {
+                            let info = DlqInfo {
+                                group_name:        self.consumer_id.clone(),
+                                source_event_id:   event.event_id,
+                                source_event_type: event.event_type.clone(),
+                                error:             format!("{:#}", e),
+                                attempts,
+                            };
+                            let mapped = mapper(info);
+                            self.attempts.lock().remove(&event.event_id);
+
+                            // Build outbox row (if mapper returned a
+                            // Fact) and atomically commit + advance.
+                            // `output_index = u32::MAX` distinguishes
+                            // DLQ-synthesized outputs from normal
+                            // react() outputs (idx 0..N).
+                            let mut rows: Vec<InsertableOutboxRow> = Vec::new();
+                            if let Some(fact) = mapped {
+                                rows.push(InsertableOutboxRow {
+                                    reactor_id:      self.consumer_id.clone(),
+                                    source_event_id: event.event_id,
+                                    output_index:    u32::MAX,
+                                    event_id:        derive_output_event_id(
+                                        &self.consumer_id,
+                                        event.event_id,
+                                        u32::MAX,
+                                    ),
+                                    event_type: format!(
+                                        "{}:{}",
+                                        fact.category(),
+                                        fact.variant_name(),
+                                    ),
+                                    fact_payload: fact.to_value()?,
+                                    correlation_id: event.correlation_id,
+                                });
+                            }
+
+                            self.outbox.commit_reactor_batch(
+                                rows,
+                                Some((self.consumer_id.clone(), event.position)),
+                            ).await?;
+                            applied += 1;
+                            continue;
+                        }
                     }
                     return Err(e);
                 }
@@ -581,5 +676,137 @@ mod tests {
         assert_eq!(outcome, StepOutcome::Progressed { applied: 0 });
         assert!(store.outbox_pending(10).await.unwrap().is_empty());
         assert!(store.get("r.skip").await.unwrap().is_some());
+    }
+
+    // ── DLQ — terminal-failure mapper after retry exhaustion ──
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct HandlerFailed {
+        group_name: String,
+        attempts:   u32,
+    }
+    impl Fact for HandlerFailed {
+        const CATEGORY: &'static str = "ops";
+        fn name(&self) -> &str { "handler_failed" }
+        fn stream_id(&self) -> Uuid { Uuid::nil() }
+    }
+
+    struct AlwaysFails(std::sync::Arc<AtomicUsize>);
+    #[async_trait]
+    impl Reactor for AlwaysFails {
+        type Trigger = OrderPlaced;
+        const GROUP_NAME: &'static str = "always-fails";
+        async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("boom"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reactor_step_invokes_dlq_mapper_after_retry_exhaustion() {
+        let store = Arc::new(MemoryStore::new());
+        let payload = OrderPlaced {
+            order_id:    Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        };
+        let trigger_id = append_trigger(&store, &payload);
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let dlq_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let dlq_calls_c = dlq_calls.clone();
+
+        let mapper: DlqMapperArc = std::sync::Arc::new(move |info: DlqInfo| {
+            dlq_calls_c.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(HandlerFailed {
+                group_name: info.group_name,
+                attempts:   info.attempts,
+            }) as Box<dyn crate::engine_v3::ErasedFact>)
+        });
+
+        let runner = ReactorRunner::new(
+            AlwaysFails(calls.clone()),
+            "always-fails",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        ).with_dlq(mapper, 3);
+
+        // Attempt 1: fails, no DLQ yet (1 < 3).
+        assert!(runner.step(10).await.is_err());
+        assert_eq!(dlq_calls.load(Ordering::SeqCst), 0);
+
+        // Attempt 2: fails, no DLQ yet (2 < 3).
+        assert!(runner.step(10).await.is_err());
+        assert_eq!(dlq_calls.load(Ordering::SeqCst), 0);
+
+        // Attempt 3: fails, DLQ mapper fires (3 >= 3). Cursor
+        // advances; outbox row written.
+        let outcome = runner.step(10).await.unwrap();
+        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        assert_eq!(dlq_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // The outbox carries the synthesized HandlerFailed Fact.
+        let pending = store.outbox_pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.source_event_id, trigger_id);
+        assert_eq!(row.event_type, "ops:handler_failed");
+        assert_eq!(row.output_index, u32::MAX,
+                   "DLQ outputs use u32::MAX to distinguish from react() outputs");
+
+        // Cursor is past the failing event — runner is done with it.
+        let next = runner.step(10).await.unwrap();
+        assert_eq!(next, StepOutcome::Idle);
+    }
+
+    #[tokio::test]
+    async fn reactor_step_dlq_mapper_returning_none_still_advances_cursor() {
+        let store = Arc::new(MemoryStore::new());
+        let payload = OrderPlaced {
+            order_id:    Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        };
+        let _ = append_trigger(&store, &payload);
+
+        let mapper: DlqMapperArc = std::sync::Arc::new(move |_info| None);
+
+        let runner = ReactorRunner::new(
+            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            "drop-on-dlq",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        ).with_dlq(mapper, 2);
+
+        // 1st fails, 2nd hits max + maps to None: cursor advances,
+        // no outbox row.
+        let _ = runner.step(10).await;
+        let outcome = runner.step(10).await.unwrap();
+        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        assert!(store.outbox_pending(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactor_step_without_dlq_mapper_returns_err_indefinitely() {
+        let store = Arc::new(MemoryStore::new());
+        let payload = OrderPlaced {
+            order_id:    Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        };
+        let _ = append_trigger(&store, &payload);
+
+        let runner = ReactorRunner::new(
+            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            "no-dlq",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        );
+
+        // Many attempts, all Err — without DLQ, no cap on retries.
+        for _ in 0..10 {
+            assert!(runner.step(10).await.is_err());
+        }
+        // Cursor stayed at zero.
+        let cursor = store.get("no-dlq").await.unwrap();
+        assert!(cursor.is_none() || cursor == Some(LogCursor::ZERO));
     }
 }

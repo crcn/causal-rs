@@ -87,6 +87,7 @@ pub use reactor_v3::{Events, Reactor};
 pub use engine_v3::{
     Engine, EngineBuilder,
     EmitBuilder, EmitError, EmitResult,
+    DlqInfo,
     MultiProjectorRegistration, ProjectorRegistration, ReactorRegistration,
 };
 

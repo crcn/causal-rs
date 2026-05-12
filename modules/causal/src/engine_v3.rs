@@ -186,13 +186,36 @@ pub struct EmitResult {
     pub version:  Option<StreamVersion>,
 }
 
+/// Metadata about a reactor that has exhausted its retry budget,
+/// passed to the [`EngineBuilder::on_dlq`] mapper. The mapper
+/// decides whether to synthesize a terminal-failure Fact and emit
+/// it through the outbox so downstream consumers can react.
+///
+/// Production use case: scout's `PipelineEvent::HandlerFailed` is
+/// emitted on terminal reactor failure so `PipelineState` can fold
+/// it and unblock downstream gates.
+#[derive(Debug, Clone)]
+pub struct DlqInfo {
+    /// `Reactor::GROUP_NAME` of the failing reactor.
+    pub group_name:        String,
+    /// `event_id` of the trigger that caused the failure.
+    pub source_event_id:   Uuid,
+    /// `event_type` of the trigger (canonical `{CATEGORY}:{name}`).
+    pub source_event_type: String,
+    /// Last error message from the reactor's `react()`.
+    pub error:             String,
+    /// Number of attempts that ran before declaring terminal
+    /// failure (equal to `max_attempts`).
+    pub attempts:          u32,
+}
+
 /// Type-erased view of a [`Fact`] for the emit builder.
 ///
 /// `EmitInput` stores facts behind this trait so [`EmitBuilder`] is
 /// non-generic — one builder type handles any Fact, single or
 /// batched. The blanket impl below covers every `Fact` automatically;
 /// downstream code never names this trait.
-trait ErasedFact: Send + Sync {
+pub(crate) trait ErasedFact: Send + Sync {
     fn category(&self) -> &'static str;
     fn variant_name(&self) -> &str;
     fn stream_id(&self) -> Uuid;
@@ -309,6 +332,16 @@ type RunnerFactory = Box<
     dyn FnOnce(Option<Arc<AggregatorRegistry>>) -> Arc<dyn Supervisable> + Send,
 >;
 
+/// Type-erased DLQ mapper plumbed from
+/// `EngineBuilder::on_dlq` into each `ReactorRunner`.
+pub(crate) type DlqMapperArc = Arc<
+    dyn Fn(DlqInfo) -> Option<Box<dyn ErasedFact>> + Send + Sync,
+>;
+
+/// Framework default for `max_attempts` when `on_dlq` is configured.
+/// Reactors retry up to this many times before the mapper fires.
+pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
 pub struct EngineBuilder {
     log:                   Arc<dyn EventLogBackend>,
     checkpoint:            Arc<dyn CheckpointStore>,
@@ -318,6 +351,8 @@ pub struct EngineBuilder {
     aggregators:           Vec<Aggregator>,
     group_names:           std::collections::HashSet<String>,
     default_metadata:      Metadata,
+    dlq_mapper:            Option<DlqMapperArc>,
+    max_attempts:          u32,
 }
 
 impl EngineBuilder {
@@ -341,7 +376,43 @@ impl EngineBuilder {
             aggregators: Vec::new(),
             group_names: std::collections::HashSet::new(),
             default_metadata: Metadata::new(),
+            dlq_mapper: None,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
         }
+    }
+
+    /// Register a DLQ mapper. When any reactor's `react()` errors
+    /// `max_attempts` times in a row on the same trigger event, the
+    /// runner stops retrying and invokes the mapper with the
+    /// failure details. If the mapper returns `Some(fact)`, the
+    /// fact is emitted through the outbox (so downstream consumers
+    /// react to it) and the cursor advances past the failing event.
+    ///
+    /// Without this, terminal failures park forever — the
+    /// supervisor backs off + retries indefinitely, blocking
+    /// downstream progress.
+    ///
+    /// Use case in scout: synthesize `PipelineEvent::HandlerFailed`
+    /// from `DlqInfo`; `PipelineState` folds it and unblocks
+    /// downstream gates based on `info.group_name`.
+    pub fn on_dlq<F, Out>(mut self, mapper: F) -> Self
+    where
+        F: Fn(DlqInfo) -> Option<Out> + Send + Sync + 'static,
+        Out: Fact,
+    {
+        self.dlq_mapper = Some(Arc::new(move |info| {
+            mapper(info).map(|f| Box::new(f) as Box<dyn ErasedFact>)
+        }));
+        self
+    }
+
+    /// Override the framework's default retry budget for reactors.
+    /// Default is [`DEFAULT_MAX_ATTEMPTS`] (3). Applies only when
+    /// `on_dlq` is also configured — without a mapper, reactors
+    /// retry indefinitely (supervisor backoff).
+    pub fn with_max_attempts(mut self, n: u32) -> Self {
+        self.max_attempts = n;
+        self
     }
 
     /// Stamp these metadata keys on every emit through this engine.
@@ -432,9 +503,14 @@ impl EngineBuilder {
         self.claim_group_name(R::GROUP_NAME);
         let log = self.log.clone();
         let outbox = self.outbox.clone();
+        let dlq_mapper = self.dlq_mapper.clone();
+        let max_attempts = self.max_attempts;
         self.consumers.push(Box::new(move |aggs| {
             let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, outbox);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
+            if let Some(mapper) = dlq_mapper {
+                runner = runner.with_dlq(mapper, max_attempts);
+            }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -1698,6 +1774,78 @@ mod tests {
             store.clone() as Arc<dyn ReactorOutbox>,
         ).build();
         let _ = engine.singleton::<TickCounter>();
+    }
+
+    #[tokio::test]
+    async fn engine_on_dlq_mapper_drains_synthesized_fact_to_log() {
+        // End-to-end: register a reactor that always fails on
+        // UserCreated. Configure on_dlq to synthesize HandlerFailed.
+        // After settle, the log contains the synthesized fact.
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct HandlerFailed {
+            group_name: String,
+            attempts: u32,
+        }
+        impl Fact for HandlerFailed {
+            const CATEGORY: &'static str = "ops";
+            fn name(&self) -> &str { "handler_failed" }
+            fn stream_id(&self) -> Uuid { Uuid::nil() }
+        }
+
+        struct AlwaysFails;
+        #[async_trait]
+        impl Reactor for AlwaysFails {
+            type Trigger = UserCreated;
+            const GROUP_NAME: &'static str = "always-fails-e2e";
+            async fn react(&self, _t: &UserCreated, _: Ctx<'_>) -> Result<Events> {
+                Err(anyhow!("boom"))
+            }
+        }
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .on_dlq(|info: DlqInfo| Some(HandlerFailed {
+            group_name: info.group_name,
+            attempts: info.attempts,
+        }))
+        .with_max_attempts(2)
+        .with_reactor(AlwaysFails)
+        .build();
+
+        let result = engine.emit(UserCreated {
+            user_id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).await.unwrap();
+
+        // Wait until the reactor has retried + DLQ-mapped + the
+        // relay has drained the synthetic fact to the log.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let events = EventLogBackend::load_from(
+                store.as_ref(), LogCursor::ZERO, 10,
+            ).await.unwrap();
+            let dlq_emitted = events.iter()
+                .any(|e| e.event_type == "ops:handler_failed");
+            if dlq_emitted { break; }
+            assert!(std::time::Instant::now() < deadline,
+                    "DLQ-mapped fact never made it to the log");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Trigger UserCreated + synthesized HandlerFailed both present.
+        let events = EventLogBackend::load_from(
+            store.as_ref(), LogCursor::ZERO, 10,
+        ).await.unwrap();
+        assert!(events.iter().any(|e| e.event_type == "user:user_created"));
+        assert!(events.iter().any(|e| e.event_type == "ops:handler_failed"));
+
+        let _ = result;
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
