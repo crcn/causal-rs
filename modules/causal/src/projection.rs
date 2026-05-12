@@ -425,6 +425,26 @@ pub trait ProjectionStore: Send + Sync {
 ///   `record_failure` separately when DLQ-skipping is wanted.
 /// - The trait surface drops from ~12 methods to 5.
 ///
+/// ## Semantic change from `ProjectionStore`: DLQ write is no longer
+/// atomic with cursor advance
+///
+/// The legacy [`ProjectionStore::advance_past_failure`] bundled the
+/// DLQ row write and cursor advance into one transaction. A runner
+/// crash between the two writes was impossible by construction.
+///
+/// `ProjectionOps` decouples them: callers in `AdvanceAfter` mode
+/// invoke `record_failure(...)` and then `CheckpointStore::set(...)`
+/// as **two separate writes**. A crash between them leaves a DLQ row
+/// recorded but the cursor unmoved — the runner will retry the
+/// failing event on restart and (if it succeeds this time) leave a
+/// misleading DLQ entry for an event that ultimately processed.
+///
+/// **Implementation guidance for backends with transactions**:
+/// expose your own atomic helper alongside the trait if you want the
+/// legacy guarantee back. Backends without transactions (in-memory,
+/// some KV stores) can't offer atomicity here anyway — the trait's
+/// looser contract reflects what's actually portable.
+///
 /// During the v0.3 → v0.4 transition this trait is available alongside
 /// `ProjectionStore`; P11 (Legacy collapse) deletes `ProjectionStore`
 /// and migrates Postgres backends to `ProjectionOps` directly.

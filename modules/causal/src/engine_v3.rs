@@ -165,10 +165,21 @@ pub enum EmitError {
 /// Result of a successful `emit(...).await`.
 ///
 /// `position` is the global log cursor of the last event written
-/// (single emits and batches alike). `version` is the per-stream
-/// version after the write — `None` for streams that aren't
-/// aggregate-scoped (the global log accepts the write but doesn't
-/// track a per-stream cursor).
+/// (single emits and batches alike).
+///
+/// `version` semantics depend on whether `.expecting()` was used:
+/// - **CAS write (`.expecting(v)` set):** `Some(v_new)` — the
+///   stream's version *after* the CAS-protected append. Chain
+///   subsequent CAS writes by passing this back to `.expecting()`.
+/// - **Non-CAS write (no `.expecting()`):** whatever the backend
+///   reports for the last event written. Most backends return
+///   `None` for non-aggregate-scoped writes (the global log
+///   accepts the write but doesn't track a per-stream cursor);
+///   backends that DO track versions independently of CAS may
+///   return `Some`. Treat as informational.
+///
+/// For an empty-batch emit, `position` is `LogCursor::ZERO` and
+/// `version` is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmitResult {
     pub position: LogCursor,
@@ -617,8 +628,11 @@ impl Engine {
     }
 
     async fn execute_emit(&self, b: EmitBuilder<'_>) -> Result<EmitResult> {
+        // Empty batch is a successful no-op. Callers that build a
+        // `Vec<F>` from `.filter()` results shouldn't have to special-
+        // case the empty case at the emit site.
         if b.input.facts.is_empty() {
-            anyhow::bail!("emit called with an empty batch");
+            return Ok(EmitResult { position: LogCursor::ZERO, version: None });
         }
 
         // Stream-policy gate: OCC-required streams demand `.expecting()`.
@@ -998,7 +1012,9 @@ mod tests {
     /// Aggregate registered for stream-policy testing.
     #[derive(Default, Clone, Serialize, Deserialize)]
     struct UserAgg;
-    impl crate::aggregate_v3::Aggregate for UserAgg {}
+    impl crate::aggregate_v3::Aggregate for UserAgg {
+        const NAME: &'static str = "UserAgg";
+    }
     impl crate::aggregate_v3::Apply<UserCreated> for UserAgg {
         fn apply(&mut self, _fact: &UserCreated) {}
     }
@@ -1116,7 +1132,9 @@ mod tests {
 
     #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
     struct Counter { value: i32 }
-    impl crate::aggregate_v3::Aggregate for Counter {}
+    impl crate::aggregate_v3::Aggregate for Counter {
+        const NAME: &'static str = "Counter";
+    }
     impl crate::aggregate_v3::Apply<CounterFact> for Counter {
         fn apply(&mut self, fact: &CounterFact) {
             match fact {
@@ -1549,6 +1567,28 @@ mod tests {
                     "both bulk-registered projectors didn't see the event");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emit_with_empty_batch_is_a_no_op() {
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        ).build();
+
+        let result = engine.emit(Vec::<UserCreated>::new()).await.unwrap();
+        assert_eq!(result.position, LogCursor::ZERO);
+        assert_eq!(result.version, None);
+
+        // No events written.
+        let events = EventLogBackend::load_from(
+            store.as_ref(), LogCursor::ZERO, 10,
+        ).await.unwrap();
+        assert!(events.is_empty());
+
         engine.shutdown().await.unwrap();
     }
 

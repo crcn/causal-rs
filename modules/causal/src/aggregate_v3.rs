@@ -40,7 +40,21 @@ use crate::fact::Fact;
 /// the Fact's `CATEGORY` const, not from the Aggregate itself —
 /// callers always specify both `A` and `F` when loading/appending
 /// (`engine.load::<UserAgg, UserCreated>(id)`).
-pub trait Aggregate: Default + Send + Sync + 'static {}
+pub trait Aggregate: Default + Send + Sync + 'static {
+    /// Stable identifier for this Aggregate type. Used as the key for
+    /// in-memory registry state and — critically — as the
+    /// `aggregate_type` string a backend writes to disk when
+    /// persisting snapshots or events. MUST be stable across
+    /// refactorings (renames, module moves) and across builds: pick
+    /// it once, treat it like a wire format.
+    ///
+    /// Two different Aggregates folding the same Fact stream MUST
+    /// have distinct `NAME`s so their state doesn't collide in the
+    /// shared registry. Recommended convention: PascalCase singular
+    /// matching the Rust type name (`"UserAgg"`, `"Counter"`,
+    /// `"PipelineState"`).
+    const NAME: &'static str;
+}
 
 /// Per-Fact fold for hydration. Called once per fact loaded from the
 /// aggregate's stream during `Engine::load<A, F>`. No I/O, no
@@ -91,7 +105,9 @@ mod tests {
     #[derive(Default, Debug, PartialEq)]
     struct Counter { value: i32 }
 
-    impl Aggregate for Counter {}
+    impl Aggregate for Counter {
+        const NAME: &'static str = "Counter";
+    }
     impl Apply<CounterFact> for Counter {
         fn apply(&mut self, fact: &CounterFact) {
             match fact {
@@ -132,7 +148,9 @@ mod tests {
 
         #[derive(Default, Debug)]
         struct Multi { increments: i32, tags: u32 }
-        impl Aggregate for Multi {}
+        impl Aggregate for Multi {
+            const NAME: &'static str = "Multi";
+        }
         impl Apply<CounterFact> for Multi {
             fn apply(&mut self, f: &CounterFact) {
                 if let CounterFact::Incremented { by, .. } = f { self.increments += by; }

@@ -100,6 +100,13 @@ pub struct Aggregator {
     /// marks `event_prefix` (= `F::CATEGORY`) as OCC-required so
     /// `Engine::emit` rejects writes without `.expecting()`. Legacy
     /// constructors leave it `false` for read-only fold registration.
+    ///
+    /// **Transitional shape**: this `bool` exists because legacy
+    /// `Aggregator::new` (read-only fold) and v0.4 `Aggregator::for_type`
+    /// (write-side OCC + read-side fold) share one struct during the
+    /// v0.3 → v0.4 transition. P11 (Legacy collapse) splits these so
+    /// the v0.4-only `Aggregator` carries no flag — every aggregator
+    /// then implies its own OCC stream by construction.
     pub occ_required: bool,
     /// Extract the aggregate ID from JSON payload (deserializes internally).
     json_extract_id: Arc<dyn Fn(&serde_json::Value) -> Option<Uuid> + Send + Sync>,
@@ -185,8 +192,8 @@ impl Aggregator {
     /// `F::CATEGORY` as OCC-required on the write side.
     ///
     /// Stream id comes from `Fact::stream_id`; aggregate type string
-    /// comes from `std::any::type_name::<A>()` (deterministic within
-    /// a binary, sufficient for the in-memory registry).
+    /// comes from `A::NAME` — explicit, stable across refactorings,
+    /// portable to disk (backend `aggregate_type` columns).
     pub fn for_type<A, F>() -> Self
     where
         A: crate::aggregate_v3::Aggregate
@@ -198,7 +205,7 @@ impl Aggregator {
     {
         let event_prefix = <F as crate::fact::Fact>::CATEGORY.to_string();
         let event_type_id = TypeId::of::<F>();
-        let aggregate_type = std::any::type_name::<A>().to_string();
+        let aggregate_type = <A as crate::aggregate_v3::Aggregate>::NAME.to_string();
 
         let codec = Arc::new(EventCodec {
             event_prefix: event_prefix.clone(),
