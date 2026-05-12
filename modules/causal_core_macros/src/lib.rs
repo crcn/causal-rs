@@ -1853,16 +1853,33 @@ fn expand_aggregator_with_id(
         IdAccess::Singleton => quote! { ::uuid::Uuid::nil() },
     };
 
+    // v0.4 Apply<F>::apply takes `&mut self, fact: &F` (borrow).
+    // User authors aggregator fns in v0.3 owned style
+    // (`fn on_x(state, event: F)`); the macro adapts by binding
+    // `#event_ident` to a `&F` and shadowing it with a cheap clone
+    // inside the body so the user's owned-value semantics stand.
+    // Fact types are Clone by trait bound, so this is uniformly safe.
+    //
+    // Aggregator factory uses v0.4 `for_type::<A, F>()` —
+    // stream_id derives from `Fact::stream_id()`, no id-extraction
+    // closure needed. `#id_expr` is dead under v0.4 but kept in
+    // scope to suppress unused-variable warnings in the
+    // intermediate state; suppressed via let-binding.
+    let _ = id_expr; // legacy IdAccess result no longer used at call site
     Ok(quote! {
         impl ::causal::Apply<#event_ty> for #agg_ty {
-            fn apply(&mut self, #event_ident: #event_ty) {
+            fn apply(&mut self, #event_ident: &#event_ty) {
                 let #agg_ident = self;
+                // Shadow `event` as owned so v0.3-style bodies that
+                // pattern-match or pass-by-value compile unchanged.
+                // Clone is bound by Fact: Clone.
+                let #event_ident: #event_ty = #event_ident.clone();
                 #body
             }
         }
 
         fn #factory_name() -> ::causal::Aggregator {
-            ::causal::Aggregator::new::<#event_ty, #agg_ty, _>(|e| #id_expr)
+            ::causal::Aggregator::for_type::<#agg_ty, #event_ty>()
         }
     })
 }
