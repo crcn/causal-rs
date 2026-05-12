@@ -14,12 +14,15 @@
 //! aggregate at version V") MUST be modeled as command handlers
 //! (`load<A>` + decide + `append<A>`), not as `Reactor` impls.
 
+use std::any::TypeId;
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::contexts::Ctx;
+use crate::event_codec::EventCodec;
 use crate::fact::Fact;
-use crate::reactor::Events;
 
 /// Pure decision producing `Events`. Forward-only; outputs go through
 /// the runtime-side outbox.
@@ -56,6 +59,127 @@ pub trait Reactor: Send + Sync {
         trigger: &Self::Trigger,
         ctx: Ctx<'_>,
     ) -> Result<Events>;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Reactor output types
+// ─────────────────────────────────────────────────────────────────────
+//
+// `Events` is the universal `Reactor::react` return type — a
+// type-erased collection of output facts that the runtime persists
+// through the outbox. The shape currently builds on the legacy
+// `crate::event::Event` trait (via `EventOutput::new<E: Event>`);
+// P11.d migrates this to `<F: Fact>` so the v0.4 reactor output is
+// fully Fact-aligned. Until then, reactors that emit through this
+// surface need their output types to impl both `Event` and `Fact`.
+
+/// One unit of reactor output. Eagerly serialized so the runtime can
+/// journal it without re-walking the type.
+#[derive(Clone)]
+pub struct EventOutput {
+    pub type_id: TypeId,
+    /// Fully-qualified Rust type name (legacy, for Debug).
+    pub event_type: String,
+    /// Stable durable name from `Event::durable_name()`.
+    pub durable_name: String,
+    /// Event prefix for codec/aggregator lookup.
+    pub event_prefix: String,
+    /// Whether this event is persistent (vs in-process-only).
+    pub persistent: bool,
+    pub payload: serde_json::Value,
+    pub(crate) codec: Option<Arc<EventCodec>>,
+    /// Original typed event (live dispatch only).
+    pub ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl EventOutput {
+    /// Create from a typed event implementing the legacy `Event` trait.
+    pub fn new<E: crate::event::Event>(event: E) -> Self {
+        let durable_name = event.durable_name().to_string();
+        let event_prefix = E::event_prefix().to_string();
+        let persistent = !E::is_ephemeral();
+        let payload = serde_json::to_value(&event).expect("Event must be serializable");
+        let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(event);
+        Self {
+            type_id: TypeId::of::<E>(),
+            event_type: std::any::type_name::<E>().to_string(),
+            durable_name,
+            event_prefix: event_prefix.clone(),
+            persistent,
+            payload,
+            codec: Some(Arc::new(EventCodec {
+                event_prefix,
+                type_id: TypeId::of::<E>(),
+                decode: Arc::new(|payload| {
+                    let event: E = serde_json::from_value(payload.clone())?;
+                    Ok(Arc::new(event))
+                }),
+            })),
+            ephemeral: Some(ephemeral),
+        }
+    }
+
+    /// Reconstruct from a serialized form (replay path; no codec).
+    pub fn from_serialized(event_type: String, payload: serde_json::Value) -> Self {
+        Self {
+            type_id: TypeId::of::<()>(),
+            durable_name: event_type.clone(),
+            event_prefix: extract_prefix(&event_type).to_string(),
+            persistent: true,
+            event_type,
+            payload,
+            codec: None,
+            ephemeral: None,
+        }
+    }
+}
+
+/// Extract the category prefix from an event_type / durable_name.
+///
+/// `"scrape:web_scrape_completed"` → `"scrape"`
+/// `"order_placed"` → `"order_placed"` (no colon = whole string)
+pub fn extract_prefix(event_type: &str) -> &str {
+    event_type.split(':').next().unwrap_or(event_type)
+}
+
+/// Universal return type for [`Reactor::react`]. Builder-style; use
+/// `Events::push(fact)` (or the [`events!`](crate::events) macro) to
+/// accumulate outputs.
+#[derive(Clone, Default)]
+pub struct Events {
+    pub(crate) outputs: Vec<EventOutput>,
+}
+
+impl Events {
+    pub fn new() -> Self { Self { outputs: Vec::new() } }
+
+    pub fn add<E: crate::event::Event>(mut self, event: E) -> Self {
+        self.outputs.push(EventOutput::new(event));
+        self
+    }
+
+    pub fn push<E: crate::event::Event>(&mut self, event: E) {
+        self.outputs.push(EventOutput::new(event));
+    }
+
+    pub fn extend(&mut self, other: Events) {
+        self.outputs.extend(other.outputs);
+    }
+
+    pub fn len(&self) -> usize { self.outputs.len() }
+    pub fn is_empty(&self) -> bool { self.outputs.is_empty() }
+
+    pub fn batch<E: crate::event::Event>(items: impl IntoIterator<Item = E>) -> Self {
+        Self {
+            outputs: items.into_iter().map(EventOutput::new).collect(),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &EventOutput> {
+        self.outputs.iter()
+    }
+
+    pub fn into_outputs(self) -> Vec<EventOutput> { self.outputs }
 }
 
 #[cfg(test)]

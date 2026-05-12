@@ -855,7 +855,7 @@ mod tests {
     use super::*;
     use crate::contexts::Ctx;
         use crate::memory_store::MemoryStore;
-    use crate::reactor::Events;
+    use crate::reactor_v3::Events;
     use chrono::DateTime;
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1746,10 +1746,10 @@ mod tests {
             const GROUP_NAME: &'static str = "ticker.reactor";
             async fn react(
                 &self, _t: &Tick, ctx: Ctx<'_>,
-            ) -> Result<crate::reactor::Events> {
+            ) -> Result<crate::reactor_v3::Events> {
                 let s = ctx.aggregate::<TickCounter>();
                 self.transitions.lock().push((s.prev.count, s.curr.count));
-                Ok(crate::reactor::Events::new())
+                Ok(crate::reactor_v3::Events::new())
             }
         }
 

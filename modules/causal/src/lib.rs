@@ -46,31 +46,30 @@ pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
 pub mod projector;
-pub mod reactor;
 pub mod reactor_queue;
 pub mod reactor_runner;
 pub mod reactor_v3;
 pub mod relay;
-pub mod job_executor;
 pub mod snapshot_store;
 pub mod types;
 
-mod engine;
 mod event_codec;
-mod reactor_registry;
 pub mod memory_store;
-mod process;
 pub mod upcaster;
 
 // Re-export Event trait
+// Re-export legacy Event trait — used by `Events::push<E: Event>`
+// until P11.d migrates that API to take `F: Fact`. Stays for now.
 pub use event::Event;
 
-// Re-export aggregator types
-pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
+// Aggregator dispatch + v0.4 Aggregate marker. Legacy `Aggregate`
+// trait (with `aggregate_type()` method) and legacy `Apply<E>`
+// (owned) are gone in P11.e; the trait surface here is the v0.4
+// shape from `aggregate_v3`.
+pub use aggregate_v3::{Aggregate, Apply};
+pub use aggregator::{Aggregator, AggregatorRegistry};
 
-// Re-export event store helpers and types
-pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
-pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, QueueStatus, Snapshot, StreamVersion};
+pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, Snapshot, StreamVersion};
 
 // ── v0.4 public trait surface ─────────────────────────────────────────
 // Implementation-detail runners + outbox shapes live behind module
@@ -79,65 +78,36 @@ pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, QueueStatus, 
 // prelude. Backends that implement ReactorOutbox import OutboxRow /
 // InsertableOutboxRow from their module path directly.
 pub use checkpoint_store::{CheckpointStore, ReactorOutbox};
-pub use contexts::{Ctx, Metadata};
-pub use event_log::{EventLog, EventLogBackend};
+pub use contexts::{AggregateState, Ctx, Metadata};
+pub use event_log::EventLogBackend;
 pub use fact::Fact;
 pub use multi_projector::MultiProjector;
 pub use projector::Projector;
-pub use reactor_queue::ReactorQueue;
-// Note: `crate::engine::Engine<D>` is the legacy engine. The new v0.3
-// engine is `crate::engine_v3::{Engine, EngineBuilder}` — fully-
-// qualified to avoid the name collision until Phase 9.
 pub use engine_v3::{
     EmitBuilder, EmitError, EmitInput, EmitResult,
     MultiProjectorRegistration, ProjectorRegistration, ReactorRegistration,
 };
-// Note: `crate::aggregator::Aggregate` is the legacy trait. The new
-// v0.3 trait lives at `crate::aggregate_v3::Aggregate`.
 pub use snapshot_store::SnapshotStore;
-// Note: `crate::reactor::Reactor` is the legacy builder struct.
-// The new v0.3 trait is `crate::reactor_v3::Reactor` — accessed by
-// fully-qualified path to avoid the name collision until Phase 9.
-pub use types::{EventPark, IntentCommit};
+pub use reactor_v3::{EventOutput, Events, Reactor, extract_prefix};
 
-// Re-export projection configuration types and persistence trait.
-// The runtime that uses these (engine integration, ProjectionRunner) is
-// not yet implemented — see
-// `docs/plans/2026-05-04-feat-async-projections-plan.md`.
+// Projection configuration types
 pub use projection::{
     Backoff, FailureBehavior, ProjectionFailure, ProjectionMode, ProjectionOps,
     ProjectionStatus, ProjectionStore, RetryPolicy, StartPosition,
 };
 
-// Re-export in-memory implementation
 pub use memory_store::MemoryStore;
 
-// Re-export upcaster types
 pub use upcaster::{Upcaster, UpcasterRegistry};
 
-// Re-export main types
-pub use engine::Engine;
-pub use reactor::{
-    AggregateState, AnyEvent, Context, DlqTerminalInfo, Emit, ErrorContext, EventOutput, Events,
-    Reactor, ReactorError, IntoEvents, Logger, Projection,
-};
-
-/// The universal return macro for all reactors.
-///
-/// Works like `vec![]` — constructs an [`Events`] collection:
+/// Universal return macro for [`Reactor::react`]. Builds an
+/// [`Events`] collection from one or more output facts.
 ///
 /// ```ignore
-/// // Nothing — no events emitted
-/// Ok(events![])
-///
-/// // Single event
-/// Ok(events![OrderShipped { order_id }])
-///
-/// // Multiple heterogeneous events
-/// Ok(events![ScrapeEvent { data }, LifecycleEvent::PhaseCompleted])
-///
-/// // Fan-out batch (each element becomes a separate event with batch metadata)
-/// Ok(events![..items])
+/// Ok(events![])                                  // no outputs
+/// Ok(events![OrderShipped { order_id }])         // one output
+/// Ok(events![ScrapeEvent { .. }, Lifecycle::..]) // many
+/// Ok(events![..items])                           // fan-out batch
 /// ```
 #[macro_export]
 macro_rules! events {
@@ -159,20 +129,11 @@ macro_rules! events {
     }};
 }
 
-pub use job_executor::{ReactorResult, ReactorStatus, JobExecutor};
-pub use process::{EmitFuture, ProcessHandle, SettleFuture};
-pub use types::{
-    EmittedEvent, EventWorkerConfig, ReactorCompletion,
-    ReactorDlq, ReactorIntent, ReactorResolution, ReactorWorkerConfig,
-    JournalEntry, LogEntry, LogLevel, QueuedReactor,
-    NAMESPACE_CAUSAL,
-};
-
-// Top-level builder functions
-pub use reactor::{on, on_any, project};
-
+// Legacy reactor builder fns (`on`, `on_any`, `project`) and the
+// macros that depend on them (`#[reactor]`, `#[reactors]`,
+// `#[projection]`, `#[aggregator]`) are gone with the legacy
+// reactor module. `#[event]` and `#[aggregators]` (plural) survive
+// — they emit v0.4-compatible code.
 #[cfg(feature = "macros")]
-pub use causal_core_macros::{
-    aggregator, aggregators, event, projection, reactor, reactors,
-};
+pub use causal_core_macros::{aggregators, event};
 

@@ -36,7 +36,7 @@ use causal::fact::Fact;
 use causal::projector::Projector;
 use causal::memory_store::MemoryStore;
 use causal::projection_runner::{ProjectionRunner, StepOutcome};
-use causal::reactor::Events;
+use causal::reactor_v3::Events;
 use causal::reactor_runner::ReactorRunner;
 use causal::reactor_v3::Reactor;
 use causal::relay::RelayLoop;

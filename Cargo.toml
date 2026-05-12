@@ -6,6 +6,11 @@ members = [
     "modules/causal_utils",
     "modules/causal_inspector",
     "modules/causal_inspector_utils",
+    # examples/ entries removed in P11.c — they're legacy-API demos
+    # (Engine<D> + reactor::on()) that need a v0.4 rewrite. Source
+    # stays on disk for reference; parked from build until rewritten.
+]
+exclude = [
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",

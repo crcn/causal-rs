@@ -24,8 +24,16 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::aggregator::{Aggregate as LegacyAggregate, AggregatorRegistry};
-use crate::reactor::AggregateState;
 use crate::types::LogCursor;
+
+/// Aggregate state snapshot pair returned by [`Ctx::aggregate`] and
+/// [`Ctx::aggregate_of`]. `prev` is the state before the current
+/// event was folded; `curr` is the state after. Both are `Arc<A>`
+/// so reads are zero-clone.
+pub struct AggregateState<A> {
+    pub prev: Arc<A>,
+    pub curr: Arc<A>,
+}
 
 /// Per-event metadata carried through the log envelope. Application
 /// code may stamp arbitrary keys at emit time (`_run_id`,

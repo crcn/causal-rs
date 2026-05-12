@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::event_codec::EventCodec;
-use crate::reactor::extract_prefix;
+use crate::reactor_v3::extract_prefix;
 use crate::types::StreamVersion;
 use crate::upcaster::UpcasterRegistry;
 

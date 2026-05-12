@@ -231,7 +231,7 @@ mod tests {
     use crate::checkpoint_store::CheckpointStore;
     use crate::event::Event;
         use crate::memory_store::MemoryStore;
-    use crate::reactor::Events;
+    use crate::reactor_v3::Events;
     use crate::types::NewEvent;
     use anyhow::anyhow;
     use async_trait::async_trait;
