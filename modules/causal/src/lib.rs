@@ -103,8 +103,8 @@ pub use types::{EventPark, IntentCommit};
 // not yet implemented — see
 // `docs/plans/2026-05-04-feat-async-projections-plan.md`.
 pub use projection::{
-    Backoff, FailureBehavior, ProjectionFailure, ProjectionMode, ProjectionStatus,
-    ProjectionStore, RetryPolicy, StartPosition,
+    Backoff, FailureBehavior, ProjectionFailure, ProjectionMode, ProjectionOps,
+    ProjectionStatus, ProjectionStore, RetryPolicy, StartPosition,
 };
 
 // Re-export in-memory implementation

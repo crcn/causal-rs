@@ -407,3 +407,64 @@ pub trait ProjectionStore: Send + Sync {
         event_id: Uuid,
     ) -> Result<bool>;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// v0.4 surface — minimal ops trait on top of CheckpointStore
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Optional operational extension to [`CheckpointStore`]. Carries the
+/// DLQ + pause/resume + status surface needed by ops tooling and the
+/// inspector UI. Backends that don't need these — pure read-only
+/// projections, throwaway tests — can satisfy the runtime with just
+/// `CheckpointStore`.
+///
+/// Compared to the legacy [`ProjectionStore`]:
+/// - Cursor get/set lives on `CheckpointStore` (required base trait).
+/// - CAS variants (`advance_projection_cursor`, `advance_past_failure`)
+///   are gone — the v0.4 runners use `CheckpointStore::set` and call
+///   `record_failure` separately when DLQ-skipping is wanted.
+/// - The trait surface drops from ~12 methods to 5.
+///
+/// During the v0.3 → v0.4 transition this trait is available alongside
+/// `ProjectionStore`; P11 (Legacy collapse) deletes `ProjectionStore`
+/// and migrates Postgres backends to `ProjectionOps` directly.
+#[async_trait]
+pub trait ProjectionOps: crate::checkpoint_store::CheckpointStore {
+    /// Set the paused flag for a projection. Runners check this
+    /// before each batch and skip work while `paused = true`.
+    async fn set_paused(&self, group_name: &str, paused: bool) -> Result<()>;
+
+    /// Record a DLQ row for a failed event. Does NOT advance the
+    /// cursor — that's `CheckpointStore::set`'s job. Caller decides
+    /// the order (skip-after vs block-on). Idempotent on
+    /// `(group_name, event_id)` per the underlying primary-key
+    /// contract.
+    async fn record_failure(
+        &self,
+        group_name: &str,
+        event_id: Uuid,
+        error: &str,
+        attempts: u32,
+    ) -> Result<()>;
+
+    /// List DLQ rows for a projection, most-recent first, limited to
+    /// `limit` rows.
+    async fn list_failures(
+        &self,
+        group_name: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectionFailure>>;
+
+    /// Return the operational status of a projection. Returns `None`
+    /// if no cursor exists for this id.
+    async fn status(&self, group_name: &str) -> Result<Option<ProjectionStatus>>;
+
+    /// Delete one DLQ row. Used by operator workflows that fix the
+    /// underlying bug then remove the failure record. Returns `true`
+    /// if a row was deleted, `false` if no row matched.
+    async fn delete_failure(
+        &self,
+        group_name: &str,
+        event_id: Uuid,
+    ) -> Result<bool>;
+}

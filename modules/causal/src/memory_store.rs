@@ -942,6 +942,60 @@ impl ProjectionStore for MemoryStore {
     }
 }
 
+// ── ProjectionOps (v0.4 ops surface) ────────────────────────────────
+
+#[async_trait]
+impl causal::projection::ProjectionOps for MemoryStore {
+    async fn set_paused(&self, group_name: &str, paused: bool) -> Result<()> {
+        ProjectionStore::set_projection_paused(self, group_name, paused).await
+    }
+
+    async fn record_failure(
+        &self,
+        group_name: &str,
+        event_id: Uuid,
+        error: &str,
+        attempts: u32,
+    ) -> Result<()> {
+        // Direct DLQ write — bypasses the legacy `advance_past_failure`
+        // path's cursor coupling. Idempotent on (group_name, event_id).
+        let mut failures = self.projection_failures.lock();
+        let already_present = failures.iter().any(|f| {
+            f.projection_id == group_name && f.event_id == event_id
+        });
+        if !already_present {
+            failures.push(ProjectionFailure {
+                projection_id: group_name.to_string(),
+                event_id,
+                error: error.to_string(),
+                attempts,
+                failed_at: chrono::Utc::now(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_failures(
+        &self,
+        group_name: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectionFailure>> {
+        ProjectionStore::list_projection_failures(self, group_name, limit).await
+    }
+
+    async fn status(&self, group_name: &str) -> Result<Option<ProjectionStatus>> {
+        ProjectionStore::projection_status(self, group_name).await
+    }
+
+    async fn delete_failure(
+        &self,
+        group_name: &str,
+        event_id: Uuid,
+    ) -> Result<bool> {
+        ProjectionStore::delete_projection_failure(self, group_name, event_id).await
+    }
+}
+
 // ── ReactorOutbox implementation (C12 atomicity) ────────────────────
 
 #[async_trait]
@@ -1141,5 +1195,46 @@ mod outbox_tests {
         assert_eq!(status.cursor, new_pos);
         assert!(status.last_error.is_none());
         assert_eq!(status.consecutive_failures, 0);
+    }
+
+    // ── P8: v0.4 ProjectionOps surface ─────────────────────────────
+
+    #[tokio::test]
+    async fn projection_ops_record_and_list_failures() {
+        use causal::projection::ProjectionOps;
+        let store = MemoryStore::new();
+        let event_id = Uuid::new_v4();
+
+        ProjectionOps::record_failure(&store, "p", event_id, "boom", 1).await.unwrap();
+        ProjectionOps::record_failure(&store, "p", event_id, "boom retry", 2).await.unwrap();
+
+        let failures = ProjectionOps::list_failures(&store, "p", 10).await.unwrap();
+        assert_eq!(failures.len(), 1,
+                   "idempotent on (group_name, event_id) — second call no-op");
+        assert_eq!(failures[0].event_id, event_id);
+        assert_eq!(failures[0].error, "boom");
+        assert_eq!(failures[0].attempts, 1);
+
+        let deleted = ProjectionOps::delete_failure(&store, "p", event_id).await.unwrap();
+        assert!(deleted);
+        assert!(ProjectionOps::list_failures(&store, "p", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn projection_ops_set_paused_and_status() {
+        use causal::projection::ProjectionOps;
+        let store = MemoryStore::new();
+
+        // status() requires a cursor entry; seed one via CheckpointStore.
+        CheckpointStore::set(&store, "p", LogCursor::from_raw(5)).await.unwrap();
+
+        ProjectionOps::set_paused(&store, "p", true).await.unwrap();
+        let status = ProjectionOps::status(&store, "p").await.unwrap().unwrap();
+        assert!(status.paused);
+        assert_eq!(status.cursor, LogCursor::from_raw(5));
+
+        ProjectionOps::set_paused(&store, "p", false).await.unwrap();
+        let status = ProjectionOps::status(&store, "p").await.unwrap().unwrap();
+        assert!(!status.paused);
     }
 }
