@@ -373,6 +373,19 @@ pub struct PersistedEvent {
     pub persistent: bool,
 }
 
+impl PersistedEvent {
+    /// The category prefix of this event's `event_type`. For v0.4
+    /// events with the canonical `{CATEGORY}:{name}` shape, this
+    /// returns the category. For legacy events without a colon,
+    /// returns the full `event_type` string.
+    ///
+    /// Useful in `MultiProjector::project` bodies that need to route
+    /// across categories without parsing the string themselves.
+    pub fn category(&self) -> &str {
+        self.event_type.split(':').next().unwrap_or(&self.event_type)
+    }
+}
+
 impl fmt::Debug for PersistedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PersistedEvent")
@@ -475,5 +488,42 @@ impl fmt::Display for QueuedReactor {
             self.attempts,
             self.max_attempts
         )
+    }
+}
+
+#[cfg(test)]
+mod persisted_event_tests {
+    use super::*;
+
+    fn mk(event_type: &str) -> PersistedEvent {
+        PersistedEvent {
+            position:        LogCursor::ZERO,
+            event_id:        Uuid::nil(),
+            parent_id:       None,
+            correlation_id:  Uuid::nil(),
+            event_type:      event_type.into(),
+            payload:         serde_json::Value::Null,
+            created_at:      Utc::now(),
+            aggregate_type:  None,
+            aggregate_id:    None,
+            version:         None,
+            metadata:        serde_json::Map::new(),
+            ephemeral:       None,
+            persistent:      true,
+        }
+    }
+
+    #[test]
+    fn category_returns_prefix_before_colon() {
+        assert_eq!(mk("scrape:web_scrape_completed").category(), "scrape");
+        assert_eq!(mk("world:tick").category(), "world");
+    }
+
+    #[test]
+    fn category_returns_full_string_when_no_colon() {
+        // Legacy events that pre-date the `{CATEGORY}:{name}` convention
+        // surface here too — bare `order_placed`-style strings have no
+        // separator, so `category()` returns the whole thing.
+        assert_eq!(mk("order_placed").category(), "order_placed");
     }
 }

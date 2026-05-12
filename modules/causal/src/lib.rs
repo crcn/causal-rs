@@ -57,48 +57,71 @@ mod event_codec;
 pub mod memory_store;
 pub mod upcaster;
 
-// Re-export Event trait
-// Re-export legacy Event trait — used by `Events::push<E: Event>`
-// until P11.d migrates that API to take `F: Fact`. Stays for now.
-pub use event::Event;
+// ── v0.4 public surface ──────────────────────────────────────────────
+//
+// What's in the prelude vs. behind a module path follows one rule:
+// **the prelude is for what a user types in normal application code**.
+//
+// User-facing (here): facts, aggregates, consumer traits, the engine,
+// the emit builder, registration trait objects, context types,
+// cursors/versions, backend traits (cast at builder time), MemoryStore,
+// upcasters, macros.
+//
+// Backend-impl-facing (module paths only): NewEvent, AppendResult,
+// Snapshot — backends pull these from `causal::types::*` directly.
+// Same for runners (`causal::projection_runner::*`), outbox row shapes
+// (`causal::checkpoint_store::*`), and the relay (`causal::relay::*`).
+//
+// Internal-detail (module paths only): EventOutput (Events
+// implementation detail), EmitInput (Into-target only),
+// AggregatorRegistry (engine-internal state), extract_prefix
+// (replaced by PersistedEvent::category() for the common case).
 
-// Aggregator dispatch + v0.4 Aggregate marker. Legacy `Aggregate`
-// trait (with `aggregate_type()` method) and legacy `Apply<E>`
-// (owned) are gone in P11.e; the trait surface here is the v0.4
-// shape from `aggregate_v3`.
-pub use aggregate_v3::{Aggregate, Apply};
-pub use aggregator::{Aggregator, AggregatorRegistry};
-
-pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, Snapshot, StreamVersion};
-
-// ── v0.4 public trait surface ─────────────────────────────────────────
-// Implementation-detail runners + outbox shapes live behind module
-// paths (causal::projection_runner::ProjectionRunner,
-// causal::checkpoint_store::OutboxRow, etc.) so they don't crowd the
-// prelude. Backends that implement ReactorOutbox import OutboxRow /
-// InsertableOutboxRow from their module path directly.
-pub use checkpoint_store::{CheckpointStore, ReactorOutbox};
-pub use contexts::{AggregateState, Ctx, Metadata};
-pub use event_log::EventLogBackend;
+// Facts + aggregates
 pub use fact::Fact;
-pub use multi_projector::MultiProjector;
+pub use aggregate_v3::{Aggregate, Apply};
+pub use aggregator::Aggregator;
+
+// Consumers
 pub use projector::Projector;
+pub use multi_projector::MultiProjector;
+pub use reactor_v3::{Events, Reactor};
+
+// Engine + emit
 pub use engine_v3::{
-    EmitBuilder, EmitError, EmitInput, EmitResult,
+    Engine, EngineBuilder,
+    EmitBuilder, EmitError, EmitResult,
     MultiProjectorRegistration, ProjectorRegistration, ReactorRegistration,
 };
-pub use snapshot_store::SnapshotStore;
-pub use reactor_v3::{EventOutput, Events, Reactor, extract_prefix};
 
-// Projection configuration types
+// Context
+pub use contexts::{AggregateState, Ctx, Metadata};
+
+// Cursors / versions / values users see in signatures
+pub use types::{LogCursor, PersistedEvent, StreamVersion};
+
+// Backend traits (users typically cast `Arc<dyn ...>` at builder time)
+pub use checkpoint_store::{CheckpointStore, ReactorOutbox};
+pub use event_log::EventLogBackend;
 pub use projection::{
     Backoff, FailureBehavior, ProjectionFailure, ProjectionMode, ProjectionOps,
-    ProjectionStatus, ProjectionStore, RetryPolicy, StartPosition,
+    ProjectionStatus, RetryPolicy, StartPosition,
 };
+pub use snapshot_store::SnapshotStore;
 
+// Default backend
 pub use memory_store::MemoryStore;
 
+// Schema migration helpers
 pub use upcaster::{Upcaster, UpcasterRegistry};
+
+// ── Legacy carryover ──────────────────────────────────────────────
+// `Event` trait stays until P11.d migrates `Events::push<E: Event>`
+// to take `F: Fact`. `ProjectionStore` and legacy `aggregator::Aggregate`/
+// `Apply<E>` stay until P11.e. Re-exported here so the transition
+// doesn't force users onto deep module paths before the migration.
+pub use event::Event;
+pub use projection::ProjectionStore;
 
 /// Universal return macro for [`Reactor::react`]. Builds an
 /// [`Events`] collection from one or more output facts.
