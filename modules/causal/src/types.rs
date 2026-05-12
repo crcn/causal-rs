@@ -1,50 +1,20 @@
-//! Core data types for causal event processing.
+//! Core data types for the causal event log.
 
 use chrono::{DateTime, Utc};
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
-// ── Reactor logging ──────────────────────────────────────────────
-
-/// Log level for reactor log entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    Debug,
-    Info,
-    Warn,
-}
-
-impl fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LogLevel::Debug => write!(f, "DEBUG"),
-            LogLevel::Info => write!(f, "INFO"),
-            LogLevel::Warn => write!(f, "WARN"),
-        }
-    }
-}
-
-/// A structured log entry captured during reactor execution.
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    pub level: LogLevel,
-    pub message: String,
-    pub data: Option<serde_json::Value>,
-    pub timestamp: DateTime<Utc>,
-}
-
-// ── Opaque cursor types ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
+// Cursors + versions
+// ─────────────────────────────────────────────────────────────────────
 
 /// Opaque cursor into the global event log.
 ///
-/// Represents a monotonically increasing position in the append-only log.
-/// Gaps between values are allowed (e.g. Postgres BIGSERIAL). Consumers
-/// must never perform arithmetic on this value — use it only for
-/// ordering comparisons and as a checkpoint cursor.
+/// Monotonically increasing position; gaps between values are allowed
+/// (e.g. Postgres BIGSERIAL). Consumers must never perform arithmetic —
+/// use it only for ordering comparisons and checkpoint cursors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct LogCursor(u64);
 
@@ -56,7 +26,7 @@ impl LogCursor {
         LogCursor(position)
     }
 
-    /// Unwrap to raw u64 for storage boundary (e.g. SQL parameter).
+    /// Unwrap to raw u64 for a storage boundary (e.g. SQL parameter).
     pub fn raw(self) -> u64 {
         self.0
     }
@@ -70,21 +40,19 @@ impl fmt::Display for LogCursor {
 
 /// Opaque per-aggregate stream version.
 ///
-/// Represents the version number within a single aggregate's event stream.
-/// Versions are contiguous within a stream (1, 2, 3, …). Used for
-/// optimistic concurrency, snapshot thresholds, and hydration replay.
+/// Contiguous within a stream (1, 2, 3, …). Used for optimistic
+/// concurrency (`emit(...).expecting(v)`), snapshot thresholds, and
+/// hydration replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct StreamVersion(u64);
 
 impl StreamVersion {
     pub const ZERO: StreamVersion = StreamVersion(0);
 
-    /// Wrap a raw u64 from a storage boundary (e.g. Postgres row).
     pub fn from_raw(version: u64) -> Self {
         StreamVersion(version)
     }
 
-    /// Unwrap to raw u64 for storage boundary (e.g. SQL parameter).
     pub fn raw(self) -> u64 {
         self.0
     }
@@ -96,280 +64,53 @@ impl fmt::Display for StreamVersion {
     }
 }
 
-// ── Constants ────────────────────────────────────────────────────
-
-/// UUID v5 namespace for deterministic event ID generation
-/// Used to prevent duplicate events on crash+retry
-/// This is a custom namespace UUID (derived from URL namespace)
-pub const NAMESPACE_CAUSAL: Uuid = Uuid::from_u128(0x6ba7b8109dad11d180b400c04fd430c8);
-
-/// Event emitted by a reactor (for atomic insertion)
-#[derive(Debug, Clone)]
-pub struct EmittedEvent {
-    /// Stable durable name from Event trait (e.g. "scrape:web_scrape_completed").
-    pub durable_name: String,
-    /// Event prefix for codec lookup (e.g. "scrape").
-    pub event_prefix: String,
-    /// Whether this event should be persisted to EventLog.
-    pub persistent: bool,
-    /// Event payload (JSON)
-    pub payload: serde_json::Value,
-    /// Reactor that produced this event.
-    pub reactor_id: Option<String>,
-    /// Original typed event (live dispatch only).
-    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
-}
-
-// ── New types (EventLog + ReactorQueue split) ─────────────────────
-
-/// Atomic intent creation payload.
-///
-/// Produced by the engine's `process_event` during Phase 1 of the settle
-/// loop. Single job: atomically enqueue reactor intents and advance the
-/// dispatch cursor.
-///
-/// Projection failures are NOT carried here. A projection failure causes
-/// `process_event_inner` to return `Err`; the engine retries the event via
-/// the existing event-retry budget. See
-/// `docs/plans/2026-05-04-fix-projection-failure-cursor-advance-plan.md`.
-#[derive(Debug)]
-pub struct IntentCommit {
-    /// Source event identifiers.
-    pub event_id: Uuid,
-    pub correlation_id: Uuid,
-    pub event_type: String,
-    pub event_payload: serde_json::Value,
-    /// Source event's `created_at`. Carried through so queued reactors
-    /// see a stable, replay-deterministic timestamp via `Context::event_created_at`.
-    pub event_created_at: DateTime<Utc>,
-    /// Queued reactor intents to persist.
-    pub intents: Vec<ReactorIntent>,
-    /// Reactor gate descriptions (reactor_id → serialized describe output).
-    pub reactor_descriptions: HashMap<String, serde_json::Value>,
-    /// Aggregate state snapshots (aggregate_key → serialized state).
-    pub aggregate_snapshots: HashMap<String, serde_json::Value>,
-    /// Advance checkpoint to this EventLog position.
-    pub checkpoint: LogCursor,
-    /// Park this event in DLQ (exceeded hops, exceeded retry, etc.)
-    pub park: Option<EventPark>,
-}
-
-impl IntentCommit {
-    /// Park an event in DLQ and advance checkpoint past it.
-    pub fn park(event: &PersistedEvent, reason: impl Into<String>) -> Self {
-        Self {
-            event_id: event.event_id,
-            correlation_id: event.correlation_id,
-            event_type: event.event_type.clone(),
-            event_payload: event.payload.clone(),
-            event_created_at: event.created_at,
-            intents: Vec::new(),
-            reactor_descriptions: HashMap::new(),
-            aggregate_snapshots: HashMap::new(),
-            checkpoint: event.position,
-            park: Some(EventPark {
-                reason: reason.into(),
-            }),
-        }
-    }
-
-    /// Skip an event (advance checkpoint, no intents, no DLQ).
-    pub fn skip(event: &PersistedEvent) -> Self {
-        Self {
-            event_id: event.event_id,
-            correlation_id: event.correlation_id,
-            event_type: event.event_type.clone(),
-            event_payload: event.payload.clone(),
-            event_created_at: event.created_at,
-            intents: Vec::new(),
-            reactor_descriptions: HashMap::new(),
-            aggregate_snapshots: HashMap::new(),
-            checkpoint: event.position,
-            park: None,
-        }
-    }
-}
-
-/// Reason for parking (DLQ-ing) an event during processing.
-#[derive(Debug, Clone)]
-pub struct EventPark {
-    pub reason: String,
-}
-
-/// Persisted intent for a queued reactor execution.
-#[derive(Debug, Clone)]
-pub struct ReactorIntent {
-    /// Stable reactor identifier.
-    pub reactor_id: String,
-    /// Parent event for causality tracking.
-    pub parent_event_id: Option<Uuid>,
-    /// Earliest time this reactor can execute.
-    pub execute_at: DateTime<Utc>,
-    /// Per-reactor timeout in seconds.
-    pub timeout_seconds: i32,
-    /// Max retry attempts for this reactor.
-    pub max_attempts: i32,
-    /// Queue priority (lower = higher priority).
-    pub priority: i32,
-    /// Hop count inherited from source event (for infinite loop detection).
-    pub hops: i32,
-}
-
-/// Queued reactor execution from store
-#[derive(Debug, Clone)]
-pub struct QueuedReactor {
-    pub event_id: Uuid,
-    pub reactor_id: String,
-    pub correlation_id: Uuid,
-    pub event_type: String,
-    pub event_payload: serde_json::Value,
-    pub parent_event_id: Option<Uuid>,
-    /// Original event's `created_at` from the persisted log envelope.
-    /// Carried through the queue so reactors fired async still see a
-    /// stable, replay-deterministic timestamp via `ctx.event_created_at()`.
-    pub event_created_at: DateTime<Utc>,
-    pub execute_at: DateTime<Utc>,
-    pub timeout_seconds: i32,
-    pub max_attempts: i32,
-    pub priority: i32,
-    pub hops: i32,
-    pub attempts: i32,
-    /// Original typed event (live dispatch only).
-    pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
-}
-
-/// Event worker configuration.
-#[derive(Debug, Clone)]
-pub struct EventWorkerConfig {
-    /// Polling interval when no events available.
-    pub poll_interval: Duration,
-    /// Maximum hop count before DLQ (infinite loop detection).
-    pub max_hops: i32,
-    /// Maximum retry count for event-level failures.
-    pub max_event_retry_attempts: i32,
-}
-
-impl Default for EventWorkerConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval: Duration::from_millis(100),
-            max_hops: 50,
-            max_event_retry_attempts: 3,
-        }
-    }
-}
-
-/// Reactor worker configuration.
-#[derive(Debug, Clone)]
-pub struct ReactorWorkerConfig {
-    /// Polling interval when no reactors available.
-    pub poll_interval: Duration,
-    /// Default timeout for reactor execution.
-    pub default_timeout: Duration,
-}
-
-impl Default for ReactorWorkerConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval: Duration::from_millis(100),
-            default_timeout: Duration::from_secs(30),
-        }
-    }
-}
-
-/// Atomic reactor completion payload.
-#[derive(Debug)]
-pub struct ReactorCompletion {
-    pub event_id: Uuid,
-    pub reactor_id: String,
-    pub result: serde_json::Value,
-    /// Log entries captured during reactor execution.
-    pub log_entries: Vec<LogEntry>,
-}
-
-/// Atomic DLQ + terminal-event payload.
-#[derive(Debug)]
-pub struct ReactorDlq {
-    pub event_id: Uuid,
-    pub reactor_id: String,
-    pub error: String,
-    pub reason: String,
-    pub attempts: i32,
-    /// Log entries captured during reactor execution.
-    pub log_entries: Vec<LogEntry>,
-}
-
-/// Unified reactor resolution outcome.
-///
-/// Replaces the three separate `complete_handler`, `fail_handler`, `dlq_handler`
-/// Store methods with a single `resolve_handler(ReactorResolution)` call.
-#[derive(Debug)]
-pub enum ReactorResolution {
-    /// Reactor completed successfully.
-    Complete(ReactorCompletion),
-    /// Reactor failed but can be retried.
-    Retry {
-        event_id: Uuid,
-        reactor_id: String,
-        error: String,
-        new_attempts: i32,
-        next_execute_at: DateTime<Utc>,
-        /// Log entries captured during this attempt.
-        log_entries: Vec<LogEntry>,
-    },
-    /// Reactor exhausted retries — send to dead letter queue.
-    DeadLetter(ReactorDlq),
-}
-
-// ── Event persistence types ───────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
+// Append result / persisted-event / new-event / snapshot
+// ─────────────────────────────────────────────────────────────────────
 
 /// Result of appending an event to the global log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
-    /// Opaque global ordering cursor. Monotonically increasing; gaps between
-    /// values are allowed. Consumers must treat this as an opaque cursor for
-    /// [`Store::load_global_from`](crate::store::Store::load_global_from) and
-    /// should not perform arithmetic or assume a gapless sequence.
+    /// Opaque global ordering cursor.
     pub position: LogCursor,
-    /// Per-aggregate stream version at the time of append. `None` for events
-    /// that are not scoped to an aggregate.
+    /// Per-aggregate stream version at the time of append. `None` for
+    /// events that aren't scoped to an aggregate.
     pub version: Option<StreamVersion>,
 }
 
 /// A persisted event loaded from the store.
 #[derive(Clone)]
 pub struct PersistedEvent {
-    /// Opaque global ordering cursor. Monotonically increasing; gaps between
-    /// values are allowed. Used for checkpoint-based cursor tracking —
-    /// no arithmetic should be performed on this value.
     pub position: LogCursor,
-    /// Unique event ID.
     pub event_id: Uuid,
     /// Parent event that caused this event (None for root events).
     pub parent_id: Option<Uuid>,
     /// Correlation ID linking the full causal tree.
     pub correlation_id: Uuid,
-    /// Short stable event type name (e.g. "OrderPlaced").
+    /// Canonical `{CATEGORY}:{name}` event_type string.
     pub event_type: String,
     /// JSON payload.
     pub payload: serde_json::Value,
-    /// When the event was persisted.
+    /// When the event was persisted (backend-authoritative —
+    /// `NewEvent::created_at` is a hint that backends MAY override).
     pub created_at: DateTime<Utc>,
     /// Aggregate type (only present for aggregate-scoped events).
     pub aggregate_type: Option<String>,
     /// Aggregate instance ID (only present for aggregate-scoped events).
     pub aggregate_id: Option<Uuid>,
-    /// Per-aggregate stream version (only present for aggregate-scoped events).
+    /// Per-aggregate stream version (only present for aggregate-scoped
+    /// events).
     pub version: Option<StreamVersion>,
-    /// Application-level metadata (e.g. run_id, schema_v, actor).
+    /// Application-level metadata (e.g. `_run_id`, `_schema_v`,
+    /// `_actor`). Set via `EmitBuilder::metadata`.
     pub metadata: serde_json::Map<String, serde_json::Value>,
-    /// Original typed event, available only during live dispatch in-process.
-    /// `None` on load from durable store — reactors fall back to JSON deserialization.
+    /// Original typed event, available only during live in-process
+    /// dispatch. `None` on load from durable store — consumers fall
+    /// back to JSON deserialization.
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
-    /// Whether this event should be forwarded to the permanent event store
-    /// (e.g. KurrentDB). Ephemeral events (`false`) are persisted to the
-    /// operational store (Postgres) for causal chain durability, but are
-    /// not domain facts and should not be in the permanent log.
+    /// Whether this event should be forwarded to the permanent event
+    /// store. Always `true` under v0.4 — facts are persistent (P1.5).
+    /// Field retained for backend compatibility.
     pub persistent: bool,
 }
 
@@ -408,30 +149,20 @@ impl fmt::Debug for PersistedEvent {
 /// A new event to be appended to the global log.
 #[derive(Clone)]
 pub struct NewEvent {
-    /// Unique event ID.
     pub event_id: Uuid,
-    /// Parent event that caused this event (None for root events).
     pub parent_id: Option<Uuid>,
-    /// Correlation ID linking the full causal tree.
     pub correlation_id: Uuid,
-    /// Short stable event type name (e.g. "OrderPlaced").
     pub event_type: String,
-    /// JSON payload.
     pub payload: serde_json::Value,
-    /// When the event was created.
+    /// Hint for `created_at` — backends MAY override server-side.
     pub created_at: DateTime<Utc>,
-    /// Aggregate type (set by engine when aggregators match).
     pub aggregate_type: Option<String>,
-    /// Aggregate instance ID (set by engine when aggregators match).
     pub aggregate_id: Option<Uuid>,
-    /// Application-level metadata (e.g. run_id, schema_v, actor).
     pub metadata: serde_json::Map<String, serde_json::Value>,
-    /// Original typed event for zero-cost dispatch in-process.
-    /// `None` for events loaded from durable stores.
+    /// Original typed event for zero-cost in-process dispatch. `None`
+    /// for events loaded from durable stores.
     pub ephemeral: Option<Arc<dyn Any + Send + Sync>>,
-    /// Whether this event should be persisted to EventLog.
-    /// Ephemeral events (`false`) route through reactors but skip persistence,
-    /// aggregators, and projections.
+    /// Always `true` under v0.4 (facts are persistent, per P1.5).
     pub persistent: bool,
 }
 
@@ -452,7 +183,7 @@ impl fmt::Debug for NewEvent {
     }
 }
 
-/// A serialized snapshot of aggregate state at a specific stream version.
+/// Serialized snapshot of aggregate state at a specific stream version.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub aggregate_type: String,
@@ -460,35 +191,6 @@ pub struct Snapshot {
     pub version: StreamVersion,
     pub state: serde_json::Value,
     pub created_at: DateTime<Utc>,
-}
-
-/// A single journaled result from `ctx.run()`.
-#[derive(Debug, Clone)]
-pub struct JournalEntry {
-    pub seq: u32,
-    pub value: serde_json::Value,
-}
-
-/// Summary of pending work for a correlation ID.
-#[derive(Debug, Clone, Default)]
-pub struct QueueStatus {
-    pub pending_reactors: usize,
-    pub dead_lettered: usize,
-}
-
-impl fmt::Display for QueuedReactor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Reactor(event_id={}, reactor_id={}, correlation_id={}, priority={}, attempts={}/{})",
-            self.event_id,
-            self.reactor_id,
-            self.correlation_id,
-            self.priority,
-            self.attempts,
-            self.max_attempts
-        )
-    }
 }
 
 #[cfg(test)]

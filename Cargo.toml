@@ -4,13 +4,17 @@ members = [
     "modules/causal_core_macros",
     "modules/causal_replay",
     "modules/causal_utils",
-    "modules/causal_inspector",
-    "modules/causal_inspector_utils",
-    # examples/ entries removed in P11.c — they're legacy-API demos
-    # (Engine<D> + reactor::on()) that need a v0.4 rewrite. Source
-    # stays on disk for reference; parked from build until rewritten.
+    # P11.f: causal_inspector + causal_inspector_utils park out.
+    # They read MemoryStore's legacy execution-tracking state
+    # (reactor_log_entries, reactor_executions, etc.) which the
+    # legacy engine populated. Under v0.4 nothing writes those
+    # fields. The inspector needs re-instrumentation against v0.4
+    # before it earns its place back in the workspace.
+    # Examples parked similarly in P11.c.
 ]
 exclude = [
+    "modules/causal_inspector",
+    "modules/causal_inspector_utils",
     "examples/simple-order",
     "examples/http-fetcher",
     "examples/ai-summarizer",

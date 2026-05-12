@@ -44,7 +44,6 @@ pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
 pub mod projector;
-pub mod reactor_queue;
 pub mod reactor_runner;
 pub mod reactor_v3;
 pub mod relay;
