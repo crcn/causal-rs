@@ -72,17 +72,19 @@ pub use aggregator::{Aggregate, Aggregator, AggregatorRegistry, Apply};
 pub use event_store::{event_type_short_name, persist_event, save_snapshot, Versioned};
 pub use types::{AppendResult, LogCursor, NewEvent, PersistedEvent, QueueStatus, Snapshot, StreamVersion};
 
-// Re-export v0.3 trait surface
-pub use checkpoint_store::{CheckpointStore, InsertableOutboxRow, OutboxRow, ReactorOutbox};
+// ── v0.4 public trait surface ─────────────────────────────────────────
+// Implementation-detail runners + outbox shapes live behind module
+// paths (causal::projection_runner::ProjectionRunner,
+// causal::checkpoint_store::OutboxRow, etc.) so they don't crowd the
+// prelude. Backends that implement ReactorOutbox import OutboxRow /
+// InsertableOutboxRow from their module path directly.
+pub use checkpoint_store::{CheckpointStore, ReactorOutbox};
 pub use contexts::{Ctx, Metadata};
 pub use event_log::{EventLog, EventLogBackend};
 pub use fact::Fact;
-pub use multi_projector::{MultiProjector, MultiProjectorRunner};
-pub use projection_runner::{ProjectionRunner, StepOutcome};
+pub use multi_projector::MultiProjector;
 pub use projector::Projector;
 pub use reactor_queue::ReactorQueue;
-pub use reactor_runner::{derive_output_event_id, ReactorRunner, NS_REACTOR_OUTPUT};
-pub use relay::RelayLoop;
 // Note: `crate::engine::Engine<D>` is the legacy engine. The new v0.3
 // engine is `crate::engine_v3::{Engine, EngineBuilder}` — fully-
 // qualified to avoid the name collision until Phase 9.
