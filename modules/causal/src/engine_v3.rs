@@ -504,10 +504,15 @@ impl EngineBuilder {
             }
             Some(Arc::new(reg))
         };
+        // Engine-level registry for external read access — separate
+        // from per-consumer clones so consumer-side capture/restore
+        // rollback doesn't leak into outside observers' state.
+        let engine_aggregators = make_registry();
         let consumers: Vec<Arc<dyn Supervisable>> = self.consumers
             .into_iter()
             .map(|f| f(make_registry()))
             .collect();
+        let consumer_ids: Vec<String> = self.group_names.into_iter().collect();
         Engine::start(
             self.log,
             self.checkpoint,
@@ -515,6 +520,8 @@ impl EngineBuilder {
             consumers,
             self.occ_required_streams,
             self.default_metadata,
+            engine_aggregators,
+            consumer_ids,
         )
     }
 }
@@ -530,6 +537,17 @@ pub struct Engine {
     handles:               Vec<JoinHandle<()>>,
     occ_required_streams:  std::collections::HashSet<String>,
     default_metadata:      Metadata,
+    /// Engine-level aggregator registry for out-of-band read access
+    /// via `engine.singleton::<A>()` / `engine.aggregate_of::<A>(id)`.
+    /// Folded on every successful `emit()`. Each consumer holds its
+    /// OWN registry clone for in-body `ctx.aggregate` reads — the
+    /// engine-level registry exists for the test ergonomic of
+    /// reading aggregate state without going through a consumer.
+    aggregators:           Option<Arc<AggregatorRegistry>>,
+    /// Consumer group names registered with the builder, in
+    /// registration order. Used by `Engine::settle` to await every
+    /// consumer catching up to an emit position.
+    consumer_ids:          Vec<String>,
 }
 
 impl Engine {
@@ -540,6 +558,8 @@ impl Engine {
         consumers: Vec<Arc<dyn Supervisable>>,
         occ_required_streams: std::collections::HashSet<String>,
         default_metadata: Metadata,
+        aggregators: Option<Arc<AggregatorRegistry>>,
+        consumer_ids: Vec<String>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len() + 1);
@@ -560,7 +580,11 @@ impl Engine {
         });
         handles.push(relay_task);
 
-        Self { log, checkpoint, shutdown_tx, handles, occ_required_streams, default_metadata }
+        Self {
+            log, checkpoint, shutdown_tx, handles,
+            occ_required_streams, default_metadata,
+            aggregators, consumer_ids,
+        }
     }
 
     /// Emit one or more Facts to the log.
@@ -697,6 +721,11 @@ impl Engine {
                 persistent:      true,
             };
 
+            // Capture the event_type + payload for the engine-level
+            // aggregator fold BEFORE the log write consumes new_event.
+            let agg_event_type = new_event.event_type.clone();
+            let agg_payload = new_event.payload.clone();
+
             let result = if b.expected.is_some() {
                 let r = self.log
                     .append_to_stream(fact.category(), stream_id, current_expected, new_event)
@@ -713,8 +742,72 @@ impl Engine {
             if last_version.is_none() {
                 last_version = result.version;
             }
+
+            // Fold into the engine-level registry for out-of-band
+            // `engine.singleton::<A>()` access. Consumers maintain
+            // their own folded registry copies independently — this
+            // mirror exists so tests + ops tooling can read aggregate
+            // state without a consumer hop.
+            if let Some(reg) = &self.aggregators {
+                reg.apply_event(&agg_event_type, &agg_payload);
+            }
         }
         Ok(EmitResult { position: last_position, version: last_version })
+    }
+
+    /// Read singleton aggregate state — equivalent to
+    /// `ctx.aggregate::<A>().curr` from outside a consumer body.
+    /// Reads the engine-level aggregator registry that's folded on
+    /// every successful `emit()`.
+    ///
+    /// # Panics
+    /// Panics if no aggregators were registered via
+    /// `EngineBuilder::with_aggregators(...)`.
+    pub fn singleton<A>(&self) -> Arc<A>
+    where
+        A: crate::aggregate_v3::Aggregate,
+    {
+        let reg = self.aggregators.as_ref().expect(
+            "engine.singleton::<A>() called but no aggregators were \
+             registered with EngineBuilder::with_aggregators(...)",
+        );
+        let (_, curr) = reg.get_singleton_arc::<A>();
+        curr
+    }
+
+    /// Read aggregate state for a specific aggregate id. Same
+    /// semantics as `singleton` but for non-singleton aggregates.
+    ///
+    /// # Panics
+    /// Panics if no aggregators were registered. See [`Self::singleton`].
+    pub fn aggregate_of<A>(&self, id: Uuid) -> Arc<A>
+    where
+        A: crate::aggregate_v3::Aggregate,
+    {
+        let reg = self.aggregators.as_ref().expect(
+            "engine.aggregate_of::<A>(id) called but no aggregators \
+             were registered with EngineBuilder::with_aggregators(...)",
+        );
+        let (_, curr) = reg.get_transition_arc::<A>(id);
+        curr
+    }
+
+    /// Wait until every registered consumer has caught up to the
+    /// position recorded in `emit_result`. Composes over
+    /// [`await_observed_by`](Self::await_observed_by) — one cursor
+    /// poll per consumer until they all clear.
+    ///
+    /// **Semantic vs. legacy v0.3 `.settled()`**: v0.3's settled was
+    /// an in-process synchronous wait — emit triggered an inline
+    /// settle that ran reactors in the same task. v0.4's settle is
+    /// a cursor-poll loop with bounded latency based on consumer
+    /// batch size + supervisor poll interval. The end state is the
+    /// same; the wait mechanism is different.
+    pub async fn settle(&self, result: EmitResult) -> Result<()> {
+        for id in &self.consumer_ids {
+            self.await_observed_by(id, result.position).await?;
+        }
+        Ok(())
     }
 
     /// Block until consumer `id` has caught up to `pos`. Polls the
@@ -1568,6 +1661,72 @@ mod tests {
                     "both bulk-registered projectors didn't see the event");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_singleton_reads_state_folded_on_emit() {
+        // External read: emit Ticks, then read TickCounter via
+        // engine.singleton::<A>() without going through a consumer.
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators(vec![tick_aggregator()])
+        .build();
+
+        for i in 0..5 {
+            engine.emit(Tick { seq: i, occurred_at: Utc::now() }).await.unwrap();
+        }
+
+        let counter = engine.singleton::<TickCounter>();
+        assert_eq!(counter.count, 5,
+                   "engine-level registry folded all 5 emitted Ticks");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "engine.singleton")]
+    async fn engine_singleton_panics_without_aggregators() {
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        ).build();
+        let _ = engine.singleton::<TickCounter>();
+    }
+
+    #[tokio::test]
+    async fn engine_settle_waits_for_every_consumer_to_catch_up() {
+        // After emit + settle, every registered consumer's cursor is
+        // ≥ the emit position. Pin the contract.
+        let store = store();
+        let roster = UserRoster::default();
+        let seen = roster.seen.clone();
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_projector(roster)
+        .build();
+
+        let result = engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).await.unwrap();
+
+        engine.settle(result).await.unwrap();
+
+        // After settle, the projector has definitely processed the
+        // event — no polling sleep needed.
+        assert_eq!(seen.lock().len(), 1);
+
         engine.shutdown().await.unwrap();
     }
 
