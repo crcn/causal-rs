@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::aggregate_v3::Aggregate;
+use crate::aggregate_v3::{Aggregate, Apply};
 use crate::aggregator::{Aggregator, AggregatorRegistry};
 use crate::checkpoint_store::{CheckpointStore, ReactorOutbox};
 use crate::multi_projector::{MultiProjector, MultiProjectorRunner};
@@ -89,7 +89,7 @@ impl<P: MultiProjector + 'static> Supervisable for MultiProjectorRunner<P> {
 // Aggregate-stream gate (partial BS1 closure)
 // ─────────────────────────────────────────────────────────────────────
 //
-// `with_aggregate::<A>()` records `A::CATEGORY` as an OCC-required
+// `with_aggregate::<A, F>()` records `F::CATEGORY` as an OCC-required
 // stream. `Engine::emit` rejects writes to those streams with
 // `EmitError::OccStreamMisuse`. Streams not in the set are accepted
 // (default permissive — preserves Phase 4d behavior).
@@ -185,13 +185,20 @@ impl EngineBuilder {
         );
     }
 
-    /// Register an aggregate. Marks `A::CATEGORY` as OCC-required so
-    /// `Engine::emit` rejects writes to that stream — only
-    /// `Engine::append<A>(expected, ...)` writes (per C11). The
-    /// `Engine::load<A>` and `Engine::append<A>` methods wire the
-    /// command-handler path.
-    pub fn with_aggregate<A: Aggregate>(mut self) -> Self {
-        self.occ_required_streams.insert(A::CATEGORY.into());
+    /// Register an aggregate-on-stream binding. Marks `F::CATEGORY`
+    /// as OCC-required so `Engine::emit` rejects writes to that
+    /// stream — only `Engine::append<A, F>(expected, ...)` writes
+    /// (per C11). The `Engine::load<A, F>` and
+    /// `Engine::append<A, F>` methods wire the command-handler path.
+    ///
+    /// `A: Aggregate + Apply<F>` says "this aggregate folds this
+    /// Fact"; `F: Fact` provides the stream category.
+    pub fn with_aggregate<A, F>(mut self) -> Self
+    where
+        A: Aggregate + Apply<F>,
+        F: Fact,
+    {
+        self.occ_required_streams.insert(F::CATEGORY.into());
         self
     }
 
@@ -398,21 +405,23 @@ impl Engine {
     /// Returns the aggregate state and the current stream version
     /// (for use as `expected` in a subsequent `append`).
     ///
-    /// Aggregate streams use `aggregate_type = A::CATEGORY` and
-    /// `aggregate_id = id`; the same convention `Engine::append<A>`
-    /// uses on write.
-    pub async fn load<A: Aggregate>(
+    /// Stream identity comes from `F::CATEGORY` + `id`; the same
+    /// convention `Engine::append<A, F>` uses on write. Caller picks
+    /// both type params so the same `Aggregate` impl can fold
+    /// different Fact streams (e.g. `load::<PipelineState, ScrapeEvent>`).
+    pub async fn load<A, F>(
         &self,
         id: Uuid,
     ) -> Result<(A, StreamVersion)>
     where
-        A::Fact: DeserializeOwned,
+        A: Aggregate + Apply<F>,
+        F: Fact + DeserializeOwned,
     {
-        let events = self.log.load_stream(A::CATEGORY, id, None).await?;
+        let events = self.log.load_stream(F::CATEGORY, id, None).await?;
         let mut agg = A::default();
         let mut version = StreamVersion::ZERO;
         for event in events {
-            let fact: A::Fact = serde_json::from_value(event.payload)?;
+            let fact: F = serde_json::from_value(event.payload)?;
             agg.apply(&fact);
             if let Some(v) = event.version {
                 version = v;
@@ -424,33 +433,44 @@ impl Engine {
     /// CAS-protected append to an aggregate stream (per C6).
     /// Convenience over [`append_in`](Self::append_in) with default
     /// envelope (auto correlation_id, no parent, empty metadata).
-    pub async fn append<A: Aggregate>(
+    pub async fn append<A, F>(
         &self,
         id: Uuid,
         expected: StreamVersion,
-        facts: Vec<A::Fact>,
-    ) -> Result<StreamVersion> {
-        self.append_in::<A>(id, expected, facts, WriteOptions::default()).await
+        facts: Vec<F>,
+    ) -> Result<StreamVersion>
+    where
+        A: Aggregate + Apply<F>,
+        F: Fact,
+    {
+        self.append_in::<A, F>(id, expected, facts, WriteOptions::default()).await
     }
 
     /// CAS-protected append with explicit envelope fields. Each fact
     /// in the batch carries the same `correlation_id` and `parent_id`
     /// from `opts`. Errors with `ConflictError` if the stream has
-    /// moved past `expected`. The standard recovery is to `load<A>`
+    /// moved past `expected`. The standard recovery is to `load<A, F>`
     /// again, re-decide on the new state, and retry. On failure
     /// mid-batch, prior appends remain durable.
-    pub async fn append_in<A: Aggregate>(
+    pub async fn append_in<A, F>(
         &self,
         id: Uuid,
         expected: StreamVersion,
-        facts: Vec<A::Fact>,
+        facts: Vec<F>,
         opts: WriteOptions,
-    ) -> Result<StreamVersion> {
+    ) -> Result<StreamVersion>
+    where
+        A: Aggregate + Apply<F>,
+        F: Fact,
+    {
+        // A: Apply<F> is the contract that this Fact belongs to this
+        // Aggregate. Caller-facing — unused at runtime here.
+        let _ = std::marker::PhantomData::<A>;
         let correlation = opts.correlation_id.unwrap_or_else(Uuid::new_v4);
         let mut current_expected = expected;
         let mut last_version = expected;
         for fact in facts {
-            let event_type = format!("{}:{}", <A::Fact as Fact>::CATEGORY, fact.name());
+            let event_type = format!("{}:{}", F::CATEGORY, fact.name());
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let payload = serde_json::to_value(&fact)?;
             let new_event = NewEvent {
@@ -460,14 +480,14 @@ impl Engine {
                 event_type,
                 payload,
                 created_at:      occurred_at,
-                aggregate_type:  Some(A::CATEGORY.to_string()),
+                aggregate_type:  Some(F::CATEGORY.to_string()),
                 aggregate_id:    Some(id),
                 metadata:        opts.metadata.clone(),
                 ephemeral:       None,
                 persistent:      true,
             };
             let result = self.log
-                .append_to_stream(A::CATEGORY, id, current_expected, new_event)
+                .append_to_stream(F::CATEGORY, id, current_expected, new_event)
                 .await?;
             last_version = result.version.unwrap_or(current_expected);
             current_expected = last_version;
@@ -770,9 +790,8 @@ mod tests {
     /// Aggregate registered for stream-policy testing.
     #[derive(Default)]
     struct UserAgg;
-    impl crate::aggregate_v3::Aggregate for UserAgg {
-        type Fact = UserCreated;
-        const CATEGORY: &'static str = "user";
+    impl crate::aggregate_v3::Aggregate for UserAgg {}
+    impl crate::aggregate_v3::Apply<UserCreated> for UserAgg {
         fn apply(&mut self, _fact: &UserCreated) {}
     }
 
@@ -803,7 +822,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<UserAgg>()
+        .with_aggregate::<UserAgg, UserCreated>()
         .build();
 
         let result = engine.emit(UserCreated {
@@ -828,7 +847,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<UserAgg>()
+        .with_aggregate::<UserAgg, UserCreated>()
         .build();
 
         // OrderPlaced lives in category "order" — unregistered, default
@@ -889,9 +908,8 @@ mod tests {
 
     #[derive(Default, Debug, PartialEq)]
     struct Counter { value: i32 }
-    impl crate::aggregate_v3::Aggregate for Counter {
-        type Fact = CounterFact;
-        const CATEGORY: &'static str = "counter";
+    impl crate::aggregate_v3::Aggregate for Counter {}
+    impl crate::aggregate_v3::Apply<CounterFact> for Counter {
         fn apply(&mut self, fact: &CounterFact) {
             match fact {
                 CounterFact::Inc { by, .. } => self.value += by,
@@ -908,11 +926,11 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter>()
+        .with_aggregate::<Counter, CounterFact>()
         .build();
 
         let id = Uuid::new_v4();
-        let (agg, ver) = engine.load::<Counter>(id).await.unwrap();
+        let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
         assert_eq!(agg, Counter::default());
         assert_eq!(ver, StreamVersion::ZERO);
         engine.shutdown().await.unwrap();
@@ -926,18 +944,18 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter>()
+        .with_aggregate::<Counter, CounterFact>()
         .build();
 
         let id = Uuid::new_v4();
-        let v1 = engine.append::<Counter>(id, StreamVersion::ZERO, vec![
+        let v1 = engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
             CounterFact::Inc { by: 3, occurred_at: Utc::now(), counter_id: id },
             CounterFact::Inc { by: 5, occurred_at: Utc::now(), counter_id: id },
         ]).await.unwrap();
         assert_eq!(v1, StreamVersion::from_raw(2),
                    "version is 2 after appending 2 facts");
 
-        let (agg, ver) = engine.load::<Counter>(id).await.unwrap();
+        let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
         assert_eq!(agg.value, 8);
         assert_eq!(ver, StreamVersion::from_raw(2));
 
@@ -952,18 +970,18 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter>()
+        .with_aggregate::<Counter, CounterFact>()
         .build();
 
         let id = Uuid::new_v4();
 
         // First append moves version to 1.
-        engine.append::<Counter>(id, StreamVersion::ZERO, vec![
+        engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
             CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
         ]).await.unwrap();
 
         // Stale expected (still ZERO) → ConflictError.
-        let result = engine.append::<Counter>(id, StreamVersion::ZERO, vec![
+        let result = engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
             CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
         ]).await;
         assert!(result.is_err());
@@ -990,7 +1008,7 @@ mod tests {
                 store.clone() as Arc<dyn CheckpointStore>,
                 store.clone() as Arc<dyn ReactorOutbox>,
             )
-            .with_aggregate::<Counter>()
+            .with_aggregate::<Counter, CounterFact>()
             .build()
         );
 
@@ -999,12 +1017,12 @@ mod tests {
         let e1 = engine.clone();
         let e2 = engine.clone();
         let h1 = tokio::spawn(async move {
-            e1.append::<Counter>(id, StreamVersion::ZERO, vec![
+            e1.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
                 CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
             ]).await
         });
         let h2 = tokio::spawn(async move {
-            e2.append::<Counter>(id, StreamVersion::ZERO, vec![
+            e2.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
                 CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
             ]).await
         });
@@ -1018,7 +1036,7 @@ mod tests {
         assert_eq!(losers, 1, "exactly one conflict");
 
         // Final aggregate state: one Inc applied → value == 1.
-        let (agg, ver) = engine.load::<Counter>(id).await.unwrap();
+        let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
         assert_eq!(agg.value, 1);
         assert_eq!(ver, StreamVersion::from_raw(1));
     }
@@ -1033,18 +1051,18 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter>()
+        .with_aggregate::<Counter, CounterFact>()
         .build();
 
         let id = Uuid::new_v4();
         let pinned = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap().with_timezone(&Utc);
-        engine.append::<Counter>(id, StreamVersion::ZERO, vec![
+        engine.append::<Counter, CounterFact>(id, StreamVersion::ZERO, vec![
             CounterFact::Inc { by: 1, occurred_at: pinned, counter_id: id },
         ]).await.unwrap();
 
         let events = EventLogBackend::load_stream(
-            store.as_ref(), Counter::CATEGORY, id, None,
+            store.as_ref(), <CounterFact as Fact>::CATEGORY, id, None,
         ).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].created_at, pinned,
@@ -1209,13 +1227,13 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         )
-        .with_aggregate::<Counter>()
+        .with_aggregate::<Counter, CounterFact>()
         .build();
 
         let id = Uuid::new_v4();
         let cmd_correlation = Uuid::new_v4();
 
-        engine.append_in::<Counter>(
+        engine.append_in::<Counter, CounterFact>(
             id,
             StreamVersion::ZERO,
             vec![
@@ -1230,7 +1248,7 @@ mod tests {
         ).await.unwrap();
 
         let events = EventLogBackend::load_stream(
-            store.as_ref(), Counter::CATEGORY, id, None,
+            store.as_ref(), <CounterFact as Fact>::CATEGORY, id, None,
         ).await.unwrap();
         assert_eq!(events.len(), 2);
         for ev in &events {

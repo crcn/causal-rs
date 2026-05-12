@@ -1,44 +1,56 @@
-//! v0.3 `Aggregate` trait — write-side consistency boundary.
-//!
-//! Lives at `crate::aggregate_v3::Aggregate` until Phase 9 collapses
-//! the legacy `crate::aggregator::Aggregate` (which uses per-event
-//! `Apply<E>` impls and an `AggregatorRegistry`). The v0.3 form is
-//! single-Fact-per-aggregate with apply on the trait itself, mirroring
-//! the rest of the v0.4 trait taxonomy (Projector / Reactor).
+//! v0.4 `Aggregate` marker + `Apply<F: Fact>` extension.
 //!
 //! Aggregates are the consistency boundary on the write path — the
 //! place where command-time invariants are enforced before facts hit
-//! the log. Per C6, `Engine::append<A>` is OCC-protected: command
-//! handlers `load<A>` to fold the stream, decide, then `append<A>`
-//! with `expected_version`; the backend errors with `Conflict` if the
-//! stream moved.
+//! the log. Per C6, `Engine::append<A, F>` is OCC-protected: command
+//! handlers `load<A, F>` to fold the stream, decide, then
+//! `append<A, F>` with `expected_version`; the backend errors with
+//! `Conflict` if the stream moved.
 //!
 //! Per C11, Reactors cannot emit into Aggregate streams; saga-shaped
 //! "emit only if aggregate at version V" operations must be modeled
-//! as command handlers. Phase 5a's `EngineBuilder::with_aggregate`
-//! registers the aggregate's stream as `StreamPolicy::OccRequired`
-//! so `Engine::emit` rejects writes to it; Phase 5b wires up
-//! `load<A>` / `append<A>` to actually do the OCC work.
+//! as command handlers. `EngineBuilder::with_aggregate<A, F>`
+//! registers `F::CATEGORY` as `StreamPolicy::OccRequired` so
+//! `Engine::emit` rejects writes to it; `load<A, F>` / `append<A, F>`
+//! do the OCC work.
+//!
+//! ## Shape
+//!
+//! ```ignore
+//! pub trait Aggregate: Default + Send + Sync + 'static {}
+//! pub trait Apply<F: Fact>: Aggregate {
+//!     fn apply(&mut self, fact: &F);
+//! }
+//! ```
+//!
+//! `Aggregate` is a pure marker. The per-Fact fold lives in
+//! `Apply<F>`. Single-Fact aggregates impl `Apply<F>` once; multi-Fact
+//! aggregates impl `Apply<F1>`, `Apply<F2>`, … for each Fact type
+//! they fold (one stream per F, selected at `load<A, F>` time).
+//!
+//! The split lets multiple Aggregates share a Fact (e.g. an audit
+//! aggregate and a domain aggregate both folding `UserCreated`)
+//! without forcing one trait per Fact. Mirrors Axon's
+//! `AggregateMember` and EventStoreDB's "decider" pattern.
 
 use crate::fact::Fact;
 
-/// Write-side consistency boundary. Aggregates are folded from a
-/// dedicated stream named `format!("{CATEGORY}-{id}")`; command
-/// handlers `engine.load::<A>(id)` to hydrate, decide, then
-/// `engine.append::<A>(id, expected_version, new_facts)` with OCC.
-pub trait Aggregate: Default + Send + Sync + 'static {
-    type Fact: Fact;
+/// Write-side consistency boundary marker. Per-Fact fold behavior
+/// lives in [`Apply<F>`]. The aggregate's stream identity comes from
+/// the Fact's `CATEGORY` const, not from the Aggregate itself —
+/// callers always specify both `A` and `F` when loading/appending
+/// (`engine.load::<UserAgg, UserCreated>(id)`).
+pub trait Aggregate: Default + Send + Sync + 'static {}
 
-    /// Per-type stream category. Used to compute stream names
-    /// (`format!("{CATEGORY}-{id}")`) and to register the stream
-    /// policy as OCC-required at builder time. Typically the singular
-    /// aggregate noun: `"schedule"`, `"order"`, `"region"`.
-    const CATEGORY: &'static str;
-
-    /// Pure fold for hydration. Called once per fact loaded from the
-    /// aggregate's stream during `Engine::load<A>`. No I/O, no
-    /// wall-clock — same purity rules as `View::apply`.
-    fn apply(&mut self, fact: &Self::Fact);
+/// Per-Fact fold for hydration. Called once per fact loaded from the
+/// aggregate's stream during `Engine::load<A, F>`. No I/O, no
+/// wall-clock — same purity rules as `Projector::project`.
+///
+/// Borrows `&F` rather than taking ownership: the runner needs the
+/// fact again to forward to projectors / reactors, and the fold
+/// pattern almost never needs to consume.
+pub trait Apply<F: Fact>: Aggregate {
+    fn apply(&mut self, fact: &F);
 }
 
 #[cfg(test)]
@@ -79,10 +91,8 @@ mod tests {
     #[derive(Default, Debug, PartialEq)]
     struct Counter { value: i32 }
 
-    impl Aggregate for Counter {
-        type Fact = CounterFact;
-        const CATEGORY: &'static str = "counter";
-
+    impl Aggregate for Counter {}
+    impl Apply<CounterFact> for Counter {
         fn apply(&mut self, fact: &CounterFact) {
             match fact {
                 CounterFact::Incremented { by, .. } => self.value += by,
@@ -106,14 +116,41 @@ mod tests {
         assert_eq!(agg.value, 5, "fold matches manual reduction");
     }
 
+    /// Multi-Fact: one aggregate, two Apply impls, each fact type's
+    /// CATEGORY identifies its own stream. Folded independently via
+    /// `load::<A, F>(id)` per stream.
     #[test]
-    fn aggregate_category_drives_stream_name() {
+    fn aggregate_can_apply_multiple_fact_types() {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Tagged { tag_id: Uuid, occurred_at: DateTime<Utc> }
+        impl Fact for Tagged {
+            const CATEGORY: &'static str = "tag";
+            fn name(&self) -> &str { "tagged" }
+            fn stream_id(&self) -> Uuid { self.tag_id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+
+        #[derive(Default, Debug)]
+        struct Multi { increments: i32, tags: u32 }
+        impl Aggregate for Multi {}
+        impl Apply<CounterFact> for Multi {
+            fn apply(&mut self, f: &CounterFact) {
+                if let CounterFact::Incremented { by, .. } = f { self.increments += by; }
+            }
+        }
+        impl Apply<Tagged> for Multi {
+            fn apply(&mut self, _f: &Tagged) { self.tags += 1; }
+        }
+
         let cid = Uuid::new_v4();
-        let _fact = CounterFact::Incremented {
-            by: 1, occurred_at: Utc::now(), counter_id: cid,
-        };
-        // Under v0.4, the Fact's CATEGORY const is the type-level
-        // constant; aggregate Fact::CATEGORY matches it by trait.
-        assert_eq!(<CounterFact as Fact>::CATEGORY, <Counter as Aggregate>::CATEGORY);
+        let mut m = Multi::default();
+        Apply::<CounterFact>::apply(&mut m, &CounterFact::Incremented {
+            by: 7, occurred_at: Utc::now(), counter_id: cid,
+        });
+        Apply::<Tagged>::apply(&mut m, &Tagged {
+            tag_id: cid, occurred_at: Utc::now(),
+        });
+        assert_eq!(m.increments, 7);
+        assert_eq!(m.tags, 1);
     }
 }
