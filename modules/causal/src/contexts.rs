@@ -21,11 +21,12 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::aggregate_v3::Aggregate;
 use crate::aggregator::AggregatorRegistry;
-use crate::types::LogCursor;
+use crate::types::{LogCursor, LogEntry, LogLevel};
 
 /// Aggregate state snapshot pair returned by [`Ctx::aggregate`] and
 /// [`Ctx::aggregate_of`]. `prev` is the state before the current
@@ -58,6 +59,13 @@ pub struct Ctx<'a> {
     /// from events. `None` if the runner wasn't configured with an
     /// aggregator registry. Use [`Ctx::aggregate`] to query.
     pub(crate) aggregators: Option<&'a Arc<AggregatorRegistry>>,
+    /// Per-attempt sink for `ctx.log(...)` entries. The runner owns
+    /// the underlying Vec and drains it after `react()` returns,
+    /// routing the entries through the configured
+    /// [`ReactorObserver`](crate::reactor_observer::ReactorObserver).
+    /// `None` when not running inside a reactor body (engine emit
+    /// path, projector body, tests that construct Ctx by hand).
+    pub(crate) logs: Option<&'a Mutex<Vec<LogEntry>>>,
 }
 
 impl<'a> std::fmt::Debug for Ctx<'a> {
@@ -79,6 +87,31 @@ impl<'a> Ctx<'a> {
     /// state byte-identically.
     #[inline]
     pub fn now(&self) -> DateTime<Utc> { self.occurred_at }
+
+    /// Append a log entry to this attempt's per-event log. Captured
+    /// by the `ReactorObserver` and surfaced in the inspector's
+    /// reactor-log pane. No-op when called outside a reactor body
+    /// (e.g. from a projector or hand-constructed Ctx).
+    pub fn log(&self, level: LogLevel, message: impl Into<String>) {
+        self.log_with_data(level, message, None);
+    }
+
+    /// Append a log entry with attached structured data.
+    pub fn log_with_data(
+        &self,
+        level: LogLevel,
+        message: impl Into<String>,
+        data: Option<serde_json::Value>,
+    ) {
+        if let Some(sink) = self.logs {
+            sink.lock().push(LogEntry {
+                level,
+                message: message.into(),
+                data,
+                timestamp: Utc::now(),
+            });
+        }
+    }
 
     /// Read singleton aggregate state — `(prev, curr)` snapshots
     /// captured by the runner around folding the current event.
@@ -146,6 +179,7 @@ mod tests {
             correlation_id: Uuid::nil(),
             metadata:       &meta,
             aggregators:    None,
+            logs:           None,
         };
         assert_eq!(ctx.now(), occurred);
     }
@@ -163,6 +197,7 @@ mod tests {
             correlation_id: Uuid::nil(),
             metadata:       &meta,
             aggregators:    None,
+            logs:           None,
         };
         assert_eq!(
             ctx.metadata.get("_phase").and_then(|v| v.as_str()),

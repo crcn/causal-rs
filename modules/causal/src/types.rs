@@ -7,6 +7,40 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────
+// Reactor logging
+// ─────────────────────────────────────────────────────────────────────
+
+/// Log level for reactor log entries captured via `Ctx::log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogLevel::Debug => write!(f, "DEBUG"),
+            LogLevel::Info  => write!(f, "INFO"),
+            LogLevel::Warn  => write!(f, "WARN"),
+        }
+    }
+}
+
+/// A structured log entry captured during reactor execution. The
+/// reactor body pushes entries via `ctx.log(...)`; the runner drains
+/// them after `react()` returns and routes them through the
+/// `ReactorObserver`.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub level:     LogLevel,
+    pub message:   String,
+    pub data:      Option<serde_json::Value>,
+    pub timestamp: DateTime<Utc>,
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Cursors + versions
 // ─────────────────────────────────────────────────────────────────────
 
@@ -40,9 +74,10 @@ impl fmt::Display for LogCursor {
 
 /// Opaque per-aggregate stream version.
 ///
-/// Contiguous within a stream (1, 2, 3, …). Used for optimistic
-/// concurrency (`emit(...).expecting(v)`), snapshot thresholds, and
-/// hydration replay.
+/// Contiguous within a stream (1, 2, 3, …). Backend-internal — used
+/// by `EventLogBackend::append_to_stream` for stores that maintain
+/// stream cursors, by snapshot thresholds, and by hydration replay.
+/// Not surfaced on the user-facing `Engine::emit` path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct StreamVersion(u64);
 

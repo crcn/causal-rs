@@ -29,6 +29,7 @@ use crate::contexts::Ctx;
 use crate::event_log::EventLogBackend;
 use crate::fact::Fact;
 use crate::projector::Projector;
+use crate::reactor_observer::ReactorObserver;
 use crate::types::LogCursor;
 
 /// Outcome of a single `step()` call.
@@ -57,6 +58,7 @@ pub struct ProjectionRunner<M: Projector> {
     checkpoint:   Arc<dyn CheckpointStore>,
     aggregators:  Option<Arc<AggregatorRegistry>>,
     hydrated:     OnceCell<()>,
+    observer:     Option<Arc<dyn ReactorObserver>>,
 }
 
 impl<M: Projector> ProjectionRunner<M>
@@ -76,6 +78,7 @@ where
             checkpoint,
             aggregators: None,
             hydrated: OnceCell::new(),
+            observer: None,
         }
     }
 
@@ -84,6 +87,12 @@ where
     /// so `ctx.aggregate::<A>()` reads state INCLUDING the current event.
     pub fn with_aggregators(mut self, aggregators: Arc<AggregatorRegistry>) -> Self {
         self.aggregators = Some(aggregators);
+        self
+    }
+
+    /// Attach a [`ReactorObserver`] for inspector / telemetry capture.
+    pub fn with_observer(mut self, observer: Arc<dyn ReactorObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -130,7 +139,16 @@ where
             // discipline.
             let rollback = self.aggregators.as_ref().map(|reg| {
                 let r = reg.capture_for_rollback(&event.event_type, &event.payload);
-                reg.apply_event(&event.event_type, &event.payload);
+                let snapshots = reg.apply_event(&event.event_type, &event.payload);
+                if let Some(obs) = self.observer.as_ref() {
+                    reg.notify_observer(
+                        &snapshots,
+                        obs.as_ref(),
+                        event.correlation_id,
+                        event.position,
+                        event.event_id,
+                    );
+                }
                 r
             });
 
@@ -150,6 +168,7 @@ where
                 correlation_id: event.correlation_id,
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
+                logs:           None,
             };
 
             match self.projector.project(&fact, ctx).await {

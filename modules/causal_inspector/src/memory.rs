@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use causal::{MemoryStore, ReactorQueue};
+use causal::MemoryStore;
 
 use crate::read_model::{
     InspectorReadModel, EventQuery, AggregateLifecycleEntry, AggregateStateSnapshotEntry,
@@ -306,11 +306,20 @@ impl InspectorReadModel for MemoryStore {
             return Ok(vec![]);
         };
 
-        let descriptions = ReactorQueue::get_descriptions(self, cid)
-            .await
-            .unwrap_or_default();
+        // Derive the latest description per reactor from the
+        // per-event snapshots captured by ReactorObserver. Snapshots
+        // are appended in order; the last entry per `reactor_id` is
+        // the current description.
+        let snapshots = self.reactor_description_snapshots().lock();
+        let mut latest: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for (corr, _seq, _event_id, reactor_id, description) in snapshots.iter() {
+            if *corr == cid {
+                latest.insert(reactor_id.clone(), description.clone());
+            }
+        }
 
-        Ok(descriptions
+        Ok(latest
             .into_iter()
             .map(|(reactor_id, description)| ReactorDescriptionEntry {
                 reactor_id,

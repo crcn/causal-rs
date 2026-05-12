@@ -35,6 +35,7 @@ use crate::engine_v3::{DlqInfo, DlqMapperArc};
 use crate::event_log::EventLogBackend;
 use crate::fact::Fact;
 use crate::projection_runner::StepOutcome;
+use crate::reactor_observer::ReactorObserver;
 use crate::reactor_v3::Reactor;
 use crate::types::LogCursor;
 
@@ -84,6 +85,8 @@ pub struct ReactorRunner<R: Reactor> {
     /// Retry budget — applies only when `dlq_mapper` is set. Without
     /// a mapper, reactors retry indefinitely (supervisor backoff).
     max_attempts: u32,
+    /// Inspector / telemetry hook. Default `None` = zero overhead.
+    observer:    Option<Arc<dyn ReactorObserver>>,
 }
 
 impl<R: Reactor> ReactorRunner<R>
@@ -105,7 +108,15 @@ where
             hydrated: OnceCell::new(),
             dlq_mapper: None,
             max_attempts: 0,
+            observer: None,
         }
+    }
+
+    /// Attach a [`ReactorObserver`] for inspector / telemetry capture.
+    /// Default: no observer = noop hot path.
+    pub fn with_observer(mut self, observer: Arc<dyn ReactorObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Attach a per-runner [`AggregatorRegistry`] copy. See
@@ -148,7 +159,16 @@ where
             // application on retry. Mirrors legacy engine semantics.
             let rollback = self.aggregators.as_ref().map(|reg| {
                 let r = reg.capture_for_rollback(&event.event_type, &event.payload);
-                reg.apply_event(&event.event_type, &event.payload);
+                let snapshots = reg.apply_event(&event.event_type, &event.payload);
+                if let Some(obs) = self.observer.as_ref() {
+                    reg.notify_observer(
+                        &snapshots,
+                        obs.as_ref(),
+                        event.correlation_id,
+                        event.position,
+                        event.event_id,
+                    );
+                }
                 r
             });
 
@@ -163,6 +183,41 @@ where
             }
 
             let trigger: R::Trigger = serde_json::from_value(event.payload.clone())?;
+
+            // ── Telemetry: record this attempt's start. `attempt_seq`
+            //    is the persistent-store counter — pre-incremented to
+            //    treat this very attempt as attempt #(prev+1).
+            let attempt_seq = self.outbox
+                .record_reactor_attempt(&self.consumer_id, event.event_id)
+                .await?;
+            let started_at = chrono::Utc::now();
+            if let Some(obs) = self.observer.as_ref() {
+                obs.reactor_started(
+                    event.event_id,
+                    &self.consumer_id,
+                    event.correlation_id,
+                    attempt_seq,
+                    started_at,
+                );
+                // describe() runs once per attempt, BEFORE react().
+                // Optional: reactors that don't override the default
+                // return `None` and the observer hook is skipped.
+                if let Some(descr) = self.reactor.describe(&trigger) {
+                    obs.reactor_description(
+                        event.correlation_id,
+                        event.position,
+                        event.event_id,
+                        &self.consumer_id,
+                        descr,
+                    );
+                }
+            }
+
+            // Per-attempt log sink — react body pushes via `ctx.log(...)`.
+            // Drained below into the observer's reactor_completed /
+            // reactor_failed hooks.
+            let log_sink: parking_lot::Mutex<Vec<crate::types::LogEntry>> =
+                parking_lot::Mutex::new(Vec::new());
             let ctx = Ctx {
                 event_id:       event.event_id,
                 log_position:   event.position,
@@ -170,6 +225,7 @@ where
                 correlation_id: event.correlation_id,
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
+                logs:           Some(&log_sink),
             };
 
             // ── Decision. On Err, cursor stays where it was; no rows
@@ -182,6 +238,19 @@ where
             //    the failing event, and clear the attempt counter.
             let emitted = match self.reactor.react(&trigger, ctx).await {
                 Ok(events) => {
+                    let completed_at = chrono::Utc::now();
+                    if let Some(obs) = self.observer.as_ref() {
+                        let drained = log_sink.into_inner();
+                        obs.reactor_completed(
+                            event.event_id,
+                            &self.consumer_id,
+                            event.correlation_id,
+                            attempt_seq,
+                            started_at,
+                            completed_at,
+                            &drained,
+                        );
+                    }
                     // Clear persisted attempt count on success so a
                     // future failure starts fresh.
                     self.outbox
@@ -190,19 +259,27 @@ where
                     events
                 }
                 Err(e) => {
+                    let completed_at = chrono::Utc::now();
                     if let (Some(reg), Some(r)) = (self.aggregators.as_ref(), rollback) {
                         reg.restore_state(r);
                     }
 
-                    // Increment via the persistent store. Survives
-                    // ReactorRunner reconstruction; durable backends
-                    // (Postgres, etc.) survive process crashes too.
-                    let attempts = self.outbox
-                        .record_reactor_attempt(&self.consumer_id, event.event_id)
-                        .await?;
+                    // attempt counter already incremented for this run;
+                    // use attempt_seq for the cap check.
+                    let attempts = attempt_seq;
 
                     if let Some(mapper) = self.dlq_mapper.as_ref() {
                         if attempts >= self.max_attempts {
+                            if let Some(obs) = self.observer.as_ref() {
+                                obs.reactor_dlq(
+                                    event.event_id,
+                                    &self.consumer_id,
+                                    event.correlation_id,
+                                    attempts,
+                                    &format!("{:#}", e),
+                                    completed_at,
+                                );
+                            }
                             let info = DlqInfo {
                                 group_name:        self.consumer_id.clone(),
                                 source_event_id:   event.event_id,
@@ -248,6 +325,21 @@ where
                             applied += 1;
                             continue;
                         }
+                    }
+                    // Retry path: record failed-attempt telemetry, then
+                    // propagate to supervisor for backoff.
+                    if let Some(obs) = self.observer.as_ref() {
+                        let drained = log_sink.into_inner();
+                        obs.reactor_failed(
+                            event.event_id,
+                            &self.consumer_id,
+                            event.correlation_id,
+                            attempts,
+                            started_at,
+                            completed_at,
+                            &format!("{:#}", e),
+                            &drained,
+                        );
                     }
                     return Err(e);
                 }

@@ -91,6 +91,7 @@ pub struct MultiProjectorRunner<P: MultiProjector> {
     checkpoint:   Arc<dyn CheckpointStore>,
     aggregators:  Option<Arc<AggregatorRegistry>>,
     hydrated:     OnceCell<()>,
+    observer:     Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
 }
 
 impl<P: MultiProjector> MultiProjectorRunner<P> {
@@ -118,6 +119,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             checkpoint,
             aggregators: None,
             hydrated: OnceCell::new(),
+            observer: None,
         }
     }
 
@@ -126,6 +128,16 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
     /// for semantics.
     pub fn with_aggregators(mut self, aggregators: Arc<AggregatorRegistry>) -> Self {
         self.aggregators = Some(aggregators);
+        self
+    }
+
+    /// Attach a [`ReactorObserver`](crate::reactor_observer::ReactorObserver)
+    /// for inspector / telemetry capture.
+    pub fn with_observer(
+        mut self,
+        observer: Arc<dyn crate::reactor_observer::ReactorObserver>,
+    ) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -162,7 +174,16 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             // events. Mirrors ProjectionRunner.
             let rollback = self.aggregators.as_ref().map(|reg| {
                 let r = reg.capture_for_rollback(&event.event_type, &event.payload);
-                reg.apply_event(&event.event_type, &event.payload);
+                let snapshots = reg.apply_event(&event.event_type, &event.payload);
+                if let Some(obs) = self.observer.as_ref() {
+                    reg.notify_observer(
+                        &snapshots,
+                        obs.as_ref(),
+                        event.correlation_id,
+                        event.position,
+                        event.event_id,
+                    );
+                }
                 r
             });
 
@@ -185,6 +206,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 correlation_id: event.correlation_id,
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
+                logs:           None,
             };
             match self.projector.project(&event, ctx).await {
                 Ok(()) => {

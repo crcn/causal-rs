@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::checkpoint_store::{InsertableOutboxRow, OutboxRow, ReactorOutbox};
 use crate::projection::{ProjectionFailure, ProjectionStatus};
+use crate::reactor_observer::ReactorObserver;
 use crate::types::*;
 
 /// In-memory cursor row for one projection.
@@ -54,6 +55,32 @@ pub struct MemoryStore {
     /// lifetime; lost on process crash (matches MemoryStore's
     /// "no durability" position).
     reactor_attempts: Arc<DashMap<(String, Uuid), u32>>,
+
+    // ── Inspector observability (P13.a) ──────────────────────────
+    //
+    // These mirror what v0.3 MemoryStore captured via the legacy
+    // IntentCommit path. Populated by `impl ReactorObserver for
+    // MemoryStore`. Read by `causal_inspector` to render UI panes.
+    //
+    /// Reactor execution timing: `(event_id, reactor_id)` → `(corr,
+    /// started_at, completed_at, status, error, attempts)`.
+    reactor_executions:
+        Arc<DashMap<(Uuid, String), (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String, Option<String>, i32)>>,
+    /// Per-attempt history: `(event_id, reactor_id, corr, attempt#,
+    /// status, error, started_at, completed_at)`.
+    reactor_attempt_history:
+        Arc<Mutex<Vec<(Uuid, String, Uuid, i32, String, Option<String>, DateTime<Utc>, DateTime<Utc>)>>>,
+    /// Reactor log entries captured via `ctx.log(...)`:
+    /// `(event_id, reactor_id, LogEntry)`.
+    reactor_log_entries: Arc<Mutex<Vec<(Uuid, String, LogEntry)>>>,
+    /// Aggregate state after each fold:
+    /// `(corr, position, event_id, aggregate_key, state_json)`.
+    aggregate_state_snapshots:
+        Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
+    /// Reactor describe-DSL output per event:
+    /// `(corr, position, event_id, reactor_id, description_json)`.
+    reactor_description_snapshots:
+        Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
 }
 
 impl MemoryStore {
@@ -67,12 +94,202 @@ impl MemoryStore {
             outbox: Arc::new(Mutex::new(Vec::new())),
             next_outbox_id: Arc::new(AtomicI64::new(1)),
             reactor_attempts: Arc::new(DashMap::new()),
+            reactor_executions: Arc::new(DashMap::new()),
+            reactor_attempt_history: Arc::new(Mutex::new(Vec::new())),
+            reactor_log_entries: Arc::new(Mutex::new(Vec::new())),
+            aggregate_state_snapshots: Arc::new(Mutex::new(Vec::new())),
+            reactor_description_snapshots: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Access the underlying global event log (for test assertions).
     pub fn global_log(&self) -> &Mutex<Vec<PersistedEvent>> {
         &self.global_log
+    }
+
+    // ── Inspector accessors ──────────────────────────────────────
+    //
+    // These return the same shape as v0.3 so the inspector reads
+    // compile unchanged. Populated by the `ReactorObserver` impl
+    // below as the engine calls hooks.
+
+    /// Reactor execution timing records keyed by `(event_id, reactor_id)`.
+    pub fn reactor_executions(
+        &self,
+    ) -> &DashMap<(Uuid, String), (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String, Option<String>, i32)> {
+        &self.reactor_executions
+    }
+
+    /// Per-attempt history. Each row is one `react()` invocation.
+    pub fn reactor_attempt_history(
+        &self,
+    ) -> &Mutex<Vec<(Uuid, String, Uuid, i32, String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
+        &self.reactor_attempt_history
+    }
+
+    /// Log entries pushed by reactor bodies via `ctx.log(...)`.
+    pub fn reactor_log_entries(&self) -> &Mutex<Vec<(Uuid, String, LogEntry)>> {
+        &self.reactor_log_entries
+    }
+
+    /// Aggregate-state-after-each-event snapshots.
+    pub fn aggregate_state_snapshots(
+        &self,
+    ) -> &Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>> {
+        &self.aggregate_state_snapshots
+    }
+
+    /// Reactor describe-DSL output captured per-event.
+    pub fn reactor_description_snapshots(
+        &self,
+    ) -> &Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>> {
+        &self.reactor_description_snapshots
+    }
+}
+
+// ── ReactorObserver implementation ──────────────────────────────────
+
+impl ReactorObserver for MemoryStore {
+    fn reactor_started(
+        &self,
+        event_id: Uuid,
+        reactor_id: &str,
+        correlation_id: Uuid,
+        attempt: u32,
+        started_at: DateTime<Utc>,
+    ) {
+        self.reactor_executions.insert(
+            (event_id, reactor_id.to_string()),
+            (correlation_id, started_at, None, "running".to_string(), None, attempt as i32),
+        );
+    }
+
+    fn reactor_completed(
+        &self,
+        event_id: Uuid,
+        reactor_id: &str,
+        correlation_id: Uuid,
+        attempt: u32,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        logs: &[LogEntry],
+    ) {
+        // Update execution timing record (latest known state per event_id+reactor_id).
+        if let Some(mut entry) =
+            self.reactor_executions.get_mut(&(event_id, reactor_id.to_string()))
+        {
+            entry.2 = Some(completed_at);
+            entry.3 = "completed".to_string();
+            entry.5 = attempt as i32;
+        }
+        // Append a closed attempt row.
+        self.reactor_attempt_history.lock().push((
+            event_id,
+            reactor_id.to_string(),
+            correlation_id,
+            attempt as i32,
+            "completed".to_string(),
+            None,
+            started_at,
+            completed_at,
+        ));
+        // Capture log entries from this attempt.
+        if !logs.is_empty() {
+            let mut sink = self.reactor_log_entries.lock();
+            for e in logs {
+                sink.push((event_id, reactor_id.to_string(), e.clone()));
+            }
+        }
+    }
+
+    fn reactor_failed(
+        &self,
+        event_id: Uuid,
+        reactor_id: &str,
+        correlation_id: Uuid,
+        attempt: u32,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        error: &str,
+        logs: &[LogEntry],
+    ) {
+        // Update execution record — surface error + attempt count.
+        if let Some(mut entry) =
+            self.reactor_executions.get_mut(&(event_id, reactor_id.to_string()))
+        {
+            entry.3 = "retry".to_string();
+            entry.4 = Some(error.to_string());
+            entry.5 = attempt as i32;
+        }
+        self.reactor_attempt_history.lock().push((
+            event_id,
+            reactor_id.to_string(),
+            correlation_id,
+            attempt as i32,
+            "retry".to_string(),
+            Some(error.to_string()),
+            started_at,
+            completed_at,
+        ));
+        if !logs.is_empty() {
+            let mut sink = self.reactor_log_entries.lock();
+            for e in logs {
+                sink.push((event_id, reactor_id.to_string(), e.clone()));
+            }
+        }
+    }
+
+    fn reactor_dlq(
+        &self,
+        event_id: Uuid,
+        reactor_id: &str,
+        _correlation_id: Uuid,
+        attempts: u32,
+        error: &str,
+        at: DateTime<Utc>,
+    ) {
+        if let Some(mut entry) =
+            self.reactor_executions.get_mut(&(event_id, reactor_id.to_string()))
+        {
+            entry.2 = Some(at);
+            entry.3 = "error".to_string();
+            entry.4 = Some(error.to_string());
+            entry.5 = attempts as i32;
+        }
+    }
+
+    fn aggregate_folded(
+        &self,
+        correlation_id: Uuid,
+        position: LogCursor,
+        event_id: Uuid,
+        aggregate_key: &str,
+        state: serde_json::Value,
+    ) {
+        self.aggregate_state_snapshots.lock().push((
+            correlation_id,
+            position.raw(),
+            event_id,
+            aggregate_key.to_string(),
+            state,
+        ));
+    }
+
+    fn reactor_description(
+        &self,
+        correlation_id: Uuid,
+        position: LogCursor,
+        event_id: Uuid,
+        reactor_id: &str,
+        description: serde_json::Value,
+    ) {
+        self.reactor_description_snapshots.lock().push((
+            correlation_id,
+            position.raw(),
+            event_id,
+            reactor_id.to_string(),
+            description,
+        ));
     }
 }
 

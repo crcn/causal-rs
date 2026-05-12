@@ -41,6 +41,37 @@ use crate::fact::Fact;
 /// - Filter in the reactor body, e.g. inspect `ctx.metadata` for a
 ///   `_synthetic = true` flag stamped by the producer when emitting
 ///   reactor output that intentionally re-enters the same prefix.
+///
+/// # Concurrent decisions on the same aggregate stream
+///
+/// The framework does **not** provide write-side concurrency control
+/// (no CAS / OCC on the user-facing emit path). When two reactors
+/// running in parallel both read `ctx.aggregate::<A>(id)` at version
+/// V and each emit a fact for that same stream, both facts append —
+/// the second decision was made on stale state. Example:
+///
+/// ```text
+/// t0: state = {placed}
+/// t1: ReactorA reads {placed}, decides → emits Cancel
+/// t2: ReactorB reads {placed}, decides → emits Ship
+/// t3: log = [..., Cancel, Ship]
+///     apply(Cancel) → {cancelled}, apply(Ship) → {shipped}
+///     // ← inconsistent: shipped after cancelled
+/// ```
+///
+/// Mitigations (all user-side, none enforced by the framework):
+///
+/// - **Funnel writes through one decision reactor per stream.** If
+///   exactly one reactor decides on a given aggregate, no race.
+///   This is the most common pattern; most apps end up here naturally.
+/// - **Design facts to be commutative or idempotent.** "Ship after
+///   Cancel" is a no-op; "Cancel after Ship" rolls back. Order
+///   doesn't matter.
+/// - **Accept the hazard.** Saga-shaped aggregates (read-only state
+///   folded by reactors that don't write back to the same stream)
+///   are unaffected — this race only matters when a reactor decides
+///   on aggregate state and writes a new event to that aggregate's
+///   own stream.
 #[async_trait]
 pub trait Reactor: Send + Sync {
     type Trigger: Fact;
@@ -60,6 +91,19 @@ pub trait Reactor: Send + Sync {
         trigger: &Self::Trigger,
         ctx: Ctx<'_>,
     ) -> Result<Events>;
+
+    /// **Optional**. Return a JSON description of what this reactor
+    /// would do with the given trigger, BEFORE `react()` is invoked.
+    /// Captured by [`crate::ReactorObserver::reactor_description`] for
+    /// the inspector's "what's about to happen" pane.
+    ///
+    /// Default: returns `None` (no description). Reactors that opt in
+    /// override this to emit a structured intent — typically a JSON
+    /// object like `{"action": "ship", "order_id": "..."}`. Pure,
+    /// like `react`; no I/O.
+    fn describe(&self, _trigger: &Self::Trigger) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -236,6 +280,7 @@ mod tests {
             correlation_id: Uuid::nil(),
             metadata:       &meta,
             aggregators:    None,
+            logs:           None,
         };
 
         let events = r.react(&trigger, ctx).await.unwrap();

@@ -44,6 +44,7 @@ pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
 pub mod projector;
+pub mod reactor_observer;
 pub mod reactor_runner;
 pub mod reactor_v3;
 pub mod relay;
@@ -86,7 +87,7 @@ pub use reactor_v3::{Events, Reactor};
 // Engine + emit
 pub use engine_v3::{
     Engine, EngineBuilder,
-    EmitBuilder, EmitError, EmitResult,
+    EmitBuilder, EmitResult, SettledEmit,
     DlqInfo,
     MultiProjectorRegistration, ProjectorRegistration, ReactorRegistration,
 };
@@ -95,7 +96,10 @@ pub use engine_v3::{
 pub use contexts::{AggregateState, Ctx, Metadata};
 
 // Cursors / versions / values users see in signatures
-pub use types::{LogCursor, PersistedEvent, StreamVersion};
+pub use types::{LogCursor, LogEntry, LogLevel, PersistedEvent, StreamVersion};
+
+// Observability hook
+pub use reactor_observer::{NoopObserver, ReactorObserver};
 
 // Backend traits (users typically cast `Arc<dyn ...>` at builder time)
 pub use checkpoint_store::{CheckpointStore, ReactorOutbox};

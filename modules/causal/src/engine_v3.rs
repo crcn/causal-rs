@@ -15,7 +15,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+#[cfg(test)]
+use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
@@ -136,54 +138,23 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Aggregate-stream gate (partial BS1 closure)
-// ─────────────────────────────────────────────────────────────────────
-//
-// `with_aggregators([Aggregator::for_type::<A, F>()])` records
-// `F::CATEGORY` as an OCC-required stream. `Engine::emit` rejects
-// writes to those streams without `.expecting()` with
-// `EmitError::OccStreamMisuse`. Streams not in the set are accepted
-// (default permissive — preserves Phase 4d behavior).
-//
-// AUDIT NOTE: this only PARTIALLY closes BS1. Truly closing it would
-// require flipping the default to "reject unregistered" + forcing
-// every emit-able category to be explicitly registered. That's a
-// behavior break the audit deferred. Tracked in the design doc's
-// black-swan table as "BS1: regressed; future phase to flip default."
-
-/// Errors returned by `Engine::emit` when stream-policy enforcement
-/// kicks in.
-#[derive(Debug, thiserror::Error)]
-pub enum EmitError {
-    #[error("category `{category}` is registered as OccRequired \
-             (aggregate stream); use Engine::append::<A> with an \
-             expected_version instead of emit")]
-    OccStreamMisuse { category: String },
-}
-
 /// Result of a successful `emit(...).await`.
 ///
 /// `position` is the global log cursor of the last event written
-/// (single emits and batches alike).
+/// (single emits and batches alike). For an empty-batch emit,
+/// `position` is the log's current latest position so a
+/// downstream `settle(result)` waits for any pre-existing pending
+/// work to drain.
 ///
-/// `version` semantics depend on whether `.expecting()` was used:
-/// - **CAS write (`.expecting(v)` set):** `Some(v_new)` — the
-///   stream's version *after* the CAS-protected append. Chain
-///   subsequent CAS writes by passing this back to `.expecting()`.
-/// - **Non-CAS write (no `.expecting()`):** whatever the backend
-///   reports for the last event written. Most backends return
-///   `None` for non-aggregate-scoped writes (the global log
-///   accepts the write but doesn't track a per-stream cursor);
-///   backends that DO track versions independently of CAS may
-///   return `Some`. Treat as informational.
-///
-/// For an empty-batch emit, `position` is `LogCursor::ZERO` and
-/// `version` is `None`.
+/// `correlation_id` is the chain id stamped on every fact in the
+/// batch. Clients use it to poll workflow-status projections;
+/// tests use it to scope reads (`engine.snapshot::<A>(corr_id)`)
+/// and waits (`engine.settled()`) to a single chain. Auto-generated
+/// per emit unless the caller set it via `EmitBuilder::correlation_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmitResult {
-    pub position: LogCursor,
-    pub version:  Option<StreamVersion>,
+    pub position:       LogCursor,
+    pub correlation_id: Uuid,
 }
 
 /// Metadata about a reactor that has exhausted its retry budget,
@@ -265,23 +236,12 @@ impl<F: Fact> From<Vec<F>> for EmitInput {
 pub struct EmitBuilder<'a> {
     engine:         &'a Engine,
     input:          EmitInput,
-    expected:       Option<StreamVersion>,
     correlation_id: Option<Uuid>,
     parent_id:      Option<Uuid>,
     metadata:       Metadata,
 }
 
 impl<'a> EmitBuilder<'a> {
-    /// Opt-in CAS: the write errors if the target stream moved past
-    /// `version`. Required for streams registered via
-    /// `EngineBuilder::with_aggregators([Aggregator::for_type::<A, F>()])`;
-    /// optional but allowed
-    /// on any stream.
-    pub fn expecting(mut self, version: StreamVersion) -> Self {
-        self.expected = Some(version);
-        self
-    }
-
     /// Stamp `correlation_id` on every fact in the batch. Defaults to
     /// a fresh UUID per emit; command handlers should propagate the
     /// trigger's `correlation_id` here so causal-chain tracing works
@@ -306,6 +266,35 @@ impl<'a> EmitBuilder<'a> {
         self.metadata.insert(key.into(), value.into());
         self
     }
+
+    /// Wait for the full causal chain triggered by this emit to drain.
+    ///
+    /// `engine.emit(fact).await` returns once the fact is durably in
+    /// the log; the reactor chain runs asynchronously and may still
+    /// be in flight. `engine.emit(fact).settled().await` returns only
+    /// after every registered consumer has observed every event
+    /// produced by this emit (and any downstream emissions the
+    /// reactor chain produced from it).
+    ///
+    /// Use for tests, sync command handlers, or any case where the
+    /// caller needs the side effects to be visible before continuing.
+    /// For HTTP handlers that just need to confirm durability and
+    /// return a correlation_id to the client, use the bare
+    /// `.await` instead — it's faster and avoids holding connections
+    /// open during long chains.
+    ///
+    /// Timeout: wrap with `tokio::time::timeout` as needed.
+    ///
+    /// ```ignore
+    /// // wait up to 5s for the chain to drain
+    /// tokio::time::timeout(
+    ///     Duration::from_secs(5),
+    ///     engine.emit(fact).settled(),
+    /// ).await??;
+    /// ```
+    pub fn settled(self) -> SettledEmit<'a> {
+        SettledEmit { builder: self }
+    }
 }
 
 impl<'a> std::future::IntoFuture for EmitBuilder<'a> {
@@ -316,6 +305,28 @@ impl<'a> std::future::IntoFuture for EmitBuilder<'a> {
         Box::pin(async move {
             let engine = self.engine;
             engine.execute_emit(self).await
+        })
+    }
+}
+
+/// Terminal returned by [`EmitBuilder::settled`]. `.await` runs the
+/// emit and then waits for the resulting causal chain to drain
+/// across every registered consumer.
+#[must_use = "settled() returns a future — call .await to run the emit and drain"]
+pub struct SettledEmit<'a> {
+    builder: EmitBuilder<'a>,
+}
+
+impl<'a> std::future::IntoFuture for SettledEmit<'a> {
+    type Output = Result<EmitResult>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmitResult>> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let engine = self.builder.engine;
+            let result = engine.execute_emit(self.builder).await?;
+            engine.settle(result).await?;
+            Ok(result)
         })
     }
 }
@@ -347,12 +358,12 @@ pub struct EngineBuilder {
     checkpoint:            Arc<dyn CheckpointStore>,
     outbox:                Arc<dyn ReactorOutbox>,
     consumers:             Vec<RunnerFactory>,
-    occ_required_streams:  std::collections::HashSet<String>,
     aggregators:           Vec<Aggregator>,
     group_names:           std::collections::HashSet<String>,
     default_metadata:      Metadata,
     dlq_mapper:            Option<DlqMapperArc>,
     max_attempts:          u32,
+    observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
 }
 
 impl EngineBuilder {
@@ -372,13 +383,41 @@ impl EngineBuilder {
             checkpoint,
             outbox,
             consumers: Vec::new(),
-            occ_required_streams: std::collections::HashSet::new(),
             aggregators: Vec::new(),
             group_names: std::collections::HashSet::new(),
             default_metadata: Metadata::new(),
             dlq_mapper: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            observer: None,
         }
+    }
+
+    /// Register a [`ReactorObserver`](crate::reactor_observer::ReactorObserver)
+    /// for telemetry / inspector capture. Plumbed into every
+    /// `ReactorRunner` registered after this call AND into the
+    /// engine-level aggregator fold path. Without this, observer
+    /// hooks are noop (zero hot-path overhead).
+    ///
+    /// `MemoryStore` implements `ReactorObserver` directly — the
+    /// common in-process pattern is:
+    ///
+    /// ```ignore
+    /// let store = Arc::new(MemoryStore::new());
+    /// let engine = EngineBuilder::new(
+    ///         store.clone() as Arc<dyn EventLogBackend>,
+    ///         store.clone() as Arc<dyn CheckpointStore>,
+    ///         store.clone() as Arc<dyn ReactorOutbox>,
+    ///     )
+    ///     .with_observer(store.clone())
+    ///     .with_reactor(MyReactor)
+    ///     .build();
+    /// ```
+    pub fn with_observer<O>(mut self, observer: Arc<O>) -> Self
+    where
+        O: crate::reactor_observer::ReactorObserver + 'static,
+    {
+        self.observer = Some(observer as Arc<dyn crate::reactor_observer::ReactorObserver>);
+        self
     }
 
     /// Register a DLQ mapper. When any reactor's `react()` errors
@@ -440,18 +479,12 @@ impl EngineBuilder {
     }
 
     /// Register [`crate::Aggregator`] definitions so consumers can read
-    /// folded singleton/keyed aggregate state via `ctx.aggregate::<A>()`
-    /// and `ctx.aggregate_of::<A>(id)`. Aggregators built via
-    /// [`Aggregator::for_type`] also mark `F::CATEGORY` as OCC-required
-    /// on the write side (`Engine::emit` rejects emits without
-    /// `.expecting()` for those categories).
-    ///
-    /// Aggregator state is **per-engine, in-memory**. It does NOT
-    /// persist across `Engine` instances. For saga-pattern read-only
-    /// state shared across reactors *within* one workflow run, this
-    /// is the right tool. For long-lived aggregates spanning
-    /// processes, see `docs/aggregate-state-scope.md` for what's
-    /// missing and when to add it.
+    /// folded aggregate state via `ctx.aggregate::<A>(id)`. Aggregator
+    /// state is **per-engine, in-memory** — it does NOT persist across
+    /// `Engine` instances. For saga-pattern read state shared across
+    /// reactors within one workflow run, this is the right tool.
+    /// For long-lived aggregates spanning processes, see
+    /// `docs/aggregate-state-scope.md`.
     ///
     /// Chainable; each call accumulates onto the same set. Each runner
     /// gets its OWN [`AggregatorRegistry`] copy (cheap clones of the
@@ -469,13 +502,6 @@ impl EngineBuilder {
         I: IntoIterator<Item = Aggregator>,
     {
         for agg in aggregators {
-            // v0.4 aggregators (via Aggregator::for_type) carry an OCC
-            // marker — registration also flips the stream's write
-            // policy. Legacy aggregators (via Aggregator::fold) leave
-            // it unset, registering for read-side fold only.
-            if agg.occ_required {
-                self.occ_required_streams.insert(agg.event_prefix.clone());
-            }
             // Reject duplicate Aggregate::NAME within one builder —
             // two aggregators sharing the registry key
             // `{NAME}:{id}` would silently overwrite each other's
@@ -513,9 +539,11 @@ impl EngineBuilder {
         self.claim_group_name(P::GROUP_NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
+        let observer = self.observer.clone();
         self.consumers.push(Box::new(move |aggs| {
             let mut runner = ProjectionRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
+            if let Some(obs) = observer { runner = runner.with_observer(obs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -530,12 +558,14 @@ impl EngineBuilder {
         let outbox = self.outbox.clone();
         let dlq_mapper = self.dlq_mapper.clone();
         let max_attempts = self.max_attempts;
+        let observer = self.observer.clone();
         self.consumers.push(Box::new(move |aggs| {
             let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, outbox);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(mapper) = dlq_mapper {
                 runner = runner.with_dlq(mapper, max_attempts);
             }
+            if let Some(obs) = observer { runner = runner.with_observer(obs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -559,9 +589,11 @@ impl EngineBuilder {
         self.claim_group_name(P::GROUP_NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
+        let observer = self.observer.clone();
         self.consumers.push(Box::new(move |aggs| {
             let mut runner = MultiProjectorRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
+            if let Some(obs) = observer { runner = runner.with_observer(obs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -619,10 +651,10 @@ impl EngineBuilder {
             self.checkpoint,
             self.outbox,
             consumers,
-            self.occ_required_streams,
             self.default_metadata,
             engine_aggregators,
             consumer_ids,
+            self.observer,
         )
     }
 }
@@ -639,19 +671,20 @@ pub struct Engine {
     outbox:                Arc<dyn ReactorOutbox>,
     shutdown_tx:           broadcast::Sender<()>,
     handles:               Vec<JoinHandle<()>>,
-    occ_required_streams:  std::collections::HashSet<String>,
     default_metadata:      Metadata,
     /// Engine-level aggregator registry for out-of-band read access
-    /// via `engine.singleton::<A>()` / `engine.aggregate_of::<A>(id)`.
-    /// Folded on every successful `emit()`. Each consumer holds its
-    /// OWN registry clone for in-body `ctx.aggregate` reads — the
-    /// engine-level registry exists for the test ergonomic of
-    /// reading aggregate state without going through a consumer.
+    /// via `engine.snapshot::<A>(stream_id)`. Folded on every
+    /// successful `emit()`. Each consumer holds its OWN registry
+    /// clone for in-body `ctx.aggregate` reads — the engine-level
+    /// registry exists for the test ergonomic of reading aggregate
+    /// state without going through a consumer.
     aggregators:           Option<Arc<AggregatorRegistry>>,
     /// Consumer group names registered with the builder, in
     /// registration order. Used by `Engine::settle` to await every
     /// consumer catching up to an emit position.
     consumer_ids:          Vec<String>,
+    /// Telemetry hook for inspector / external observability sinks.
+    observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
 }
 
 impl Engine {
@@ -660,10 +693,10 @@ impl Engine {
         checkpoint: Arc<dyn CheckpointStore>,
         outbox: Arc<dyn ReactorOutbox>,
         consumers: Vec<Arc<dyn Supervisable>>,
-        occ_required_streams: std::collections::HashSet<String>,
         default_metadata: Metadata,
         aggregators: Option<Arc<AggregatorRegistry>>,
         consumer_ids: Vec<String>,
+        observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len() + 1);
@@ -686,49 +719,46 @@ impl Engine {
 
         Self {
             log, checkpoint, outbox, shutdown_tx, handles,
-            occ_required_streams, default_metadata,
-            aggregators, consumer_ids,
+            default_metadata,
+            aggregators, consumer_ids, observer,
         }
     }
 
     /// Emit one or more Facts to the log.
     ///
-    /// Returns an [`EmitBuilder`] — chain `.expecting()`, `.metadata()`,
+    /// Returns an [`EmitBuilder`] — chain `.metadata()`,
     /// `.correlation_id()`, `.parent_id()` and finally `.await` to run
-    /// the write. `await` directly to use defaults.
+    /// the write. `.await` returns once facts are durably in the log;
+    /// the reactor chain runs asynchronously after that. Use
+    /// `.settled().await` to also wait for the chain to drain.
     ///
     /// ```ignore
-    /// // simplest:
+    /// // simplest — durable append, returns immediately
     /// engine.emit(fact).await?;
-    /// // CAS to an aggregate stream:
-    /// engine.emit(fact).expecting(version).await?;
-    /// // command-handler envelope:
+    /// // command-handler envelope — propagate trigger correlation
     /// engine.emit(out)
     ///     .correlation_id(trigger_corr)
     ///     .parent_id(trigger_event_id)
     ///     .await?;
-    /// // batch:
-    /// engine.emit(vec![f1, f2]).expecting(v).await?;
+    /// // batch
+    /// engine.emit(vec![f1, f2]).await?;
+    /// // wait for the whole causal chain (tests, sync handlers)
+    /// engine.emit(fact).settled().await?;
     /// ```
-    ///
-    /// `.expecting()` opts into per-stream CAS: the write errors if
-    /// the stream moved past `expected`. Streams registered via
-    /// `Aggregator::for_type::<A, F>` *require* `.expecting()`
-    /// — emit without it errors with `EmitError::OccStreamMisuse`.
     pub fn emit<I: Into<EmitInput>>(&self, input: I) -> EmitBuilder<'_> {
         EmitBuilder {
             engine: self,
             input: input.into(),
-            expected: None,
             correlation_id: None,
             parent_id: None,
             metadata: Metadata::new(),
         }
     }
 
-    /// Hydrate an aggregate by folding its stream from version 0.
+    /// Hydrate an aggregate by folding its full stream from the log.
     /// Returns the aggregate state and the current stream version
-    /// (for use as `expected` in a subsequent `emit(...).expecting(v)`).
+    /// (informational — backend-internal cursor, not used for user-
+    /// facing CAS).
     ///
     /// Stream identity comes from `F::CATEGORY` + `id`; the same
     /// convention `Engine::emit` uses on write. Caller picks both
@@ -757,46 +787,17 @@ impl Engine {
 
     async fn execute_emit(&self, b: EmitBuilder<'_>) -> Result<EmitResult> {
         // Empty batch is a successful no-op. Returns the log's
-        // current latest position so a downstream `settle(result)`
+        // current latest position so a downstream `settled()`
         // waits for any pre-existing pending work to drain (rather
         // than returning trivially against `LogCursor::ZERO`).
         if b.input.facts.is_empty() {
             let position = self.log.latest_position().await?;
-            return Ok(EmitResult { position, version: None });
-        }
-
-        // Stream-policy gate: OCC-required streams demand `.expecting()`.
-        // We check on the FIRST fact's category — all facts in a batch
-        // share the same Fact type, so they share CATEGORY.
-        let category = b.input.facts[0].category();
-        let is_occ_required = self.occ_required_streams.contains(category);
-        if is_occ_required && b.expected.is_none() {
-            return Err(anyhow!(EmitError::OccStreamMisuse {
-                category: category.into(),
-            }));
-        }
-
-        // For CAS batches, all facts must target the same stream_id
-        // — there is one expected_version per stream, not per fact.
-        if let Some(_) = b.expected {
-            let first_id = b.input.facts[0].stream_id();
-            for f in b.input.facts.iter().skip(1) {
-                if f.stream_id() != first_id {
-                    anyhow::bail!(
-                        "emit(...).expecting(...): batch facts must share \
-                         stream_id (CAS targets a single stream); first={}, \
-                         conflicting={}",
-                        first_id,
-                        f.stream_id(),
-                    );
-                }
-            }
+            let correlation_id = b.correlation_id.unwrap_or_else(Uuid::new_v4);
+            return Ok(EmitResult { position, correlation_id });
         }
 
         let correlation = b.correlation_id.unwrap_or_else(Uuid::new_v4);
-        let mut current_expected = b.expected.unwrap_or(StreamVersion::ZERO);
         let mut last_position = LogCursor::ZERO;
-        let mut last_version: Option<StreamVersion> = None;
 
         // Merge engine defaults under per-emit metadata. Per-emit
         // overrides on key collision; non-colliding keys merge.
@@ -827,75 +828,68 @@ impl Engine {
                 persistent:      true,
             };
 
-            // Capture the event_type + payload for the engine-level
-            // aggregator fold BEFORE the log write consumes new_event.
+            // Capture for engine-level aggregator fold before the log
+            // write consumes new_event.
             let agg_event_type = new_event.event_type.clone();
             let agg_payload = new_event.payload.clone();
 
-            let result = if b.expected.is_some() {
-                let r = self.log
-                    .append_to_stream(fact.category(), stream_id, current_expected, new_event)
-                    .await?;
-                if let Some(v) = r.version {
-                    current_expected = v;
-                    last_version = Some(v);
-                }
-                r
-            } else {
-                self.log.append(new_event).await?
-            };
+            let event_id = new_event.event_id;
+            let result = self.log.append(new_event).await?;
             last_position = result.position;
-            if last_version.is_none() {
-                last_version = result.version;
-            }
 
-            // Fold into the engine-level registry for out-of-band
-            // `engine.singleton::<A>()` access. Consumers maintain
-            // their own folded registry copies independently — this
-            // mirror exists so tests + ops tooling can read aggregate
-            // state without a consumer hop.
+            // Mirror into the engine-level registry so out-of-band
+            // `engine.snapshot::<A>(stream_id)` reads stay fresh.
+            // Consumers maintain their OWN registry clones for
+            // in-body `ctx.aggregate` reads — independent state.
             if let Some(reg) = &self.aggregators {
-                reg.apply_event(&agg_event_type, &agg_payload);
+                let snapshots = reg.apply_event(&agg_event_type, &agg_payload);
+                if let Some(obs) = self.observer.as_ref() {
+                    reg.notify_observer(
+                        &snapshots,
+                        obs.as_ref(),
+                        correlation,
+                        result.position,
+                        event_id,
+                    );
+                }
             }
         }
-        Ok(EmitResult { position: last_position, version: last_version })
+        Ok(EmitResult {
+            position: last_position,
+            correlation_id: correlation,
+        })
     }
 
-    /// Read singleton aggregate state — equivalent to
-    /// `ctx.aggregate::<A>().curr` from outside a consumer body.
-    /// Reads the engine-level aggregator registry that's folded on
-    /// every successful `emit()`.
+    /// Inspect the current folded state of aggregate `A` for the
+    /// given `stream_id`. Returns `None` if no aggregator is
+    /// registered for `A`, or if no facts have ever been folded
+    /// for this `stream_id`.
     ///
-    /// # Panics
-    /// Panics if no aggregators were registered via
-    /// `EngineBuilder::with_aggregators(...)`.
-    pub fn singleton<A>(&self) -> Arc<A>
-    where
-        A: crate::aggregate_v3::Aggregate,
-    {
-        let reg = self.aggregators.as_ref().expect(
-            "engine.singleton::<A>() called but no aggregators were \
-             registered with EngineBuilder::with_aggregators(...)",
-        );
-        let (_, curr) = reg.get_singleton_arc::<A>();
-        curr
-    }
-
-    /// Read aggregate state for a specific aggregate id. Same
-    /// semantics as `singleton` but for non-singleton aggregates.
+    /// ## Not for decisions
     ///
-    /// # Panics
-    /// Panics if no aggregators were registered. See [`Self::singleton`].
-    pub fn aggregate_of<A>(&self, id: Uuid) -> Arc<A>
+    /// **Do not** use this to read aggregate state and then `emit`
+    /// based on what you saw — the value is stale by the time you
+    /// hold it (other emits, reactor chains, or restarts may have
+    /// moved past it), and decisions made outside the causal chain
+    /// are not recorded with provenance. Make decisions **inside**
+    /// reactors via `ctx.aggregate::<A>(id)`; expose query results
+    /// to clients via projections (Postgres tables, etc.) keyed on
+    /// `correlation_id` or the entity id.
+    ///
+    /// `snapshot` exists for tests, debugging, and operational
+    /// inspection — assertions, status dashboards, ad-hoc CLI
+    /// dumps. Treat it as a peek into in-memory state, nothing more.
+    pub fn snapshot<A>(&self, stream_id: Uuid) -> Option<A>
     where
-        A: crate::aggregate_v3::Aggregate,
+        A: crate::aggregate_v3::Aggregate + Clone,
     {
-        let reg = self.aggregators.as_ref().expect(
-            "engine.aggregate_of::<A>(id) called but no aggregators \
-             were registered with EngineBuilder::with_aggregators(...)",
-        );
-        let (_, curr) = reg.get_transition_arc::<A>(id);
-        curr
+        let reg = self.aggregators.as_ref()?;
+        let key = format!("{}:{}", <A as crate::aggregate_v3::Aggregate>::NAME, stream_id);
+        if !reg.has_state(&key) {
+            return None;
+        }
+        let (_, curr) = reg.get_transition_arc::<A>(stream_id);
+        Some((*curr).clone())
     }
 
     /// Wait until every reactor chain triggered by `emit_result`
@@ -1272,7 +1266,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_to_aggregate_stream_returns_occ_stream_misuse() {
+    async fn emit_to_aggregate_stream_succeeds_without_ceremony() {
+        // OCC is no longer part of the user-facing API. Emitting a
+        // fact whose CATEGORY has an aggregator registered just
+        // appends + folds — no version check, no error, no special
+        // builder methods required.
+        //
+        // The aggregator still folds in-memory state from each fact
+        // (verified separately by aggregate-state tests); registration
+        // does not change the emit path.
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -1287,17 +1289,17 @@ mod tests {
             occurred_at: Utc::now(),
         }).await;
 
-        assert!(result.is_err(), "emit to aggregate stream MUST error");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("OccRequired") || err_msg.contains("user"),
-                "error message identifies the misused category: {}", err_msg);
+        assert!(result.is_ok(),
+                "emit to aggregate stream succeeds without .expecting(): {:?}",
+                result.err());
         engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn aggregate_registration_does_not_affect_other_streams() {
-        // Register UserAgg on category "user". A different fact whose
-        // stream lives in a different category should still be emit-able.
+    async fn registering_aggregator_is_invisible_to_emit_path() {
+        // Aggregator registration is read-side only — it does not
+        // change emit semantics. Both the registered and unregistered
+        // streams accept naked emit identically.
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -1307,8 +1309,6 @@ mod tests {
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .build();
 
-        // OrderPlaced lives in category "order" — unregistered, default
-        // OpenAppend.
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct OrderPlaced { order_id: Uuid, occurred_at: DateTime<Utc> }
         impl Fact for OrderPlaced {
@@ -1323,17 +1323,16 @@ mod tests {
             occurred_at: Utc::now(),
         }).await.unwrap();
 
-        // But user-category emits still rejected.
-        let user_result = engine.emit(UserCreated {
+        // Registered category emits identically.
+        engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
             occurred_at: Utc::now(),
-        }).await;
-        assert!(user_result.is_err());
+        }).await.unwrap();
 
         engine.shutdown().await.unwrap();
     }
 
-    // ── Phase 5b — load + append with OCC ──
+    // ── Phase 5b — load + aggregator fold ──
 
     /// Counter aggregate for OCC tests.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1396,7 +1395,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_then_load_round_trips_aggregate_state() {
+    async fn emit_batch_round_trips_through_aggregator_fold() {
+        // Emitting a batch of facts of the registered Fact type
+        // folds them into the engine's aggregator state, readable
+        // via the read-side hydration helper.
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -1407,97 +1409,15 @@ mod tests {
         .build();
 
         let id = Uuid::new_v4();
-        let v1 = engine.emit(vec![
+        engine.emit(vec![
             CounterFact::Inc { by: 3, occurred_at: Utc::now(), counter_id: id },
             CounterFact::Inc { by: 5, occurred_at: Utc::now(), counter_id: id },
-        ]).expecting(StreamVersion::ZERO).await.unwrap().version.unwrap();
-        assert_eq!(v1, StreamVersion::from_raw(2),
-                   "version is 2 after appending 2 facts");
+        ]).await.unwrap();
 
-        let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        let (agg, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
         assert_eq!(agg.value, 8);
-        assert_eq!(ver, StreamVersion::from_raw(2));
 
         engine.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn append_with_stale_expected_version_returns_conflict() {
-        let store = store();
-        let engine = EngineBuilder::new(
-            store.clone() as Arc<dyn EventLogBackend>,
-            store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
-        )
-        .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
-        .build();
-
-        let id = Uuid::new_v4();
-
-        // First append moves version to 1.
-        engine.emit(vec![
-            CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-        ]).expecting(StreamVersion::ZERO).await.unwrap();
-
-        // Stale expected (still ZERO) → ConflictError.
-        let result = engine.emit(vec![
-            CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-        ]).expecting(StreamVersion::ZERO).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let conflict = err.downcast_ref::<crate::event_log::ConflictError>()
-            .expect("expected ConflictError");
-        assert_eq!(conflict.expected, StreamVersion::ZERO);
-        assert_eq!(conflict.current, StreamVersion::from_raw(1));
-
-        engine.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn concurrent_appends_to_same_aggregate_one_wins_one_conflicts() {
-        // C6 in action under concurrent load. Two callers both load
-        // the aggregate at version 0, both decide, both call
-        // append::<A>(0, ...). The atomic single-mutex MemoryStore
-        // override of append_to_stream serializes them: one wins
-        // (version 1), the other gets ConflictError.
-        let store = store();
-        let engine = Arc::new(
-            EngineBuilder::new(
-                store.clone() as Arc<dyn EventLogBackend>,
-                store.clone() as Arc<dyn CheckpointStore>,
-                store.clone() as Arc<dyn ReactorOutbox>,
-            )
-            .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
-            .build()
-        );
-
-        let id = Uuid::new_v4();
-
-        let e1 = engine.clone();
-        let e2 = engine.clone();
-        let h1 = tokio::spawn(async move {
-            e1.emit(vec![
-                CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-            ]).expecting(StreamVersion::ZERO).await
-        });
-        let h2 = tokio::spawn(async move {
-            e2.emit(vec![
-                CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
-            ]).expecting(StreamVersion::ZERO).await
-        });
-        let (r1, r2) = tokio::join!(h1, h2);
-        let r1 = r1.unwrap();
-        let r2 = r2.unwrap();
-
-        let winners = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
-        let losers  = [&r1, &r2].iter().filter(|r| r.is_err()).count();
-        assert_eq!(winners, 1, "exactly one winner");
-        assert_eq!(losers, 1, "exactly one conflict");
-
-        // Final aggregate state: one Inc applied → value == 1.
-        let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
-        assert_eq!(agg.value, 1);
-        assert_eq!(ver, StreamVersion::from_raw(1));
     }
 
     #[tokio::test]
@@ -1518,7 +1438,7 @@ mod tests {
             .unwrap().with_timezone(&Utc);
         engine.emit(vec![
             CounterFact::Inc { by: 1, occurred_at: pinned, counter_id: id },
-        ]).expecting(StreamVersion::ZERO).await.unwrap();
+        ]).await.unwrap();
 
         let events = EventLogBackend::load_stream(
             store.as_ref(), <CounterFact as Fact>::CATEGORY, id, None,
@@ -1685,7 +1605,6 @@ mod tests {
             CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
             CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
         ])
-        .expecting(StreamVersion::ZERO)
         .correlation_id(cmd_correlation)
         .await.unwrap();
 
@@ -1761,8 +1680,8 @@ mod tests {
             store.clone() as Arc<dyn ReactorOutbox>,
         )
         .with_aggregators(vec![
-            crate::aggregator::Aggregator::fold::<Multi, Tick>(),
-            crate::aggregator::Aggregator::fold::<Multi, Pong>(),
+            crate::aggregator::Aggregator::for_type::<Multi, Tick>(),
+            crate::aggregator::Aggregator::for_type::<Multi, Pong>(),
         ])
         .build();
         // No panic — different Fact CATEGORYs.
@@ -1787,8 +1706,8 @@ mod tests {
             store.clone() as Arc<dyn ReactorOutbox>,
         )
         .with_aggregators(vec![
-            crate::aggregator::Aggregator::fold::<TickCounter, Tick>(),
-            crate::aggregator::Aggregator::fold::<TickCounter, Tick>(),
+            crate::aggregator::Aggregator::for_type::<TickCounter, Tick>(),
+            crate::aggregator::Aggregator::for_type::<TickCounter, Tick>(),
             // ↑ same NAME twice — panic here.
         ]);
     }
@@ -1872,9 +1791,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_singleton_reads_state_folded_on_emit() {
-        // External read: emit Ticks, then read TickCounter via
-        // engine.singleton::<A>() without going through a consumer.
+    async fn engine_snapshot_reads_state_folded_on_emit() {
+        // Inspection path: emit Ticks for one stream_id, then read
+        // TickCounter via engine.snapshot::<A>(id) without going
+        // through a consumer.
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -1884,11 +1804,14 @@ mod tests {
         .with_aggregators(vec![tick_aggregator()])
         .build();
 
+        // Tick.stream_id() returns Uuid::nil() — all ticks fold into
+        // the nil-keyed slot.
         for i in 0..5 {
             engine.emit(Tick { seq: i, occurred_at: Utc::now() }).await.unwrap();
         }
 
-        let counter = engine.singleton::<TickCounter>();
+        let counter = engine.snapshot::<TickCounter>(Uuid::nil())
+            .expect("snapshot Some after 5 ticks folded");
         assert_eq!(counter.count, 5,
                    "engine-level registry folded all 5 emitted Ticks");
 
@@ -1896,15 +1819,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "engine.singleton")]
-    async fn engine_singleton_panics_without_aggregators() {
+    async fn engine_snapshot_returns_none_without_aggregators() {
+        // No aggregators registered → snapshot returns None
+        // (no panic, no implicit registration).
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorOutbox>,
         ).build();
-        let _ = engine.singleton::<TickCounter>();
+        assert!(engine.snapshot::<TickCounter>(Uuid::nil()).is_none());
     }
 
     #[tokio::test]
@@ -2118,6 +2042,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_settled_waits_for_consumer_to_catch_up() {
+        // engine.emit(fact).settled().await is sugar over
+        // emit + engine.settle(result). After it returns, every
+        // registered consumer has observed the emitted fact.
+        let store = store();
+        let roster = UserRoster::default();
+        let seen = roster.seen.clone();
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_projector(roster)
+        .build();
+
+        // Without .settled(), bare .await would return before the
+        // async projector ran. With .settled(), we are guaranteed
+        // the projector has processed the fact.
+        let result = engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).settled().await.unwrap();
+
+        assert_eq!(seen.lock().len(), 1,
+                   ".settled() waited for the projector to observe");
+        assert_ne!(result.correlation_id, Uuid::nil(),
+                   "settled still surfaces the EmitResult");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_none_for_id_with_no_facts() {
+        // Snapshot is for inspection only. When no facts have been
+        // emitted for a given stream_id, the aggregate hasn't been
+        // materialized — return None rather than a fresh default
+        // (which would silently fool callers asserting on existence).
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
+        .build();
+
+        let id = Uuid::new_v4();
+        assert!(engine.snapshot::<UserAgg>(id).is_none(),
+                "snapshot returns None when the aggregate has no facts yet");
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_some_clone_after_emit() {
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
+        .build();
+
+        let id = Uuid::new_v4();
+        engine.emit(CounterFact::Inc {
+            by: 7, occurred_at: Utc::now(), counter_id: id,
+        }).await.unwrap();
+
+        let state = engine.snapshot::<Counter>(id)
+            .expect("snapshot Some after emit folded a fact for this id");
+        assert_eq!(state.value, 7);
+
+        // Independent ids stay None.
+        let other = Uuid::new_v4();
+        assert!(engine.snapshot::<Counter>(other).is_none(),
+                "snapshot is keyed — other ids unaffected");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emit_result_carries_correlation_id() {
+        // EmitResult.correlation_id must surface the chain id that was
+        // stamped on the emitted fact(s). Clients use it to poll
+        // workflow projections; tests use it to scope `settle_to`
+        // and `snapshot::<A>(stream_id)` to one run.
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        ).build();
+
+        // Auto-generated correlation when not provided.
+        let r1 = engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).await.unwrap();
+        assert_ne!(r1.correlation_id, Uuid::nil(),
+                   "emit auto-generates correlation_id when not set");
+
+        // Two emits without explicit correlation must produce
+        // distinct correlations (each is a fresh chain).
+        let r2 = engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }).await.unwrap();
+        assert_ne!(r1.correlation_id, r2.correlation_id,
+                   "distinct emits get distinct correlation_ids");
+
+        // Explicit correlation: result echoes what the caller set.
+        let corr = Uuid::new_v4();
+        let r3 = engine.emit(UserCreated {
+            user_id:     Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        })
+        .correlation_id(corr)
+        .await.unwrap();
+        assert_eq!(r3.correlation_id, corr,
+                   "EmitResult.correlation_id echoes the explicit value");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn emit_with_empty_batch_is_a_no_op() {
         let store = store();
         let engine = EngineBuilder::new(
@@ -2128,7 +2178,9 @@ mod tests {
 
         let result = engine.emit(Vec::<UserCreated>::new()).await.unwrap();
         assert_eq!(result.position, LogCursor::ZERO);
-        assert_eq!(result.version, None);
+        // Empty emit still produces a fresh correlation_id (no facts
+        // got stamped with it; the value is informational).
+        assert_ne!(result.correlation_id, Uuid::nil());
 
         // No events written.
         let events = EventLogBackend::load_from(
@@ -2219,10 +2271,7 @@ mod tests {
     }
 
     fn tick_aggregator() -> crate::aggregator::Aggregator {
-        // `fold` not `for_type` — these tests emit Tick freely;
-        // TickCounter is a read-only derived counter, not the
-        // aggregate-as-consistency-boundary case.
-        crate::aggregator::Aggregator::fold::<TickCounter, Tick>()
+        crate::aggregator::Aggregator::for_type::<TickCounter, Tick>()
     }
 
     #[tokio::test]
@@ -2631,8 +2680,8 @@ mod tests {
             }
         }
 
-        let agg_a = crate::aggregator::Aggregator::fold::<TickCounter, Tick>();
-        let agg_b = crate::aggregator::Aggregator::fold::<OtherCounter, Tick>();
+        let agg_a = crate::aggregator::Aggregator::for_type::<TickCounter, Tick>();
+        let agg_b = crate::aggregator::Aggregator::for_type::<OtherCounter, Tick>();
 
         let store = store();
         let v = VerifyBoth {

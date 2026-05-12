@@ -131,6 +131,7 @@ mod tests {
                 correlation_id: Uuid::nil(),
                 metadata:       &meta,
                 aggregators:    None,
+                logs:           None,
             },
         ).await.unwrap();
 
@@ -159,6 +160,7 @@ mod tests {
                     correlation_id: Uuid::nil(),
                     metadata:       &meta,
                     aggregators:    None,
+                logs:           None,
                 },
             ).await.unwrap();
         }

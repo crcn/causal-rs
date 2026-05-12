@@ -63,6 +63,11 @@ pub trait Aggregate: Default + Send + Sync + 'static {
 /// Borrows `&F` rather than taking ownership: the runner needs the
 /// fact again to forward to projectors / reactors, and the fold
 /// pattern almost never needs to consume.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not implement `Apply<{F}>` — register an aggregator for `{F}` only after implementing `Apply<{F}> for {Self}`",
+    label = "missing `Apply<{F}>` impl",
+    note = "every Fact that an aggregator folds requires its own `impl Apply<F> for A` block; the engine calls `apply(&mut self, fact: &F)` once per fact"
+)]
 pub trait Apply<F: Fact>: Aggregate {
     fn apply(&mut self, fact: &F);
 }

@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::reactor_v3::extract_prefix;
-use crate::types::StreamVersion;
+use crate::types::{LogCursor, StreamVersion};
 use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate state snapshots ────────────────────────────────────
@@ -61,6 +61,19 @@ impl TransitionSnapshots {
     ) {
         self.inner.insert(key, (prev, next));
     }
+
+    /// Iterate `(key, prev, next)` for every fold captured.
+    /// Used by `AggregatorRegistry::notify_observer` to drive the
+    /// inspector's `aggregate_folded` hook.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<
+        Item = (&str, &Arc<dyn Any + Send + Sync>, &Arc<dyn Any + Send + Sync>),
+    > {
+        self.inner
+            .iter()
+            .map(|(k, (prev, next))| (k.as_str(), prev, next))
+    }
 }
 
 // ── Aggregator (type-erased event→aggregate applier) ────────────────
@@ -77,19 +90,6 @@ pub struct Aggregator {
     pub event_type_id: TypeId,
     /// The aggregate type string.
     pub aggregate_type: String,
-    /// `true` for v0.4 aggregators constructed via
-    /// [`Aggregator::for_type`] — `EngineBuilder::with_aggregators`
-    /// marks `event_prefix` (= `F::CATEGORY`) as OCC-required so
-    /// `Engine::emit` rejects writes without `.expecting()`. Legacy
-    /// constructors leave it `false` for read-only fold registration.
-    ///
-    /// **Transitional shape**: this `bool` exists because legacy
-    /// `Aggregator::new` (read-only fold) and v0.4 `Aggregator::for_type`
-    /// (write-side OCC + read-side fold) share one struct during the
-    /// v0.3 → v0.4 transition. P11 (Legacy collapse) splits these so
-    /// the v0.4-only `Aggregator` carries no flag — every aggregator
-    /// then implies its own OCC stream by construction.
-    pub occ_required: bool,
     /// Extract the aggregate ID from JSON payload (deserializes internally).
     json_extract_id: Arc<dyn Fn(&serde_json::Value) -> Option<Uuid> + Send + Sync>,
     /// Deserialize JSON and apply to a type-erased aggregate (&mut dyn Any = &mut A).
@@ -106,19 +106,16 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
-    /// Construct an Aggregator that acts as both an OCC-gated stream
-    /// (write-side: `Engine::emit` requires `.expecting()`) and a
-    /// read-side fold (consumers see folded state via
-    /// `ctx.aggregate::<A>()`).
-    ///
-    /// This is the canonical "aggregate IS the consistency boundary"
-    /// case (per C6). For read-only folds that should NOT gate
-    /// writes (saga-style derived state, statistics counters), use
-    /// [`Self::fold`] instead.
+    /// Construct an Aggregator that folds facts of type `F` into
+    /// aggregate state `A`. Consumers read the folded state via
+    /// `ctx.aggregate::<A>(stream_id)` inside their reactor / projector
+    /// body.
     ///
     /// Stream id comes from `Fact::stream_id`; aggregate type string
     /// comes from `A::NAME` — explicit, stable across refactorings,
     /// portable to disk (backend `aggregate_type` columns).
+    ///
+    /// Registration via [`crate::EngineBuilder::with_aggregators`].
     pub fn for_type<A, F>() -> Self
     where
         A: crate::aggregate_v3::Aggregate
@@ -136,7 +133,6 @@ impl Aggregator {
             event_prefix,
             event_type_id,
             aggregate_type,
-            occ_required: true,
             json_extract_id: Arc::new(|payload: &serde_json::Value| -> Option<Uuid> {
                 let fact: F = serde_json::from_value(payload.clone()).ok()?;
                 Some(<F as crate::fact::Fact>::stream_id(&fact))
@@ -169,32 +165,7 @@ impl Aggregator {
         }
     }
 
-    /// Construct a read-only fold Aggregator — same shape as
-    /// [`Self::for_type`] but **without** the write-side OCC gate.
-    ///
-    /// Use this for derived state that lives in the registry but
-    /// doesn't make `F`'s stream an aggregate. Common cases:
-    /// statistics counters, saga-style read state shared across
-    /// reactors / projectors, debugging snapshots.
-    ///
-    /// `Engine::emit(fact)` still works freely against `F::CATEGORY`
-    /// — `with_aggregators([Aggregator::fold::<A, F>()])` does not
-    /// mark the stream as OCC-required.
-    pub fn fold<A, F>() -> Self
-    where
-        A: crate::aggregate_v3::Aggregate
-            + crate::aggregate_v3::Apply<F>
-            + Clone
-            + serde::Serialize
-            + serde::de::DeserializeOwned,
-        F: crate::fact::Fact,
-    {
-        let mut agg = Self::for_type::<A, F>();
-        agg.occ_required = false;
-        agg
-    }
-
-/// Extract the aggregate ID from a JSON event payload.
+    /// Extract the aggregate ID from a JSON event payload.
     pub fn extract_id_from_json(&self, payload: &serde_json::Value) -> Option<Uuid> {
         (self.json_extract_id)(payload)
     }
@@ -582,6 +553,46 @@ impl AggregatorRegistry {
         self.aggregators
             .iter()
             .find(|a| a.aggregate_type == aggregate_type)
+    }
+
+    /// Push each `(key, next)` from a fold's snapshots into the
+    /// observer's `aggregate_folded` hook. Used by runners that
+    /// folded an event and want to surface state-after-fold to
+    /// inspector / telemetry.
+    ///
+    /// Resolves the matching `Aggregator` by `aggregate_type` (the
+    /// key's prefix before `:`) to obtain a typed serializer; the
+    /// observer receives JSON, not type-erased `Any`.
+    pub fn notify_observer(
+        &self,
+        snapshots: &TransitionSnapshots,
+        observer: &dyn crate::reactor_observer::ReactorObserver,
+        correlation_id: Uuid,
+        position: LogCursor,
+        event_id: Uuid,
+    ) {
+        for (key, _prev, next) in snapshots.iter() {
+            // Key format: "{aggregate_type}:{aggregate_id}". Split
+            // once at the first ':'.
+            let aggregate_type = key.split(':').next().unwrap_or("");
+            let Some(agg) = self.find_first_by_aggregate_type(aggregate_type) else {
+                continue;
+            };
+            match agg.serialize_state(next.as_ref()) {
+                Ok(state_json) => observer.aggregate_folded(
+                    correlation_id,
+                    position,
+                    event_id,
+                    key,
+                    state_json,
+                ),
+                Err(e) => tracing::warn!(
+                    aggregate_key = %key,
+                    error = %e,
+                    "notify_observer: serialize_state failed; skipping snapshot"
+                ),
+            }
+        }
     }
 
     /// Capture pre-mutation state for the aggregates that would be affected
