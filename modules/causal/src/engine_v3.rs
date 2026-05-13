@@ -1303,6 +1303,238 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    /// Pin the `Aggregator::for_type_with_id_fn` contract: a single
+    /// fact type can register two aggregators with different keys.
+    ///
+    /// Before 0.4.5: the `#[aggregator(id_fn = "...")]` macro accepted
+    /// the attribute but the factory hard-coded `Fact::stream_id`, so
+    /// every aggregator registered for the same fact type folded into
+    /// the same key. The "per-signal aggregate vs per-run aggregate"
+    /// pattern was impossible without emitting twin events (a smell
+    /// that surfaced in the scout `SignalEvent::ReviewCompleted` twin
+    /// of `SystemEvent::ReviewVerdictReached`).
+    ///
+    /// This test proves the bridge: one `UserCreated` fact, two
+    /// aggregators — one keyed by `user_id` (default via `for_type`),
+    /// one keyed by a *different* `org_id` field via
+    /// `for_type_with_id_fn`. Both fold; neither's state bleeds into
+    /// the other's key.
+    #[tokio::test]
+    async fn aggregator_for_type_with_id_fn_keys_independently() {
+        use crate::aggregate_v3::{Aggregate, Apply};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct OrgUserCreated {
+            user_id: Uuid,
+            org_id: Uuid,
+            occurred_at: DateTime<Utc>,
+        }
+        impl Fact for OrgUserCreated {
+            const CATEGORY: &'static str = "org_user";
+            fn name(&self) -> &str { "org_user_created" }
+            fn stream_id(&self) -> Uuid { self.user_id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct UserCount { n: u32 }
+        impl Aggregate for UserCount {
+            const NAME: &'static str = "UserCount";
+        }
+        impl Apply<OrgUserCreated> for UserCount {
+            fn apply(&mut self, _: &OrgUserCreated) { self.n += 1; }
+        }
+
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct OrgCount { n: u32 }
+        impl Aggregate for OrgCount {
+            const NAME: &'static str = "OrgCount";
+        }
+        impl Apply<OrgUserCreated> for OrgCount {
+            fn apply(&mut self, _: &OrgUserCreated) { self.n += 1; }
+        }
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators([
+            // UserCount keys by the natural stream_id (user_id).
+            Aggregator::for_type::<UserCount, OrgUserCreated>(),
+            // OrgCount keys by org_id — a different field. Pre-0.4.5
+            // this was impossible; the factory ignored id_fn and
+            // also folded into user_id, collapsing both aggregators
+            // onto the same key.
+            Aggregator::for_type_with_id_fn::<OrgCount, OrgUserCreated, _>(
+                |e: &OrgUserCreated| Some(e.org_id)
+            ),
+        ])
+        .build();
+
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+        let user_1 = Uuid::new_v4();
+        let user_2 = Uuid::new_v4();
+        let user_3 = Uuid::new_v4();
+
+        // Two events in org_a (user_1, user_2), one in org_b (user_3).
+        engine.emit(OrgUserCreated { user_id: user_1, org_id: org_a, occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(OrgUserCreated { user_id: user_2, org_id: org_a, occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(OrgUserCreated { user_id: user_3, org_id: org_b, occurred_at: Utc::now() }).settled().await.unwrap();
+
+        // UserCount: each user_id folds independently → 1, 1, 1.
+        assert_eq!(engine.snapshot::<UserCount>(user_1).unwrap().n, 1);
+        assert_eq!(engine.snapshot::<UserCount>(user_2).unwrap().n, 1);
+        assert_eq!(engine.snapshot::<UserCount>(user_3).unwrap().n, 1);
+
+        // OrgCount: keyed by org_id → 2 for org_a, 1 for org_b.
+        assert_eq!(engine.snapshot::<OrgCount>(org_a).unwrap().n, 2,
+            "id_fn must extract org_id, not user_id (Fact::stream_id)");
+        assert_eq!(engine.snapshot::<OrgCount>(org_b).unwrap().n, 1);
+
+        // Cross-check: org_a snapshot at user_1's key must be None
+        // (the OrgCount aggregator never folded there).
+        assert!(engine.snapshot::<OrgCount>(user_1).is_none(),
+            "OrgCount keyed by org_id must not appear under user_id key");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `id_fn` that returns `Option<Uuid>` and yields `None` for some
+    /// facts must skip the fold entirely (not fold at `Uuid::nil`).
+    #[tokio::test]
+    async fn aggregator_id_fn_returning_none_skips_fold() {
+        use crate::aggregate_v3::{Aggregate, Apply};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct MaybeRunEvent {
+            stream_id: Uuid,
+            run_id: Option<Uuid>,
+            occurred_at: DateTime<Utc>,
+        }
+        impl Fact for MaybeRunEvent {
+            const CATEGORY: &'static str = "maybe_run";
+            fn name(&self) -> &str { "maybe_run_event" }
+            fn stream_id(&self) -> Uuid { self.stream_id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct RunCounter { n: u32 }
+        impl Aggregate for RunCounter {
+            const NAME: &'static str = "RunCounter";
+        }
+        impl Apply<MaybeRunEvent> for RunCounter {
+            fn apply(&mut self, _: &MaybeRunEvent) { self.n += 1; }
+        }
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators([
+            Aggregator::for_type_with_id_fn::<RunCounter, MaybeRunEvent, _>(
+                |e: &MaybeRunEvent| e.run_id
+            ),
+        ])
+        .build();
+
+        let run = Uuid::new_v4();
+
+        // Two events with run_id, one without.
+        engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: Some(run), occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: None, occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: Some(run), occurred_at: Utc::now() }).settled().await.unwrap();
+
+        assert_eq!(engine.snapshot::<RunCounter>(run).unwrap().n, 2,
+            "only the two facts with run_id Some should fold");
+
+        // The None-run fact must not have created an entry at
+        // Uuid::nil — verify nothing leaked there.
+        assert!(engine.snapshot::<RunCounter>(Uuid::nil()).is_none(),
+            "id_fn returning None must skip the fold entirely, not fold at nil");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    // Types for the macro id_fn regression test below — kept at
+    // module scope (not inside a test fn) so the `#[aggregators]`
+    // module macro can emit at proper Rust scope.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TaggedEvent {
+        event_id: Uuid,
+        tag_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    }
+    impl Fact for TaggedEvent {
+        const CATEGORY: &'static str = "tagged";
+        fn name(&self) -> &str { "tagged" }
+        // stream_id intentionally NOT tag_id — proves the macro
+        // uses id_fn over stream_id.
+        fn stream_id(&self) -> Uuid { self.event_id }
+        fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+    }
+    impl TaggedEvent {
+        fn tag(&self) -> Uuid { self.tag_id }
+    }
+
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct TagBucket { count: u32 }
+    impl crate::aggregate_v3::Aggregate for TagBucket {
+        const NAME: &'static str = "TagBucket";
+    }
+
+    use causal_core_macros::{aggregator, aggregators};
+
+    #[aggregators]
+    mod tagged_aggs {
+        use super::*;
+
+        #[aggregator(id_fn = "tag")]
+        fn on_tagged(b: &mut TagBucket, e: TaggedEvent) {
+            b.count += 1;
+            let _ = e;
+        }
+    }
+
+    /// End-to-end macro test: `#[aggregator(id_fn = "method")]` must
+    /// emit a factory that keys by the user method's return value, not
+    /// by `Fact::stream_id`. This is the contract the scout side
+    /// depends on (e.g. SignalLifecycle keyed by signal_id from a
+    /// CuriosityEvent whose stream_id is nil).
+    ///
+    /// Regression test for the v0.4.0–0.4.4 bug where the macro
+    /// accepted the attribute but the factory hard-coded
+    /// `Fact::stream_id`.
+    #[tokio::test]
+    async fn macro_aggregator_id_fn_actually_keys_by_method() {
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorOutbox>,
+        )
+        .with_aggregators(tagged_aggs::aggregators())
+        .build();
+
+        let tag_a = Uuid::new_v4();
+        let tag_b = Uuid::new_v4();
+
+        engine.emit(TaggedEvent { event_id: Uuid::new_v4(), tag_id: tag_a, occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(TaggedEvent { event_id: Uuid::new_v4(), tag_id: tag_a, occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(TaggedEvent { event_id: Uuid::new_v4(), tag_id: tag_b, occurred_at: Utc::now() }).settled().await.unwrap();
+
+        assert_eq!(engine.snapshot::<TagBucket>(tag_a).unwrap().count, 2,
+            "#[aggregator(id_fn = \"tag\")] must key by tag_id, not event_id");
+        assert_eq!(engine.snapshot::<TagBucket>(tag_b).unwrap().count, 1);
+
+        engine.shutdown().await.unwrap();
+    }
+
     // ── Phase 5a — Aggregate-stream emit gating ──
 
     /// Aggregate registered for stream-policy testing.

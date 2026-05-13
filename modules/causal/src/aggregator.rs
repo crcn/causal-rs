@@ -105,6 +105,26 @@ pub struct Aggregator {
         Arc<dyn Fn(serde_json::Value) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>,
 }
 
+/// Coerce a user-supplied id-extraction return into the `Option<Uuid>`
+/// the aggregator framework needs. Supports both shapes so user
+/// methods registered via `#[aggregator(id_fn = "...")]` can return
+/// either `Uuid` (the common case) or `Option<Uuid>` ("skip this
+/// aggregator on this fact" semantics).
+///
+/// Macro-generated code uses this trait; user code rarely calls it
+/// directly.
+pub trait AggregatorIdValue {
+    fn into_aggregator_id(self) -> Option<Uuid>;
+}
+
+impl AggregatorIdValue for Uuid {
+    fn into_aggregator_id(self) -> Option<Uuid> { Some(self) }
+}
+
+impl AggregatorIdValue for Option<Uuid> {
+    fn into_aggregator_id(self) -> Option<Uuid> { self }
+}
+
 impl Aggregator {
     /// Construct an Aggregator that folds facts of type `F` into
     /// aggregate state `A`. Consumers read the folded state via
@@ -125,17 +145,49 @@ impl Aggregator {
             + serde::de::DeserializeOwned,
         F: crate::fact::Fact,
     {
+        Self::for_type_with_id_fn::<A, F, _>(|f: &F| Some(<F as crate::fact::Fact>::stream_id(f)))
+    }
+
+    /// Construct an Aggregator that extracts the aggregate id with a
+    /// custom function instead of `Fact::stream_id`. Returning `None`
+    /// from `id_fn` skips the fold for this aggregator on that event.
+    ///
+    /// **Use case.** A fact may naturally stream by signal_id (per-
+    /// signal facts) but contribute to a per-run aggregate. The fact's
+    /// `Fact::stream_id` is signal_id (for the per-signal stream that
+    /// owns it); the *aggregator* over that fact wants run_id. With
+    /// `for_type_with_id_fn`, the same fact type can register two
+    /// aggregators with different keys — one keyed by `signal_id`
+    /// (default via `for_type`), another keyed by `run_id` (custom
+    /// via `for_type_with_id_fn`).
+    ///
+    /// This replaces the v0.3 `#[aggregator(id_fn = "...")]` /
+    /// `#[aggregator(id = "...")]` / `#[aggregator(singleton)]`
+    /// macro attributes, which were silently no-ops in 0.4.0–0.4.4
+    /// (the factory hard-coded `Fact::stream_id`).
+    pub fn for_type_with_id_fn<A, F, IdFn>(id_fn: IdFn) -> Self
+    where
+        A: crate::aggregate_v3::Aggregate
+            + crate::aggregate_v3::Apply<F>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned,
+        F: crate::fact::Fact,
+        IdFn: Fn(&F) -> Option<Uuid> + Send + Sync + 'static,
+    {
         let event_prefix = <F as crate::fact::Fact>::CATEGORY.to_string();
         let event_type_id = TypeId::of::<F>();
         let aggregate_type = <A as crate::aggregate_v3::Aggregate>::NAME.to_string();
+        let id_fn = Arc::new(id_fn);
+        let id_fn_for_extract = id_fn.clone();
 
         Self {
             event_prefix,
             event_type_id,
             aggregate_type,
-            json_extract_id: Arc::new(|payload: &serde_json::Value| -> Option<Uuid> {
+            json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
                 let fact: F = serde_json::from_value(payload.clone()).ok()?;
-                Some(<F as crate::fact::Fact>::stream_id(&fact))
+                id_fn_for_extract(&fact)
             }),
             apply_to: Arc::new(|state: &mut dyn Any, data: serde_json::Value| -> Result<()> {
                 let state = state

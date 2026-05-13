@@ -1847,10 +1847,42 @@ fn expand_aggregator_with_id(
     let body = &input_fn.block;
     let factory_name = format_ident!("__causal_aggregator_{}", fn_name);
 
-    let id_expr = match id_access {
-        IdAccess::Field(ident) => quote! { e.#ident },
-        IdAccess::Method(ident) => quote! { e.#ident() },
-        IdAccess::Singleton => quote! { ::uuid::Uuid::nil() },
+    // Build the id-extraction expression for the aggregator factory.
+    // `e` binds to a `&#event_ty` inside the closure passed to
+    // `for_type_with_id_fn`; the closure must return `Option<Uuid>`
+    // so we wrap user-supplied Uuid-returning fields/methods in
+    // `Some(...)`. The singleton case returns `Some(Uuid::nil())`.
+    //
+    // 0.4.0–0.4.4 silently ignored this attribute and hard-coded
+    // `Fact::stream_id`. 0.4.5 restores the v0.3 semantics: events
+    // can fold into aggregators keyed by a field/method/singleton
+    // that differs from their natural stream_id.
+    // User id_fn methods may return either `Uuid` or `Option<Uuid>` —
+    // the `AggregatorIdValue` trait lifts both into `Option<Uuid>` so
+    // either signature compiles. Field access lifts a bare `Uuid`
+    // field; singleton always returns `Some(Uuid::nil())`.
+    let factory_body = match id_access {
+        IdAccess::Field(field_ident) => quote! {
+            ::causal::Aggregator::for_type_with_id_fn::<#agg_ty, #event_ty, _>(
+                |e: &#event_ty| {
+                    use ::causal::aggregator::AggregatorIdValue;
+                    e.#field_ident.into_aggregator_id()
+                }
+            )
+        },
+        IdAccess::Method(method_ident) => quote! {
+            ::causal::Aggregator::for_type_with_id_fn::<#agg_ty, #event_ty, _>(
+                |e: &#event_ty| {
+                    use ::causal::aggregator::AggregatorIdValue;
+                    e.#method_ident().into_aggregator_id()
+                }
+            )
+        },
+        IdAccess::Singleton => quote! {
+            ::causal::Aggregator::for_type_with_id_fn::<#agg_ty, #event_ty, _>(
+                |_: &#event_ty| Some(::uuid::Uuid::nil())
+            )
+        },
     };
 
     // v0.4 Apply<F>::apply takes `&mut self, fact: &F` (borrow).
@@ -1859,13 +1891,6 @@ fn expand_aggregator_with_id(
     // `#event_ident` to a `&F` and shadowing it with a cheap clone
     // inside the body so the user's owned-value semantics stand.
     // Fact types are Clone by trait bound, so this is uniformly safe.
-    //
-    // Aggregator factory uses v0.4 `for_type::<A, F>()` —
-    // stream_id derives from `Fact::stream_id()`, no id-extraction
-    // closure needed. `#id_expr` is dead under v0.4 but kept in
-    // scope to suppress unused-variable warnings in the
-    // intermediate state; suppressed via let-binding.
-    let _ = id_expr; // legacy IdAccess result no longer used at call site
     Ok(quote! {
         impl ::causal::Apply<#event_ty> for #agg_ty {
             fn apply(&mut self, #event_ident: &#event_ty) {
@@ -1879,7 +1904,7 @@ fn expand_aggregator_with_id(
         }
 
         fn #factory_name() -> ::causal::Aggregator {
-            ::causal::Aggregator::for_type::<#agg_ty, #event_ty>()
+            #factory_body
         }
     })
 }

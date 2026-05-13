@@ -4,6 +4,42 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] — 2026-05-12
+
+### Fixed (breaking-ish — see migration note)
+
+- **`#[aggregator(id_fn = "...")]` / `#[aggregator(id = "...")]` /
+  `#[aggregator(singleton)]` now actually work.** From 0.4.0 through
+  0.4.4 the macro accepted these attributes but the generated factory
+  hard-coded `Fact::stream_id`, so the per-aggregator key extraction
+  documented in the v0.3 docs was silently a no-op. Aggregators
+  registered with `id_fn` quietly folded into the same key as
+  `Fact::stream_id`, which collapsed multi-aggregator-per-fact setups
+  onto a single key.
+
+  Two regression tests pin the new behavior
+  (`aggregator_for_type_with_id_fn_keys_independently`,
+  `macro_aggregator_id_fn_actually_keys_by_method`). Verified to detect
+  the prior bug by reverting the macro change.
+
+  **Migration:** If you were on 0.4.0–0.4.4 with `id_fn`/`id`/`singleton`
+  attributes, the aggregator was probably folding incorrectly under
+  the hood. On 0.4.5 it folds correctly. If your application depended
+  on the incorrect (singleton-collapsed) behavior, expect aggregate
+  state to redistribute across stream keys after this upgrade. Tests
+  that asserted state at `Uuid::nil()` may now see state at the
+  intended key instead.
+
+### Added
+
+- **`Aggregator::for_type_with_id_fn<A, F, IdFn>(id_fn: IdFn)`**: public
+  API for the new id-extraction path. `id_fn: Fn(&F) -> Option<Uuid>`;
+  returning `None` skips the fold for this aggregator on that fact
+  (third regression test:
+  `aggregator_id_fn_returning_none_skips_fold`).
+- **`AggregatorIdValue` trait** with impls for `Uuid` and `Option<Uuid>`
+  so the macro accepts user methods returning either shape.
+
 ## [0.4.4] — 2026-05-12
 
 ### Added
