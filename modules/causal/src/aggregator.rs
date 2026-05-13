@@ -285,6 +285,37 @@ impl AggregatorRegistry {
     /// 4. Increment version atomically with state update
     ///
     /// State is stored as concrete types via `Arc<dyn Any>` — zero serialization overhead.
+    ///
+    /// # Concurrency caveat (known-issue, tracked in causal-rs#TBD)
+    ///
+    /// The read-modify-write below is **not atomic per key**. The
+    /// sequence `state.get(&key) → clone → apply → state.insert(&key)`
+    /// races against a concurrent caller doing the same sequence for
+    /// the same key. DashMap makes each individual op atomic but the
+    /// composite is not — two concurrent applies can both read the
+    /// same `pre_state`, both produce a `post_state`, and the second
+    /// insert overwrites the first. The earlier event's mutations
+    /// are lost.
+    ///
+    /// In v0.4 this is reachable from two paths concurrently:
+    ///   1. `Engine::execute_emit` folds caller-emitted facts.
+    ///   2. `RelayLoop::drain_once` folds reactor-emitted facts after
+    ///      `log.append` (added in 0.4.3 for `engine.snapshot()`
+    ///      visibility).
+    ///
+    /// Both run on different tokio tasks. Streams that only see one
+    /// path are safe; streams that receive both caller- and reactor-
+    /// emitted facts can lose updates under load.
+    ///
+    /// **Mitigation paths considered, not yet implemented:**
+    ///   - Per-key `Mutex`/`RwLock` around the RMW block.
+    ///   - DashMap `entry().and_modify().or_insert()` (atomic per key,
+    ///     but the apply closure must be sync — fine here since
+    ///     `apply_to` is sync).
+    ///   - CAS retry loop on `version`.
+    ///
+    /// All single-emit scenarios and tests that `await settled()`
+    /// before snapshotting are unaffected (no overlap).
     pub fn apply_event(
         &self,
         event_type: &str,
