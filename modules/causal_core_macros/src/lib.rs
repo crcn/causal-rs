@@ -1714,9 +1714,16 @@ enum IdAccess {
     Method(Ident),
     /// Singleton — uses `Uuid::nil()` as a constant ID.
     Singleton,
+    /// Default: use `Fact::stream_id`. Emitted when `#[aggregator]`
+    /// has no arguments (or `#[aggregators]` has no module-level
+    /// default). Factory uses the plain `Aggregator::for_type::<A,F>()`
+    /// path which delegates to `Fact::stream_id` internally.
+    FactStreamId,
 }
 
 /// Parse `id = "field"` or `id_fn = "method"` from `#[aggregator(...)]`.
+/// Empty metas → `IdAccess::FactStreamId` (use `Fact::stream_id`,
+/// the documented v0.4 default).
 fn parse_aggregator_id_access(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<IdAccess> {
     for meta in metas {
         if let Meta::Path(path) = meta {
@@ -1755,10 +1762,7 @@ fn parse_aggregator_id_access(metas: &Punctuated<Meta, Token![,]>) -> syn::Resul
             }
         }
     }
-    Err(syn::Error::new(
-        proc_macro2::Span::call_site(),
-        "#[aggregator] requires `singleton`, `id = \"field\"`, or `id_fn = \"method\"` to specify how to extract the aggregate ID from the event",
-    ))
+    Ok(IdAccess::FactStreamId)
 }
 
 /// Extract `(&mut AggregateType, EventType)` from function signature.
@@ -1860,8 +1864,14 @@ fn expand_aggregator_with_id(
     // User id_fn methods may return either `Uuid` or `Option<Uuid>` —
     // the `AggregatorIdValue` trait lifts both into `Option<Uuid>` so
     // either signature compiles. Field access lifts a bare `Uuid`
-    // field; singleton always returns `Some(Uuid::nil())`.
+    // field; singleton always returns `Some(Uuid::nil())`. The default
+    // (no attribute) path uses `Aggregator::for_type` which delegates
+    // to `Fact::stream_id` internally — exactly what most run-scoped
+    // facts want.
     let factory_body = match id_access {
+        IdAccess::FactStreamId => quote! {
+            ::causal::Aggregator::for_type::<#agg_ty, #event_ty>()
+        },
         IdAccess::Field(field_ident) => quote! {
             ::causal::Aggregator::for_type_with_id_fn::<#agg_ty, #event_ty, _>(
                 |e: &#event_ty| {
@@ -1926,8 +1936,11 @@ fn expand_aggregators_module(
         ));
     };
 
+    // No module args → default to `Fact::stream_id` for bare functions.
+    // Pre-0.4.5, no-args `#[aggregators]` skipped bare functions; now
+    // they expand with the documented default.
     let module_id_access = if module_metas.is_empty() {
-        None
+        Some(IdAccess::FactStreamId)
     } else {
         Some(parse_aggregator_id_access(module_metas)?)
     };

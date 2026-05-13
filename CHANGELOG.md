@@ -4,6 +4,32 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] — 2026-05-12
+
+### Fixed (follow-up to 0.4.5)
+
+- **`#[aggregators]` (no args) now expands bare functions** using
+  `Fact::stream_id`. Pre-0.4.6, a module marked `#[aggregators]` with
+  no module-level default (`singleton` / `id` / `id_fn`) would silently
+  skip any `fn` items that lacked a per-function `#[aggregator]` attr.
+  The skip was invisible — the `aggregators()` factory returned an
+  empty Vec and the engine appeared healthy until a snapshot returned
+  None at the expected key.
+- **`#[aggregator]` (no args) is now valid** with the same default
+  (`Fact::stream_id`). Required for scout's pipeline_aggregators where
+  most fact types use the natural per-fact stream.
+
+### Migration from 0.4.5
+
+If your `#[aggregators(singleton)]` module previously had no
+per-function attrs, the singleton attr was load-bearing — pre-0.4.5
+it was a no-op (every aggregator hard-coded `Fact::stream_id`),
+0.4.5 made it actually singleton (`Uuid::nil()` key). 0.4.6 keeps
+the 0.4.5 semantics for that case. If you wrote `#[aggregators(singleton)]`
+intending the legacy (silent stream_id) behavior, drop the `singleton`
+attr → `#[aggregators]` — now valid in 0.4.6 and means "default to
+Fact::stream_id".
+
 ## [0.4.5] — 2026-05-12
 
 ### Fixed (breaking-ish — see migration note)
