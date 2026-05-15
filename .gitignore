@@ -34,3 +34,5 @@ test_emit*
 .env
 .env.local
 .claude/
+target/
+examples/**/target/

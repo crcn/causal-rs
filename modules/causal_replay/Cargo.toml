@@ -13,7 +13,7 @@ postgres = ["dep:sqlx", "dep:dashmap"]
 kurrent  = ["dep:kurrentdb", "dep:bytes"]
 
 [dependencies]
-causal = { version = "0.4.6", path = "../causal" }
+causal = { version = "0.5.0", path = "../causal" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
