@@ -20,7 +20,7 @@ mod pg {
     use uuid::Uuid;
 
     use causal::snapshot_store::SnapshotStore;
-    use causal::types::{Snapshot, StreamVersion};
+    use causal::types::{Snapshot, StreamRevision};
 
     /// Encode `(aggregate_type, aggregate_id)` into a single key.
     /// Using a colon separator that aggregate_type is not allowed to
@@ -61,7 +61,7 @@ mod pg {
             .await?;
 
             let Some(row) = row else { return Ok(None); };
-            let version: i64 = row.try_get("version")?;
+            let revision: i64 = row.try_get("version")?;
             let blob: Vec<u8> = row.try_get("blob")?;
             let created_at: DateTime<Utc> = row.try_get("created_at")?;
             let state: serde_json::Value = serde_json::from_slice(&blob)?;
@@ -69,7 +69,7 @@ mod pg {
             Ok(Some(Snapshot {
                 aggregate_type: aggregate_type.to_string(),
                 aggregate_id,
-                version: StreamVersion::from_raw(version as u64),
+                revision: StreamRevision::from_raw(revision as u64),
                 state,
                 created_at,
             }))
@@ -89,7 +89,7 @@ mod pg {
                  ON CONFLICT (key, version) DO NOTHING",
             )
             .bind(&key)
-            .bind(snapshot.version.raw() as i64)
+            .bind(snapshot.revision.raw() as i64)
             .bind(&blob)
             .bind(snapshot.created_at)
             .execute(&self.pool)

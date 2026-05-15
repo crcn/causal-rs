@@ -1,7 +1,7 @@
 //! Snapshot persistence trait — separate from the event log so the
 //! snapshot backend can be swapped independently (Postgres log + S3
-//! snapshots, Kurrent log + Postgres snapshots, etc.). Backends impl
-//! directly; the legacy `EventLog` blanket is gone.
+//! snapshots, Kurrent log + Postgres snapshots, etc.). Backends
+//! implement this trait directly.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,10 +20,10 @@ pub trait SnapshotStore: Send + Sync {
     async fn save_snapshot(&self, snapshot: Snapshot) -> Result<()>;
 
     /// Delete a snapshot. Default is a no-op for backends that don't
-    /// support targeted deletion. Phase 4 self-heal (BS3 / BS10) relies
-    /// on this when a snapshot blob fails to deserialize after schema
-    /// drift; backends without a working delete will accumulate stale
-    /// snapshots. Override on backends that can support it.
+    /// support targeted deletion. Self-heal relies on this when a
+    /// snapshot blob fails to deserialize after schema drift; backends
+    /// without a working delete will accumulate stale snapshots.
+    /// Override on backends that can support it.
     async fn delete_snapshot(
         &self,
         _aggregate_type: &str,

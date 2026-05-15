@@ -1,7 +1,7 @@
 //! Store-agnostic GraphQL resolvers for the causal inspector.
 //!
 //! Queries read from `Arc<dyn InspectorReadModel>` (injected into context).
-//! Subscriptions read from `tokio::sync::broadcast::Sender<PersistedEvent>`
+//! Subscriptions read from `tokio::sync::broadcast::Sender<RecordedEvent>`
 //! (injected into context — how events get broadcast is the consumer's concern).
 
 use std::sync::Arc;

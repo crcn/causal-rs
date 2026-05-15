@@ -16,15 +16,15 @@ use crate::read_model::{
     ReactorLogEntry, ReactorOutcomeEntry, StoredEvent,
 };
 
-/// Convert a `PersistedEvent` to a `StoredEvent`.
-fn to_stored(e: &causal::types::PersistedEvent) -> StoredEvent {
+/// Convert a `RecordedEvent` to a `StoredEvent`.
+fn to_stored(e: &causal::types::RecordedEvent) -> StoredEvent {
     StoredEvent {
         seq: e.position.raw() as i64,
         ts: e.created_at,
         event_type: e.event_type.clone(),
         payload: e.payload.clone(),
         id: Some(e.event_id),
-        parent_id: e.parent_id,
+        causation_id: e.causation_id,
         correlation_id: Some(e.correlation_id),
         reactor_id: e
             .metadata
@@ -33,7 +33,7 @@ fn to_stored(e: &causal::types::PersistedEvent) -> StoredEvent {
             .map(|s| s.to_string()),
         aggregate_type: e.aggregate_type.clone(),
         aggregate_id: e.aggregate_id,
-        stream_version: e.version.map(|v| v.raw()),
+        stream_revision: e.revision.map(|r| r.raw()),
     }
 }
 
@@ -132,7 +132,7 @@ impl InspectorReadModel for MemoryStore {
 
         let root_seq = events
             .iter()
-            .find(|e| e.parent_id.is_none())
+            .find(|e| e.causation_id.is_none())
             .map(|e| e.seq)
             .unwrap_or(seq);
 
@@ -421,8 +421,8 @@ impl InspectorReadModel for MemoryStore {
             if e.created_at > entry.2 {
                 entry.2 = e.created_at;
             }
-            // Root event = no parent_id
-            if e.parent_id.is_none() && entry.3.is_empty() {
+            // Root event = no causation_id
+            if e.causation_id.is_none() && entry.3.is_empty() {
                 entry.3 = e.event_type.clone();
             }
         }

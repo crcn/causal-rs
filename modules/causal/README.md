@@ -12,7 +12,7 @@ unchanged; v0.3 is additive.
 ```rust
 use causal::{
     Engine, EngineBuilder, Fact, Materializer, Reactor, Ctx,
-    aggregate_v3::Aggregate, memory_store::MemoryStore,
+    aggregate::Aggregate, memory_store::MemoryStore,
     EventLogBackend, CheckpointStore, ReactorOutbox,
 };
 use std::sync::Arc;

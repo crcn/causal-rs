@@ -1,8 +1,8 @@
-//! Runner for v0.3 [`Reactor`](crate::reactor_v3::Reactor) consumers.
+//! Runner for [`Reactor`](crate::reactor::Reactor) consumers.
 //!
 //! Implements C12 (runtime-side outbox + atomic batch commit) end-to-end:
 //!
-//!   1. Read trigger fact from log (load_from polling, like Phase 4b).
+//!   1. Read trigger fact from log (read_all polling).
 //!   2. Filter by `R::Trigger::type_prefix()`.
 //!   3. Call `reactor.react(trigger, ctx)` → `Result<Events>`.
 //!   4. Convert `Events::outputs` → `Vec<OutboxRow>` with deterministic
@@ -31,12 +31,12 @@ use uuid::Uuid;
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::{InsertableOutboxRow, ReactorOutbox};
 use crate::contexts::Ctx;
-use crate::engine_v3::{DlqInfo, DlqMapperArc};
+use crate::engine::{DlqInfo, DlqMapperArc};
 use crate::event_log::EventLogBackend;
-use crate::fact::Fact;
+use crate::event::Event;
 use crate::projection_runner::StepOutcome;
 use crate::reactor_observer::ReactorObserver;
-use crate::reactor_v3::Reactor;
+use crate::reactor::Reactor;
 use crate::types::LogCursor;
 
 /// Namespace UUID for deriving deterministic reactor-output event_ids
@@ -132,7 +132,7 @@ where
     /// is invoked; on `Some(fact)`, the fact is emitted through the
     /// outbox and the cursor advances past the failing event.
     /// Without this, errored reactors retry indefinitely.
-    pub fn with_dlq(mut self, mapper: DlqMapperArc, max_attempts: u32) -> Self {
+    pub(crate) fn with_dlq(mut self, mapper: DlqMapperArc, max_attempts: u32) -> Self {
         self.dlq_mapper = Some(mapper);
         self.max_attempts = max_attempts;
         self
@@ -146,12 +146,12 @@ where
 
         self.ensure_hydrated(cursor).await?;
 
-        let events = self.log.load_from(cursor, batch).await?;
+        let events = self.log.read_all(cursor, batch).await?;
         if events.is_empty() {
             return Ok(StepOutcome::Idle);
         }
 
-        let prefix = <R::Trigger as Fact>::CATEGORY;
+        let prefix = <R::Trigger as Event>::CATEGORY;
         let mut applied = 0usize;
         for event in events {
             // Fold every event into the aggregator registry, with
@@ -293,7 +293,7 @@ where
                                 .await?;
 
                             // Build outbox row (if mapper returned a
-                            // Fact) and atomically commit + advance.
+                            // Event) and atomically commit + advance.
                             // `output_index = u32::MAX` distinguishes
                             // DLQ-synthesized outputs from normal
                             // react() outputs (idx 0..N).
@@ -387,7 +387,7 @@ where
             let reg = self.aggregators.as_ref().unwrap();
             let mut from = LogCursor::ZERO;
             loop {
-                let batch = self.log.load_from(from, 1024).await?;
+                let batch = self.log.read_all(from, 1024).await?;
                 if batch.is_empty() { break; }
                 let last_pos = batch.last().unwrap().position;
                 let mut hit_cursor = false;
@@ -413,8 +413,8 @@ mod tests {
     use super::*;
     use crate::checkpoint_store::CheckpointStore;
     use crate::memory_store::MemoryStore;
-    use crate::reactor_v3::Events;
-    use crate::types::NewEvent;
+    use crate::reactor::Events;
+    use crate::types::EventData;
     use anyhow::anyhow;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -428,9 +428,9 @@ mod tests {
         order_id:    Uuid,
         occurred_at: DateTime<Utc>,
     }
-    impl Fact for OrderPlaced {
+    impl Event for OrderPlaced {
         const CATEGORY: &'static str = "order";
-        fn name(&self) -> &str { "order_placed" }
+        fn event_type(&self) -> &str { "order_placed" }
         fn stream_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -440,19 +440,19 @@ mod tests {
     struct ShippedNotification {
         order_id: Uuid,
     }
-    impl Fact for ShippedNotification {
+    impl Event for ShippedNotification {
         const CATEGORY: &'static str = "shipping";
-        fn name(&self) -> &str { "shipped_notification" }
+        fn event_type(&self) -> &str { "shipped_notification" }
         fn stream_id(&self) -> Uuid { self.order_id }
     }
 
     fn append_trigger(store: &MemoryStore, payload: &OrderPlaced) -> Uuid {
         let event_id = Uuid::new_v4();
-        let ev = NewEvent {
+        let ev = EventData {
             event_id,
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
-            event_type:      format!("{}:{}", <OrderPlaced as Fact>::CATEGORY, payload.name()),
+            event_type:      format!("{}:{}", <OrderPlaced as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             aggregate_type:  None,
@@ -587,7 +587,7 @@ mod tests {
 
         // Read the persisted event to get the correlation_id the helper
         // generated.
-        let persisted = EventLogBackend::load_from(
+        let persisted = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         let trigger_correlation = persisted[0].correlation_id;
@@ -614,7 +614,7 @@ mod tests {
         );
         relay.drain_once(10).await.unwrap();
 
-        let all_events = EventLogBackend::load_from(
+        let all_events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         let output_event = all_events.iter()
@@ -622,8 +622,8 @@ mod tests {
             .expect("relay-drained output present in log");
         assert_eq!(output_event.correlation_id, trigger_correlation,
                    "relay-drained output MUST carry trigger's correlation_id");
-        assert_eq!(output_event.parent_id, Some(trigger_event_id),
-                   "relay-drained output's parent_id MUST be the trigger's event_id");
+        assert_eq!(output_event.causation_id, Some(trigger_event_id),
+                   "relay-drained output's causation_id MUST be the trigger's event_id");
     }
 
     #[tokio::test]
@@ -713,7 +713,7 @@ mod tests {
 
         let cursor = store.get("r.flaky").await.unwrap().unwrap();
 
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(),
             LogCursor::ZERO,
             10,
@@ -738,9 +738,9 @@ mod tests {
     #[tokio::test]
     async fn reactor_skips_non_matching_trigger_type() {
         let store = Arc::new(MemoryStore::new());
-        let foreign = NewEvent {
+        let foreign = EventData {
             event_id:        Uuid::new_v4(),
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      "other.thing".into(),
             payload:         serde_json::json!({}),
@@ -773,9 +773,9 @@ mod tests {
         group_name: String,
         attempts:   u32,
     }
-    impl Fact for HandlerFailed {
+    impl Event for HandlerFailed {
         const CATEGORY: &'static str = "ops";
-        fn name(&self) -> &str { "handler_failed" }
+        fn event_type(&self) -> &str { "handler_failed" }
         fn stream_id(&self) -> Uuid { Uuid::nil() }
     }
 
@@ -815,7 +815,7 @@ mod tests {
                 Some(Box::new(HandlerFailed {
                     group_name: info.group_name,
                     attempts:   info.attempts,
-                }) as Box<dyn crate::engine_v3::ErasedFact>)
+                }) as Box<dyn crate::engine::ErasedFact>)
             })
         };
 
@@ -868,7 +868,7 @@ mod tests {
             Some(Box::new(HandlerFailed {
                 group_name: info.group_name,
                 attempts:   info.attempts,
-            }) as Box<dyn crate::engine_v3::ErasedFact>)
+            }) as Box<dyn crate::engine::ErasedFact>)
         });
 
         let runner = ReactorRunner::new(
@@ -893,7 +893,7 @@ mod tests {
         assert_eq!(dlq_calls.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-        // The outbox carries the synthesized HandlerFailed Fact.
+        // The outbox carries the synthesized HandlerFailed Event.
         let pending = store.outbox_pending(10).await.unwrap();
         assert_eq!(pending.len(), 1);
         let row = &pending[0];
@@ -901,6 +901,24 @@ mod tests {
         assert_eq!(row.event_type, "ops:handler_failed");
         assert_eq!(row.output_index, u32::MAX,
                    "DLQ outputs use u32::MAX to distinguish from react() outputs");
+
+        // Load the trigger from the log to capture its correlation_id,
+        // then assert the DLQ outbox row carries the SAME id. Without
+        // this, a failing reactor's downstream "HandlerFailed" event
+        // would be untraceable back to the trigger — breaking the
+        // causal-chain debugging story rootsignal depends on. This
+        // pins the contract introduced at reactor_runner.rs:317.
+        let trigger = EventLogBackend::read_all(
+            store.as_ref(), LogCursor::ZERO, 10,
+        ).await.unwrap()
+            .into_iter()
+            .find(|e| e.event_id == trigger_id)
+            .expect("trigger in log");
+        assert_eq!(
+            row.correlation_id, trigger.correlation_id,
+            "DLQ-synthesized fact MUST inherit trigger correlation_id \
+             (otherwise debug chains break in production)"
+        );
 
         // Cursor is past the failing event — runner is done with it.
         let next = runner.step(10).await.unwrap();

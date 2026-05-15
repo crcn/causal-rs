@@ -35,7 +35,7 @@
 //!
 //! ## Read paths
 //!
-//! `load_from`, `load_stream`, `latest_position` delegate to the legacy
+//! `read_all`, `read_stream`, `latest_position` delegate to the legacy
 //! child. The legacy store is the source of truth during transition;
 //! the v0.3 mirror is a write-only secondary.
 
@@ -45,7 +45,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use causal::types::{
-    AppendResult, LogCursor, NewEvent, PersistedEvent, StreamVersion,
+    WriteResult, LogCursor, EventData, RecordedEvent, StreamRevision,
 };
 use causal::EventLogBackend;
 
@@ -56,7 +56,7 @@ pub struct MirroringEventLogBackend {
 
 impl MirroringEventLogBackend {
     /// Construct a wrapper that writes every emit to both `legacy` and
-    /// `v03`. `legacy` is the source of truth — its `AppendResult` is
+    /// `v03`. `legacy` is the source of truth — its `WriteResult` is
     /// what callers see. `v03` is the mirror.
     pub fn new(
         legacy: Arc<dyn EventLogBackend>,
@@ -67,21 +67,21 @@ impl MirroringEventLogBackend {
 
     /// Diagnostic: did the most recent write to `legacy` make it to
     /// `v03` too? This is a logical check — looks up the same
-    /// event_id in the v0.3 mirror via `load_stream` heuristics or a
-    /// full `load_from` scan. For continuous parity monitoring see
+    /// event_id in the v0.3 mirror via `read_stream` heuristics or a
+    /// full `read_all` scan. For continuous parity monitoring see
     /// 4f.4 in the migration plan.
     ///
     /// Returns `Ok(true)` if both stores contain the event, `Ok(false)`
     /// if only the legacy contains it, `Err(_)` on backend errors.
     pub async fn parity_check_event(&self, event_id: Uuid) -> Result<bool> {
-        // Both backends scanned via load_from from position 0. Cheap
+        // Both backends scanned via read_all from position 0. Cheap
         // for tests, expensive for production traffic — the production
         // version of this check should use a backend-specific query
         // (`SELECT EXISTS(... WHERE event_id = $1)`). The trait doesn't
         // expose that; runners that need it can downcast to the
         // concrete child type.
-        let legacy_events = self.legacy.load_from(LogCursor::ZERO, 100_000).await?;
-        let v03_events = self.v03.load_from(LogCursor::ZERO, 100_000).await?;
+        let legacy_events = self.legacy.read_all(LogCursor::ZERO, 100_000).await?;
+        let v03_events = self.v03.read_all(LogCursor::ZERO, 100_000).await?;
         let in_legacy = legacy_events.iter().any(|e| e.event_id == event_id);
         let in_v03 = v03_events.iter().any(|e| e.event_id == event_id);
         Ok(in_legacy && in_v03)
@@ -90,7 +90,7 @@ impl MirroringEventLogBackend {
 
 #[async_trait]
 impl EventLogBackend for MirroringEventLogBackend {
-    async fn append(&self, event: NewEvent) -> Result<AppendResult> {
+    async fn append(&self, event: EventData) -> Result<WriteResult> {
         // Sequential dual-write. See module docstring for why this
         // is not 2PC.
         let legacy_result = self.legacy.append(event.clone()).await?;
@@ -106,9 +106,9 @@ impl EventLogBackend for MirroringEventLogBackend {
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        expected: StreamVersion,
-        event: NewEvent,
-    ) -> Result<AppendResult> {
+        expected: causal::types::StreamState,
+        event: EventData,
+    ) -> Result<WriteResult> {
         // OCC semantics flow from the legacy store — it's the source
         // of truth and the only one that can reject on stale expected.
         // The mirror writes whatever the legacy write produced.
@@ -124,23 +124,23 @@ impl EventLogBackend for MirroringEventLogBackend {
         Ok(legacy_result)
     }
 
-    async fn load_from(
+    async fn read_all(
         &self,
         after: LogCursor,
         limit: usize,
-    ) -> Result<Vec<PersistedEvent>> {
+    ) -> Result<Vec<RecordedEvent>> {
         // Source of truth = legacy during transition.
-        self.legacy.load_from(after, limit).await
+        self.legacy.read_all(after, limit).await
     }
 
-    async fn load_stream(
+    async fn read_stream(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        after_version: Option<StreamVersion>,
-    ) -> Result<Vec<PersistedEvent>> {
+        after: Option<StreamRevision>,
+    ) -> Result<Vec<RecordedEvent>> {
         self.legacy
-            .load_stream(aggregate_type, aggregate_id, after_version)
+            .read_stream(aggregate_type, aggregate_id, after)
             .await
     }
 

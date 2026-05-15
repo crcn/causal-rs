@@ -11,42 +11,46 @@
 //! ## Example
 //!
 //! ```ignore
-//! use causal::{Engine, on};
+//! use causal::{Engine, Reactor, Events, Ctx, MemoryStore};
+//! use std::sync::Arc;
 //!
-//! // Define event types (struct-per-event pattern)
-//! #[derive(Clone)]
-//! struct UserCreated { name: String }
-//! #[derive(Clone)]
-//! struct UserWelcomed { name: String }
+//! struct WelcomeOnSignup;
 //!
-//! // Create engine with reactors
-//! let engine = Engine::in_memory(deps)
-//!     .with_reactor(on::<UserCreated>().then(|event, _ctx| async move {
-//!         println!("User created: {}", event.name);
-//!         Ok(UserWelcomed { name: event.name.clone() })
-//!     }));
+//! #[async_trait::async_trait]
+//! impl Reactor for WelcomeOnSignup {
+//!     type Trigger = UserCreated;
+//!     const GROUP_NAME: &'static str = "welcome_on_signup";
 //!
-//! // Emit + settle the full causal tree.
+//!     async fn react(&self, trigger: &UserCreated, _ctx: Ctx<'_>) -> anyhow::Result<Events> {
+//!         Ok(causal::events![UserWelcomed { name: trigger.name.clone() }])
+//!     }
+//! }
+//!
+//! let store = Arc::new(MemoryStore::new());
+//! let engine = Engine::builder(store.clone(), store.clone(), store)
+//!     .with_reactor(WelcomeOnSignup)
+//!     .build();
+//!
 //! engine.emit(UserCreated { name: "Alice".into() }).settled().await?;
 //! ```
 
 extern crate self as causal;
 
 // Module structure
-pub mod aggregate_v3;
+pub mod aggregate;
 pub mod aggregator;
 pub mod checkpoint_store;
 pub mod contexts;
-pub mod engine_v3;
+pub mod engine;
 pub mod event_log;
-pub mod fact;
+pub mod event;
 pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
 pub mod projector;
 pub mod reactor_observer;
 pub mod reactor_runner;
-pub mod reactor_v3;
+pub mod reactor;
 pub mod relay;
 pub mod snapshot_store;
 pub mod types;
@@ -54,7 +58,7 @@ pub mod types;
 pub mod memory_store;
 pub mod upcaster;
 
-// ── v0.4 public surface ──────────────────────────────────────────────
+// ── public surface ──────────────────────────────────────────────
 //
 // What's in the prelude vs. behind a module path follows one rule:
 // **the prelude is for what a user types in normal application code**.
@@ -64,7 +68,7 @@ pub mod upcaster;
 // cursors/versions, backend traits (cast at builder time), MemoryStore,
 // upcasters, macros.
 //
-// Backend-impl-facing (module paths only): NewEvent, AppendResult,
+// Backend-impl-facing (module paths only): EventData, WriteResult,
 // Snapshot — backends pull these from `causal::types::*` directly.
 // Same for runners (`causal::projection_runner::*`), outbox row shapes
 // (`causal::checkpoint_store::*`), and the relay (`causal::relay::*`).
@@ -72,20 +76,20 @@ pub mod upcaster;
 // Internal-detail (module paths only): EventOutput (Events
 // implementation detail), EmitInput (Into-target only),
 // AggregatorRegistry (engine-internal state), extract_prefix
-// (replaced by PersistedEvent::category() for the common case).
+// (replaced by RecordedEvent::category() for the common case).
 
 // Facts + aggregates
-pub use fact::Fact;
-pub use aggregate_v3::{Aggregate, Apply};
+pub use event::{event_type_for, stream_name_for, Event};
+pub use aggregate::{Aggregate, Apply};
 pub use aggregator::Aggregator;
 
 // Consumers
 pub use projector::Projector;
 pub use multi_projector::MultiProjector;
-pub use reactor_v3::{Events, Reactor};
+pub use reactor::{Events, Reactor};
 
 // Engine + emit
-pub use engine_v3::{
+pub use engine::{
     Engine, EngineBuilder,
     EmitBuilder, EmitResult, SettledEmit,
     DlqInfo,
@@ -95,8 +99,11 @@ pub use engine_v3::{
 // Context
 pub use contexts::{AggregateState, Ctx, Metadata};
 
-// Cursors / versions / values users see in signatures
-pub use types::{LogCursor, LogEntry, LogLevel, PersistedEvent, StreamVersion};
+// Cursors / revisions / values users see in signatures
+pub use types::{
+    WriteResult, EventData, LogCursor, LogEntry, LogLevel, RecordedEvent,
+    StreamRevision, StreamState,
+};
 
 // Observability hook
 pub use reactor_observer::{NoopObserver, ReactorObserver};
@@ -146,11 +153,6 @@ macro_rules! events {
     }};
 }
 
-// Legacy reactor builder fns (`on`, `on_any`, `project`) and the
-// macros that depend on them (`#[reactor]`, `#[reactors]`,
-// `#[projection]`, `#[aggregator]`) are gone with the legacy
-// reactor module. `#[event]` and `#[aggregators]` (plural) survive
-// — they emit v0.4-compatible code.
 #[cfg(feature = "macros")]
 pub use causal_core_macros::{aggregators, event};
 

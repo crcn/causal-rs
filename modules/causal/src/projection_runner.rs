@@ -1,9 +1,5 @@
-//! Runners that drive [`Projector`](crate::Projector) and
-//! [`View`](crate::View) consumers.
-//!
-//! Phase 4b lands the polling-based runner (uses
-//! `EventLogBackend::load_from`); Phase 4d swaps in subscribe-based
-//! delivery once that primitive lands on the trait.
+//! Runner that drives [`Projector`](crate::Projector) consumers via
+//! polling on `EventLogBackend::read_all`.
 //!
 //! Implements:
 //!   - C2 — per-fact cursor advance (cursor advances iff `apply` /
@@ -27,7 +23,7 @@ use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::CheckpointStore;
 use crate::contexts::Ctx;
 use crate::event_log::EventLogBackend;
-use crate::fact::Fact;
+use crate::event::Event;
 use crate::projector::Projector;
 use crate::reactor_observer::ReactorObserver;
 use crate::types::LogCursor;
@@ -63,7 +59,7 @@ pub struct ProjectionRunner<M: Projector> {
 
 impl<M: Projector> ProjectionRunner<M>
 where
-    M::Fact: DeserializeOwned,
+    M::Event: DeserializeOwned,
 {
     pub fn new(
         projector: M,
@@ -124,12 +120,12 @@ where
 
         self.ensure_hydrated(cursor).await?;
 
-        let events = self.log.load_from(cursor, batch).await?;
+        let events = self.log.read_all(cursor, batch).await?;
         if events.is_empty() {
             return Ok(StepOutcome::Idle);
         }
 
-        let prefix = <M::Fact as Fact>::CATEGORY;
+        let prefix = <M::Event as Event>::CATEGORY;
         let mut applied = 0usize;
         for event in events {
             // Fold into the per-runner aggregator registry BEFORE
@@ -152,7 +148,7 @@ where
                 r
             });
 
-            // Filter by Fact prefix. Non-matching events advance the
+            // Filter by Event prefix. Non-matching events advance the
             // cursor but don't trigger project — the consumer
             // legitimately doesn't handle them.
             if !event.event_type.starts_with(prefix) {
@@ -160,7 +156,7 @@ where
                 continue;
             }
 
-            let fact: M::Fact = serde_json::from_value(event.payload.clone())?;
+            let fact: M::Event = serde_json::from_value(event.payload.clone())?;
             let ctx = Ctx {
                 event_id:       event.event_id,
                 log_position:   event.position,
@@ -217,7 +213,7 @@ where
             let reg = self.aggregators.as_ref().unwrap();
             let mut from = LogCursor::ZERO;
             loop {
-                let batch = self.log.load_from(from, 1024).await?;
+                let batch = self.log.read_all(from, 1024).await?;
                 if batch.is_empty() { break; }
                 let last_pos = batch.last().unwrap().position;
                 let mut hit_cursor = false;
@@ -242,7 +238,7 @@ where
 mod tests {
     use super::*;
     use crate::memory_store::MemoryStore;
-    use crate::types::NewEvent;
+    use crate::types::EventData;
     use anyhow::anyhow;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -256,9 +252,9 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
 
-    impl Fact for Recorded {
+    impl Event for Recorded {
         const CATEGORY: &'static str = "test";
-        fn name(&self) -> &str { "recorded" }
+        fn event_type(&self) -> &str { "recorded" }
         fn stream_id(&self) -> Uuid { self.id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -270,7 +266,7 @@ mod tests {
 
     #[async_trait]
     impl Projector for CollectingProjector {
-        type Fact = Recorded;
+        type Event = Recorded;
         const GROUP_NAME: &'static str = "collecting";
 
         async fn project(
@@ -291,7 +287,7 @@ mod tests {
 
     #[async_trait]
     impl Projector for FailsOnNth {
-        type Fact = Recorded;
+        type Event = Recorded;
         const GROUP_NAME: &'static str = "fails-on-nth";
 
         async fn project(
@@ -308,12 +304,12 @@ mod tests {
         }
     }
 
-    fn new_event(payload: &Recorded) -> NewEvent {
-        NewEvent {
+    fn new_event(payload: &Recorded) -> EventData {
+        EventData {
             event_id:        Uuid::new_v4(),
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
-            event_type:      format!("{}:{}", <Recorded as Fact>::CATEGORY, payload.name()),
+            event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             aggregate_type:  None,
@@ -351,7 +347,7 @@ mod tests {
         }
         #[async_trait]
         impl Projector for CorrelationCapture {
-            type Fact = Recorded;
+            type Event = Recorded;
             const GROUP_NAME: &'static str = "correlation-capture";
             async fn project(
                 &self, _fact: &Recorded, ctx: Ctx<'_>,
@@ -369,11 +365,11 @@ mod tests {
         // request).
         let payload = Recorded { id: Uuid::new_v4(), occurred_at: Utc::now() };
         let event_id = Uuid::new_v4();
-        let ev = NewEvent {
+        let ev = EventData {
             event_id,
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  cmd_correlation,
-            event_type:      format!("{}:{}", <Recorded as Fact>::CATEGORY, payload.name()),
+            event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(&payload).unwrap(),
             created_at:      Utc::now(),
             aggregate_type:  None,
@@ -444,7 +440,7 @@ mod tests {
         let cursor = store.get("m_fail").await.unwrap().unwrap();
 
         // Re-fetch event positions to compare.
-        let events = EventLogBackend::load_from(store.as_ref(), LogCursor::ZERO, 10).await.unwrap();
+        let events = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10).await.unwrap();
         assert_eq!(cursor, events[1].position,
                    "cursor at fact[1] (after two successful projects), \
                     not at fact[2] (where project errored)");
@@ -473,7 +469,7 @@ mod tests {
         }
         #[async_trait]
         impl Projector for DepM {
-            type Fact = Recorded;
+            type Event = Recorded;
             const GROUP_NAME: &'static str = "downstream";
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
             async fn project(
@@ -492,7 +488,7 @@ mod tests {
         // Set this consumer's cursor to fact[1] manually so the fence
         // check has something to compare against. Upstream is at ZERO.
         let downstream_pos = {
-            let events = EventLogBackend::load_from(store.as_ref(), LogCursor::ZERO, 10).await.unwrap();
+            let events = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10).await.unwrap();
             events[1].position
         };
         store.set("downstream", downstream_pos).await.unwrap();
@@ -514,7 +510,7 @@ mod tests {
         struct DepM;
         #[async_trait]
         impl Projector for DepM {
-            type Fact = Recorded;
+            type Event = Recorded;
             const GROUP_NAME: &'static str = "downstream-2";
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
             async fn project(
@@ -528,7 +524,7 @@ mod tests {
         append_n(&store, 2).await;
 
         let last_pos = {
-            let events = EventLogBackend::load_from(store.as_ref(), LogCursor::ZERO, 10).await.unwrap();
+            let events = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10).await.unwrap();
             events.last().unwrap().position
         };
 
@@ -551,14 +547,14 @@ mod tests {
     #[tokio::test]
     async fn non_matching_event_type_is_skipped_and_cursor_advances() {
         // Append an event with a different type prefix than the
-        // projector's `Fact::type_prefix()`. Runner should advance
+        // projector's `Event::type_prefix()`. Runner should advance
         // past it without calling project.
         let store = Arc::new(MemoryStore::new());
 
         // Append a "foreign" event (different prefix).
-        let foreign = NewEvent {
+        let foreign = EventData {
             event_id:        Uuid::new_v4(),
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      "other.thing".into(),
             payload:         serde_json::json!({}),
@@ -588,19 +584,19 @@ mod tests {
 
     #[tokio::test]
     async fn fact_without_occurred_at_falls_back_to_event_created_at() {
-        // 0.3.4: Fact::occurred_at returns Option, default None. When
+        // 0.3.4: Event::occurred_at returns Option, default None. When
         // a fact opts out, the runner sets ctx.now() to
         // event.created_at (the persistence-side envelope timestamp).
-        // Verifies the fallback path: append a fact whose Fact impl
+        // Verifies the fallback path: append a fact whose Event impl
         // uses the default `None`, pin event.created_at to a known
         // value, assert ctx.now() resolves to that pinned timestamp.
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct NoTimeFact { id: Uuid }
 
-        impl Fact for NoTimeFact {
+        impl Event for NoTimeFact {
             const CATEGORY: &'static str = "test";
-            fn name(&self) -> &str { "notime" }
+            fn event_type(&self) -> &str { "notime" }
             fn stream_id(&self) -> Uuid { self.id }
             // occurred_at — uses trait default returning None
         }
@@ -609,7 +605,7 @@ mod tests {
         struct CaptureNow { snap: Arc<parking_lot::Mutex<Option<DateTime<Utc>>>> }
         #[async_trait]
         impl Projector for CaptureNow {
-            type Fact = NoTimeFact;
+            type Event = NoTimeFact;
             const GROUP_NAME: &'static str = "capture-now";
             async fn project(
                 &self, _f: &NoTimeFact, ctx: Ctx<'_>,
@@ -626,11 +622,11 @@ mod tests {
         let id = Uuid::new_v4();
         let fact = NoTimeFact { id };
 
-        EventLogBackend::append(store.as_ref(), crate::types::NewEvent {
+        EventLogBackend::append(store.as_ref(), crate::types::EventData {
             event_id:        Uuid::new_v4(),
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
-            event_type:      format!("{}:{}", <NoTimeFact as Fact>::CATEGORY, fact.name()),
+            event_type:      format!("{}:{}", <NoTimeFact as Event>::CATEGORY, fact.event_type()),
             payload:         serde_json::to_value(&fact).unwrap(),
             created_at:      pinned,
             aggregate_type:  None,
@@ -652,6 +648,6 @@ mod tests {
         runner.step(10).await.unwrap();
 
         assert_eq!(*snap.lock(), Some(pinned),
-                   "ctx.now() falls back to event.created_at when Fact::occurred_at is None");
+                   "ctx.now() falls back to event.created_at when Event::occurred_at is None");
     }
 }

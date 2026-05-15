@@ -7,10 +7,7 @@
 //!   advance in one transaction). Required only for engines hosting
 //!   reactors.
 //!
-//! Backends implement these directly. The legacy
-//! `impl<T: ProjectionStore> CheckpointStore for T` blanket is gone
-//! as of P11.e — backends must provide a direct `CheckpointStore`
-//! impl.
+//! Backends provide a direct `CheckpointStore` impl.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -56,7 +53,7 @@ pub struct InsertableOutboxRow {
 /// append-on-event-id contract (C1).
 ///
 /// `event_type` and `correlation_id` are carried so the relay can
-/// reconstruct a `NewEvent` for `EventLogBackend::append` without
+/// reconstruct a `EventData` for `EventLogBackend::append` without
 /// re-deserializing the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {

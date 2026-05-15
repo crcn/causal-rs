@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use causal::event_log::EventLogBackend;
-use causal::types::NewEvent;
+use causal::types::EventData;
 use causal::{LogCursor, MemoryStore};
 use causal_replay::{Mode, PointerStatus, PointerStore, ProjectionStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,10 +78,10 @@ impl PointerStore for MemoryPointerStore {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn make_event(i: usize) -> NewEvent {
-    NewEvent {
+fn make_event(i: usize) -> EventData {
+    EventData {
         event_id: Uuid::new_v4(),
-        parent_id: None,
+        causation_id: None,
         correlation_id: Uuid::new_v4(),
         event_type: format!("test:event_{i}"),
         payload: serde_json::json!({ "index": i }),
@@ -252,7 +252,7 @@ async fn replay_respects_batch_size() {
 
     let count = AtomicUsize::new(0);
 
-    // Small batch size forces multiple load_from calls.
+    // Small batch size forces multiple read_all calls.
     ProjectionStream::new(&log, &pointer)
         .mode(Mode::Replay)
         .batch_size(7)

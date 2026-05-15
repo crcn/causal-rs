@@ -10,23 +10,22 @@ use anyhow::Result;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::reactor_v3::extract_prefix;
-use crate::types::{LogCursor, StreamVersion};
+use crate::reactor::extract_prefix;
+use crate::types::{LogCursor, StreamRevision};
 use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate state snapshots ────────────────────────────────────
 //
-// The `Aggregate` marker + `Apply<F: Fact>` extension traits live in
-// `crate::aggregate_v3` (the v0.4 home). This module focuses on the
-// registry-side machinery — type-erased dispatch, state storage,
-// rollback, snapshots.
+// The `Aggregate` marker + `Apply<F: Event>` extension traits live in
+// `crate::aggregate`. This module focuses on the registry-side
+// machinery — type-erased dispatch, state storage, rollback, snapshots.
 
 /// Per-event `(prev, next)` aggregate snapshots produced by a single fold.
 ///
 /// Captured as stack-local pairs around `apply_event`, so transition guards
 /// can read the actual prev/next for *this* event — not the racing `:prev`
 /// DashMap slot, which is overwritten by every subsequent fold in the same
-/// Phase 1 batch. See `tests/fan_in_races.rs::transition_*`.
+/// batch. See `tests/fan_in_races.rs::transition_*`.
 #[derive(Default)]
 pub struct TransitionSnapshots {
     inner: std::collections::HashMap<
@@ -45,7 +44,7 @@ impl TransitionSnapshots {
     ///
     /// Returns `None` if this event did not affect `A` for that id, which
     /// transition guards should treat as "no transition — don't fire."
-    pub fn get_pair<A: crate::aggregate_v3::Aggregate>(&self, id: Uuid) -> Option<(&A, &A)> {
+    pub fn get_pair<A: crate::aggregate::Aggregate>(&self, id: Uuid) -> Option<(&A, &A)> {
         let key = format!("{}:{}", A::NAME, id);
         let (pre, post) = self.inner.get(&key)?;
         let pre_a = (**pre).downcast_ref::<A>()?;
@@ -131,53 +130,49 @@ impl Aggregator {
     /// `ctx.aggregate::<A>(stream_id)` inside their reactor / projector
     /// body.
     ///
-    /// Stream id comes from `Fact::stream_id`; aggregate type string
+    /// Stream id comes from `Event::stream_id`; aggregate type string
     /// comes from `A::NAME` — explicit, stable across refactorings,
     /// portable to disk (backend `aggregate_type` columns).
     ///
     /// Registration via [`crate::EngineBuilder::with_aggregators`].
     pub fn for_type<A, F>() -> Self
     where
-        A: crate::aggregate_v3::Aggregate
-            + crate::aggregate_v3::Apply<F>
+        A: crate::aggregate::Aggregate
+            + crate::aggregate::Apply<F>
             + Clone
             + serde::Serialize
             + serde::de::DeserializeOwned,
-        F: crate::fact::Fact,
+        F: crate::event::Event,
     {
-        Self::for_type_with_id_fn::<A, F, _>(|f: &F| Some(<F as crate::fact::Fact>::stream_id(f)))
+        Self::for_type_with_id_fn::<A, F, _>(|f: &F| Some(<F as crate::event::Event>::stream_id(f)))
     }
 
     /// Construct an Aggregator that extracts the aggregate id with a
-    /// custom function instead of `Fact::stream_id`. Returning `None`
+    /// custom function instead of `Event::stream_id`. Returning `None`
     /// from `id_fn` skips the fold for this aggregator on that event.
     ///
     /// **Use case.** A fact may naturally stream by signal_id (per-
     /// signal facts) but contribute to a per-run aggregate. The fact's
-    /// `Fact::stream_id` is signal_id (for the per-signal stream that
+    /// `Event::stream_id` is signal_id (for the per-signal stream that
     /// owns it); the *aggregator* over that fact wants run_id. With
     /// `for_type_with_id_fn`, the same fact type can register two
     /// aggregators with different keys — one keyed by `signal_id`
     /// (default via `for_type`), another keyed by `run_id` (custom
     /// via `for_type_with_id_fn`).
     ///
-    /// This replaces the v0.3 `#[aggregator(id_fn = "...")]` /
-    /// `#[aggregator(id = "...")]` / `#[aggregator(singleton)]`
-    /// macro attributes, which were silently no-ops in 0.4.0–0.4.4
-    /// (the factory hard-coded `Fact::stream_id`).
     pub fn for_type_with_id_fn<A, F, IdFn>(id_fn: IdFn) -> Self
     where
-        A: crate::aggregate_v3::Aggregate
-            + crate::aggregate_v3::Apply<F>
+        A: crate::aggregate::Aggregate
+            + crate::aggregate::Apply<F>
             + Clone
             + serde::Serialize
             + serde::de::DeserializeOwned,
-        F: crate::fact::Fact,
+        F: crate::event::Event,
         IdFn: Fn(&F) -> Option<Uuid> + Send + Sync + 'static,
     {
-        let event_prefix = <F as crate::fact::Fact>::CATEGORY.to_string();
+        let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
         let event_type_id = TypeId::of::<F>();
-        let aggregate_type = <A as crate::aggregate_v3::Aggregate>::NAME.to_string();
+        let aggregate_type = <A as crate::aggregate::Aggregate>::NAME.to_string();
         let id_fn = Arc::new(id_fn);
         let id_fn_for_extract = id_fn.clone();
 
@@ -194,7 +189,7 @@ impl Aggregator {
                     .downcast_mut::<A>()
                     .ok_or_else(|| anyhow::anyhow!("aggregate type mismatch in apply_to"))?;
                 let fact: F = serde_json::from_value(data)?;
-                <A as crate::aggregate_v3::Apply<F>>::apply(state, &fact);
+                <A as crate::aggregate::Apply<F>>::apply(state, &fact);
                 Ok(())
             }),
             clone_state: Arc::new(|state: &dyn Any| -> Box<dyn Any + Send + Sync> {
@@ -261,9 +256,9 @@ impl Aggregator {
 struct StateEntry {
     state: Arc<dyn Any + Send + Sync>,
     /// Stream version from the Store (ZERO = never persisted / unknown).
-    version: StreamVersion,
+    version: StreamRevision,
     /// Version at which last snapshot was taken (ZERO = never).
-    snapshot_at_version: StreamVersion,
+    snapshot_at_version: StreamRevision,
 }
 
 /// Captured aggregator state for rollback after a failed event-processing attempt.
@@ -288,13 +283,6 @@ struct RollbackEntry {
 /// Holds `Aggregator` definitions plus the current folded state for
 /// each `(aggregate_type, aggregate_id)` key. State lives in memory
 /// for the registry's lifetime — there is no built-in persistence.
-///
-/// The v0.2.x engine includes snapshot integration on top of this
-/// registry (`replay_events_onto`, `set_state`, `get_version`,
-/// `update_snapshot_at_version`) for long-lived aggregates that span
-/// engine instances. The v0.3 runners deliberately do NOT use that
-/// integration — see `docs/aggregate-state-scope.md` for the design
-/// rationale and the conditions under which it should be added back.
 pub struct AggregatorRegistry {
     aggregators: Vec<Aggregator>,
     state: DashMap<String, StateEntry>,
@@ -334,40 +322,40 @@ impl AggregatorRegistry {
     /// 1. Read current state (or create default)
     /// 2. Clone current state → prev snapshot
     /// 3. Apply event to cloned current state
-    /// 4. Increment version atomically with state update
+    /// 4. Insert post-state + bumped version under the same per-key
+    ///    DashMap entry guard that held step 1
     ///
-    /// State is stored as concrete types via `Arc<dyn Any>` — zero serialization overhead.
+    /// State is stored as concrete types via `Arc<dyn Any>` — zero
+    /// serialization overhead.
     ///
-    /// # Concurrency caveat (known-issue, tracked in causal-rs#TBD)
+    /// # Per-key atomicity
     ///
-    /// The read-modify-write below is **not atomic per key**. The
-    /// sequence `state.get(&key) → clone → apply → state.insert(&key)`
-    /// races against a concurrent caller doing the same sequence for
-    /// the same key. DashMap makes each individual op atomic but the
-    /// composite is not — two concurrent applies can both read the
-    /// same `pre_state`, both produce a `post_state`, and the second
-    /// insert overwrites the first. The earlier event's mutations
-    /// are lost.
+    /// The RMW above is atomic per key. The DashMap `entry()` guard
+    /// holds the per-shard lock for the duration of `apply_event`'s
+    /// inner block, so concurrent callers targeting the same key
+    /// serialize: caller A reads pre=v0, writes post=v1; caller B
+    /// then reads pre=v1, writes post=v2.
     ///
-    /// In v0.4 this is reachable from two paths concurrently:
+    /// This matters because two paths fold into this registry
+    /// concurrently:
     ///   1. `Engine::execute_emit` folds caller-emitted facts.
     ///   2. `RelayLoop::drain_once` folds reactor-emitted facts after
     ///      `log.append` (added in 0.4.3 for `engine.snapshot()`
     ///      visibility).
     ///
-    /// Both run on different tokio tasks. Streams that only see one
-    /// path are safe; streams that receive both caller- and reactor-
-    /// emitted facts can lose updates under load.
+    /// Before the entry-guarded variant landed (see the `Unreleased`
+    /// CHANGELOG entry that follows 0.4.6) these could lose updates
+    /// on the same stream key under load — a regression test
+    /// (`aggregator_apply_event_serializes_concurrent_callers`) pins
+    /// the contract.
     ///
-    /// **Mitigation paths considered, not yet implemented:**
-    ///   - Per-key `Mutex`/`RwLock` around the RMW block.
-    ///   - DashMap `entry().and_modify().or_insert()` (atomic per key,
-    ///     but the apply closure must be sync — fine here since
-    ///     `apply_to` is sync).
-    ///   - CAS retry loop on `version`.
-    ///
-    /// All single-emit scenarios and tests that `await settled()`
-    /// before snapshotting are unaffected (no overlap).
+    /// **Caveat: the `:prev` slot remains racy under fan-in.** It's
+    /// written outside the entry guard (writing it inside risks
+    /// deadlocking when `key` and `:prev` hash to the same DashMap
+    /// shard). New readers should consume the `(prev, post)` pair
+    /// from the returned [`TransitionSnapshots`] instead — those are
+    /// captured under the guard and reflect this event's exact
+    /// transition.
     pub fn apply_event(
         &self,
         event_type: &str,
@@ -390,53 +378,63 @@ impl AggregatorRegistry {
             let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
             let prev_key = format!("{}:prev", key);
 
-            // Read pre-fold state. If no entry exists, materialise the default
-            // *now* so we have an Arc to capture as `prev`.
-            let (pre_state, current_version, snapshot_at) = match self.state.get(&key) {
-                Some(entry) => (
-                    entry.state.clone(),
-                    entry.version,
-                    entry.snapshot_at_version,
-                ),
-                None => {
-                    let default: Arc<dyn Any + Send + Sync> = Arc::from(agg.default_state());
-                    self.state.insert(
-                        key.clone(),
-                        StateEntry {
-                            state: default.clone(),
-                            version: StreamVersion::ZERO,
-                            snapshot_at_version: StreamVersion::ZERO,
-                        },
-                    );
-                    (default, StreamVersion::ZERO, StreamVersion::ZERO)
+            // Atomic RMW under the DashMap entry guard. Holding the
+            // entry serializes concurrent applies on the same key,
+            // closing the lost-update race between
+            // `Engine::execute_emit` and `RelayLoop::drain_once`
+            // (caller-emit vs reactor-emit).
+            let (pre_state, post_state) = {
+                use dashmap::mapref::entry::Entry;
+                let entry = self.state.entry(key.clone());
+
+                let (pre_state, current_version, snapshot_at) = match &entry {
+                    Entry::Occupied(occ) => {
+                        let e = occ.get();
+                        (e.state.clone(), e.version, e.snapshot_at_version)
+                    }
+                    Entry::Vacant(_) => {
+                        let default: Arc<dyn Any + Send + Sync> =
+                            Arc::from(agg.default_state());
+                        (default, StreamRevision::ZERO, StreamRevision::ZERO)
+                    }
+                };
+
+                let mut next_state = agg.clone_state(pre_state.as_ref());
+                if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
+                    tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
                 }
+                let post_state: Arc<dyn Any + Send + Sync> = Arc::from(next_state);
+
+                let new_entry = StateEntry {
+                    state: post_state.clone(),
+                    version: StreamRevision::from_raw(current_version.raw() + 1),
+                    snapshot_at_version: snapshot_at,
+                };
+                match entry {
+                    Entry::Occupied(mut occ) => {
+                        occ.insert(new_entry);
+                    }
+                    Entry::Vacant(vac) => {
+                        vac.insert(new_entry);
+                    }
+                }
+
+                (pre_state, post_state)
             };
 
-            // Clone pre-fold for mutation, apply, freeze as Arc.
-            let mut next_state = agg.clone_state(pre_state.as_ref());
-            if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
-                tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
-            }
-            let post_state: Arc<dyn Any + Send + Sync> = Arc::from(next_state);
-
-            // Update the registry:
-            //   :prev slot — kept for backward compat with `get_transition_*`
-            //   readers, but it is racy under fan-in. New code reads from the
-            //   `TransitionSnapshots` returned by this function instead.
+            // `:prev` slot lives on a separate DashMap entry that may
+            // hash to a different (or the SAME) shard. Writing it
+            // under the entry guard above risks a same-shard
+            // deadlock; writing it after release keeps the slot
+            // best-effort. The slot is documented racy under fan-in;
+            // new code reads the captured transition from
+            // `TransitionSnapshots` (returned below).
             self.state.insert(
                 prev_key,
                 StateEntry {
                     state: pre_state.clone(),
-                    version: StreamVersion::ZERO,
-                    snapshot_at_version: StreamVersion::ZERO,
-                },
-            );
-            self.state.insert(
-                key.clone(),
-                StateEntry {
-                    state: post_state.clone(),
-                    version: StreamVersion::from_raw(current_version.raw() + 1),
-                    snapshot_at_version: snapshot_at,
+                    version: StreamRevision::ZERO,
+                    snapshot_at_version: StreamRevision::ZERO,
                 },
             );
 
@@ -449,7 +447,7 @@ impl AggregatorRegistry {
 
     /// Replay a sequence of persisted events to reconstruct aggregate state.
     ///
-    /// Takes `(event_type, payload)` pairs (decoupled from `PersistedEvent`).
+    /// Takes `(event_type, payload)` pairs (decoupled from `RecordedEvent`).
     /// Uses short name matching so persisted events (e.g. `"OrderPlaced"`)
     /// match aggregators registered with full type paths.
     ///
@@ -503,7 +501,7 @@ impl AggregatorRegistry {
     /// Returns `(A::default(), A::default())` if no state exists.
     pub fn get_transition<A>(&self, id: Uuid) -> (A, A)
     where
-        A: crate::aggregate_v3::Aggregate + Clone,
+        A: crate::aggregate::Aggregate + Clone,
     {
         let key = format!("{}:{}", A::NAME, id);
         let prev_key = format!("{}:prev", key);
@@ -526,7 +524,7 @@ impl AggregatorRegistry {
     /// Get the (prev, next) transition as `Arc<A>` — zero-clone read access.
     pub fn get_transition_arc<A>(&self, id: Uuid) -> (Arc<A>, Arc<A>)
     where
-        A: crate::aggregate_v3::Aggregate,
+        A: crate::aggregate::Aggregate,
     {
         let key = format!("{}:{}", A::NAME, id);
         let prev_key = format!("{}:prev", key);
@@ -549,7 +547,7 @@ impl AggregatorRegistry {
     /// Get the (prev, next) transition for a singleton aggregate (uses `Uuid::nil()`).
     pub fn get_singleton<A>(&self) -> (A, A)
     where
-        A: crate::aggregate_v3::Aggregate + Clone,
+        A: crate::aggregate::Aggregate + Clone,
     {
         self.get_transition::<A>(Uuid::nil())
     }
@@ -557,7 +555,7 @@ impl AggregatorRegistry {
     /// Get the (prev, next) transition for a singleton aggregate as `Arc<A>`.
     pub fn get_singleton_arc<A>(&self) -> (Arc<A>, Arc<A>)
     where
-        A: crate::aggregate_v3::Aggregate,
+        A: crate::aggregate::Aggregate,
     {
         self.get_transition_arc::<A>(Uuid::nil())
     }
@@ -572,32 +570,32 @@ impl AggregatorRegistry {
     /// Inject hydrated state + version into the DashMap.
     ///
     /// Used during cold-start hydration from the Store.
-    pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: StreamVersion, snapshot_at_version: StreamVersion) {
+    pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: StreamRevision, snapshot_at_version: StreamRevision) {
         self.state.insert(key.to_string(), StateEntry { state, version, snapshot_at_version });
     }
 
     /// Read the stream version from the DashMap entry.
     ///
     /// Returns 0 if no state exists (consistent with "version 0 = empty stream").
-    pub fn get_version(&self, key: &str) -> StreamVersion {
+    pub fn get_version(&self, key: &str) -> StreamRevision {
         self.state
             .get(key)
             .map(|entry| entry.version)
-            .unwrap_or(StreamVersion::ZERO)
+            .unwrap_or(StreamRevision::ZERO)
     }
 
     /// Read the snapshot_at_version from the DashMap entry.
     ///
     /// Returns 0 if no state exists (consistent with "never snapshotted").
-    pub fn get_snapshot_at_version(&self, key: &str) -> StreamVersion {
+    pub fn get_snapshot_at_version(&self, key: &str) -> StreamRevision {
         self.state
             .get(key)
             .map(|entry| entry.snapshot_at_version)
-            .unwrap_or(StreamVersion::ZERO)
+            .unwrap_or(StreamRevision::ZERO)
     }
 
     /// Update snapshot_at_version after saving a snapshot.
-    pub fn update_snapshot_at_version(&self, key: &str, version: StreamVersion) {
+    pub fn update_snapshot_at_version(&self, key: &str, version: StreamRevision) {
         if let Some(mut entry) = self.state.get_mut(key) {
             entry.snapshot_at_version = version;
         }

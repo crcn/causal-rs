@@ -10,6 +10,7 @@ readme = "README.md"
 [features]
 default = []
 postgres = ["dep:sqlx", "dep:dashmap"]
+kurrent  = ["dep:kurrentdb", "dep:bytes"]
 
 [dependencies]
 causal = { version = "0.4.6", path = "../causal" }
@@ -21,9 +22,12 @@ uuid.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 dashmap = { workspace = true, optional = true }
+kurrentdb = { version = "1.2", optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
@@ -53,10 +57,29 @@ path = "tests/pg_snapshot_store_test.rs"
 required-features = ["postgres"]
 
 [[test]]
-name = "v03_smoke_test"
-path = "tests/v03_smoke_test.rs"
+name = "mirroring_test"
+path = "tests/mirroring_test.rs"
+
+[[test]]
+name = "memory_store_conformance_test"
+path = "tests/memory_store_conformance_test.rs"
+
+[[test]]
+name = "pg_event_log_conformance_test"
+path = "tests/pg_event_log_conformance_test.rs"
 required-features = ["postgres"]
 
 [[test]]
-name = "mirroring_test"
-path = "tests/mirroring_test.rs"
+name = "kurrent_event_log_conformance_test"
+path = "tests/kurrent_event_log_conformance_test.rs"
+required-features = ["kurrent"]
+
+[[test]]
+name = "kurrent_pg_hybrid_test"
+path = "tests/kurrent_pg_hybrid_test.rs"
+required-features = ["postgres", "kurrent"]
+
+[[test]]
+name = "kurrent_event_log_test"
+path = "tests/kurrent_event_log_test.rs"
+required-features = ["kurrent"]

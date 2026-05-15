@@ -1,14 +1,10 @@
-//! v0.3 Engine + EngineBuilder.
+//! `Engine` + `EngineBuilder` — the public runtime surface.
 //!
-//! Wires the per-consumer runners (Phase 4b/4c) into a public `Engine`
-//! surface that spawns supervisor tasks per consumer plus a relay
-//! drain task. Phase 4d MVP: `emit` + `shutdown` only. Aggregate-side
-//! `load` / `append` (with OCC), StreamPolicy enforcement on `emit`,
-//! and the `ViewHandle` query surface land in Phase 5+ as documented
-//! in `docs/plans/2026-05-05-causal-v03-impl-plan.md`.
-//!
-//! Lives at `crate::engine_v3::Engine` until Phase 9 renames the file
-//! and removes the legacy `crate::engine::Engine<D>`. The two coexist.
+//! Wires per-consumer runners into one supervisor: each registered
+//! reactor / projector / multi-projector spawns its own task, plus
+//! a relay drain task that flushes the reactor outbox into the log.
+//! The builder casts backend trait objects (`EventLogBackend`,
+//! `CheckpointStore`, `ReactorOutbox`) and assembles them.
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -26,19 +22,19 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::aggregate_v3::{Aggregate, Apply};
+use crate::aggregate::{Aggregate, Apply};
 use crate::aggregator::{Aggregator, AggregatorRegistry};
 use crate::checkpoint_store::{CheckpointStore, ReactorOutbox};
 use crate::multi_projector::{MultiProjector, MultiProjectorRunner};
 use crate::contexts::Metadata;
 use crate::event_log::EventLogBackend;
-use crate::fact::Fact;
+use crate::event::Event;
 use crate::projector::Projector;
 use crate::projection_runner::{ProjectionRunner, StepOutcome};
 use crate::reactor_runner::ReactorRunner;
-use crate::reactor_v3::Reactor;
+use crate::reactor::Reactor;
 use crate::relay::RelayLoop;
-use crate::types::{LogCursor, NewEvent, StreamVersion};
+use crate::types::{LogCursor, EventData, StreamRevision};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BACKOFF_ON_ERROR: Duration = Duration::from_millis(250);
@@ -60,7 +56,7 @@ trait Supervisable: Send + Sync {
 #[async_trait]
 impl<P: Projector + 'static> Supervisable for ProjectionRunner<P>
 where
-    P::Fact: DeserializeOwned,
+    P::Event: DeserializeOwned,
 {
     async fn step(&self, batch: usize) -> Result<StepOutcome> {
         ProjectionRunner::step(self, batch).await
@@ -104,7 +100,7 @@ pub trait ProjectorRegistration: Send + 'static {
 impl<P> ProjectorRegistration for P
 where
     P: Projector + 'static,
-    P::Fact: DeserializeOwned,
+    P::Event: DeserializeOwned,
 {
     fn register(self: Box<Self>, builder: EngineBuilder) -> EngineBuilder {
         builder.with_projector(*self)
@@ -159,7 +155,7 @@ pub struct EmitResult {
 
 /// Metadata about a reactor that has exhausted its retry budget,
 /// passed to the [`EngineBuilder::on_dlq`] mapper. The mapper
-/// decides whether to synthesize a terminal-failure Fact and emit
+/// decides whether to synthesize a terminal-failure Event and emit
 /// it through the outbox so downstream consumers can react.
 ///
 /// Production use case: scout's `PipelineEvent::HandlerFailed` is
@@ -180,11 +176,11 @@ pub struct DlqInfo {
     pub attempts:          u32,
 }
 
-/// Type-erased view of a [`Fact`] for the emit builder.
+/// Type-erased view of a [`Event`] for the emit builder.
 ///
 /// `EmitInput` stores facts behind this trait so [`EmitBuilder`] is
-/// non-generic — one builder type handles any Fact, single or
-/// batched. The blanket impl below covers every `Fact` automatically;
+/// non-generic — one builder type handles any Event, single or
+/// batched. The blanket impl below covers every `Event` automatically;
 /// downstream code never names this trait.
 pub(crate) trait ErasedFact: Send + Sync {
     fn category(&self) -> &'static str;
@@ -194,30 +190,30 @@ pub(crate) trait ErasedFact: Send + Sync {
     fn to_value(&self) -> Result<serde_json::Value>;
 }
 
-impl<F: Fact> ErasedFact for F {
-    fn category(&self) -> &'static str { <F as Fact>::CATEGORY }
-    fn variant_name(&self) -> &str { Fact::name(self) }
-    fn stream_id(&self) -> Uuid { Fact::stream_id(self) }
-    fn occurred_at(&self) -> Option<DateTime<Utc>> { Fact::occurred_at(self) }
+impl<F: Event> ErasedFact for F {
+    fn category(&self) -> &'static str { <F as Event>::CATEGORY }
+    fn variant_name(&self) -> &str { Event::event_type(self) }
+    fn stream_id(&self) -> Uuid { Event::stream_id(self) }
+    fn occurred_at(&self) -> Option<DateTime<Utc>> { Event::occurred_at(self) }
     fn to_value(&self) -> Result<serde_json::Value> {
         serde_json::to_value(self).map_err(Into::into)
     }
 }
 
-/// What `Engine::emit` accepts: a single Fact, or a batch of Facts
+/// What `Engine::emit` accepts: a single Event, or a batch of Facts
 /// of the same type. Both produced automatically via `Into` impls —
 /// callers write `engine.emit(fact)` or `engine.emit(vec![f1, f2])`.
 pub struct EmitInput {
     facts: Vec<Box<dyn ErasedFact>>,
 }
 
-impl<F: Fact> From<F> for EmitInput {
+impl<F: Event> From<F> for EmitInput {
     fn from(f: F) -> Self {
         Self { facts: vec![Box::new(f) as Box<dyn ErasedFact>] }
     }
 }
 
-impl<F: Fact> From<Vec<F>> for EmitInput {
+impl<F: Event> From<Vec<F>> for EmitInput {
     fn from(v: Vec<F>) -> Self {
         Self {
             facts: v.into_iter()
@@ -232,12 +228,12 @@ impl<F: Fact> From<Vec<F>> for EmitInput {
 ///
 /// `EmitBuilder` is non-generic — Facts are type-erased at construction
 /// time via the `Into<EmitInput>` impls, so one builder type handles
-/// any Fact, single or batched.
+/// any Event, single or batched.
 pub struct EmitBuilder<'a> {
     engine:         &'a Engine,
     input:          EmitInput,
     correlation_id: Option<Uuid>,
-    parent_id:      Option<Uuid>,
+    causation_id:      Option<Uuid>,
     metadata:       Metadata,
 }
 
@@ -251,11 +247,11 @@ impl<'a> EmitBuilder<'a> {
         self
     }
 
-    /// Stamp `parent_id` on every fact in the batch. Defaults to
+    /// Stamp `causation_id` on every fact in the batch. Defaults to
     /// `None` (root event). Command handlers should pass the trigger's
     /// `event_id` here.
-    pub fn parent_id(mut self, id: Uuid) -> Self {
-        self.parent_id = Some(id);
+    pub fn causation_id(mut self, id: Uuid) -> Self {
+        self.causation_id = Some(id);
         self
     }
 
@@ -437,7 +433,7 @@ impl EngineBuilder {
     pub fn on_dlq<F, Out>(mut self, mapper: F) -> Self
     where
         F: Fn(DlqInfo) -> Option<Out> + Send + Sync + 'static,
-        Out: Fact,
+        Out: Event,
     {
         self.dlq_mapper = Some(Arc::new(move |info| {
             mapper(info).map(|f| Box::new(f) as Box<dyn ErasedFact>)
@@ -508,7 +504,7 @@ impl EngineBuilder {
             // state. Same protective pattern as `claim_group_name`.
             //
             // Multiple aggregators with the same NAME folding
-            // DIFFERENT Fact types into one Aggregate (the multi-Fact
+            // DIFFERENT Event types into one Aggregate (the multi-Event
             // Apply<F1> + Apply<F2> case) is legitimate — those
             // SHOULD share a NAME by construction (same A). To
             // distinguish that case from a true collision: assert
@@ -519,10 +515,10 @@ impl EngineBuilder {
             }) {
                 panic!(
                     "duplicate Aggregate::NAME `{}` registered against the \
-                     same Fact CATEGORY `{}` — two aggregators MUST NOT \
-                     share a registry key. Multi-Fact aggregates folding \
-                     different Fact streams are fine (Apply<F1> + Apply<F2> \
-                     with the same A::NAME); same Fact registered twice \
+                     same Event CATEGORY `{}` — two aggregators MUST NOT \
+                     share a registry key. Multi-Event aggregates folding \
+                     different Event streams are fine (Apply<F1> + Apply<F2> \
+                     with the same A::NAME); same Event registered twice \
                      is not.",
                     agg.aggregate_type, existing.event_prefix,
                 );
@@ -534,7 +530,7 @@ impl EngineBuilder {
 
     pub fn with_projector<P: Projector + 'static>(mut self, p: P) -> Self
     where
-        P::Fact: DeserializeOwned,
+        P::Event: DeserializeOwned,
     {
         self.claim_group_name(P::GROUP_NAME);
         let log = self.log.clone();
@@ -575,15 +571,15 @@ impl EngineBuilder {
     /// consumer with declared subscription. The runner filters events
     /// to those whose `event_type` matches any category in
     /// `P::CATEGORIES` (matching `{CATEGORY}:*`) before invoking the
-    /// body. Body receives raw `&PersistedEvent` for cross-domain
+    /// body. Body receives raw `&RecordedEvent` for cross-domain
     /// payload routing.
     ///
     /// Use when:
-    /// - Body needs raw `&PersistedEvent` (heterogeneous payload routing
+    /// - Body needs raw `&RecordedEvent` (heterogeneous payload routing
     ///   that no single typed enum captures), AND
     /// - Subscription is a known-bounded set of categories.
     ///
-    /// For single-Fact consumers, use [`Self::with_projector`] — it
+    /// For single-Event consumers, use [`Self::with_projector`] — it
     /// deserializes for you.
     pub fn with_multi_projector<P: MultiProjector + 'static>(mut self, p: P) -> Self {
         self.claim_group_name(P::GROUP_NAME);
@@ -732,7 +728,7 @@ impl Engine {
     /// Emit one or more Facts to the log.
     ///
     /// Returns an [`EmitBuilder`] — chain `.metadata()`,
-    /// `.correlation_id()`, `.parent_id()` and finally `.await` to run
+    /// `.correlation_id()`, `.causation_id()` and finally `.await` to run
     /// the write. `.await` returns once facts are durably in the log;
     /// the reactor chain runs asynchronously after that. Use
     /// `.settled().await` to also wait for the chain to drain.
@@ -743,7 +739,7 @@ impl Engine {
     /// // command-handler envelope — propagate trigger correlation
     /// engine.emit(out)
     ///     .correlation_id(trigger_corr)
-    ///     .parent_id(trigger_event_id)
+    ///     .causation_id(trigger_event_id)
     ///     .await?;
     /// // batch
     /// engine.emit(vec![f1, f2]).await?;
@@ -755,7 +751,7 @@ impl Engine {
             engine: self,
             input: input.into(),
             correlation_id: None,
-            parent_id: None,
+            causation_id: None,
             metadata: Metadata::new(),
         }
     }
@@ -768,26 +764,26 @@ impl Engine {
     /// Stream identity comes from `F::CATEGORY` + `id`; the same
     /// convention `Engine::emit` uses on write. Caller picks both
     /// type params so the same `Aggregate` impl can fold different
-    /// Fact streams (e.g. `load::<PipelineState, ScrapeEvent>`).
+    /// Event streams (e.g. `load::<PipelineState, ScrapeEvent>`).
     pub async fn load<A, F>(
         &self,
         id: Uuid,
-    ) -> Result<(A, StreamVersion)>
+    ) -> Result<(A, StreamRevision)>
     where
         A: Aggregate + Apply<F>,
-        F: Fact + DeserializeOwned,
+        F: Event + DeserializeOwned,
     {
-        let events = self.log.load_stream(F::CATEGORY, id, None).await?;
+        let events = self.log.read_stream(F::CATEGORY, id, None).await?;
         let mut agg = A::default();
-        let mut version = StreamVersion::ZERO;
+        let mut revision = StreamRevision::ZERO;
         for event in events {
             let fact: F = serde_json::from_value(event.payload)?;
             agg.apply(&fact);
-            if let Some(v) = event.version {
-                version = v;
+            if let Some(r) = event.revision {
+                revision = r;
             }
         }
-        Ok((agg, version))
+        Ok((agg, revision))
     }
 
     async fn execute_emit(&self, b: EmitBuilder<'_>) -> Result<EmitResult> {
@@ -819,9 +815,9 @@ impl Engine {
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let stream_id = fact.stream_id();
             let payload = fact.to_value()?;
-            let new_event = NewEvent {
+            let new_event = EventData {
                 event_id:        Uuid::new_v4(),
-                parent_id:       b.parent_id,
+                causation_id:       b.causation_id,
                 correlation_id:  correlation,
                 event_type,
                 payload,
@@ -886,10 +882,10 @@ impl Engine {
     /// dumps. Treat it as a peek into in-memory state, nothing more.
     pub fn snapshot<A>(&self, stream_id: Uuid) -> Option<A>
     where
-        A: crate::aggregate_v3::Aggregate + Clone,
+        A: crate::aggregate::Aggregate + Clone,
     {
         let reg = self.aggregators.as_ref()?;
-        let key = format!("{}:{}", <A as crate::aggregate_v3::Aggregate>::NAME, stream_id);
+        let key = format!("{}:{}", <A as crate::aggregate::Aggregate>::NAME, stream_id);
         if !reg.has_state(&key) {
             return None;
         }
@@ -916,14 +912,12 @@ impl Engine {
     /// each input event produces a bounded number of outputs; the
     /// outbox eventually empties; consumers eventually catch up;
     /// no new events can appear. Self-feedback reactors (a reactor
-    /// whose output triggers itself) are NOT well-formed under
-    /// v0.4 (see [`Reactor`] doc) and will loop forever here too.
+    /// whose output triggers itself) are NOT well-formed (see
+    /// [`Reactor`] doc) and will loop forever here too.
     ///
-    /// **Semantic vs. legacy v0.3 `.settled()`**: same end-state
-    /// (the full causal chain has run), different mechanism. v0.3
-    /// ran reactors inline in the emitting task; v0.4 runs them
-    /// asynchronously in supervisor tasks and `settle` polls their
-    /// cursors. Bounded latency depends on consumer batch size +
+    /// Reactors run asynchronously in supervisor tasks; `settle`
+    /// polls their cursors until every consumer reaches the current
+    /// log head. Bounded latency depends on consumer batch size +
     /// supervisor poll interval.
     pub async fn settle(&self, _result: EmitResult) -> Result<()> {
         loop {
@@ -1086,7 +1080,7 @@ mod tests {
     use super::*;
     use crate::contexts::Ctx;
         use crate::memory_store::MemoryStore;
-    use crate::reactor_v3::Events;
+    use crate::reactor::Events;
     use chrono::DateTime;
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1096,9 +1090,9 @@ mod tests {
         user_id:     Uuid,
         occurred_at: DateTime<Utc>,
     }
-    impl Fact for UserCreated {
+    impl Event for UserCreated {
         const CATEGORY: &'static str = "user";
-        fn name(&self) -> &str { "user_created" }
+        fn event_type(&self) -> &str { "user_created" }
         fn stream_id(&self) -> Uuid { self.user_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -1107,9 +1101,9 @@ mod tests {
     struct WelcomeQueued {
         user_id: Uuid,
     }
-    impl Fact for WelcomeQueued {
+    impl Event for WelcomeQueued {
         const CATEGORY: &'static str = "welcome";
-        fn name(&self) -> &str { "welcome_queued" }
+        fn event_type(&self) -> &str { "welcome_queued" }
         fn stream_id(&self) -> Uuid { self.user_id }
     }
 
@@ -1120,7 +1114,7 @@ mod tests {
     }
     #[async_trait]
     impl Projector for UserRoster {
-        type Fact = UserCreated;
+        type Event = UserCreated;
         const GROUP_NAME: &'static str = "users";
         async fn project(
             &self, fact: &UserCreated, _ctx: Ctx<'_>,
@@ -1195,14 +1189,14 @@ mod tests {
         struct WelcomeCounter(Arc<AtomicUsize>);
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct WelcomeQueuedFact { user_id: Uuid }
-        impl Fact for WelcomeQueuedFact {
+        impl Event for WelcomeQueuedFact {
             const CATEGORY: &'static str = "welcome";
-            fn name(&self) -> &str { "welcome_queued" }
+            fn event_type(&self) -> &str { "welcome_queued" }
             fn stream_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
         impl Projector for WelcomeCounter {
-            type Fact = WelcomeQueuedFact;
+            type Event = WelcomeQueuedFact;
             const GROUP_NAME: &'static str = "welcome.counter";
             async fn project(
                 &self, _fact: &WelcomeQueuedFact, _ctx: Ctx<'_>,
@@ -1260,7 +1254,7 @@ mod tests {
     /// (or wires it to the wrong registry), this assertion drops to 1.
     #[tokio::test]
     async fn engine_snapshot_sees_reactor_emitted_facts() {
-        use crate::aggregate_v3::{Aggregate, Apply};
+        use crate::aggregate::{Aggregate, Apply};
 
         #[derive(Default, Clone, Debug, Serialize, Deserialize)]
         struct ChainCount { applied: u32 }
@@ -1303,11 +1297,103 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    /// Regression test for the `AggregatorRegistry::apply_event` RMW
+    /// race documented in the 0.4.4 CHANGELOG.
+    ///
+    /// Pre-fix: `apply_event` did `state.get(&key) → clone → apply →
+    /// state.insert(&key)` across separate DashMap operations.
+    /// Concurrent applies on the same key could both read the same
+    /// pre-state and the second insert would overwrite the first —
+    /// lost update.
+    ///
+    /// Post-fix: the RMW lives under a single `state.entry(key)`
+    /// guard. Per-shard locking serializes concurrent applies on
+    /// the same key.
+    ///
+    /// The test spawns N OS threads that each call `apply_event` M
+    /// times on the same stream key. Final fold count must equal
+    /// N * M; pre-fix, it would drop updates probabilistically under
+    /// load.
+    #[test]
+    fn aggregator_apply_event_serializes_concurrent_callers() {
+        use crate::aggregate::{Aggregate, Apply};
+
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct Counter {
+            n: u32,
+        }
+        impl Aggregate for Counter {
+            const NAME: &'static str = "Counter";
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Inc {
+            stream_id: Uuid,
+        }
+        impl Event for Inc {
+            const CATEGORY: &'static str = "race";
+            fn event_type(&self) -> &str {
+                "inc"
+            }
+            fn stream_id(&self) -> Uuid {
+                self.stream_id
+            }
+        }
+        impl Apply<Inc> for Counter {
+            fn apply(&mut self, _: &Inc) {
+                self.n += 1;
+            }
+        }
+
+        let mut reg = crate::aggregator::AggregatorRegistry::new();
+        reg.register(crate::aggregator::Aggregator::for_type::<Counter, Inc>());
+        let reg = Arc::new(reg);
+
+        let stream_id = Uuid::new_v4();
+        let event_type = "race:inc";
+        let payload = serde_json::to_value(&Inc { stream_id }).unwrap();
+
+        const TASKS: usize = 8;
+        const PER_TASK: usize = 200;
+
+        let mut handles = Vec::new();
+        for _ in 0..TASKS {
+            let reg = reg.clone();
+            let payload = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..PER_TASK {
+                    reg.apply_event(event_type, &payload);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread joined");
+        }
+
+        let key = format!("Counter:{}", stream_id);
+        let version = reg.get_version(&key);
+        assert_eq!(
+            version.raw() as usize,
+            TASKS * PER_TASK,
+            "version must equal total applies — entry guard serializes RMW"
+        );
+
+        let state = reg.get_state(&key).expect("state must exist");
+        let counter = state
+            .downcast_ref::<Counter>()
+            .expect("type-erased state downcasts to Counter");
+        assert_eq!(
+            counter.n as usize,
+            TASKS * PER_TASK,
+            "fold count must equal total applies — no lost updates"
+        );
+    }
+
     /// Pin the `Aggregator::for_type_with_id_fn` contract: a single
     /// fact type can register two aggregators with different keys.
     ///
     /// Before 0.4.5: the `#[aggregator(id_fn = "...")]` macro accepted
-    /// the attribute but the factory hard-coded `Fact::stream_id`, so
+    /// the attribute but the factory hard-coded `Event::stream_id`, so
     /// every aggregator registered for the same fact type folded into
     /// the same key. The "per-signal aggregate vs per-run aggregate"
     /// pattern was impossible without emitting twin events (a smell
@@ -1321,7 +1407,7 @@ mod tests {
     /// the other's key.
     #[tokio::test]
     async fn aggregator_for_type_with_id_fn_keys_independently() {
-        use crate::aggregate_v3::{Aggregate, Apply};
+        use crate::aggregate::{Aggregate, Apply};
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct OrgUserCreated {
@@ -1329,9 +1415,9 @@ mod tests {
             org_id: Uuid,
             occurred_at: DateTime<Utc>,
         }
-        impl Fact for OrgUserCreated {
+        impl Event for OrgUserCreated {
             const CATEGORY: &'static str = "org_user";
-            fn name(&self) -> &str { "org_user_created" }
+            fn event_type(&self) -> &str { "org_user_created" }
             fn stream_id(&self) -> Uuid { self.user_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -1391,7 +1477,7 @@ mod tests {
 
         // OrgCount: keyed by org_id → 2 for org_a, 1 for org_b.
         assert_eq!(engine.snapshot::<OrgCount>(org_a).unwrap().n, 2,
-            "id_fn must extract org_id, not user_id (Fact::stream_id)");
+            "id_fn must extract org_id, not user_id (Event::stream_id)");
         assert_eq!(engine.snapshot::<OrgCount>(org_b).unwrap().n, 1);
 
         // Cross-check: org_a snapshot at user_1's key must be None
@@ -1406,7 +1492,7 @@ mod tests {
     /// facts must skip the fold entirely (not fold at `Uuid::nil`).
     #[tokio::test]
     async fn aggregator_id_fn_returning_none_skips_fold() {
-        use crate::aggregate_v3::{Aggregate, Apply};
+        use crate::aggregate::{Aggregate, Apply};
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct MaybeRunEvent {
@@ -1414,9 +1500,9 @@ mod tests {
             run_id: Option<Uuid>,
             occurred_at: DateTime<Utc>,
         }
-        impl Fact for MaybeRunEvent {
+        impl Event for MaybeRunEvent {
             const CATEGORY: &'static str = "maybe_run";
-            fn name(&self) -> &str { "maybe_run_event" }
+            fn event_type(&self) -> &str { "maybe_run_event" }
             fn stream_id(&self) -> Uuid { self.stream_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -1470,9 +1556,9 @@ mod tests {
         tag_id: Uuid,
         occurred_at: DateTime<Utc>,
     }
-    impl Fact for TaggedEvent {
+    impl Event for TaggedEvent {
         const CATEGORY: &'static str = "tagged";
-        fn name(&self) -> &str { "tagged" }
+        fn event_type(&self) -> &str { "tagged" }
         // stream_id intentionally NOT tag_id — proves the macro
         // uses id_fn over stream_id.
         fn stream_id(&self) -> Uuid { self.event_id }
@@ -1484,7 +1570,7 @@ mod tests {
 
     #[derive(Default, Clone, Debug, Serialize, Deserialize)]
     struct TagBucket { count: u32 }
-    impl crate::aggregate_v3::Aggregate for TagBucket {
+    impl crate::aggregate::Aggregate for TagBucket {
         const NAME: &'static str = "TagBucket";
     }
 
@@ -1503,13 +1589,12 @@ mod tests {
 
     /// End-to-end macro test: `#[aggregator(id_fn = "method")]` must
     /// emit a factory that keys by the user method's return value, not
-    /// by `Fact::stream_id`. This is the contract the scout side
+    /// by `Event::stream_id`. This is the contract the scout side
     /// depends on (e.g. SignalLifecycle keyed by signal_id from a
     /// CuriosityEvent whose stream_id is nil).
     ///
-    /// Regression test for the v0.4.0–0.4.4 bug where the macro
-    /// accepted the attribute but the factory hard-coded
-    /// `Fact::stream_id`.
+    /// Regression: the macro must thread the `id_fn` attribute
+    /// through to the factory rather than hard-coding `Event::stream_id`.
     #[tokio::test]
     async fn macro_aggregator_id_fn_actually_keys_by_method() {
         let store = store();
@@ -1540,10 +1625,10 @@ mod tests {
     /// Aggregate registered for stream-policy testing.
     #[derive(Default, Clone, Serialize, Deserialize)]
     struct UserAgg;
-    impl crate::aggregate_v3::Aggregate for UserAgg {
+    impl crate::aggregate::Aggregate for UserAgg {
         const NAME: &'static str = "UserAgg";
     }
-    impl crate::aggregate_v3::Apply<UserCreated> for UserAgg {
+    impl crate::aggregate::Apply<UserCreated> for UserAgg {
         fn apply(&mut self, _fact: &UserCreated) {}
     }
 
@@ -1612,9 +1697,9 @@ mod tests {
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct OrderPlaced { order_id: Uuid, occurred_at: DateTime<Utc> }
-        impl Fact for OrderPlaced {
+        impl Event for OrderPlaced {
             const CATEGORY: &'static str = "order";
-            fn name(&self) -> &str { "order_placed" }
+            fn event_type(&self) -> &str { "order_placed" }
             fn stream_id(&self) -> Uuid { self.order_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -1641,9 +1726,9 @@ mod tests {
         Inc { by: i32, occurred_at: DateTime<Utc>, counter_id: Uuid },
         Reset { occurred_at: DateTime<Utc>, counter_id: Uuid },
     }
-    impl Fact for CounterFact {
+    impl Event for CounterFact {
         const CATEGORY: &'static str = "counter";
-        fn name(&self) -> &str {
+        fn event_type(&self) -> &str {
             match self {
                 CounterFact::Inc { .. }   => "inc",
                 CounterFact::Reset { .. } => "reset",
@@ -1665,10 +1750,10 @@ mod tests {
 
     #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
     struct Counter { value: i32 }
-    impl crate::aggregate_v3::Aggregate for Counter {
+    impl crate::aggregate::Aggregate for Counter {
         const NAME: &'static str = "Counter";
     }
-    impl crate::aggregate_v3::Apply<CounterFact> for Counter {
+    impl crate::aggregate::Apply<CounterFact> for Counter {
         fn apply(&mut self, fact: &CounterFact) {
             match fact {
                 CounterFact::Inc { by, .. } => self.value += by,
@@ -1691,13 +1776,13 @@ mod tests {
         let id = Uuid::new_v4();
         let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
         assert_eq!(agg, Counter::default());
-        assert_eq!(ver, StreamVersion::ZERO);
+        assert_eq!(ver, StreamRevision::ZERO);
         engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn emit_batch_round_trips_through_aggregator_fold() {
-        // Emitting a batch of facts of the registered Fact type
+        // Emitting a batch of facts of the registered Event type
         // folds them into the engine's aggregator state, readable
         // via the read-side hydration helper.
         let store = store();
@@ -1741,8 +1826,8 @@ mod tests {
             CounterFact::Inc { by: 1, occurred_at: pinned, counter_id: id },
         ]).await.unwrap();
 
-        let events = EventLogBackend::load_stream(
-            store.as_ref(), <CounterFact as Fact>::CATEGORY, id, None,
+        let events = EventLogBackend::read_stream(
+            store.as_ref(), <CounterFact as Event>::CATEGORY, id, None,
         ).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].created_at, pinned,
@@ -1751,7 +1836,7 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    // ── Phase 7 — MultiProjector engine integration ──
+    // ── MultiProjector engine integration ──
 
     #[tokio::test]
     async fn engine_drives_multi_projector_seeing_heterogeneous_events() {
@@ -1768,7 +1853,7 @@ mod tests {
 
             async fn project(
                 &self,
-                event: &crate::types::PersistedEvent,
+                event: &crate::types::RecordedEvent,
                 _ctx: Ctx<'_>,
             ) -> Result<()> {
                 self.seen.lock().push(event.event_type.clone());
@@ -1778,17 +1863,17 @@ mod tests {
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct A { a_id: Uuid, occurred_at: DateTime<Utc> }
-        impl Fact for A {
+        impl Event for A {
             const CATEGORY: &'static str = "alpha";
-            fn name(&self) -> &str { "a" }
+            fn event_type(&self) -> &str { "a" }
             fn stream_id(&self) -> Uuid { self.a_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct B { b_id: Uuid, occurred_at: DateTime<Utc> }
-        impl Fact for B {
+        impl Event for B {
             const CATEGORY: &'static str = "beta";
-            fn name(&self) -> &str { "b" }
+            fn event_type(&self) -> &str { "b" }
             fn stream_id(&self) -> Uuid { self.b_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -1842,7 +1927,7 @@ mod tests {
         .correlation_id(cmd_correlation)
         .await.unwrap();
 
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -1867,15 +1952,15 @@ mod tests {
             user_id:     Uuid::new_v4(),
             occurred_at: Utc::now(),
         })
-        .parent_id(parent)
+        .causation_id(parent)
         .metadata("_run_id", "run-abc")
         .metadata("_schema_v", 2)
         .await.unwrap();
 
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
-        assert_eq!(events[0].parent_id, Some(parent));
+        assert_eq!(events[0].causation_id, Some(parent));
         assert_eq!(
             events[0].metadata.get("_run_id").and_then(|v| v.as_str()),
             Some("run-abc"),
@@ -1909,8 +1994,8 @@ mod tests {
         .correlation_id(cmd_correlation)
         .await.unwrap();
 
-        let events = EventLogBackend::load_stream(
-            store.as_ref(), <CounterFact as Fact>::CATEGORY, id, None,
+        let events = EventLogBackend::read_stream(
+            store.as_ref(), <CounterFact as Event>::CATEGORY, id, None,
         ).await.unwrap();
         assert_eq!(events.len(), 2);
         for ev in &events {
@@ -1947,30 +2032,30 @@ mod tests {
 
     #[tokio::test]
     async fn registering_one_aggregate_against_two_facts_is_allowed() {
-        // Multi-Fact aggregates: same A::NAME registered with two
+        // Multi-Event aggregates: same A::NAME registered with two
         // distinct Apply<F> impls is legitimate (e.g. PipelineState
         // folding ScrapeEvent + LifecycleEvent). The collision check
-        // distinguishes "same NAME + same Fact CATEGORY" (panic)
-        // from "same NAME + different Fact CATEGORYs" (allowed).
+        // distinguishes "same NAME + same Event CATEGORY" (panic)
+        // from "same NAME + different Event CATEGORYs" (allowed).
 
         #[derive(Default, Debug, Clone, Serialize, Deserialize)]
         struct Multi { hits: u32 }
-        impl crate::aggregate_v3::Aggregate for Multi {
+        impl crate::aggregate::Aggregate for Multi {
             const NAME: &'static str = "Multi";
         }
-        impl crate::aggregate_v3::Apply<Tick> for Multi {
+        impl crate::aggregate::Apply<Tick> for Multi {
             fn apply(&mut self, _t: &Tick) { self.hits += 1; }
         }
-        // Second Fact type for the same Aggregate.
+        // Second Event type for the same Aggregate.
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Pong { pong_id: Uuid, occurred_at: DateTime<Utc> }
-        impl Fact for Pong {
+        impl Event for Pong {
             const CATEGORY: &'static str = "pong";
-            fn name(&self) -> &str { "pong" }
+            fn event_type(&self) -> &str { "pong" }
             fn stream_id(&self) -> Uuid { self.pong_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
-        impl crate::aggregate_v3::Apply<Pong> for Multi {
+        impl crate::aggregate::Apply<Pong> for Multi {
             fn apply(&mut self, _p: &Pong) { self.hits += 1; }
         }
 
@@ -1985,7 +2070,7 @@ mod tests {
             crate::aggregator::Aggregator::for_type::<Multi, Pong>(),
         ])
         .build();
-        // No panic — different Fact CATEGORYs.
+        // No panic — different Event CATEGORYs.
     }
 
     #[tokio::test]
@@ -1994,12 +2079,8 @@ mod tests {
         // Two aggregators with the same Aggregate::NAME would collide
         // on the registry key `{NAME}:{id}` and silently overwrite
         // each other's state. EngineBuilder catches this at
-        // registration time.
-        //
-        // Pattern: legacy `Aggregator::new(...)` returned non-OCC
-        // aggregators that pre-v0.4 tests register two of. Under
-        // v0.4 both would need distinct A::NAME consts. The check
-        // protects users from naming both `"TickCounter"` by mistake.
+        // registration time; duplicate names need distinct `A::NAME`
+        // consts.
         let store = store();
         let _engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -2037,7 +2118,7 @@ mod tests {
         struct A { hit: Arc<AtomicUsize> }
         #[async_trait]
         impl Projector for A {
-            type Fact = UserCreated;
+            type Event = UserCreated;
             const GROUP_NAME: &'static str = "bulk.a";
             async fn project(&self, _f: &UserCreated, _: Ctx<'_>) -> Result<()> {
                 self.hit.fetch_add(1, Ordering::SeqCst);
@@ -2049,7 +2130,7 @@ mod tests {
         struct B { hit: Arc<AtomicUsize> }
         #[async_trait]
         impl Projector for B {
-            type Fact = UserCreated;
+            type Event = UserCreated;
             const GROUP_NAME: &'static str = "bulk.b";
             async fn project(&self, _f: &UserCreated, _: Ctx<'_>) -> Result<()> {
                 self.hit.fetch_add(1, Ordering::SeqCst);
@@ -2143,9 +2224,9 @@ mod tests {
             group_name: String,
             attempts: u32,
         }
-        impl Fact for HandlerFailed {
+        impl Event for HandlerFailed {
             const CATEGORY: &'static str = "ops";
-            fn name(&self) -> &str { "handler_failed" }
+            fn event_type(&self) -> &str { "handler_failed" }
             fn stream_id(&self) -> Uuid { Uuid::nil() }
         }
 
@@ -2182,7 +2263,7 @@ mod tests {
         // relay has drained the synthetic fact to the log.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let events = EventLogBackend::load_from(
+            let events = EventLogBackend::read_all(
                 store.as_ref(), LogCursor::ZERO, 10,
             ).await.unwrap();
             let dlq_emitted = events.iter()
@@ -2194,7 +2275,7 @@ mod tests {
         }
 
         // Trigger UserCreated + synthesized HandlerFailed both present.
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         assert!(events.iter().any(|e| e.event_type == "user:user_created"));
@@ -2225,14 +2306,14 @@ mod tests {
         struct WelcomeCounter(Arc<AtomicUsize>);
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct WelcomeQueuedFact { user_id: Uuid }
-        impl Fact for WelcomeQueuedFact {
+        impl Event for WelcomeQueuedFact {
             const CATEGORY: &'static str = "welcome";
-            fn name(&self) -> &str { "welcome_queued" }
+            fn event_type(&self) -> &str { "welcome_queued" }
             fn stream_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
         impl Projector for WelcomeCounter {
-            type Fact = WelcomeQueuedFact;
+            type Event = WelcomeQueuedFact;
             const GROUP_NAME: &'static str = "settle.chain.counter";
             async fn project(
                 &self, _f: &WelcomeQueuedFact, _ctx: Ctx<'_>,
@@ -2381,7 +2462,7 @@ mod tests {
         // Registers MemoryStore as the observer; emits a fact that
         // both folds into an aggregator AND triggers a reactor;
         // asserts every observability table was populated.
-        use crate::reactor_v3::{Events, Reactor};
+        use crate::reactor::{Events, Reactor};
         use std::sync::atomic::AtomicUsize;
 
         struct EchoReactor {
@@ -2593,7 +2674,7 @@ mod tests {
         assert_ne!(result.correlation_id, Uuid::nil());
 
         // No events written.
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         assert!(events.is_empty());
@@ -2626,7 +2707,7 @@ mod tests {
         .metadata("_trace", "abc123")
         .await.unwrap();
 
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         let m = &events[0].metadata;
@@ -2664,19 +2745,19 @@ mod tests {
     /// (`extract_prefix(event_type)` splits on `:`) finds it.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Tick { seq: u32, occurred_at: DateTime<Utc> }
-    impl Fact for Tick {
+    impl Event for Tick {
         const CATEGORY: &'static str = "ticker";
-        fn name(&self) -> &str { "tick" }
+        fn event_type(&self) -> &str { "tick" }
         fn stream_id(&self) -> Uuid { Uuid::nil() }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 
     #[derive(Debug, Default, Clone, Serialize, Deserialize)]
     struct TickCounter { count: u32 }
-    impl crate::aggregate_v3::Aggregate for TickCounter {
+    impl crate::aggregate::Aggregate for TickCounter {
         const NAME: &'static str = "TickCounter";
     }
-    impl crate::aggregate_v3::Apply<Tick> for TickCounter {
+    impl crate::aggregate::Apply<Tick> for TickCounter {
         fn apply(&mut self, _t: &Tick) { self.count += 1; }
     }
 
@@ -2694,7 +2775,7 @@ mod tests {
         struct Capture { snaps: Arc<parking_lot::Mutex<Vec<u32>>> }
         #[async_trait]
         impl Projector for Capture {
-            type Fact = Tick;
+            type Event = Tick;
             const GROUP_NAME: &'static str = "ticks";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
@@ -2751,10 +2832,10 @@ mod tests {
             const GROUP_NAME: &'static str = "ticker.reactor";
             async fn react(
                 &self, _t: &Tick, ctx: Ctx<'_>,
-            ) -> Result<crate::reactor_v3::Events> {
+            ) -> Result<crate::reactor::Events> {
                 let s = ctx.aggregate::<TickCounter>();
                 self.transitions.lock().push((s.prev.count, s.curr.count));
-                Ok(crate::reactor_v3::Events::new())
+                Ok(crate::reactor::Events::new())
             }
         }
 
@@ -2791,9 +2872,9 @@ mod tests {
     /// Append a Tick directly to the store, return its position.
     async fn append_tick(store: &MemoryStore, seq: u32) -> LogCursor {
         let tick = Tick { seq, occurred_at: Utc::now() };
-        let result = EventLogBackend::append(store, NewEvent {
+        let result = EventLogBackend::append(store, EventData {
             event_id:        Uuid::new_v4(),
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      "ticker:tick".into(),
             payload:         serde_json::to_value(&tick).unwrap(),
@@ -2823,7 +2904,7 @@ mod tests {
         struct FailsOnSecond { calls: Arc<AtomicUsize> }
         #[async_trait]
         impl Projector for FailsOnSecond {
-            type Fact = Tick;
+            type Event = Tick;
             const GROUP_NAME: &'static str = "rollback.test";
             async fn project(
                 &self, _f: &Tick, _ctx: Ctx<'_>,
@@ -2853,6 +2934,77 @@ mod tests {
                    "event 2's fold rolled back; only event 1's fold remains");
     }
 
+    /// F9.6 — pin the apply→project interleaving contract for batch
+    /// processing.
+    ///
+    /// When `ProjectionRunner::step` drains N events in one batch, the
+    /// runtime must fold each event into the aggregator registry
+    /// *and then* invoke `project()` for that event, before moving on
+    /// to event N+1. The projector sees `(prev, curr)` corresponding
+    /// to its own event — not the post-batch state for every call.
+    ///
+    /// This matters because the "obvious" alternative — apply ALL
+    /// facts, then project ALL — would silently break transition
+    /// guards that depend on per-event `prev`/`curr` deltas
+    /// (`ctx.aggregate::<A>().prev` vs `.curr`). Today's projection
+    /// runner does the right thing; this test makes the contract
+    /// load-bearing so a future refactor can't silently flip to
+    /// apply-all-then-project-all.
+    ///
+    /// Setup: append 5 ticks to the log, then run `step(10)` from a
+    /// fresh runner (cursor=ZERO). Expect per-event transitions
+    /// `[(0,1), (1,2), (2,3), (3,4), (4,5)]`. If apply-all-first
+    /// regressed in, every projector call would see `(4, 5)`.
+    #[tokio::test]
+    async fn projector_batch_sees_per_event_prev_curr_interleaved() {
+        #[derive(Clone)]
+        struct Capture {
+            transitions: Arc<parking_lot::Mutex<Vec<(u32, u32)>>>,
+        }
+        #[async_trait]
+        impl Projector for Capture {
+            type Event = Tick;
+            const GROUP_NAME: &'static str = "batch.interleave";
+            async fn project(
+                &self,
+                _f: &Tick,
+                ctx: Ctx<'_>,
+            ) -> Result<()> {
+                let s = ctx.aggregate::<TickCounter>();
+                self.transitions.lock().push((s.prev.count, s.curr.count));
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        for i in 0..5 {
+            append_tick(&store, i).await;
+        }
+
+        let cap = Capture {
+            transitions: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        };
+        let transitions = cap.transitions.clone();
+
+        let runner = ProjectionRunner::new(
+            cap,
+            "batch.interleave",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        )
+        .with_aggregators(fresh_tick_registry());
+
+        runner.step(10).await.unwrap();
+
+        assert_eq!(
+            *transitions.lock(),
+            vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)],
+            "single batch must interleave apply→project per event so each \
+             projector call sees its own (prev, curr) — not a post-batch \
+             fixed view"
+        );
+    }
+
     #[tokio::test]
     async fn hydration_does_not_double_fold_after_zero_cursor_first_step() {
         // Reproduces the OnceCell short-circuit bug: first step at
@@ -2867,7 +3019,7 @@ mod tests {
         struct Capture { snaps: Arc<parking_lot::Mutex<Vec<u32>>> }
         #[async_trait]
         impl Projector for Capture {
-            type Fact = Tick;
+            type Event = Tick;
             const GROUP_NAME: &'static str = "hydration.bug";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
@@ -2918,7 +3070,7 @@ mod tests {
         struct Capture { snap: Arc<parking_lot::Mutex<Option<u32>>> }
         #[async_trait]
         impl Projector for Capture {
-            type Fact = Tick;
+            type Event = Tick;
             const GROUP_NAME: &'static str = "hydrate.cold";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
@@ -2944,6 +3096,75 @@ mod tests {
                    "hydration folded the 2 historical events; step folded the new one");
     }
 
+    /// Transition-guard behavior after cold-start replay.
+    ///
+    /// Pinned per the P11.a-audit follow-up (`docs/audits/2026-05-14-
+    /// p11a-legacy-test-parity-audit.md`, HIGH-severity gap
+    /// `transition_guard_correct_after_log_replay`).
+    ///
+    /// Setup: 2 historical Tick events in the log, checkpoint past
+    /// them; one fresh Tick arrives. A consumer that reads
+    /// `ctx.aggregate::<TickCounter>().prev.count` vs `.curr.count`
+    /// must see `(2, 3)` — the historical state from hydration vs
+    /// the post-fold state for the new event. If hydration only
+    /// folds into `curr` and leaves `prev` at default, transition
+    /// guards (`prev != curr`) fire spuriously on the first event
+    /// after restart, breaking gates rootsignal depends on.
+    #[tokio::test]
+    async fn transition_guard_prev_curr_correct_after_cold_start_hydration() {
+        let store = Arc::new(MemoryStore::new());
+        append_tick(&store, 0).await;
+        let pos2 = append_tick(&store, 1).await;
+        // Checkpoint past the historical events — simulates a
+        // restart that resumes from a known cursor.
+        store.set("hydrate.transition", pos2).await.unwrap();
+        // New event the runner picks up after hydration.
+        append_tick(&store, 2).await;
+
+        #[derive(Clone)]
+        struct Capture {
+            prev_curr: Arc<parking_lot::Mutex<Option<(u32, u32)>>>,
+        }
+        #[async_trait]
+        impl Projector for Capture {
+            type Event = Tick;
+            const GROUP_NAME: &'static str = "hydrate.transition";
+            async fn project(
+                &self,
+                _f: &Tick,
+                ctx: Ctx<'_>,
+            ) -> Result<()> {
+                let s = ctx.aggregate::<TickCounter>();
+                *self.prev_curr.lock() = Some((s.prev.count, s.curr.count));
+                Ok(())
+            }
+        }
+
+        let cap = Capture {
+            prev_curr: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        let prev_curr = cap.prev_curr.clone();
+
+        let runner = ProjectionRunner::new(
+            cap,
+            "hydrate.transition",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        )
+        .with_aggregators(fresh_tick_registry());
+
+        runner.step(10).await.unwrap();
+
+        assert_eq!(
+            *prev_curr.lock(),
+            Some((2, 3)),
+            "after replaying 2 historical events, the next event's projector \
+             body must see prev=2 (historical fold state) and curr=3 \
+             (post-fold state) — the contract that lets transition guards \
+             survive cold-start"
+        );
+    }
+
     #[tokio::test]
     #[should_panic(expected = "no aggregators were registered")]
     async fn ctx_aggregate_panics_without_registered_aggregators() {
@@ -2955,7 +3176,7 @@ mod tests {
         struct Reader;
         #[async_trait]
         impl Projector for Reader {
-            type Fact = Tick;
+            type Event = Tick;
             const GROUP_NAME: &'static str = "reader";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
@@ -2969,9 +3190,9 @@ mod tests {
         // Append one Tick directly to the log.
         let tick = Tick { seq: 0, occurred_at: Utc::now() };
         let payload = serde_json::to_value(&tick).unwrap();
-        EventLogBackend::append(store.as_ref(), NewEvent {
+        EventLogBackend::append(store.as_ref(), EventData {
             event_id:        Uuid::new_v4(),
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      "ticker:tick".into(),
             payload,
@@ -3014,7 +3235,7 @@ mod tests {
         }
         #[async_trait]
         impl Projector for PanicsThenSucceeds {
-            type Fact = Tick;
+            type Event = Tick;
             const GROUP_NAME: &'static str = "panic.recovery";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
@@ -3065,10 +3286,10 @@ mod tests {
 
         #[derive(Debug, Default, Clone, Serialize, Deserialize)]
         struct OtherCounter { count: u32 }
-        impl crate::aggregate_v3::Aggregate for OtherCounter {
+        impl crate::aggregate::Aggregate for OtherCounter {
             const NAME: &'static str = "OtherCounter";
         }
-        impl crate::aggregate_v3::Apply<Tick> for OtherCounter {
+        impl crate::aggregate::Apply<Tick> for OtherCounter {
             fn apply(&mut self, _: &Tick) { self.count += 1; }
         }
 
@@ -3079,7 +3300,7 @@ mod tests {
         }
         #[async_trait]
         impl Projector for VerifyBoth {
-            type Fact = Tick;
+            type Event = Tick;
             const GROUP_NAME: &'static str = "accum.test";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
@@ -3147,9 +3368,9 @@ mod tests {
             id: Uuid,
             occurred_at: DateTime<Utc>,
         }
-        impl Fact for OtherFact {
+        impl Event for OtherFact {
             const CATEGORY: &'static str = "other";
-            fn name(&self) -> &str { "happening" }
+            fn event_type(&self) -> &str { "happening" }
             fn stream_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -3164,7 +3385,7 @@ mod tests {
             const CATEGORIES: &'static [&'static str] = &["ticker"];
             async fn project(
                 &self,
-                event: &crate::types::PersistedEvent,
+                event: &crate::types::RecordedEvent,
                 _ctx: Ctx<'_>,
             ) -> Result<()> {
                 self.seen.lock().push(event.event_type.clone());

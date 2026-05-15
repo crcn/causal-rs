@@ -32,15 +32,15 @@ use causal::checkpoint_store::{
 };
 use causal::contexts::Ctx;
 use causal::event_log::EventLogBackend;
-use causal::fact::Fact;
+use causal::event::Event;
 use causal::projector::Projector;
 use causal::memory_store::MemoryStore;
 use causal::projection_runner::{ProjectionRunner, StepOutcome};
-use causal::reactor_v3::Events;
+use causal::reactor::Events;
 use causal::reactor_runner::ReactorRunner;
-use causal::reactor_v3::Reactor;
+use causal::reactor::Reactor;
 use causal::relay::RelayLoop;
-use causal::types::{AppendResult, LogCursor, NewEvent, PersistedEvent, StreamVersion};
+use causal::types::{WriteResult, LogCursor, EventData, RecordedEvent, StreamRevision};
 
 // ─────────────────────────────────────────────────────────────────────
 // Fault injector — wraps MemoryStore; lets tests arm one Err per fault
@@ -86,23 +86,23 @@ impl FaultInjector {
 
 #[async_trait]
 impl EventLogBackend for FaultInjector {
-    async fn append(&self, event: NewEvent) -> Result<AppendResult> {
+    async fn append(&self, event: EventData) -> Result<WriteResult> {
         if self.take_if_matches(FaultPoint::Append) {
             return Err(anyhow!("fault: append"));
         }
         EventLogBackend::append(self.inner.as_ref(), event).await
     }
-    async fn load_from(
+    async fn read_all(
         &self, after: LogCursor, limit: usize,
-    ) -> Result<Vec<PersistedEvent>> {
-        EventLogBackend::load_from(self.inner.as_ref(), after, limit).await
+    ) -> Result<Vec<RecordedEvent>> {
+        EventLogBackend::read_all(self.inner.as_ref(), after, limit).await
     }
-    async fn load_stream(
+    async fn read_stream(
         &self, aggregate_type: &str, aggregate_id: Uuid,
-        after_version: Option<StreamVersion>,
-    ) -> Result<Vec<PersistedEvent>> {
-        EventLogBackend::load_stream(
-            self.inner.as_ref(), aggregate_type, aggregate_id, after_version,
+        after: Option<StreamRevision>,
+    ) -> Result<Vec<RecordedEvent>> {
+        EventLogBackend::read_stream(
+            self.inner.as_ref(), aggregate_type, aggregate_id, after,
         ).await
     }
     async fn latest_position(&self) -> Result<LogCursor> {
@@ -113,9 +113,9 @@ impl EventLogBackend for FaultInjector {
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        expected: StreamVersion,
-        event: NewEvent,
-    ) -> Result<AppendResult> {
+        expected: causal::types::StreamState,
+        event: EventData,
+    ) -> Result<WriteResult> {
         EventLogBackend::append_to_stream(
             self.inner.as_ref(), aggregate_type, aggregate_id, expected, event,
         ).await
@@ -182,9 +182,9 @@ impl ReactorOutbox for FaultInjector {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Recorded { id: Uuid, occurred_at: DateTime<Utc> }
-impl Fact for Recorded {
+impl Event for Recorded {
     const CATEGORY: &'static str = "test";
-    fn name(&self) -> &str { "recorded" }
+    fn event_type(&self) -> &str { "recorded" }
     fn stream_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
@@ -192,11 +192,11 @@ impl Fact for Recorded {
 async fn append_n(store: &MemoryStore, n: usize) {
     for _ in 0..n {
         let payload = Recorded { id: Uuid::new_v4(), occurred_at: Utc::now() };
-        let ev = NewEvent {
+        let ev = EventData {
             event_id: Uuid::new_v4(),
-            parent_id: None,
+            causation_id: None,
             correlation_id: Uuid::new_v4(),
-            event_type: format!("{}:{}", <Recorded as Fact>::CATEGORY, payload.name()),
+            event_type: format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload: serde_json::to_value(&payload).unwrap(),
             created_at: Utc::now(),
             aggregate_type: None,
@@ -216,7 +216,7 @@ struct CountingProjector {
 
 #[async_trait]
 impl Projector for CountingProjector {
-    type Fact = Recorded;
+    type Event = Recorded;
     const GROUP_NAME: &'static str = "counting";
     async fn project(
         &self, _fact: &Recorded, ctx: Ctx<'_>,
@@ -272,7 +272,7 @@ async fn cursor_set_failure_after_project_redelivers_idempotently() {
 
     // Cursor at last fact's position.
     let cursor = injector.get("m1").await.unwrap().unwrap();
-    let events = EventLogBackend::load_from(
+    let events = EventLogBackend::read_all(
         inner.as_ref(), LogCursor::ZERO, 10,
     ).await.unwrap();
     assert_eq!(cursor, events.last().unwrap().position);
@@ -283,18 +283,18 @@ async fn cursor_set_failure_after_project_redelivers_idempotently() {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Trigger { id: Uuid, occurred_at: DateTime<Utc> }
-impl Fact for Trigger {
+impl Event for Trigger {
     const CATEGORY: &'static str = "test";
-    fn name(&self) -> &str { "trigger" }
+    fn event_type(&self) -> &str { "trigger" }
     fn stream_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Echoed;
-impl Fact for Echoed {
+impl Event for Echoed {
     const CATEGORY: &'static str = "test";
-    fn name(&self) -> &str { "echoed" }
+    fn event_type(&self) -> &str { "echoed" }
     fn stream_id(&self) -> Uuid { Uuid::nil() }
 }
 
@@ -315,11 +315,11 @@ impl Reactor for EmitOne {
 async fn append_trigger(store: &MemoryStore) -> Uuid {
     let event_id = Uuid::new_v4();
     let payload = Trigger { id: Uuid::new_v4(), occurred_at: Utc::now() };
-    let ev = NewEvent {
+    let ev = EventData {
         event_id,
-        parent_id: None,
+        causation_id: None,
         correlation_id: Uuid::new_v4(),
-        event_type: format!("{}:{}", <Trigger as Fact>::CATEGORY, payload.name()),
+        event_type: format!("{}:{}", <Trigger as Event>::CATEGORY, payload.event_type()),
         payload: serde_json::to_value(&payload).unwrap(),
         created_at: Utc::now(),
         aggregate_type: None,
@@ -427,7 +427,7 @@ async fn relay_outbox_delete_failure_redelivers_with_log_dedup() {
     assert!(relay.drain_once(10).await.is_err());
 
     // Log has the appended event; outbox row STILL pending.
-    let log_events = EventLogBackend::load_from(
+    let log_events = EventLogBackend::read_all(
         inner.as_ref(), LogCursor::ZERO, 10,
     ).await.unwrap();
     let echoed_count = log_events
@@ -442,7 +442,7 @@ async fn relay_outbox_delete_failure_redelivers_with_log_dedup() {
     relay.drain_once(10).await.unwrap();
 
     // Still exactly one log entry (C1 dedup); outbox empty.
-    let log_events = EventLogBackend::load_from(
+    let log_events = EventLogBackend::read_all(
         inner.as_ref(), LogCursor::ZERO, 10,
     ).await.unwrap();
     let echoed_count = log_events

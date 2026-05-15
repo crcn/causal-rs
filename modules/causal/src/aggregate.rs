@@ -1,4 +1,4 @@
-//! v0.4 `Aggregate` marker + `Apply<F: Fact>` extension.
+//! `Aggregate` marker + `Apply<F: Event>` extension.
 //!
 //! Aggregates are the consistency boundary on the write path — the
 //! place where command-time invariants are enforced before facts hit
@@ -18,26 +18,26 @@
 //!
 //! ```ignore
 //! pub trait Aggregate: Default + Send + Sync + 'static {}
-//! pub trait Apply<F: Fact>: Aggregate {
+//! pub trait Apply<F: Event>: Aggregate {
 //!     fn apply(&mut self, fact: &F);
 //! }
 //! ```
 //!
-//! `Aggregate` is a pure marker. The per-Fact fold lives in
-//! `Apply<F>`. Single-Fact aggregates impl `Apply<F>` once; multi-Fact
-//! aggregates impl `Apply<F1>`, `Apply<F2>`, … for each Fact type
+//! `Aggregate` is a pure marker. The per-Event fold lives in
+//! `Apply<F>`. Single-Event aggregates impl `Apply<F>` once; multi-Event
+//! aggregates impl `Apply<F1>`, `Apply<F2>`, … for each Event type
 //! they fold (one stream per F, selected at `load<A, F>` time).
 //!
-//! The split lets multiple Aggregates share a Fact (e.g. an audit
+//! The split lets multiple Aggregates share a Event (e.g. an audit
 //! aggregate and a domain aggregate both folding `UserCreated`)
-//! without forcing one trait per Fact. Mirrors Axon's
+//! without forcing one trait per Event. Mirrors Axon's
 //! `AggregateMember` and EventStoreDB's "decider" pattern.
 
-use crate::fact::Fact;
+use crate::event::Event;
 
-/// Write-side consistency boundary marker. Per-Fact fold behavior
+/// Write-side consistency boundary marker. Per-Event fold behavior
 /// lives in [`Apply<F>`]. The aggregate's stream identity comes from
-/// the Fact's `CATEGORY` const, not from the Aggregate itself —
+/// the Event's `CATEGORY` const, not from the Aggregate itself —
 /// callers always specify both `A` and `F` when loading/appending
 /// (`engine.load::<UserAgg, UserCreated>(id)`).
 pub trait Aggregate: Default + Send + Sync + 'static {
@@ -48,7 +48,7 @@ pub trait Aggregate: Default + Send + Sync + 'static {
     /// refactorings (renames, module moves) and across builds: pick
     /// it once, treat it like a wire format.
     ///
-    /// Two different Aggregates folding the same Fact stream MUST
+    /// Two different Aggregates folding the same Event stream MUST
     /// have distinct `NAME`s so their state doesn't collide in the
     /// shared registry. Recommended convention: PascalCase singular
     /// matching the Rust type name (`"UserAgg"`, `"Counter"`,
@@ -56,7 +56,7 @@ pub trait Aggregate: Default + Send + Sync + 'static {
     const NAME: &'static str;
 }
 
-/// Per-Fact fold for hydration. Called once per fact loaded from the
+/// Per-Event fold for hydration. Called once per fact loaded from the
 /// aggregate's stream during `Engine::load<A, F>`. No I/O, no
 /// wall-clock — same purity rules as `Projector::project`.
 ///
@@ -66,9 +66,9 @@ pub trait Aggregate: Default + Send + Sync + 'static {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `Apply<{F}>` — register an aggregator for `{F}` only after implementing `Apply<{F}> for {Self}`",
     label = "missing `Apply<{F}>` impl",
-    note = "every Fact that an aggregator folds requires its own `impl Apply<F> for A` block; the engine calls `apply(&mut self, fact: &F)` once per fact"
+    note = "every Event that an aggregator folds requires its own `impl Apply<F> for A` block; the engine calls `apply(&mut self, fact: &F)` once per fact"
 )]
-pub trait Apply<F: Fact>: Aggregate {
+pub trait Apply<F: Event>: Aggregate {
     fn apply(&mut self, fact: &F);
 }
 
@@ -85,9 +85,9 @@ mod tests {
         Reset { occurred_at: DateTime<Utc>, counter_id: Uuid },
     }
 
-    impl Fact for CounterFact {
+    impl Event for CounterFact {
         const CATEGORY: &'static str = "counter";
-        fn name(&self) -> &str {
+        fn event_type(&self) -> &str {
             match self {
                 CounterFact::Incremented { .. } => "incremented",
                 CounterFact::Reset { .. }       => "reset",
@@ -137,16 +137,16 @@ mod tests {
         assert_eq!(agg.value, 5, "fold matches manual reduction");
     }
 
-    /// Multi-Fact: one aggregate, two Apply impls, each fact type's
+    /// Multi-Event: one aggregate, two Apply impls, each fact type's
     /// CATEGORY identifies its own stream. Folded independently via
     /// `load::<A, F>(id)` per stream.
     #[test]
     fn aggregate_can_apply_multiple_fact_types() {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Tagged { tag_id: Uuid, occurred_at: DateTime<Utc> }
-        impl Fact for Tagged {
+        impl Event for Tagged {
             const CATEGORY: &'static str = "tag";
-            fn name(&self) -> &str { "tagged" }
+            fn event_type(&self) -> &str { "tagged" }
             fn stream_id(&self) -> Uuid { self.tag_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }

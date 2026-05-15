@@ -1,13 +1,9 @@
-//! `Reactor` (v0.3) trait — pure decisions producing new facts.
-//!
-//! Lives at `crate::reactor_v3::Reactor` until Phase 9 renames the file
-//! and removes the legacy `crate::reactor::Reactor<D>` builder struct.
-//! The two coexist deliberately: the legacy form continues to drive
-//! existing engine settle loops while v0.3 work proceeds incrementally.
+//! `Reactor` trait — pure decisions producing new facts.
 //!
 //! Per C5, reactors are forward-only — never replayable by default.
 //! Per C12, output emission goes through a runtime-side outbox with
-//! deterministic event_id derivation; details live in Phase 4.
+//! deterministic `event_id` derivation, drained into the log by the
+//! relay loop.
 //!
 //! Per C11, reactor outputs are appended via the non-OCC `emit` path.
 //! Saga-shaped operations needing aggregate-OCC ("emit only if
@@ -22,7 +18,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::contexts::Ctx;
-use crate::fact::Fact;
+use crate::event::Event;
 
 /// Pure decision producing `Events`. Forward-only; outputs go through
 /// the runtime-side outbox.
@@ -74,7 +70,7 @@ use crate::fact::Fact;
 ///   own stream.
 #[async_trait]
 pub trait Reactor: Send + Sync {
-    type Trigger: Fact;
+    type Trigger: Event;
 
     /// Persistent-subscription group name. See
     /// [`crate::Projector::GROUP_NAME`] for the full uniqueness
@@ -84,8 +80,37 @@ pub trait Reactor: Send + Sync {
     /// Decide on output facts in response to a trigger. Pure — no I/O
     /// to external systems beyond what's exposed via the trigger and
     /// `ctx`. Output type is heterogeneous (`Events`) to accommodate
-    /// reactors that emit across multiple Fact enums (e.g. system +
+    /// reactors that emit across multiple Event enums (e.g. system +
     /// discovery + scheduling).
+    ///
+    /// # Cross-category outputs are the norm
+    ///
+    /// Output facts do **not** need to share the trigger's category.
+    /// A reactor that consumes from one category and writes to
+    /// another is the common shape — e.g. a lifecycle reactor that
+    /// emits scheduling facts:
+    ///
+    /// ```ignore
+    /// impl Reactor for RunCompletion {
+    ///     type Trigger = LifecycleEvent;
+    ///     const GROUP_NAME: &'static str = "run_completion";
+    ///
+    ///     async fn react(
+    ///         &self,
+    ///         _trigger: &LifecycleEvent,
+    ///         _ctx: Ctx<'_>,
+    ///     ) -> Result<Events> {
+    ///         // Trigger is `lifecycle`; output is `schedule`.
+    ///         Ok(Events::new().add(ScheduleEvent::Created { /* ... */ }))
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The runtime routes each output to `{CATEGORY}-{stream_id}` per
+    /// the output Event's own `CATEGORY` const and `stream_id()` — the
+    /// trigger's category never leaks into the destination. Mixing
+    /// outputs from different categories in a single `Events` return
+    /// is also supported.
     async fn react(
         &self,
         trigger: &Self::Trigger,
@@ -112,8 +137,8 @@ pub trait Reactor: Send + Sync {
 //
 // `Events` is the universal `Reactor::react` return type — a
 // type-erased collection of output facts that the runtime persists
-// through the outbox. `EventOutput::new<F: Fact>` derives the
-// canonical `{CATEGORY}:{name}` event_type from the Fact's trait
+// through the outbox. `EventOutput::new<F: Event>` derives the
+// canonical `{CATEGORY}:{name}` event_type from the Event's trait
 // methods, matching what `Engine::emit` writes for caller-emitted
 // facts.
 
@@ -124,12 +149,11 @@ pub struct EventOutput {
     pub type_id: TypeId,
     /// Canonical event_type: `format!("{CATEGORY}:{name}")` — same
     /// shape `Engine::emit` writes on the producer side. Field name
-    /// kept as `durable_name` for backend-impl compatibility; the
-    /// value is the v0.4 event_type string.
+    /// kept as `durable_name` for backend-impl compatibility.
     pub durable_name: String,
-    /// `Fact::CATEGORY`. The stream category this output belongs to.
+    /// `Event::CATEGORY`. The stream category this output belongs to.
     pub event_prefix: String,
-    /// Stream id from `Fact::stream_id()` — which stream within
+    /// Stream id from `Event::stream_id()` — which stream within
     /// `event_prefix` this output targets.
     pub stream_id: Uuid,
     pub payload: serde_json::Value,
@@ -138,14 +162,14 @@ pub struct EventOutput {
 }
 
 impl EventOutput {
-    /// Create from a typed Fact. The durable_name is composed as
+    /// Create from a typed Event. The durable_name is composed as
     /// `format!("{CATEGORY}:{name}")` to match the Kurrent-aligned
     /// event_type shape.
-    pub fn new<F: crate::fact::Fact>(fact: F) -> Self {
-        let event_prefix = <F as crate::fact::Fact>::CATEGORY.to_string();
-        let durable_name = format!("{}:{}", event_prefix, fact.name());
+    pub fn new<F: crate::event::Event>(fact: F) -> Self {
+        let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
+        let durable_name = format!("{}:{}", event_prefix, fact.event_type());
         let stream_id = fact.stream_id();
-        let payload = serde_json::to_value(&fact).expect("Fact must be serializable");
+        let payload = serde_json::to_value(&fact).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(fact);
         Self {
             type_id: TypeId::of::<F>(),
@@ -181,7 +205,7 @@ impl EventOutput {
 /// `"order_placed"` → `"order_placed"` (no colon = whole string)
 ///
 /// For the common consumer-side case, prefer
-/// [`PersistedEvent::category`](crate::PersistedEvent::category).
+/// [`RecordedEvent::category`](crate::RecordedEvent::category).
 pub fn extract_prefix(event_type: &str) -> &str {
     event_type.split(':').next().unwrap_or(event_type)
 }
@@ -197,12 +221,12 @@ pub struct Events {
 impl Events {
     pub fn new() -> Self { Self { outputs: Vec::new() } }
 
-    pub fn add<F: crate::fact::Fact>(mut self, fact: F) -> Self {
+    pub fn add<F: crate::event::Event>(mut self, fact: F) -> Self {
         self.outputs.push(EventOutput::new(fact));
         self
     }
 
-    pub fn push<F: crate::fact::Fact>(&mut self, fact: F) {
+    pub fn push<F: crate::event::Event>(&mut self, fact: F) {
         self.outputs.push(EventOutput::new(fact));
     }
 
@@ -213,7 +237,7 @@ impl Events {
     pub fn len(&self) -> usize { self.outputs.len() }
     pub fn is_empty(&self) -> bool { self.outputs.is_empty() }
 
-    pub fn batch<F: crate::fact::Fact>(items: impl IntoIterator<Item = F>) -> Self {
+    pub fn batch<F: crate::event::Event>(items: impl IntoIterator<Item = F>) -> Self {
         Self {
             outputs: items.into_iter().map(EventOutput::new).collect(),
         }
@@ -241,9 +265,9 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
 
-    impl Fact for OrderPlaced {
+    impl Event for OrderPlaced {
         const CATEGORY: &'static str = "order";
-        fn name(&self) -> &str { "order_placed" }
+        fn event_type(&self) -> &str { "order_placed" }
         fn stream_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }

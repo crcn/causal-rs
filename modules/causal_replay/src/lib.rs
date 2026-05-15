@@ -30,7 +30,9 @@
 //! $ REPLAY=1 REPLAY_TARGETS=neo4j server    # replay neo4j only
 //! ```
 
+pub mod conformance;
 pub mod event_log;
+pub mod kurrent_event_log;
 pub mod mirroring;
 pub mod pointer;
 pub mod reactor_outbox;
@@ -58,3 +60,6 @@ pub use snapshot_store::PgSnapshotStore;
 
 #[cfg(feature = "postgres")]
 pub use tail::PgNotifyTailSource;
+
+#[cfg(feature = "kurrent")]
+pub use kurrent_event_log::KurrentEventLogBackend;

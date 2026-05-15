@@ -29,11 +29,11 @@ struct ProjectionCursorEntry {
     consecutive_failures: u32,
 }
 
-/// In-memory backend implementing the v0.4 trait surface.
+/// In-memory backend implementing the full trait surface.
 #[derive(Clone)]
 pub struct MemoryStore {
     /// Global event log.
-    global_log: Arc<Mutex<Vec<PersistedEvent>>>,
+    global_log: Arc<Mutex<Vec<RecordedEvent>>>,
     /// Global position counter for event ordering.
     global_position: Arc<AtomicU64>,
     /// Snapshot store keyed by (aggregate_type, aggregate_id).
@@ -56,11 +56,10 @@ pub struct MemoryStore {
     /// "no durability" position).
     reactor_attempts: Arc<DashMap<(String, Uuid), u32>>,
 
-    // ── Inspector observability (P13.a) ──────────────────────────
+    // ── Inspector observability ──────────────────────────
     //
-    // These mirror what v0.3 MemoryStore captured via the legacy
-    // IntentCommit path. Populated by `impl ReactorObserver for
-    // MemoryStore`. Read by `causal_inspector` to render UI panes.
+    // Populated by `impl ReactorObserver for MemoryStore`. Read by
+    // `causal_inspector` to render UI panes.
     //
     /// Reactor execution timing: `(event_id, reactor_id)` → `(corr,
     /// started_at, completed_at, status, error, attempts)`.
@@ -103,15 +102,14 @@ impl MemoryStore {
     }
 
     /// Access the underlying global event log (for test assertions).
-    pub fn global_log(&self) -> &Mutex<Vec<PersistedEvent>> {
+    pub fn global_log(&self) -> &Mutex<Vec<RecordedEvent>> {
         &self.global_log
     }
 
     // ── Inspector accessors ──────────────────────────────────────
     //
-    // These return the same shape as v0.3 so the inspector reads
-    // compile unchanged. Populated by the `ReactorObserver` impl
-    // below as the engine calls hooks.
+    // Populated by the `ReactorObserver` impl below as the engine
+    // calls hooks; consumed by `causal_inspector`.
 
     /// Reactor execution timing records keyed by `(event_id, reactor_id)`.
     pub fn reactor_executions(
@@ -293,25 +291,27 @@ impl ReactorObserver for MemoryStore {
     }
 }
 
-// ── EventLog implementation ─────────────────────────────────────────
+// ── EventLogBackend implementation ──────────────────────────────────
 
 #[async_trait]
 impl crate::event_log::EventLogBackend for MemoryStore {
-    async fn append(&self, event: NewEvent) -> Result<AppendResult> {
+    async fn append(&self, event: EventData) -> Result<WriteResult> {
         let mut log = self.global_log.lock();
 
         // Idempotency: if event_id already exists, return existing result
         if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
-            return Ok(AppendResult {
+            return Ok(WriteResult {
                 position: existing.position,
-                version: existing.version,
+                revision: existing.revision,
             });
         }
 
         let position = LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
 
-        // Compute per-aggregate version if aggregate metadata is present
-        let version = if let (Some(ref agg_type), Some(agg_id)) =
+        // Compute per-stream revision (0-indexed) if aggregate metadata
+        // is present. `count` = events ALREADY in this stream; the new
+        // event lands at `count` (so first event is revision 0).
+        let revision = if let (Some(ref agg_type), Some(agg_id)) =
             (&event.aggregate_type, event.aggregate_id)
         {
             let count = log
@@ -321,22 +321,22 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                         && e.aggregate_id == Some(agg_id)
                 })
                 .count() as u64;
-            Some(StreamVersion::from_raw(count + 1))
+            Some(StreamRevision::from_raw(count))
         } else {
             None
         };
 
-        let persisted = PersistedEvent {
+        let persisted = RecordedEvent {
             position,
             event_id: event.event_id,
-            parent_id: event.parent_id,
+            causation_id: event.causation_id,
             correlation_id: event.correlation_id,
             event_type: event.event_type,
             payload: event.payload,
             created_at: event.created_at,
             aggregate_type: event.aggregate_type,
             aggregate_id: event.aggregate_id,
-            version,
+            revision,
             metadata: event.metadata,
             ephemeral: event.ephemeral,
             persistent: event.persistent,
@@ -344,14 +344,14 @@ impl crate::event_log::EventLogBackend for MemoryStore {
 
         log.push(persisted);
 
-        Ok(AppendResult { position, version })
+        Ok(WriteResult { position, revision })
     }
 
-    async fn load_from(
+    async fn read_all(
         &self,
         after: LogCursor,
         limit: usize,
-    ) -> Result<Vec<PersistedEvent>> {
+    ) -> Result<Vec<RecordedEvent>> {
         let log = self.global_log.lock();
         let events = log
             .iter()
@@ -362,20 +362,23 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         Ok(events)
     }
 
-    async fn load_stream(
+    async fn read_stream(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        after_version: Option<StreamVersion>,
-    ) -> Result<Vec<PersistedEvent>> {
+        after: Option<StreamRevision>,
+    ) -> Result<Vec<RecordedEvent>> {
         let log = self.global_log.lock();
-        let min_version = after_version.unwrap_or(StreamVersion::ZERO);
         let events = log
             .iter()
             .filter(|e| {
                 e.aggregate_type.as_deref() == Some(aggregate_type)
                     && e.aggregate_id == Some(aggregate_id)
-                    && (after_version.is_none() || e.version.unwrap_or(StreamVersion::ZERO) > min_version)
+                    && match (after, e.revision) {
+                        (None, _) => true,
+                        (Some(min), Some(rev)) => rev > min,
+                        (Some(_), None) => false,
+                    }
             })
             .cloned()
             .collect();
@@ -387,57 +390,68 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         Ok(log.last().map(|e| e.position).unwrap_or(LogCursor::ZERO))
     }
 
-    /// Atomic CAS append for aggregate streams. Holds the global log
-    /// mutex for the duration of the version check + insert so two
-    /// concurrent callers can't both pass the check.
+    /// Atomic CAS append. Holds the global log mutex for the duration
+    /// of the state check + insert so two concurrent callers can't
+    /// both pass the check.
     async fn append_to_stream(
         &self,
         aggregate_type: &str,
         aggregate_id: Uuid,
-        expected: StreamVersion,
-        event: NewEvent,
-    ) -> Result<AppendResult> {
+        expected: crate::types::StreamState,
+        event: EventData,
+    ) -> Result<WriteResult> {
+        use crate::types::StreamState;
         let mut log = self.global_log.lock();
 
         // Idempotency: if event_id already exists, return existing
-        // result regardless of expected_version. Matches the C1
-        // contract: append is totally idempotent on event_id.
+        // result regardless of expected state.
         if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
-            return Ok(AppendResult {
+            return Ok(WriteResult {
                 position: existing.position,
-                version:  existing.version,
+                revision: existing.revision,
             });
         }
 
-        let current_count = log
+        let count = log
             .iter()
             .filter(|e| {
                 e.aggregate_type.as_deref() == Some(aggregate_type)
                     && e.aggregate_id == Some(aggregate_id)
             })
             .count() as u64;
-        let current = StreamVersion::from_raw(current_count);
-        if current != expected {
+        let current_tail: Option<StreamRevision> = if count == 0 {
+            None
+        } else {
+            Some(StreamRevision::from_raw(count - 1))
+        };
+        let matches = match (expected, current_tail) {
+            (StreamState::Any, _) => true,
+            (StreamState::NoStream, None) => true,
+            (StreamState::StreamExists, Some(_)) => true,
+            (StreamState::StreamRevision(want), Some(actual)) => actual.raw() == want,
+            _ => false,
+        };
+        if !matches {
             return Err(anyhow::Error::new(crate::event_log::ConflictError {
                 expected,
-                current,
+                current: current_tail,
             }));
         }
 
         let position = LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
-        let new_version = StreamVersion::from_raw(current_count + 1);
+        let new_revision = StreamRevision::from_raw(count);
 
-        let persisted = PersistedEvent {
+        let persisted = RecordedEvent {
             position,
             event_id: event.event_id,
-            parent_id: event.parent_id,
+            causation_id: event.causation_id,
             correlation_id: event.correlation_id,
             event_type: event.event_type,
             payload: event.payload,
             created_at: event.created_at,
             aggregate_type: Some(aggregate_type.to_string()),
             aggregate_id: Some(aggregate_id),
-            version: Some(new_version),
+            revision: Some(new_revision),
             metadata: event.metadata,
             ephemeral: event.ephemeral,
             persistent: event.persistent,
@@ -445,9 +459,8 @@ impl crate::event_log::EventLogBackend for MemoryStore {
 
         log.push(persisted);
 
-        Ok(AppendResult { position, version: Some(new_version) })
+        Ok(WriteResult { position, revision: Some(new_revision) })
     }
-
 }
 
 #[async_trait]
@@ -494,7 +507,7 @@ impl crate::checkpoint_store::CheckpointStore for MemoryStore {
 
 // ── ReactorOutbox implementation (C12 atomicity) ────────────────────
 
-// ── ProjectionOps (v0.4 ops surface) ────────────────────────────────
+// ── ProjectionOps surface ───────────────────────────────────────────
 
 #[async_trait]
 impl causal::projection::ProjectionOps for MemoryStore {
@@ -525,7 +538,7 @@ impl causal::projection::ProjectionOps for MemoryStore {
         // Direct DLQ write. Idempotent on (group_name, event_id) —
         // matches the unique-constraint contract documented on the
         // trait. See trait docs re: atomicity (not bundled with
-        // cursor advance under v0.4).
+        // cursor advance).
         let mut failures = self.projection_failures.lock();
         let already_present = failures.iter().any(|f| {
             f.projection_id == group_name && f.event_id == event_id
@@ -608,8 +621,7 @@ impl ReactorOutbox for MemoryStore {
             });
         }
         if let Some((consumer_id, pos)) = cursor {
-            // Mirror the ProjectionStore semantics for cursor write —
-            // upsert-with-create-on-missing.
+            // CheckpointStore::set semantics: upsert with create-on-missing.
             match self.projection_cursors.entry(consumer_id) {
                 dashmap::mapref::entry::Entry::Vacant(slot) => {
                     slot.insert(ProjectionCursorEntry {
@@ -792,9 +804,9 @@ mod outbox_tests {
         let store = MemoryStore::new();
         // Seed a cursor with error state. Use CheckpointStore::set to
         // establish the cursor row, then poke the error fields
-        // directly (the v0.4 ProjectionOps surface doesn't expose
-        // an in-flight error-state setter — `record_failure` writes
-        // DLQ rows, not live consecutive-failure counters).
+        // directly (ProjectionOps doesn't expose an in-flight
+        // error-state setter — `record_failure` writes DLQ rows,
+        // not live consecutive-failure counters).
         CheckpointStore::set(&store, "r3", LogCursor::ZERO).await.unwrap();
         if let Some(mut entry) = store.projection_cursors.get_mut("r3") {
             entry.last_error = Some("prior failure".into());
@@ -813,7 +825,7 @@ mod outbox_tests {
         assert_eq!(status.consecutive_failures, 0);
     }
 
-    // ── P8: v0.4 ProjectionOps surface ─────────────────────────────
+    // ── ProjectionOps surface ───────────────────────────────────────
 
     #[tokio::test]
     async fn projection_ops_record_and_list_failures() {

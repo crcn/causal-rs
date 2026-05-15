@@ -8,10 +8,6 @@
 //!   - Crash between successful append and outbox_delete is harmless
 //!     because the next drain re-appends — and the log's idempotent-
 //!     append-on-event_id contract (C1) absorbs the duplicate.
-//!
-//! Phase 4c lands the drain primitive (`RelayLoop::drain_once`) as a
-//! pure async function the engine builder can call. Phase 4d will
-//! spawn this in a long-running task with backoff and shutdown.
 
 use std::sync::Arc;
 
@@ -21,7 +17,7 @@ use chrono::{DateTime, Utc};
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::{OutboxRow, ReactorOutbox};
 use crate::event_log::EventLogBackend;
-use crate::types::NewEvent;
+use crate::types::EventData;
 
 pub struct RelayLoop {
     log:                 Arc<dyn EventLogBackend>,
@@ -78,10 +74,10 @@ impl RelayLoop {
         Ok(delivered)
     }
 
-    fn row_to_new_event(&self, row: &OutboxRow) -> NewEvent {
-        NewEvent {
+    fn row_to_new_event(&self, row: &OutboxRow) -> EventData {
+        EventData {
             event_id:       row.event_id,
-            parent_id:      Some(row.source_event_id),
+            causation_id:      Some(row.source_event_id),
             correlation_id: row.correlation_id,
             event_type:     row.event_type.clone(),
             payload:        row.fact_payload.clone(),
@@ -153,7 +149,7 @@ mod tests {
         assert!(store.outbox_pending(10).await.unwrap().is_empty());
 
         // Log has 3 events
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         assert_eq!(events.len(), 3);
@@ -174,9 +170,9 @@ mod tests {
 
         // Pre-write the same event_id directly to the log to simulate
         // "first drain succeeded at append, crashed before delete".
-        let dup = NewEvent {
+        let dup = EventData {
             event_id,
-            parent_id: Some(row.source_event_id),
+            causation_id: Some(row.source_event_id),
             correlation_id: row.correlation_id,
             event_type: row.event_type.clone(),
             payload: row.fact_payload.clone(),
@@ -200,7 +196,7 @@ mod tests {
         assert_eq!(n, 1);
 
         // Log has exactly one event with this event_id.
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         let matching: Vec<_> = events.iter().filter(|e| e.event_id == event_id).collect();
@@ -235,7 +231,7 @@ mod tests {
         );
         relay.drain_once(10).await.unwrap();
 
-        let events = EventLogBackend::load_from(
+        let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         let row = &events[0];

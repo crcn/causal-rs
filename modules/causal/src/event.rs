@@ -1,35 +1,35 @@
-//! `Fact` trait — v0.4 application-facing surface for events.
+//! `Event` trait — application-facing surface for events.
 //!
-//! Every value appended to the event log implements `Fact`. The trait
+//! Every value appended to the event log implements `Event`. The trait
 //! is Kurrent-aligned by design:
 //!
-//! - [`CATEGORY`](Fact::CATEGORY): per-type const, the prefix of
+//! - [`CATEGORY`](Event::CATEGORY): per-type const, the prefix of
 //!   Kurrent's `category-id` stream-name convention. Every variant
-//!   of a Fact enum shares one category. Subscriptions are by
+//!   of a Event enum shares one category. Subscriptions are by
 //!   category (`$ce-{CATEGORY}`).
-//! - [`name`](Fact::name): per-variant event name. The runtime
-//!   composes Kurrent's `event_type` as `format!("{}:{}",
-//!   Self::CATEGORY, self.name())`.
-//! - [`stream_id`](Fact::stream_id): per-variant stream id. The
+//! - [`event_type`](Event::event_type): per-variant event type name.
+//!   The runtime composes Kurrent's stored `event_type` as
+//!   `format!("{}:{}", Self::CATEGORY, self.event_type())`.
+//! - [`stream_id`](Event::stream_id): per-variant stream id. The
 //!   runtime composes the stream name as `format!("{}-{}",
 //!   Self::CATEGORY, self.stream_id())`.
-//! - [`occurred_at`](Fact::occurred_at): optional producer-claimed
+//! - [`occurred_at`](Event::occurred_at): optional producer-claimed
 //!   occurrence time. Defaults to `None`; runners fall back to
 //!   `event.created_at` (the persistence-side envelope timestamp).
 //!
-//! Phase 6 macros (`#[fact(category = "..."])`) generate the impl
-//! from the enum definition. Hand-rolling is also fine — single
-//! const, two methods.
+//! The `#[event(prefix = "...")]` macro (re-exported as
+//! [`causal::event`]) generates the impl from an enum definition.
+//! Hand-rolling is also fine — single const, two methods.
 
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use uuid::Uuid;
 
 /// Application-facing event type. Implemented per fact value.
-pub trait Fact: Serialize + DeserializeOwned + Send + Sync + 'static {
+pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Stream category — the prefix portion of Kurrent's
     /// `category-id` stream name convention. Identifies the kind of
-    /// entity this Fact's variants are about. All variants share
+    /// entity this Event's variants are about. All variants share
     /// one category.
     ///
     /// Subscriptions filter by this via `$ce-{CATEGORY}` system
@@ -37,11 +37,11 @@ pub trait Fact: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// support filter by `aggregate_type = CATEGORY`.
     const CATEGORY: &'static str;
 
-    /// Per-variant event name. Stored as Kurrent's `event_type`
-    /// after the runtime composes `format!("{}:{}", Self::CATEGORY,
-    /// self.name())`. Bare variant slug — do NOT include the
-    /// category prefix here; the runtime adds it.
-    fn name(&self) -> &str;
+    /// Per-variant event type name. The runtime composes the
+    /// stored `event_type` field as `format!("{}:{}", Self::CATEGORY,
+    /// self.event_type())`. Return the bare variant slug here — do
+    /// NOT include the category prefix; the runtime adds it.
+    fn event_type(&self) -> &str;
 
     /// Per-variant stream id. Combined with [`Self::CATEGORY`] the
     /// runtime composes the Kurrent-style stream name
@@ -83,6 +83,25 @@ pub trait Fact: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn occurred_at(&self) -> Option<DateTime<Utc>> { None }
 }
 
+/// Compose the canonical Kurrent-style stream name for a fact:
+/// `{F::CATEGORY}-{stream_id}`.
+///
+/// Returns the same string the runtime uses when appending a fact
+/// of type `F` whose `stream_id()` returns `id`. Useful when you
+/// need the stream name out-of-band — e.g., constructing a Kurrent
+/// admin-UI link, running a raw `read_stream` against the
+/// underlying client, or asserting a stream name in tests.
+pub fn stream_name_for<F: Event>(id: uuid::Uuid) -> String {
+    format!("{}-{}", F::CATEGORY, id)
+}
+
+/// Compose the canonical event_type for a fact:
+/// `{F::CATEGORY}:{fact.event_type()}`. Same shape `Engine::emit` writes
+/// to `RecordedEvent::event_type` and Kurrent's `event_type` field.
+pub fn event_type_for<F: Event>(fact: &F) -> String {
+    format!("{}:{}", F::CATEGORY, fact.event_type())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,9 +113,9 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
 
-    impl Fact for ScheduleCreated {
+    impl Event for ScheduleCreated {
         const CATEGORY: &'static str = "schedule";
-        fn name(&self) -> &str { "created" }
+        fn event_type(&self) -> &str { "created" }
         fn stream_id(&self) -> Uuid { self.schedule_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -116,7 +135,7 @@ mod tests {
 
     #[test]
     fn category_is_per_type_const() {
-        assert_eq!(<ScheduleCreated as Fact>::CATEGORY, "schedule");
+        assert_eq!(<ScheduleCreated as Event>::CATEGORY, "schedule");
     }
 
     #[test]
@@ -126,7 +145,7 @@ mod tests {
             schedule_id: Uuid::nil(),
             occurred_at: Utc::now(),
         };
-        assert_eq!(f.name(), "created");
+        assert_eq!(f.event_type(), "created");
     }
 
     #[test]
@@ -143,7 +162,7 @@ mod tests {
         // trait surface narrows to providing the components.
         let id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
         let f = ScheduleCreated { schedule_id: id, occurred_at: Utc::now() };
-        let stream_name = format!("{}-{}", <ScheduleCreated as Fact>::CATEGORY, f.stream_id());
+        let stream_name = format!("{}-{}", <ScheduleCreated as Event>::CATEGORY, f.stream_id());
         assert_eq!(stream_name, format!("schedule-{}", id));
     }
 
@@ -155,7 +174,7 @@ mod tests {
             schedule_id: Uuid::nil(),
             occurred_at: Utc::now(),
         };
-        let event_type = format!("{}:{}", <ScheduleCreated as Fact>::CATEGORY, f.name());
+        let event_type = format!("{}:{}", <ScheduleCreated as Event>::CATEGORY, f.event_type());
         assert_eq!(event_type, "schedule:created");
     }
 }

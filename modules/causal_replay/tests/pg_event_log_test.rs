@@ -6,8 +6,8 @@
 //!
 //! - **C1** (append idempotency on event_id) — duplicate appends collapse.
 //! - **C6** (aggregate OCC) — stale `expected_version` errors out.
-//! - `load_from` returns events in monotonic position order.
-//! - `load_stream` partitions by `(aggregate_type, aggregate_id)`.
+//! - `read_all` returns events in monotonic position order.
+//! - `read_stream` partitions by `(aggregate_type, aggregate_id)`.
 //! - `latest_position` reports the max persisted position.
 //!
 //! Schema requires migration 054_causal_v03_backend_tables.sql to have
@@ -20,7 +20,7 @@
 #![cfg(feature = "postgres")]
 
 use anyhow::Result;
-use causal::types::{LogCursor, NewEvent, StreamVersion};
+use causal::types::{LogCursor, EventData, StreamRevision, StreamState};
 use causal::EventLogBackend;
 use causal_replay::PgEventLogBackend;
 use chrono::Utc;
@@ -68,10 +68,10 @@ async fn connect_local() -> PgPool {
 
 /// Each test isolates its rows by using a unique correlation_id and
 /// filtering on it. Avoids TRUNCATE (which would race other tests).
-fn make_event(correlation_id: Uuid, event_type: &str) -> NewEvent {
-    NewEvent {
+fn make_event(correlation_id: Uuid, event_type: &str) -> EventData {
+    EventData {
         event_id: Uuid::new_v4(),
-        parent_id: None,
+        causation_id: None,
         correlation_id,
         event_type: event_type.to_string(),
         payload: serde_json::json!({}),
@@ -137,23 +137,23 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
     let correlation = Uuid::new_v4();
     let aggregate_id = Uuid::new_v4();
 
-    // Initial append at version 0 → should land at version 1.
+    // Initial append at NoStream → lands at revision 0.
     let r1 = backend
         .append_to_stream(
             "order",
             aggregate_id,
-            StreamVersion::ZERO,
+            StreamState::NoStream,
             make_event(correlation, "test:order_placed"),
         )
         .await?;
-    assert_eq!(r1.version, Some(StreamVersion::from_raw(1)));
+    assert_eq!(r1.revision, Some(StreamRevision::ZERO));
 
     // Stale expected (still 0) → conflict.
     let stale = backend
         .append_to_stream(
             "order",
             aggregate_id,
-            StreamVersion::ZERO,
+            StreamState::NoStream,
             make_event(correlation, "test:order_updated"),
         )
         .await;
@@ -164,16 +164,16 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
         "error must report OCC conflict; got: {err}"
     );
 
-    // Correct expected (1) → next version 2.
+    // Correct expected (StreamRevision(0)) → next revision 1.
     let r2 = backend
         .append_to_stream(
             "order",
             aggregate_id,
-            StreamVersion::from_raw(1),
+            StreamState::StreamRevision(0),
             make_event(correlation, "test:order_updated"),
         )
         .await?;
-    assert_eq!(r2.version, Some(StreamVersion::from_raw(2)));
+    assert_eq!(r2.revision, Some(StreamRevision::from_raw(1)));
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
         .bind(correlation)
@@ -184,7 +184,7 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires local DATABASE_URL + migration 054 applied"]
-async fn load_from_returns_events_in_position_order() -> Result<()> {
+async fn read_all_returns_events_in_position_order() -> Result<()> {
     let pool = connect_local().await;
     let backend = PgEventLogBackend::new(pool.clone());
 
@@ -197,9 +197,9 @@ async fn load_from_returns_events_in_position_order() -> Result<()> {
         positions.push(r.position);
     }
 
-    // Capture the position BEFORE the first event — load_from is exclusive.
+    // Capture the position BEFORE the first event — read_all is exclusive.
     let before = LogCursor::from_raw(positions[0].raw() - 1);
-    let loaded = backend.load_from(before, 100).await?;
+    let loaded = backend.read_all(before, 100).await?;
 
     let our_events: Vec<_> = loaded
         .iter()
@@ -211,7 +211,7 @@ async fn load_from_returns_events_in_position_order() -> Result<()> {
     for e in &our_events {
         assert!(
             e.position > prev,
-            "load_from must return monotonically-increasing positions"
+            "read_all must return monotonically-increasing positions"
         );
         prev = e.position;
     }
@@ -225,7 +225,7 @@ async fn load_from_returns_events_in_position_order() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires local DATABASE_URL + migration 054 applied"]
-async fn load_stream_partitions_by_aggregate() -> Result<()> {
+async fn read_stream_partitions_by_aggregate() -> Result<()> {
     let pool = connect_local().await;
     let backend = PgEventLogBackend::new(pool.clone());
 
@@ -233,38 +233,39 @@ async fn load_stream_partitions_by_aggregate() -> Result<()> {
     let agg_a = Uuid::new_v4();
     let agg_b = Uuid::new_v4();
 
-    // 3 events for agg_a, 2 for agg_b — interleaved.
-    for (agg, version) in [
-        (agg_a, 1u64),
-        (agg_b, 1u64),
-        (agg_a, 2u64),
-        (agg_a, 3u64),
-        (agg_b, 2u64),
+    // 3 events for agg_a, 2 for agg_b — interleaved. `prev` is the
+    // 0-indexed revision of the LAST event written to that stream;
+    // None means "stream is empty so far".
+    for (agg, prev) in [
+        (agg_a, None),
+        (agg_b, None),
+        (agg_a, Some(0u64)),
+        (agg_a, Some(1u64)),
+        (agg_b, Some(0u64)),
     ] {
         let event = make_event(correlation, "test:stream_event");
+        let expected = match prev {
+            None => StreamState::NoStream,
+            Some(r) => StreamState::StreamRevision(r),
+        };
         backend
-            .append_to_stream(
-                "test_aggregate",
-                agg,
-                StreamVersion::from_raw(version - 1),
-                event,
-            )
+            .append_to_stream("test_aggregate", agg, expected, event)
             .await?;
     }
 
     let stream_a = backend
-        .load_stream("test_aggregate", agg_a, None)
+        .read_stream("test_aggregate", agg_a, None)
         .await?;
     let stream_b = backend
-        .load_stream("test_aggregate", agg_b, None)
+        .read_stream("test_aggregate", agg_b, None)
         .await?;
 
     assert_eq!(stream_a.len(), 3);
     assert_eq!(stream_b.len(), 2);
 
-    // Verify version ordering.
+    // 0-indexed revision ordering: events at r0, r1, r2.
     for (i, e) in stream_a.iter().enumerate() {
-        assert_eq!(e.version, Some(StreamVersion::from_raw((i + 1) as u64)));
+        assert_eq!(e.revision, Some(StreamRevision::from_raw(i as u64)));
     }
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")

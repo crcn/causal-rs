@@ -1,15 +1,18 @@
-//! Projection configuration types and persistence trait.
+//! Projection configuration types and operational extension trait.
 //!
 //! This module defines the public API for configuring projections (mode,
-//! retry policy, start position) and the persistence trait
-//! (`ProjectionStore`) that backends implement to support per-projection
-//! cursors. The runtime (`ProjectionRunner`, engine integration,
-//! sync-vs-async dispatch) is implemented separately and consumes this
-//! trait — see `docs/plans/2026-05-04-feat-async-projections-plan.md`.
+//! retry policy, start position) and the operational trait
+//! ([`ProjectionOps`]) that backends layer on top of [`CheckpointStore`]
+//! to expose DLQ + pause/resume + status surface. The runtime
+//! (`ProjectionRunner`, engine integration, sync-vs-async dispatch) is
+//! implemented separately and consumes these traits — see
+//! `docs/plans/2026-05-04-feat-async-projections-plan.md`.
 //!
-//! Backends implement `ProjectionStore` against their own storage. An
+//! Backends implement `ProjectionOps` against their own storage. An
 //! in-memory implementation is provided on `MemoryStore` for tests and
 //! single-process use cases.
+//!
+//! [`CheckpointStore`]: crate::checkpoint_store::CheckpointStore
 //!
 //! ## Recommended schema (Postgres backends)
 //!
@@ -155,9 +158,44 @@ pub enum StartPosition {
     /// Always start at `LogCursor::ZERO`. Force backfill from the
     /// beginning of the event log. Search-index rebuild, analytics
     /// reset, etc.
+    ///
+    /// # ⚠️ Replay hazard
+    ///
+    /// `Zero` (and `Specific` for any position behind a downstream
+    /// consumer's view) re-emits every event the projector has seen
+    /// before. **Anything reading the projector's output state during
+    /// replay will see partial / re-derived state until replay
+    /// completes.** Concretely:
+    ///
+    /// - If the projector writes to a shared DB table, a peer
+    ///   consumer Y reading that table during replay observes rows
+    ///   being rewritten in event order — not the final state.
+    /// - If the projector emits notifications, downstream
+    ///   subscribers receive each one again. Without idempotency
+    ///   on the receiving side, this is a duplicate-action bug
+    ///   (re-sent emails, re-charged cards, etc.).
+    ///
+    /// The framework cannot guard against this — the safe pattern is
+    /// application-side. Choose one:
+    ///
+    /// - **Blue-green tables.** Replay into a `_v2` table or schema;
+    ///   atomically swap once cursor catches up. The reference
+    ///   implementation is [`causal_replay::ProjectionStream`] in
+    ///   `Mode::Replay` — it stages into a separate target then
+    ///   promotes.
+    /// - **Idempotent UPSERTs.** If the projection writes are
+    ///   commutative or last-write-wins on the same key, replay is a
+    ///   no-op. Verify this is actually true for your projection
+    ///   before relying on it.
+    /// - **Coordinated downtime.** Pause peer consumers, replay,
+    ///   resume. Simplest, requires ops coordination.
+    ///
+    /// Treat `Zero` as a footgun on any non-trivial deployment.
     Zero,
     /// Specific position. Manual rewind for debugging or partial
-    /// replay.
+    /// replay. **Same replay hazard as [`StartPosition::Zero`]** when
+    /// the position is behind a downstream consumer's view — see
+    /// the warning above.
     Specific(LogCursor),
 }
 
@@ -167,7 +205,7 @@ pub enum StartPosition {
 
 /// Status snapshot of a projection.
 ///
-/// Returned by `ProjectionStore::projection_status` and
+/// Returned by [`ProjectionOps::status`] and
 /// `Engine::projection_status`. Used by the inspector UI and
 /// operational tooling.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +230,7 @@ pub struct ProjectionFailure {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// v0.4 surface — minimal ops trait on top of CheckpointStore
+// Minimal ops trait on top of CheckpointStore
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Optional operational extension to [`CheckpointStore`]. Carries the
@@ -201,36 +239,23 @@ pub struct ProjectionFailure {
 /// projections, throwaway tests — can satisfy the runtime with just
 /// `CheckpointStore`.
 ///
-/// Compared to the legacy [`ProjectionStore`]:
-/// - Cursor get/set lives on `CheckpointStore` (required base trait).
-/// - CAS variants (`advance_projection_cursor`, `advance_past_failure`)
-///   are gone — the v0.4 runners use `CheckpointStore::set` and call
-///   `record_failure` separately when DLQ-skipping is wanted.
-/// - The trait surface drops from ~12 methods to 5.
+/// ## DLQ write is not atomic with cursor advance
 ///
-/// ## Semantic change from `ProjectionStore`: DLQ write is no longer
-/// atomic with cursor advance
-///
-/// The legacy [`ProjectionStore::advance_past_failure`] bundled the
-/// DLQ row write and cursor advance into one transaction. A runner
-/// crash between the two writes was impossible by construction.
-///
-/// `ProjectionOps` decouples them: callers in `AdvanceAfter` mode
-/// invoke `record_failure(...)` and then `CheckpointStore::set(...)`
-/// as **two separate writes**. A crash between them leaves a DLQ row
-/// recorded but the cursor unmoved — the runner will retry the
-/// failing event on restart and (if it succeeds this time) leave a
-/// misleading DLQ entry for an event that ultimately processed.
+/// Callers in `AdvanceAfter` mode invoke [`record_failure`] and then
+/// [`CheckpointStore::set`] as **two separate writes**. A crash
+/// between them leaves a DLQ row recorded but the cursor unmoved —
+/// the runner will retry the failing event on restart and (if it
+/// succeeds this time) leave a misleading DLQ entry for an event
+/// that ultimately processed.
 ///
 /// **Implementation guidance for backends with transactions**:
-/// expose your own atomic helper alongside the trait if you want the
-/// legacy guarantee back. Backends without transactions (in-memory,
-/// some KV stores) can't offer atomicity here anyway — the trait's
-/// looser contract reflects what's actually portable.
+/// expose your own atomic helper alongside the trait if you want a
+/// strict guarantee. Backends without transactions (in-memory, some
+/// KV stores) can't offer atomicity here anyway — the trait's looser
+/// contract reflects what's portable.
 ///
-/// During the v0.3 → v0.4 transition this trait is available alongside
-/// `ProjectionStore`; P11 (Legacy collapse) deletes `ProjectionStore`
-/// and migrates Postgres backends to `ProjectionOps` directly.
+/// [`CheckpointStore::set`]: crate::checkpoint_store::CheckpointStore::set
+/// [`record_failure`]: ProjectionOps::record_failure
 #[async_trait]
 pub trait ProjectionOps: crate::checkpoint_store::CheckpointStore {
     /// Set the paused flag for a projection. Runners check this

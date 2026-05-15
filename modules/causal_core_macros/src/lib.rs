@@ -1714,15 +1714,15 @@ enum IdAccess {
     Method(Ident),
     /// Singleton — uses `Uuid::nil()` as a constant ID.
     Singleton,
-    /// Default: use `Fact::stream_id`. Emitted when `#[aggregator]`
+    /// Default: use `Event::stream_id`. Emitted when `#[aggregator]`
     /// has no arguments (or `#[aggregators]` has no module-level
     /// default). Factory uses the plain `Aggregator::for_type::<A,F>()`
-    /// path which delegates to `Fact::stream_id` internally.
+    /// path which delegates to `Event::stream_id` internally.
     FactStreamId,
 }
 
 /// Parse `id = "field"` or `id_fn = "method"` from `#[aggregator(...)]`.
-/// Empty metas → `IdAccess::FactStreamId` (use `Fact::stream_id`,
+/// Empty metas → `IdAccess::FactStreamId` (use `Event::stream_id`,
 /// the documented v0.4 default).
 fn parse_aggregator_id_access(metas: &Punctuated<Meta, Token![,]>) -> syn::Result<IdAccess> {
     for meta in metas {
@@ -1858,7 +1858,7 @@ fn expand_aggregator_with_id(
     // `Some(...)`. The singleton case returns `Some(Uuid::nil())`.
     //
     // 0.4.0–0.4.4 silently ignored this attribute and hard-coded
-    // `Fact::stream_id`. 0.4.5 restores the v0.3 semantics: events
+    // `Event::stream_id`. 0.4.5 restores the v0.3 semantics: events
     // can fold into aggregators keyed by a field/method/singleton
     // that differs from their natural stream_id.
     // User id_fn methods may return either `Uuid` or `Option<Uuid>` —
@@ -1866,7 +1866,7 @@ fn expand_aggregator_with_id(
     // either signature compiles. Field access lifts a bare `Uuid`
     // field; singleton always returns `Some(Uuid::nil())`. The default
     // (no attribute) path uses `Aggregator::for_type` which delegates
-    // to `Fact::stream_id` internally — exactly what most run-scoped
+    // to `Event::stream_id` internally — exactly what most run-scoped
     // facts want.
     let factory_body = match id_access {
         IdAccess::FactStreamId => quote! {
@@ -1900,14 +1900,14 @@ fn expand_aggregator_with_id(
     // (`fn on_x(state, event: F)`); the macro adapts by binding
     // `#event_ident` to a `&F` and shadowing it with a cheap clone
     // inside the body so the user's owned-value semantics stand.
-    // Fact types are Clone by trait bound, so this is uniformly safe.
+    // Event types are Clone by trait bound, so this is uniformly safe.
     Ok(quote! {
         impl ::causal::Apply<#event_ty> for #agg_ty {
             fn apply(&mut self, #event_ident: &#event_ty) {
                 let #agg_ident = self;
                 // Shadow `event` as owned so v0.3-style bodies that
                 // pattern-match or pass-by-value compile unchanged.
-                // Clone is bound by Fact: Clone.
+                // Clone is bound by Event: Clone.
                 let #event_ident: #event_ty = #event_ident.clone();
                 #body
             }
@@ -1936,7 +1936,7 @@ fn expand_aggregators_module(
         ));
     };
 
-    // No module args → default to `Fact::stream_id` for bare functions.
+    // No module args → default to `Event::stream_id` for bare functions.
     // Pre-0.4.5, no-args `#[aggregators]` skipped bare functions; now
     // they expand with the documented default.
     let module_id_access = if module_metas.is_empty() {
@@ -2004,7 +2004,7 @@ fn expand_aggregators_module(
 
 // ── #[event] proc macro ─────────────────────────────────────────────
 
-/// Marks a type as a causal Fact, generating a `causal::Fact` impl.
+/// Marks a type as a causal Event, generating a `causal::Event` impl.
 ///
 /// # Usage
 ///
@@ -2046,17 +2046,17 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct EventArgs {
     prefix: Option<String>,
     ephemeral: bool,
-    /// v0.3 Fact: stream category. When both `stream_category` and
+    /// v0.3 Event: stream category. When both `stream_category` and
     /// `stream_id` are set, the macro additionally generates
-    /// `impl ::causal::Fact` with `stream()` returning a `StreamRef`
+    /// `impl ::causal::Event` with `stream()` returning a `StreamRef`
     /// built from the named field on each variant.
     stream_category: Option<String>,
-    /// v0.3 Fact: name of the field carrying the stream id. Must be
+    /// v0.3 Event: name of the field carrying the stream id. Must be
     /// present on every variant. Type must be `Uuid`.
     stream_id: Option<String>,
-    /// v0.3 Fact: name of the field carrying the logical occurrence
+    /// v0.3 Event: name of the field carrying the logical occurrence
     /// time. Defaults to `"occurred_at"`. Must be present on every
-    /// variant when generating Fact. Type must be `DateTime<Utc>`.
+    /// variant when generating Event. Type must be `DateTime<Utc>`.
     occurred_at_field: Option<String>,
 }
 
@@ -2219,9 +2219,9 @@ fn expand_event_enum(
         name_arms.push(quote! { #pattern => #bare });
     }
 
-    // ─── v0.4 Fact impl ──
+    // ─── v0.4 Event impl ──
     //
-    // Emit a Fact impl in all cases. CATEGORY comes from
+    // Emit a Event impl in all cases. CATEGORY comes from
     // `stream_category` if supplied, otherwise from `prefix`.
     // stream_id() uses the variant field named by `stream_id` if
     // supplied, otherwise defaults to `Uuid::nil()` (acceptable for
@@ -2274,7 +2274,7 @@ fn expand_event_enum(
                         return Err(syn::Error::new_spanned(
                             variant_name,
                             format!(
-                                "#[event] Fact generation requires every variant to have an `{}` field (override with `occurred_at_field = \"...\"`)",
+                                "#[event] Event generation requires every variant to have an `{}` field (override with `occurred_at_field = \"...\"`)",
                                 occurred_field
                             ),
                         ));
@@ -2289,16 +2289,16 @@ fn expand_event_enum(
                 Fields::Unnamed(_) | Fields::Unit => {
                     return Err(syn::Error::new_spanned(
                         variant_name,
-                        "#[event] Fact generation requires named-fields variants when stream_id/occurred_at_field are used",
+                        "#[event] Event generation requires named-fields variants when stream_id/occurred_at_field are used",
                     ));
                 }
             }
         }
 
         quote! {
-            impl ::causal::Fact for #name {
+            impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
-                fn name(&self) -> &str {
+                fn event_type(&self) -> &str {
                     match self {
                         #(#name_arms,)*
                     }
@@ -2316,14 +2316,14 @@ fn expand_event_enum(
             }
         }
     } else {
-        // No `stream_id` arg: emit a Fact impl with the prefix as
+        // No `stream_id` arg: emit a Event impl with the prefix as
         // CATEGORY, bare variant name as `name()`, and
         // `Uuid::nil()` as stream_id (category-singleton). Used by
         // operational/telemetry events that aren't per-aggregate.
         quote! {
-            impl ::causal::Fact for #name {
+            impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #prefix;
-                fn name(&self) -> &str {
+                fn event_type(&self) -> &str {
                     match self {
                         #(#name_arms,)*
                     }
@@ -2335,7 +2335,7 @@ fn expand_event_enum(
         }
     };
 
-    // Legacy `Event` impl emission removed in P11.d — only `Fact`
+    // Legacy `Event` impl emission removed in P11.d — only `Event`
     // is generated now.
     let _ = (match_arms, ephemeral);
     Ok(quote! {
@@ -2362,7 +2362,7 @@ fn expand_event_struct(
 
     let prefix_str = durable.clone();
 
-    // v0.4 Fact impl for structs. CATEGORY = `stream_category` if
+    // v0.4 Event impl for structs. CATEGORY = `stream_category` if
     // supplied, else `prefix` (or the snake-cased struct name).
     // stream_id uses the `stream_id` field name if supplied, else
     // `Uuid::nil()` (category-singleton). occurred_at uses
@@ -2378,9 +2378,9 @@ fn expand_event_struct(
                 .unwrap_or_else(|| "occurred_at".to_string())
         );
         quote! {
-            impl ::causal::Fact for #name {
+            impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
-                fn name(&self) -> &str { #bare_name }
+                fn event_type(&self) -> &str { #bare_name }
                 fn stream_id(&self) -> ::uuid::Uuid {
                     self.#id_field_ident
                 }
@@ -2392,9 +2392,9 @@ fn expand_event_struct(
     } else {
         let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
         quote! {
-            impl ::causal::Fact for #name {
+            impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
-                fn name(&self) -> &str { #bare_name }
+                fn event_type(&self) -> &str { #bare_name }
                 fn stream_id(&self) -> ::uuid::Uuid {
                     ::uuid::Uuid::nil()
                 }

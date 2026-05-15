@@ -1,22 +1,12 @@
-//! Single `Ctx` type passed to all v0.3 consumer bodies.
-//!
-//! The audit collapsed three identical structs (`ApplyCtx`,
-//! `MaterializeCtx`, `ReactCtx`) into one because the capability
-//! boundary that justified separate types — `MaterializeCtx` lacks
-//! `view::<V>()`, `ReactCtx` has it, `ApplyCtx` lacks it — went away
-//! when the `View` trait was cut. Three identical structs add no
-//! safety, just noise; `Ctx` is the result.
+//! Single `Ctx` type passed to all consumer bodies. Three separate
+//! context types would add no safety beyond what the runtime already
+//! enforces.
 //!
 //! Critical property — no wall-clock accessor. `ctx.now()` returns
 //! the fact's logical `occurred_at`, set at emit by the producer.
-//! Replay reproduces byte-identical state because deterministic
-//! time is the only reachable time.
-//!
-//! Phase tagging for migration boundaries lives in `ctx.metadata`
-//! (the producer stamps `_phase = "pre_migration"` etc.); the
-//! audit cut the dedicated `Phase` enum since no consumer body
-//! branched on `is_replay()` / `is_live()` and the design always
-//! preferred metadata-based tagging.
+//! Replay reproduces byte-identical state because deterministic time
+//! is the only reachable time. Migration-boundary tagging belongs in
+//! `ctx.metadata`, not a dedicated enum.
 
 use std::sync::Arc;
 
@@ -24,7 +14,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use crate::aggregate_v3::Aggregate;
+use crate::aggregate::Aggregate;
 use crate::aggregator::AggregatorRegistry;
 use crate::types::{LogCursor, LogEntry, LogLevel};
 
@@ -43,7 +33,7 @@ pub struct AggregateState<A> {
 /// them via `ctx.metadata`.
 pub type Metadata = serde_json::Map<String, serde_json::Value>;
 
-/// Context passed to every v0.4 consumer body
+/// Context passed to every consumer body
 /// (`Projector::project`, `Reactor::react`, `MultiProjector::project`).
 ///
 /// Deliberately absent: any wall-clock accessor. `ctx.now()` returns
@@ -118,9 +108,8 @@ impl<'a> Ctx<'a> {
     /// `curr` reflects state INCLUDING the current event because the
     /// runner folds before invoking the consumer body.
     ///
-    /// Restores the v0.2.x `ctx.aggregate::<A>()` accessor. Used for
-    /// incrementally-built read-only state shared across reactors /
-    /// projectors (saga-style PipelineState pattern).
+    /// Used for incrementally-built read-only state shared across
+    /// reactors / projectors (saga-style PipelineState pattern).
     ///
     /// # Panics
     /// Panics if no aggregators were registered with the engine via

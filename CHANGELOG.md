@@ -4,6 +4,243 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-15
+
+### Breaking — module-path cleanup (the _v3 → canonical rename)
+
+The three migration-era `_v3` modules drop their suffix; the legacy
+non-v3 versions they coexisted with had already been deleted earlier
+in the v0.4 line. Direct imports via the old paths break.
+
+- `causal::aggregate_v3` → `causal::aggregate` (trait + Apply<F>)
+- `causal::engine_v3` → `causal::engine` (Engine, EngineBuilder, EmitBuilder)
+- `causal::reactor_v3` → `causal::reactor` (Reactor, Events, EventOutput)
+
+Public re-exports through `causal::Engine`, `causal::Reactor`,
+`causal::Aggregate`, `causal::Events`, etc. are unchanged — only
+direct `causal::<module>_v3::` paths need updating to the new module
+name.
+
+### Docs housecleaning
+
+Removed historical implementation plans, brainstorms, audits, and
+migration-era schema/runbooks from `docs/` (~55 files). What remains:
+`README.md`, `CHANGELOG.md`, `docs/MIGRATION_0.4.md`,
+`docs/schema.sql`. Source-tree doc headers stripped of phase-numbered
+migration narration (v0.3, v0.4, "Phase 4d MVP", "Lives at X until
+Phase 9 renames the file", etc.) — the surface IS current, so the
+docs say so directly.
+
+### Breaking — final KurrentDB vocabulary cleanup (2026-05-15)
+
+Follow-up to the 2026-05-14 alignment pass. Closes the remaining
+divergences after one more audit:
+
+- **`Fact` trait → `Event`.** Closes the last causal-only term in
+  the core surface. The three-layer model is now
+  `Event` (typed authoring trait) → `EventData` (write boundary) →
+  `RecordedEvent` (read boundary). `causal::Event` replaces
+  `causal::Fact`; module path renamed `causal::fact` →
+  `causal::event`; `pub use causal_core_macros::event` is the macro
+  (was effectively unchanged — the trait was the noun).
+- **`Event::name()` → `Event::event_type()`.** Method name matches
+  the stored field on `EventData` / `RecordedEvent`. No more
+  `f.name() → "{prefix}:{name}"` recursion.
+- **`AppendResult` → `WriteResult`.** Kurrent's exact name on the
+  return type from `append` / `append_to_stream`.
+- **Dropped `load_stream` / `load_from` aliases** from
+  `EventLogBackend`. `read_stream` / `read_all` are the only names;
+  every backend impl + caller uses them.
+
+Migration (additive to the 2026-05-14 matrix in this same
+`[Unreleased]` block):
+
+| Find | Replace |
+|---|---|
+| `Fact` (trait) | `Event` |
+| `Fact::CATEGORY` | `Event::CATEGORY` |
+| `impl Fact for X` | `impl Event for X` |
+| `fn name(&self) -> &str` (on Event impls) | `fn event_type(&self) -> &str` |
+| `.name()` (on Event values) | `.event_type()` |
+| `causal::fact::*` | `causal::event::*` |
+| `AppendResult` | `WriteResult` |
+| `.load_from(...)` | `.read_all(...)` |
+| `.load_stream(...)` | `.read_stream(...)` |
+
+### Breaking — KurrentDB vocabulary alignment
+
+A coordinated rename pass to make causal-rs feel native to KurrentDB
+developers. Every shape that has a Kurrent counterpart now uses
+Kurrent's exact name; deliberate divergences (`Fact` vs `Event`,
+`Reactor` vs `PersistentSubscription`) are documented in `README.md`
+under "KurrentDB vocabulary mapping".
+
+- **`NewEvent` → `EventData`** (write-side struct). Mirrors
+  `kurrentdb::EventData`.
+- **`PersistedEvent` → `RecordedEvent`** (read-side struct).
+  Mirrors `kurrentdb::RecordedEvent`.
+- **`parent_id` → `causation_id`** on both structs and on
+  `EmitBuilder::causation_id(...)`. Kurrent's universal term for
+  "the event that caused this one." Underlying PG column renames
+  in a separate migration; see MIGRATION_0.4.md.
+- **Metadata reserved keys** moved to KurrentDB's `$`-prefix
+  convention: `_correlation_id` → `$correlationId`,
+  `_parent_id` → `$causationId`. **This unlocks server-side
+  projections** (`$by_correlation_id`, `$by_causation_id`) — they
+  read those exact keys. Causal-internal keys (`_persistent`,
+  `_aggregateType`) keep the `_` prefix to distinguish from
+  Kurrent system metadata.
+- **`StreamVersion` → `StreamRevision`** (0-indexed). First event
+  in a stream now has revision 0, matching Kurrent exactly. The
+  off-by-one translation layer in `KurrentEventLogBackend` is
+  gone — kurrentdb revision and causal::StreamRevision are
+  identity-mapped.
+- **New `StreamState` enum** for the `expected` parameter on
+  `EventLogBackend::append_to_stream`. Matches
+  `kurrentdb::StreamState` variant-for-variant: `Any`, `NoStream`,
+  `StreamExists`, `StreamRevision(u64)`. Callers writing the FIRST
+  event to a stream pass `StreamState::NoStream` (was
+  `StreamVersion::ZERO`).
+- **`AppendResult.version` → `AppendResult.revision`** and
+  **`RecordedEvent.version` → `RecordedEvent.revision`** and
+  **`Snapshot.version` → `Snapshot.revision`**.
+- **`EventLogBackend::load_stream` → `read_stream`** and
+  **`load_from` → `read_all`**. Kurrent's verbs. Old names kept
+  as default-method aliases until a future major release.
+- **`Engine::append_to_stream(fact)`** added as an alias for
+  `Engine::emit(fact)` — familiar entry point for Kurrent devs.
+- **`causal::stream_name_for::<F>(id)`** and
+  **`causal::event_type_for(&fact)`** helpers — pure functions
+  that compose the canonical stream name (`{CATEGORY}-{id}`) and
+  event_type (`{CATEGORY}:{name}`) the runtime would use. Useful
+  for out-of-band Kurrent access.
+
+Migration matrix:
+
+| Find | Replace |
+|---|---|
+| `NewEvent` | `EventData` |
+| `PersistedEvent` | `RecordedEvent` |
+| `.parent_id` | `.causation_id` |
+| `EmitBuilder::parent_id(...)` | `EmitBuilder::causation_id(...)` |
+| `StreamVersion::ZERO` (as `expected`) | `StreamState::NoStream` |
+| `StreamVersion::from_raw(N)` (as `expected`) | `StreamState::StreamRevision(N - 1)` |
+| `result.version` | `result.revision` |
+| `AppendResult { version: ... }` | `AppendResult { revision: ... }` |
+| `Snapshot { version: ... }` | `Snapshot { revision: ... }` |
+| `.load_stream(...)` | `.read_stream(...)` |
+| `.load_from(...)` | `.read_all(...)` |
+| `m.get("_correlation_id")` | `m.get("$correlationId")` |
+| `m.get("_parent_id")` | `m.get("$causationId")` |
+
+Test value shifts (1-indexed → 0-indexed):
+
+| Was | Now |
+|---|---|
+| First event lands at `version = 1` | First event lands at `revision = 0` |
+| Second event at `version = 2` | Second event at `revision = 1` |
+
+The conformance suite covers all of this — every backend impl runs
+through identical scenarios against `StreamState::NoStream` +
+`StreamRevision::ZERO`.
+
+### Added
+
+- **`causal_replay::KurrentEventLogBackend`** behind a new `kurrent`
+  feature flag. Implements `EventLogBackend` against KurrentDB
+  (formerly EventStoreDB) via the official `kurrentdb = "1.2"` crate.
+  The trait surface was designed against Kurrent's primitives; this
+  is the implementation.
+
+  Locked design decisions are documented inline:
+  - **CAS append**: causal's 1-indexed `StreamVersion` (ZERO = empty
+    stream, first event lands at v1) is translated to Kurrent's
+    0-indexed revision (`NoStream` for fresh stream, `StreamRevision(N-1)`
+    for an N-event stream). Three unit tests pin the conversion
+    (`causal_zero_maps_to_no_stream`,
+    `causal_v1_maps_to_kurrent_revision_0`,
+    `causal_vN_maps_to_kurrent_revision_N_minus_1`) plus
+    `kurrent_revision_round_trips_through_causal_version` cross-checks
+    against the kurrentdb crate's own test fixture (3 events written
+    → `next_expected_version=2`). On `WrongExpectedVersion` the
+    backend scans the conflict slice for the caller's `event_id` and
+    returns the existing AppendResult on duplicate (idempotent retry)
+    or surfaces an `OCC conflict` error on a real collision.
+  - **Non-CAS append** uses `StreamState::Any` with `EventData::id`.
+    Kurrent's ~1-min EventId cache dedups within the window; post-
+    cache retries can produce duplicates. Documented gap on
+    `KurrentEventLogBackend::append`.
+  - **Stream naming**: aggregate events → `{type}-{id}`, non-aggregate
+    → `{category}-_global` (`_global` isn't a valid UUID, so it can't
+    collide).
+  - **Metadata** maps to Kurrent's `custom_metadata` slot; reserved
+    keys `_correlation_id` / `_parent_id` / `_aggregate_type` /
+    `_persistent` are stamped on write and stripped on read.
+
+  Scope is the event log only. `CheckpointStore`, `ReactorOutbox`,
+  and `SnapshotStore` keep using the Postgres backends — Kurrent is
+  an event store, not a job queue (hybrid Option B). Multi-process
+  leases, snapshots-as-events, catch-up subscriptions, cross-node
+  sync are all out of scope here.
+
+  Integration tests live in `tests/kurrent_event_log_test.rs` and
+  are `#[ignore]`'d by default — run against a live KurrentDB on
+  `KURRENT_URL` with `cargo test --features kurrent -- --ignored`.
+  Pure-function unit tests (stream-name composition, metadata
+  stamping) run unconditionally.
+
+### Fixed
+
+- **`AggregatorRegistry::apply_event` is now atomic per key.** The
+  RMW that read pre-state, cloned, applied, and inserted post-state
+  ran across separate DashMap operations. Two concurrent callers on
+  the same stream key — typically `Engine::execute_emit`
+  (caller-emit) racing `RelayLoop::drain_once` (reactor-emit) —
+  could both read the same pre-state; the second insert overwrote
+  the first; the earlier event's mutations were lost. Documented as
+  a known-issue in 0.4.4. The fix holds a DashMap `entry()` guard
+  for the full read-modify-write block, serializing concurrent
+  applies on the same key.
+
+  A regression test
+  (`aggregator_apply_event_serializes_concurrent_callers`,
+  `engine_v3.rs`) pins the contract: 8 threads × 200 applies on the
+  same stream id. Pre-fix loses ~70% of updates in release mode;
+  post-fix the final fold count equals total applies.
+
+  The `:prev` slot remains best-effort (written outside the entry
+  guard — holding it inside could deadlock if `key` and `:prev`
+  hash to the same DashMap shard). Readers that need the exact
+  per-event transition should consume `TransitionSnapshots`
+  returned by `apply_event`; the on-disk `:prev` slot is documented
+  racy and only kept for backward compatibility.
+
+### Documentation
+
+- **`Reactor::react` doc** clarifies that output facts can be from
+  any category — not just the trigger's. Cross-category reactor
+  outputs are the common shape (e.g. a lifecycle reactor that emits
+  scheduling facts). Closes pressure-test finding F9.5.
+- **`StartPosition::Zero` doc** carries a loud replay-hazard warning
+  with the application-side mitigations (blue-green via
+  `ProjectionStream::Mode::Replay`, idempotent UPSERTs, coordinated
+  downtime). `StartPosition::Specific` references the same warning
+  when the position is behind a downstream consumer. Closes
+  pressure-test finding F6.2.
+
+### Tests
+
+- New regression test
+  `projector_batch_sees_per_event_prev_curr_interleaved`
+  (`engine_v3.rs`) pins the apply→project interleaving contract for
+  `ProjectionRunner::step`. Batches of N events must fold each into
+  the aggregator registry and *then* invoke `project()` for that
+  event, before moving on — not fold-all-then-project-all. Without
+  this contract, transition guards reading
+  `ctx.aggregate::<A>().prev` vs `.curr` would silently see the
+  same `(prev, curr)` pair for every batch element. Closes
+  pressure-test finding F9.6.
+
 ## [0.4.6] — 2026-05-12
 
 ### Fixed (follow-up to 0.4.5)
@@ -131,4 +368,4 @@ consumers who upgraded from 0.4.2:
   Reactor/Projector traits with `GROUP_NAME` consts, `ReactorObserver`,
   `EngineBuilder` with three explicit backend traits (`EventLogBackend`,
   `CheckpointStore`, `ReactorOutbox`). See `docs/MIGRATION_0.4.md` for
-  details (not yet written — file as known gap).
+  the consumer migration guide.

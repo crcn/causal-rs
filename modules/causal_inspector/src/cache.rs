@@ -196,7 +196,7 @@ impl EventCache {
 
         let root_seq = events
             .iter()
-            .find(|e| e.parent_id.is_none())
+            .find(|e| e.causation_id.is_none())
             .map(|e| e.seq)
             .unwrap_or(seq);
 
@@ -239,7 +239,7 @@ mod tests {
         payload: &str,
         correlation_id: Option<&str>,
         reactor_id: Option<&str>,
-        parent_id: Option<&str>,
+        causation_id: Option<&str>,
     ) -> InspectorEvent {
         InspectorEvent {
             seq,
@@ -247,12 +247,12 @@ mod tests {
             event_type: event_type.to_string(),
             name: "test_event".to_string(),
             id: Some(Uuid::new_v4().to_string()),
-            parent_id: parent_id.map(String::from),
+            causation_id: causation_id.map(String::from),
             correlation_id: correlation_id.map(String::from),
             reactor_id: reactor_id.map(String::from),
             aggregate_type: None,
             aggregate_id: None,
-            stream_version: None,
+            stream_revision: None,
             summary: None,
             payload: payload.to_string(),
         }

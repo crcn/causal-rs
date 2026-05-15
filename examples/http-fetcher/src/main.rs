@@ -1,138 +1,154 @@
-//! HTTP Fetcher Example
+//! HTTP Fetcher example backed by KurrentDB.
+//!
+//! Run KurrentDB first:
+//!
+//!     docker compose up -d
+//!
+//! Then:
+//!
+//!     cargo run
+
+use std::sync::Arc;
 
 use anyhow::Result;
-use causal::{event, events, reactor, Context, Engine};
+use async_trait::async_trait;
+use causal::{
+    CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend, Events,
+    MemoryStore, Reactor, ReactorOutbox,
+};
+use causal_replay::KurrentEventLogBackend;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-#[event(prefix = "fetch")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum FetchEvent {
-    FetchRequested {
-        urls: Vec<String>,
-        success_count: usize,
-        failure_count: usize,
-    },
-    Fetched {
-        url: String,
-        status: u16,
-    },
-    FetchFailed {
-        url: String,
-        reason: String,
-    },
-    AllComplete {
-        success_count: usize,
-        failure_count: usize,
-    },
+#[derive(Clone, Serialize, Deserialize)]
+struct FetchRequested {
+    request_id:  Uuid,
+    url:         String,
+    occurred_at: DateTime<Utc>,
 }
 
-#[derive(Clone)]
-struct Deps {
+impl Event for FetchRequested {
+    const CATEGORY: &'static str = "fetch_request";
+    fn event_type(&self) -> &str { "requested" }
+    fn stream_id(&self) -> Uuid { self.request_id }
+    fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Fetched {
+    request_id:  Uuid,
+    url:         String,
+    status:      u16,
+    occurred_at: DateTime<Utc>,
+}
+
+impl Event for Fetched {
+    const CATEGORY: &'static str = "fetch_result";
+    fn event_type(&self) -> &str { "fetched" }
+    fn stream_id(&self) -> Uuid { self.request_id }
+    fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FetchFailed {
+    request_id:  Uuid,
+    url:         String,
+    reason:      String,
+    occurred_at: DateTime<Utc>,
+}
+
+impl Event for FetchFailed {
+    const CATEGORY: &'static str = "fetch_result";
+    fn event_type(&self) -> &str { "failed" }
+    fn stream_id(&self) -> Uuid { self.request_id }
+    fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+}
+
+struct FetchReactor {
     http_client: reqwest::Client,
+}
+
+#[async_trait]
+impl Reactor for FetchReactor {
+    type Trigger = FetchRequested;
+    const GROUP_NAME: &'static str = "fetch_url";
+
+    async fn react(&self, trigger: &FetchRequested, _ctx: Ctx<'_>) -> Result<Events> {
+        let occurred_at = Utc::now();
+        match self.http_client.get(&trigger.url).send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                println!("fetched {} → {}", trigger.url, status);
+                Ok(Events::new().add(Fetched {
+                    request_id: trigger.request_id,
+                    url: trigger.url.clone(),
+                    status,
+                    occurred_at,
+                }))
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                println!("failed  {} → {}", trigger.url, reason);
+                Ok(Events::new().add(FetchFailed {
+                    request_id: trigger.request_id,
+                    url: trigger.url.clone(),
+                    reason,
+                    occurred_at,
+                }))
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let deps = Deps {
-        http_client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?,
+    let kurrent_url = std::env::var("KURRENT_URL")
+        .unwrap_or_else(|_| "esdb://localhost:2113?tls=false".to_string());
+
+    let kurrent = match KurrentEventLogBackend::connect(&kurrent_url) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("could not connect to KurrentDB at {kurrent_url}: {e}");
+            eprintln!();
+            eprintln!("start one locally with:");
+            eprintln!("    docker compose up -d");
+            std::process::exit(1);
+        }
     };
 
-    let engine = Engine::in_memory(deps)
-        .with_reactor(
-            reactor::on::<FetchEvent>()
-                .id("fetch_url")
-                .extract(|e| match e {
-                    FetchEvent::FetchRequested {
-                        urls,
-                        success_count,
-                        failure_count,
-                    } => Some((urls.clone(), *success_count, *failure_count)),
-                    _ => None,
-                })
-                .then(
-                    |(urls, success_count, failure_count), ctx: Context<Deps>| async move {
-                        if let Some((url, rest)) = urls.split_first() {
-                            let url = url.clone();
-                            let rest = rest.to_vec();
+    let mem = Arc::new(MemoryStore::new());
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
 
-                            match ctx.deps().http_client.get(&url).send().await {
-                                Ok(response) if response.status().is_success() => {
-                                    let status = response.status().as_u16();
-                                    let _ = response.text().await?;
-                                    Ok(events![
-                                        FetchEvent::Fetched { url, status },
-                                        FetchEvent::FetchRequested {
-                                            urls: rest,
-                                            success_count: success_count + 1,
-                                            failure_count,
-                                        },
-                                    ])
-                                }
-                                Ok(response) => Ok(events![
-                                    FetchEvent::FetchFailed {
-                                        url,
-                                        reason: format!("HTTP {}", response.status().as_u16()),
-                                    },
-                                    FetchEvent::FetchRequested {
-                                        urls: rest,
-                                        success_count,
-                                        failure_count: failure_count + 1,
-                                    },
-                                ]),
-                                Err(error) => Ok(events![
-                                    FetchEvent::FetchFailed {
-                                        url,
-                                        reason: error.to_string(),
-                                    },
-                                    FetchEvent::FetchRequested {
-                                        urls: rest,
-                                        success_count,
-                                        failure_count: failure_count + 1,
-                                    },
-                                ]),
-                            }
-                        } else {
-                            Ok(events![FetchEvent::AllComplete {
-                                success_count,
-                                failure_count,
-                            }])
-                        }
-                    },
-                ),
-        )
-        .with_reactor(
-            reactor::on::<FetchEvent>()
-                .id("all_complete")
-                .extract(|e| match e {
-                    FetchEvent::AllComplete {
-                        success_count,
-                        failure_count,
-                    } => Some((*success_count, *failure_count)),
-                    _ => None,
-                })
-                .then(|(ok, fail), _ctx: Context<Deps>| async move {
-                    println!("all fetches complete: ok={}, fail={}", ok, fail);
-                    Ok(events![])
-                }),
-        );
+    let engine = EngineBuilder::new(
+        Arc::new(kurrent) as Arc<dyn EventLogBackend>,
+        mem.clone() as Arc<dyn CheckpointStore>,
+        mem as Arc<dyn ReactorOutbox>,
+    )
+    .with_reactor(FetchReactor { http_client })
+    .build();
 
-    let urls = vec![
-        "https://example.com".to_string(),
-        "https://httpbin.org/status/200".to_string(),
-        "https://httpbin.org/status/404".to_string(),
+    let urls = [
+        "https://example.com",
+        "https://httpbin.org/status/200",
+        "https://httpbin.org/status/404",
     ];
 
-    engine
-        .emit(FetchEvent::FetchRequested {
-            urls,
-            success_count: 0,
-            failure_count: 0,
+    let now = Utc::now();
+    let requests: Vec<FetchRequested> = urls
+        .into_iter()
+        .map(|url| FetchRequested {
+            request_id:  Uuid::new_v4(),
+            url:         url.to_string(),
+            occurred_at: now,
         })
-        .settled()
-        .await?;
+        .collect();
 
+    engine.emit(requests).settled().await?;
+
+    println!();
+    println!("all fetches drained. event log → {kurrent_url}");
     Ok(())
 }

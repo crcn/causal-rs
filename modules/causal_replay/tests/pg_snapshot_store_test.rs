@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use causal::snapshot_store::SnapshotStore;
-use causal::types::{Snapshot, StreamVersion};
+use causal::types::{Snapshot, StreamRevision};
 use causal_replay::PgSnapshotStore;
 use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
@@ -60,7 +60,7 @@ async fn save_and_load_round_trips_state_and_version() -> Result<()> {
     let snapshot = Snapshot {
         aggregate_type: "order".to_string(),
         aggregate_id,
-        version: StreamVersion::from_raw(42),
+        revision: StreamRevision::from_raw(42),
         state: serde_json::json!({"total": 100, "items": ["apple", "banana"]}),
         created_at: Utc::now(),
     };
@@ -70,7 +70,7 @@ async fn save_and_load_round_trips_state_and_version() -> Result<()> {
 
     assert_eq!(loaded.aggregate_type, "order");
     assert_eq!(loaded.aggregate_id, aggregate_id);
-    assert_eq!(loaded.version, StreamVersion::from_raw(42));
+    assert_eq!(loaded.revision, StreamRevision::from_raw(42));
     assert_eq!(loaded.state, snapshot.state);
 
     store.delete_snapshot("order", aggregate_id).await?;
@@ -89,7 +89,7 @@ async fn load_returns_latest_version_when_multiple_exist() -> Result<()> {
             .save_snapshot(Snapshot {
                 aggregate_type: "order".to_string(),
                 aggregate_id,
-                version: StreamVersion::from_raw(v),
+                revision: StreamRevision::from_raw(v),
                 state: serde_json::json!({"v": v}),
                 created_at: Utc::now(),
             })
@@ -98,8 +98,8 @@ async fn load_returns_latest_version_when_multiple_exist() -> Result<()> {
 
     let loaded = store.load_snapshot("order", aggregate_id).await?.unwrap();
     assert_eq!(
-        loaded.version,
-        StreamVersion::from_raw(10),
+        loaded.revision,
+        StreamRevision::from_raw(10),
         "load_snapshot must return the highest-version snapshot"
     );
     assert_eq!(loaded.state, serde_json::json!({"v": 10}));
@@ -131,7 +131,7 @@ async fn save_is_idempotent_on_duplicate_key_version() -> Result<()> {
     let snapshot = Snapshot {
         aggregate_type: "order".to_string(),
         aggregate_id,
-        version: StreamVersion::from_raw(1),
+        revision: StreamRevision::from_raw(1),
         state: serde_json::json!({"original": true}),
         created_at: Utc::now(),
     };
@@ -165,7 +165,7 @@ async fn delete_removes_all_versions_for_aggregate() -> Result<()> {
             .save_snapshot(Snapshot {
                 aggregate_type: "order".to_string(),
                 aggregate_id,
-                version: StreamVersion::from_raw(v),
+                revision: StreamRevision::from_raw(v),
                 state: serde_json::json!({"v": v}),
                 created_at: Utc::now(),
             })

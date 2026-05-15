@@ -15,7 +15,7 @@ pub struct InspectorEvent {
     /// Causal event UUID.
     pub id: Option<String>,
     /// Parent event UUID (causal link).
-    pub parent_id: Option<String>,
+    pub causation_id: Option<String>,
     /// Correlation ID linking the full causal chain.
     pub correlation_id: Option<String>,
     pub reactor_id: Option<String>,
@@ -24,7 +24,7 @@ pub struct InspectorEvent {
     /// Aggregate instance ID, if this event matched an aggregator.
     pub aggregate_id: Option<String>,
     /// Per-stream version, if this event matched an aggregator.
-    pub stream_version: Option<i64>,
+    pub stream_revision: Option<i64>,
     /// Optional one-line summary from `EventDisplay::summary`.
     pub summary: Option<String>,
     /// JSON payload as string.

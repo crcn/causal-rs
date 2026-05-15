@@ -7,7 +7,7 @@ use std::time::Duration;
 /// A source of wake-up signals for tailing new events.
 ///
 /// Implementations provide a `wait()` method that blocks until new events
-/// may be available. The caller always reads from `EventLog::load_from()`
+/// may be available. The caller always reads from `EventLogBackend::read_all()`
 /// after waking — the tail source is just a signal, not a delivery mechanism.
 #[async_trait]
 pub trait TailSource: Send + Sync {

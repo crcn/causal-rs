@@ -12,10 +12,10 @@
 //!   makes `RETURNING position` work in both fresh and duplicate cases.
 //!
 //! - **C6 (aggregate OCC):** `append_to_stream` relies on the partial
-//!   `UNIQUE(aggregate_type, aggregate_id, version)` index. A stale
-//!   `expected` produces the next version that collides; the backend
-//!   catches the unique violation, looks up the current version, and
-//!   returns `Conflict { current_version }`.
+//!   `UNIQUE(aggregate_type, aggregate_id, revision)` index. A stale
+//!   `expected` produces the next revision that collides; the backend
+//!   catches the unique violation, looks up the current revision, and
+//!   returns an `OCC conflict` error message.
 //!
 //! Position gaps are allowed (rolled-back transactions leave gaps in
 //! BIGSERIAL). Cursor consumers compare with `position > cursor`,
@@ -30,7 +30,7 @@ mod pg {
     use uuid::Uuid;
 
     use causal::types::{
-        AppendResult, LogCursor, NewEvent, PersistedEvent, StreamVersion,
+        WriteResult, EventData, LogCursor, RecordedEvent, StreamRevision, StreamState,
     };
     use causal::EventLogBackend;
 
@@ -51,7 +51,7 @@ mod pg {
 
     #[async_trait]
     impl EventLogBackend for PgEventLogBackend {
-        async fn append(&self, event: NewEvent) -> Result<AppendResult> {
+        async fn append(&self, event: EventData) -> Result<WriteResult> {
             // ON CONFLICT DO UPDATE SET event_id = excluded.event_id is a
             // no-op update (event_id is the conflict target, so this
             // assignment is identity). Necessary because plain
@@ -63,22 +63,22 @@ mod pg {
                 serde_json::Value::Object(event.metadata.clone());
             let row = sqlx::query(
                 "INSERT INTO causal_log
-                    (event_id, parent_id, correlation_id, event_type,
-                     payload, aggregate_type, aggregate_id, version,
+                    (event_id, causation_id, correlation_id, event_type,
+                     payload, aggregate_type, aggregate_id, revision,
                      metadata, created_at, persistent)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT (event_id) DO UPDATE
                     SET event_id = excluded.event_id
-                 RETURNING position, version",
+                 RETURNING position, revision",
             )
             .bind(event.event_id)
-            .bind(event.parent_id)
+            .bind(event.causation_id)
             .bind(event.correlation_id)
             .bind(&event.event_type)
             .bind(&event.payload)
             .bind(event.aggregate_type.as_deref())
             .bind(event.aggregate_id)
-            .bind(event.version_for_storage())
+            .bind(event.revision_for_storage())
             .bind(&metadata)
             .bind(event.created_at)
             .bind(event.persistent)
@@ -86,10 +86,10 @@ mod pg {
             .await?;
 
             let position: i64 = row.try_get("position")?;
-            let version: Option<i64> = row.try_get("version")?;
-            Ok(AppendResult {
+            let revision: Option<i64> = row.try_get("revision")?;
+            Ok(WriteResult {
                 position: LogCursor::from_raw(position as u64),
-                version: version.map(|v| StreamVersion::from_raw(v as u64)),
+                revision: revision.map(|r| StreamRevision::from_raw(r as u64)),
             })
         }
 
@@ -97,29 +97,60 @@ mod pg {
             &self,
             aggregate_type: &str,
             aggregate_id: Uuid,
-            expected: StreamVersion,
-            event: NewEvent,
-        ) -> Result<AppendResult> {
-            let next_version = (expected.raw() + 1) as i64;
+            expected: StreamState,
+            event: EventData,
+        ) -> Result<WriteResult> {
+            // Compute the new event's revision (0-indexed).
+            // For NoStream: 0 (the first event).
+            // For StreamRevision(n): n + 1 (the event after that).
+            // For StreamExists / Any: we have to read the current tail
+            // first.
+            let next_revision: i64 = match expected {
+                StreamState::NoStream => 0,
+                StreamState::StreamRevision(n) => (n + 1) as i64,
+                StreamState::StreamExists | StreamState::Any => {
+                    let current: Option<i64> = sqlx::query_scalar(
+                        "SELECT MAX(revision)
+                           FROM causal_log
+                          WHERE aggregate_type = $1
+                            AND aggregate_id = $2",
+                    )
+                    .bind(aggregate_type)
+                    .bind(aggregate_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+                    match (expected, current) {
+                        (StreamState::StreamExists, None) => {
+                            return Err(anyhow::anyhow!(
+                                "OCC conflict on aggregate {}:{} — \
+                                 expected StreamExists, stream is empty",
+                                aggregate_type, aggregate_id,
+                            ));
+                        }
+                        (_, Some(c)) => c + 1,
+                        (_, None) => 0,
+                    }
+                }
+            };
             let metadata =
                 serde_json::Value::Object(event.metadata.clone());
 
             let result = sqlx::query(
                 "INSERT INTO causal_log
-                    (event_id, parent_id, correlation_id, event_type,
-                     payload, aggregate_type, aggregate_id, version,
+                    (event_id, causation_id, correlation_id, event_type,
+                     payload, aggregate_type, aggregate_id, revision,
                      metadata, created_at, persistent)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  RETURNING position",
             )
             .bind(event.event_id)
-            .bind(event.parent_id)
+            .bind(event.causation_id)
             .bind(event.correlation_id)
             .bind(&event.event_type)
             .bind(&event.payload)
             .bind(aggregate_type)
             .bind(aggregate_id)
-            .bind(next_version)
+            .bind(next_revision)
             .bind(&metadata)
             .bind(event.created_at)
             .bind(event.persistent)
@@ -129,27 +160,22 @@ mod pg {
             match result {
                 Ok(row) => {
                     let position: i64 = row.try_get("position")?;
-                    Ok(AppendResult {
+                    Ok(WriteResult {
                         position: LogCursor::from_raw(position as u64),
-                        version: Some(StreamVersion::from_raw(next_version as u64)),
+                        revision: Some(StreamRevision::from_raw(next_revision as u64)),
                     })
                 }
                 Err(e) => {
-                    // Detect unique violation on the stream index. The
-                    // trait surface returns generic anyhow::Error here
-                    // (the v0.3 design doc names a `Conflict` variant
-                    // for the engine layer; backend signals the
-                    // collision via error and the engine maps it).
                     if let Some(db_err) = e.as_database_error() {
                         if db_err
                             .constraint()
                             .map(|c| c == "idx_causal_log_stream")
                             .unwrap_or(false)
                         {
-                            // Look up the current head version so the
-                            // caller can retry with the right expected.
-                            let current: i64 = sqlx::query_scalar(
-                                "SELECT COALESCE(MAX(version), 0)
+                            // Look up the current head revision so the
+                            // caller knows what to retry with.
+                            let current: Option<i64> = sqlx::query_scalar(
+                                "SELECT MAX(revision)
                                    FROM causal_log
                                   WHERE aggregate_type = $1
                                     AND aggregate_id = $2",
@@ -159,10 +185,10 @@ mod pg {
                             .fetch_one(&self.pool)
                             .await?;
                             return Err(anyhow::anyhow!(
-                                "OCC conflict on aggregate {}:{} — expected version {}, current is {}",
+                                "OCC conflict on aggregate {}:{} — expected {}, current revision is {:?}",
                                 aggregate_type,
                                 aggregate_id,
-                                expected.raw(),
+                                expected,
                                 current,
                             ));
                         }
@@ -172,15 +198,15 @@ mod pg {
             }
         }
 
-        async fn load_from(
+        async fn read_all(
             &self,
             after: LogCursor,
             limit: usize,
-        ) -> Result<Vec<PersistedEvent>> {
+        ) -> Result<Vec<RecordedEvent>> {
             let rows = sqlx::query(
-                "SELECT position, event_id, parent_id, correlation_id,
+                "SELECT position, event_id, causation_id, correlation_id,
                         event_type, payload, aggregate_type, aggregate_id,
-                        version, metadata, created_at, persistent
+                        revision, metadata, created_at, persistent
                    FROM causal_log
                   WHERE position > $1
                   ORDER BY position ASC
@@ -194,26 +220,30 @@ mod pg {
             rows.into_iter().map(row_to_persisted).collect()
         }
 
-        async fn load_stream(
+        async fn read_stream(
             &self,
             aggregate_type: &str,
             aggregate_id: Uuid,
-            after_version: Option<StreamVersion>,
-        ) -> Result<Vec<PersistedEvent>> {
-            let after = after_version.map(|v| v.raw() as i64).unwrap_or(0);
+            after: Option<StreamRevision>,
+        ) -> Result<Vec<RecordedEvent>> {
+            // 0-indexed `after`: caller asks for events with
+            // revision > after. For `None`, return everything from
+            // the stream. Use `-1` as the floor for the `None` case
+            // so `revision > -1` matches `revision >= 0`.
+            let after_val: i64 = after.map(|r| r.raw() as i64).unwrap_or(-1);
             let rows = sqlx::query(
-                "SELECT position, event_id, parent_id, correlation_id,
+                "SELECT position, event_id, causation_id, correlation_id,
                         event_type, payload, aggregate_type, aggregate_id,
-                        version, metadata, created_at, persistent
+                        revision, metadata, created_at, persistent
                    FROM causal_log
                   WHERE aggregate_type = $1
                     AND aggregate_id = $2
-                    AND version > $3
-                  ORDER BY version ASC",
+                    AND revision > $3
+                  ORDER BY revision ASC",
             )
             .bind(aggregate_type)
             .bind(aggregate_id)
-            .bind(after)
+            .bind(after_val)
             .fetch_all(&self.pool)
             .await?;
 
@@ -230,7 +260,7 @@ mod pg {
         }
     }
 
-    fn row_to_persisted(row: sqlx::postgres::PgRow) -> Result<PersistedEvent> {
+    fn row_to_persisted(row: sqlx::postgres::PgRow) -> Result<RecordedEvent> {
         let metadata_value: serde_json::Value =
             row.try_get("metadata")?;
         let metadata = match metadata_value {
@@ -238,19 +268,19 @@ mod pg {
             _ => serde_json::Map::new(),
         };
         let position: i64 = row.try_get("position")?;
-        let version: Option<i64> = row.try_get("version")?;
+        let revision: Option<i64> = row.try_get("revision")?;
         let created_at: DateTime<Utc> = row.try_get("created_at")?;
 
-        Ok(PersistedEvent {
+        Ok(RecordedEvent {
             position: LogCursor::from_raw(position as u64),
             event_id: row.try_get("event_id")?,
-            parent_id: row.try_get("parent_id")?,
+            causation_id: row.try_get("causation_id")?,
             correlation_id: row.try_get("correlation_id")?,
             event_type: row.try_get("event_type")?,
             payload: row.try_get("payload")?,
             aggregate_type: row.try_get("aggregate_type")?,
             aggregate_id: row.try_get("aggregate_id")?,
-            version: version.map(|v| StreamVersion::from_raw(v as u64)),
+            revision: revision.map(|r| StreamRevision::from_raw(r as u64)),
             metadata,
             created_at,
             ephemeral: None,
@@ -258,25 +288,15 @@ mod pg {
         })
     }
 
-    /// Helper trait for `NewEvent` to project its `version` field as the
-    /// nullable storage-side BIGINT. NewEvent doesn't currently expose a
-    /// `version` field directly (StreamVersion is set by `append_to_stream`,
-    /// not on NewEvent), so we derive it from the aggregate-shape: events
-    /// with `aggregate_type == None` have `version = NULL`. For
-    /// `append_to_stream`, the caller supplies the version; this helper
-    /// is only used by `append`.
-    trait NewEventVersionExt {
-        fn version_for_storage(&self) -> Option<i64>;
+    /// Helper for `append()` (non-CAS path): the column is always
+    /// NULL because `append()` is for non-aggregate events. The
+    /// CAS path (`append_to_stream`) binds revision explicitly.
+    trait EventDataRevisionExt {
+        fn revision_for_storage(&self) -> Option<i64>;
     }
 
-    impl NewEventVersionExt for NewEvent {
-        fn version_for_storage(&self) -> Option<i64> {
-            // append() is for non-aggregate events; version is always None.
-            // append_to_stream() bypasses this code path and binds version
-            // explicitly. If a NewEvent constructed for append() somehow
-            // has aggregate_type set, we still write NULL — append() is
-            // not the OCC-protected path, and writing the version without
-            // OCC would defeat the C6 contract.
+    impl EventDataRevisionExt for EventData {
+        fn revision_for_storage(&self) -> Option<i64> {
             None
         }
     }

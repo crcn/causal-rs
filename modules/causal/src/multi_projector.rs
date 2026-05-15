@@ -1,19 +1,19 @@
 //! `MultiProjector` — declared-subscription cross-domain event consumer.
 //!
-//! Single-Fact subscription is covered by [`crate::Projector`]; the
+//! Single-Event subscription is covered by [`crate::Projector`]; the
 //! middle ground (multiple declared categories, body wants raw
-//! `&PersistedEvent` access for cross-domain payload routing) is
+//! `&RecordedEvent` access for cross-domain payload routing) is
 //! `MultiProjector`. Common consumers: graph projector, search
 //! index, audit log, activity stream.
 //!
-//! Body shape: `&PersistedEvent` plus `Ctx`. The runner filters to
+//! Body shape: `&RecordedEvent` plus `Ctx`. The runner filters to
 //! events whose `event_type` matches `format!("{CATEGORY}:*")` for any
 //! `CATEGORY` in `CATEGORIES` before invoking the body, so the
 //! consumer never sees events outside its declared subscription.
 //!
 //! Backend mapping:
 //! - Polling backends (Postgres, MemoryStore): runner reads via
-//!   `EventLogBackend::load_from` and applies the category-list filter
+//!   `EventLogBackend::read_all` and applies the category-list filter
 //!   client-side. Same query shape as the typed runner.
 //! - KurrentDB (future): runner subscribes to `$et-{CATEGORY}:*` per
 //!   listed category and merges by commit position. Native subscription
@@ -34,18 +34,18 @@ use crate::checkpoint_store::CheckpointStore;
 use crate::contexts::Ctx;
 use crate::event_log::EventLogBackend;
 use crate::projection_runner::StepOutcome;
-use crate::types::{LogCursor, PersistedEvent};
+use crate::types::{LogCursor, RecordedEvent};
 
 /// Cross-domain projection consumer with a declared subscription set.
 ///
 /// Use when:
-/// - Body needs raw `&PersistedEvent` (heterogeneous payload routing
+/// - Body needs raw `&RecordedEvent` (heterogeneous payload routing
 ///   inside the body, no single typed enum captures all consumed
 ///   events), AND
 /// - Subscription is bounded to a known set of `CATEGORY` values
 ///   (not "every event").
 ///
-/// If you have exactly one Fact type, use [`crate::Projector`]
+/// If you have exactly one Event type, use [`crate::Projector`]
 /// instead — it deserializes the payload for you. If you genuinely
 /// need every event in the log regardless of type, you don't have a
 /// declared subscription and likely shouldn't be running as a
@@ -60,7 +60,7 @@ pub trait MultiProjector: Send + Sync {
     const GROUP_NAME: &'static str;
 
     /// Declared subscription. Non-empty. Each entry is a bare
-    /// `Fact::CATEGORY` value (e.g. `"world"`, `"discovery"`). The
+    /// `Event::CATEGORY` value (e.g. `"world"`, `"discovery"`). The
     /// runner matches events whose `event_type` starts with
     /// `format!("{CATEGORY}:")`. Compile-time const so the runner can
     /// plan subscriptions at registration time without needing an
@@ -79,7 +79,7 @@ pub trait MultiProjector: Send + Sync {
     /// or routes by string. MUST be idempotent on `event.event_id`.
     async fn project(
         &self,
-        event: &PersistedEvent,
+        event: &RecordedEvent,
         ctx: Ctx<'_>,
     ) -> Result<()>;
 }
@@ -98,7 +98,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
     /// # Panics
     /// Panics if `P::CATEGORIES` is empty. An empty subscription
     /// declaration is a programmer error — use [`crate::Projector`]
-    /// for single-Fact consumers, or reconsider whether you need a
+    /// for single-Event consumers, or reconsider whether you need a
     /// consumer at all.
     pub fn new(
         projector: P,
@@ -109,7 +109,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
         assert!(
             !P::CATEGORIES.is_empty(),
             "MultiProjector::CATEGORIES must be non-empty. \
-             For single-Fact consumers, use the typed `Projector` \
+             For single-Event consumers, use the typed `Projector` \
              trait instead."
         );
         Self {
@@ -161,7 +161,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
 
         self.ensure_hydrated(cursor).await?;
 
-        let events = self.log.load_from(cursor, batch).await?;
+        let events = self.log.read_all(cursor, batch).await?;
         if events.is_empty() {
             return Ok(StepOutcome::Idle);
         }
@@ -236,7 +236,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             let reg = self.aggregators.as_ref().unwrap();
             let mut from = LogCursor::ZERO;
             loop {
-                let batch = self.log.load_from(from, 1024).await?;
+                let batch = self.log.read_all(from, 1024).await?;
                 if batch.is_empty() { break; }
                 let last_pos = batch.last().unwrap().position;
                 let mut hit_cursor = false;
@@ -267,7 +267,7 @@ mod tests {
     use super::*;
     use crate::event_log::EventLogBackend;
     use crate::memory_store::MemoryStore;
-    use crate::types::NewEvent;
+    use crate::types::EventData;
     use chrono::Utc;
     use parking_lot::Mutex;
     use uuid::Uuid;
@@ -290,7 +290,7 @@ mod tests {
 
         async fn project(
             &self,
-            event: &PersistedEvent,
+            event: &RecordedEvent,
             _ctx: Ctx<'_>,
         ) -> Result<()> {
             self.seen.lock().push((event.event_id, event.event_type.clone()));
@@ -300,9 +300,9 @@ mod tests {
 
     async fn append_event(store: &MemoryStore, event_type: &str) -> Uuid {
         let event_id = Uuid::new_v4();
-        let ev = NewEvent {
+        let ev = EventData {
             event_id,
-            parent_id:       None,
+            causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      event_type.into(),
             payload:         serde_json::json!({"event_type": event_type}),
@@ -365,7 +365,7 @@ mod tests {
         runner.step(10).await.unwrap();
 
         let cursor = store.get("graph").await.unwrap().unwrap();
-        let last_pos = EventLogBackend::load_from(
+        let last_pos = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap()
             .last()
@@ -398,7 +398,7 @@ mod tests {
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
             async fn project(
                 &self,
-                event: &PersistedEvent,
+                event: &RecordedEvent,
                 _ctx: Ctx<'_>,
             ) -> Result<()> {
                 self.seen.lock().push(event.event_id);
@@ -410,7 +410,7 @@ mod tests {
         for _ in 0..2 {
             append_event(&store, "world:event").await;
         }
-        let last_pos = EventLogBackend::load_from(
+        let last_pos = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap()[0].position;
         store.set("downstream", last_pos).await.unwrap();
@@ -436,7 +436,7 @@ mod tests {
             const CATEGORIES: &'static [&'static str] = &[];
             async fn project(
                 &self,
-                _event: &PersistedEvent,
+                _event: &RecordedEvent,
                 _ctx: Ctx<'_>,
             ) -> Result<()> { Ok(()) }
         }

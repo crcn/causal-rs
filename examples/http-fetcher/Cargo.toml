@@ -1,12 +1,16 @@
 [package]
 name = "http-fetcher-example"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 publish = false
 
 [dependencies]
-causal = { version = "0.3.6", path = "../../modules/causal" }
+causal = { version = "0.4.6", path = "../../modules/causal" }
+causal_replay = { version = "0.4.6", path = "../../modules/causal_replay", features = ["kurrent"] }
 tokio = { version = "1.49", features = ["full"] }
 reqwest = "0.12"
 anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.20", features = ["v4", "serde"] }

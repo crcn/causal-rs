@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use causal::types::{AppendResult, LogCursor, NewEvent, PersistedEvent, StreamVersion};
+use causal::types::{WriteResult, LogCursor, EventData, RecordedEvent, StreamRevision, StreamState};
 use causal::{EventLogBackend, MemoryStore};
 use causal_replay::MirroringEventLogBackend;
 use chrono::Utc;
@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-fn make_event(correlation: Uuid, event_type: &str) -> NewEvent {
-    NewEvent {
+fn make_event(correlation: Uuid, event_type: &str) -> EventData {
+    EventData {
         event_id: Uuid::new_v4(),
-        parent_id: None,
+        causation_id: None,
         correlation_id: correlation,
         event_type: event_type.to_string(),
         payload: serde_json::json!({}),
@@ -42,8 +42,8 @@ async fn append_writes_to_both_children() -> Result<()> {
 
     mirror.append(event).await?;
 
-    let legacy_events = legacy.load_from(LogCursor::ZERO, 100).await?;
-    let v03_events = v03.load_from(LogCursor::ZERO, 100).await?;
+    let legacy_events = legacy.read_all(LogCursor::ZERO, 100).await?;
+    let v03_events = v03.read_all(LogCursor::ZERO, 100).await?;
 
     assert_eq!(legacy_events.len(), 1, "legacy must have the row");
     assert_eq!(v03_events.len(), 1, "v0.3 mirror must have the row");
@@ -54,10 +54,10 @@ async fn append_writes_to_both_children() -> Result<()> {
 
 #[tokio::test]
 async fn read_paths_delegate_to_legacy() -> Result<()> {
-    // The wrapper's `load_from`, `load_stream`, `latest_position` all
+    // The wrapper's `read_all`, `read_stream`, `latest_position` all
     // read from legacy. To verify, write to legacy directly (bypassing
-    // the wrapper) and confirm `mirror.load_from` sees it; then write
-    // to v03 directly and confirm `mirror.load_from` does NOT see it.
+    // the wrapper) and confirm `mirror.read_all` sees it; then write
+    // to v03 directly and confirm `mirror.read_all` does NOT see it.
     let legacy: Arc<dyn EventLogBackend> = Arc::new(MemoryStore::new());
     let v03: Arc<dyn EventLogBackend> = Arc::new(MemoryStore::new());
     let mirror = MirroringEventLogBackend::new(legacy.clone(), v03.clone());
@@ -66,17 +66,17 @@ async fn read_paths_delegate_to_legacy() -> Result<()> {
         .append(make_event(Uuid::new_v4(), "legacy:only"))
         .await?;
 
-    let from_mirror = mirror.load_from(LogCursor::ZERO, 100).await?;
+    let from_mirror = mirror.read_all(LogCursor::ZERO, 100).await?;
     assert_eq!(from_mirror.len(), 1);
     assert_eq!(from_mirror[0].event_type, "legacy:only");
 
-    // Now write to v03 only — mirror should NOT see it via load_from.
+    // Now write to v03 only — mirror should NOT see it via read_all.
     v03.append(make_event(Uuid::new_v4(), "v03:only")).await?;
-    let from_mirror_again = mirror.load_from(LogCursor::ZERO, 100).await?;
+    let from_mirror_again = mirror.read_all(LogCursor::ZERO, 100).await?;
     assert_eq!(
         from_mirror_again.len(),
         1,
-        "mirror.load_from should still only see the legacy row"
+        "mirror.read_all should still only see the legacy row"
     );
     assert_eq!(from_mirror_again[0].event_type, "legacy:only");
     Ok(())
@@ -97,7 +97,7 @@ async fn legacy_failure_propagates_and_skips_v03_write() -> Result<()> {
         .await;
     assert!(result.is_err(), "wrapper must propagate legacy failure");
 
-    let v03_events = v03.load_from(LogCursor::ZERO, 100).await?;
+    let v03_events = v03.read_all(LogCursor::ZERO, 100).await?;
     assert!(
         v03_events.is_empty(),
         "v0.3 mirror must NOT have the row after legacy failure"
@@ -122,7 +122,7 @@ async fn v03_failure_after_legacy_success_leaves_legacy_committed() -> Result<()
     assert!(result.is_err(), "wrapper must propagate v0.3 failure");
 
     // Legacy has the row — observable inconsistency until retry.
-    let legacy_events = legacy.load_from(LogCursor::ZERO, 100).await?;
+    let legacy_events = legacy.read_all(LogCursor::ZERO, 100).await?;
     assert_eq!(legacy_events.len(), 1);
     assert_eq!(legacy_events[0].event_id, event_id);
 
@@ -132,11 +132,11 @@ async fn v03_failure_after_legacy_success_leaves_legacy_committed() -> Result<()
     mirror.append(event).await?;
 
     // Legacy still has just the one row (idempotent on event_id).
-    let legacy_events_after = legacy.load_from(LogCursor::ZERO, 100).await?;
+    let legacy_events_after = legacy.read_all(LogCursor::ZERO, 100).await?;
     assert_eq!(legacy_events_after.len(), 1);
 
-    // v0.3 mirror now ALSO has it. Verify via load_from on the
-    // FailingBackend's "succeed" mode (its load_from returns empty
+    // v0.3 mirror now ALSO has it. Verify via read_all on the
+    // FailingBackend's "succeed" mode (its read_all returns empty
     // since FailingBackend is a stub — for a real verification we'd
     // need to use MemoryStore on the v0.3 side; what this test
     // demonstrates is that the wrapper's retry semantics work, not
@@ -168,9 +168,9 @@ async fn retry_recovers_when_v03_recovers() -> Result<()> {
     assert!(r2.is_ok(), "retry must succeed once v0.3 recovers");
 
     // Both have it.
-    let legacy_events = legacy.load_from(LogCursor::ZERO, 100).await?;
+    let legacy_events = legacy.read_all(LogCursor::ZERO, 100).await?;
     assert_eq!(legacy_events.len(), 1);
-    let v03_events = v03_inner.load_from(LogCursor::ZERO, 100).await?;
+    let v03_events = v03_inner.read_all(LogCursor::ZERO, 100).await?;
     assert_eq!(v03_events.len(), 1);
     assert_eq!(legacy_events[0].event_id, event_id);
     assert_eq!(v03_events[0].event_id, event_id);
@@ -185,23 +185,23 @@ struct GatedBackend {
 
 #[async_trait]
 impl EventLogBackend for GatedBackend {
-    async fn append(&self, event: NewEvent) -> Result<AppendResult> {
+    async fn append(&self, event: EventData) -> Result<WriteResult> {
         if self.fail_first_n.swap(false, Ordering::SeqCst) {
             Err(anyhow::anyhow!("gated: failing first call"))
         } else {
             self.inner.append(event).await
         }
     }
-    async fn load_from(&self, after: LogCursor, limit: usize) -> Result<Vec<PersistedEvent>> {
-        self.inner.load_from(after, limit).await
+    async fn read_all(&self, after: LogCursor, limit: usize) -> Result<Vec<RecordedEvent>> {
+        self.inner.read_all(after, limit).await
     }
-    async fn load_stream(
+    async fn read_stream(
         &self,
         a: &str,
         b: Uuid,
-        c: Option<StreamVersion>,
-    ) -> Result<Vec<PersistedEvent>> {
-        self.inner.load_stream(a, b, c).await
+        c: Option<StreamRevision>,
+    ) -> Result<Vec<RecordedEvent>> {
+        self.inner.read_stream(a, b, c).await
     }
     async fn latest_position(&self) -> Result<LogCursor> {
         self.inner.latest_position().await
@@ -210,9 +210,9 @@ impl EventLogBackend for GatedBackend {
         &self,
         a: &str,
         b: Uuid,
-        c: StreamVersion,
-        event: NewEvent,
-    ) -> Result<AppendResult> {
+        c: StreamState,
+        event: EventData,
+    ) -> Result<WriteResult> {
         self.inner.append_to_stream(a, b, c, event).await
     }
 }
@@ -247,38 +247,29 @@ struct FailingBackend {
     fail: AtomicBool,
 }
 
-impl FailingBackend {
-    /// Helper for the recovery test — exposes the inner state. Doesn't
-    /// actually return a MemoryStore (the inner store is the OUTER
-    /// failure switch); kept for naming symmetry with the test.
-    fn fail_check_v03(&self) -> &Self {
-        self
-    }
-}
-
 #[async_trait]
 impl EventLogBackend for FailingBackend {
-    async fn append(&self, _event: NewEvent) -> Result<AppendResult> {
+    async fn append(&self, _event: EventData) -> Result<WriteResult> {
         if self.fail.load(Ordering::SeqCst) {
             Err(anyhow::anyhow!("FailingBackend: configured to fail"))
         } else {
-            Ok(AppendResult {
+            Ok(WriteResult {
                 position: LogCursor::from_raw(1),
-                version: None,
+                revision: None,
             })
         }
     }
 
-    async fn load_from(&self, _: LogCursor, _: usize) -> Result<Vec<PersistedEvent>> {
+    async fn read_all(&self, _: LogCursor, _: usize) -> Result<Vec<RecordedEvent>> {
         Ok(Vec::new())
     }
 
-    async fn load_stream(
+    async fn read_stream(
         &self,
         _: &str,
         _: Uuid,
-        _: Option<StreamVersion>,
-    ) -> Result<Vec<PersistedEvent>> {
+        _: Option<StreamRevision>,
+    ) -> Result<Vec<RecordedEvent>> {
         Ok(Vec::new())
     }
 
@@ -290,9 +281,9 @@ impl EventLogBackend for FailingBackend {
         &self,
         _: &str,
         _: Uuid,
-        _: StreamVersion,
-        _: NewEvent,
-    ) -> Result<AppendResult> {
+        _: StreamState,
+        _: EventData,
+    ) -> Result<WriteResult> {
         Err(anyhow::anyhow!("FailingBackend: configured to fail"))
     }
 }

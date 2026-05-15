@@ -28,7 +28,7 @@ pub struct StoredEvent {
     /// Unique event ID.
     pub id: Option<Uuid>,
     /// Parent event ID (causal link).
-    pub parent_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
     /// Correlation ID linking the full causal chain.
     pub correlation_id: Option<Uuid>,
     /// Reactor that produced this event.
@@ -38,7 +38,7 @@ pub struct StoredEvent {
     /// Aggregate instance ID, if this event matched an aggregator.
     pub aggregate_id: Option<Uuid>,
     /// Per-stream version, if this event matched an aggregator.
-    pub stream_version: Option<u64>,
+    pub stream_revision: Option<u64>,
 }
 
 impl StoredEvent {
@@ -54,12 +54,12 @@ impl StoredEvent {
             event_type: self.event_type.clone(),
             name,
             id: self.id.map(|u| u.to_string()),
-            parent_id: self.parent_id.map(|u| u.to_string()),
+            causation_id: self.causation_id.map(|u| u.to_string()),
             correlation_id: self.correlation_id.map(|u| u.to_string()),
             reactor_id: self.reactor_id.clone(),
             aggregate_type: self.aggregate_type.clone(),
             aggregate_id: self.aggregate_id.map(|u| u.to_string()),
-            stream_version: self.stream_version.map(|v| v as i64),
+            stream_revision: self.stream_revision.map(|v| v as i64),
             summary,
             payload: payload_str,
         }

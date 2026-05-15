@@ -1,14 +1,14 @@
-//! `Projector` trait — v0.4 idempotent at-least-once external state.
+//! `Projector` trait — idempotent at-least-once external state.
 //!
 //! A Projector applies a fact to external state (Postgres tables,
 //! Neo4j graph, search index, foreign API) idempotently keyed on
 //! `ctx.event_id`. The runtime delivers each matching fact at-least-once;
 //! the application's idempotency turns that into exactly-once observed
-//! effect (per C8 in the v0.4 API design plan).
+//! effect (per C8).
 //!
-//! Projectors are NOT allowed to read Views (per C13). All derived
-//! state needed by a projector must be folded directly from the
-//! facts the projector subscribes to.
+//! Projectors must NOT read derived state from other consumers (per
+//! C13). All state needed by a projector must be folded directly from
+//! the facts the projector subscribes to.
 //!
 //! There is no `commit_reactor_batch`-style atomicity here: projector
 //! cursor advance is per-fact (per C2), independent of the writes
@@ -16,7 +16,7 @@
 //! and cursor checkpoint causes the same fact to redeliver, which
 //! idempotency absorbs.
 //!
-//! Kurrent alignment: a Projector's per-Fact subscription maps to a
+//! Kurrent alignment: a Projector's per-Event subscription maps to a
 //! Kurrent persistent subscription on `$et-{CATEGORY}:*`. The
 //! `GROUP_NAME` const (added in P4) becomes the persistent
 //! subscription's group name.
@@ -25,11 +25,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::contexts::Ctx;
-use crate::fact::Fact;
+use crate::event::Event;
 
 #[async_trait]
 pub trait Projector: Send + Sync {
-    type Fact: Fact;
+    type Event: Event;
 
     /// Persistent-subscription group name (= Kurrent persistent
     /// subscription group identity). Used as the consumer's cursor
@@ -59,7 +59,7 @@ pub trait Projector: Send + Sync {
     /// on caller idempotency to prevent duplicate effects.
     async fn project(
         &self,
-        fact: &Self::Fact,
+        fact: &Self::Event,
         ctx: Ctx<'_>,
     ) -> Result<()>;
 }
@@ -81,9 +81,9 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
 
-    impl Fact for Recorded {
+    impl Event for Recorded {
         const CATEGORY: &'static str = "records";
-        fn name(&self) -> &str { "recorded" }
+        fn event_type(&self) -> &str { "recorded" }
         fn stream_id(&self) -> Uuid { self.id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -97,7 +97,7 @@ mod tests {
 
     #[async_trait]
     impl Projector for CountingSink {
-        type Fact = Recorded;
+        type Event = Recorded;
         const GROUP_NAME: &'static str = "counting-sink";
 
         async fn project(

@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use causal::event_log::EventLogBackend;
-use causal::types::PersistedEvent;
+use causal::types::RecordedEvent;
 use causal::LogCursor;
 
 use crate::pointer::PointerStore;
@@ -179,7 +179,7 @@ impl<'a> ProjectionStream<'a> {
     /// - Live: catch up from active pointer, tail indefinitely
     pub async fn run<F, Fut>(self, apply: F) -> Result<()>
     where
-        F: Fn(&PersistedEvent) -> Fut + Send + Sync,
+        F: Fn(&RecordedEvent) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
         let mode = self.mode.unwrap_or_else(Mode::from_env);
@@ -191,7 +191,7 @@ impl<'a> ProjectionStream<'a> {
 
     /// Run the projection stream with batch callbacks.
     ///
-    /// Same lifecycle as `run()` but passes the whole batch from `load_from`
+    /// Same lifecycle as `run()` but passes the whole batch from `read_all`
     /// to the callback instead of iterating per-event. This lets consumers
     /// batch writes (e.g. Neo4j transactions, bulk inserts).
     ///
@@ -199,7 +199,7 @@ impl<'a> ProjectionStream<'a> {
     /// The consumer owns atomicity within the batch.
     pub async fn run_batch<F, Fut>(self, apply: F) -> Result<()>
     where
-        F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
+        F: Fn(&[RecordedEvent]) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
         let mode = self.mode.unwrap_or_else(Mode::from_env);
@@ -212,7 +212,7 @@ impl<'a> ProjectionStream<'a> {
     /// Replay mode: read all events from position 0, stage, promote.
     async fn run_replay<F, Fut>(&self, apply: &F) -> Result<()>
     where
-        F: Fn(&PersistedEvent) -> Fut + Send + Sync,
+        F: Fn(&RecordedEvent) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
         let mut position = LogCursor::ZERO;
@@ -222,7 +222,7 @@ impl<'a> ProjectionStream<'a> {
         tracing::info!(target = target.raw(), "replay starting from position 0");
 
         loop {
-            let events = self.log.load_from(position, self.batch_size).await?;
+            let events = self.log.read_all(position, self.batch_size).await?;
             if events.is_empty() {
                 break;
             }
@@ -250,7 +250,7 @@ impl<'a> ProjectionStream<'a> {
     /// Replay mode with batch callbacks.
     async fn run_batch_replay<F, Fut>(&self, apply: &F) -> Result<()>
     where
-        F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
+        F: Fn(&[RecordedEvent]) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
         let mut position = LogCursor::ZERO;
@@ -260,7 +260,7 @@ impl<'a> ProjectionStream<'a> {
         tracing::info!(target = target.raw(), "replay starting from position 0");
 
         loop {
-            let events = self.log.load_from(position, self.batch_size).await?;
+            let events = self.log.read_all(position, self.batch_size).await?;
             if events.is_empty() {
                 break;
             }
@@ -312,7 +312,7 @@ impl<'a> ProjectionStream<'a> {
     /// Live mode: catch up from active pointer, then tail.
     async fn run_live<F, Fut>(&self, apply: &F) -> Result<()>
     where
-        F: Fn(&PersistedEvent) -> Fut + Send + Sync,
+        F: Fn(&RecordedEvent) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
         let mut position = self.pointer.position().await?.unwrap_or(LogCursor::ZERO);
@@ -320,7 +320,7 @@ impl<'a> ProjectionStream<'a> {
 
         // Catch up.
         loop {
-            let events = self.log.load_from(position, self.batch_size).await?;
+            let events = self.log.read_all(position, self.batch_size).await?;
             if events.is_empty() {
                 break;
             }
@@ -363,7 +363,7 @@ impl<'a> ProjectionStream<'a> {
                 }
             }
 
-            let events = self.log.load_from(position, self.batch_size).await?;
+            let events = self.log.read_all(position, self.batch_size).await?;
             for event in &events {
                 if let Err(e) = apply(event).await {
                     tracing::warn!(
@@ -383,7 +383,7 @@ impl<'a> ProjectionStream<'a> {
     /// Live mode with batch callbacks.
     async fn run_batch_live<F, Fut>(&self, apply: &F) -> Result<()>
     where
-        F: Fn(&[PersistedEvent]) -> Fut + Send + Sync,
+        F: Fn(&[RecordedEvent]) -> Fut + Send + Sync,
         Fut: Future<Output = Result<()>> + Send,
     {
         let mut position = self.pointer.position().await?.unwrap_or(LogCursor::ZERO);
@@ -391,7 +391,7 @@ impl<'a> ProjectionStream<'a> {
 
         // Catch up.
         loop {
-            let events = self.log.load_from(position, self.batch_size).await?;
+            let events = self.log.read_all(position, self.batch_size).await?;
             if events.is_empty() {
                 break;
             }
@@ -430,7 +430,7 @@ impl<'a> ProjectionStream<'a> {
                 }
             }
 
-            let events = self.log.load_from(position, self.batch_size).await?;
+            let events = self.log.read_all(position, self.batch_size).await?;
             if !events.is_empty() {
                 if let Err(e) = apply(&events).await {
                     tracing::warn!(
