@@ -1,12 +1,16 @@
-//! HTTP Fetcher example backed by KurrentDB.
+//! HTTP Fetcher example: KurrentDB event log + Postgres reactor outbox.
 //!
-//! Run KurrentDB first:
+//! Run the stack first (Kurrent + Postgres):
 //!
 //!     docker compose up -d
 //!
 //! Then:
 //!
 //!     cargo run
+//!
+//! With the PG outbox, the reactor cursor survives restarts — re-running
+//! `cargo run` skips events from prior runs and only processes the new
+//! `FetchRequested` emissions.
 
 use std::sync::Arc;
 
@@ -14,11 +18,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use causal::{
     CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend, Events,
-    MemoryStore, Reactor, ReactorOutbox,
+    Reactor, ReactorOutbox,
 };
-use causal_replay::KurrentEventLogBackend;
+use causal_replay::{KurrentEventLogBackend, PgReactorOutbox};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -105,27 +110,38 @@ impl Reactor for FetchReactor {
 async fn main() -> Result<()> {
     let kurrent_url = std::env::var("KURRENT_URL")
         .unwrap_or_else(|_| "esdb://localhost:2113?tls=false".to_string());
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://causal:causal@localhost:54320/causal".to_string());
 
     let kurrent = match KurrentEventLogBackend::connect(&kurrent_url) {
         Ok(client) => client,
         Err(e) => {
             eprintln!("could not connect to KurrentDB at {kurrent_url}: {e}");
             eprintln!();
-            eprintln!("start one locally with:");
-            eprintln!("    docker compose up -d");
+            eprintln!("start the stack with:  docker compose up -d");
             std::process::exit(1);
         }
     };
 
-    let mem = Arc::new(MemoryStore::new());
+    let pg_pool = match PgPoolOptions::new().max_connections(4).connect(&database_url).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("could not connect to Postgres at {database_url}: {e}");
+            eprintln!();
+            eprintln!("start the stack with:  docker compose up -d");
+            std::process::exit(1);
+        }
+    };
+
+    let pg = Arc::new(PgReactorOutbox::new(pg_pool));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let engine = EngineBuilder::new(
         Arc::new(kurrent) as Arc<dyn EventLogBackend>,
-        mem.clone() as Arc<dyn CheckpointStore>,
-        mem as Arc<dyn ReactorOutbox>,
+        pg.clone() as Arc<dyn CheckpointStore>,
+        pg as Arc<dyn ReactorOutbox>,
     )
     .with_reactor(FetchReactor { http_client })
     .build();
