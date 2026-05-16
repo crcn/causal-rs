@@ -170,8 +170,16 @@ impl Reactor for SummarizeReactor {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .expect("ANTHROPIC_API_KEY environment variable required");
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) => k,
+        Err(_) => {
+            eprintln!("ANTHROPIC_API_KEY not set.");
+            eprintln!();
+            eprintln!("export it and re-run:");
+            eprintln!("    export ANTHROPIC_API_KEY=sk-ant-...");
+            std::process::exit(1);
+        }
+    };
 
     let kurrent_url = std::env::var("KURRENT_URL")
         .unwrap_or_else(|_| "esdb://localhost:2113?tls=false".to_string());
