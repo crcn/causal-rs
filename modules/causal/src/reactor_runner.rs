@@ -71,6 +71,18 @@ pub fn derive_output_event_id(
     Uuid::new_v5(&NS_REACTOR_OUTPUT, &key)
 }
 
+/// Metadata stamped on every reactor output so consumers (the inspector in
+/// particular) can attribute the emitted event to the reactor that produced
+/// it. Read back via `metadata["reactor_id"]`.
+fn reactor_output_metadata(reactor_id: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "reactor_id".to_string(),
+        serde_json::Value::String(reactor_id.to_string()),
+    );
+    m
+}
+
 pub struct ReactorRunner<R: Reactor> {
     reactor:     R,
     consumer_id: String,
@@ -344,7 +356,7 @@ where
                                     created_at: chrono::Utc::now(),
                                     category: Some(cat.clone()),
                                     stream_id: Some(sid),
-                                    metadata: serde_json::Map::new(),
+                                    metadata: reactor_output_metadata(&self.consumer_id),
                                     ephemeral: None,
                                     persistent: true,
                                 };
@@ -397,7 +409,7 @@ where
                     created_at: chrono::Utc::now(),
                     category: Some(out.event_prefix.clone()),
                     stream_id: Some(out.stream_id),
-                    metadata: serde_json::Map::new(),
+                    metadata: reactor_output_metadata(&self.consumer_id),
                     ephemeral: None,
                     persistent: true,
                 };
