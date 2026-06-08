@@ -6,12 +6,12 @@ const EVENT_FIELDS = `
   type
   name
   id
-  parentId
+  parentId: causationId
   correlationId
   reactorId
   aggregateType
   aggregateId
-  streamVersion
+  streamVersion: streamRevision
   summary
   payload
 `;
