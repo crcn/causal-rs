@@ -16,7 +16,7 @@
 //! ```
 //! (cd ../../modules/causal-inspector-ui && npm install && npm run build)
 //! (cd ui && npm install && npm run build)        # build the inspector UI once
-//! docker compose up -d                            # start KurrentDB
+//! docker compose up -d                            # start KurrentDB + Postgres
 //! cargo run                                       # or: ../../dev.sh example run inspector-demo
 //! ```
 //!
@@ -24,9 +24,11 @@
 //!   - http://localhost:4000/causal — Inspector UI
 //!   - http://localhost:4000        — GraphQL playground
 //!
-//! KurrentDB is the durable event log; an in-process `MemoryStore` mirrors every
-//! event and captures reactor observability, since only `MemoryStore` implements
-//! the inspector's `InspectorReadModel` + `ReactorObserver`.
+//! KurrentDB is the durable source of truth. Postgres is a best-effort
+//! observability store: `PgEventProjector` mirrors the event log into PG
+//! `causal_log`, and `PgReactorObserver` records reactor execution, logs,
+//! descriptions, and aggregate snapshots. The inspector reads only from PG
+//! (`PgInspectorReadModel`), so any box in a fleet can serve it.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -44,13 +46,17 @@ use uuid::Uuid;
 
 use causal::aggregate::{Aggregate, Apply};
 use causal::aggregator::Aggregator;
-use causal::types::{LogLevel, RecordedEvent};
+use causal::types::LogLevel;
 use causal::{
-    CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend, Events, MemoryStore, Reactor,
+    CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend, Events, Reactor,
     ReactorCheckpoint,
 };
 use causal_inspector::{router, EventDisplay, InspectorReadModel, StoredEvent};
-use causal_replay::{KurrentEventLogBackend, MirroringEventLogBackend};
+use causal_replay::{
+    KurrentEventLogBackend, PgEventProjector, PgInspectorReadModel, PgReactorCheckpoint,
+    PgReactorObserver,
+};
+use sqlx::postgres::PgPoolOptions;
 
 // ── Events ──────────────────────────────────────────────────────────
 //
@@ -413,23 +419,6 @@ impl EventDisplay for DemoEventDisplay {
     }
 }
 
-/// Map a persisted `RecordedEvent` to the inspector's `StoredEvent`.
-fn to_stored(e: &RecordedEvent) -> StoredEvent {
-    StoredEvent {
-        seq: e.position.raw() as i64,
-        ts: e.created_at,
-        event_type: e.event_type.clone(),
-        payload: e.payload.clone(),
-        id: Some(e.event_id),
-        causation_id: e.causation_id,
-        correlation_id: Some(e.correlation_id),
-        reactor_id: e.metadata.get("reactor_id").and_then(|v| v.as_str()).map(String::from),
-        aggregate_type: Some(e.category.clone()),
-        aggregate_id: Some(e.stream_id),
-        stream_revision: Some(e.revision.raw()),
-    }
-}
-
 async fn graphiql() -> axum::response::Html<String> {
     axum::response::Html(
         async_graphql::http::GraphiQLSource::build()
@@ -445,9 +434,11 @@ async fn graphiql() -> axum::response::Html<String> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
-    // KurrentDB is the durable event log. An in-process MemoryStore mirrors
-    // every event and captures reactor observability for the inspector —
-    // only MemoryStore implements InspectorReadModel + ReactorObserver.
+    // KurrentDB is the durable source of truth. Postgres is a best-effort
+    // observability store: a background projector mirrors the event log into
+    // `causal_log`, and `PgReactorObserver` records reactor execution/logs/
+    // descriptions + aggregate snapshots. The inspector reads only from PG, so
+    // any box in a fleet can serve it (`PgInspectorReadModel`).
     let kurrent_url = std::env::var("KURRENT_URL")
         .unwrap_or_else(|_| "kurrentdb://localhost:2113?tls=false".to_string());
     let kurrent = match KurrentEventLogBackend::connect(&kurrent_url) {
@@ -460,24 +451,44 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    let memory = Arc::new(MemoryStore::new());
-    let log = Arc::new(MirroringEventLogBackend::new(
-        Arc::new(kurrent) as Arc<dyn EventLogBackend>, // durable source of truth
-        memory.clone() as Arc<dyn EventLogBackend>,    // mirror for the inspector
-    ));
+    let log = Arc::new(kurrent) as Arc<dyn EventLogBackend>;
 
-    // Live event feed for the inspector: poll the mirror and broadcast new events.
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://causal:causal@localhost:54330/causal".to_string());
+    let pool = match PgPoolOptions::new().max_connections(8).connect(&database_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("could not connect to Postgres at {database_url}: {e}");
+            eprintln!();
+            eprintln!("start it with:  docker compose up -d");
+            eprintln!("          (or:  ../../dev.sh example run inspector-demo)");
+            std::process::exit(1);
+        }
+    };
+
+    let checkpoint = Arc::new(PgReactorCheckpoint::new(pool.clone()));
+    let observer = Arc::new(PgReactorObserver::new(pool.clone()));
+
+    // Project KurrentDB's $all into PG `causal_log` (idempotent, off the hot path)
+    // so the inspector's event/flow views have data.
+    PgEventProjector::spawn(
+        log.clone(),
+        checkpoint.clone() as Arc<dyn CheckpointStore>,
+        pool.clone(),
+    );
+
+    // Live event feed for the inspector: poll PG for new events and broadcast.
     let (inspector_tx, _) = broadcast::channel::<StoredEvent>(1024);
     {
-        let memory = memory.clone();
+        let read = PgInspectorReadModel::new(pool.clone());
         let tx = inspector_tx.clone();
         tokio::spawn(async move {
-            let mut cursor = causal::types::LogCursor::ZERO;
+            let mut next_seq: i64 = 0;
             loop {
-                if let Ok(events) = EventLogBackend::read_all(memory.as_ref(), cursor, 256).await {
-                    for e in &events {
-                        let _ = tx.send(to_stored(e));
-                        cursor = e.position;
+                if let Ok(events) = read.events_from_seq(next_seq, 256).await {
+                    for e in events {
+                        next_seq = e.seq + 1;
+                        let _ = tx.send(e);
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -487,11 +498,11 @@ async fn main() -> Result<()> {
 
     // Build the engine: singleton phase-tracking aggregate + the reactor pipeline.
     let engine = EngineBuilder::new(
-        log as Arc<dyn EventLogBackend>,
-        memory.clone() as Arc<dyn CheckpointStore>,
-        memory.clone() as Arc<dyn ReactorCheckpoint>,
+        log.clone(),
+        checkpoint.clone() as Arc<dyn CheckpointStore>,
+        checkpoint.clone() as Arc<dyn ReactorCheckpoint>,
     )
-    .with_observer(memory.clone())
+    .with_observer(observer)
     .with_aggregators(vec![
         Aggregator::for_type_with_id_fn::<PipelineState, MetadataExtracted, _>(nil_id),
         Aggregator::for_type_with_id_fn::<PipelineState, SentimentAnalyzed, _>(nil_id),
@@ -515,7 +526,7 @@ async fn main() -> Result<()> {
 
     // Inspector router (GraphQL + WS) + the bundled UI under /causal.
     let inspector = router(
-        memory.clone() as Arc<dyn InspectorReadModel>,
+        Arc::new(PgInspectorReadModel::new(pool.clone())) as Arc<dyn InspectorReadModel>,
         DemoEventDisplay,
         inspector_tx,
     );

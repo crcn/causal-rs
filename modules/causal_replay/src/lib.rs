@@ -33,9 +33,12 @@
 pub mod conformance;
 pub mod event_log;
 pub mod kurrent_event_log;
+pub mod event_projector;
+pub mod inspector_read_model;
 pub mod mirroring;
 pub mod pointer;
 pub mod reactor_checkpoint;
+pub mod reactor_observer;
 pub mod snapshot_store;
 pub mod stream;
 pub mod tail;
@@ -54,6 +57,15 @@ pub use pointer::PgPointerStore;
 
 #[cfg(feature = "postgres")]
 pub use reactor_checkpoint::PgReactorCheckpoint;
+
+#[cfg(feature = "postgres")]
+pub use reactor_observer::PgReactorObserver;
+
+#[cfg(feature = "postgres")]
+pub use inspector_read_model::PgInspectorReadModel;
+
+#[cfg(feature = "postgres")]
+pub use event_projector::PgEventProjector;
 
 #[cfg(feature = "postgres")]
 pub use snapshot_store::PgSnapshotStore;

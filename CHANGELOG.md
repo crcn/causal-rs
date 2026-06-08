@@ -4,6 +4,66 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-08
+
+### Added — Postgres observability (best-effort, fleet-wide inspector backend)
+
+The inspector previously read from an in-process `MemoryStore`, so its event
+flow, reactor logs, and chain-of-events were visible only on the box that
+processed them — useless across a load-balanced fleet, and lost on restart.
+This release adds a Postgres-backed observability store so any box can serve the
+full picture.
+
+KurrentDB remains the durable source of truth. Postgres is a deliberately
+**best-effort, lossy** read + observability store — never used for coordination,
+leasing, or anything that has to be bulletproof. Three new public types in
+`causal_replay` (all under the `postgres` feature):
+
+- **`PgReactorObserver`** — implements `causal::ReactorObserver`. On the reactor
+  hot path the hooks only `try_send` to a bounded channel (drop-on-overflow); a
+  background writer batches reactor executions, logs, descriptions, and
+  aggregate snapshots into Postgres in one transaction of idempotent UPSERTs.
+  DLQ folds to `status = 'dead_letter'`. Cheap on the write path, lossy by
+  design.
+- **`PgInspectorReadModel`** — implements all of `causal_inspector`'s
+  `InspectorReadModel`. Event/flow views query `causal_log`; observability views
+  join it on `event_id` so there is a single Postgres sequence authority.
+- **`PgEventProjector`** — a background catch-up consumer that mirrors the source
+  log's `$all` into `causal_log` with `ON CONFLICT (event_id) DO NOTHING`.
+  Idempotent, so any/all boxes can run it and a restart simply resumes.
+
+### Added — schema
+
+- `migrations/20260608_reactor_observability.sql` (also in the canonical
+  `docs/schema.sql`): `causal_reactor_executions`, `causal_reactor_logs`,
+  `causal_reactor_descriptions`, `causal_aggregate_snapshots`. The aggregate and
+  description tables key on `(event_id, …)` so the at-least-once reactor firehose
+  collapses to one row per `(event, key)`.
+
+### Changed
+
+- `examples/inspector-demo` now runs on the production-shape stack — KurrentDB as
+  the source of truth, Postgres as the observability backend — instead of the
+  in-process `MemoryStore` mirror. Its `docker-compose.yml` gains a Postgres
+  service seeded from `docs/schema.sql`. The flow graph and chain-of-events are
+  derived from Postgres and survive restarts.
+
+### Hardening (pre-release audit)
+
+- `PgInspectorReadModel::reactor_outcomes` now reports the **terminal** status of
+  each reactor — a reactor that failed then recovered reads as `completed`, not
+  `failed` — and pairs the error with that terminal attempt (so a recovered
+  reactor shows no error). Matches the `MemoryStore` reference; the previous
+  worst-status logic mislabeled every recovered reactor as failed.
+- `reactor_attempt_history` returns only closed attempts; in-flight `running`
+  rows no longer render as zero-duration completed attempts.
+- `PgEventProjector` writes a non-aggregate event's identity as `NULL` rather
+  than `("", nil, 0)`, preserving the `causal_log` all-set-or-all-NULL invariant
+  and avoiding a partial-unique-index collision that `ON CONFLICT (event_id)`
+  cannot catch (which would otherwise stall the projector).
+- All correlation-scoped reads are bounded (`LIMIT 10000`) so a pathological
+  correlation can't load an unbounded result set into a single inspector request.
+
 ## [0.6.0] - 2026-06-08
 
 ### Breaking — atomic batch append

@@ -18,6 +18,26 @@ services:
       - kurrentdb-data:/var/lib/kurrentdb
       - kurrentdb-logs:/var/log/kurrentdb
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: inspector-demo-postgres
+    environment:
+      POSTGRES_DB: causal
+      POSTGRES_USER: causal
+      POSTGRES_PASSWORD: causal
+    ports:
+      - "54330:5432"   # best-effort observability store (DATABASE_URL)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U causal -d causal"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Canonical schema (event log + reactor observability tables) as init.
+      - ../../docs/schema.sql:/docker-entrypoint-initdb.d/01-causal.sql:ro
+
 volumes:
   kurrentdb-data:
   kurrentdb-logs:
+  postgres-data:
