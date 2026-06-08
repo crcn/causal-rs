@@ -1,6 +1,7 @@
 # Rust
 /target
 Cargo.lock
+!dev/cli/Cargo.lock
 **/*.rs.bk
 *.pdb
 

@@ -1,0 +1,25 @@
+[package]
+name = "dev-cli"
+version = "0.1.0"
+edition = "2021"
+
+# Independent workspace - won't conflict with parent project
+[workspace]
+
+[[bin]]
+name = "dev-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+console = "0.15"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+dotenvy = "0.15"
+indicatif = "0.17"
+open = "5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# devkit core library (pinned version)
+devkit-core = { git = "https://github.com/crcn/devkit", tag = "v0.1.0-fbee47f" }

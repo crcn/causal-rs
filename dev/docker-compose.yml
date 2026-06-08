@@ -1,0 +1,38 @@
+# Local infrastructure for `./dev.sh test pg|kurrent|live`.
+#
+# Distinct ports + project name so it never clashes with an example stack
+# (examples use Kurrent :2113 / Postgres :54320; this uses :2114 / :5433).
+# Kurrent runs --mem-db so every `up` is a clean slate for the live suites.
+name: causal-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: causal-dev-postgres
+    environment:
+      POSTGRES_DB: causal_dev
+      POSTGRES_USER: causal
+      POSTGRES_PASSWORD: causal
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U causal -d causal_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  kurrentdb:
+    image: docker.kurrent.io/kurrent-latest/kurrentdb:latest
+    container_name: causal-dev-kurrentdb
+    command:
+      - --insecure
+      - --run-projections=All
+      - --enable-atom-pub-over-http
+      - --mem-db
+    ports:
+      - "2114:2113"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:2113/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

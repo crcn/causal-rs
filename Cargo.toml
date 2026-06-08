@@ -10,6 +10,7 @@ members = [
 exclude = [
     "examples/http-fetcher",
     "examples/ai-summarizer",
+    "dev/cli",
 ]
 resolver = "2"
 

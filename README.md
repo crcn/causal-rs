@@ -51,6 +51,35 @@ step-by-step guide.
 The library is being prepared for production deployment in
 [rootsignal](https://rootsignal.com) on KurrentDB.
 
+## Development
+
+[`./dev.sh`](dev.sh) is the entry point for everything — tests, examples, and
+the local infrastructure they need. Run it with no arguments for an interactive
+menu, or use it directly:
+
+```bash
+./dev.sh                          # interactive menu
+./dev.sh doctor                   # check your toolchain (cargo, docker, …)
+
+./dev.sh test unit                # in-memory suite (no docker)
+./dev.sh test live                # live Postgres + Kurrent + hybrid suites
+./dev.sh test all                 # everything
+
+./dev.sh example list             # list runnable examples
+./dev.sh example run http-fetcher # spin up its docker stack (health-waited) + run it
+./dev.sh example down http-fetcher
+
+./dev.sh stack up | down          # the live-test infra (Postgres :5433, Kurrent :2114)
+./dev.sh lint | fmt | check       # cargo clippy / fmt / check
+```
+
+`dev.sh` is a thin bootstrap: it ensures a Rust toolchain, then builds and runs
+the dev CLI in [`dev/cli`](dev/cli) (release mode, rebuilt only when its sources
+change). The CLI discovers examples under `examples/`, brings up each one's
+`docker-compose.yml` (waiting for healthchecks) before running it, and manages a
+separate live-test stack (`dev/docker-compose.yml`) for the `--ignored` backend
+suites — applying migrations automatically.
+
 ## Crates
 
 - **`causal`** — core engine, `Event` trait, `Reactor` / `Projector`
