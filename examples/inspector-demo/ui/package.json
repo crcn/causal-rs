@@ -1,0 +1,28 @@
+{
+  "name": "inspector-demo-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@causal/inspector-ui": "file:../../../modules/causal-inspector-ui",
+    "@dagrejs/dagre": "^2.0.4",
+    "@xyflow/react": "^12.10.1",
+    "flexlayout-react": "^0.8.19",
+    "graphql-ws": "^6.0.4",
+    "lucide-react": "^0.575.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.4",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "tailwindcss": "^4.1.4",
+    "typescript": "^5.7.0",
+    "vite": "^6.3.2"
+  }
+}

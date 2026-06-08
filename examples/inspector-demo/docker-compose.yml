@@ -1,0 +1,23 @@
+services:
+  kurrentdb:
+    image: docker.kurrent.io/kurrent-latest/kurrentdb:latest
+    container_name: inspector-demo-kurrentdb
+    command:
+      - --insecure
+      - --run-projections=All
+      - --enable-atom-pub-over-http
+    ports:
+      - "2113:2113"   # gRPC + web UI (http://localhost:2113)
+      - "1113:1113"   # TCP client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:2113/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - kurrentdb-data:/var/lib/kurrentdb
+      - kurrentdb-logs:/var/log/kurrentdb
+
+volumes:
+  kurrentdb-data:
+  kurrentdb-logs:

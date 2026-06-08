@@ -8,6 +8,7 @@ Runnable causal-rs examples backed by KurrentDB.
 |---------|---------|---------------|
 | [`http-fetcher`](http-fetcher/) | KurrentDB + Postgres | Production-shape wiring: Kurrent for the event log, `PgReactorCheckpoint` for reactor/projection cursors. Reactor fans out HTTP fetches, emits success/failure events per request. |
 | [`ai-summarizer`](ai-summarizer/) | KurrentDB + `MemoryStore` | Minimal wiring: Kurrent for the log, in-memory cursors (single-process, ephemeral). Reactor calls the Anthropic API and emits `Summarized` / `SummaryFailed`. |
+| [`inspector-demo`](inspector-demo/) | KurrentDB + Inspector UI | A branching/converging content pipeline (retry/recovery + a singleton phase-tracking aggregate) on a KurrentDB log, served with the causal **inspector** (GraphQL + React UI) on `:4000`. An in-process `MemoryStore` mirror feeds the inspector. |
 
 ## The shape
 

@@ -129,6 +129,13 @@ fn run_example(ctx: &AppContext, name: &str) -> Result<()> {
              `export ANTHROPIC_API_KEY=…` and re-run.",
         );
     }
+    let ui = dir.join("ui");
+    if ui.is_dir() && !ui.join("dist").is_dir() {
+        ctx.print_warning(&format!(
+            "{name} ships a UI that isn't built yet — its /causal route will 404. \
+             Build it first: (cd examples/{name}/ui && npm install && npm run build)"
+        ));
+    }
 
     ctx.print_info("Running (cargo run) — Ctrl-C to stop.");
     println!();
