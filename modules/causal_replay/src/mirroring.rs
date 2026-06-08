@@ -90,37 +90,28 @@ impl MirroringEventLogBackend {
 
 #[async_trait]
 impl EventLogBackend for MirroringEventLogBackend {
-    async fn append(&self, event: EventData) -> Result<WriteResult> {
-        // Sequential dual-write. See module docstring for why this
-        // is not 2PC.
-        let legacy_result = self.legacy.append(event.clone()).await?;
-        // If the legacy write succeeded but the v0.3 mirror fails, we
-        // surface the error. Caller's retry semantics + idempotency-
-        // on-event_id keep the system convergent: a re-emit is a no-op
-        // on the legacy side and completes the v0.3 mirror.
-        let _v03_result = self.v03.append(event).await?;
-        Ok(legacy_result)
-    }
-
     async fn append_to_stream(
         &self,
-        aggregate_type: &str,
-        aggregate_id: Uuid,
+        category: &str,
+        stream_id: Uuid,
         expected: causal::types::StreamState,
-        event: EventData,
+        events: Vec<EventData>,
     ) -> Result<WriteResult> {
         // OCC semantics flow from the legacy store — it's the source
         // of truth and the only one that can reject on stale expected.
         // The mirror writes whatever the legacy write produced.
         let legacy_result = self
             .legacy
-            .append_to_stream(aggregate_type, aggregate_id, expected, event.clone())
+            .append_to_stream(category, stream_id, expected, events.clone())
             .await?;
-        // Mirror writes via plain append (no OCC) — its only job is to
-        // accumulate the same event_id stream. Letting it perform OCC
+        // Mirror writes with `Any` (no independent OCC) — its only job is
+        // to accumulate the same event_id stream. Letting it perform OCC
         // separately would risk diverging from legacy under concurrent
         // writers.
-        let _ = self.v03.append(event).await?;
+        let _ = self
+            .v03
+            .append_to_stream(category, stream_id, causal::types::StreamState::Any, events)
+            .await?;
         Ok(legacy_result)
     }
 
@@ -135,12 +126,12 @@ impl EventLogBackend for MirroringEventLogBackend {
 
     async fn read_stream(
         &self,
-        aggregate_type: &str,
-        aggregate_id: Uuid,
+        category: &str,
+        stream_id: Uuid,
         after: Option<StreamRevision>,
     ) -> Result<Vec<RecordedEvent>> {
         self.legacy
-            .read_stream(aggregate_type, aggregate_id, after)
+            .read_stream(category, stream_id, after)
             .await
     }
 

@@ -165,6 +165,7 @@ where
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
                 logs:           None,
+                reaction_cache: None,
             };
 
             match self.projector.project(&fact, ctx).await {
@@ -312,8 +313,8 @@ mod tests {
             event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
-            aggregate_type:  None,
-            aggregate_id:    None,
+            category:  None,
+            stream_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
@@ -329,7 +330,7 @@ mod tests {
             };
             let ev = new_event(&payload);
             ids.push(ev.event_id);
-            EventLogBackend::append(store, ev).await.unwrap();
+            crate::append_event(store, ev).await.unwrap();
         }
         ids
     }
@@ -372,13 +373,13 @@ mod tests {
             event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(&payload).unwrap(),
             created_at:      Utc::now(),
-            aggregate_type:  None,
-            aggregate_id:    None,
+            category:  None,
+            stream_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
         };
-        EventLogBackend::append(store.as_ref(), ev).await.unwrap();
+        crate::append_event(store.as_ref(), ev).await.unwrap();
 
         let cap = CorrelationCapture::default();
         let seen = cap.seen.clone();
@@ -559,13 +560,13 @@ mod tests {
             event_type:      "other.thing".into(),
             payload:         serde_json::json!({}),
             created_at:      Utc::now(),
-            aggregate_type:  None,
-            aggregate_id:    None,
+            category:  None,
+            stream_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
         };
-        EventLogBackend::append(store.as_ref(), foreign).await.unwrap();
+        crate::append_event(store.as_ref(), foreign).await.unwrap();
 
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let runner = ProjectionRunner::new(
@@ -622,15 +623,15 @@ mod tests {
         let id = Uuid::new_v4();
         let fact = NoTimeFact { id };
 
-        EventLogBackend::append(store.as_ref(), crate::types::EventData {
+        crate::append_event(store.as_ref(), crate::types::EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      format!("{}:{}", <NoTimeFact as Event>::CATEGORY, fact.event_type()),
             payload:         serde_json::to_value(&fact).unwrap(),
             created_at:      pinned,
-            aggregate_type:  None,
-            aggregate_id:    None,
+            category:  None,
+            stream_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,

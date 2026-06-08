@@ -1,4 +1,4 @@
-//! HTTP Fetcher example: KurrentDB event log + Postgres reactor outbox.
+//! HTTP Fetcher example: KurrentDB event log + Postgres reactor checkpoint.
 //!
 //! Run the stack first (Kurrent + Postgres):
 //!
@@ -8,7 +8,7 @@
 //!
 //!     cargo run
 //!
-//! With the PG outbox, the reactor cursor survives restarts — re-running
+//! With the PG checkpoint store, the reactor cursor survives restarts — re-running
 //! `cargo run` skips events from prior runs and only processes the new
 //! `FetchRequested` emissions.
 
@@ -18,9 +18,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use causal::{
     CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend, Events,
-    Reactor, ReactorOutbox,
+    Reactor, ReactorCheckpoint,
 };
-use causal_replay::{KurrentEventLogBackend, PgReactorOutbox};
+use causal_replay::{KurrentEventLogBackend, PgReactorCheckpoint};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -109,7 +109,7 @@ impl Reactor for FetchReactor {
 #[tokio::main]
 async fn main() -> Result<()> {
     let kurrent_url = std::env::var("KURRENT_URL")
-        .unwrap_or_else(|_| "esdb://localhost:2113?tls=false".to_string());
+        .unwrap_or_else(|_| "kurrentdb://localhost:2113?tls=false".to_string());
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://causal:causal@localhost:54320/causal".to_string());
 
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let pg = Arc::new(PgReactorOutbox::new(pg_pool));
+    let pg = Arc::new(PgReactorCheckpoint::new(pg_pool));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
     let engine = EngineBuilder::new(
         Arc::new(kurrent) as Arc<dyn EventLogBackend>,
         pg.clone() as Arc<dyn CheckpointStore>,
-        pg as Arc<dyn ReactorOutbox>,
+        pg as Arc<dyn ReactorCheckpoint>,
     )
     .with_reactor(FetchReactor { http_client })
     .build();

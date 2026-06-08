@@ -19,31 +19,21 @@ use crate::types::{
     WriteResult, EventData, LogCursor, RecordedEvent, StreamRevision, StreamState,
 };
 
-/// Append-only event log with aggregate stream support.
+/// Append-only event log. One write primitive — every event belongs to a
+/// stream (`{category}-{stream_id}`); see [`append_to_stream`](Self::append_to_stream).
 ///
 /// # Idempotency contract
 ///
-/// `append` MUST be totally idempotent on `event_id`: a second call with
-/// an already-persisted `event_id` returns an equivalent [`WriteResult`]
-/// without creating a duplicate entry.
+/// `append_to_stream` MUST be idempotent on `event_id`: a second call whose
+/// events carry already-persisted `event_id`s returns an equivalent
+/// [`WriteResult`] without creating duplicate entries.
+///
+/// **`EventData::created_at` is a hint, not authoritative.** Backends MAY
+/// override with a server-assigned timestamp on write (KurrentDB does this
+/// unconditionally; `MemoryStore` preserves the client value). Consumers
+/// reading `RecordedEvent::created_at` see whatever the backend persisted.
 #[async_trait]
 pub trait EventLogBackend: Send + Sync {
-    /// Append a non-aggregate event to the log (no concurrency check).
-    ///
-    /// **`EventData::created_at` is a hint, not authoritative.** Backends
-    /// MAY override with a server-assigned timestamp on write (KurrentDB
-    /// does this unconditionally; `MemoryStore` preserves the client
-    /// value). Consumers reading `RecordedEvent::created_at` see
-    /// whatever the backend persisted; replay determinism follows from
-    /// THAT value.
-    ///
-    /// `Engine::emit` derives `EventData::created_at` from
-    /// `fact.occurred_at().unwrap_or_else(Utc::now)`. For backends that
-    /// override server-side, stamp the producer-claimed
-    /// `Event::occurred_at` into `EventData::metadata` if a consumer needs
-    /// to distinguish event-time from commit-time post-write.
-    async fn append(&self, event: EventData) -> Result<WriteResult>;
-
     /// Read events from `$all` after `after`, up to `limit` events
     /// ordered by position.
     async fn read_all(
@@ -52,70 +42,62 @@ pub trait EventLogBackend: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RecordedEvent>>;
 
-    /// Read events from a single aggregate stream. Pass
+    /// Read events from a single stream (`{category}-{stream_id}`). Pass
     /// `after: Some(revision)` to load only events with revision >
     /// the given value (snapshot + partial replay); `None` for full
     /// replay.
     async fn read_stream(
         &self,
-        aggregate_type: &str,
-        aggregate_id: Uuid,
+        category: &str,
+        stream_id: Uuid,
         after: Option<StreamRevision>,
     ) -> Result<Vec<RecordedEvent>>;
 
     /// Latest global position in the log (`LogCursor::ZERO` if empty).
     async fn latest_position(&self) -> Result<LogCursor>;
 
-    /// CAS-protected append to an aggregate stream.
+    /// The append primitive — write `events` to stream
+    /// `{category}-{stream_id}` under an optimistic-concurrency check.
+    ///
+    /// The batch is **atomic**: all events land at consecutive revisions
+    /// or none do. This mirrors KurrentDB's `append_to_stream`, which takes
+    /// a sequence of events and commits them as a unit — it's what lets a
+    /// multi-fact decision ([`Engine::append`](crate::Engine::append))
+    /// commit without a torn write. `events` must be non-empty.
     ///
     /// `expected` matches KurrentDB's [`StreamState`] semantics:
     /// `NoStream` for an empty stream's first event,
     /// `StreamRevision(n)` to assert the last event's revision is `n`,
-    /// `StreamExists` for any non-empty stream, `Any` to skip the
-    /// check (idempotency guarantees weaken in this mode).
+    /// `StreamExists` for any non-empty stream, `Any` to skip the check
+    /// (append-only fact streams; idempotency then rests on `event_id`).
     ///
-    /// On a mismatch the backend returns an `anyhow::Error` carrying
-    /// a [`ConflictError`] (downcast with `.downcast_ref::<ConflictError>()`).
-    /// Command handlers SHOULD reload the aggregate at the new
-    /// `current` revision, re-decide, and retry if the command still
-    /// applies.
+    /// The returned [`WriteResult`] describes the **last** event in the
+    /// batch (its position + revision); the rest occupy the consecutive
+    /// revisions below it.
     ///
-    /// **Default impl is NOT atomic** — it does read_stream + check +
-    /// append in three separate operations. Two concurrent callers can
-    /// both see the expected revision, both pass the check, both
-    /// append, both succeed. Backends with native CAS primitives
-    /// (Postgres `SELECT FOR UPDATE`, in-memory single-mutex,
-    /// KurrentDB `StreamState`) SHOULD override.
+    /// **Idempotency precondition**: within one batch the `event_id`s must be
+    /// either ALL new or ALL already-persisted — never a mix. Idempotent
+    /// retries resubmit the *identical* batch, which is fine; submitting a
+    /// batch that partially overlaps a prior write is a caller bug. Backends
+    /// detect redelivery by the batch's last `event_id` and reject a
+    /// partially-overlapping batch rather than corrupt the stream. (All
+    /// in-tree callers satisfy this: `Engine::append` mints fresh ids per
+    /// attempt; reactor outputs are single-event batches.)
+    ///
+    /// On a mismatch the backend returns an `anyhow::Error` carrying a
+    /// [`ConflictError`] (downcast with `.downcast_ref::<ConflictError>()`).
+    /// Command handlers SHOULD reload at the new `current` revision,
+    /// re-decide, and retry — see [`Engine::append`](crate::Engine::append).
+    ///
+    /// Backends MUST make this atomic (Postgres transaction, in-memory
+    /// single-mutex, KurrentDB native multi-event append).
     async fn append_to_stream(
         &self,
-        aggregate_type: &str,
-        aggregate_id: Uuid,
+        category: &str,
+        stream_id: Uuid,
         expected: StreamState,
-        event: EventData,
-    ) -> Result<WriteResult> {
-        let stream = self.read_stream(aggregate_type, aggregate_id, None).await?;
-        let actual_tail: Option<StreamRevision> =
-            stream.last().and_then(|e| e.revision);
-        let matches = match (expected, actual_tail) {
-            (StreamState::Any, _) => true,
-            (StreamState::NoStream, None) => true,
-            (StreamState::StreamExists, Some(_)) => true,
-            (StreamState::StreamRevision(want), Some(actual)) => {
-                actual.raw() == want
-            }
-            _ => false,
-        };
-        if !matches {
-            return Err(anyhow::Error::new(ConflictError {
-                expected,
-                current: actual_tail,
-            }));
-        }
-        // Caller MUST set aggregate_type + aggregate_id on `event`
-        // matching this method's parameters; the existing append impl
-        // assigns the next revision sequentially.
-        self.append(event).await
-    }
+        events: Vec<EventData>,
+    ) -> Result<WriteResult>;
 }
 
 /// Returned when [`EventLogBackend::append_to_stream`] sees a stream
@@ -128,4 +110,37 @@ pub trait EventLogBackend: Send + Sync {
 pub struct ConflictError {
     pub expected: StreamState,
     pub current:  Option<StreamRevision>,
+}
+
+/// Convenience over the single [`EventLogBackend::append_to_stream`]
+/// primitive: append `event` to its own stream with [`StreamState::Any`]
+/// (append-only, no concurrency check; idempotency rests on `event_id`).
+///
+/// The destination stream is `event.category` / `event.stream_id` when
+/// carried; otherwise it's derived — category from the `{category}:{name}`
+/// `event_type` prefix, stream_id from the event's own `event_id` (a
+/// standalone single-event stream). So a bare fact always lands somewhere
+/// sensible, never a shared `_global`.
+///
+/// Not a backend method — backends implement only `append_to_stream`.
+/// Sugar for seeding fixtures and ad-hoc single appends. Invariant-bearing
+/// writes go through [`Engine::append`](crate::Engine::append); the typed
+/// emit/reactor paths set `category`/`stream_id` explicitly.
+pub async fn append_event<B: EventLogBackend + ?Sized>(
+    backend: &B,
+    event: EventData,
+) -> Result<WriteResult> {
+    let category = event.category.clone().unwrap_or_else(|| {
+        event
+            .event_type
+            .split(':')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("event")
+            .to_string()
+    });
+    let stream_id = event.stream_id.unwrap_or(event.event_id);
+    backend
+        .append_to_stream(&category, stream_id, StreamState::Any, vec![event])
+        .await
 }

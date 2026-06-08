@@ -9,10 +9,10 @@
 //!     --test kurrent_event_log_test -- --ignored --nocapture
 //!
 //! Requires:
-//! - A live KurrentDB on `KURRENT_URL` (default `esdb://localhost:2113?tls=false`).
+//! - A live KurrentDB on `KURRENT_URL` (default `kurrentdb://localhost:2113?tls=false`).
 //! - Docker example:
 //!     docker run -d --name kurrent -p 2113:2113 \
-//!       kurrent/kurrentdb-ce:latest --insecure --run-projections=All \
+//!       kurrentplatform/kurrentdb:latest --insecure --run-projections=All \
 //!       --enable-atom-pub-over-http
 //!
 //! Each test scopes its assertions by a per-test correlation_id; we
@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 fn connection_string() -> String {
     std::env::var("KURRENT_URL").unwrap_or_else(|_| {
-        "esdb://localhost:2113?tls=false".to_string()
+        "kurrentdb://localhost:2113?tls=false".to_string()
     })
 }
 
@@ -45,8 +45,8 @@ fn connect() -> KurrentEventLogBackend {
 fn mk_event(
     correlation: Uuid,
     event_type: &str,
-    aggregate_type: Option<&str>,
-    aggregate_id: Option<Uuid>,
+    category: Option<&str>,
+    stream_id: Option<Uuid>,
 ) -> EventData {
     EventData {
         event_id:        Uuid::new_v4(),
@@ -55,8 +55,8 @@ fn mk_event(
         event_type:      event_type.to_string(),
         payload:         serde_json::json!({ "v": 1 }),
         created_at:      Utc::now(),
-        aggregate_type:  aggregate_type.map(String::from),
-        aggregate_id,
+        category:  category.map(String::from),
+        stream_id,
         metadata:        serde_json::Map::new(),
         ephemeral:       None,
         persistent:      true,
@@ -75,9 +75,9 @@ async fn append_and_read_stream_round_trips() -> Result<()> {
     let event_id = event.event_id;
 
     let result = backend
-        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, event)
+        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, vec![event])
         .await?;
-    assert_eq!(result.revision, Some(StreamRevision::ZERO),
+    assert_eq!(result.revision, StreamRevision::ZERO,
                "first append to fresh stream lands at revision 0 (0-indexed)");
 
     let stream = backend.read_stream("lifecycle", agg_id, None).await?;
@@ -91,23 +91,25 @@ async fn append_and_read_stream_round_trips() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires running Kurrent on KURRENT_URL"]
-async fn append_is_idempotent_within_kurrent_eventid_cache() -> Result<()> {
-    // Within Kurrent's ~1-min EventId cache, duplicate appends collapse.
-    // Documented gap on KurrentEventLogBackend::append: post-cache
-    // retries can produce duplicates — this test pins the in-window
-    // behavior.
+async fn append_is_idempotent_for_duplicate_eventid_at_stream_head() -> Result<()> {
+    // Back-to-back duplicate appends (same EventId, no interleaving)
+    // collapse: with `StreamState::Any` Kurrent matches the EventId
+    // against the events at the current stream head. Documented gap on
+    // KurrentEventLogBackend::append: a retry that interleaves with
+    // another append to the same stream can still duplicate — there is
+    // no time window. This test pins the no-interleave behavior.
     let backend = connect();
     let correlation = Uuid::new_v4();
     let mut event = mk_event(correlation, "telemetry:ping", None, None);
     let event_id = event.event_id;
 
-    let first = backend.append(event.clone()).await?;
+    let first = causal::append_event(&backend, event.clone()).await?;
     // Same event_id, different payload — Kurrent collapses the write.
     event.payload = serde_json::json!({"this_should_not": "overwrite"});
-    let second = backend.append(event).await?;
+    let second = causal::append_event(&backend, event).await?;
 
     assert_eq!(first.position, second.position,
-               "duplicate event_id within cache window returns same position");
+               "duplicate event_id at stream head returns same position");
 
     // The first payload is the one that landed.
     let stream = backend.read_stream("telemetry", Uuid::nil(), None).await;
@@ -145,20 +147,23 @@ async fn append_to_stream_enforces_occ() -> Result<()> {
     let e0 = mk_event(Uuid::new_v4(), "lifecycle:created",
                       Some("lifecycle"), Some(agg_id));
     let r0 = backend
-        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, e0)
+        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, vec![e0])
         .await?;
-    assert_eq!(r0.revision, Some(StreamRevision::ZERO));
+    assert_eq!(r0.revision, StreamRevision::ZERO);
 
     // Try to write again at expected=0 (stale) — should conflict.
     let e1 = mk_event(Uuid::new_v4(), "lifecycle:updated",
                       Some("lifecycle"), Some(agg_id));
     let err = backend
-        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, e1)
+        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, vec![e1])
         .await
         .expect_err("stale expected version must error");
-    let msg = format!("{err:?}");
-    assert!(msg.contains("OCC conflict"),
-            "error must mention OCC conflict, got: {msg}");
+    // Must be a typed ConflictError (so Engine::append can downcast + retry),
+    // not just a string mentioning conflict.
+    assert!(
+        err.downcast_ref::<causal::event_log::ConflictError>().is_some(),
+        "OCC mismatch must surface as a typed ConflictError, got: {err:?}"
+    );
     Ok(())
 }
 
@@ -174,7 +179,7 @@ async fn append_to_stream_retry_with_same_event_id_is_idempotent() -> Result<()>
     let event = mk_event(Uuid::new_v4(), "lifecycle:created",
                          Some("lifecycle"), Some(agg_id));
     let first = backend
-        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, event.clone())
+        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, vec![event.clone()])
         .await?;
 
     // Replay the exact same event at the same expected version. The
@@ -187,7 +192,7 @@ async fn append_to_stream_retry_with_same_event_id_is_idempotent() -> Result<()>
     // Either way, "retry of an already-landed event at the same
     // expected version" should not duplicate.
     let second = backend
-        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, event)
+        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, vec![event])
         .await;
 
     match second {
@@ -216,15 +221,15 @@ async fn read_stream_partitions_by_aggregate() -> Result<()> {
     backend
         .append_to_stream(
             "lifecycle", agg_a, StreamState::NoStream,
-            mk_event(Uuid::new_v4(), "lifecycle:a",
-                     Some("lifecycle"), Some(agg_a)),
+            vec![mk_event(Uuid::new_v4(), "lifecycle:a",
+                     Some("lifecycle"), Some(agg_a))],
         )
         .await?;
     backend
         .append_to_stream(
             "lifecycle", agg_b, StreamState::NoStream,
-            mk_event(Uuid::new_v4(), "lifecycle:b",
-                     Some("lifecycle"), Some(agg_b)),
+            vec![mk_event(Uuid::new_v4(), "lifecycle:b",
+                     Some("lifecycle"), Some(agg_b))],
         )
         .await?;
 
@@ -256,7 +261,7 @@ async fn metadata_round_trips_with_reserved_keys_stripped() -> Result<()> {
     let event_id = event.event_id;
 
     backend
-        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, event)
+        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, vec![event])
         .await?;
 
     let stream = backend.read_stream("lifecycle", agg_id, None).await?;
@@ -266,9 +271,9 @@ async fn metadata_round_trips_with_reserved_keys_stripped() -> Result<()> {
                "$correlationId was stamped and stripped back into the field");
     assert_eq!(loaded.causation_id, Some(parent),
                "$causationId was stamped and stripped back into the field");
-    assert_eq!(loaded.aggregate_type.as_deref(), Some("lifecycle"),
+    assert_eq!(loaded.category, "lifecycle",
                "_aggregateType was stamped and stripped back into the field");
-    assert_eq!(loaded.aggregate_id, Some(agg_id));
+    assert_eq!(loaded.stream_id, agg_id);
     assert!(loaded.persistent);
     // User metadata survives.
     assert_eq!(
@@ -292,7 +297,7 @@ async fn latest_position_reflects_a_recent_write() -> Result<()> {
                          Some("lifecycle"), Some(agg_id));
 
     let write = backend
-        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, event)
+        .append_to_stream("lifecycle", agg_id, StreamState::NoStream, vec![event])
         .await?;
     let latest = backend.latest_position().await?;
     assert!(latest >= write.position,
@@ -310,4 +315,76 @@ async fn read_stream_returns_empty_for_missing_stream() -> Result<()> {
         .await?;
     assert!(result.is_empty(), "missing stream returns empty Vec, not error");
     Ok(())
+}
+
+// ── Live end-to-end: reactor output streams to its own stream (bridge) ──
+//
+// Proves Phase 4's "bridge" slice against a REAL KurrentDB: a reactor's
+// output lands in `{output_category}-{output_stream_id}`, not a shared
+// `_global`. Hybrid wiring — Kurrent is the event log; MemoryStore is the
+// reactor outbox + checkpoint (Kurrent is a log, not a job queue).
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct FetchRequested { id: Uuid, occurred_at: chrono::DateTime<Utc> }
+impl causal::Event for FetchRequested {
+    const CATEGORY: &'static str = "fetch_req";
+    fn event_type(&self) -> &str { "requested" }
+    fn stream_id(&self) -> Uuid { self.id }
+    fn occurred_at(&self) -> Option<chrono::DateTime<Utc>> { Some(self.occurred_at) }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Fetched { id: Uuid, occurred_at: chrono::DateTime<Utc> }
+impl causal::Event for Fetched {
+    const CATEGORY: &'static str = "fetched";
+    fn event_type(&self) -> &str { "done" }
+    fn stream_id(&self) -> Uuid { self.id }
+    fn occurred_at(&self) -> Option<chrono::DateTime<Utc>> { Some(self.occurred_at) }
+}
+
+struct DoFetch;
+#[async_trait::async_trait]
+impl causal::Reactor for DoFetch {
+    type Trigger = FetchRequested;
+    const GROUP_NAME: &'static str = "do_fetch_reactor";
+    async fn react(&self, t: &FetchRequested, ctx: causal::Ctx<'_>) -> Result<causal::Events> {
+        let mut out = causal::Events::new();
+        out.push(Fetched { id: t.id, occurred_at: ctx.now() });
+        Ok(out)
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires running Kurrent on KURRENT_URL"]
+async fn reactor_output_lands_in_its_own_stream_not_global() {
+    use causal::{CheckpointStore, EngineBuilder, MemoryStore, ReactorCheckpoint};
+    use std::sync::Arc;
+
+    let kurrent = Arc::new(connect());
+    let mem = Arc::new(MemoryStore::new());
+    let engine = EngineBuilder::new(
+        kurrent.clone() as Arc<dyn EventLogBackend>,
+        mem.clone() as Arc<dyn CheckpointStore>,
+        mem.clone() as Arc<dyn ReactorCheckpoint>,
+    )
+    .with_reactor(DoFetch)
+    .build();
+
+    let id = Uuid::new_v4();
+    engine
+        .emit(FetchRequested { id, occurred_at: Utc::now() })
+        .settled()
+        .await
+        .unwrap();
+
+    // The Fetched output must be in ITS OWN stream `fetched-{id}`, routed
+    // by the output Event's own (category, stream_id) — not `_global`.
+    let out = kurrent.read_stream("fetched", id, None).await.unwrap();
+    assert_eq!(out.len(), 1, "exactly one Fetched in fetched-{id}");
+    assert_eq!(out[0].event_type, "fetched:done");
+    assert_eq!(out[0].category, "fetched");
+    assert_eq!(out[0].stream_id, id);
+    assert!(out[0].causation_id.is_some(), "output carries the trigger as causation");
+
+    engine.shutdown().await.unwrap();
 }

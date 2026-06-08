@@ -1,5 +1,5 @@
 //! In-memory backend: `EventLogBackend` + `CheckpointStore` +
-//! `ReactorOutbox` + `SnapshotStore` + `ProjectionOps`.
+//! `ReactorCheckpoint` + `SnapshotStore` + `ProjectionOps`.
 //!
 //! Suitable for tests, examples, and single-process use cases. Drop in
 //! a Postgres / Kurrent backend for production durability.
@@ -12,9 +12,9 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::checkpoint_store::{InsertableOutboxRow, OutboxRow, ReactorOutbox};
+use crate::checkpoint_store::ReactorCheckpoint;
 use crate::projection::{ProjectionFailure, ProjectionStatus};
 use crate::reactor_observer::ReactorObserver;
 use crate::types::*;
@@ -43,13 +43,6 @@ pub struct MemoryStore {
     /// Per-projection DLQ rows. Idempotent on `(projection_id,
     /// event_id)` — matches the unique-constraint contract.
     projection_failures: Arc<Mutex<Vec<ProjectionFailure>>>,
-    /// Reactor outbox rows pending drain to the log. Inserted by
-    /// `commit_reactor_batch`, drained by `outbox_pending` /
-    /// `outbox_delete`. Per C12, inserts here AND `set` on the cursor
-    /// happen under the same Mutex lock for atomicity.
-    outbox: Arc<Mutex<Vec<OutboxRow>>>,
-    /// Monotonic id generator for outbox rows.
-    next_outbox_id: Arc<AtomicI64>,
     /// DLQ attempt counter keyed by (consumer_id, source_event_id).
     /// Survives ReactorRunner reconstruction within the store's
     /// lifetime; lost on process crash (matches MemoryStore's
@@ -90,8 +83,6 @@ impl MemoryStore {
             snapshots: Arc::new(DashMap::new()),
             projection_cursors: Arc::new(DashMap::new()),
             projection_failures: Arc::new(Mutex::new(Vec::new())),
-            outbox: Arc::new(Mutex::new(Vec::new())),
-            next_outbox_id: Arc::new(AtomicI64::new(1)),
             reactor_attempts: Arc::new(DashMap::new()),
             reactor_executions: Arc::new(DashMap::new()),
             reactor_attempt_history: Arc::new(Mutex::new(Vec::new())),
@@ -295,58 +286,6 @@ impl ReactorObserver for MemoryStore {
 
 #[async_trait]
 impl crate::event_log::EventLogBackend for MemoryStore {
-    async fn append(&self, event: EventData) -> Result<WriteResult> {
-        let mut log = self.global_log.lock();
-
-        // Idempotency: if event_id already exists, return existing result
-        if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
-            return Ok(WriteResult {
-                position: existing.position,
-                revision: existing.revision,
-            });
-        }
-
-        let position = LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
-
-        // Compute per-stream revision (0-indexed) if aggregate metadata
-        // is present. `count` = events ALREADY in this stream; the new
-        // event lands at `count` (so first event is revision 0).
-        let revision = if let (Some(ref agg_type), Some(agg_id)) =
-            (&event.aggregate_type, event.aggregate_id)
-        {
-            let count = log
-                .iter()
-                .filter(|e| {
-                    e.aggregate_type.as_deref() == Some(agg_type)
-                        && e.aggregate_id == Some(agg_id)
-                })
-                .count() as u64;
-            Some(StreamRevision::from_raw(count))
-        } else {
-            None
-        };
-
-        let persisted = RecordedEvent {
-            position,
-            event_id: event.event_id,
-            causation_id: event.causation_id,
-            correlation_id: event.correlation_id,
-            event_type: event.event_type,
-            payload: event.payload,
-            created_at: event.created_at,
-            aggregate_type: event.aggregate_type,
-            aggregate_id: event.aggregate_id,
-            revision,
-            metadata: event.metadata,
-            ephemeral: event.ephemeral,
-            persistent: event.persistent,
-        };
-
-        log.push(persisted);
-
-        Ok(WriteResult { position, revision })
-    }
-
     async fn read_all(
         &self,
         after: LogCursor,
@@ -364,20 +303,19 @@ impl crate::event_log::EventLogBackend for MemoryStore {
 
     async fn read_stream(
         &self,
-        aggregate_type: &str,
-        aggregate_id: Uuid,
+        category: &str,
+        stream_id: Uuid,
         after: Option<StreamRevision>,
     ) -> Result<Vec<RecordedEvent>> {
         let log = self.global_log.lock();
         let events = log
             .iter()
             .filter(|e| {
-                e.aggregate_type.as_deref() == Some(aggregate_type)
-                    && e.aggregate_id == Some(aggregate_id)
-                    && match (after, e.revision) {
-                        (None, _) => true,
-                        (Some(min), Some(rev)) => rev > min,
-                        (Some(_), None) => false,
+                e.category == category
+                    && e.stream_id == stream_id
+                    && match after {
+                        None => true,
+                        Some(min) => e.revision > min,
                     }
             })
             .cloned()
@@ -390,34 +328,50 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         Ok(log.last().map(|e| e.position).unwrap_or(LogCursor::ZERO))
     }
 
-    /// Atomic CAS append. Holds the global log mutex for the duration
-    /// of the state check + insert so two concurrent callers can't
-    /// both pass the check.
+    /// Atomic CAS append of a batch. Holds the global log mutex for the
+    /// duration of the state check + inserts so two concurrent callers
+    /// can't both pass the check, and so the whole batch lands or none of
+    /// it does. Returns the [`WriteResult`] for the last event.
     async fn append_to_stream(
         &self,
-        aggregate_type: &str,
-        aggregate_id: Uuid,
+        category: &str,
+        stream_id: Uuid,
         expected: crate::types::StreamState,
-        event: EventData,
+        events: Vec<EventData>,
     ) -> Result<WriteResult> {
         use crate::types::StreamState;
+        let Some(last_id) = events.last().map(|e| e.event_id) else {
+            anyhow::bail!("append_to_stream: events must be non-empty");
+        };
         let mut log = self.global_log.lock();
 
-        // Idempotency: if event_id already exists, return existing
+        // Idempotency: a batch is written atomically, so if the last
+        // event_id is already present the whole batch is — return its
         // result regardless of expected state.
-        if let Some(existing) = log.iter().find(|e| e.event_id == event.event_id) {
+        if let Some(existing) = log.iter().find(|e| e.event_id == last_id) {
             return Ok(WriteResult {
                 position: existing.position,
                 revision: existing.revision,
             });
         }
 
+        // Partial-overlap guard (see EventLogBackend::append_to_stream
+        // contract): the last id is absent (checked above), so if any earlier
+        // id is already present this is a torn/partial batch — reject rather
+        // than double-write. Only multi-event batches can be torn.
+        if events.len() > 1
+            && events.iter().any(|e| log.iter().any(|r| r.event_id == e.event_id))
+        {
+            anyhow::bail!(
+                "append_to_stream: partial-overlap batch — an event_id already \
+                 exists but the batch tail does not (event_ids must be all-new \
+                 or all-already-persisted)"
+            );
+        }
+
         let count = log
             .iter()
-            .filter(|e| {
-                e.aggregate_type.as_deref() == Some(aggregate_type)
-                    && e.aggregate_id == Some(aggregate_id)
-            })
+            .filter(|e| e.category == category && e.stream_id == stream_id)
             .count() as u64;
         let current_tail: Option<StreamRevision> = if count == 0 {
             None
@@ -438,28 +392,34 @@ impl crate::event_log::EventLogBackend for MemoryStore {
             }));
         }
 
-        let position = LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
-        let new_revision = StreamRevision::from_raw(count);
-
-        let persisted = RecordedEvent {
-            position,
-            event_id: event.event_id,
-            causation_id: event.causation_id,
-            correlation_id: event.correlation_id,
-            event_type: event.event_type,
-            payload: event.payload,
-            created_at: event.created_at,
-            aggregate_type: Some(aggregate_type.to_string()),
-            aggregate_id: Some(aggregate_id),
-            revision: Some(new_revision),
-            metadata: event.metadata,
-            ephemeral: event.ephemeral,
-            persistent: event.persistent,
+        // Append all events at consecutive revisions/positions.
+        let mut result = WriteResult {
+            position: LogCursor::ZERO,
+            revision: StreamRevision::from_raw(0),
         };
+        for (offset, event) in events.into_iter().enumerate() {
+            let position =
+                LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
+            let new_revision = StreamRevision::from_raw(count + offset as u64);
+            log.push(RecordedEvent {
+                position,
+                event_id: event.event_id,
+                causation_id: event.causation_id,
+                correlation_id: event.correlation_id,
+                event_type: event.event_type,
+                payload: event.payload,
+                created_at: event.created_at,
+                category: category.to_string(),
+                stream_id,
+                revision: new_revision,
+                metadata: event.metadata,
+                ephemeral: event.ephemeral,
+                persistent: event.persistent,
+            });
+            result = WriteResult { position, revision: new_revision };
+        }
 
-        log.push(persisted);
-
-        Ok(WriteResult { position, revision: Some(new_revision) })
+        Ok(result)
     }
 }
 
@@ -505,7 +465,7 @@ impl crate::checkpoint_store::CheckpointStore for MemoryStore {
     }
 }
 
-// ── ReactorOutbox implementation (C12 atomicity) ────────────────────
+// ── ReactorCheckpoint implementation (C12 atomicity) ────────────────────
 
 // ── ProjectionOps surface ───────────────────────────────────────────
 
@@ -594,67 +554,10 @@ impl causal::projection::ProjectionOps for MemoryStore {
     }
 }
 
-// ── ReactorOutbox implementation (C12 atomicity) ────────────────────
+// ── ReactorCheckpoint implementation (C12 atomicity) ────────────────────
 
 #[async_trait]
-impl ReactorOutbox for MemoryStore {
-    async fn commit_reactor_batch(
-        &self,
-        rows: Vec<InsertableOutboxRow>,
-        cursor: Option<(String, LogCursor)>,
-    ) -> Result<()> {
-        // Atomicity is via single Mutex lock spanning both writes.
-        // Postgres equivalent is BEGIN; INSERT ...; UPDATE cursor; COMMIT.
-        let mut outbox = self.outbox.lock();
-        for row in rows {
-            let assigned_id = self.next_outbox_id.fetch_add(1, Ordering::SeqCst);
-            outbox.push(OutboxRow {
-                id:              assigned_id,
-                reactor_id:      row.reactor_id,
-                source_event_id: row.source_event_id,
-                output_index:    row.output_index,
-                event_id:        row.event_id,
-                event_type:      row.event_type,
-                fact_payload:    row.fact_payload,
-                correlation_id:  row.correlation_id,
-                created_at:      Utc::now(),
-            });
-        }
-        if let Some((consumer_id, pos)) = cursor {
-            // CheckpointStore::set semantics: upsert with create-on-missing.
-            match self.projection_cursors.entry(consumer_id) {
-                dashmap::mapref::entry::Entry::Vacant(slot) => {
-                    slot.insert(ProjectionCursorEntry {
-                        cursor: pos,
-                        paused: false,
-                        last_error: None,
-                        last_attempt_at: None,
-                        consecutive_failures: 0,
-                    });
-                }
-                dashmap::mapref::entry::Entry::Occupied(mut slot) => {
-                    let entry = slot.get_mut();
-                    entry.cursor = pos;
-                    entry.last_error = None;
-                    entry.consecutive_failures = 0;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn outbox_pending(&self, limit: usize) -> Result<Vec<OutboxRow>> {
-        let outbox = self.outbox.lock();
-        // Already FIFO by insertion (created_at ascending then id).
-        Ok(outbox.iter().take(limit).cloned().collect())
-    }
-
-    async fn outbox_delete(&self, id: i64) -> Result<()> {
-        let mut outbox = self.outbox.lock();
-        outbox.retain(|r| r.id != id);
-        Ok(())
-    }
-
+impl ReactorCheckpoint for MemoryStore {
     async fn record_reactor_attempt(
         &self,
         consumer_id: &str,
@@ -678,111 +581,9 @@ impl ReactorOutbox for MemoryStore {
 }
 
 #[cfg(test)]
-mod outbox_tests {
+mod checkpoint_tests {
     use super::*;
     use crate::checkpoint_store::CheckpointStore;
-
-    fn row(reactor_id: &str, idx: u32) -> InsertableOutboxRow {
-        InsertableOutboxRow {
-            reactor_id:      reactor_id.into(),
-            source_event_id: Uuid::nil(),
-            output_index:    idx,
-            event_id:        Uuid::nil(),
-            event_type:      "test.payload".into(),
-            fact_payload:    serde_json::json!({"test": idx}),
-            correlation_id:  Uuid::nil(),
-        }
-    }
-
-    #[tokio::test]
-    async fn commit_reactor_batch_inserts_rows_and_advances_cursor() {
-        let store = MemoryStore::new();
-        let pos = LogCursor::from_raw(42);
-
-        store.commit_reactor_batch(
-            vec![row("r1", 0), row("r1", 1), row("r1", 2)],
-            Some(("r1".into(), pos)),
-        ).await.unwrap();
-
-        // Cursor advanced
-        let cursor = CheckpointStore::get(&store, "r1").await.unwrap();
-        assert_eq!(cursor, Some(pos));
-
-        // Three rows pending
-        let pending = store.outbox_pending(10).await.unwrap();
-        assert_eq!(pending.len(), 3);
-        assert_eq!(pending[0].output_index, 0);
-        assert_eq!(pending[1].output_index, 1);
-        assert_eq!(pending[2].output_index, 2);
-
-        // Backend assigned monotonic ids
-        assert!(pending[0].id < pending[1].id);
-        assert!(pending[1].id < pending[2].id);
-    }
-
-    #[tokio::test]
-    async fn commit_reactor_batch_with_no_cursor_just_inserts_rows() {
-        let store = MemoryStore::new();
-
-        store.commit_reactor_batch(
-            vec![row("r2", 0)],
-            None,
-        ).await.unwrap();
-
-        assert!(CheckpointStore::get(&store, "r2").await.unwrap().is_none());
-        assert_eq!(store.outbox_pending(10).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn outbox_pending_respects_limit() {
-        let store = MemoryStore::new();
-        let rows: Vec<InsertableOutboxRow> = (0..5).map(|i| row("r", i)).collect();
-        store.commit_reactor_batch(rows, None).await.unwrap();
-
-        let pending = store.outbox_pending(3).await.unwrap();
-        assert_eq!(pending.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn outbox_pending_returns_oldest_first() {
-        let store = MemoryStore::new();
-        store.commit_reactor_batch(vec![row("r", 0)], None).await.unwrap();
-        store.commit_reactor_batch(vec![row("r", 1)], None).await.unwrap();
-        store.commit_reactor_batch(vec![row("r", 2)], None).await.unwrap();
-
-        let pending = store.outbox_pending(10).await.unwrap();
-        assert_eq!(pending[0].output_index, 0);
-        assert_eq!(pending[1].output_index, 1);
-        assert_eq!(pending[2].output_index, 2);
-    }
-
-    #[tokio::test]
-    async fn outbox_delete_removes_specific_row() {
-        let store = MemoryStore::new();
-        store.commit_reactor_batch(
-            vec![row("r", 0), row("r", 1), row("r", 2)],
-            None,
-        ).await.unwrap();
-
-        let pending = store.outbox_pending(10).await.unwrap();
-        let target_id = pending[1].id;
-
-        store.outbox_delete(target_id).await.unwrap();
-
-        let after = store.outbox_pending(10).await.unwrap();
-        assert_eq!(after.len(), 2);
-        assert_eq!(after[0].output_index, 0);
-        assert_eq!(after[1].output_index, 2);
-    }
-
-    #[tokio::test]
-    async fn outbox_delete_idempotent_on_missing_id() {
-        // Per the trait contract, deleting an already-deleted id MUST
-        // succeed — the relay may retry after a partial crash.
-        let store = MemoryStore::new();
-        store.outbox_delete(999_999).await.unwrap();
-        store.outbox_delete(999_999).await.unwrap();
-    }
 
     #[tokio::test]
     async fn cursor_set_and_get_round_trips() {
@@ -794,35 +595,6 @@ mod outbox_tests {
             CheckpointStore::get(&store, "consumer_a").await.unwrap(),
             Some(pos),
         );
-    }
-
-    #[tokio::test]
-    async fn commit_reactor_batch_clears_consumer_error_state() {
-        use causal::checkpoint_store::CheckpointStore;
-        use causal::projection::ProjectionOps;
-
-        let store = MemoryStore::new();
-        // Seed a cursor with error state. Use CheckpointStore::set to
-        // establish the cursor row, then poke the error fields
-        // directly (ProjectionOps doesn't expose an in-flight
-        // error-state setter — `record_failure` writes DLQ rows,
-        // not live consecutive-failure counters).
-        CheckpointStore::set(&store, "r3", LogCursor::ZERO).await.unwrap();
-        if let Some(mut entry) = store.projection_cursors.get_mut("r3") {
-            entry.last_error = Some("prior failure".into());
-            entry.consecutive_failures = 3;
-        }
-
-        let new_pos = LogCursor::from_raw(7);
-        store.commit_reactor_batch(
-            vec![row("r3", 0)],
-            Some(("r3".into(), new_pos)),
-        ).await.unwrap();
-
-        let status = ProjectionOps::status(&store, "r3").await.unwrap().unwrap();
-        assert_eq!(status.cursor, new_pos);
-        assert!(status.last_error.is_none());
-        assert_eq!(status.consecutive_failures, 0);
     }
 
     // ── ProjectionOps surface ───────────────────────────────────────

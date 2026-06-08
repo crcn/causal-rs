@@ -35,7 +35,7 @@ pub mod event_log;
 pub mod kurrent_event_log;
 pub mod mirroring;
 pub mod pointer;
-pub mod reactor_outbox;
+pub mod reactor_checkpoint;
 pub mod snapshot_store;
 pub mod stream;
 pub mod tail;
@@ -53,7 +53,7 @@ pub use event_log::PgEventLogBackend;
 pub use pointer::PgPointerStore;
 
 #[cfg(feature = "postgres")]
-pub use reactor_outbox::PgReactorOutbox;
+pub use reactor_checkpoint::PgReactorCheckpoint;
 
 #[cfg(feature = "postgres")]
 pub use snapshot_store::PgSnapshotStore;

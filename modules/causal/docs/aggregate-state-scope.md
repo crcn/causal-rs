@@ -38,7 +38,7 @@ Cost: per-event apply, bounded by per-run event volume.
 ### 2. Service-level materializer (in scope)
 
 ```rust
-EngineBuilder::new(log, checkpoint, outbox)
+EngineBuilder::new(log, checkpoint, reactor_checkpoint)
     .with_materializer(RunsMaterializer::new(...), "runs")
     .build()
 ```

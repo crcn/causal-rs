@@ -85,6 +85,18 @@ async fn append_to_stream_idempotent_on_event_id_retry() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires local DATABASE_URL + migration 054"]
+async fn append_to_stream_batch_lands_atomically() -> Result<()> {
+    conformance::append_to_stream_batch_lands_atomically(&backend().await).await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
+async fn append_to_stream_batch_idempotent_on_replay() -> Result<()> {
+    conformance::append_to_stream_batch_idempotent_on_replay(&backend().await).await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
 async fn read_stream_partitions_by_aggregate_id() -> Result<()> {
     conformance::read_stream_partitions_by_aggregate_id(&backend().await).await
 }

@@ -5,7 +5,7 @@
 `causal-rs` is an event-driven runtime with a typed
 `Event → Reactor → Event` loop, designed to run against
 [KurrentDB](https://www.kurrent.io/) (formerly EventStoreDB) as the
-durable event log, with Postgres as the reactor outbox + cursor
+durable event log, with Postgres as the reactor/projection cursor
 store. It also runs entirely in-memory for tests.
 
 The library's vocabulary mirrors KurrentDB's exactly where the
@@ -15,7 +15,7 @@ concepts overlap (`EventData` / `RecordedEvent`, `causation_id` /
 should be able to read the API and recognize every term.
 
 ```rust
-use causal::{Engine, EngineBuilder, EventLogBackend, CheckpointStore, ReactorOutbox};
+use causal::{Engine, EngineBuilder, EventLogBackend, CheckpointStore, ReactorCheckpoint};
 use causal::types::StreamState;
 use causal::MemoryStore;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ let store = Arc::new(MemoryStore::new());
 let engine = EngineBuilder::new(
         store.clone() as Arc<dyn EventLogBackend>,
         store.clone() as Arc<dyn CheckpointStore>,
-        store.clone() as Arc<dyn ReactorOutbox>,
+        store.clone() as Arc<dyn ReactorCheckpoint>,
     )
     .with_aggregators(order_aggregators())   // Vec<Aggregator>
     .with_reactor(ShipOnPlaced)               // impl Reactor
@@ -56,7 +56,7 @@ The library is being prepared for production deployment in
 - **`causal`** — core engine, `Event` trait, `Reactor` / `Projector`
   traits, `EngineBuilder`, in-memory `MemoryStore` backend.
 - **`causal_replay`** — durable backend implementations:
-  `PgEventLogBackend`, `PgReactorOutbox`, `PgSnapshotStore` and
+  `PgEventLogBackend`, `PgReactorCheckpoint`, `PgSnapshotStore` and
   `KurrentEventLogBackend` (behind feature flags), plus the
   cross-backend conformance suite.
 - **`causal_core_macros`** — `#[fact]`, `#[aggregator]`,
@@ -70,21 +70,21 @@ The roadmap calls for a **hybrid backend** (Option B):
 
 - **KurrentDB** as the event log
   ([`KurrentEventLogBackend`](modules/causal_replay/src/kurrent_event_log.rs)).
-- **Postgres** as the reactor outbox + cursors + snapshots
-  ([`PgReactorOutbox`](modules/causal_replay/src/reactor_outbox.rs),
+- **Postgres** as the reactor/projection cursors + snapshots
+  ([`PgReactorCheckpoint`](modules/causal_replay/src/reactor_checkpoint.rs),
   [`PgSnapshotStore`](modules/causal_replay/src/snapshot_store.rs)).
 
-Kurrent is the event store it excels at being; the queue / cursor
+Kurrent is the event store it excels at being; the cursor / snapshot
 work is inherently relational and stays on Postgres.
 
 ```rust
-let kurrent = KurrentEventLogBackend::connect("esdb://localhost:2113?tls=false")?;
-let pg = Arc::new(PgReactorOutbox::new(pool));
+let kurrent = KurrentEventLogBackend::connect("kurrentdb://localhost:2113?tls=false")?;
+let pg = Arc::new(PgReactorCheckpoint::new(pool));
 
 let engine = EngineBuilder::new(
     Arc::new(kurrent) as Arc<dyn EventLogBackend>,
     pg.clone()       as Arc<dyn CheckpointStore>,
-    pg.clone()       as Arc<dyn ReactorOutbox>,
+    pg.clone()       as Arc<dyn ReactorCheckpoint>,
 ).build();
 ```
 
@@ -106,8 +106,8 @@ let engine = EngineBuilder::new(
 | Group name | `Reactor::GROUP_NAME` / `Projector::GROUP_NAME` |
 | `correlation_id` | `correlation_id` |
 | `causation_id` | `causation_id` |
-| `$correlationId` metadata | stamped automatically — server-side `$by_correlation_id` works natively |
-| `$causationId` metadata | stamped automatically — server-side `$by_causation_id` works natively |
+| `$correlationId` metadata | stamped automatically — feeds the `$by_correlation_id` projection (enable + configure `correlationIdProperty`) |
+| `$causationId` metadata | stamped automatically — the `$by_correlation_id` projection uses it to build the causation tree (there is no `$by_causation_id`) |
 
 Deliberate divergence: `Reactor` vs Kurrent's `PersistentSubscription`
 — Reactor adds atomic emit on top of the subscription contract. The
@@ -124,10 +124,11 @@ suite once and the assertion runs against every impl. See
 
 ## Schema
 
-[`docs/schema.sql`](docs/schema.sql) — authoritative v0.4 Postgres
-schema (causal_log, causal_outbox, causal_checkpoints,
-causal_snapshots, causal_projection_cursors). The Kurrent-alignment
-column renames are in
+[`docs/schema.sql`](docs/schema.sql) — authoritative Postgres schema
+(causal_log, causal_checkpoints, causal_snapshots,
+causal_projection_cursors, causal_projection_failures). There is no
+outbox table — reactors append their outputs directly to the log. The
+Kurrent-alignment column renames are in
 [`migrations/20260514_kurrent_alignment.sql`](migrations/20260514_kurrent_alignment.sql).
 
 ## License

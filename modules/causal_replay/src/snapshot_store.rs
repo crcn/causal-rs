@@ -8,7 +8,7 @@
 //! module owns the encoding so the schema stays string-agnostic.
 //!
 //! `load_snapshot` returns the latest snapshot for an aggregate by
-//! `ORDER BY version DESC LIMIT 1`. Older snapshots remain in the
+//! `ORDER BY revision DESC LIMIT 1`. Older snapshots remain in the
 //! table; they're free per Phase 4 decisions.
 
 #[cfg(feature = "postgres")]
@@ -50,10 +50,10 @@ mod pg {
         ) -> Result<Option<Snapshot>> {
             let key = encode_key(aggregate_type, aggregate_id);
             let row = sqlx::query(
-                "SELECT version, blob, created_at
+                "SELECT revision, blob, created_at
                    FROM causal_snapshots
                   WHERE key = $1
-                  ORDER BY version DESC
+                  ORDER BY revision DESC
                   LIMIT 1",
             )
             .bind(&key)
@@ -61,7 +61,7 @@ mod pg {
             .await?;
 
             let Some(row) = row else { return Ok(None); };
-            let revision: i64 = row.try_get("version")?;
+            let revision: i64 = row.try_get("revision")?;
             let blob: Vec<u8> = row.try_get("blob")?;
             let created_at: DateTime<Utc> = row.try_get("created_at")?;
             let state: serde_json::Value = serde_json::from_slice(&blob)?;
@@ -78,15 +78,15 @@ mod pg {
         async fn save_snapshot(&self, snapshot: Snapshot) -> Result<()> {
             let key = encode_key(&snapshot.aggregate_type, snapshot.aggregate_id);
             let blob = serde_json::to_vec(&snapshot.state)?;
-            // ON CONFLICT (key, version) DO NOTHING — same key+version
+            // ON CONFLICT (key, revision) DO NOTHING — same key+revision
             // saved twice is a no-op (idempotent retry of a partial
-            // crash). The snapshot's state for a given (aggregate, version)
+            // crash). The snapshot's state for a given (aggregate, revision)
             // is deterministic — it's the fold of all events up to that
-            // version — so duplicate writes are guaranteed-equal.
+            // revision — so duplicate writes are guaranteed-equal.
             sqlx::query(
-                "INSERT INTO causal_snapshots (key, version, blob, created_at)
+                "INSERT INTO causal_snapshots (key, revision, blob, created_at)
                  VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (key, version) DO NOTHING",
+                 ON CONFLICT (key, revision) DO NOTHING",
             )
             .bind(&key)
             .bind(snapshot.revision.raw() as i64)

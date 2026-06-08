@@ -1,9 +1,9 @@
 //! `Reactor` trait — pure decisions producing new facts.
 //!
 //! Per C5, reactors are forward-only — never replayable by default.
-//! Per C12, output emission goes through a runtime-side outbox with
-//! deterministic `event_id` derivation, drained into the log by the
-//! relay loop.
+//! Reactor outputs are appended **directly** to the log by the runner,
+//! with deterministic `event_id` derivation so redelivered runs dedup
+//! on append (C1) — at-least-once + idempotent, no outbox.
 //!
 //! Per C11, reactor outputs are appended via the non-OCC `emit` path.
 //! Saga-shaped operations needing aggregate-OCC ("emit only if
@@ -20,15 +20,15 @@ use uuid::Uuid;
 use crate::contexts::Ctx;
 use crate::event::Event;
 
-/// Pure decision producing `Events`. Forward-only; outputs go through
-/// the runtime-side outbox.
+/// Pure decision producing `Events`. Forward-only; outputs are appended
+/// directly to the log by the runner.
 ///
 /// # Footgun — self-feedback loops
 ///
 /// A reactor whose output `Events` include a fact that matches its
 /// own `Trigger::type_prefix()` will react to its own output. The
-/// relay drains the output to the log, the runner picks it up as a
-/// new trigger, the reactor fires again, emits again — ad infinitum.
+/// runner appends the output to the log, picks it up as a new
+/// trigger, the reactor fires again, emits again — ad infinitum.
 /// The framework does NOT detect this; per-emit prefix-comparison
 /// would impose a cost on every reactor.
 ///
@@ -136,8 +136,8 @@ pub trait Reactor: Send + Sync {
 // ─────────────────────────────────────────────────────────────────────
 //
 // `Events` is the universal `Reactor::react` return type — a
-// type-erased collection of output facts that the runtime persists
-// through the outbox. `EventOutput::new<F: Event>` derives the
+// type-erased collection of output facts that the runtime appends
+// directly to the log. `EventOutput::new<F: Event>` derives the
 // canonical `{CATEGORY}:{name}` event_type from the Event's trait
 // methods, matching what `Engine::emit` writes for caller-emitted
 // facts.
@@ -305,6 +305,7 @@ mod tests {
             metadata:       &meta,
             aggregators:    None,
             logs:           None,
+            reaction_cache: None,
         };
 
         let events = r.react(&trigger, ctx).await.unwrap();

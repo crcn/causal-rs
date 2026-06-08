@@ -15,7 +15,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use causal::{
     CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend, Events,
-    MemoryStore, Reactor, ReactorOutbox,
+    MemoryStore, Reactor, ReactorCheckpoint,
 };
 use causal_replay::KurrentEventLogBackend;
 use chrono::{DateTime, Utc};
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
     };
 
     let kurrent_url = std::env::var("KURRENT_URL")
-        .unwrap_or_else(|_| "esdb://localhost:2113?tls=false".to_string());
+        .unwrap_or_else(|_| "kurrentdb://localhost:2113?tls=false".to_string());
 
     let kurrent = match KurrentEventLogBackend::connect(&kurrent_url) {
         Ok(client) => client,
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
     let engine = EngineBuilder::new(
         Arc::new(kurrent) as Arc<dyn EventLogBackend>,
         mem.clone() as Arc<dyn CheckpointStore>,
-        mem as Arc<dyn ReactorOutbox>,
+        mem as Arc<dyn ReactorCheckpoint>,
     )
     .with_reactor(SummarizeReactor { http_client, api_key })
     .build();

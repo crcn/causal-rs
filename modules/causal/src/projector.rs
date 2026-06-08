@@ -16,10 +16,13 @@
 //! and cursor checkpoint causes the same fact to redeliver, which
 //! idempotency absorbs.
 //!
-//! Kurrent alignment: a Projector's per-Event subscription maps to a
-//! Kurrent persistent subscription on `$et-{CATEGORY}:*`. The
-//! `GROUP_NAME` const (added in P4) becomes the persistent
-//! subscription's group name.
+//! Subscription model: a Projector is a **catch-up subscription** — the
+//! runner reads the log from a client-managed cursor (`read_all` from the
+//! position stored in `CheckpointStore`) and advances that cursor per
+//! fact. `GROUP_NAME` is the cursor key. (Kurrent's server-side
+//! *persistent* subscriptions — server checkpoints, ack/nack, competing
+//! consumers — are a possible future backend optimization, not what ships;
+//! against Kurrent the cursor reads `$et-{CATEGORY}:*` / `$ce-{CATEGORY}`.)
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -31,10 +34,10 @@ use crate::event::Event;
 pub trait Projector: Send + Sync {
     type Event: Event;
 
-    /// Persistent-subscription group name (= Kurrent persistent
-    /// subscription group identity). Used as the consumer's cursor
-    /// key in `CheckpointStore`, and as the group name when subscribing
-    /// to `$et-{CATEGORY}:*` against a Kurrent backend.
+    /// Consumer group name. Used as the consumer's cursor key in
+    /// `CheckpointStore` (the catch-up subscription's identity); on a
+    /// Kurrent backend it also names the category/event-type stream the
+    /// cursor reads (`$ce-{CATEGORY}` / `$et-{CATEGORY}:*`).
     ///
     /// **Uniqueness contract:**
     /// - Within one `EngineBuilder`: enforced. Builder panics on
@@ -132,6 +135,7 @@ mod tests {
                 metadata:       &meta,
                 aggregators:    None,
                 logs:           None,
+                reaction_cache: None,
             },
         ).await.unwrap();
 
@@ -161,6 +165,7 @@ mod tests {
                     metadata:       &meta,
                     aggregators:    None,
                 logs:           None,
+                reaction_cache: None,
                 },
             ).await.unwrap();
         }

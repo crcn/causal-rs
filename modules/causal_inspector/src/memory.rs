@@ -31,9 +31,9 @@ fn to_stored(e: &causal::types::RecordedEvent) -> StoredEvent {
             .get("reactor_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        aggregate_type: e.aggregate_type.clone(),
-        aggregate_id: e.aggregate_id,
-        stream_revision: e.revision.map(|r| r.raw()),
+        aggregate_type: Some(e.category.clone()),
+        aggregate_id: Some(e.stream_id),
+        stream_revision: Some(e.revision.raw()),
     }
 }
 
@@ -72,10 +72,7 @@ impl InspectorReadModel for MemoryStore {
                 }
                 // Aggregate key filter (e.g. "Order:00000000-…")
                 if let Some(ref key) = query.aggregate_key {
-                    let event_key = match (&e.aggregate_type, &e.aggregate_id) {
-                        (Some(t), Some(id)) => format!("{t}:{id}"),
-                        _ => return false,
-                    };
+                    let event_key = format!("{}:{}", e.category, e.stream_id);
                     if event_key != *key {
                         return false;
                     }

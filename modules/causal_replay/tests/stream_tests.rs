@@ -1,7 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use causal::event_log::EventLogBackend;
 use causal::types::EventData;
 use causal::{LogCursor, MemoryStore};
 use causal_replay::{Mode, PointerStatus, PointerStore, ProjectionStream};
@@ -86,8 +85,8 @@ fn make_event(i: usize) -> EventData {
         event_type: format!("test:event_{i}"),
         payload: serde_json::json!({ "index": i }),
         created_at: Utc::now(),
-        aggregate_type: None,
-        aggregate_id: None,
+        category: None,
+        stream_id: None,
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
@@ -96,7 +95,7 @@ fn make_event(i: usize) -> EventData {
 
 async fn append_events(store: &MemoryStore, count: usize) {
     for i in 0..count {
-        store.append(make_event(i)).await.unwrap();
+        causal::append_event(store, make_event(i)).await.unwrap();
     }
 }
 
@@ -481,7 +480,7 @@ async fn replay_apply_receives_correct_event_data() {
         let mut event = make_event(i);
         event.event_type = format!("test:type_{i}");
         event.payload = serde_json::json!({ "value": i * 10 });
-        log.append(event).await.unwrap();
+        causal::append_event(&log, event).await.unwrap();
     }
 
     let types = Arc::new(Mutex::new(Vec::new()));

@@ -27,9 +27,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use causal::checkpoint_store::{
-    CheckpointStore, InsertableOutboxRow, OutboxRow, ReactorOutbox,
-};
+use causal::checkpoint_store::{CheckpointStore, ReactorCheckpoint};
 use causal::contexts::Ctx;
 use causal::event_log::EventLogBackend;
 use causal::event::Event;
@@ -39,7 +37,6 @@ use causal::projection_runner::{ProjectionRunner, StepOutcome};
 use causal::reactor::Events;
 use causal::reactor_runner::ReactorRunner;
 use causal::reactor::Reactor;
-use causal::relay::RelayLoop;
 use causal::types::{WriteResult, LogCursor, EventData, RecordedEvent, StreamRevision};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -50,9 +47,7 @@ use causal::types::{WriteResult, LogCursor, EventData, RecordedEvent, StreamRevi
 #[derive(Clone, Debug)]
 enum FaultPoint {
     Append,
-    OutboxDelete,
     CheckpointSet,
-    CommitReactorBatch,
 }
 
 struct FaultInjector {
@@ -72,10 +67,8 @@ impl FaultInjector {
     fn take_if_matches(&self, target: FaultPoint) -> bool {
         let mut armed = self.armed.lock();
         match (&*armed, &target) {
-            (Some(FaultPoint::Append),             FaultPoint::Append)
-          | (Some(FaultPoint::OutboxDelete),       FaultPoint::OutboxDelete)
-          | (Some(FaultPoint::CheckpointSet),      FaultPoint::CheckpointSet)
-          | (Some(FaultPoint::CommitReactorBatch), FaultPoint::CommitReactorBatch) => {
+            (Some(FaultPoint::Append),        FaultPoint::Append)
+          | (Some(FaultPoint::CheckpointSet), FaultPoint::CheckpointSet) => {
                 *armed = None;
                 true
             }
@@ -86,12 +79,6 @@ impl FaultInjector {
 
 #[async_trait]
 impl EventLogBackend for FaultInjector {
-    async fn append(&self, event: EventData) -> Result<WriteResult> {
-        if self.take_if_matches(FaultPoint::Append) {
-            return Err(anyhow!("fault: append"));
-        }
-        EventLogBackend::append(self.inner.as_ref(), event).await
-    }
     async fn read_all(
         &self, after: LogCursor, limit: usize,
     ) -> Result<Vec<RecordedEvent>> {
@@ -114,10 +101,15 @@ impl EventLogBackend for FaultInjector {
         aggregate_type: &str,
         aggregate_id: Uuid,
         expected: causal::types::StreamState,
-        event: EventData,
+        events: Vec<EventData>,
     ) -> Result<WriteResult> {
+        // All appends flow through this one primitive now, so the
+        // `Append` fault point fires here.
+        if self.take_if_matches(FaultPoint::Append) {
+            return Err(anyhow!("fault: append"));
+        }
         EventLogBackend::append_to_stream(
-            self.inner.as_ref(), aggregate_type, aggregate_id, expected, event,
+            self.inner.as_ref(), aggregate_type, aggregate_id, expected, events,
         ).await
     }
 }
@@ -136,29 +128,7 @@ impl CheckpointStore for FaultInjector {
 }
 
 #[async_trait]
-impl ReactorOutbox for FaultInjector {
-    async fn commit_reactor_batch(
-        &self,
-        rows: Vec<InsertableOutboxRow>,
-        cursor: Option<(String, LogCursor)>,
-    ) -> Result<()> {
-        if self.take_if_matches(FaultPoint::CommitReactorBatch) {
-            return Err(anyhow!("fault: commit_reactor_batch"));
-        }
-        self.inner.commit_reactor_batch(rows, cursor).await
-    }
-
-    async fn outbox_pending(&self, limit: usize) -> Result<Vec<OutboxRow>> {
-        self.inner.outbox_pending(limit).await
-    }
-
-    async fn outbox_delete(&self, id: i64) -> Result<()> {
-        if self.take_if_matches(FaultPoint::OutboxDelete) {
-            return Err(anyhow!("fault: outbox_delete"));
-        }
-        self.inner.outbox_delete(id).await
-    }
-
+impl ReactorCheckpoint for FaultInjector {
     async fn record_reactor_attempt(
         &self,
         consumer_id: &str,
@@ -199,13 +169,13 @@ async fn append_n(store: &MemoryStore, n: usize) {
             event_type: format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload: serde_json::to_value(&payload).unwrap(),
             created_at: Utc::now(),
-            aggregate_type: None,
-            aggregate_id: None,
+            category: None,
+            stream_id: None,
             metadata: serde_json::Map::new(),
             ephemeral: None,
             persistent: true,
         };
-        EventLogBackend::append(store, ev).await.unwrap();
+        causal::append_event(store, ev).await.unwrap();
     }
 }
 
@@ -293,7 +263,11 @@ impl Event for Trigger {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Echoed;
 impl Event for Echoed {
-    const CATEGORY: &'static str = "test";
+    // Distinct category from the trigger ("test") — self-trigger
+    // discipline: a reactor must not emit into its own trigger category,
+    // else it would consume its own output. Now that outputs land in the
+    // log immediately (no outbox), this is enforced in practice.
+    const CATEGORY: &'static str = "echo";
     fn event_type(&self) -> &str { "echoed" }
     fn stream_id(&self) -> Uuid { Uuid::nil() }
 }
@@ -322,133 +296,62 @@ async fn append_trigger(store: &MemoryStore) -> Uuid {
         event_type: format!("{}:{}", <Trigger as Event>::CATEGORY, payload.event_type()),
         payload: serde_json::to_value(&payload).unwrap(),
         created_at: Utc::now(),
-        aggregate_type: None,
-        aggregate_id: None,
+        category: None,
+        stream_id: None,
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
     };
-    EventLogBackend::append(store, ev).await.unwrap();
+    causal::append_event(store, ev).await.unwrap();
     event_id
 }
 
 #[tokio::test]
-async fn commit_reactor_batch_failure_leaves_no_partial_state() {
-    // C12 atomicity under failure: commit_reactor_batch errors; no
-    // outbox rows, no cursor advance. Recovery on next step.
+async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
+    // New crash model (no outbox): the runner appends the output, then
+    // advances the cursor. A crash AFTER append but BEFORE checkpoint.set
+    // leaves the output in the log with the cursor un-advanced. On the
+    // next step the trigger redelivers; the runner re-reacts and
+    // re-appends — the log's deterministic-event_id dedup (C1) absorbs
+    // the duplicate, so exactly ONE output exists and the cursor advances.
     let inner = Arc::new(MemoryStore::new());
     append_trigger(&inner).await;
     let injector = FaultInjector::new(inner.clone());
 
     let runner = ReactorRunner::new(
         EmitOne,
-        "r.flaky",
+        "r.crash",
         injector.clone() as Arc<dyn EventLogBackend>,
-        injector.clone() as Arc<dyn ReactorOutbox>,
+        injector.clone() as Arc<dyn ReactorCheckpoint>,
     );
 
-    injector.arm(FaultPoint::CommitReactorBatch);
+    // Crash at the cursor advance, AFTER the output append.
+    injector.arm(FaultPoint::CheckpointSet);
     assert!(runner.step(10).await.is_err());
 
-    // Atomic property: ZERO outbox rows AND cursor unchanged.
-    assert_eq!(inner.outbox_pending(10).await.unwrap().len(), 0);
-    assert!(inner.get("r.flaky").await.unwrap().is_none());
+    // Output is in the log; cursor NOT advanced.
+    let after_crash =
+        EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
+    let outs1 = after_crash
+        .iter()
+        .filter(|e| e.event_type == "echo:echoed")
+        .count();
+    assert_eq!(outs1, 1, "output appended before the crash");
+    assert!(inner.get("r.crash").await.unwrap().is_none(), "cursor not advanced");
 
-    // Recovery: next step (no fault) commits the batch.
+    // Recovery: next step re-reacts + re-appends (deduped on event_id),
+    // then advances the cursor.
     runner.step(10).await.unwrap();
-    assert_eq!(inner.outbox_pending(10).await.unwrap().len(), 1);
-    assert!(inner.get("r.flaky").await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn relay_append_failure_leaves_outbox_row_pending() {
-    // Relay errors on log.append; outbox row stays pending; next drain
-    // succeeds.
-    let inner = Arc::new(MemoryStore::new());
-    let trigger_event_id = append_trigger(&inner).await;
-    let _ = trigger_event_id; // not used; satisfies unused warnings
-
-    // Run reactor to populate outbox.
-    {
-        let runner = ReactorRunner::new(
-            EmitOne,
-            "r.x",
-            inner.clone() as Arc<dyn EventLogBackend>,
-            inner.clone() as Arc<dyn ReactorOutbox>,
-        );
-        runner.step(10).await.unwrap();
-    }
-    assert_eq!(inner.outbox_pending(10).await.unwrap().len(), 1);
-
-    // Relay through the injector with append fault armed.
-    let injector = FaultInjector::new(inner.clone());
-    let relay = RelayLoop::new(
-        injector.clone() as Arc<dyn EventLogBackend>,
-        injector.clone() as Arc<dyn ReactorOutbox>,
-    );
-
-    injector.arm(FaultPoint::Append);
-    assert!(relay.drain_once(10).await.is_err());
-
-    // Row is STILL pending — not delivered, not deleted.
-    assert_eq!(inner.outbox_pending(10).await.unwrap().len(), 1);
-
-    // Recovery: next drain succeeds.
-    relay.drain_once(10).await.unwrap();
-    assert!(inner.outbox_pending(10).await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn relay_outbox_delete_failure_redelivers_with_log_dedup() {
-    // Relay: log.append succeeded, then outbox_delete errored. On retry
-    // the same outbox row re-appends; log idempotent on event_id absorbs
-    // the duplicate. After the SECOND retry (no fault), outbox_delete
-    // succeeds, row removed.
-    let inner = Arc::new(MemoryStore::new());
-    append_trigger(&inner).await;
-    {
-        let runner = ReactorRunner::new(
-            EmitOne,
-            "r.y",
-            inner.clone() as Arc<dyn EventLogBackend>,
-            inner.clone() as Arc<dyn ReactorOutbox>,
-        );
-        runner.step(10).await.unwrap();
-    }
-
-    let injector = FaultInjector::new(inner.clone());
-    let relay = RelayLoop::new(
-        injector.clone() as Arc<dyn EventLogBackend>,
-        injector.clone() as Arc<dyn ReactorOutbox>,
-    );
-
-    // Fault on outbox_delete: append succeeds, delete errors.
-    injector.arm(FaultPoint::OutboxDelete);
-    assert!(relay.drain_once(10).await.is_err());
-
-    // Log has the appended event; outbox row STILL pending.
-    let log_events = EventLogBackend::read_all(
-        inner.as_ref(), LogCursor::ZERO, 10,
-    ).await.unwrap();
-    let echoed_count = log_events
+    let after_recovery =
+        EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
+    let outs2 = after_recovery
         .iter()
-        .filter(|e| e.event_type == "test:echoed")
+        .filter(|e| e.event_type == "echo:echoed")
         .count();
-    assert_eq!(echoed_count, 1);
-    assert_eq!(inner.outbox_pending(10).await.unwrap().len(), 1);
-
-    // Second drain (no fault). append called again with same event_id;
-    // log dedups (C1); outbox_delete succeeds.
-    relay.drain_once(10).await.unwrap();
-
-    // Still exactly one log entry (C1 dedup); outbox empty.
-    let log_events = EventLogBackend::read_all(
-        inner.as_ref(), LogCursor::ZERO, 10,
-    ).await.unwrap();
-    let echoed_count = log_events
-        .iter()
-        .filter(|e| e.event_type == "test:echoed")
-        .count();
-    assert_eq!(echoed_count, 1, "log dedups duplicate event_id (C1)");
-    assert!(inner.outbox_pending(10).await.unwrap().is_empty());
+    assert_eq!(outs2, 1, "re-append deduped on event_id — exactly one output");
+    assert!(inner.get("r.crash").await.unwrap().is_some(), "cursor advanced on recovery");
 }
+
+// (The outbox/relay crash-recovery tests were removed with slice 3 —
+// reactor outputs now append directly; their crash model is covered by
+// `reactor_append_then_checkpoint_crash_redelivers_idempotently` above.)

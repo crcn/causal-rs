@@ -13,7 +13,7 @@ postgres = ["dep:sqlx", "dep:dashmap"]
 kurrent  = ["dep:kurrentdb", "dep:bytes"]
 
 [dependencies]
-causal = { version = "0.5.0", path = "../causal" }
+causal = { version = "0.6.0", path = "../causal" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -44,11 +44,6 @@ path = "tests/stream_tests.rs"
 [[test]]
 name = "pg_event_log_test"
 path = "tests/pg_event_log_test.rs"
-required-features = ["postgres"]
-
-[[test]]
-name = "pg_reactor_outbox_test"
-path = "tests/pg_reactor_outbox_test.rs"
 required-features = ["postgres"]
 
 [[test]]

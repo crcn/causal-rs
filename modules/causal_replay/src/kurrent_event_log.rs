@@ -13,27 +13,34 @@
 //!   backend reads the conflict slice to distinguish a true duplicate
 //!   (return the existing WriteResult) from a real OCC collision
 //!   (surface `anyhow::Error` whose message includes the current
-//!   stream version, matching the PG backend's shape). Non-CAS
-//!   `append` uses `StreamState::Any` + `EventData::id(event_id)` —
-//!   Kurrent's ~1-min EventId cache dedups within the window;
-//!   post-window retries can produce duplicates. **Documented gap.**
-//! - **Q2 stream naming.** Aggregate events land in
-//!   `{aggregate_type}-{aggregate_id}`. Non-aggregate events land in
-//!   `{category}-_global` where category is extracted from
-//!   `event_type` prefix. `_global` is not a valid UUID so it can't
-//!   collide with a real aggregate id.
+//!   stream version, matching the PG backend's shape). Under expected
+//!   version, Kurrent's EventId dedup is a strong guarantee.
+//!   Non-CAS `append` uses `StreamState::Any` + `EventData::id(event_id)`.
+//!   With `Any` the dedup is BEST-EFFORT: Kurrent compares the EventId
+//!   against the events currently at the stream head, so a retry that
+//!   interleaves with another append to the same stream can duplicate.
+//!   There is no time-based cache. **Documented gap** — prefer the CAS
+//!   path; see Decision 1 in
+//!   `docs/plans/2026-06-07-kurrent-native-consolidation.md`.
+//! - **Q2 stream naming.** Every event lands in `{category}-{stream_id}`
+//!   (`Event::CATEGORY` + `Event::stream_id`). `category` and `stream_id`
+//!   are recovered on read by parsing the stream name (the trailing 36
+//!   chars are the canonical UUID) — no metadata round-trip needed.
 //! - **Q3 metadata.** Mapped to Kurrent's `custom_metadata` slot.
 //!   System keys (`$correlationId`, `$causationId`) use Kurrent's
-//!   `$`-prefix convention so server-side projections
-//!   (`$by_correlation_id`, `$by_causation_id`) read them natively.
-//!   Causal-specific keys (`_persistent`, `_aggregateType`) keep
-//!   the `_` prefix to mark "framework-internal." All are stamped
-//!   on write and stripped on read.
+//!   `$`-prefix convention. The `$by_correlation_id` system projection
+//!   reads `$correlationId` (when configured + projections are running)
+//!   and uses `$causationId` to build the causation tree. There is NO
+//!   `$by_causation_id` system projection — the five built-ins are
+//!   `$by_category`, `$by_event_type`, `$by_correlation_id`,
+//!   `$stream_by_category`, `$streams`. The one causal-specific key
+//!   (`_persistent`) keeps the `_` prefix to mark "framework-internal";
+//!   it's stamped on write and stripped on read.
 //! - **Q4 client.** Uses the official `kurrentdb` crate.
 //!
 //! ## What this module does NOT provide
 //!
-//! - No `CheckpointStore` / `ReactorOutbox` on Kurrent — keep using
+//! - No `CheckpointStore` / `ReactorCheckpoint` on Kurrent — keep using
 //!   the PG backends. Kurrent is an event store, not a job queue
 //!   (roadmap Option B: hybrid).
 //! - No `SnapshotStore` on Kurrent — application-level concern;
@@ -61,8 +68,9 @@ mod kurrent {
 
     /// KurrentDB-backed event log.
     ///
-    /// Construct with a connection string (`esdb://...`) or by passing
-    /// a pre-built `Client`. See module docs for design decisions.
+    /// Construct with a connection string (`kurrentdb://...`) or by
+    /// passing a pre-built `Client`. See module docs for design
+    /// decisions.
     pub struct KurrentEventLogBackend {
         client: Client,
     }
@@ -70,7 +78,8 @@ mod kurrent {
     impl KurrentEventLogBackend {
         /// Build from a connection string.
         ///
-        /// Format: `esdb://[user:pass@]host:port[?option=value&...]`.
+        /// Format: `kurrentdb://[user:pass@]host:port[?option=value&...]`
+        /// (the legacy `esdb://` scheme is still accepted as a synonym).
         /// See <https://docs.kurrent.io/clients/grpc/#connection-string>.
         pub fn connect(connection_string: &str) -> Result<Self> {
             let settings: ClientSettings = connection_string
@@ -90,49 +99,29 @@ mod kurrent {
 
     #[async_trait]
     impl EventLogBackend for KurrentEventLogBackend {
-        async fn append(&self, event: EventData) -> Result<WriteResult> {
-            // Non-CAS append. `StreamState::Any` permits writes
-            // regardless of current revision; `EventData::id(...)`
-            // gives EventId-based dedup inside Kurrent's ~1-min cache.
-            //
-            // Post-cache retries can produce duplicates — documented
-            // on this method. Hot-path callers (`Engine::emit` retry)
-            // finish inside the cache window.
-            let stream = stream_name(&event);
-            let event_data = build_event_data(&event)?;
-            let options = AppendToStreamOptions::default()
-                .stream_state(StreamState::Any);
-
-            let write = self
-                .client
-                .append_to_stream(stream.as_str(), &options, event_data)
-                .await
-                .map_err(|e| anyhow!("kurrent append failed for stream '{stream}': {e}"))?;
-
-            Ok(WriteResult {
-                position: LogCursor::from_raw(write.position.commit),
-                // append() is the non-aggregate path — surface no
-                // stream revision (matches the PG backend's behavior).
-                revision: None,
-            })
-        }
-
         async fn append_to_stream(
             &self,
-            aggregate_type: &str,
-            aggregate_id: Uuid,
+            category: &str,
+            stream_id: Uuid,
             expected: causal::types::StreamState,
-            event: EventData,
+            events: Vec<EventData>,
         ) -> Result<WriteResult> {
             use causal::types::StreamState as CausalStreamState;
-            // Per Q2 invariant: aggregate_type must not contain '-'.
+            // Per Q2 invariant: category must not contain '-'.
             debug_assert!(
-                !aggregate_type.contains('-'),
-                "aggregate_type '{aggregate_type}' contains '-'; conflicts with \
+                !category.contains('-'),
+                "category '{category}' contains '-'; conflicts with \
                  Kurrent's '{{category}}-{{id}}' stream naming convention",
             );
-            let stream = format!("{}-{}", aggregate_type, aggregate_id);
-            let event_data = build_event_data(&event)?;
+            let stream = format!("{}-{}", category, stream_id);
+            let Some(last_event_id) = events.last().map(|e| e.event_id) else {
+                anyhow::bail!("append_to_stream: events must be non-empty");
+            };
+            // Kurrent commits the whole iterator as one atomic batch.
+            let event_data = events
+                .iter()
+                .map(build_event_data)
+                .collect::<Result<Vec<_>>>()?;
 
             // causal::StreamState and kurrentdb::StreamState are
             // structurally identical; map variant-for-variant.
@@ -155,12 +144,12 @@ mod kurrent {
                     // `next_expected_version` is Kurrent's name for
                     // "revision of the just-written event" — 0-indexed,
                     // matching causal::StreamRevision directly.
-                    revision: Some(StreamRevision::from_raw(
-                        write.next_expected_version,
-                    )),
+                    revision: StreamRevision::from_raw(write.next_expected_version),
                 }),
                 Err(kurrentdb::Error::WrongExpectedVersion { current, .. }) => {
-                    let event_id = event.event_id;
+                    // A batch lands atomically, so the last event's id
+                    // identifies the whole batch on the idempotent-retry path.
+                    let event_id = last_event_id;
                     let current_rev = match current {
                         CurrentRevision::Current(n) => Some(n),
                         CurrentRevision::NoStream => None,
@@ -187,11 +176,12 @@ mod kurrent {
                         }
                         _ => {}
                     }
-                    Err(anyhow!(
-                        "OCC conflict on '{stream}': expected {}, current revision is {:?}",
+                    // Typed ConflictError so Engine::append can downcast
+                    // + retry (not a bare string).
+                    Err(anyhow::Error::new(causal::event_log::ConflictError {
                         expected,
-                        current_rev,
-                    ))
+                        current: current_rev.map(StreamRevision::from_raw),
+                    }))
                 }
                 Err(e) => Err(anyhow!("kurrent append_to_stream failed: {e}")),
             }
@@ -243,11 +233,11 @@ mod kurrent {
 
         async fn read_stream(
             &self,
-            aggregate_type: &str,
-            aggregate_id: Uuid,
+            category: &str,
+            stream_id: Uuid,
             after: Option<StreamRevision>,
         ) -> Result<Vec<RecordedEvent>> {
-            let stream_name = format!("{}-{}", aggregate_type, aggregate_id);
+            let stream_name = format!("{}-{}", category, stream_id);
             // causal::StreamRevision is 0-indexed, matching Kurrent
             // exactly. To return events with revision > r, start
             // reading at position r + 1.
@@ -278,13 +268,22 @@ mod kurrent {
             };
 
             let mut out = Vec::new();
-            while let Some(resolved) = stream
-                .next()
-                .await
-                .map_err(|e| anyhow!("kurrent read_stream next failed: {e}"))?
-            {
-                let recorded = resolved.get_original_event();
-                out.push(recorded_to_persisted(recorded)?);
+            loop {
+                match stream.next().await {
+                    Ok(Some(resolved)) => {
+                        let recorded = resolved.get_original_event();
+                        out.push(recorded_to_persisted(recorded)?);
+                    }
+                    Ok(None) => break,
+                    // On a real KurrentDB, a missing stream isn't reported on
+                    // the initial `read_stream` call — it surfaces here, on the
+                    // first `next()`. Treat it as an empty stream (contract:
+                    // missing stream → empty Vec, never an error).
+                    Err(kurrentdb::Error::ResourceNotFound) => break,
+                    Err(e) => {
+                        return Err(anyhow!("kurrent read_stream next failed: {e}"));
+                    }
+                }
             }
             Ok(out)
         }
@@ -320,35 +319,6 @@ mod kurrent {
     // Helpers
     // ──────────────────────────────────────────────────────────────
 
-    /// Compose the target stream name for a `EventData`.
-    ///
-    /// - Aggregate events: `{aggregate_type}-{aggregate_id}` (matches
-    ///   Kurrent's `$by_category` convention).
-    /// - Non-aggregate events: `{category}-_global` where category is
-    ///   extracted from `event_type` prefix. Falls back to
-    ///   `"causal-_global"` for legacy events with no colon.
-    fn stream_name(event: &EventData) -> String {
-        match (event.aggregate_type.as_deref(), event.aggregate_id) {
-            (Some(t), Some(id)) => {
-                debug_assert!(
-                    !t.contains('-'),
-                    "aggregate_type '{t}' contains '-'; conflicts with \
-                     Kurrent's stream naming convention",
-                );
-                format!("{}-{}", t, id)
-            }
-            _ => {
-                let category = event
-                    .event_type
-                    .split(':')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("causal");
-                format!("{}-_global", category)
-            }
-        }
-    }
-
     /// Build a `kurrentdb::EventData` from causal's `EventData`. Stamps
     /// the causal-reserved metadata keys.
     fn build_event_data(event: &EventData) -> Result<KurrentEventData> {
@@ -366,11 +336,12 @@ mod kurrent {
     fn build_metadata(event: &EventData) -> Map<String, Value> {
         let mut m = event.metadata.clone();
         // KurrentDB convention: system metadata keys are `$`-prefixed
-        // camelCase. `$correlationId` and `$causationId` are what
-        // Kurrent's server-side projections (`$by_correlation_id`,
-        // `$by_causation_id`) read. Using these specific names is
-        // the difference between native projections working and
-        // silently returning nothing.
+        // camelCase. The `$by_correlation_id` system projection reads
+        // `$correlationId` (once configured + projections running) and
+        // uses `$causationId` to build the causation tree. There is no
+        // `$by_causation_id` projection. Using these exact names is the
+        // difference between the native projection working and silently
+        // returning nothing.
         m.insert(
             "$correlationId".to_string(),
             Value::String(event.correlation_id.to_string()),
@@ -381,15 +352,10 @@ mod kurrent {
                 Value::String(causation.to_string()),
             );
         }
-        // causal-specific reserved keys (no Kurrent counterpart):
-        // keep `_` prefix to mark "framework-internal."
+        // causal-specific reserved key (no Kurrent counterpart): keep `_`
+        // prefix to mark "framework-internal." (category/stream_id are
+        // recovered from the stream name, so no `_aggregateType` needed.)
         m.insert("_persistent".to_string(), Value::Bool(event.persistent));
-        if let Some(ref agg_t) = event.aggregate_type {
-            m.insert(
-                "_aggregateType".to_string(),
-                Value::String(agg_t.clone()),
-            );
-        }
         m
     }
 
@@ -417,23 +383,22 @@ mod kurrent {
             .remove("_persistent")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let aggregate_type = metadata
-            .remove("_aggregateType")
-            .and_then(|v| v.as_str().map(String::from));
-        // Parse aggregate_id from stream_id when aggregate_type is set:
-        // stream "{type}-{uuid}" → uuid. For non-aggregate events
-        // (stream "{cat}-_global"), aggregate_id stays None.
-        let aggregate_id = aggregate_type.as_ref().and_then(|t| {
-            let prefix = format!("{}-", t);
-            rec.stream_id()
-                .strip_prefix(&prefix)
-                .and_then(|rest| Uuid::parse_str(rest).ok())
-        });
-        // causal::StreamRevision and Kurrent revision are both
-        // 0-indexed; identity mapping.
-        let revision = aggregate_type
-            .as_ref()
-            .map(|_| StreamRevision::from_raw(rec.revision));
+        // category + stream_id are recovered from the Kurrent stream name
+        // `{category}-{stream_id}` (stream_id is a canonical 36-char UUID
+        // at the end). No `_aggregateType` metadata needed.
+        let stream_name = rec.stream_id();
+        let stream_id = stream_name
+            .get(stream_name.len().saturating_sub(36)..)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| {
+                anyhow!("Kurrent stream name '{stream_name}' does not end in a UUID")
+            })?;
+        let category = stream_name
+            .strip_suffix(&format!("-{stream_id}"))
+            .unwrap_or_default()
+            .to_string();
+        // causal::StreamRevision and Kurrent revision are both 0-indexed.
+        let revision = StreamRevision::from_raw(rec.revision);
 
         let payload: Value = serde_json::from_slice(&rec.data)
             .map_err(|e| anyhow!("malformed Kurrent payload: {e}"))?;
@@ -447,8 +412,8 @@ mod kurrent {
             correlation_id,
             event_type: rec.event_type.clone(),
             payload,
-            aggregate_type,
-            aggregate_id,
+            category,
+            stream_id,
             revision,
             metadata,
             created_at,
@@ -504,16 +469,19 @@ mod kurrent {
             Err(kurrentdb::Error::ResourceNotFound) => return Ok(None),
             Err(e) => return Err(anyhow!("kurrent reconcile read failed: {e}")),
         };
-        while let Some(resolved) = read
-            .next()
-            .await
-            .map_err(|e| anyhow!("kurrent reconcile next failed: {e}"))?
-        {
+        loop {
+            let resolved = match read.next().await {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                // Missing stream surfaces on `next()`, not the initial call.
+                Err(kurrentdb::Error::ResourceNotFound) => break,
+                Err(e) => return Err(anyhow!("kurrent reconcile next failed: {e}")),
+            };
             let rec = resolved.get_original_event();
             if rec.id == event_id {
                 return Ok(Some(WriteResult {
                     position: LogCursor::from_raw(rec.position.commit),
-                    revision: Some(StreamRevision::from_raw(rec.revision)),
+                    revision: StreamRevision::from_raw(rec.revision),
                 }));
             }
         }
@@ -531,8 +499,8 @@ mod kurrent {
 
         fn mk_event(
             event_type: &str,
-            aggregate_type: Option<&str>,
-            aggregate_id: Option<Uuid>,
+            category: Option<&str>,
+            stream_id: Option<Uuid>,
         ) -> EventData {
             EventData {
                 event_id:        Uuid::new_v4(),
@@ -541,33 +509,12 @@ mod kurrent {
                 event_type:      event_type.to_string(),
                 payload:         serde_json::json!({}),
                 created_at:      Utc::now(),
-                aggregate_type:  aggregate_type.map(String::from),
-                aggregate_id,
+                category:        category.map(String::from),
+                stream_id:       stream_id,
                 metadata:        Map::new(),
                 ephemeral:       None,
                 persistent:      true,
             }
-        }
-
-        #[test]
-        fn stream_name_uses_aggregate_when_present() {
-            let id = Uuid::new_v4();
-            let e = mk_event("lifecycle:run_started", Some("lifecycle"), Some(id));
-            assert_eq!(stream_name(&e), format!("lifecycle-{}", id));
-        }
-
-        #[test]
-        fn stream_name_falls_back_to_global_for_non_aggregate() {
-            let e = mk_event("telemetry:ping", None, None);
-            assert_eq!(stream_name(&e), "telemetry-_global");
-        }
-
-        #[test]
-        fn stream_name_uses_causal_when_event_type_has_no_colon() {
-            let e = mk_event("order_placed", None, None);
-            assert_eq!(stream_name(&e), "order_placed-_global");
-            let e = mk_event("", None, None);
-            assert_eq!(stream_name(&e), "causal-_global");
         }
 
         // The old "causal version vs Kurrent revision" conversion
@@ -599,9 +546,9 @@ mod kurrent {
                 "Kurrent convention: $causationId, not _parent_id"
             );
             assert_eq!(m.get("_persistent").and_then(Value::as_bool), Some(true));
-            assert_eq!(
-                m.get("_aggregateType").and_then(Value::as_str),
-                Some("lifecycle")
+            assert!(
+                !m.contains_key("_aggregateType"),
+                "category is recovered from the stream name, not metadata",
             );
             // User metadata preserved.
             assert_eq!(

@@ -48,10 +48,10 @@ pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
 pub mod projector;
+pub mod reaction_cache;
 pub mod reactor_observer;
 pub mod reactor_runner;
 pub mod reactor;
-pub mod relay;
 pub mod snapshot_store;
 pub mod types;
 
@@ -70,8 +70,8 @@ pub mod upcaster;
 //
 // Backend-impl-facing (module paths only): EventData, WriteResult,
 // Snapshot — backends pull these from `causal::types::*` directly.
-// Same for runners (`causal::projection_runner::*`), outbox row shapes
-// (`causal::checkpoint_store::*`), and the relay (`causal::relay::*`).
+// Same for runners (`causal::projection_runner::*`) and the
+// checkpoint / reactor-checkpoint traits (`causal::checkpoint_store::*`).
 //
 // Internal-detail (module paths only): EventOutput (Events
 // implementation detail), EmitInput (Into-target only),
@@ -108,9 +108,13 @@ pub use types::{
 // Observability hook
 pub use reactor_observer::{NoopObserver, ReactorObserver};
 
+// Reactor idempotency (Phase 4 foundation): memoize side-effecting
+// reactions so at-least-once delivery is safe; deterministic emit ids.
+pub use reaction_cache::{remember, InMemoryReactionCache, ReactionCache, ReactionKey};
+
 // Backend traits (users typically cast `Arc<dyn ...>` at builder time)
-pub use checkpoint_store::{CheckpointStore, ReactorOutbox};
-pub use event_log::EventLogBackend;
+pub use checkpoint_store::{CheckpointStore, ReactorCheckpoint};
+pub use event_log::{append_event, EventLogBackend};
 pub use projection::{
     Backoff, FailureBehavior, ProjectionFailure, ProjectionMode, ProjectionOps,
     ProjectionStatus, RetryPolicy, StartPosition,

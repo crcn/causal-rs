@@ -207,6 +207,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
                 logs:           None,
+                reaction_cache: None,
             };
             match self.projector.project(&event, ctx).await {
                 Ok(()) => {
@@ -307,13 +308,13 @@ mod tests {
             event_type:      event_type.into(),
             payload:         serde_json::json!({"event_type": event_type}),
             created_at:      Utc::now(),
-            aggregate_type:  None,
-            aggregate_id:    None,
+            category:  None,
+            stream_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
         };
-        EventLogBackend::append(store, ev).await.unwrap();
+        crate::append_event(store, ev).await.unwrap();
         event_id
     }
 

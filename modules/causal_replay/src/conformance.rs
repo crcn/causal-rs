@@ -52,8 +52,8 @@ use causal::EventLogBackend;
 pub fn fresh_event(
     correlation: Uuid,
     event_type: &str,
-    aggregate_type: Option<&str>,
-    aggregate_id: Option<Uuid>,
+    category: Option<&str>,
+    stream_id: Option<Uuid>,
 ) -> EventData {
     EventData {
         event_id:        Uuid::new_v4(),
@@ -62,8 +62,8 @@ pub fn fresh_event(
         event_type:      event_type.to_string(),
         payload:         serde_json::json!({}),
         created_at:      Utc::now(),
-        aggregate_type:  aggregate_type.map(String::from),
-        aggregate_id,
+        category:        category.map(String::from),
+        stream_id,
         metadata:        serde_json::Map::new(),
         ephemeral:       None,
         persistent:      true,
@@ -82,11 +82,11 @@ pub async fn append_is_idempotent_on_event_id<B: EventLogBackend>(b: &B) -> Resu
     let mut event = fresh_event(correlation, "conformance:c1", None, None);
     let event_id = event.event_id;
 
-    let first = b.append(event.clone()).await?;
+    let first = causal::append_event(b, event.clone()).await?;
     // Second call: same event_id, different payload — backend must
     // collapse to the first write's result.
     event.payload = serde_json::json!({"this_should_not": "overwrite"});
-    let second = b.append(event).await?;
+    let second = causal::append_event(b, event).await?;
 
     assert_eq!(
         first.position, second.position,
@@ -120,11 +120,11 @@ pub async fn fresh_stream_first_event_lands_at_revision_zero<B: EventLogBackend>
     );
 
     let result = b
-        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, event)
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, vec![event])
         .await?;
     assert_eq!(
         result.revision,
-        Some(StreamRevision::ZERO),
+        StreamRevision::ZERO,
         "0-indexed revision contract: fresh-stream first event lands at revision 0"
     );
     Ok(())
@@ -145,9 +145,9 @@ pub async fn revision_is_monotonic_within_stream<B: EventLogBackend>(b: &B) -> R
             Some(aggregate_id),
         );
         let result = b
-            .append_to_stream(aggregate_type, aggregate_id, expected, event)
+            .append_to_stream(aggregate_type, aggregate_id, expected, vec![event])
             .await?;
-        let r = result.revision.expect("stream append returns Some(revision)");
+        let r = result.revision;
         assert_eq!(
             r.raw(),
             n,
@@ -173,7 +173,7 @@ pub async fn append_to_stream_rejects_stale_expected<B: EventLogBackend>(
         Some(aggregate_type),
         Some(aggregate_id),
     );
-    b.append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, e1)
+    b.append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, vec![e1])
         .await?;
 
     // Try to write again at NoStream (stale — stream has events now).
@@ -184,13 +184,17 @@ pub async fn append_to_stream_rejects_stale_expected<B: EventLogBackend>(
         Some(aggregate_id),
     );
     let err = b
-        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, e2)
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, vec![e2])
         .await
         .expect_err("stale expected must error");
-    let msg = format!("{err:?}").to_lowercase();
+    // Must be a TYPED ConflictError, not just a string with "conflict" in it —
+    // Engine::append's OCC retry keys on `downcast_ref::<ConflictError>()`, so a
+    // bare string error would silently disable retry on this backend.
+    let conflict = err.downcast_ref::<causal::event_log::ConflictError>();
     assert!(
-        msg.contains("conflict") || msg.contains("expected"),
-        "OCC error message should reference conflict or expected version; got: {msg}"
+        conflict.is_some(),
+        "OCC mismatch must surface as a typed ConflictError so Engine::append \
+         can downcast + retry; got: {err:?}"
     );
     Ok(())
 }
@@ -213,11 +217,11 @@ pub async fn append_to_stream_idempotent_on_event_id_retry<B: EventLogBackend>(
     );
 
     let first = b
-        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, event.clone())
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, vec![event.clone()])
         .await?;
     // Same event, same expected — should collapse idempotently.
     let second = b
-        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, event)
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, vec![event])
         .await?;
     assert_eq!(
         first.position, second.position,
@@ -227,6 +231,107 @@ pub async fn append_to_stream_idempotent_on_event_id_retry<B: EventLogBackend>(
         first.revision, second.revision,
         "C1 (CAS): idempotent retry returns the same revision"
     );
+    Ok(())
+}
+
+/// A multi-event batch appends ATOMICALLY: all events land at consecutive
+/// revisions, the `WriteResult` describes the LAST event, and `read_stream`
+/// returns the whole batch in order. This is the spine of `Engine::append`'s
+/// multi-fact atomicity — exercise it directly against every backend.
+pub async fn append_to_stream_batch_lands_atomically<B: EventLogBackend>(
+    b: &B,
+) -> Result<()> {
+    let aggregate_type = "conformance";
+    let aggregate_id = Uuid::new_v4();
+    let batch: Vec<EventData> = (0..3)
+        .map(|i| {
+            fresh_event(
+                Uuid::new_v4(),
+                &format!("conformance:batch{i}"),
+                Some(aggregate_type),
+                Some(aggregate_id),
+            )
+        })
+        .collect();
+    let ids: Vec<Uuid> = batch.iter().map(|e| e.event_id).collect();
+
+    let result = b
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, batch)
+        .await?;
+
+    // WriteResult describes the LAST event: revision 2 (0-indexed, 3 events).
+    assert_eq!(
+        result.revision,
+        StreamRevision::from_raw(2),
+        "batch WriteResult.revision must be the last event's revision"
+    );
+
+    let events = b.read_stream(aggregate_type, aggregate_id, None).await?;
+    assert_eq!(events.len(), 3, "all 3 batch events landed atomically");
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(
+            ev.revision,
+            StreamRevision::from_raw(i as u64),
+            "batch event {i} must be at consecutive revision {i}"
+        );
+        assert_eq!(ev.event_id, ids[i], "batch order is preserved");
+    }
+    Ok(())
+}
+
+/// Re-appending the IDENTICAL multi-event batch is idempotent: it collapses
+/// to the original write (same `WriteResult`, no duplicates, stream doesn't
+/// grow) even though the second call's `expected` is stale. Pins the
+/// "detect redelivery by the batch's last event_id" contract on every backend.
+pub async fn append_to_stream_batch_idempotent_on_replay<B: EventLogBackend>(
+    b: &B,
+) -> Result<()> {
+    let aggregate_type = "conformance";
+    let aggregate_id = Uuid::new_v4();
+    let batch: Vec<EventData> = (0..3)
+        .map(|i| {
+            fresh_event(
+                Uuid::new_v4(),
+                &format!("conformance:replay{i}"),
+                Some(aggregate_type),
+                Some(aggregate_id),
+            )
+        })
+        .collect();
+    let ids: Vec<Uuid> = batch.iter().map(|e| e.event_id).collect();
+
+    let first = b
+        .append_to_stream(
+            aggregate_type,
+            aggregate_id,
+            StreamState::NoStream,
+            batch.clone(),
+        )
+        .await?;
+    // Replay the identical batch. The stream is non-empty now, so NoStream is
+    // stale — but idempotency (last event_id already present) takes precedence
+    // over the expected-state check.
+    let second = b
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, batch)
+        .await?;
+
+    assert_eq!(
+        first.position, second.position,
+        "replaying an identical batch returns the same WriteResult.position"
+    );
+    assert_eq!(
+        first.revision, second.revision,
+        "replaying an identical batch returns the same WriteResult.revision"
+    );
+    for id in &ids {
+        assert_eq!(
+            count_event_id_in_log(b, *id).await?,
+            1,
+            "batch replay must not duplicate event {id}"
+        );
+    }
+    let events = b.read_stream(aggregate_type, aggregate_id, None).await?;
+    assert_eq!(events.len(), 3, "batch replay must not grow the stream");
     Ok(())
 }
 
@@ -246,14 +351,14 @@ pub async fn read_stream_partitions_by_aggregate_id<B: EventLogBackend>(
         aggregate_type,
         agg_a,
         StreamState::NoStream,
-        fresh_event(Uuid::new_v4(), "conformance:a", Some(aggregate_type), Some(agg_a)),
+        vec![fresh_event(Uuid::new_v4(), "conformance:a", Some(aggregate_type), Some(agg_a))],
     )
     .await?;
     b.append_to_stream(
         aggregate_type,
         agg_b,
         StreamState::NoStream,
-        fresh_event(Uuid::new_v4(), "conformance:b", Some(aggregate_type), Some(agg_b)),
+        vec![fresh_event(Uuid::new_v4(), "conformance:b", Some(aggregate_type), Some(agg_b))],
     )
     .await?;
 
@@ -282,10 +387,9 @@ pub async fn read_stream_after_revision_is_strict<B: EventLogBackend>(b: &B) -> 
         );
         ids.push(event.event_id);
         let r = b
-            .append_to_stream(aggregate_type, aggregate_id, expected, event)
+            .append_to_stream(aggregate_type, aggregate_id, expected, vec![event])
             .await?;
-        let rev = r.revision.unwrap();
-        expected = StreamState::StreamRevision(rev.raw());
+        expected = StreamState::StreamRevision(r.revision.raw());
     }
 
     // After revision 1, we should see exactly revisions 2 and 3
@@ -330,11 +434,11 @@ pub async fn read_all_returns_events_strictly_after_cursor<B: EventLogBackend>(
     let correlation = Uuid::new_v4();
     let e1 = fresh_event(correlation, "conformance:c1", None, None);
     let e1_id = e1.event_id;
-    let r1 = b.append(e1).await?;
+    let r1 = causal::append_event(b, e1).await?;
 
     let e2 = fresh_event(correlation, "conformance:c2", None, None);
     let e2_id = e2.event_id;
-    b.append(e2).await?;
+    causal::append_event(b, e2).await?;
 
     // Reading $all after r1.position must NOT include e1, but MUST
     // include e2. (Filtering by correlation so we don't pick up
@@ -367,7 +471,7 @@ pub async fn latest_position_reflects_committed_writes<B: EventLogBackend>(
     b: &B,
 ) -> Result<()> {
     let event = fresh_event(Uuid::new_v4(), "conformance:latest", None, None);
-    let r = b.append(event).await?;
+    let r = causal::append_event(b, event).await?;
     let latest = b.latest_position().await?;
     assert!(
         latest >= r.position,
@@ -422,6 +526,8 @@ pub fn scenario_names() -> &'static [&'static str] {
         "revision_is_monotonic_within_stream",
         "append_to_stream_rejects_stale_expected",
         "append_to_stream_idempotent_on_event_id_retry",
+        "append_to_stream_batch_lands_atomically",
+        "append_to_stream_batch_idempotent_on_replay",
         "read_stream_partitions_by_aggregate_id",
         "read_stream_after_revision_is_strict",
         "read_stream_returns_empty_for_missing_stream",

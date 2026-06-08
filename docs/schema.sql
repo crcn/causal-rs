@@ -3,7 +3,7 @@
 -- ============================================================
 --
 -- This is the authoritative schema for the v0.4 PG-backed
--- `EventLogBackend` / `CheckpointStore` / `ReactorOutbox` /
+-- `EventLogBackend` / `CheckpointStore` / `ReactorCheckpoint` /
 -- `SnapshotStore` / `ProjectionOps` implementations in the
 -- `causal_replay` crate.
 --
@@ -57,7 +57,9 @@ CREATE INDEX idx_causal_log_event_type
     ON causal_log (event_type);
 
 COMMENT ON COLUMN causal_log.position IS
-    '0-indexed global commit position. Maps to Kurrent commit position.';
+    'Global commit position (BIGSERIAL, starts at 1). Cursors compare with
+     position > cursor and start at 0, so rolled-back-txn gaps are fine.
+     Maps to Kurrent commit position.';
 COMMENT ON COLUMN causal_log.revision IS
     '0-indexed per-stream revision. First event in a stream has revision 0. NULL for non-aggregate events.';
 COMMENT ON COLUMN causal_log.causation_id IS
@@ -67,7 +69,7 @@ COMMENT ON COLUMN causal_log.correlation_id IS
 
 -- ── causal_checkpoints: per-consumer cursor storage ─────────────────
 --
--- Backs `PgReactorOutbox`'s `CheckpointStore` impl. One row per
+-- Backs `PgReactorCheckpoint`'s `CheckpointStore` impl. One row per
 -- (reactor or projector) consumer; tracks how far it's read in $all.
 CREATE TABLE causal_checkpoints (
     consumer_id   TEXT PRIMARY KEY,
@@ -75,30 +77,9 @@ CREATE TABLE causal_checkpoints (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ── causal_outbox: reactor output buffer ────────────────────────────
---
--- Backs `PgReactorOutbox::commit_reactor_batch`. Reactor outputs land
--- here in the same transaction as the trigger event's cursor advance
--- (C12: atomic outbox + cursor commit). The relay drains pending rows
--- and appends them to causal_log.
-CREATE TABLE causal_outbox (
-    id              BIGSERIAL PRIMARY KEY,
-    reactor_id      TEXT NOT NULL,
-    source_event_id UUID NOT NULL,
-    output_index    INTEGER NOT NULL,
-    event_id        UUID NOT NULL,
-    event_type      VARCHAR(255) NOT NULL,
-    fact_payload    JSONB NOT NULL,
-    correlation_id  UUID NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (reactor_id, source_event_id, output_index)
-);
-
-CREATE INDEX idx_causal_outbox_pending
-    ON causal_outbox (created_at, id);
-
-COMMENT ON COLUMN causal_outbox.output_index IS
-    '0..N for normal react() outputs; u32::MAX for DLQ-synthesized facts.';
+-- (No causal_outbox table: reactors append their outputs directly to
+-- causal_log with a deterministic event_id and advance their cursor —
+-- at-least-once + idempotent, no transactional outbox / relay.)
 
 -- ── causal_snapshots: aggregate state snapshots ─────────────────────
 --

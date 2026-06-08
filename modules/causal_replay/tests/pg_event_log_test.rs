@@ -7,7 +7,7 @@
 //! - **C1** (append idempotency on event_id) — duplicate appends collapse.
 //! - **C6** (aggregate OCC) — stale `expected_version` errors out.
 //! - `read_all` returns events in monotonic position order.
-//! - `read_stream` partitions by `(aggregate_type, aggregate_id)`.
+//! - `read_stream` partitions by `(category, stream_id)`.
 //! - `latest_position` reports the max persisted position.
 //!
 //! Schema requires migration 054_causal_v03_backend_tables.sql to have
@@ -76,8 +76,8 @@ fn make_event(correlation_id: Uuid, event_type: &str) -> EventData {
         event_type: event_type.to_string(),
         payload: serde_json::json!({}),
         created_at: Utc::now(),
-        aggregate_type: None,
-        aggregate_id: None,
+        category: None,
+        stream_id: None,
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
@@ -96,11 +96,11 @@ async fn append_is_idempotent_on_event_id_c1() -> Result<()> {
     let mut event = make_event(correlation, "test:c1");
     let event_id = event.event_id;
 
-    let first = backend.append(event.clone()).await?;
+    let first = causal::append_event(&backend, event.clone()).await?;
 
     // Same event_id, different payload — second call should be a no-op.
     event.payload = serde_json::json!({"this_should_not": "overwrite"});
-    let second = backend.append(event).await?;
+    let second = causal::append_event(&backend, event).await?;
 
     assert_eq!(
         first.position, second.position,
@@ -135,45 +135,47 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
     let backend = PgEventLogBackend::new(pool.clone());
 
     let correlation = Uuid::new_v4();
-    let aggregate_id = Uuid::new_v4();
+    let stream_id = Uuid::new_v4();
 
     // Initial append at NoStream → lands at revision 0.
     let r1 = backend
         .append_to_stream(
             "order",
-            aggregate_id,
+            stream_id,
             StreamState::NoStream,
-            make_event(correlation, "test:order_placed"),
+            vec![make_event(correlation, "test:order_placed")],
         )
         .await?;
-    assert_eq!(r1.revision, Some(StreamRevision::ZERO));
+    assert_eq!(r1.revision, StreamRevision::ZERO);
 
     // Stale expected (still 0) → conflict.
     let stale = backend
         .append_to_stream(
             "order",
-            aggregate_id,
+            stream_id,
             StreamState::NoStream,
-            make_event(correlation, "test:order_updated"),
+            vec![make_event(correlation, "test:order_updated")],
         )
         .await;
     assert!(stale.is_err(), "stale expected_version must error");
-    let err = stale.unwrap_err().to_string();
+    let err = stale.unwrap_err();
+    // Must be a typed ConflictError (so Engine::append can downcast + retry),
+    // not just a string mentioning conflict.
     assert!(
-        err.contains("OCC conflict"),
-        "error must report OCC conflict; got: {err}"
+        err.downcast_ref::<causal::event_log::ConflictError>().is_some(),
+        "OCC mismatch must surface as a typed ConflictError, got: {err:?}"
     );
 
     // Correct expected (StreamRevision(0)) → next revision 1.
     let r2 = backend
         .append_to_stream(
             "order",
-            aggregate_id,
+            stream_id,
             StreamState::StreamRevision(0),
-            make_event(correlation, "test:order_updated"),
+            vec![make_event(correlation, "test:order_updated")],
         )
         .await?;
-    assert_eq!(r2.revision, Some(StreamRevision::from_raw(1)));
+    assert_eq!(r2.revision, StreamRevision::from_raw(1));
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
         .bind(correlation)
@@ -191,8 +193,7 @@ async fn read_all_returns_events_in_position_order() -> Result<()> {
     let correlation = Uuid::new_v4();
     let mut positions = Vec::new();
     for i in 0..5 {
-        let r = backend
-            .append(make_event(correlation, &format!("test:n{}", i)))
+        let r = causal::append_event(&backend, make_event(correlation, &format!("test:n{}", i)))
             .await?;
         positions.push(r.position);
     }
@@ -249,7 +250,7 @@ async fn read_stream_partitions_by_aggregate() -> Result<()> {
             Some(r) => StreamState::StreamRevision(r),
         };
         backend
-            .append_to_stream("test_aggregate", agg, expected, event)
+            .append_to_stream("test_aggregate", agg, expected, vec![event])
             .await?;
     }
 
@@ -265,7 +266,7 @@ async fn read_stream_partitions_by_aggregate() -> Result<()> {
 
     // 0-indexed revision ordering: events at r0, r1, r2.
     for (i, e) in stream_a.iter().enumerate() {
-        assert_eq!(e.revision, Some(StreamRevision::from_raw(i as u64)));
+        assert_eq!(e.revision, StreamRevision::from_raw(i as u64));
     }
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
@@ -282,8 +283,7 @@ async fn latest_position_reports_max() -> Result<()> {
     let backend = PgEventLogBackend::new(pool.clone());
 
     let correlation = Uuid::new_v4();
-    let r = backend
-        .append(make_event(correlation, "test:latest"))
+    let r = causal::append_event(&backend, make_event(correlation, "test:latest"))
         .await?;
 
     let latest = backend.latest_position().await?;

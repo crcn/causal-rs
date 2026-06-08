@@ -6,8 +6,8 @@ Runnable causal-rs examples backed by KurrentDB.
 
 | Example | Backend | What it shows |
 |---------|---------|---------------|
-| [`http-fetcher`](http-fetcher/) | KurrentDB + Postgres | Production-shape wiring: Kurrent for the event log, `PgReactorOutbox` for outbox + checkpoints. Reactor fans out HTTP fetches, emits success/failure events per request. |
-| [`ai-summarizer`](ai-summarizer/) | KurrentDB + `MemoryStore` | Minimal wiring: Kurrent for the log, in-memory outbox + checkpoints (single-process, ephemeral). Reactor calls the Anthropic API and emits `Summarized` / `SummaryFailed`. |
+| [`http-fetcher`](http-fetcher/) | KurrentDB + Postgres | Production-shape wiring: Kurrent for the event log, `PgReactorCheckpoint` for reactor/projection cursors. Reactor fans out HTTP fetches, emits success/failure events per request. |
+| [`ai-summarizer`](ai-summarizer/) | KurrentDB + `MemoryStore` | Minimal wiring: Kurrent for the log, in-memory cursors (single-process, ephemeral). Reactor calls the Anthropic API and emits `Summarized` / `SummaryFailed`. |
 
 ## The shape
 
@@ -15,7 +15,7 @@ Every example follows the same three steps:
 
 1. **Define `Event`s.** Typed structs implementing `causal::Event` — one `CATEGORY` per logical stream, `stream_id` for routing.
 2. **Define a `Reactor`.** A struct implementing `causal::Reactor` with `type Trigger = …` and `async fn react(…) -> Result<Events>`.
-3. **Build the engine.** `EngineBuilder::new(log, checkpoint, outbox)` casts three backend trait objects, `.with_reactor(R)` registers each consumer, `.build()` returns the live engine. `engine.emit(...).settled().await?` runs the full causal chain to quiescence.
+3. **Build the engine.** `EngineBuilder::new(log, checkpoint, reactor_checkpoint)` casts three backend trait objects, `.with_reactor(R)` registers each consumer, `.build()` returns the live engine. `engine.emit(...).settled().await?` runs the full causal chain to quiescence.
 
 ## Why no adapters
 

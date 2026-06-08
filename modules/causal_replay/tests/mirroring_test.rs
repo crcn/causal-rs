@@ -22,8 +22,8 @@ fn make_event(correlation: Uuid, event_type: &str) -> EventData {
         event_type: event_type.to_string(),
         payload: serde_json::json!({}),
         created_at: Utc::now(),
-        aggregate_type: None,
-        aggregate_id: None,
+        category: None,
+        stream_id: None,
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
@@ -40,7 +40,7 @@ async fn append_writes_to_both_children() -> Result<()> {
     let event = make_event(correlation, "test:dual");
     let event_id = event.event_id;
 
-    mirror.append(event).await?;
+    causal::append_event(&mirror, event).await?;
 
     let legacy_events = legacy.read_all(LogCursor::ZERO, 100).await?;
     let v03_events = v03.read_all(LogCursor::ZERO, 100).await?;
@@ -62,8 +62,7 @@ async fn read_paths_delegate_to_legacy() -> Result<()> {
     let v03: Arc<dyn EventLogBackend> = Arc::new(MemoryStore::new());
     let mirror = MirroringEventLogBackend::new(legacy.clone(), v03.clone());
 
-    legacy
-        .append(make_event(Uuid::new_v4(), "legacy:only"))
+    causal::append_event(legacy.as_ref(), make_event(Uuid::new_v4(), "legacy:only"))
         .await?;
 
     let from_mirror = mirror.read_all(LogCursor::ZERO, 100).await?;
@@ -71,7 +70,7 @@ async fn read_paths_delegate_to_legacy() -> Result<()> {
     assert_eq!(from_mirror[0].event_type, "legacy:only");
 
     // Now write to v03 only — mirror should NOT see it via read_all.
-    v03.append(make_event(Uuid::new_v4(), "v03:only")).await?;
+    causal::append_event(v03.as_ref(), make_event(Uuid::new_v4(), "v03:only")).await?;
     let from_mirror_again = mirror.read_all(LogCursor::ZERO, 100).await?;
     assert_eq!(
         from_mirror_again.len(),
@@ -92,9 +91,8 @@ async fn legacy_failure_propagates_and_skips_v03_write() -> Result<()> {
     let v03 = Arc::new(MemoryStore::new());
     let mirror = MirroringEventLogBackend::new(legacy, v03.clone());
 
-    let result = mirror
-        .append(make_event(Uuid::new_v4(), "test:fail"))
-        .await;
+    let result =
+        causal::append_event(&mirror, make_event(Uuid::new_v4(), "test:fail")).await;
     assert!(result.is_err(), "wrapper must propagate legacy failure");
 
     let v03_events = v03.read_all(LogCursor::ZERO, 100).await?;
@@ -118,7 +116,7 @@ async fn v03_failure_after_legacy_success_leaves_legacy_committed() -> Result<()
 
     let event = make_event(Uuid::new_v4(), "test:partial");
     let event_id = event.event_id;
-    let result = mirror.append(event.clone()).await;
+    let result = causal::append_event(&mirror, event.clone()).await;
     assert!(result.is_err(), "wrapper must propagate v0.3 failure");
 
     // Legacy has the row — observable inconsistency until retry.
@@ -129,7 +127,7 @@ async fn v03_failure_after_legacy_success_leaves_legacy_committed() -> Result<()
     // Recovery: v0.3 stops failing; retry with same event_id; both
     // converge.
     v03.fail.store(false, Ordering::SeqCst);
-    mirror.append(event).await?;
+    causal::append_event(&mirror, event).await?;
 
     // Legacy still has just the one row (idempotent on event_id).
     let legacy_events_after = legacy.read_all(LogCursor::ZERO, 100).await?;
@@ -160,11 +158,11 @@ async fn retry_recovers_when_v03_recovers() -> Result<()> {
     let event_id = event.event_id;
 
     // First call: legacy succeeds, v0.3 fails.
-    let r = mirror.append(event.clone()).await;
+    let r = causal::append_event(&mirror, event.clone()).await;
     assert!(r.is_err());
 
     // Retry: v0.3 should now succeed; legacy is idempotent.
-    let r2 = mirror.append(event).await;
+    let r2 = causal::append_event(&mirror, event).await;
     assert!(r2.is_ok(), "retry must succeed once v0.3 recovers");
 
     // Both have it.
@@ -185,13 +183,6 @@ struct GatedBackend {
 
 #[async_trait]
 impl EventLogBackend for GatedBackend {
-    async fn append(&self, event: EventData) -> Result<WriteResult> {
-        if self.fail_first_n.swap(false, Ordering::SeqCst) {
-            Err(anyhow::anyhow!("gated: failing first call"))
-        } else {
-            self.inner.append(event).await
-        }
-    }
     async fn read_all(&self, after: LogCursor, limit: usize) -> Result<Vec<RecordedEvent>> {
         self.inner.read_all(after, limit).await
     }
@@ -211,9 +202,13 @@ impl EventLogBackend for GatedBackend {
         a: &str,
         b: Uuid,
         c: StreamState,
-        event: EventData,
+        events: Vec<EventData>,
     ) -> Result<WriteResult> {
-        self.inner.append_to_stream(a, b, c, event).await
+        if self.fail_first_n.swap(false, Ordering::SeqCst) {
+            Err(anyhow::anyhow!("gated: failing first call"))
+        } else {
+            self.inner.append_to_stream(a, b, c, events).await
+        }
     }
 }
 
@@ -225,7 +220,7 @@ async fn parity_check_returns_true_when_both_have_event() -> Result<()> {
 
     let event = make_event(Uuid::new_v4(), "test:parity");
     let event_id = event.event_id;
-    mirror.append(event).await?;
+    causal::append_event(&mirror, event).await?;
 
     assert!(
         mirror.parity_check_event(event_id).await?,
@@ -249,17 +244,6 @@ struct FailingBackend {
 
 #[async_trait]
 impl EventLogBackend for FailingBackend {
-    async fn append(&self, _event: EventData) -> Result<WriteResult> {
-        if self.fail.load(Ordering::SeqCst) {
-            Err(anyhow::anyhow!("FailingBackend: configured to fail"))
-        } else {
-            Ok(WriteResult {
-                position: LogCursor::from_raw(1),
-                revision: None,
-            })
-        }
-    }
-
     async fn read_all(&self, _: LogCursor, _: usize) -> Result<Vec<RecordedEvent>> {
         Ok(Vec::new())
     }
@@ -282,8 +266,12 @@ impl EventLogBackend for FailingBackend {
         _: &str,
         _: Uuid,
         _: StreamState,
-        _: EventData,
+        _: Vec<EventData>,
     ) -> Result<WriteResult> {
-        Err(anyhow::anyhow!("FailingBackend: configured to fail"))
+        if self.fail.load(Ordering::SeqCst) {
+            Err(anyhow::anyhow!("FailingBackend: configured to fail"))
+        } else {
+            Ok(WriteResult { position: LogCursor::from_raw(1), revision: StreamRevision::ZERO })
+        }
     }
 }

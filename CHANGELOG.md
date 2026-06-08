@@ -4,6 +4,57 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-08
+
+### Breaking — atomic batch append
+
+- `EventLogBackend::append_to_stream` now takes `Vec<EventData>` instead of a
+  single `EventData` and commits the batch atomically (KurrentDB native
+  multi-event append; Postgres single transaction; `MemoryStore` single mutex).
+  `Engine::append` builds the whole decision and appends it in one OCC call, so
+  a crash can no longer tear a multi-fact decision. Single-event callers pass
+  `vec![event]`. Idempotency keys on the batch's last `event_id`.
+
+### Breaking — rename
+
+- `ReactorOutbox` → `ReactorCheckpoint`, `PgReactorOutbox` → `PgReactorCheckpoint`
+  (`reactor_outbox.rs` → `reactor_checkpoint.rs`). The trait never had any outbox
+  methods — it carries the per-consumer cursor plus DLQ retry-attempt counters.
+  No behavior change.
+
+### Fixed
+
+- **OCC retry was silently broken on the durable backends.** `PgEventLogBackend`
+  and `KurrentEventLogBackend` returned a bare `anyhow!` string on an
+  expected-version mismatch instead of the typed `ConflictError` the trait
+  contract and `Engine::append`'s retry loop require — so a concurrent-write
+  conflict surfaced as a hard error instead of triggering reload-redecide-retry.
+  Both backends now return `ConflictError`; the conformance suite asserts the
+  *type* (not the message) so it can't regress.
+- `PgSnapshotStore` queried column `version`, but the Kurrent-alignment migration
+  had renamed it to `revision` — the Postgres snapshot path was broken. Caught by
+  running the (previously never-executed) ignored PG suite against live Postgres.
+- `PgEventLogBackend` read aggregate identity defensively, silently defaulting a
+  half-populated row to the nil stream at revision 0; it now errors on a
+  half-populated `(aggregate_type, aggregate_id, revision)`.
+- Removed `migrations/20260206_add_dead_letter_queue.sql` — it referenced a
+  `causal_events` table that never existed in causal and created an unused table
+  (rootsignal-v0.3 drift that broke a clean migration run). See
+  `migrations/README.md`: `docs/schema.sql` is the canonical fresh-install schema.
+
+### Docs (correctness)
+
+- Rewrote `modules/causal/README.md` — its quick-start described the pre-0.4 API
+  (`Fact`, `Materializer`, old `append` signature, `ReactorOutbox`, `causal =
+  "0.3"`) and would not compile. Now matches the current `Event` / `Reactor` /
+  `Engine::append` API.
+
+### Docs
+
+- Reactors and projectors are documented accurately as **catch-up subscriptions**
+  (client-managed cursor via `read_all`), not Kurrent server-side persistent
+  subscriptions. Purged stale `RelayLoop` / outbox-drain references throughout.
+
 ## [0.5.0] - 2026-05-15
 
 ### Breaking — module-path cleanup (the _v3 → canonical rename)

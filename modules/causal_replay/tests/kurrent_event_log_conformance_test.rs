@@ -1,7 +1,7 @@
 //! Conformance suite run against `KurrentEventLogBackend`.
 //!
 //! `#[ignore]`'d by default; run against a live KurrentDB on
-//! `KURRENT_URL` (default `esdb://localhost:2113?tls=false`):
+//! `KURRENT_URL` (default `kurrentdb://localhost:2113?tls=false`):
 //!
 //!   cargo test -p causal_replay --features kurrent \
 //!     --test kurrent_event_log_conformance_test -- --ignored --nocapture
@@ -13,7 +13,7 @@ use causal_replay::{conformance, KurrentEventLogBackend};
 
 fn connection_string() -> String {
     std::env::var("KURRENT_URL")
-        .unwrap_or_else(|_| "esdb://localhost:2113?tls=false".to_string())
+        .unwrap_or_else(|_| "kurrentdb://localhost:2113?tls=false".to_string())
 }
 
 fn backend() -> KurrentEventLogBackend {
@@ -49,6 +49,18 @@ async fn append_to_stream_rejects_stale_expected() -> Result<()> {
 #[ignore = "requires running Kurrent on KURRENT_URL"]
 async fn append_to_stream_idempotent_on_event_id_retry() -> Result<()> {
     conformance::append_to_stream_idempotent_on_event_id_retry(&backend()).await
+}
+
+#[tokio::test]
+#[ignore = "requires running Kurrent on KURRENT_URL"]
+async fn append_to_stream_batch_lands_atomically() -> Result<()> {
+    conformance::append_to_stream_batch_lands_atomically(&backend()).await
+}
+
+#[tokio::test]
+#[ignore = "requires running Kurrent on KURRENT_URL"]
+async fn append_to_stream_batch_idempotent_on_replay() -> Result<()> {
+    conformance::append_to_stream_batch_idempotent_on_replay(&backend()).await
 }
 
 #[tokio::test]

@@ -2,9 +2,8 @@
 
 A `SummarizeReactor` calls the Anthropic API with `reqwest + serde` and
 emits `Summarized` / `SummaryFailed` events. Minimal backend: KurrentDB
-for the event log, `MemoryStore` for outbox + checkpoints
-(single-process, ephemeral — fine for examples, swap to
-`PgReactorOutbox` for production).
+for the event log, `MemoryStore` for cursors (single-process, ephemeral
+— fine for examples, swap to `PgReactorCheckpoint` for production).
 
 ## Run
 
@@ -16,5 +15,5 @@ cargo run
 
 Environment overrides:
 
-- `KURRENT_URL` — default `esdb://localhost:2113?tls=false`
+- `KURRENT_URL` — default `kurrentdb://localhost:2113?tls=false`
 - `ANTHROPIC_API_KEY` — required

@@ -32,6 +32,7 @@ mod pg {
     use causal::types::{
         WriteResult, EventData, LogCursor, RecordedEvent, StreamRevision, StreamState,
     };
+    use causal::event_log::ConflictError;
     use causal::EventLogBackend;
 
     /// Postgres-backed event log.
@@ -51,61 +52,28 @@ mod pg {
 
     #[async_trait]
     impl EventLogBackend for PgEventLogBackend {
-        async fn append(&self, event: EventData) -> Result<WriteResult> {
-            // ON CONFLICT DO UPDATE SET event_id = excluded.event_id is a
-            // no-op update (event_id is the conflict target, so this
-            // assignment is identity). Necessary because plain
-            // ON CONFLICT DO NOTHING returns no row, which would force a
-            // follow-up SELECT for the existing position. The no-op
-            // update lets RETURNING work in both fresh and duplicate
-            // cases — one round trip either way.
-            let metadata =
-                serde_json::Value::Object(event.metadata.clone());
-            let row = sqlx::query(
-                "INSERT INTO causal_log
-                    (event_id, causation_id, correlation_id, event_type,
-                     payload, aggregate_type, aggregate_id, revision,
-                     metadata, created_at, persistent)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                 ON CONFLICT (event_id) DO UPDATE
-                    SET event_id = excluded.event_id
-                 RETURNING position, revision",
-            )
-            .bind(event.event_id)
-            .bind(event.causation_id)
-            .bind(event.correlation_id)
-            .bind(&event.event_type)
-            .bind(&event.payload)
-            .bind(event.aggregate_type.as_deref())
-            .bind(event.aggregate_id)
-            .bind(event.revision_for_storage())
-            .bind(&metadata)
-            .bind(event.created_at)
-            .bind(event.persistent)
-            .fetch_one(&self.pool)
-            .await?;
-
-            let position: i64 = row.try_get("position")?;
-            let revision: Option<i64> = row.try_get("revision")?;
-            Ok(WriteResult {
-                position: LogCursor::from_raw(position as u64),
-                revision: revision.map(|r| StreamRevision::from_raw(r as u64)),
-            })
-        }
-
         async fn append_to_stream(
             &self,
             aggregate_type: &str,
             aggregate_id: Uuid,
             expected: StreamState,
-            event: EventData,
+            events: Vec<EventData>,
         ) -> Result<WriteResult> {
-            // Compute the new event's revision (0-indexed).
-            // For NoStream: 0 (the first event).
-            // For StreamRevision(n): n + 1 (the event after that).
-            // For StreamExists / Any: we have to read the current tail
-            // first.
-            let next_revision: i64 = match expected {
+            let Some(last_event_id) = events.last().map(|e| e.event_id) else {
+                anyhow::bail!("append_to_stream: events must be non-empty");
+            };
+
+            // One transaction so the whole batch lands atomically: a
+            // partial multi-fact decision is never observable, and a
+            // mid-batch failure rolls back cleanly.
+            let mut tx = self.pool.begin().await?;
+
+            // Revision of the FIRST event in the batch (0-indexed); the
+            // rest follow at consecutive revisions.
+            //   NoStream         → 0
+            //   StreamRevision(n)→ n + 1
+            //   StreamExists/Any → read the current tail first.
+            let base_revision: i64 = match expected {
                 StreamState::NoStream => 0,
                 StreamState::StreamRevision(n) => (n + 1) as i64,
                 StreamState::StreamExists | StreamState::Any => {
@@ -117,61 +85,104 @@ mod pg {
                     )
                     .bind(aggregate_type)
                     .bind(aggregate_id)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&mut *tx)
                     .await?;
                     match (expected, current) {
                         (StreamState::StreamExists, None) => {
-                            return Err(anyhow::anyhow!(
-                                "OCC conflict on aggregate {}:{} — \
-                                 expected StreamExists, stream is empty",
-                                aggregate_type, aggregate_id,
-                            ));
+                            // Typed ConflictError so Engine::append can
+                            // downcast + retry (not a bare string).
+                            return Err(anyhow::Error::new(ConflictError {
+                                expected,
+                                current: None,
+                            }));
                         }
                         (_, Some(c)) => c + 1,
                         (_, None) => 0,
                     }
                 }
             };
-            let metadata =
-                serde_json::Value::Object(event.metadata.clone());
 
-            let result = sqlx::query(
-                "INSERT INTO causal_log
-                    (event_id, causation_id, correlation_id, event_type,
-                     payload, aggregate_type, aggregate_id, revision,
-                     metadata, created_at, persistent)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                 RETURNING position",
-            )
-            .bind(event.event_id)
-            .bind(event.causation_id)
-            .bind(event.correlation_id)
-            .bind(&event.event_type)
-            .bind(&event.payload)
-            .bind(aggregate_type)
-            .bind(aggregate_id)
-            .bind(next_revision)
-            .bind(&metadata)
-            .bind(event.created_at)
-            .bind(event.persistent)
-            .fetch_one(&self.pool)
-            .await;
+            let mut result = WriteResult {
+                position: LogCursor::ZERO,
+                revision: StreamRevision::from_raw(0),
+            };
+            for (offset, event) in events.iter().enumerate() {
+                let revision = base_revision + offset as i64;
+                let metadata = serde_json::Value::Object(event.metadata.clone());
+                let row = sqlx::query(
+                    "INSERT INTO causal_log
+                        (event_id, causation_id, correlation_id, event_type,
+                         payload, aggregate_type, aggregate_id, revision,
+                         metadata, created_at, persistent)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     RETURNING position",
+                )
+                .bind(event.event_id)
+                .bind(event.causation_id)
+                .bind(event.correlation_id)
+                .bind(&event.event_type)
+                .bind(&event.payload)
+                .bind(aggregate_type)
+                .bind(aggregate_id)
+                .bind(revision)
+                .bind(&metadata)
+                .bind(event.created_at)
+                .bind(event.persistent)
+                .fetch_one(&mut *tx)
+                .await;
 
-            match result {
-                Ok(row) => {
-                    let position: i64 = row.try_get("position")?;
-                    Ok(WriteResult {
-                        position: LogCursor::from_raw(position as u64),
-                        revision: Some(StreamRevision::from_raw(next_revision as u64)),
-                    })
-                }
-                Err(e) => {
-                    if let Some(db_err) = e.as_database_error() {
-                        if db_err
-                            .constraint()
-                            .map(|c| c == "idx_causal_log_stream")
-                            .unwrap_or(false)
-                        {
+                match row {
+                    Ok(row) => {
+                        let position: i64 = row.try_get("position")?;
+                        result = WriteResult {
+                            position: LogCursor::from_raw(position as u64),
+                            revision: StreamRevision::from_raw(revision as u64),
+                        };
+                    }
+                    Err(e) => {
+                        let constraint =
+                            e.as_database_error().and_then(|d| d.constraint());
+                        // Idempotency (C1): a batch lands atomically, so a
+                        // duplicate event_id means the whole batch is already
+                        // persisted — return its WriteResult, never an error.
+                        // Reactors rely on this for crash-redelivery safety
+                        // (re-append after a crash before the cursor advances).
+                        if constraint == Some("causal_log_event_id_key") {
+                            drop(tx);
+                            // Idempotent retry: the batch was already written, so
+                            // its last event is present — return its result. If
+                            // the last event is ABSENT, only part of the batch
+                            // previously landed: a partial-overlap batch that
+                            // violates the all-new-or-all-present precondition.
+                            // Fail with a clear error rather than the opaque
+                            // RowNotFound a `fetch_one` would raise.
+                            let row = sqlx::query(
+                                "SELECT position, revision FROM causal_log \
+                                 WHERE event_id = $1",
+                            )
+                            .bind(last_event_id)
+                            .fetch_optional(&self.pool)
+                            .await?;
+                            let Some(row) = row else {
+                                return Err(anyhow::anyhow!(
+                                    "append_to_stream on {}:{}: a batch event_id \
+                                     already exists but the batch tail does not — \
+                                     partial-overlap batch (event_ids must be all-new \
+                                     or all-already-persisted)",
+                                    aggregate_type, aggregate_id,
+                                ));
+                            };
+                            let position: i64 = row.try_get("position")?;
+                            let revision: Option<i64> = row.try_get("revision")?;
+                            return Ok(WriteResult {
+                                position: LogCursor::from_raw(position as u64),
+                                revision: StreamRevision::from_raw(
+                                    revision.unwrap_or(0) as u64,
+                                ),
+                            });
+                        }
+                        if constraint == Some("idx_causal_log_stream") {
+                            drop(tx);
                             // Look up the current head revision so the
                             // caller knows what to retry with.
                             let current: Option<i64> = sqlx::query_scalar(
@@ -184,18 +195,21 @@ mod pg {
                             .bind(aggregate_id)
                             .fetch_one(&self.pool)
                             .await?;
-                            return Err(anyhow::anyhow!(
-                                "OCC conflict on aggregate {}:{} — expected {}, current revision is {:?}",
-                                aggregate_type,
-                                aggregate_id,
+                            // Typed ConflictError so Engine::append can
+                            // downcast + retry (not a bare string).
+                            return Err(anyhow::Error::new(ConflictError {
                                 expected,
-                                current,
-                            ));
+                                current: current
+                                    .map(|c| StreamRevision::from_raw(c as u64)),
+                            }));
                         }
+                        return Err(e.into());
                     }
-                    Err(e.into())
                 }
             }
+
+            tx.commit().await?;
+            Ok(result)
         }
 
         async fn read_all(
@@ -268,8 +282,26 @@ mod pg {
             _ => serde_json::Map::new(),
         };
         let position: i64 = row.try_get("position")?;
-        let revision: Option<i64> = row.try_get("revision")?;
         let created_at: DateTime<Utc> = row.try_get("created_at")?;
+
+        // Aggregate identity is all-present (the current model: every event
+        // belongs to a stream) or all-NULL (legacy non-aggregate rows). A
+        // half-populated row is corruption — fail loudly rather than silently
+        // mis-attribute the event to the nil stream at revision 0.
+        let category: Option<String> = row.try_get("aggregate_type")?;
+        let stream_id: Option<Uuid> = row.try_get("aggregate_id")?;
+        let revision: Option<i64> = row.try_get("revision")?;
+        let (category, stream_id, revision) = match (category, stream_id, revision) {
+            (Some(c), Some(s), Some(r)) => (c, s, r),
+            (None, None, None) => (String::new(), Uuid::nil(), 0),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "causal_log position {position}: half-populated aggregate \
+                     identity — aggregate_type/aggregate_id/revision must be \
+                     all-set or all-NULL"
+                ))
+            }
+        };
 
         Ok(RecordedEvent {
             position: LogCursor::from_raw(position as u64),
@@ -278,29 +310,15 @@ mod pg {
             correlation_id: row.try_get("correlation_id")?,
             event_type: row.try_get("event_type")?,
             payload: row.try_get("payload")?,
-            aggregate_type: row.try_get("aggregate_type")?,
-            aggregate_id: row.try_get("aggregate_id")?,
-            revision: revision.map(|r| StreamRevision::from_raw(r as u64)),
+            category,
+            stream_id,
+            revision: StreamRevision::from_raw(revision as u64),
             metadata,
             created_at,
             ephemeral: None,
             persistent: row.try_get("persistent")?,
         })
     }
-
-    /// Helper for `append()` (non-CAS path): the column is always
-    /// NULL because `append()` is for non-aggregate events. The
-    /// CAS path (`append_to_stream`) binds revision explicitly.
-    trait EventDataRevisionExt {
-        fn revision_for_storage(&self) -> Option<i64>;
-    }
-
-    impl EventDataRevisionExt for EventData {
-        fn revision_for_storage(&self) -> Option<i64> {
-            None
-        }
-    }
-
 }
 
 #[cfg(feature = "postgres")]

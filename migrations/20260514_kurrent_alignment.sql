@@ -79,9 +79,13 @@ BEGIN
 END
 $$;
 
--- Snapshot primary key / unique index uses the version column; drop
--- and recreate against `revision` to stay in sync.
+-- Snapshot unique constraint uses the version column; drop and recreate
+-- against `revision` to stay in sync. Drop BOTH the old- and new-named
+-- constraints first so this is idempotent — on a fresh DB the base
+-- migration already created `causal_snapshots_key_revision_key`, so this
+-- step is a clean no-op rather than an "already exists" error.
 ALTER TABLE causal_snapshots DROP CONSTRAINT IF EXISTS causal_snapshots_key_version_key;
+ALTER TABLE causal_snapshots DROP CONSTRAINT IF EXISTS causal_snapshots_key_revision_key;
 ALTER TABLE causal_snapshots
     ADD CONSTRAINT causal_snapshots_key_revision_key
     UNIQUE (key, revision);

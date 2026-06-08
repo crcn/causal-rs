@@ -2,9 +2,9 @@
 //!
 //! Wires per-consumer runners into one supervisor: each registered
 //! reactor / projector / multi-projector spawns its own task, plus
-//! a relay drain task that flushes the reactor outbox into the log.
+//! reactor/projector runner supervisors (reactors append outputs directly).
 //! The builder casts backend trait objects (`EventLogBackend`,
-//! `CheckpointStore`, `ReactorOutbox`) and assembles them.
+//! `CheckpointStore`, `ReactorCheckpoint`) and assembles them.
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::aggregate::{Aggregate, Apply};
 use crate::aggregator::{Aggregator, AggregatorRegistry};
-use crate::checkpoint_store::{CheckpointStore, ReactorOutbox};
+use crate::checkpoint_store::{CheckpointStore, ReactorCheckpoint};
 use crate::multi_projector::{MultiProjector, MultiProjectorRunner};
 use crate::contexts::Metadata;
 use crate::event_log::EventLogBackend;
@@ -33,13 +33,11 @@ use crate::projector::Projector;
 use crate::projection_runner::{ProjectionRunner, StepOutcome};
 use crate::reactor_runner::ReactorRunner;
 use crate::reactor::Reactor;
-use crate::relay::RelayLoop;
 use crate::types::{LogCursor, EventData, StreamRevision};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BACKOFF_ON_ERROR: Duration = Duration::from_millis(250);
 const SUPERVISOR_BATCH: usize = 256;
-const RELAY_BATCH: usize = 256;
 
 // ─────────────────────────────────────────────────────────────────────
 // Supervisable — trait-object adapter so we can box heterogeneous
@@ -155,8 +153,8 @@ pub struct EmitResult {
 
 /// Metadata about a reactor that has exhausted its retry budget,
 /// passed to the [`EngineBuilder::on_dlq`] mapper. The mapper
-/// decides whether to synthesize a terminal-failure Event and emit
-/// it through the outbox so downstream consumers can react.
+/// decides whether to synthesize a terminal-failure Event and append
+/// it to its stream so downstream consumers can react.
 ///
 /// Production use case: scout's `PipelineEvent::HandlerFailed` is
 /// emitted on terminal reactor failure so `PipelineState` can fold
@@ -336,7 +334,11 @@ impl<'a> std::future::IntoFuture for SettledEmit<'a> {
 /// registry creation can happen at `build()` time after every
 /// `.with_aggregators(...)` call has accumulated.
 type RunnerFactory = Box<
-    dyn FnOnce(Option<Arc<AggregatorRegistry>>) -> Arc<dyn Supervisable> + Send,
+    dyn FnOnce(
+            Option<Arc<AggregatorRegistry>>,
+            Option<Arc<AggregatorRegistry>>,
+        ) -> Arc<dyn Supervisable>
+        + Send,
 >;
 
 /// Type-erased DLQ mapper plumbed from
@@ -352,40 +354,67 @@ pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 pub struct EngineBuilder {
     log:                   Arc<dyn EventLogBackend>,
     checkpoint:            Arc<dyn CheckpointStore>,
-    outbox:                Arc<dyn ReactorOutbox>,
+    reactor_checkpoint:    Arc<dyn ReactorCheckpoint>,
     consumers:             Vec<RunnerFactory>,
     aggregators:           Vec<Aggregator>,
     group_names:           std::collections::HashSet<String>,
+    /// Categories registered via [`with_aggregate`](Self::with_aggregate)
+    /// as `StreamPolicy::OccRequired`. `Engine::emit` rejects facts in
+    /// these categories — they must go through the OCC command path
+    /// [`Engine::append`].
+    occ_categories:        std::collections::HashSet<String>,
     default_metadata:      Metadata,
     dlq_mapper:            Option<DlqMapperArc>,
     max_attempts:          u32,
     observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
+    /// Reaction-result cache (Phase 4). Plumbed into every `ReactorRunner`
+    /// registered *after* this is set (same ordering rule as `observer`),
+    /// surfaced to reactor bodies via `ctx.reaction_cache()`.
+    reaction_cache:        Option<Arc<dyn crate::reaction_cache::ReactionCache>>,
 }
 
 impl EngineBuilder {
-    /// `outbox` and `checkpoint` typically point to the same backend
-    /// instance (e.g., one `Arc<MemoryStore>` cast to both traits) so
-    /// that C12's atomic outbox+cursor commit holds. Backends that
-    /// support only `CheckpointStore` (no reactor outbox) can pass any
-    /// `ReactorOutbox` impl that errors on commit_reactor_batch — the
-    /// engine is happy as long as no reactors are registered.
+    /// `checkpoint` stores projector/reactor cursors; `reactor_checkpoint`
+    /// adds the reactor retry-attempt counters. They typically point to
+    /// the same backend instance (e.g., one `Arc<MemoryStore>` cast to
+    /// both traits). An engine hosting no reactors only ever touches
+    /// `checkpoint`.
     pub fn new(
         log: Arc<dyn EventLogBackend>,
         checkpoint: Arc<dyn CheckpointStore>,
-        outbox: Arc<dyn ReactorOutbox>,
+        reactor_checkpoint: Arc<dyn ReactorCheckpoint>,
     ) -> Self {
         Self {
             log,
             checkpoint,
-            outbox,
+            reactor_checkpoint,
             consumers: Vec::new(),
             aggregators: Vec::new(),
             group_names: std::collections::HashSet::new(),
+            occ_categories: std::collections::HashSet::new(),
             default_metadata: Metadata::new(),
             dlq_mapper: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             observer: None,
+            reaction_cache: None,
         }
+    }
+
+    /// Register a [`ReactionCache`](crate::reaction_cache::ReactionCache)
+    /// surfaced to reactor bodies via `ctx.reaction_cache()`. Lets a
+    /// side-effecting reactor memoize its external call under its
+    /// [`ReactionKey`](crate::reaction_cache::ReactionKey) so retry /
+    /// redelivery runs the call effectively once.
+    ///
+    /// Ordering: like [`with_observer`](Self::with_observer), this is
+    /// plumbed into reactors registered *after* this call. Set it before
+    /// `with_reactor(...)`.
+    pub fn with_reaction_cache(
+        mut self,
+        cache: Arc<dyn crate::reaction_cache::ReactionCache>,
+    ) -> Self {
+        self.reaction_cache = Some(cache);
+        self
     }
 
     /// Register a [`ReactorObserver`](crate::reactor_observer::ReactorObserver)
@@ -402,7 +431,7 @@ impl EngineBuilder {
     /// let engine = EngineBuilder::new(
     ///         store.clone() as Arc<dyn EventLogBackend>,
     ///         store.clone() as Arc<dyn CheckpointStore>,
-    ///         store.clone() as Arc<dyn ReactorOutbox>,
+    ///         store.clone() as Arc<dyn ReactorCheckpoint>,
     ///     )
     ///     .with_observer(store.clone())
     ///     .with_reactor(MyReactor)
@@ -420,7 +449,7 @@ impl EngineBuilder {
     /// `max_attempts` times in a row on the same trigger event, the
     /// runner stops retrying and invokes the mapper with the
     /// failure details. If the mapper returns `Some(fact)`, the
-    /// fact is emitted through the outbox (so downstream consumers
+    /// fact is appended to its stream (so downstream consumers
     /// react to it) and the cursor advances past the failing event.
     ///
     /// Without this, terminal failures park forever — the
@@ -528,6 +557,36 @@ impl EngineBuilder {
         self
     }
 
+    /// Register aggregate `A` (folded from event stream `F`) as an
+    /// **OCC-required** stream. Two effects:
+    ///
+    /// 1. Registers an aggregator so the stream folds for
+    ///    [`Engine::load`] / [`Engine::append`].
+    /// 2. Marks `F::CATEGORY` as `StreamPolicy::OccRequired`, so
+    ///    [`Engine::emit`] **rejects** facts in this category — they
+    ///    carry invariants and must go through the optimistic-
+    ///    concurrency command path [`Engine::append`].
+    ///
+    /// ```ignore
+    /// EngineBuilder::new(...)
+    ///     .with_aggregate::<Counter, CounterFact>();
+    /// // engine.emit(CounterFact { .. })  → Err (OCC-required)
+    /// // engine.append::<Counter, CounterFact>(id, |c| Ok(decide(c)))  → ok
+    /// ```
+    pub fn with_aggregate<A, F>(mut self) -> Self
+    where
+        A: crate::aggregate::Aggregate
+            + crate::aggregate::Apply<F>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned,
+        F: crate::event::Event,
+    {
+        self.occ_categories
+            .insert(<F as crate::event::Event>::CATEGORY.to_string());
+        self.with_aggregators(std::iter::once(Aggregator::for_type::<A, F>()))
+    }
+
     pub fn with_projector<P: Projector + 'static>(mut self, p: P) -> Self
     where
         P::Event: DeserializeOwned,
@@ -536,7 +595,7 @@ impl EngineBuilder {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
-        self.consumers.push(Box::new(move |aggs| {
+        self.consumers.push(Box::new(move |aggs, _engine_aggs| {
             let mut runner = ProjectionRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
@@ -551,17 +610,20 @@ impl EngineBuilder {
     {
         self.claim_group_name(R::GROUP_NAME);
         let log = self.log.clone();
-        let outbox = self.outbox.clone();
+        let reactor_checkpoint = self.reactor_checkpoint.clone();
         let dlq_mapper = self.dlq_mapper.clone();
         let max_attempts = self.max_attempts;
         let observer = self.observer.clone();
-        self.consumers.push(Box::new(move |aggs| {
-            let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, outbox);
+        let reaction_cache = self.reaction_cache.clone();
+        self.consumers.push(Box::new(move |aggs, engine_aggs| {
+            let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, reactor_checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(mapper) = dlq_mapper {
                 runner = runner.with_dlq(mapper, max_attempts);
             }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
+            if let Some(rc) = reaction_cache { runner = runner.with_reaction_cache(rc); }
+            runner = runner.with_engine_aggregators(engine_aggs);
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -586,7 +648,7 @@ impl EngineBuilder {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
-        self.consumers.push(Box::new(move |aggs| {
+        self.consumers.push(Box::new(move |aggs, _engine_aggs| {
             let mut runner = MultiProjectorRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
@@ -639,18 +701,18 @@ impl EngineBuilder {
         let engine_aggregators = make_registry();
         let consumers: Vec<Arc<dyn Supervisable>> = self.consumers
             .into_iter()
-            .map(|f| f(make_registry()))
+            .map(|f| f(make_registry(), engine_aggregators.clone()))
             .collect();
         let consumer_ids: Vec<String> = self.group_names.into_iter().collect();
         Engine::start(
             self.log,
             self.checkpoint,
-            self.outbox,
             consumers,
             self.default_metadata,
             engine_aggregators,
             consumer_ids,
             self.observer,
+            self.occ_categories,
         )
     }
 }
@@ -662,9 +724,6 @@ impl EngineBuilder {
 pub struct Engine {
     log:                   Arc<dyn EventLogBackend>,
     checkpoint:            Arc<dyn CheckpointStore>,
-    /// Held alongside the relay's handle so `settle` can check
-    /// `outbox_pending` for race-free quiescence detection.
-    outbox:                Arc<dyn ReactorOutbox>,
     shutdown_tx:           broadcast::Sender<()>,
     handles:               Vec<JoinHandle<()>>,
     default_metadata:      Metadata,
@@ -681,22 +740,30 @@ pub struct Engine {
     consumer_ids:          Vec<String>,
     /// Telemetry hook for inspector / external observability sinks.
     observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
+    /// Categories marked `StreamPolicy::OccRequired` via
+    /// `EngineBuilder::with_aggregate`. `emit` rejects facts in these
+    /// categories; they must use the OCC command path `Engine::append`.
+    occ_categories:        std::collections::HashSet<String>,
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         log: Arc<dyn EventLogBackend>,
         checkpoint: Arc<dyn CheckpointStore>,
-        outbox: Arc<dyn ReactorOutbox>,
         consumers: Vec<Arc<dyn Supervisable>>,
         default_metadata: Metadata,
         aggregators: Option<Arc<AggregatorRegistry>>,
         consumer_ids: Vec<String>,
         observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
+        occ_categories: std::collections::HashSet<String>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        let mut handles = Vec::with_capacity(consumers.len() + 1);
+        let mut handles = Vec::with_capacity(consumers.len());
 
+        // Each consumer (reactor / projector runner) is supervised; it
+        // reads the log from its cursor and, for reactors, appends outputs
+        // directly. No relay — reactor outputs go straight to the log.
         for consumer in consumers {
             let mut rx = shutdown_tx.subscribe();
             let task = tokio::spawn(async move {
@@ -705,23 +772,11 @@ impl Engine {
             handles.push(task);
         }
 
-        // Relay supervisor: drain reactor outbox into the log. The
-        // engine's aggregator registry is folded after every successful
-        // append so reactor-emitted events become visible via
-        // `engine.snapshot()` — without this, only caller-emitted
-        // events update the engine-level state.
-        let relay = RelayLoop::new(log.clone(), outbox.clone())
-            .with_engine_aggregators(aggregators.clone());
-        let mut relay_rx = shutdown_tx.subscribe();
-        let relay_task = tokio::spawn(async move {
-            supervise_relay(relay, &mut relay_rx).await;
-        });
-        handles.push(relay_task);
-
         Self {
-            log, checkpoint, outbox, shutdown_tx, handles,
+            log, checkpoint, shutdown_tx, handles,
             default_metadata,
             aggregators, consumer_ids, observer,
+            occ_categories,
         }
     }
 
@@ -779,11 +834,154 @@ impl Engine {
         for event in events {
             let fact: F = serde_json::from_value(event.payload)?;
             agg.apply(&fact);
-            if let Some(r) = event.revision {
-                revision = r;
-            }
+            revision = event.revision;
         }
         Ok((agg, revision))
+    }
+
+    /// OCC-protected command path — the decider pattern, and the
+    /// counterpart to [`with_aggregate`](EngineBuilder::with_aggregate).
+    ///
+    /// Folds aggregate `A` from stream `{F::CATEGORY}-{id}`, hands the
+    /// state to `decide`, then appends the resulting facts with an
+    /// expected-revision check. On a concurrent write the backend
+    /// returns a [`ConflictError`](crate::event_log::ConflictError);
+    /// `append` reloads, re-decides, and retries (bounded).
+    ///
+    /// `decide` MUST be pure — it may run several times across retries.
+    /// An empty `Vec` result is a no-op (no append). `emit` rejects
+    /// OCC-required categories; this is their write path.
+    ///
+    /// A multi-fact decision is appended as **one atomic batch** at the
+    /// expected revision (KurrentDB commits the events as a unit) — the
+    /// whole decision lands or none of it does, so a crash can't tear it.
+    ///
+    /// The whole decision is written to the single aggregate stream
+    /// `{F::CATEGORY}-{id}` — this is the OCC consistency boundary, so every
+    /// emitted fact must belong to aggregate `id`. Each fact's own
+    /// [`Event::stream_id`] is therefore expected to equal `id` (debug-asserted)
+    /// and is not used for routing here; to affect a *different* aggregate, run
+    /// a separate `append` against it.
+    pub async fn append<A, F, D>(&self, id: Uuid, decide: D) -> Result<EmitResult>
+    where
+        A: Aggregate + Apply<F>,
+        F: Event + DeserializeOwned + serde::Serialize,
+        D: Fn(&A) -> Result<Vec<F>>,
+    {
+        use crate::types::StreamState;
+        // OCC retry budget. A single writer may lose to N-1 contenders
+        // on a hot stream, so the budget must comfortably exceed expected
+        // concurrency; jittered backoff (below) breaks the thundering
+        // herd so realistic contention converges well within it. Streams
+        // hotter than this shouldn't use OCC — partition or queue them.
+        const MAX_OCC_RETRIES: u32 = 16;
+        let mut last_conflict: Option<anyhow::Error> = None;
+
+        for attempt in 0..MAX_OCC_RETRIES {
+            // Load: fold the stream + capture the expected stream state.
+            let events = self.log.read_stream(F::CATEGORY, id, None).await?;
+            let expected = match events.last() {
+                None => StreamState::NoStream,
+                Some(e) => StreamState::StreamRevision(e.revision.raw()),
+            };
+            let mut agg = A::default();
+            for e in &events {
+                let fact: F = serde_json::from_value(e.payload.clone())?;
+                agg.apply(&fact);
+            }
+
+            // Decide (pure).
+            let facts = decide(&agg)?;
+            if facts.is_empty() {
+                let position = self.log.latest_position().await?;
+                return Ok(EmitResult { position, correlation_id: Uuid::new_v4() });
+            }
+
+            // Build the whole decision, then append it as one atomic
+            // batch under OCC — the events land contiguously or not at all.
+            let correlation = Uuid::new_v4();
+            let mut events_data = Vec::with_capacity(facts.len());
+            // (event_type, payload, event_id) for the post-append fold.
+            let mut folds = Vec::with_capacity(facts.len());
+            for fact in &facts {
+                // The whole decision is written to the (F::CATEGORY, id)
+                // aggregate stream — every fact must belong to aggregate `id`.
+                debug_assert_eq!(
+                    fact.stream_id(), id,
+                    "Engine::append: decided fact has stream_id {} but the \
+                     command targets aggregate {id}; a decision may only emit \
+                     facts for its own aggregate",
+                    fact.stream_id(),
+                );
+                let event_type = crate::event::event_type_for(fact);
+                let payload = serde_json::to_value(fact)?;
+                let event = EventData {
+                    event_id:        Uuid::new_v4(),
+                    causation_id:    None,
+                    correlation_id:  correlation,
+                    event_type:      event_type.clone(),
+                    payload:         payload.clone(),
+                    created_at:      fact.occurred_at().unwrap_or_else(Utc::now),
+                    category:        Some(F::CATEGORY.to_string()),
+                    stream_id:       Some(id),
+                    metadata:        self.default_metadata.clone(),
+                    ephemeral:       None,
+                    persistent:      true,
+                };
+                folds.push((event_type, payload, event.event_id));
+                events_data.push(event);
+            }
+
+            match self.log.append_to_stream(F::CATEGORY, id, expected, events_data).await {
+                Ok(result) => {
+                    // Fold each fact into the engine registry so
+                    // `engine.snapshot::<A>(id)` reflects the write. The
+                    // batch committed atomically, so all events are
+                    // attributed to the commit position.
+                    if let Some(reg) = &self.aggregators {
+                        for (event_type, payload, event_id) in &folds {
+                            let snaps = reg.apply_event(event_type, payload);
+                            if let Some(obs) = self.observer.as_ref() {
+                                reg.notify_observer(
+                                    &snaps, obs.as_ref(), correlation,
+                                    result.position, *event_id,
+                                );
+                            }
+                        }
+                    }
+                    return Ok(EmitResult {
+                        position: result.position,
+                        correlation_id: correlation,
+                    });
+                }
+                Err(e) => {
+                    if e.downcast_ref::<crate::event_log::ConflictError>().is_some() {
+                        last_conflict = Some(e);
+                        // Jittered exponential backoff before reload +
+                        // re-decide, so concurrent losers don't all retry
+                        // in lockstep and collide again. Jitter entropy
+                        // from a fresh UUID (no extra dependency). At
+                        // command time, not replay — a non-deterministic
+                        // delay never affects which events are written.
+                        let window_us = 50u64 << attempt.min(6); // 50µs … ~3.2ms
+                        let jitter_us = (Uuid::new_v4().as_u128() as u64) % window_us;
+                        tokio::time::sleep(
+                            std::time::Duration::from_micros(jitter_us),
+                        ).await;
+                        continue; // reload + re-decide against the new tail
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(last_conflict.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "Engine::append exhausted {MAX_OCC_RETRIES} OCC retries for \
+                 '{}-{}'",
+                F::CATEGORY, id,
+            )
+        }))
     }
 
     async fn execute_emit(&self, b: EmitBuilder<'_>) -> Result<EmitResult> {
@@ -811,6 +1009,18 @@ impl Engine {
         };
 
         for fact in b.input.facts {
+            // StreamPolicy::OccRequired guard. Facts in a category
+            // registered via `with_aggregate` carry invariants and must
+            // go through the optimistic-concurrency command path
+            // `Engine::append`, not the no-check `emit` path.
+            if self.occ_categories.contains(fact.category()) {
+                return Err(anyhow::anyhow!(
+                    "category '{}' is OCC-required (registered via \
+                     with_aggregate); use Engine::append::<A, F>(id, decide) \
+                     instead of emit()",
+                    fact.category(),
+                ));
+            }
             let event_type = format!("{}:{}", fact.category(), fact.variant_name());
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let stream_id = fact.stream_id();
@@ -822,8 +1032,8 @@ impl Engine {
                 event_type,
                 payload,
                 created_at:      occurred_at,
-                aggregate_type:  Some(fact.category().to_string()),
-                aggregate_id:    Some(stream_id),
+                category:        Some(fact.category().to_string()),
+                stream_id:       Some(stream_id),
                 metadata:        merged_metadata.clone(),
                 ephemeral:       None,
                 persistent:      true,
@@ -835,7 +1045,19 @@ impl Engine {
             let agg_payload = new_event.payload.clone();
 
             let event_id = new_event.event_id;
-            let result = self.log.append(new_event).await?;
+            // `emit` is the append-only fact path: write to the fact's own
+            // stream with `StreamState::Any` (no concurrency invariant —
+            // OCC-bearing streams are rejected above and go through
+            // `Engine::append`). Idempotency rests on `event_id`.
+            let result = self
+                .log
+                .append_to_stream(
+                    fact.category(),
+                    stream_id,
+                    crate::types::StreamState::Any,
+                    vec![new_event],
+                )
+                .await?;
             last_position = result.position;
 
             // Mirror into the engine-level registry so out-of-band
@@ -895,25 +1117,23 @@ impl Engine {
 
     /// Wait until every reactor chain triggered by `emit_result`
     /// has fully quiesced — every consumer caught up, every reactor
-    /// output drained through the outbox to the log, no pending
-    /// work remaining.
+    /// output appended to the log, no pending work remaining.
     ///
     /// Algorithm:
     ///
     ///   1. Read `latest = log.latest_position()`.
     ///   2. Wait for every consumer cursor to reach `latest`.
-    ///   3. Wait for the outbox to drain (`outbox_pending().len()
-    ///      == 0`).
-    ///   4. Re-read latest. If unchanged from step 1, the chain has
-    ///      quiesced — return Ok. Otherwise loop (new events
-    ///      appeared while waiting).
+    ///   3. Re-read latest. If unchanged from step 1, the chain has
+    ///      quiesced — return Ok. Otherwise loop (reactor outputs
+    ///      appended new events while we waited, so a downstream
+    ///      consumer may still have work).
     ///
     /// This terminates for well-formed reactor topologies because
-    /// each input event produces a bounded number of outputs; the
-    /// outbox eventually empties; consumers eventually catch up;
-    /// no new events can appear. Self-feedback reactors (a reactor
-    /// whose output triggers itself) are NOT well-formed (see
-    /// [`Reactor`] doc) and will loop forever here too.
+    /// each input event produces a bounded number of outputs;
+    /// consumers eventually catch up; no new events can appear.
+    /// Self-feedback reactors (a reactor whose output triggers
+    /// itself) are NOT well-formed (see [`Reactor`] doc) and will
+    /// loop forever here too.
     ///
     /// Reactors run asynchronously in supervisor tasks; `settle`
     /// polls their cursors until every consumer reaches the current
@@ -928,15 +1148,10 @@ impl Engine {
                 self.await_observed_by(id, p1).await?;
             }
 
-            // Wait for the relay to drain everything consumers
-            // produced while we were waiting. Bounded by relay's
-            // poll interval; one sleep usually enough.
-            while !self.outbox.outbox_pending(1).await?.is_empty() {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-
-            // If no new events landed in the log during the above
-            // waits, the chain has quiesced. Otherwise loop.
+            // Reactor outputs append directly to the log, so any work the
+            // consumers produced shows up as new log positions. If no new
+            // events landed during the catch-up wait, the chain has
+            // quiesced; otherwise loop.
             let p2 = self.log.latest_position().await?;
             if p1 == p2 { return Ok(()); }
         }
@@ -1036,41 +1251,6 @@ fn panic_payload_message(payload: &Box<dyn Any + Send>) -> String {
     }
 }
 
-async fn supervise_relay(
-    relay: RelayLoop,
-    shutdown: &mut broadcast::Receiver<()>,
-) {
-    loop {
-        if shutdown.try_recv().is_ok() {
-            // One final drain before halting so in-flight reactor
-            // outputs reach the log on clean shutdown.
-            let _ = relay.drain_once(RELAY_BATCH).await;
-            break;
-        }
-        match relay.drain_once(RELAY_BATCH).await {
-            Ok(0) => {
-                tokio::select! {
-                    _ = shutdown.recv() => {
-                        let _ = relay.drain_once(RELAY_BATCH).await;
-                        break;
-                    }
-                    _ = tokio::time::sleep(POLL_INTERVAL) => {}
-                }
-            }
-            Ok(_) => continue,
-            Err(e) => {
-                tracing::warn!(error = %e, "relay drain errored, backing off");
-                tokio::select! {
-                    _ = shutdown.recv() => break,
-                    _ = tokio::time::sleep(BACKOFF_ON_ERROR) => {}
-                }
-            }
-        }
-    }
-    // Suppress unused warning; ts of last drain attempt for ops.
-    let _ = Utc::now();
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
@@ -1150,7 +1330,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
         .build();
@@ -1177,15 +1357,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_drives_reactor_with_relay_drain_end_to_end() {
+    async fn engine_drives_reactor_chain_end_to_end() {
         let store = store();
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_for_assertion = counter.clone();
 
         // A second projector that observes the WelcomeQueued facts
         // emitted by the reactor — verifies the full chain:
-        //   emit UserCreated → reactor emits WelcomeQueued → relay
-        //   drains to log → second projector sees WelcomeQueued.
+        //   emit UserCreated → reactor appends WelcomeQueued to the log
+        //   → second projector sees WelcomeQueued.
         struct WelcomeCounter(Arc<AtomicUsize>);
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct WelcomeQueuedFact { user_id: Uuid }
@@ -1209,7 +1389,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter))
@@ -1220,7 +1400,7 @@ mod tests {
             occurred_at: Utc::now(),
         }).await.unwrap();
 
-        // Wait for the reactor → relay → projector chain.
+        // Wait for the reactor → projector chain.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             if counter_for_assertion.load(Ordering::SeqCst) == 1 { break; }
@@ -1233,7 +1413,7 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    /// Regression test for the RelayLoop → engine-aggregator fold path.
+    /// Regression test for the reactor-append → engine-aggregator fold path.
     ///
     /// Before this path existed, `engine.snapshot::<A>(stream_id)`
     /// reflected only caller-emitted facts; reactor-emitted facts
@@ -1243,15 +1423,15 @@ mod tests {
     /// you could emit a trigger and verify its direct effect on state,
     /// but not the effect of downstream reactor outputs.
     ///
-    /// The fix attaches the engine aggregator registry to RelayLoop so
-    /// every drained outbox row folds into it after `log.append`. This
-    /// test pins that contract: emit a UserCreated, the reactor emits
-    /// a WelcomeQueued, settle, then `engine.snapshot::<ChainCount>` on
+    /// The fix folds every reactor output into the engine aggregator
+    /// registry right after it's appended to the log. This test pins
+    /// that contract: emit a UserCreated, the reactor emits a
+    /// WelcomeQueued, settle, then `engine.snapshot::<ChainCount>` on
     /// the user_id stream reflects BOTH (one UserCreated, one
     /// WelcomeQueued — total = 2).
     ///
-    /// If a future refactor of RelayLoop omits the `apply_event` call
-    /// (or wires it to the wrong registry), this assertion drops to 1.
+    /// If a future refactor of the reactor runner omits the `apply_event`
+    /// call (or wires it to the wrong registry), this assertion drops to 1.
     #[tokio::test]
     async fn engine_snapshot_sees_reactor_emitted_facts() {
         use crate::aggregate::{Aggregate, Apply};
@@ -1272,7 +1452,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([
             Aggregator::for_type::<ChainCount, UserCreated>(),
@@ -1292,7 +1472,7 @@ mod tests {
             .expect("snapshot must exist after settled emit");
         assert_eq!(state.applied, 2,
             "engine.snapshot must reflect BOTH caller-emitted UserCreated \
-             AND reactor-emitted WelcomeQueued — relay-side fold contract");
+             AND reactor-emitted WelcomeQueued — reactor-side fold contract");
 
         engine.shutdown().await.unwrap();
     }
@@ -1444,7 +1624,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([
             // UserCount keys by the natural stream_id (user_id).
@@ -1520,7 +1700,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([
             Aggregator::for_type_with_id_fn::<RunCounter, MaybeRunEvent, _>(
@@ -1601,7 +1781,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(tagged_aggs::aggregators())
         .build();
@@ -1641,7 +1821,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build();
 
         engine.emit(UserCreated {
@@ -1665,7 +1845,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .build();
@@ -1690,7 +1870,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .build();
@@ -1768,7 +1948,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
@@ -1777,6 +1957,275 @@ mod tests {
         let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
         assert_eq!(agg, Counter::default());
         assert_eq!(ver, StreamRevision::ZERO);
+        engine.shutdown().await.unwrap();
+    }
+
+    // ── Phase 3 — OCC command path (Engine::append) ──
+
+    fn occ_engine(store: &Arc<MemoryStore>) -> Engine {
+        EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregate::<Counter, CounterFact>()
+        .build()
+    }
+
+    #[tokio::test]
+    async fn append_persists_and_folds_across_calls() {
+        let store = store();
+        let engine = occ_engine(&store);
+        let id = Uuid::new_v4();
+
+        engine
+            .append::<Counter, CounterFact, _>(id, move |_c| {
+                Ok(vec![CounterFact::Inc { by: 3, occurred_at: Utc::now(), counter_id: id }])
+            })
+            .await
+            .unwrap();
+        // Second decision folds the first append's state.
+        engine
+            .append::<Counter, CounterFact, _>(id, move |c| {
+                assert_eq!(c.value, 3, "decide sees the prior append folded in");
+                Ok(vec![CounterFact::Inc { by: 7, occurred_at: Utc::now(), counter_id: id }])
+            })
+            .await
+            .unwrap();
+
+        let (c, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        assert_eq!(c.value, 10);
+        assert_eq!(ver, StreamRevision::from_raw(1), "two events → tail revision 1");
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_empty_decision_is_noop() {
+        let store = store();
+        let engine = occ_engine(&store);
+        let id = Uuid::new_v4();
+
+        engine
+            .append::<Counter, CounterFact, _>(id, |_c| Ok(Vec::new()))
+            .await
+            .unwrap();
+
+        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        assert_eq!(c.value, 0, "empty decision wrote nothing");
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emit_rejects_occ_required_category() {
+        let store = store();
+        let engine = occ_engine(&store);
+
+        let err = engine
+            .emit(CounterFact::Inc {
+                by: 1,
+                occurred_at: Utc::now(),
+                counter_id: Uuid::new_v4(),
+            })
+            .await
+            .expect_err("emit into an OCC-required category must error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("OCC-required") && msg.contains("counter"),
+            "error must steer to Engine::append, got: {msg}"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_occ_prevents_double_apply_under_concurrency() {
+        // An "increment-once" guard: emit Inc{1} only if value == 0.
+        // Without OCC, two concurrent appends both read 0 and both
+        // apply → value 2 (guard violated). With OCC, the loser
+        // conflicts, reloads, sees value 1, and no-ops → value 1.
+        let store = store();
+        let engine = Arc::new(occ_engine(&store));
+        let id = Uuid::new_v4();
+
+        let guard = move |c: &Counter| -> Result<Vec<CounterFact>> {
+            if c.value == 0 {
+                Ok(vec![CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id }])
+            } else {
+                Ok(Vec::new())
+            }
+        };
+
+        let (e1, e2) = (engine.clone(), engine.clone());
+        let t1 = tokio::spawn(async move { e1.append::<Counter, CounterFact, _>(id, guard).await });
+        let t2 = tokio::spawn(async move { e2.append::<Counter, CounterFact, _>(id, guard).await });
+        t1.await.unwrap().unwrap();
+        t2.await.unwrap().unwrap();
+
+        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        assert_eq!(c.value, 1, "OCC prevented the double-apply (would be 2 without it)");
+
+        Arc::try_unwrap(engine)
+            .unwrap_or_else(|_| panic!("engine still shared"))
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_multi_fact_decision_lands_contiguously() {
+        let store = store();
+        let engine = occ_engine(&store);
+        let id = Uuid::new_v4();
+
+        engine
+            .append::<Counter, CounterFact, _>(id, move |_c| {
+                Ok(vec![
+                    CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
+                    CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
+                    CounterFact::Inc { by: 4, occurred_at: Utc::now(), counter_id: id },
+                ])
+            })
+            .await
+            .unwrap();
+
+        let events = EventLogBackend::read_stream(store.as_ref(), "counter", id, None)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 3, "all three facts landed");
+        assert_eq!(events[0].revision, StreamRevision::from_raw(0));
+        assert_eq!(events[1].revision, StreamRevision::from_raw(1));
+        assert_eq!(events[2].revision, StreamRevision::from_raw(2));
+
+        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        assert_eq!(c.value, 7);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_high_contention_all_increments_apply() {
+        // Stress: N concurrent UNCONDITIONAL increments to ONE stream.
+        // Each must land (no lost updates), so each contender may have
+        // to retry up to N-1 times — the real test of the OCC retry
+        // budget + backoff.
+        const N: i32 = 8;
+        let store = store();
+        let engine = Arc::new(occ_engine(&store));
+        let id = Uuid::new_v4();
+
+        let mut tasks = Vec::new();
+        for _ in 0..N {
+            let e = engine.clone();
+            tasks.push(tokio::spawn(async move {
+                e.append::<Counter, CounterFact, _>(id, move |_c| {
+                    Ok(vec![CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id }])
+                })
+                .await
+            }));
+        }
+        let mut ok = 0;
+        for t in tasks {
+            if t.await.unwrap().is_ok() {
+                ok += 1;
+            }
+        }
+
+        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        assert_eq!(ok, N, "all {N} appends succeeded (none exhausted OCC retries)");
+        assert_eq!(c.value, N, "every increment applied — no lost update");
+
+        Arc::try_unwrap(engine)
+            .unwrap_or_else(|_| panic!("engine still shared"))
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    // ── Phase 4 — ReactionCache wired into the reactor path ──
+
+    #[tokio::test]
+    async fn reaction_cache_dedups_side_effect_across_retry() {
+        use crate::reaction_cache::{InMemoryReactionCache, ReactionCache};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Ping { id: Uuid, occurred_at: DateTime<Utc> }
+        impl Event for Ping {
+            const CATEGORY: &'static str = "ping";
+            fn event_type(&self) -> &str { "ping" }
+            fn stream_id(&self) -> Uuid { self.id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Pong { id: Uuid, value: i64, occurred_at: DateTime<Utc> }
+        impl Event for Pong {
+            const CATEGORY: &'static str = "pong";
+            fn event_type(&self) -> &str { "pong" }
+            fn stream_id(&self) -> Uuid { self.id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+
+        struct CachedSideEffect {
+            external_calls: Arc<AtomicU32>,
+            attempts: Arc<AtomicU32>,
+        }
+        #[async_trait::async_trait]
+        impl Reactor for CachedSideEffect {
+            type Trigger = Ping;
+            const GROUP_NAME: &'static str = "cached_side_effect";
+            async fn react(&self, trigger: &Ping, ctx: Ctx<'_>) -> anyhow::Result<Events> {
+                // The "expensive external call" — memoized by reaction key.
+                let calls = self.external_calls.clone();
+                let value: i64 = ctx
+                    .remember(Self::GROUP_NAME, || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(42)
+                    })
+                    .await?;
+
+                // Fail the FIRST attempt (after the cached call) to force a
+                // retry; the retry must NOT re-run the external call.
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("transient failure — forces a retry");
+                }
+
+                let mut out = Events::new();
+                out.push(Pong { id: trigger.id, value, occurred_at: ctx.now() });
+                Ok(out)
+            }
+        }
+
+        let store = store();
+        let external_calls = Arc::new(AtomicU32::new(0));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let cache = Arc::new(InMemoryReactionCache::new());
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_reaction_cache(cache.clone() as Arc<dyn ReactionCache>)
+        .with_reactor(CachedSideEffect {
+            external_calls: external_calls.clone(),
+            attempts: attempts.clone(),
+        })
+        .build();
+
+        engine
+            .emit(Ping { id: Uuid::new_v4(), occurred_at: Utc::now() })
+            .settled()
+            .await
+            .unwrap();
+
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "reactor retried after the forced failure (attempts: {})",
+            attempts.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            external_calls.load(Ordering::SeqCst),
+            1,
+            "external call ran once despite the retry — ReactionCache deduped it",
+        );
         engine.shutdown().await.unwrap();
     }
 
@@ -1789,7 +2238,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
@@ -1814,7 +2263,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
@@ -1885,7 +2334,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_multi_projector(auditor)
         .build();
@@ -1915,7 +2364,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build();
 
         let cmd_correlation = Uuid::new_v4();
@@ -1943,7 +2392,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build();
 
         let parent = Uuid::new_v4();
@@ -1979,7 +2428,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
@@ -2014,7 +2463,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(UserRoster::default())
         .build();
@@ -2063,7 +2512,7 @@ mod tests {
         let _engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(vec![
             crate::aggregator::Aggregator::for_type::<Multi, Tick>(),
@@ -2085,7 +2534,7 @@ mod tests {
         let _engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(vec![
             crate::aggregator::Aggregator::for_type::<TickCounter, Tick>(),
@@ -2103,7 +2552,7 @@ mod tests {
         let _engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(UserRoster::default())
         .with_projector(UserRoster::default()); // <- panic here
@@ -2147,7 +2596,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projectors(vec![
             Box::new(a) as Box<dyn ProjectorRegistration>,
@@ -2181,7 +2630,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(vec![tick_aggregator()])
         .build();
@@ -2208,7 +2657,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build();
         assert!(engine.snapshot::<TickCounter>(Uuid::nil()).is_none());
     }
@@ -2244,7 +2693,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .on_dlq(|info: DlqInfo| Some(HandlerFailed {
             group_name: info.group_name,
@@ -2260,7 +2709,7 @@ mod tests {
         }).await.unwrap();
 
         // Wait until the reactor has retried + DLQ-mapped + the
-        // relay has drained the synthetic fact to the log.
+        // synthetic fact has been appended to the log.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             let events = EventLogBackend::read_all(
@@ -2288,13 +2737,12 @@ mod tests {
     #[tokio::test]
     async fn engine_settle_waits_for_reactor_chains_to_quiesce() {
         // The bug: settle waited only for direct consumers to reach
-        // the emit position. Reactor outputs flowing through the
-        // relay → log → downstream consumers weren't covered.
+        // the emit position. Reactor outputs appended to the log and
+        // their downstream consumers weren't covered.
         //
         // Setup:
         //   emit UserCreated
-        //   → WelcomeReactor reacts, emits WelcomeQueued (via outbox)
-        //   → relay drains WelcomeQueued to log
+        //   → WelcomeReactor reacts, appends WelcomeQueued to the log
         //   → WelcomeCounter projector observes WelcomeQueued
         //
         // After fix: settle waits until log position stabilizes AND
@@ -2326,7 +2774,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter_c))
@@ -2345,7 +2793,7 @@ mod tests {
         // With chain-aware settle: the assert is deterministic.
         assert_eq!(counter.load(Ordering::SeqCst), 1,
                    "settle should wait until the WelcomeReactor → \
-                    relay → WelcomeCounter chain quiesces");
+                    WelcomeCounter chain quiesces");
 
         engine.shutdown().await.unwrap();
     }
@@ -2361,7 +2809,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
         .build();
@@ -2396,7 +2844,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
         .build();
@@ -2435,7 +2883,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
         .build();
@@ -2491,7 +2939,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_observer(store.clone())
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
@@ -2575,7 +3023,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .build();
@@ -2592,7 +3040,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
         .build();
@@ -2624,7 +3072,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build();
 
         // Auto-generated correlation when not provided.
@@ -2664,7 +3112,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build();
 
         let result = engine.emit(Vec::<UserCreated>::new()).await.unwrap();
@@ -2692,7 +3140,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_default_metadata(defaults)
         .build();
@@ -2727,7 +3175,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(UserRoster::default())
         .build();
@@ -2793,7 +3241,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(vec![tick_aggregator()])
         .with_projector(cap)
@@ -2846,7 +3294,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(vec![tick_aggregator()])
         .with_reactor(cap)
@@ -2872,15 +3320,15 @@ mod tests {
     /// Append a Tick directly to the store, return its position.
     async fn append_tick(store: &MemoryStore, seq: u32) -> LogCursor {
         let tick = Tick { seq, occurred_at: Utc::now() };
-        let result = EventLogBackend::append(store, EventData {
+        let result = crate::append_event(store, EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      "ticker:tick".into(),
             payload:         serde_json::to_value(&tick).unwrap(),
             created_at:      tick.occurred_at,
-            aggregate_type:  None,
-            aggregate_id:    None,
+            category:  None,
+            stream_id:    None,
             metadata:        Metadata::new(),
             ephemeral:       None,
             persistent:      true,
@@ -3190,15 +3638,15 @@ mod tests {
         // Append one Tick directly to the log.
         let tick = Tick { seq: 0, occurred_at: Utc::now() };
         let payload = serde_json::to_value(&tick).unwrap();
-        EventLogBackend::append(store.as_ref(), EventData {
+        crate::append_event(store.as_ref(), EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
             correlation_id:  Uuid::new_v4(),
             event_type:      "ticker:tick".into(),
             payload,
             created_at:      tick.occurred_at,
-            aggregate_type:  None,
-            aggregate_id:    None,
+            category:  None,
+            stream_id:    None,
             metadata:        Metadata::new(),
             ephemeral:       None,
             persistent:      true,
@@ -3257,7 +3705,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(m)
         .build();
@@ -3325,7 +3773,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(vec![agg_a])     // first call
         .with_aggregators(vec![agg_b])     // second call — must accumulate
@@ -3402,7 +3850,7 @@ mod tests {
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
-            store.clone() as Arc<dyn ReactorOutbox>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_multi_projector(router)
         .build();

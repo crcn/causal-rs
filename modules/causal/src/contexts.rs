@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -56,6 +57,12 @@ pub struct Ctx<'a> {
     /// `None` when not running inside a reactor body (engine emit
     /// path, projector body, tests that construct Ctx by hand).
     pub(crate) logs: Option<&'a Mutex<Vec<LogEntry>>>,
+    /// Optional reaction-result cache (Phase 4). Lets a side-effecting
+    /// reactor memoize its external call under its [`ReactionKey`] so
+    /// redelivery / retry runs the call effectively once. `None` unless
+    /// the engine was built with `EngineBuilder::with_reaction_cache`.
+    pub(crate) reaction_cache:
+        Option<&'a Arc<dyn crate::reaction_cache::ReactionCache>>,
 }
 
 impl<'a> std::fmt::Debug for Ctx<'a> {
@@ -67,6 +74,7 @@ impl<'a> std::fmt::Debug for Ctx<'a> {
             .field("correlation_id", &self.correlation_id)
             .field("metadata", &self.metadata)
             .field("has_aggregators", &self.aggregators.is_some())
+            .field("has_reaction_cache", &self.reaction_cache.is_some())
             .finish()
     }
 }
@@ -145,6 +153,57 @@ impl<'a> Ctx<'a> {
         let (prev, curr) = reg.get_transition_arc::<A>(id);
         AggregateState { prev, curr }
     }
+
+    /// The reaction-result cache, if the engine was built with one via
+    /// `EngineBuilder::with_reaction_cache`. Combine with
+    /// [`Ctx::reaction_key`] + [`crate::remember`] to make a
+    /// side-effecting reactor idempotent under redelivery / retry:
+    ///
+    /// ```ignore
+    /// let key = ctx.reaction_key(Self::GROUP_NAME);
+    /// let out = causal::remember(ctx.reaction_cache().unwrap(), &key, || async {
+    ///     expensive_external_call().await   // runs once per reaction
+    /// }).await?;
+    /// ```
+    pub fn reaction_cache(&self) -> Option<&Arc<dyn crate::reaction_cache::ReactionCache>> {
+        self.reaction_cache
+    }
+
+    /// Build the [`ReactionKey`](crate::reaction_cache::ReactionKey) for
+    /// this reaction — `(group, this trigger's event_id)`. Pass your
+    /// `Reactor::GROUP_NAME`.
+    pub fn reaction_key(&self, group: &str) -> crate::reaction_cache::ReactionKey {
+        crate::reaction_cache::ReactionKey::new(group, self.event_id)
+    }
+
+    /// Memoize a side-effecting computation under this reaction's key.
+    /// `compute` runs at most once per reaction — retry / redelivery
+    /// returns the cached result, so the expensive external call (LLM,
+    /// HTTP, graph) effectively runs once. Pass your `Reactor::GROUP_NAME`.
+    ///
+    /// ```ignore
+    /// let summary: String = ctx.remember(Self::GROUP_NAME, || async {
+    ///     anthropic.summarize(&doc).await   // runs once per reaction
+    /// }).await?;
+    /// ```
+    ///
+    /// Errors if no cache was configured
+    /// (`EngineBuilder::with_reaction_cache`).
+    pub async fn remember<F, Fut, T>(&self, group: &str, compute: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let cache = self.reaction_cache.ok_or_else(|| {
+            anyhow::anyhow!(
+                "ctx.remember called but no ReactionCache was configured \
+                 (EngineBuilder::with_reaction_cache)"
+            )
+        })?;
+        let key = crate::reaction_cache::ReactionKey::new(group, self.event_id);
+        crate::reaction_cache::remember(&**cache, &key, compute).await
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +228,7 @@ mod tests {
             metadata:       &meta,
             aggregators:    None,
             logs:           None,
+            reaction_cache: None,
         };
         assert_eq!(ctx.now(), occurred);
     }
@@ -187,6 +247,7 @@ mod tests {
             metadata:       &meta,
             aggregators:    None,
             logs:           None,
+            reaction_cache: None,
         };
         assert_eq!(
             ctx.metadata.get("_phase").and_then(|v| v.as_str()),

@@ -77,8 +77,8 @@ schema, kept for reference only.
 | Reactor identity | derived | `Reactor::GROUP_NAME` const (Kurrent-aligned) |
 | Engine emit | `engine.emit(fact).settled()` | `engine.emit(fact).await` (builder w/ correlation_id, metadata, expecting) |
 | Engine snapshot | n/a (consumer-side fold) | `engine.snapshot::<A>(stream_id)` |
-| Backend traits | `EventLog`, `ReactorQueue`, `ProjectionStore` (one Store impl) | `EventLogBackend`, `CheckpointStore`, `ReactorOutbox`, `SnapshotStore`, `ProjectionOps` (composable) |
-| EngineBuilder | `Engine::with_store(store)` | `EngineBuilder::new(log, checkpoint, outbox)` (explicit at construction) |
+| Backend traits | `EventLog`, `ReactorQueue`, `ProjectionStore` (one Store impl) | `EventLogBackend`, `CheckpointStore`, `ReactorCheckpoint`, `SnapshotStore`, `ProjectionOps` (composable) |
+| EngineBuilder | `Engine::with_store(store)` | `EngineBuilder::new(log, checkpoint, reactor_checkpoint)` (explicit at construction) |
 | Macros | `#[event]`, `#[reactor]`, `#[reactors]`, `#[projection]`, singular `#[aggregator]` | `#[fact]`, `#[aggregator]`, `#[aggregators]` (legacy macros deleted) |
 | DLQ | n/a (failures propagate) | `EngineBuilder::on_dlq(mapper)` |
 | Global metadata | `with_event_metadata(json!(…))` | `with_default_metadata(Metadata)` |
@@ -134,7 +134,7 @@ let engine = Engine::new(deps, store)
     .with_projection(/* ... */);
 
 // 0.4
-let engine = EngineBuilder::new(log, checkpoint, outbox)
+let engine = EngineBuilder::new(log, checkpoint, reactor_checkpoint)
     .with_aggregators(/* ... */)
     .with_reactors(/* ... */)
     .with_projectors(/* ... */)
@@ -155,11 +155,11 @@ works for the simple case. Longer form chains `.correlation_id`,
 
 Consumers writing custom backends:
 - Implement `EventLogBackend` instead of legacy `EventLog`.
-- Split queue duties: `CheckpointStore` (cursors) + `ReactorOutbox`
+- Split queue duties: `CheckpointStore` (cursors) + `ReactorCheckpoint`
   (atomic batch commit, C12). No more single `Store` trait.
 - DLQ + pause/resume + status move to `ProjectionOps` (extends
   `CheckpointStore`).
-- See `causal_replay::PgEventLogBackend` / `PgReactorOutbox` /
+- See `causal_replay::PgEventLogBackend` / `PgReactorCheckpoint` /
   `PgSnapshotStore` for the reference Postgres implementation.
 
 ### 8. Macros

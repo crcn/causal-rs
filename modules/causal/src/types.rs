@@ -155,9 +155,9 @@ impl fmt::Display for StreamState {
 pub struct WriteResult {
     /// Opaque global ordering cursor.
     pub position: LogCursor,
-    /// Per-stream revision (0-indexed) of the just-written event.
-    /// `None` for events that aren't scoped to an aggregate stream.
-    pub revision: Option<StreamRevision>,
+    /// Per-stream revision (0-indexed) of the just-written event. Every
+    /// append targets a stream, so this is always present.
+    pub revision: StreamRevision,
 }
 
 /// A persisted event loaded from the store.
@@ -176,13 +176,13 @@ pub struct RecordedEvent {
     /// When the event was persisted (backend-authoritative —
     /// `EventData::created_at` is a hint that backends MAY override).
     pub created_at: DateTime<Utc>,
-    /// Aggregate type (only present for aggregate-scoped events).
-    pub aggregate_type: Option<String>,
-    /// Aggregate instance ID (only present for aggregate-scoped events).
-    pub aggregate_id: Option<Uuid>,
-    /// Per-stream revision (0-indexed) — only present for
-    /// aggregate-scoped events.
-    pub revision: Option<StreamRevision>,
+    /// Stream category (`Event::CATEGORY`) — the prefix of the
+    /// `{category}-{stream_id}` stream name. Every event belongs to a stream.
+    pub category: String,
+    /// Stream id (`Event::stream_id`).
+    pub stream_id: Uuid,
+    /// Per-stream revision (0-indexed).
+    pub revision: StreamRevision,
     /// Application-level metadata (e.g. `_run_id`, `_schema_v`,
     /// `_actor`). Set via `EmitBuilder::metadata`.
     pub metadata: serde_json::Map<String, serde_json::Value>,
@@ -197,15 +197,11 @@ pub struct RecordedEvent {
 }
 
 impl RecordedEvent {
-    /// The category prefix of this event's `event_type`. For events
-    /// with the canonical `{CATEGORY}:{name}` shape, this returns the
-    /// category. For events without a colon, returns the full
-    /// `event_type` string.
-    ///
-    /// Useful in `MultiProjector::project` bodies that need to route
-    /// across categories without parsing the string themselves.
+    /// The stream category (`Event::CATEGORY`) this event belongs to —
+    /// a `&str` accessor over the `category` field. Useful in
+    /// `MultiProjector::project` bodies routing across categories.
     pub fn category(&self) -> &str {
-        self.event_type.split(':').next().unwrap_or(&self.event_type)
+        &self.category
     }
 }
 
@@ -219,8 +215,8 @@ impl fmt::Debug for RecordedEvent {
             .field("event_type", &self.event_type)
             .field("payload", &self.payload)
             .field("created_at", &self.created_at)
-            .field("aggregate_type", &self.aggregate_type)
-            .field("aggregate_id", &self.aggregate_id)
+            .field("category", &self.category)
+            .field("stream_id", &self.stream_id)
             .field("revision", &self.revision)
             .field("metadata", &self.metadata)
             .field("ephemeral", &self.ephemeral.as_ref().map(|_| "..."))
@@ -238,8 +234,10 @@ pub struct EventData {
     pub payload: serde_json::Value,
     /// Hint for `created_at` — backends MAY override server-side.
     pub created_at: DateTime<Utc>,
-    pub aggregate_type: Option<String>,
-    pub aggregate_id: Option<Uuid>,
+    /// Stream category (`Event::CATEGORY`). Present for stream-scoped events.
+    pub category: Option<String>,
+    /// Stream id (`Event::stream_id`). Present for stream-scoped events.
+    pub stream_id: Option<Uuid>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
     /// Original typed event for zero-cost in-process dispatch. `None`
     /// for events loaded from durable stores.
@@ -257,8 +255,8 @@ impl fmt::Debug for EventData {
             .field("event_type", &self.event_type)
             .field("payload", &self.payload)
             .field("created_at", &self.created_at)
-            .field("aggregate_type", &self.aggregate_type)
-            .field("aggregate_id", &self.aggregate_id)
+            .field("category", &self.category)
+            .field("stream_id", &self.stream_id)
             .field("metadata", &self.metadata)
             .field("ephemeral", &self.ephemeral.as_ref().map(|_| "..."))
             .finish()
@@ -280,6 +278,7 @@ mod persisted_event_tests {
     use super::*;
 
     fn mk(event_type: &str) -> RecordedEvent {
+        let category = event_type.split(':').next().unwrap_or(event_type).to_string();
         RecordedEvent {
             position:        LogCursor::ZERO,
             event_id:        Uuid::nil(),
@@ -288,9 +287,9 @@ mod persisted_event_tests {
             event_type:      event_type.into(),
             payload:         serde_json::Value::Null,
             created_at:      Utc::now(),
-            aggregate_type:  None,
-            aggregate_id:    None,
-            revision:        None,
+            category,
+            stream_id:       Uuid::nil(),
+            revision:        StreamRevision::ZERO,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,

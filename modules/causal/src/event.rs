@@ -34,7 +34,7 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     ///
     /// Subscriptions filter by this via `$ce-{CATEGORY}` system
     /// streams in Kurrent; backends with no native category-stream
-    /// support filter by `aggregate_type = CATEGORY`.
+    /// support filter by the `category` field (= `CATEGORY`).
     const CATEGORY: &'static str;
 
     /// Per-variant event type name. The runtime composes the

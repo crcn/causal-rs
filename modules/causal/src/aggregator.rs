@@ -338,10 +338,10 @@ impl AggregatorRegistry {
     ///
     /// This matters because two paths fold into this registry
     /// concurrently:
-    ///   1. `Engine::execute_emit` folds caller-emitted facts.
-    ///   2. `RelayLoop::drain_once` folds reactor-emitted facts after
-    ///      `log.append` (added in 0.4.3 for `engine.snapshot()`
-    ///      visibility).
+    ///   1. `Engine::execute_emit` / `Engine::append` fold
+    ///      caller-emitted facts.
+    ///   2. `ReactorRunner` folds reactor-emitted facts right after it
+    ///      appends them to the log (for `engine.snapshot()` visibility).
     ///
     /// Before the entry-guarded variant landed (see the `Unreleased`
     /// CHANGELOG entry that follows 0.4.6) these could lose updates
@@ -380,9 +380,9 @@ impl AggregatorRegistry {
 
             // Atomic RMW under the DashMap entry guard. Holding the
             // entry serializes concurrent applies on the same key,
-            // closing the lost-update race between
-            // `Engine::execute_emit` and `RelayLoop::drain_once`
-            // (caller-emit vs reactor-emit).
+            // closing the lost-update race between the caller-emit path
+            // (`Engine::execute_emit` / `append`) and the reactor-emit
+            // path (`ReactorRunner`).
             let (pre_state, post_state) = {
                 use dashmap::mapref::entry::Entry;
                 let entry = self.state.entry(key.clone());
