@@ -2,6 +2,7 @@
 name = "dev-cli"
 version = "0.1.0"
 edition = "2021"
+publish = false  # internal dev tool — never goes to crates.io
 
 # Independent workspace - won't conflict with parent project
 [workspace]
