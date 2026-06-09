@@ -4,6 +4,39 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-06-09
+
+### Changed — `Engine::settle` is now per-run (correlation-scoped)
+
+`settle(result)` previously ignored `result` and waited for every consumer to
+reach the *global* log head. In a one-engine/many-runs deployment under
+continuous emission, that head never stops moving, so a run's `settle` could
+wait on unrelated runs forever. (The `result` parameter had been an unused stub
+since 0.5.0; this is its first real implementation — no prior per-run settle
+existed to regress.)
+
+`settle` now waits only for the causal chain of `result.correlation_id`:
+
+- The engine keeps an in-process per-correlation high-water mark. Each reactor
+  runner records its output's `$all` position under the trigger's
+  `correlation_id` (outputs already inherit it), so the whole chain shares one
+  key. `settle` waits until every consumer is past that mark and no new
+  chain event has appeared — then the run has drained, regardless of other
+  runs' traffic.
+- Floored at the emit position, so `settle` always waits for consumers to at
+  least observe the trigger (and empty-emit `settle` keeps its
+  drain-to-current-head behavior).
+- Bounded: entries are removed when `settle` returns; a hard cap evicts under
+  fire-and-forget load. No new public API, no trait changes — purely additive.
+
+Correctness boundary: the high-water is in-process, so this is correct when a
+run's reactors execute in the same engine instance that called `settle` (the
+single-engine deployment). A multi-engine deployment sharing one log would need
+a backend-queried high-water (not implemented).
+
+`emit(e).correlation_id(run_id).settled()` therefore becomes per-run
+automatically — no caller change.
+
 ## [0.7.1] - 2026-06-08
 
 ### Added

@@ -151,6 +151,67 @@ pub struct EmitResult {
     pub correlation_id: Uuid,
 }
 
+/// In-process per-correlation high-water mark for scoped [`Engine::settle`].
+///
+/// Tracks, per `correlation_id`, the highest `$all` position of any event in
+/// that run's causal chain — seeded floor-wise by the emit position and bumped
+/// by each reactor runner as it appends an output (outputs inherit the
+/// trigger's `correlation_id`, so the whole chain shares one key). `settle`
+/// reads it to wait only for *its* run to drain, not for global log quiescence.
+///
+/// Bounded: an entry is created lazily (first output for a run) and removed when
+/// `settle` returns; a hard `CAP` evicts an arbitrary entry under fire-and-forget
+/// load (emit without `.settled()`), trading a possible early `settle` return
+/// under pathological concurrency for bounded memory. This is in-process state —
+/// correct when a run's reactors execute in the same engine that called
+/// `settle`. A multi-engine deployment would need a backend-queried high-water.
+pub(crate) struct SettleTracker {
+    hw:  std::collections::HashMap<Uuid, LogCursor>,
+}
+
+/// Cap on tracked in-flight correlations. Generous — never approached when
+/// `.settled()` is used (entries are removed on return); only fire-and-forget
+/// emits accumulate, and this bounds them.
+const SETTLE_TRACKER_CAP: usize = 65_536;
+
+impl SettleTracker {
+    fn new() -> Self {
+        Self { hw: std::collections::HashMap::new() }
+    }
+
+    /// Record a chain event's position for `corr`, keeping the max.
+    pub(crate) fn bump(&mut self, corr: Uuid, pos: LogCursor) {
+        if let Some(cur) = self.hw.get_mut(&corr) {
+            if pos > *cur {
+                *cur = pos;
+            }
+            return;
+        }
+        if self.hw.len() >= SETTLE_TRACKER_CAP {
+            // Bound memory under fire-and-forget load. Evicting a currently
+            // settling run's entry makes that settle fall back to its emit-
+            // position floor (possible early return) — acceptable only under
+            // >CAP un-settled concurrent runs.
+            if let Some(&victim) = self.hw.keys().next() {
+                self.hw.remove(&victim);
+            }
+        }
+        self.hw.insert(corr, pos);
+    }
+
+    fn get(&self, corr: &Uuid) -> Option<LogCursor> {
+        self.hw.get(corr).copied()
+    }
+
+    fn forget(&mut self, corr: &Uuid) {
+        self.hw.remove(corr);
+    }
+}
+
+/// Shared handle to the per-correlation high-water tracker, threaded from the
+/// engine into each reactor runner.
+pub(crate) type CorrHighWater = Arc<std::sync::Mutex<SettleTracker>>;
+
 /// Metadata about a reactor that has exhausted its retry budget,
 /// passed to the [`EngineBuilder::on_dlq`] mapper. The mapper
 /// decides whether to synthesize a terminal-failure Event and append
@@ -376,6 +437,10 @@ pub struct EngineBuilder {
     /// registered *after* this is set (same ordering rule as `observer`),
     /// surfaced to reactor bodies via `ctx.reaction_cache()`.
     reaction_cache:        Option<Arc<dyn crate::reaction_cache::ReactionCache>>,
+    /// Per-correlation high-water tracker for scoped `settle`. Created eagerly
+    /// (so registration order doesn't matter), shared with every reactor runner
+    /// and the built engine.
+    corr_hw:               CorrHighWater,
 }
 
 impl EngineBuilder {
@@ -402,6 +467,7 @@ impl EngineBuilder {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             observer: None,
             reaction_cache: None,
+            corr_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
         }
     }
 
@@ -620,6 +686,7 @@ impl EngineBuilder {
         let max_attempts = self.max_attempts;
         let observer = self.observer.clone();
         let reaction_cache = self.reaction_cache.clone();
+        let corr_hw = self.corr_hw.clone();
         self.consumers.push(Box::new(move |aggs, engine_aggs| {
             let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, reactor_checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
@@ -629,6 +696,7 @@ impl EngineBuilder {
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
             if let Some(rc) = reaction_cache { runner = runner.with_reaction_cache(rc); }
             runner = runner.with_engine_aggregators(engine_aggs);
+            runner = runner.with_settle_tracker(corr_hw);
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -718,6 +786,7 @@ impl EngineBuilder {
             consumer_ids,
             self.observer,
             self.occ_categories,
+            self.corr_hw,
         )
     }
 }
@@ -749,6 +818,9 @@ pub struct Engine {
     /// `EngineBuilder::with_aggregate`. `emit` rejects facts in these
     /// categories; they must use the OCC command path `Engine::append`.
     occ_categories:        std::collections::HashSet<String>,
+    /// Per-correlation high-water tracker (shared with reactor runners) that
+    /// scopes [`Engine::settle`] to a single run's causal chain.
+    corr_hw:               CorrHighWater,
 }
 
 impl Engine {
@@ -762,6 +834,7 @@ impl Engine {
         consumer_ids: Vec<String>,
         observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
         occ_categories: std::collections::HashSet<String>,
+        corr_hw: CorrHighWater,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len());
@@ -782,6 +855,7 @@ impl Engine {
             default_metadata,
             aggregators, consumer_ids, observer,
             occ_categories,
+            corr_hw,
         }
     }
 
@@ -1144,21 +1218,36 @@ impl Engine {
     /// polls their cursors until every consumer reaches the current
     /// log head. Bounded latency depends on consumer batch size +
     /// supervisor poll interval.
-    pub async fn settle(&self, _result: EmitResult) -> Result<()> {
+    pub async fn settle(&self, result: EmitResult) -> Result<()> {
+        let corr = result.correlation_id;
         loop {
-            let p1 = self.log.latest_position().await?;
+            // High-water = the furthest position any event in THIS run's chain
+            // has reached. Floor it at the emit position so we always wait for
+            // consumers to at least observe the trigger, even before any
+            // reactor output has landed (or if the entry was never tracked).
+            let hw = self
+                .corr_hw
+                .lock()
+                .unwrap()
+                .get(&corr)
+                .unwrap_or(result.position);
 
-            // Wait for every consumer to catch up to p1.
+            // Wait for every consumer to catch up to hw. Because a consumer's
+            // cursor advances only after its output is appended (and outputs
+            // inherit this correlation_id), "all consumers past hw" plus "no
+            // new chain event appeared" means this run has drained — regardless
+            // of how busy other runs keep the global log head.
             for id in &self.consumer_ids {
-                self.await_observed_by(id, p1).await?;
+                self.await_observed_by(id, hw).await?;
             }
 
-            // Reactor outputs append directly to the log, so any work the
-            // consumers produced shows up as new log positions. If no new
-            // events landed during the catch-up wait, the chain has
-            // quiesced; otherwise loop.
-            let p2 = self.log.latest_position().await?;
-            if p1 == p2 { return Ok(()); }
+            // Fall back to the prior hw (not the floor) if the entry was evicted
+            // mid-settle, so eviction can't spuriously regress the comparison.
+            let hw2 = self.corr_hw.lock().unwrap().get(&corr).unwrap_or(hw);
+            if hw2 == hw {
+                self.corr_hw.lock().unwrap().forget(&corr);
+                return Ok(());
+            }
         }
     }
 
@@ -2831,6 +2920,58 @@ mod tests {
         assert_eq!(seen.lock().len(), 1);
 
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settle_scopes_to_one_run_while_another_floods_the_log() {
+        // The point of scoped settle: run A's settle returns once A's chain
+        // (UserCreated → WelcomeQueued) drains, EVEN WHILE run B keeps
+        // appending to the shared log. A global-head settle would loop forever
+        // here because the head never stops moving.
+        let store = store();
+        let engine = Arc::new(
+            EngineBuilder::new(
+                store.clone() as Arc<dyn EventLogBackend>,
+                store.clone() as Arc<dyn CheckpointStore>,
+                store.clone() as Arc<dyn ReactorCheckpoint>,
+            )
+            .with_reactor(WelcomeReactor)
+            .build(),
+        );
+
+        // Run B: a background flood that never stops moving the global head.
+        let flood = {
+            let engine = engine.clone();
+            let corr_b = Uuid::new_v4();
+            tokio::spawn(async move {
+                loop {
+                    let _ = engine
+                        .emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
+                        .correlation_id(corr_b)
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                }
+            })
+        };
+
+        // Run A: emit once on its own correlation, then settle. With the old
+        // global-head settle this would hang against run B's flood.
+        let corr_a = Uuid::new_v4();
+        let result = engine
+            .emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
+            .correlation_id(corr_a)
+            .await
+            .unwrap();
+
+        let settled =
+            tokio::time::timeout(Duration::from_secs(5), engine.settle(result)).await;
+        flood.abort();
+
+        assert!(
+            settled.is_ok(),
+            "scoped settle must return for run A despite run B flooding the log"
+        );
+        settled.unwrap().unwrap();
     }
 
     #[tokio::test]

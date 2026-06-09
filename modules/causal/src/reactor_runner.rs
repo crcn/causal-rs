@@ -110,6 +110,11 @@ pub struct ReactorRunner<R: Reactor> {
     /// reactor-emitted events (not just caller-emitted ones). Separate
     /// from the per-runner `aggregators` clone above.
     engine_aggregators: Option<Arc<AggregatorRegistry>>,
+    /// Shared per-correlation high-water tracker for scoped `Engine::settle`.
+    /// After appending an output, the runner records the output's position
+    /// under the trigger's `correlation_id` so `settle` knows the run's chain
+    /// has advanced. `None` outside an engine (e.g. unit tests).
+    settle_tracker: Option<crate::engine::CorrHighWater>,
 }
 
 impl<R: Reactor> ReactorRunner<R>
@@ -134,6 +139,7 @@ where
             observer: None,
             reaction_cache: None,
             engine_aggregators: None,
+            settle_tracker: None,
         }
     }
 
@@ -169,6 +175,13 @@ where
         engine_aggregators: Option<Arc<AggregatorRegistry>>,
     ) -> Self {
         self.engine_aggregators = engine_aggregators;
+        self
+    }
+
+    /// Attach the shared per-correlation high-water tracker so appended
+    /// outputs advance their run's `settle` mark.
+    pub(crate) fn with_settle_tracker(mut self, tracker: crate::engine::CorrHighWater) -> Self {
+        self.settle_tracker = Some(tracker);
         self
     }
 
@@ -361,9 +374,12 @@ where
                                     ephemeral: None,
                                     persistent: true,
                                 };
-                                self.log
+                                let write = self.log
                                     .append_to_stream(&cat, sid, StreamState::Any, vec![out_event])
                                     .await?;
+                                if let Some(tracker) = &self.settle_tracker {
+                                    tracker.lock().unwrap().bump(event.correlation_id, write.position);
+                                }
                                 if let Some(reg) = &self.engine_aggregators {
                                     reg.apply_event(&event_type, &payload);
                                 }
@@ -414,11 +430,17 @@ where
                     ephemeral: None,
                     persistent: true,
                 };
-                self.log
+                let write = self.log
                     .append_to_stream(
                         &out.event_prefix, out.stream_id, StreamState::Any, vec![out_event],
                     )
                     .await?;
+                // Advance this run's scoped-settle high-water: the output
+                // inherits the trigger's correlation_id, so it belongs to the
+                // same chain.
+                if let Some(tracker) = &self.settle_tracker {
+                    tracker.lock().unwrap().bump(event.correlation_id, write.position);
+                }
                 if let Some(reg) = &self.engine_aggregators {
                     reg.apply_event(&out.durable_name, &out.payload);
                 }
