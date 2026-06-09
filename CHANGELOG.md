@@ -4,6 +4,16 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-06-09
+
+### Docs (correctness)
+
+- `Engine::settle`'s rustdoc described the pre-0.7.2 global-head algorithm; 0.7.2
+  changed the behavior but not the doc. Rewritten to document the
+  per-correlation high-water algorithm, the single-engine correctness boundary,
+  and the shared-consumer-cursor caveat at the call site. Docs-only; no behavior
+  change from 0.7.2.
+
 ## [0.7.2] - 2026-06-09
 
 ### Changed — `Engine::settle` is now per-run (correlation-scoped)
