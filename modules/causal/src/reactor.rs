@@ -151,10 +151,15 @@ pub struct EventOutput {
     /// shape `Engine::emit` writes on the producer side. Field name
     /// kept as `durable_name` for backend-impl compatibility.
     pub durable_name: String,
-    /// `Event::CATEGORY`. The stream category this output belongs to.
+    /// `Event::CATEGORY` — the ROUTING category (consumer/aggregator
+    /// matching, via `durable_name`'s prefix).
     pub event_prefix: String,
+    /// `Event::STREAM_CATEGORY` — the physical stream this output is
+    /// stored in (`{stream_category}-{stream_id}`). Defaults to
+    /// `event_prefix`; differs only when the event overrides it.
+    pub stream_category: String,
     /// Stream id from `Event::stream_id()` — which stream within
-    /// `event_prefix` this output targets.
+    /// `stream_category` this output targets.
     pub stream_id: Uuid,
     pub payload: serde_json::Value,
     /// Original typed fact (live dispatch only).
@@ -167,6 +172,7 @@ impl EventOutput {
     /// event_type shape.
     pub fn new<F: crate::event::Event>(fact: F) -> Self {
         let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
+        let stream_category = <F as crate::event::Event>::STREAM_CATEGORY.to_string();
         let durable_name = format!("{}:{}", event_prefix, fact.event_type());
         let stream_id = fact.stream_id();
         let payload = serde_json::to_value(&fact).expect("Event must be serializable");
@@ -175,6 +181,7 @@ impl EventOutput {
             type_id: TypeId::of::<F>(),
             durable_name,
             event_prefix,
+            stream_category,
             stream_id,
             payload,
             ephemeral: Some(ephemeral),
@@ -188,9 +195,13 @@ impl EventOutput {
         stream_id: Uuid,
         payload: serde_json::Value,
     ) -> Self {
+        let event_prefix = extract_prefix(&event_type).to_string();
         Self {
             type_id: TypeId::of::<()>(),
-            event_prefix: extract_prefix(&event_type).to_string(),
+            // Replay/serialized path has no separate stream-category info;
+            // default it to the routing prefix (the backward-compat default).
+            stream_category: event_prefix.clone(),
+            event_prefix,
             durable_name: event_type,
             stream_id,
             payload,

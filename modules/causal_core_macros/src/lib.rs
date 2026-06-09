@@ -2058,6 +2058,12 @@ struct EventArgs {
     /// time. Defaults to `"occurred_at"`. Must be present on every
     /// variant when generating Event. Type must be `DateTime<Utc>`.
     occurred_at_field: Option<String>,
+    /// v0.7 Event: physical stream this event is *stored* in
+    /// (`Event::STREAM_CATEGORY`) — distinct from `prefix`/`CATEGORY`,
+    /// which stays the routing key. Set it to co-locate several distinct
+    /// event types in one stream (for durable aggregate restore). When
+    /// omitted, `STREAM_CATEGORY` defaults to `CATEGORY` (unchanged).
+    stream: Option<String>,
 }
 
 fn parse_event_args(tokens: TokenStream2) -> EventArgs {
@@ -2066,6 +2072,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
     let mut stream_category = None;
     let mut stream_id = None;
     let mut occurred_at_field = None;
+    let mut stream = None;
 
     if tokens.is_empty() {
         return EventArgs {
@@ -2074,6 +2081,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             stream_category,
             stream_id,
             occurred_at_field,
+            stream,
         };
     }
 
@@ -2087,6 +2095,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
                 stream_category,
                 stream_id,
                 occurred_at_field,
+                stream,
             };
         }
     };
@@ -2130,6 +2139,13 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
                     }
                 }
             }
+            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("stream") => {
+                if let Expr::Lit(expr_lit) = value {
+                    if let Lit::Str(lit) = &expr_lit.lit {
+                        stream = Some(lit.value());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2140,6 +2156,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
         stream_category,
         stream_id,
         occurred_at_field,
+        stream,
     }
 }
 
@@ -2170,6 +2187,13 @@ fn expand_event_enum(
             "#[event] on enums requires a prefix: #[event(prefix = \"...\")]",
         )
     })?;
+
+    // Optional `stream = "..."` → `const STREAM_CATEGORY` (physical stream
+    // placement, distinct from the routing CATEGORY). Omitted = trait default.
+    let stream_const = match &args.stream {
+        Some(s) => quote! { const STREAM_CATEGORY: &'static str = #s; },
+        None => quote! {},
+    };
 
     // Parse serde attributes to find tag and rename_all
     let serde_info = parse_serde_attrs(&input.attrs)?;
@@ -2298,6 +2322,7 @@ fn expand_event_enum(
         quote! {
             impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
+                #stream_const
                 fn event_type(&self) -> &str {
                     match self {
                         #(#name_arms,)*
@@ -2323,6 +2348,7 @@ fn expand_event_enum(
         quote! {
             impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #prefix;
+                #stream_const
                 fn event_type(&self) -> &str {
                     match self {
                         #(#name_arms,)*
@@ -2368,6 +2394,12 @@ fn expand_event_struct(
     // `Uuid::nil()` (category-singleton). occurred_at uses
     // `occurred_at_field` if supplied, else None.
     let bare_name = prefix_str.clone();
+    // Optional `stream = "..."` → `const STREAM_CATEGORY` (physical stream
+    // placement, distinct from the routing CATEGORY). Omitted = trait default.
+    let stream_const = match &args.stream {
+        Some(s) => quote! { const STREAM_CATEGORY: &'static str = #s; },
+        None => quote! {},
+    };
     let fact_impl = if let Some(id_field) = args.stream_id.as_ref() {
         let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
         let id_field_ident = format_ident!("{}", id_field);
@@ -2380,6 +2412,7 @@ fn expand_event_struct(
         quote! {
             impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
+                #stream_const
                 fn event_type(&self) -> &str { #bare_name }
                 fn stream_id(&self) -> ::uuid::Uuid {
                     self.#id_field_ident
@@ -2394,6 +2427,7 @@ fn expand_event_struct(
         quote! {
             impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
+                #stream_const
                 fn event_type(&self) -> &str { #bare_name }
                 fn stream_id(&self) -> ::uuid::Uuid {
                     ::uuid::Uuid::nil()

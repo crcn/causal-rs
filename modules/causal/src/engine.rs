@@ -248,6 +248,9 @@ pub struct DlqInfo {
 /// downstream code never names this trait.
 pub(crate) trait ErasedFact: Send + Sync {
     fn category(&self) -> &'static str;
+    /// Physical stream placement category (`Event::STREAM_CATEGORY`);
+    /// defaults to `category()`. Routing still uses `category()`.
+    fn stream_category(&self) -> &'static str;
     fn variant_name(&self) -> &str;
     fn stream_id(&self) -> Uuid;
     fn occurred_at(&self) -> Option<DateTime<Utc>>;
@@ -256,6 +259,7 @@ pub(crate) trait ErasedFact: Send + Sync {
 
 impl<F: Event> ErasedFact for F {
     fn category(&self) -> &'static str { <F as Event>::CATEGORY }
+    fn stream_category(&self) -> &'static str { <F as Event>::STREAM_CATEGORY }
     fn variant_name(&self) -> &str { Event::event_type(self) }
     fn stream_id(&self) -> Uuid { Event::stream_id(self) }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Event::occurred_at(self) }
@@ -417,6 +421,9 @@ pub(crate) type DlqMapperArc = Arc<
 /// Reactors retry up to this many times before the mapper fires.
 pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
+/// Default snapshot cadence: save an aggregate snapshot every N folded events.
+pub(crate) const DEFAULT_SNAPSHOT_EVERY: u64 = 100;
+
 pub struct EngineBuilder {
     log:                   Arc<dyn EventLogBackend>,
     checkpoint:            Arc<dyn CheckpointStore>,
@@ -441,6 +448,14 @@ pub struct EngineBuilder {
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
     corr_hw:               CorrHighWater,
+    /// Durable aggregate snapshot store. When set, folded aggregate state
+    /// survives restart via read-through restore (`Engine::load_aggregate`,
+    /// consumer restore-before-fold) and is periodically snapshotted. When
+    /// `None`, behavior is unchanged (in-memory fold only).
+    snapshot_store:        Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
+    /// Save a snapshot every N folded events per aggregate. `0` disables saving
+    /// (restore still works via full replay).
+    snapshot_every:        u64,
 }
 
 impl EngineBuilder {
@@ -468,6 +483,8 @@ impl EngineBuilder {
             observer: None,
             reaction_cache: None,
             corr_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
+            snapshot_store: None,
+            snapshot_every: DEFAULT_SNAPSHOT_EVERY,
         }
     }
 
@@ -547,6 +564,32 @@ impl EngineBuilder {
     /// retry indefinitely (supervisor backoff).
     pub fn with_max_attempts(mut self, n: u32) -> Self {
         self.max_attempts = n;
+        self
+    }
+
+    /// Wire a durable [`SnapshotStore`](crate::snapshot_store::SnapshotStore)
+    /// so folded aggregate state survives restart. With it set, an aggregate
+    /// that declares an
+    /// [`Aggregate::STREAM_CATEGORY`](crate::aggregate::Aggregate::STREAM_CATEGORY)
+    /// is restored read-through (snapshot + stream-tail replay) by
+    /// [`Engine::load_aggregate`] and by consumer runners before they fold, and
+    /// is snapshotted every [`with_snapshot_every`](Self::with_snapshot_every)
+    /// events. Without it, behavior is unchanged. Idempotent restore — safe on
+    /// any/all nodes.
+    pub fn with_snapshot_store(
+        mut self,
+        store: Arc<dyn crate::snapshot_store::SnapshotStore>,
+    ) -> Self {
+        self.snapshot_store = Some(store);
+        self
+    }
+
+    /// Save an aggregate snapshot every `n` folded events (default
+    /// [`DEFAULT_SNAPSHOT_EVERY`]). `0` disables saving — restore still works,
+    /// replaying the full stream each time. No effect without
+    /// [`with_snapshot_store`](Self::with_snapshot_store).
+    pub fn with_snapshot_every(mut self, n: u64) -> Self {
+        self.snapshot_every = n;
         self
     }
 
@@ -687,6 +730,8 @@ impl EngineBuilder {
         let observer = self.observer.clone();
         let reaction_cache = self.reaction_cache.clone();
         let corr_hw = self.corr_hw.clone();
+        let snapshot_store = self.snapshot_store.clone();
+        let snapshot_every = self.snapshot_every;
         self.consumers.push(Box::new(move |aggs, engine_aggs| {
             let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, reactor_checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
@@ -697,6 +742,7 @@ impl EngineBuilder {
             if let Some(rc) = reaction_cache { runner = runner.with_reaction_cache(rc); }
             runner = runner.with_engine_aggregators(engine_aggs);
             runner = runner.with_settle_tracker(corr_hw);
+            runner = runner.with_snapshot_persistence(snapshot_store, snapshot_every);
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -787,6 +833,8 @@ impl EngineBuilder {
             self.observer,
             self.occ_categories,
             self.corr_hw,
+            self.snapshot_store,
+            self.snapshot_every,
         )
     }
 }
@@ -821,6 +869,11 @@ pub struct Engine {
     /// Per-correlation high-water tracker (shared with reactor runners) that
     /// scopes [`Engine::settle`] to a single run's causal chain.
     corr_hw:               CorrHighWater,
+    /// Durable aggregate snapshot store (shared with runners). `None` = no
+    /// durable restore (in-memory fold only).
+    snapshot_store:        Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
+    /// Snapshot cadence for the engine-level save path.
+    snapshot_every:        u64,
 }
 
 impl Engine {
@@ -835,6 +888,8 @@ impl Engine {
         observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
         occ_categories: std::collections::HashSet<String>,
         corr_hw: CorrHighWater,
+        snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
+        snapshot_every: u64,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len());
@@ -856,6 +911,8 @@ impl Engine {
             aggregators, consumer_ids, observer,
             occ_categories,
             corr_hw,
+            snapshot_store,
+            snapshot_every,
         }
     }
 
@@ -1100,7 +1157,11 @@ impl Engine {
                     fact.category(),
                 ));
             }
+            // event_type carries the ROUTING category (consumer/aggregator
+            // matching); `category`/placement uses the STREAM category. They
+            // differ only when the event overrides `STREAM_CATEGORY`.
             let event_type = format!("{}:{}", fact.category(), fact.variant_name());
+            let stream_category = fact.stream_category();
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let stream_id = fact.stream_id();
             let payload = fact.to_value()?;
@@ -1111,7 +1172,7 @@ impl Engine {
                 event_type,
                 payload,
                 created_at:      occurred_at,
-                category:        Some(fact.category().to_string()),
+                category:        Some(stream_category.to_string()),
                 stream_id:       Some(stream_id),
                 metadata:        merged_metadata.clone(),
                 ephemeral:       None,
@@ -1123,6 +1184,23 @@ impl Engine {
             let agg_event_type = new_event.event_type.clone();
             let agg_payload = new_event.payload.clone();
 
+            // Restore the engine-level aggregate(s) for this event from durable
+            // storage BEFORE the append, so the fold below builds on full prior
+            // history without double-counting the event we are about to write.
+            // No-op without a snapshot store or a declared STREAM_CATEGORY.
+            if self.snapshot_store.is_some() {
+                if let Some(reg) = &self.aggregators {
+                    crate::aggregator::restore_aggregates_for_event(
+                        reg.as_ref(),
+                        self.snapshot_store.as_deref(),
+                        self.log.as_ref(),
+                        &agg_event_type,
+                        &agg_payload,
+                    )
+                    .await?;
+                }
+            }
+
             let event_id = new_event.event_id;
             // `emit` is the append-only fact path: write to the fact's own
             // stream with `StreamState::Any` (no concurrency invariant —
@@ -1131,7 +1209,7 @@ impl Engine {
             let result = self
                 .log
                 .append_to_stream(
-                    fact.category(),
+                    stream_category,
                     stream_id,
                     crate::types::StreamState::Any,
                     vec![new_event],
@@ -1153,6 +1231,15 @@ impl Engine {
                         result.position,
                         event_id,
                     );
+                }
+                if let Some(store) = self.snapshot_store.as_ref() {
+                    crate::aggregator::maybe_save_snapshots(
+                        reg.as_ref(),
+                        store.as_ref(),
+                        self.snapshot_every,
+                        &snapshots,
+                    )
+                    .await;
                 }
             }
         }
@@ -1192,6 +1279,49 @@ impl Engine {
         }
         let (_, curr) = reg.get_transition_arc::<A>(stream_id);
         Some((*curr).clone())
+    }
+
+    /// Read an aggregate's current state, **restoring it from durable storage
+    /// if it isn't already in memory** — the async, restart-surviving
+    /// counterpart to the sync [`snapshot`](Self::snapshot) peek.
+    ///
+    /// If the aggregate isn't cached, this loads its snapshot (if a
+    /// [`with_snapshot_store`](EngineBuilder::with_snapshot_store) is wired),
+    /// replays the tail of its stream
+    /// (`{`[`A::STREAM_CATEGORY`](crate::aggregate::Aggregate::STREAM_CATEGORY)`}-{id}`),
+    /// folds, and caches the result. A snapshot blob that fails to deserialize
+    /// self-heals (deleted, rebuilt from genesis).
+    ///
+    /// Returns `None` when the aggregate has no events and no snapshot (or when
+    /// `A::STREAM_CATEGORY` is unset, i.e. restore is disabled).
+    ///
+    /// Like `snapshot`, this is for ops/tests/read paths outside a consumer —
+    /// in a reactor/projector body, read via `ctx.aggregate::<A>(id)` (the
+    /// runner restores before folding).
+    pub async fn load_aggregate<A>(&self, id: Uuid) -> Result<Option<A>>
+    where
+        A: crate::aggregate::Aggregate + Clone + serde::de::DeserializeOwned,
+    {
+        let Some(reg) = self.aggregators.as_ref() else { return Ok(None) };
+        let key = format!("{}:{}", <A as crate::aggregate::Aggregate>::NAME, id);
+        // Restore only when a snapshot store is wired (without it, behavior is
+        // unchanged — this is a peek into in-memory state).
+        if !reg.has_state(&key) && self.snapshot_store.is_some() {
+            crate::aggregator::restore_aggregate(
+                reg.as_ref(),
+                self.snapshot_store.as_deref(),
+                self.log.as_ref(),
+                <A as crate::aggregate::Aggregate>::NAME,
+                <A as crate::aggregate::Aggregate>::STREAM_CATEGORY,
+                id,
+            )
+            .await?;
+        }
+        if !reg.has_state(&key) {
+            return Ok(None);
+        }
+        let (_, curr) = reg.get_transition_arc::<A>(id);
+        Ok(Some((*curr).clone()))
     }
 
     /// Wait until the causal chain of `result.correlation_id` has fully

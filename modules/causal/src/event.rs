@@ -37,6 +37,18 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// support filter by the `category` field (= `CATEGORY`).
     const CATEGORY: &'static str;
 
+    /// Stream the event is *stored* in — `{STREAM_CATEGORY}-{stream_id}`.
+    /// Defaults to [`CATEGORY`](Self::CATEGORY), so by default an event
+    /// streams by its own category (the original behavior).
+    ///
+    /// Override to co-locate several distinct event types in ONE stream
+    /// (e.g. every event a single aggregate folds) while each type keeps
+    /// its own `CATEGORY` for consumer/aggregator routing. Routing always
+    /// uses `event_type` (`{CATEGORY}:{name}`); only physical stream
+    /// placement uses `STREAM_CATEGORY`. An aggregate that wants durable
+    /// restore reads from this stream via `Aggregate::STREAM_CATEGORY`.
+    const STREAM_CATEGORY: &'static str = Self::CATEGORY;
+
     /// Per-variant event type name. The runtime composes the
     /// stored `event_type` field as `format!("{}:{}", Self::CATEGORY,
     /// self.event_type())`. Return the bare variant slug here — do

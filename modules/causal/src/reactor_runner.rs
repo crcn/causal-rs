@@ -115,6 +115,12 @@ pub struct ReactorRunner<R: Reactor> {
     /// under the trigger's `correlation_id` so `settle` knows the run's chain
     /// has advanced. `None` outside an engine (e.g. unit tests).
     settle_tracker: Option<crate::engine::CorrHighWater>,
+    /// Durable snapshot store for aggregate restore-before-fold (per-consumer
+    /// registry) and save-after-output-fold (shared engine registry).
+    /// `None` = no durable restore.
+    snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
+    /// Snapshot cadence (events between saves). See `with_snapshot_persistence`.
+    snapshot_every: u64,
 }
 
 impl<R: Reactor> ReactorRunner<R>
@@ -140,6 +146,8 @@ where
             reaction_cache: None,
             engine_aggregators: None,
             settle_tracker: None,
+            snapshot_store: None,
+            snapshot_every: 0,
         }
     }
 
@@ -185,6 +193,19 @@ where
         self
     }
 
+    /// Wire durable snapshot persistence: restore aggregates before folding
+    /// (so `ctx.aggregate` survives restart) and snapshot every `every`
+    /// events. `None` store disables both (unchanged behavior).
+    pub(crate) fn with_snapshot_persistence(
+        mut self,
+        store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
+        every: u64,
+    ) -> Self {
+        self.snapshot_store = store;
+        self.snapshot_every = every;
+        self
+    }
+
     /// Configure terminal-failure DLQ handling. After `max_attempts`
     /// consecutive `react()` errors on the same trigger, the mapper
     /// is invoked; on `Some(fact)`, the fact is appended directly to its
@@ -215,6 +236,8 @@ where
             // Fold every event into the aggregator registry, with
             // capture/restore around the reactor call to avoid double-
             // application on retry. Mirrors legacy engine semantics.
+            // (Per-consumer state is rebuilt from genesis by `ensure_hydrated`
+            // on restart, so no read-through restore is needed here.)
             let rollback = self.aggregators.as_ref().map(|reg| {
                 let r = reg.capture_for_rollback(&event.event_type, &event.payload);
                 let snapshots = reg.apply_event(&event.event_type, &event.payload);
@@ -354,7 +377,9 @@ where
                             // `output_index = u32::MAX` keeps its
                             // deterministic id distinct from react() outputs.
                             if let Some(fact) = mapped {
-                                let cat = fact.category().to_string();
+                                // `cat` is the STREAM placement category;
+                                // `event_type` keeps the routing category.
+                                let cat = fact.stream_category().to_string();
                                 let sid = fact.stream_id();
                                 let event_type =
                                     format!("{}:{}", fact.category(), fact.variant_name());
@@ -415,6 +440,23 @@ where
             //    and cursor-advance re-runs react() on restart; the
             //    re-appends dedup on event_id.
             for (idx, out) in emitted.iter().enumerate() {
+                // Restore the engine-level aggregate(s) for this output from
+                // durable storage BEFORE appending — so the fold below builds on
+                // full prior history and does not double-count the output we are
+                // about to append. (Per-consumer registries are handled by
+                // `ensure_hydrated`; this is the shared engine registry only.)
+                if let Some(reg) = &self.engine_aggregators {
+                    if self.snapshot_store.is_some() {
+                        crate::aggregator::restore_aggregates_for_event(
+                            reg.as_ref(),
+                            self.snapshot_store.as_deref(),
+                            self.log.as_ref(),
+                            &out.durable_name,
+                            &out.payload,
+                        )
+                        .await?;
+                    }
+                }
                 let out_event = EventData {
                     event_id: derive_output_event_id(
                         &self.consumer_id, event.event_id, idx as u32,
@@ -424,7 +466,9 @@ where
                     event_type: out.durable_name.clone(),
                     payload: out.payload.clone(),
                     created_at: chrono::Utc::now(),
-                    category: Some(out.event_prefix.clone()),
+                    // Placement uses the STREAM category; routing stays on
+                    // `event_type` (durable_name). Equal unless overridden.
+                    category: Some(out.stream_category.clone()),
                     stream_id: Some(out.stream_id),
                     metadata: reactor_output_metadata(&self.consumer_id),
                     ephemeral: None,
@@ -432,7 +476,7 @@ where
                 };
                 let write = self.log
                     .append_to_stream(
-                        &out.event_prefix, out.stream_id, StreamState::Any, vec![out_event],
+                        &out.stream_category, out.stream_id, StreamState::Any, vec![out_event],
                     )
                     .await?;
                 // Advance this run's scoped-settle high-water: the output
@@ -442,7 +486,16 @@ where
                     tracker.lock().unwrap().bump(event.correlation_id, write.position);
                 }
                 if let Some(reg) = &self.engine_aggregators {
-                    reg.apply_event(&out.durable_name, &out.payload);
+                    let snapshots = reg.apply_event(&out.durable_name, &out.payload);
+                    if let Some(store) = self.snapshot_store.as_ref() {
+                        crate::aggregator::maybe_save_snapshots(
+                            reg.as_ref(),
+                            store.as_ref(),
+                            self.snapshot_every,
+                            &snapshots,
+                        )
+                        .await;
+                    }
                 }
             }
             self.checkpoint.set(&self.consumer_id, event.position).await?;

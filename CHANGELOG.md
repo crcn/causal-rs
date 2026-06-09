@@ -4,6 +4,49 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-06-09
+
+### Added — durable aggregate restore (read-through, revision-based)
+
+Folded aggregate state now survives a process restart. Previously the
+engine-level registry (`Engine::snapshot`) was only ever folded by live emits,
+so after a restart an aggregate whose events sat behind the consumers'
+checkpoints returned empty/partial state.
+
+- **`EngineBuilder::with_snapshot_store(Arc<dyn SnapshotStore>)`** wires durable
+  restore. **`with_snapshot_every(n)`** sets the snapshot cadence (default 100;
+  `0` disables saving — restore still works via full replay). Without a store,
+  behavior is unchanged.
+- **`Engine::load_aggregate::<A>(id).await -> Option<A>`** — the async,
+  restart-surviving counterpart to the sync `snapshot` peek. Read-through: loads
+  the snapshot (if any), replays the tail of the aggregate's stream, folds, and
+  caches. A snapshot blob that fails to deserialize self-heals (deleted, rebuilt
+  from genesis). `snapshot` stays a sync in-memory peek.
+- Snapshots are saved every N folded events, keyed by the aggregate stream's
+  revision (never a `$all` position), so they round-trip with `read_stream`.
+- Inside a consumer body, `ctx.aggregate::<A>(id)` already survives restart via
+  the existing genesis hydration; this release adds the engine-level path and
+  snapshot acceleration.
+
+### Added — `Event::STREAM_CATEGORY` (stream placement vs routing)
+
+- New `Event::STREAM_CATEGORY` const (defaults to `CATEGORY`) controls the
+  stream an event is *stored* in (`{STREAM_CATEGORY}-{id}`), independent of
+  `CATEGORY`, which stays the consumer/aggregator **routing** key. This lets
+  several distinct event types co-locate in one stream (so a single aggregate
+  can be restored from one `read_stream`) while keeping distinct routing
+  categories. Default = unchanged (each event streams by its own category).
+- `Aggregate::STREAM_CATEGORY` const (defaults to `""` = restore disabled)
+  declares the stream an aggregate folds from.
+- `#[event(..., stream = "…")]` macro attribute emits `STREAM_CATEGORY`
+  (additive; distinct from the legacy `stream_category` attribute, which still
+  sets `CATEGORY`).
+- `MemoryStore` now implements `delete_snapshot` (was the no-op default), so
+  self-heal actually removes a bad snapshot.
+
+All additive — no public breakage. With no snapshot store wired and no
+`STREAM_CATEGORY` set, behavior is identical to 0.7.3.
+
 ## [0.7.3] - 2026-06-09
 
 ### Docs (correctness)

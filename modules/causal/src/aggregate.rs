@@ -54,6 +54,20 @@ pub trait Aggregate: Default + Send + Sync + 'static {
     /// matching the Rust type name (`"UserAgg"`, `"Counter"`,
     /// `"PipelineState"`).
     const NAME: &'static str;
+
+    /// The single stream this aggregate folds from, for **durable
+    /// restore** — `{STREAM_CATEGORY}-{id}`. Every event folded into
+    /// this aggregate for a given id MUST live in that one stream (set
+    /// each such event's
+    /// [`Event::STREAM_CATEGORY`](crate::event::Event::STREAM_CATEGORY)
+    /// to this value).
+    ///
+    /// Defaults to `""` — restore is **disabled** for the aggregate and
+    /// behavior is unchanged (in-memory fold only, lost on restart).
+    /// Set it (and wire `EngineBuilder::with_snapshot_store`) to make
+    /// folded state survive a restart via `Engine::load_aggregate`:
+    /// load snapshot (if any) + replay the stream tail + fold.
+    const STREAM_CATEGORY: &'static str = "";
 }
 
 /// Per-Event fold for hydration. Called once per fact loaded from the

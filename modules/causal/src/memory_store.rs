@@ -439,6 +439,15 @@ impl crate::snapshot_store::SnapshotStore for MemoryStore {
         self.snapshots.insert(key, snapshot);
         Ok(())
     }
+
+    async fn delete_snapshot(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+    ) -> Result<()> {
+        self.snapshots.remove(&(aggregate_type.to_string(), aggregate_id));
+        Ok(())
+    }
 }
 
 #[async_trait]

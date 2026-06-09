@@ -7,11 +7,14 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 
 use anyhow::Result;
+use chrono::Utc;
 use dashmap::DashMap;
 use uuid::Uuid;
 
+use crate::event_log::EventLogBackend;
 use crate::reactor::extract_prefix;
-use crate::types::{LogCursor, StreamRevision};
+use crate::snapshot_store::SnapshotStore;
+use crate::types::{LogCursor, Snapshot, StreamRevision};
 use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate state snapshots ────────────────────────────────────
@@ -89,6 +92,9 @@ pub struct Aggregator {
     pub event_type_id: TypeId,
     /// The aggregate type string.
     pub aggregate_type: String,
+    /// `Aggregate::STREAM_CATEGORY` — the single stream this aggregate
+    /// folds from, for durable restore. `""` = restore disabled.
+    pub stream_category: String,
     /// Extract the aggregate ID from JSON payload (deserializes internally).
     json_extract_id: Arc<dyn Fn(&serde_json::Value) -> Option<Uuid> + Send + Sync>,
     /// Deserialize JSON and apply to a type-erased aggregate (&mut dyn Any = &mut A).
@@ -173,6 +179,7 @@ impl Aggregator {
         let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
         let event_type_id = TypeId::of::<F>();
         let aggregate_type = <A as crate::aggregate::Aggregate>::NAME.to_string();
+        let stream_category = <A as crate::aggregate::Aggregate>::STREAM_CATEGORY.to_string();
         let id_fn = Arc::new(id_fn);
         let id_fn_for_extract = id_fn.clone();
 
@@ -180,6 +187,7 @@ impl Aggregator {
             event_prefix,
             event_type_id,
             aggregate_type,
+            stream_category,
             json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
                 let fact: F = serde_json::from_value(payload.clone()).ok()?;
                 id_fn_for_extract(&fact)
@@ -636,6 +644,26 @@ impl AggregatorRegistry {
             .find(|a| a.aggregate_type == aggregate_type)
     }
 
+    /// The `(aggregate_type, stream_category, id)` triples this event would
+    /// fold — one per matching aggregator that yields an id. Used to drive
+    /// read-through restore before a runner folds the event.
+    pub fn restore_targets(
+        &self,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Vec<(String, String, Uuid)> {
+        let prefix = extract_prefix(event_type);
+        self.aggregators
+            .iter()
+            .filter(|a| a.event_prefix == prefix)
+            .filter_map(|a| {
+                a.extract_id_from_json(payload).map(|id| {
+                    (a.aggregate_type.clone(), a.stream_category.clone(), id)
+                })
+            })
+            .collect()
+    }
+
     /// Push each `(key, next)` from a fold's snapshots into the
     /// observer's `aggregate_folded` hook. Used by runners that
     /// folded an event and want to surface state-after-fold to
@@ -770,5 +798,168 @@ impl AggregatorRegistry {
 impl Default for AggregatorRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Durable restore / snapshot save (read-through on the aggregate's stream) ──
+//
+// Free functions so both `Engine` (for `load_aggregate`) and the consumer
+// runners (restore-before-fold / save-after-fold) share one implementation.
+
+/// Read-through restore of `(aggregate_type, id)` into `reg` from its own
+/// stream `{stream_category}-{id}`: load snapshot (if a store is wired) +
+/// replay the stream tail + fold; or replay from genesis if no snapshot.
+///
+/// Self-heals a snapshot blob that fails to deserialize (delete + rebuild from
+/// 0). No-op (returns `false`) when `stream_category` is empty (restore
+/// disabled) or the stream is empty and there is no snapshot. Idempotent: if
+/// `reg` already has state for the key, returns `true` without I/O.
+pub(crate) async fn restore_aggregate(
+    reg: &AggregatorRegistry,
+    snapshot_store: Option<&dyn SnapshotStore>,
+    log: &dyn EventLogBackend,
+    aggregate_type: &str,
+    stream_category: &str,
+    id: Uuid,
+) -> Result<bool> {
+    if stream_category.is_empty() {
+        return Ok(false);
+    }
+    let key = format!("{aggregate_type}:{id}");
+    if reg.has_state(&key) {
+        return Ok(true);
+    }
+    let Some(agg) = reg.find_first_by_aggregate_type(aggregate_type) else {
+        return Ok(false);
+    };
+    let upcasters = UpcasterRegistry::new();
+
+    let snap = match snapshot_store {
+        Some(store) => store.load_snapshot(aggregate_type, id).await?,
+        None => None,
+    };
+
+    // Seed state from the snapshot (self-heal on a bad blob), tracking the
+    // revision the seed represents.
+    let (mut state, after, mut last_rev): (
+        Box<dyn Any + Send + Sync>,
+        Option<StreamRevision>,
+        Option<StreamRevision>,
+    ) = match &snap {
+        Some(s) => match agg.deserialize_state(s.state.clone()) {
+            Ok(st) => (st, Some(s.revision), Some(s.revision)),
+            Err(e) => {
+                tracing::warn!(
+                    aggregate = %aggregate_type, %id, error = %e,
+                    "snapshot deserialize failed; self-healing (delete + rebuild from 0)"
+                );
+                if let Some(store) = snapshot_store {
+                    let _ = store.delete_snapshot(aggregate_type, id).await;
+                }
+                (agg.default_state(), None, None)
+            }
+        },
+        None => (agg.default_state(), None, None),
+    };
+    let had_snapshot = after.is_some();
+
+    // Replay the tail (events with revision > `after`; all of them if `None`).
+    let tail = log.read_stream(stream_category, id, after).await?;
+    let folded_any = !tail.is_empty();
+    if folded_any {
+        let pairs: Vec<(&str, &serde_json::Value)> =
+            tail.iter().map(|e| (e.event_type.as_str(), &e.payload)).collect();
+        reg.replay_events_onto(aggregate_type, state.as_mut(), &pairs, &upcasters)?;
+        last_rev = tail.last().map(|e| e.revision);
+    }
+
+    // Nothing to restore: no snapshot and an empty stream.
+    if !had_snapshot && !folded_any {
+        return Ok(false);
+    }
+
+    // version = count of events folded = last folded revision + 1.
+    let version = last_rev
+        .map(|r| StreamRevision::from_raw(r.raw() + 1))
+        .unwrap_or(StreamRevision::ZERO);
+    let snapshot_at = snap
+        .as_ref()
+        .map(|s| StreamRevision::from_raw(s.revision.raw() + 1))
+        .unwrap_or(StreamRevision::ZERO);
+    reg.set_state(&key, Arc::from(state), version, snapshot_at);
+    Ok(true)
+}
+
+/// Ensure every aggregate this event would fold is restored into `reg` before
+/// the live fold — so `ctx.aggregate` reads correct state after a restart.
+pub(crate) async fn restore_aggregates_for_event(
+    reg: &AggregatorRegistry,
+    snapshot_store: Option<&dyn SnapshotStore>,
+    log: &dyn EventLogBackend,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    for (aggregate_type, stream_category, id) in reg.restore_targets(event_type, payload) {
+        if stream_category.is_empty() {
+            continue;
+        }
+        restore_aggregate(reg, snapshot_store, log, &aggregate_type, &stream_category, id).await?;
+    }
+    Ok(())
+}
+
+/// Save a snapshot for any aggregate in `snapshots` that has folded at least
+/// `snapshot_every` events since its last snapshot. Best-effort: a save failure
+/// is logged and skipped (the next threshold crossing retries). `revision` is
+/// the aggregate stream's last-folded revision (`version - 1`), never `$all`.
+pub(crate) async fn maybe_save_snapshots(
+    reg: &AggregatorRegistry,
+    snapshot_store: &dyn SnapshotStore,
+    snapshot_every: u64,
+    snapshots: &TransitionSnapshots,
+) {
+    if snapshot_every == 0 {
+        return;
+    }
+    for (key, _prev, _next) in snapshots.iter() {
+        let Some((aggregate_type, id_str)) = key.split_once(':') else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(id_str) else {
+            continue;
+        };
+        let version = reg.get_version(key);
+        let snapshot_at = reg.get_snapshot_at_version(key);
+        if version.raw().saturating_sub(snapshot_at.raw()) < snapshot_every {
+            continue;
+        }
+        let Some(agg) = reg.find_first_by_aggregate_type(aggregate_type) else {
+            continue;
+        };
+        // Only snapshot restorable aggregates (those with a declared stream).
+        if agg.stream_category.is_empty() {
+            continue;
+        }
+        let Some(state) = reg.get_state(key) else {
+            continue;
+        };
+        let state_json = match agg.serialize_state(state.as_ref()) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(aggregate_key = %key, error = %e, "snapshot serialize failed; skipping");
+                continue;
+            }
+        };
+        let snapshot = Snapshot {
+            aggregate_type: aggregate_type.to_string(),
+            aggregate_id: id,
+            revision: StreamRevision::from_raw(version.raw().saturating_sub(1)),
+            state: state_json,
+            created_at: Utc::now(),
+        };
+        match snapshot_store.save_snapshot(snapshot).await {
+            Ok(()) => reg.update_snapshot_at_version(key, version),
+            Err(e) => tracing::warn!(aggregate_key = %key, error = %e, "save_snapshot failed; will retry"),
+        }
     }
 }
