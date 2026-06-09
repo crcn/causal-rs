@@ -1194,30 +1194,41 @@ impl Engine {
         Some((*curr).clone())
     }
 
-    /// Wait until every reactor chain triggered by `emit_result`
-    /// has fully quiesced — every consumer caught up, every reactor
-    /// output appended to the log, no pending work remaining.
+    /// Wait until the causal chain of `result.correlation_id` has fully
+    /// quiesced — every consumer caught up to the run's furthest event, every
+    /// reactor output in that chain appended, no pending work remaining for
+    /// *this run*. Other runs' concurrent traffic does not delay it.
     ///
-    /// Algorithm:
+    /// Algorithm (per-correlation high-water):
     ///
-    ///   1. Read `latest = log.latest_position()`.
-    ///   2. Wait for every consumer cursor to reach `latest`.
-    ///   3. Re-read latest. If unchanged from step 1, the chain has
-    ///      quiesced — return Ok. Otherwise loop (reactor outputs
-    ///      appended new events while we waited, so a downstream
-    ///      consumer may still have work).
+    ///   1. `hw` = the furthest `$all` position of any event in this run's
+    ///      chain (reactor outputs inherit the trigger's `correlation_id`),
+    ///      floored at `result.position` so we always wait for the trigger to
+    ///      be observed.
+    ///   2. Wait for every consumer cursor to reach `hw`.
+    ///   3. Re-read `hw`. If unchanged, the run has drained — return Ok.
+    ///      Otherwise a reactor appended a new chain event while we waited;
+    ///      loop.
     ///
-    /// This terminates for well-formed reactor topologies because
-    /// each input event produces a bounded number of outputs;
-    /// consumers eventually catch up; no new events can appear.
-    /// Self-feedback reactors (a reactor whose output triggers
-    /// itself) are NOT well-formed (see [`Reactor`] doc) and will
-    /// loop forever here too.
+    /// Terminates for well-formed topologies: each input produces a bounded
+    /// number of outputs, consumers catch up, and the run's high-water stops
+    /// moving. Self-feedback reactors (output retriggers itself) are NOT
+    /// well-formed (see [`Reactor`] doc) and loop forever here too.
     ///
-    /// Reactors run asynchronously in supervisor tasks; `settle`
-    /// polls their cursors until every consumer reaches the current
-    /// log head. Bounded latency depends on consumer batch size +
-    /// supervisor poll interval.
+    /// **Single-engine boundary.** The high-water is tracked in-process, so
+    /// `settle` is correct only when this run's reactors execute in the *same*
+    /// engine instance that called `settle` (the typical single-engine
+    /// deployment). If you run multiple engine instances against one shared
+    /// log, a run's reactor output produced on another instance is invisible
+    /// here and `settle` may return early — that topology needs a
+    /// backend-queried high-water instead.
+    ///
+    /// `settle` still waits on *every* registered consumer's cursor (cursors
+    /// are shared/global), so a consumer wedged on an unrelated run's event can
+    /// still delay it — per-run consumer isolation is a separate concern.
+    ///
+    /// Reactors run asynchronously in supervisor tasks; bounded latency depends
+    /// on consumer batch size + supervisor poll interval.
     pub async fn settle(&self, result: EmitResult) -> Result<()> {
         let corr = result.correlation_id;
         loop {
