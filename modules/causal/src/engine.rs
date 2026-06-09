@@ -172,6 +172,11 @@ pub struct DlqInfo {
     /// Number of attempts that ran before declaring terminal
     /// failure (equal to `max_attempts`).
     pub attempts:          u32,
+    /// `correlation_id` of the failing trigger — its run / causal chain.
+    /// The DLQ-synthesized event already inherits this; exposing it lets the
+    /// mapper key its terminal-failure event per-run (e.g. stream-by-`run_id`)
+    /// so a dead-letter can still unblock that run's downstream gates.
+    pub correlation_id:    Uuid,
 }
 
 /// Type-erased view of a [`Event`] for the emit builder.

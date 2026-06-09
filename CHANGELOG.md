@@ -4,6 +4,18 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-06-08
+
+### Added
+
+- `DlqInfo` now carries `correlation_id` — the failing trigger's run / causal
+  chain. The DLQ-synthesized event already inherited it; exposing it on the
+  struct lets an `on_dlq` mapper key its terminal-failure event per-run (e.g.
+  stream-by-`run_id`) so a dead-letter can still unblock that run's downstream
+  gates instead of leaving them waiting. Additive — `DlqInfo` is only
+  constructed by the runtime and handed to mappers, so existing consumers are
+  unaffected.
+
 ## [0.7.0] - 2026-06-08
 
 ### Added — Postgres observability (best-effort, fleet-wide inspector backend)

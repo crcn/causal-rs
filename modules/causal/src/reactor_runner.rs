@@ -328,6 +328,7 @@ where
                                 source_event_type: event.event_type.clone(),
                                 error:             format!("{:#}", e),
                                 attempts,
+                                correlation_id:    event.correlation_id,
                             };
                             let mapped = mapper(info);
                             self.checkpoint
@@ -927,9 +928,14 @@ mod tests {
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let dlq_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let dlq_calls_c = dlq_calls.clone();
+        // Capture the correlation_id the mapper is handed, so we can assert the
+        // mapper can see the failing trigger's run (per-run DLQ keying).
+        let seen_corr = std::sync::Arc::new(std::sync::Mutex::new(None::<Uuid>));
+        let seen_corr_c = seen_corr.clone();
 
         let mapper: DlqMapperArc = std::sync::Arc::new(move |info: DlqInfo| {
             dlq_calls_c.fetch_add(1, Ordering::SeqCst);
+            *seen_corr_c.lock().unwrap() = Some(info.correlation_id);
             Some(Box::new(HandlerFailed {
                 group_name: info.group_name,
                 attempts:   info.attempts,
@@ -986,6 +992,14 @@ mod tests {
         assert_eq!(
             dlq.correlation_id, trigger.correlation_id,
             "DLQ-synthesized fact MUST inherit trigger correlation_id",
+        );
+
+        // DlqInfo exposes that same correlation_id to the mapper, so a mapper
+        // can key its terminal-failure event per-run (rootsignal's use case).
+        let seen = seen_corr.lock().unwrap().expect("mapper ran");
+        assert_eq!(
+            seen, trigger.correlation_id,
+            "DlqInfo.correlation_id MUST be the failing trigger's run",
         );
 
         // Cursor is past the failing trigger — the runner is done with
