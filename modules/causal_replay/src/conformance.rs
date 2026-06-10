@@ -482,6 +482,158 @@ pub async fn latest_position_reflects_committed_writes<B: EventLogBackend>(
 }
 
 // ──────────────────────────────────────────────────────────────────
+// Scenarios — concurrency
+// ──────────────────────────────────────────────────────────────────
+
+/// Gap-visibility under concurrency: N concurrent appenders race a
+/// tailer that polls `read_all` and checkpoints after every batch.
+/// The tailer must eventually observe ALL N×M events exactly once, in
+/// strictly monotonic position order.
+///
+/// This is the property the Pg backend's advisory lock exists to
+/// protect: an unserialized BIGSERIAL log can expose position 11 while
+/// position 10's transaction is still in flight — a tailer that reads
+/// and checkpoints 11 then loses 10 forever once it commits. Any
+/// backend where commit order can diverge from position order fails
+/// here with a "seen N-of-200" count mismatch.
+pub async fn concurrent_appends_are_tailable_without_loss<B: EventLogBackend>(
+    b: &B,
+) -> Result<()> {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const APPENDERS: usize = 8;
+    const EVENTS_PER_APPENDER: usize = 25;
+
+    let correlation = Uuid::new_v4();
+    let aggregate_type = "conformance";
+
+    // Pre-build every batch (one distinct stream per appender) so the
+    // expected event_id set is known up front.
+    let stream_ids: Vec<Uuid> = (0..APPENDERS).map(|_| Uuid::new_v4()).collect();
+    let batches: Vec<Vec<EventData>> = stream_ids
+        .iter()
+        .map(|stream_id| {
+            (0..EVENTS_PER_APPENDER)
+                .map(|_| {
+                    fresh_event(
+                        correlation,
+                        "conformance:stress",
+                        Some(aggregate_type),
+                        Some(*stream_id),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let expected_ids: HashSet<Uuid> = batches
+        .iter()
+        .flatten()
+        .map(|e| e.event_id)
+        .collect();
+
+    // Start tailing from the current head so the scan stays bounded on
+    // shared durable backends with accumulated data. Safe: none of our
+    // events exist yet, so they all land strictly after this point.
+    let start = b.latest_position().await?;
+
+    let done = AtomicBool::new(false);
+
+    // One appender per stream: CAS-chained sequential appends, so each
+    // stream is internally ordered while the 8 streams race each other
+    // (and the tailer) in $all.
+    let appender = |i: usize| {
+        let batch = &batches[i];
+        let stream_id = stream_ids[i];
+        async move {
+            let mut expected = StreamState::NoStream;
+            for event in batch {
+                let r = b
+                    .append_to_stream(aggregate_type, stream_id, expected, vec![event.clone()])
+                    .await?;
+                expected = StreamState::StreamRevision(r.revision.raw());
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+    };
+    let appenders = async {
+        let results = tokio::join!(
+            appender(0), appender(1), appender(2), appender(3),
+            appender(4), appender(5), appender(6), appender(7),
+        );
+        done.store(true, Ordering::SeqCst);
+        results
+    };
+
+    // The tailer: read a batch, verify global monotonicity, checkpoint
+    // (advance the cursor) after EVERY batch — exactly what a reactor
+    // runner does. Stops once the appenders are done AND a subsequent
+    // poll drains nothing.
+    let tailer = async {
+        let mut cursor = start;
+        let mut last_position = start;
+        let mut seen: Vec<Uuid> = Vec::new();
+        // Bounded so a buggy backend fails loudly instead of hanging.
+        for _ in 0..100_000 {
+            let drained = done.load(Ordering::SeqCst);
+            let batch = b.read_all(cursor, 64).await?;
+            if batch.is_empty() {
+                if drained {
+                    // `done` was set BEFORE this read started, and the
+                    // read came back empty — the log is settled.
+                    return Ok::<_, anyhow::Error>(seen);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                continue;
+            }
+            for ev in &batch {
+                // Positions are global, so strict monotonicity must
+                // hold across ALL observed events — including foreign
+                // ones on a shared backend.
+                assert!(
+                    ev.position > last_position,
+                    "tailer observed non-monotonic position {:?} after {:?}",
+                    ev.position, last_position,
+                );
+                last_position = ev.position;
+                if ev.correlation_id == correlation {
+                    seen.push(ev.event_id);
+                }
+            }
+            // Checkpoint: the cursor only ever moves forward. A gap
+            // that fills in later is now unreachable — which is exactly
+            // what this scenario is designed to catch.
+            cursor = batch.last().unwrap().position;
+        }
+        anyhow::bail!("tailer did not settle within the iteration bound")
+    };
+
+    let ((a0, a1, a2, a3, a4, a5, a6, a7), seen) = tokio::join!(appenders, tailer);
+    for r in [a0, a1, a2, a3, a4, a5, a6, a7] {
+        r?;
+    }
+    let seen = seen?;
+
+    // Exactly once: no duplicates, no losses.
+    let seen_set: HashSet<Uuid> = seen.iter().copied().collect();
+    assert_eq!(
+        seen.len(),
+        seen_set.len(),
+        "tailer observed duplicate events (exactly-once violated)"
+    );
+    assert_eq!(
+        seen_set,
+        expected_ids,
+        "tailer must observe all {} events exactly once; saw {} — a missing \
+         event means a position became visible BEHIND an already-checkpointed \
+         cursor (commit order diverged from position order)",
+        APPENDERS * EVENTS_PER_APPENDER,
+        seen.len(),
+    );
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────
 
@@ -533,5 +685,6 @@ pub fn scenario_names() -> &'static [&'static str] {
         "read_stream_returns_empty_for_missing_stream",
         "read_all_returns_events_strictly_after_cursor",
         "latest_position_reflects_committed_writes",
+        "concurrent_appends_are_tailable_without_loss",
     ]
 }

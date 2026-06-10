@@ -19,10 +19,13 @@
 
 #![cfg(feature = "postgres")]
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Result;
 use causal::types::{LogCursor, EventData, StreamRevision, StreamState};
 use causal::EventLogBackend;
-use causal_replay::PgEventLogBackend;
+use causal_replay::{PgEventLogBackend, ADVISORY_LOCK_CLASS, ADVISORY_LOCK_OBJID};
 use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -215,6 +218,189 @@ async fn read_all_returns_events_in_position_order() -> Result<()> {
             "read_all must return monotonically-increasing positions"
         );
         prev = e.position;
+    }
+
+    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
+        .bind(correlation)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+/// Regression for the read_all gap-visibility bug: `position` is a
+/// BIGSERIAL assigned at INSERT, so without serialization a tailer can
+/// read+checkpoint position 11 while position 10's transaction is still
+/// in flight — losing 10 forever once it commits. The fix serializes
+/// every append behind `pg_advisory_xact_lock(ADVISORY_LOCK_CLASS,
+/// ADVISORY_LOCK_OBJID)`, making the pre-fix interleaving impossible.
+/// This test proves the serialization deterministically: while a raw
+/// transaction holds the lock, `append_to_stream` must queue behind it
+/// and complete only after the holder releases.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local DATABASE_URL + migration 054 applied"]
+async fn append_queues_behind_the_advisory_lock() -> Result<()> {
+    let pool = connect_local().await;
+    let backend = Arc::new(PgEventLogBackend::new(pool.clone()));
+
+    // Hold the append-serialization lock from a raw transaction —
+    // standing in for an in-flight append that has been assigned a
+    // position but not yet committed.
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(ADVISORY_LOCK_CLASS)
+        .bind(ADVISORY_LOCK_OBJID)
+        .execute(&mut *blocker)
+        .await?;
+
+    // A concurrent append must now block on the same lock.
+    let correlation = Uuid::new_v4();
+    let event = make_event(correlation, "test:lock_queue");
+    let b2 = Arc::clone(&backend);
+    let pending = tokio::spawn(async move { causal::append_event(&*b2, event).await });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !pending.is_finished(),
+        "append must queue behind the advisory lock while a writer txn is in flight"
+    );
+
+    // Release the lock (rollback the holder) — the append completes.
+    blocker.rollback().await?;
+    let result = pending.await??;
+    assert!(result.position > LogCursor::ZERO, "queued append landed after release");
+
+    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
+        .bind(correlation)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+/// Two concurrent `append_to_stream` calls (distinct streams) both
+/// succeed under the advisory lock — serialization, not failure — and
+/// `read_all` returns both events in commit order (strictly monotonic
+/// positions, no event hidden behind the other's cursor).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local DATABASE_URL + migration 054 applied"]
+async fn concurrent_appends_serialize_and_both_land() -> Result<()> {
+    let pool = connect_local().await;
+    let backend = Arc::new(PgEventLogBackend::new(pool.clone()));
+
+    let correlation = Uuid::new_v4();
+    let before = backend.latest_position().await?;
+
+    let spawn_append = |stream_id: Uuid, event: EventData| {
+        let b = Arc::clone(&backend);
+        tokio::spawn(async move {
+            b.append_to_stream("test_concurrent", stream_id, StreamState::NoStream, vec![event])
+                .await
+        })
+    };
+    let e1 = make_event(correlation, "test:racer_a");
+    let e2 = make_event(correlation, "test:racer_b");
+    let (id1, id2) = (e1.event_id, e2.event_id);
+    let h1 = spawn_append(Uuid::new_v4(), e1);
+    let h2 = spawn_append(Uuid::new_v4(), e2);
+
+    // Both succeed — the lock serializes, it never rejects.
+    let r1 = h1.await??;
+    let r2 = h2.await??;
+    assert_ne!(r1.position, r2.position, "distinct appends get distinct positions");
+
+    // Both are visible via read_all, in strictly monotonic position order.
+    let visible = backend.read_all(before, 10_000).await?;
+    let ours: Vec<_> = visible
+        .iter()
+        .filter(|e| e.correlation_id == correlation)
+        .collect();
+    assert_eq!(ours.len(), 2, "both concurrent appends must be tailable");
+    assert!(
+        ours[0].position < ours[1].position,
+        "read_all returns the racers in position (== commit) order"
+    );
+    assert_eq!(
+        [ours[0].event_id, ours[1].event_id].iter().collect::<std::collections::HashSet<_>>(),
+        [id1, id2].iter().collect::<std::collections::HashSet<_>>(),
+        "exactly the two racer events are visible"
+    );
+
+    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
+        .bind(correlation)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+/// `latest_position()` is a FROZEN high-water mark under concurrent
+/// appends: once a reader observes `latest_position() == p`, no event
+/// at position <= p may appear later. Pre-fix, an in-flight transaction
+/// holding a position below an already-committed one violates this; the
+/// advisory lock makes commit order == position order, so the set of
+/// events at or below any observed head is immutable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local DATABASE_URL + migration 054 applied"]
+async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
+    let pool = connect_local().await;
+    let backend = Arc::new(PgEventLogBackend::new(pool.clone()));
+
+    let correlation = Uuid::new_v4();
+
+    // Our events visible at or below position `p`, by raw SQL (scoped to
+    // this test's correlation so other writers on a shared DB can't
+    // perturb the assertion).
+    async fn ours_at_or_below(pool: &PgPool, correlation: Uuid, p: i64) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT event_id FROM causal_log
+              WHERE correlation_id = $1 AND position <= $2
+              ORDER BY position",
+        )
+        .bind(correlation)
+        .bind(p)
+        .fetch_all(pool)
+        .await?)
+    }
+
+    // 8 concurrent appenders × 10 events each, distinct streams.
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let b = Arc::clone(&backend);
+            let stream_id = Uuid::new_v4();
+            let events: Vec<EventData> =
+                (0..10).map(|_| make_event(correlation, "test:hwm")).collect();
+            tokio::spawn(async move {
+                let mut expected = StreamState::NoStream;
+                for event in events {
+                    let r = b
+                        .append_to_stream("test_hwm", stream_id, expected, vec![event])
+                        .await?;
+                    expected = StreamState::StreamRevision(r.revision.raw());
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+        })
+        .collect();
+
+    // While the appenders run, repeatedly snapshot (head, visible-set).
+    let mut samples: Vec<(i64, Vec<Uuid>)> = Vec::new();
+    while !handles.iter().all(|h| h.is_finished()) {
+        let head = backend.latest_position().await?.raw() as i64;
+        let seen = ours_at_or_below(&pool, correlation, head).await?;
+        samples.push((head, seen));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for h in handles {
+        h.await??;
+    }
+
+    // After everything committed, every snapshot must still hold: no
+    // event materialized at or below a previously observed head.
+    for (head, seen_then) in &samples {
+        let seen_now = ours_at_or_below(&pool, correlation, *head).await?;
+        assert_eq!(
+            &seen_now, seen_then,
+            "events appeared at or below an observed latest_position ({head}) \
+             after the fact — latest_position overtook an in-flight append"
+        );
     }
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
