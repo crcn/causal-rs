@@ -10,11 +10,14 @@
 //!
 //! - **Q1 idempotency.** CAS path (`append_to_stream`) uses
 //!   `StreamState::StreamRevision`; on `WrongExpectedVersion`, the
-//!   backend reads the conflict slice to distinguish a true duplicate
-//!   (return the existing WriteResult) from a real OCC collision
-//!   (surface `anyhow::Error` whose message includes the current
-//!   stream version, matching the PG backend's shape). Under expected
-//!   version, Kurrent's EventId dedup is a strong guarantee.
+//!   backend reads the conflict slice and classifies it with the
+//!   shared [`crate::reconcile`] helper (verifying EVERY batch
+//!   event_id, in order — not just the tail): a clean redelivery
+//!   returns the existing WriteResult; a real OCC collision surfaces
+//!   a typed `ConflictError` (matching the PG backend's shape); a
+//!   partial overlap — some-but-not-all ids present — fails loudly.
+//!   Under expected version, Kurrent's EventId dedup is a strong
+//!   guarantee.
 //!   Non-CAS `append` uses `StreamState::Any` + `EventData::id(event_id)`.
 //!   With `Any` the dedup is BEST-EFFORT: Kurrent compares the EventId
 //!   against the events currently at the stream head, so a retry that
@@ -66,6 +69,8 @@ mod kurrent {
     };
     use causal::EventLogBackend;
 
+    use crate::reconcile::{reconcile, Reconciliation};
+
     /// KurrentDB-backed event log.
     ///
     /// Construct with a connection string (`kurrentdb://...`) or by
@@ -114,9 +119,12 @@ mod kurrent {
                  Kurrent's '{{category}}-{{id}}' stream naming convention",
             );
             let stream = format!("{}-{}", category, stream_id);
-            let Some(last_event_id) = events.last().map(|e| e.event_id) else {
+            if events.is_empty() {
                 anyhow::bail!("append_to_stream: events must be non-empty");
-            };
+            }
+            // Batch ids in batch order — the reconcile helper verifies
+            // ALL of them on the conflict path, not just the tail.
+            let batch_ids: Vec<Uuid> = events.iter().map(|e| e.event_id).collect();
             // Kurrent commits the whole iterator as one atomic batch.
             let event_data = events
                 .iter()
@@ -147,34 +155,64 @@ mod kurrent {
                     revision: StreamRevision::from_raw(write.next_expected_version),
                 }),
                 Err(kurrentdb::Error::WrongExpectedVersion { current, .. }) => {
-                    // A batch lands atomically, so the last event's id
-                    // identifies the whole batch on the idempotent-retry path.
-                    let event_id = last_event_id;
                     let current_rev = match current {
                         CurrentRevision::Current(n) => Some(n),
                         CurrentRevision::NoStream => None,
                     };
 
-                    // Reconciliation: scan the conflict window for
-                    // our event_id (idempotent-retry path).
-                    match (expected, current_rev) {
+                    // Reconciliation: read the conflict window (every
+                    // event after the caller's expected revision) and
+                    // let the shared `reconcile` helper classify the
+                    // append — Redelivery / Conflict / PartialOverlap.
+                    // A window only exists when the stream moved PAST
+                    // the expectation; an expectation AHEAD of the head
+                    // (or a missing stream) is a plain conflict.
+                    let window = match (expected, current_rev) {
                         (CausalStreamState::StreamRevision(want), Some(c)) if c > want => {
-                            if let Some(found) = find_event_in_range(
-                                &self.client, &stream, want, c, event_id,
-                            ).await?
-                            {
-                                return Ok(found);
-                            }
+                            Some(read_conflict_window(
+                                &self.client,
+                                &stream,
+                                StreamPosition::Position(want + 1),
+                                (c - want) as usize,
+                            ).await?)
                         }
                         (CausalStreamState::NoStream, Some(c)) => {
-                            if let Some(found) = find_event_in_range_from_start(
-                                &self.client, &stream, c, event_id,
-                            ).await?
-                            {
-                                return Ok(found);
-                            }
+                            Some(read_conflict_window(
+                                &self.client,
+                                &stream,
+                                StreamPosition::Start,
+                                (c as usize) + 1,
+                            ).await?)
                         }
-                        _ => {}
+                        _ => None,
+                    };
+                    if let Some(window) = window {
+                        let window_ids: Vec<Uuid> =
+                            window.iter().map(|(id, _)| *id).collect();
+                        match reconcile(&batch_ids, &window_ids) {
+                            Reconciliation::Redelivery => {
+                                // The whole batch already landed on an
+                                // earlier attempt — return the ORIGINAL
+                                // WriteResult (last batch event's
+                                // coordinates), never an error.
+                                let last = batch_ids.last().expect("non-empty");
+                                let (_, result) = window
+                                    .iter()
+                                    .find(|(id, _)| id == last)
+                                    .expect("Redelivery ⇒ every batch id is in the window");
+                                return Ok(*result);
+                            }
+                            Reconciliation::PartialOverlap => {
+                                return Err(anyhow!(
+                                    "append_to_stream on {stream}: batch partially \
+                                     overlaps an earlier append — an event_id \
+                                     already exists but the full batch does not \
+                                     (event_ids must be all-new or \
+                                     all-already-persisted)"
+                                ));
+                            }
+                            Reconciliation::Conflict => {} // fall through
+                        }
                     }
                     // Typed ConflictError so Engine::append can downcast
                     // + retry (not a bare string).
@@ -422,53 +460,35 @@ mod kurrent {
         })
     }
 
-    /// On `WrongExpectedVersion` where the caller expected
-    /// `StreamRevision(want)`, scan `(want, current_rev]` for
-    /// `event_id` — the idempotent-retry path.
-    async fn find_event_in_range(
+    /// On `WrongExpectedVersion`, read the conflict window — every
+    /// event from `from` for `count` events — and return each event's
+    /// `(event_id, WriteResult)` in stream order. The shared
+    /// [`reconcile`] helper then classifies the failed append against
+    /// the ids; on `Redelivery` the caller picks the last batch id's
+    /// `WriteResult` out of this window (the original append's
+    /// coordinates).
+    ///
+    /// For `StreamRevision(want)` the window is `(want, current]`; for
+    /// `NoStream` it's the whole stream (the caller saw an `Ok` on a
+    /// previous append, Kurrent's EventId cache evicted it, and the
+    /// server now reports the stream has events — check if they're
+    /// ours).
+    async fn read_conflict_window(
         client: &Client,
         stream: &str,
-        want: u64,
-        current_rev: u64,
-        event_id: Uuid,
-    ) -> Result<Option<WriteResult>> {
-        let max = (current_rev - want) as usize;
+        from: StreamPosition<u64>,
+        count: usize,
+    ) -> Result<Vec<(Uuid, WriteResult)>> {
         let opts = ReadStreamOptions::default()
             .forwards()
-            .position(StreamPosition::Position(want + 1))
-            .max_count(max.max(1));
-        run_reconcile_scan(client, stream, opts, event_id).await
-    }
-
-    /// On `WrongExpectedVersion` where the caller expected
-    /// `NoStream`, scan the entire stream from the start for
-    /// `event_id`. The caller saw an `Ok` on a previous append; the
-    /// Kurrent cache evicted the EventId; Kurrent now reports the
-    /// stream has events — check whether one of them is ours.
-    async fn find_event_in_range_from_start(
-        client: &Client,
-        stream: &str,
-        current_rev: u64,
-        event_id: Uuid,
-    ) -> Result<Option<WriteResult>> {
-        let opts = ReadStreamOptions::default()
-            .forwards()
-            .position(StreamPosition::Start)
-            .max_count((current_rev as usize) + 1);
-        run_reconcile_scan(client, stream, opts, event_id).await
-    }
-
-    async fn run_reconcile_scan(
-        client: &Client,
-        stream: &str,
-        opts: ReadStreamOptions,
-        event_id: Uuid,
-    ) -> Result<Option<WriteResult>> {
+            .position(from)
+            .max_count(count.max(1));
         let mut read = match client.read_stream(stream, &opts).await {
             Ok(s) => s,
-            Err(kurrentdb::Error::ResourceNotFound) => return Ok(None),
+            Err(kurrentdb::Error::ResourceNotFound) => return Ok(Vec::new()),
             Err(e) => return Err(anyhow!("kurrent reconcile read failed: {e}")),
         };
+        let mut window = Vec::new();
         loop {
             let resolved = match read.next().await {
                 Ok(Some(r)) => r,
@@ -478,14 +498,15 @@ mod kurrent {
                 Err(e) => return Err(anyhow!("kurrent reconcile next failed: {e}")),
             };
             let rec = resolved.get_original_event();
-            if rec.id == event_id {
-                return Ok(Some(WriteResult {
+            window.push((
+                rec.id,
+                WriteResult {
                     position: LogCursor::from_raw(rec.position.commit),
                     revision: StreamRevision::from_raw(rec.revision),
-                }));
-            }
+                },
+            ));
         }
-        Ok(None)
+        Ok(window)
     }
 
     // ──────────────────────────────────────────────────────────────
