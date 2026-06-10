@@ -958,7 +958,18 @@ async fn repair_gap(
         }
         // Dense within one stream — no further gaps possible for THIS
         // aggregate; other aggregates' gaps surface to fold_event's loop.
-        reg.apply_event(&e.event_type, &e.payload, e.stream_id, &e.category, e.revision, e.position)?;
+        // The density assumption is load-bearing: if a backend ever
+        // returned a sparse `read_stream`, the `advance_watermark` below
+        // would jump past an unfolded event and silently drop a fold.
+        // Fail loud in debug if that invariant is ever violated.
+        let repair_outcome =
+            reg.apply_event(&e.event_type, &e.payload, e.stream_id, &e.category, e.revision, e.position)?;
+        debug_assert!(
+            repair_outcome.gaps.is_empty(),
+            "read_stream returned a non-dense stream for {}-{} — gap repair \
+             cannot guarantee fold completeness over holes",
+            gap.stream_category, gap.id,
+        );
         // A stream event that matches no aggregator folds as the
         // identity — but the watermark must still advance past it, or
         // the next matching event re-detects the same gap forever

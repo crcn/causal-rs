@@ -47,7 +47,7 @@ use causal_replay::{KurrentEventLogBackend, PgReactorCheckpoint};
 fn hybrid_construction_types_compose() {
     // We never actually connect; these closures only need to exist
     // for the type-checker to verify the trait objects line up.
-    fn _build_with(
+    async fn _build_with(
         kurrent: KurrentEventLogBackend,
         pg: PgReactorCheckpoint,
     ) -> impl Sized {
