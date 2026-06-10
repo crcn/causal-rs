@@ -1,0 +1,91 @@
+# CI — unit suite on every push; live backend suites (dockerized
+# Postgres + KurrentDB, the same stack `./dev.sh stack up` runs) on PRs
+# and main.
+#
+# The live job is `continue-on-error` for the burn-in period (see plan
+# 2026-06-10, Phase 0) so docker flakes can't stall correctness fixes.
+# Flip `continue-on-error: false` once it has been green for a week.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # No `cargo fmt --check`: the codebase uses deliberate hand-alignment
+      # rustfmt would flatten (657 diffs at time of writing). Revisit if the
+      # project ever adopts rustfmt wholesale.
+      # TODO(audit-remediation, end of PR): add `-- -D warnings` once the
+      # pre-existing warnings are cleared (most live in code Phase 1 deletes).
+      - run: cargo clippy --workspace --all-targets --all-features
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # In-memory suite — mirrors `./dev.sh test unit`.
+      - run: cargo test --workspace
+      # Doc examples must compile under every feature combination they
+      # show; gated examples (postgres/kurrent wiring) only materialize
+      # with --all-features.
+      - run: cargo test --doc --workspace --all-features
+
+  live:
+    runs-on: ubuntu-latest
+    needs: unit
+    # Burn-in: do not block merges on this job yet. Flip after a week green.
+    continue-on-error: true
+    env:
+      DATABASE_URL: postgres://causal:causal@localhost:5433/causal_dev
+      KURRENT_URL: kurrentdb://localhost:2114?tls=false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start live-test stack (Postgres :5433, Kurrent :2114)
+        run: docker compose -f dev/docker-compose.yml up -d --wait
+      - name: Apply migrations
+        # Mirrors dev/cli `stack::apply_pg_schema`: every migrations/*.sql
+        # in sorted order, ON_ERROR_STOP.
+        run: |
+          for f in $(ls migrations/*.sql | sort); do
+            echo "applying $f"
+            docker exec -i causal-dev-postgres \
+              psql -U causal -d causal_dev -v ON_ERROR_STOP=1 < "$f"
+          done
+      - name: Live Postgres suites
+        run: >
+          cargo test -p causal_replay --features postgres
+          --test pg_event_log_test
+          --test pg_event_log_conformance_test
+          --test pg_snapshot_store_test
+          -- --ignored
+      - name: Live KurrentDB suites
+        run: >
+          cargo test -p causal_replay --features kurrent
+          --test kurrent_event_log_test
+          --test kurrent_event_log_conformance_test
+          -- --ignored
+      - name: Live hybrid suite
+        run: >
+          cargo test -p causal_replay --features postgres,kurrent
+          --test kurrent_pg_hybrid_test
+          -- --ignored
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose -f dev/docker-compose.yml logs --tail 200

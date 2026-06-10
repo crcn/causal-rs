@@ -1,28 +1,57 @@
 //! # causal_replay
 //!
-//! Replay and projection library for causal event processing.
+//! Durable backends for the [`causal`] runtime, plus the cross-backend
+//! conformance suite and replay/mirroring utilities.
+//!
+//! ## What lives here
+//!
+//! - **Event logs** — [`KurrentEventLogBackend`] (feature `kurrent`) and
+//!   [`PgEventLogBackend`] (feature `postgres`), both implementing
+//!   `causal::EventLogBackend`.
+//! - **Cursors & snapshots** — [`PgReactorCheckpoint`] (projector/reactor
+//!   cursors + retry counters), [`PgSnapshotStore`] (aggregate snapshots).
+//! - **Observability** — [`PgReactorObserver`], [`PgInspectorReadModel`],
+//!   and [`PgEventProjector`] (mirrors the durable log into Postgres
+//!   `causal_log` for the inspector).
+//! - **Conformance** — [`conformance`]: every `EventLogBackend` impl runs
+//!   the same scenario suite (append idempotency on `event_id`, CAS via
+//!   `StreamState`, monotonic revisions, strict-after reads, isolation).
+//! - **Replay** — [`ProjectionStream`] / [`PointerStore`]: blue/green
+//!   read-model rebuilds driven by the `REPLAY` env var.
+//!
+//! ## Recommended production shape (hybrid)
+//!
+//! KurrentDB as the event log; Postgres for the cursor/snapshot work,
+//! which is inherently relational:
+//!
+//! ```no_run
+//! # #[cfg(all(feature = "postgres", feature = "kurrent"))]
+//! # async fn wire(pool: sqlx::PgPool) -> anyhow::Result<()> {
+//! use std::sync::Arc;
+//! use causal::{CheckpointStore, EngineBuilder, EventLogBackend, ReactorCheckpoint};
+//! use causal_replay::{KurrentEventLogBackend, PgReactorCheckpoint};
+//!
+//! let kurrent = KurrentEventLogBackend::connect("kurrentdb://localhost:2113?tls=false")?;
+//! let pg = Arc::new(PgReactorCheckpoint::new(pool));
+//!
+//! let engine = EngineBuilder::new(
+//!     Arc::new(kurrent) as Arc<dyn EventLogBackend>,
+//!     pg.clone() as Arc<dyn CheckpointStore>,
+//!     pg as Arc<dyn ReactorCheckpoint>,
+//! ).build();
+//! # let _ = engine;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The Postgres schema is `docs/schema.sql` in the repository; apply it
+//! via your migration runner — backends never auto-create tables.
+//!
+//! ## Replay mode
 //!
 //! Replay is a lifecycle state of the application, not an external tool.
 //! The same `apply()` function runs in both live and replay mode —
-//! `ProjectionStream::run()` checks the `REPLAY` env var internally.
-//!
-//! ## Quick Start
-//!
-//! ```ignore
-//! use causal_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource};
-//!
-//! let pointer = PgPointerStore::new(db.clone()).await?;
-//! let tail = PgNotifyTailSource::new(&db, "events").await?;
-//!
-//! let stream = ProjectionStream::new(&log, &pointer)
-//!     .tail(Box::new(tail))
-//!     .promote_if(|| health_check(&neo4j));
-//!
-//! let version = stream.version().await?;  // DB version for both modes
-//! let neo4j = connect(&format!("neo4j.v{version}")).await?;
-//!
-//! stream.run(|event| projections.apply(event)).await?;
-//! ```
+//! [`ProjectionStream::run`] checks the `REPLAY` env var internally:
 //!
 //! ```bash
 //! $ server                                  # live: catch up, tail

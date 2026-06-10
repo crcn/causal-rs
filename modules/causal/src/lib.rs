@@ -1,38 +1,91 @@
 //! # Causal
 //!
-//! A deterministic event/reactor runtime with TypeId-based multi-event dispatch.
+//! Event-sourcing runtime for Rust, [KurrentDB](https://www.kurrent.io/)-aligned:
+//! a typed `Event → Reactor → Event` loop over an append-only event log.
+//! Runs entirely in-memory for tests ([`MemoryStore`]); production backends
+//! (KurrentDB event log, Postgres cursors/snapshots) live in `causal_replay`.
+//!
+//! The vocabulary mirrors KurrentDB's where the concepts overlap:
+//! [`EventData`](types::EventData) / [`RecordedEvent`], `causation_id` /
+//! `correlation_id`, [`StreamRevision`] (0-indexed), [`StreamState`] for
+//! optimistic concurrency, `{category}-{stream_id}` stream names.
 //!
 //! ## Guarantees
 //!
-//! - **Multi-event dispatch**: Support for multiple event types via TypeId routing.
-//! - **Reactor system**: Register reactors that react to events and can emit
-//!   new events and access shared dependencies.
+//! - **At-least-once delivery, idempotent appends** — reactor outputs carry
+//!   deterministic `event_id`s, so crash-redelivery dedups on append.
+//! - **Replay determinism** — no wall-clock inside consumer bodies;
+//!   aggregate state is a pure fold of the log.
+//! - **Quiescence** — `emit(...).settled()` resolves when the event's
+//!   correlation chain has been observed by every consumer.
+//! - **OCC where you opt in** — the `Engine::append` decider path enforces
+//!   [`StreamState`] expectations with typed conflicts.
 //!
 //! ## Example
 //!
-//! ```ignore
-//! use causal::{Engine, Reactor, Events, Ctx, MemoryStore};
+//! ```
 //! use std::sync::Arc;
+//! use causal::{
+//!     CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend,
+//!     Events, MemoryStore, Reactor, ReactorCheckpoint,
+//! };
+//! use serde::{Deserialize, Serialize};
+//! use uuid::Uuid;
 //!
-//! struct WelcomeOnSignup;
+//! #[derive(Debug, Clone, Serialize, Deserialize)]
+//! struct OrderPlaced { order_id: Uuid, total: f64 }
+//!
+//! impl Event for OrderPlaced {
+//!     const CATEGORY: &'static str = "order";
+//!     fn event_type(&self) -> &str { "placed" }
+//!     fn stream_id(&self) -> Uuid { self.order_id }
+//! }
+//!
+//! #[derive(Debug, Clone, Serialize, Deserialize)]
+//! struct ShipmentRequested { order_id: Uuid }
+//!
+//! impl Event for ShipmentRequested {
+//!     const CATEGORY: &'static str = "shipment";
+//!     fn event_type(&self) -> &str { "requested" }
+//!     fn stream_id(&self) -> Uuid { self.order_id }
+//! }
+//!
+//! struct ShipOnPlaced;
 //!
 //! #[async_trait::async_trait]
-//! impl Reactor for WelcomeOnSignup {
-//!     type Trigger = UserCreated;
-//!     const GROUP_NAME: &'static str = "welcome_on_signup";
+//! impl Reactor for ShipOnPlaced {
+//!     type Trigger = OrderPlaced;
+//!     const GROUP_NAME: &'static str = "ship_on_placed";
 //!
-//!     async fn react(&self, trigger: &UserCreated, _ctx: Ctx<'_>) -> anyhow::Result<Events> {
-//!         Ok(causal::events![UserWelcomed { name: trigger.name.clone() }])
+//!     async fn react(&self, t: &OrderPlaced, _ctx: Ctx<'_>) -> anyhow::Result<Events> {
+//!         Ok(causal::events![ShipmentRequested { order_id: t.order_id }])
 //!     }
 //! }
 //!
+//! # fn main() -> anyhow::Result<()> {
+//! # tokio::runtime::Runtime::new()?.block_on(async {
 //! let store = Arc::new(MemoryStore::new());
-//! let engine = Engine::builder(store.clone(), store.clone(), store)
-//!     .with_reactor(WelcomeOnSignup)
+//! let engine = EngineBuilder::new(
+//!         store.clone() as Arc<dyn EventLogBackend>,
+//!         store.clone() as Arc<dyn CheckpointStore>,
+//!         store.clone() as Arc<dyn ReactorCheckpoint>,
+//!     )
+//!     .with_reactor(ShipOnPlaced)
 //!     .build();
 //!
-//! engine.emit(UserCreated { name: "Alice".into() }).settled().await?;
+//! // Persists the event, stamps causation/correlation, and resolves once
+//! // ShipOnPlaced has reacted and its output has landed in the log.
+//! engine.emit(OrderPlaced { order_id: Uuid::new_v4(), total: 99.99 })
+//!     .settled()
+//!     .await?;
+//! # anyhow::Ok(())
+//! # })
+//! # }
 //! ```
+//!
+//! The `#[event]` macro (feature `macros`, on by default) generates the
+//! [`Event`] impl from an enum; the example hand-rolls it to show the
+//! full trait surface.
 
 extern crate self as causal;
 

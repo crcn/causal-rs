@@ -37,6 +37,8 @@ pub fn run(ctx: &AppContext, cmd: TestCommand) -> Result<()> {
 }
 
 /// Run `cargo test ...` with optional env, from the repo root.
+/// Propagates failure — `./dev.sh test …` must exit non-zero when a
+/// suite fails so scripts and CI can trust it.
 fn cargo_test(ctx: &AppContext, args: &[&str], envs: &[(&str, &str)], label: &str) -> Result<()> {
     let mut command = Command::new("cargo");
     command.args(args).current_dir(&ctx.repo);
@@ -47,10 +49,11 @@ fn cargo_test(ctx: &AppContext, args: &[&str], envs: &[(&str, &str)], label: &st
     println!();
     if status.success() {
         ctx.print_success(&format!("{label} — passed"));
+        Ok(())
     } else {
         ctx.print_warning(&format!("{label} — failures above"));
+        anyhow::bail!("{label} suite failed")
     }
-    Ok(())
 }
 
 fn unit(ctx: &AppContext) -> Result<()> {
