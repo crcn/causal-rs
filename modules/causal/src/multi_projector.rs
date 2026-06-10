@@ -168,24 +168,37 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
 
         let mut applied = 0usize;
         for event in events {
-            // Fold every event into the aggregator registry (capture/
-            // restore around the body call) regardless of subscription
-            // match, so aggregators that span categories still see all
-            // events. Mirrors ProjectionRunner.
-            let rollback = self.aggregators.as_ref().map(|reg| {
-                let r = reg.capture_for_rollback(&event.event_type, &event.payload);
-                let snapshots = reg.apply_event(&event.event_type, &event.payload);
-                if let Some(obs) = self.observer.as_ref() {
-                    reg.notify_observer(
-                        &snapshots,
-                        obs.as_ref(),
-                        event.correlation_id,
-                        event.position,
-                        event.event_id,
-                    );
+            // Fold every event into the aggregator registry regardless
+            // of subscription match, so aggregators that span categories
+            // still see all events. Folds are idempotent on the event's
+            // stream coordinates — a failing body retried by the
+            // supervisor re-delivers harmlessly. Mirrors ProjectionRunner.
+            if let Some(reg) = self.aggregators.as_ref() {
+                let outcome = crate::aggregator::fold_event(
+                    reg,
+                    None,
+                    self.log.as_ref(),
+                    &event.event_type,
+                    &event.payload,
+                    event.stream_id,
+                    &event.category,
+                    event.revision,
+                    event.position,
+                    /* strict_to_event = */ true,
+                )
+                .await?;
+                if outcome.applied {
+                    if let Some(obs) = self.observer.as_ref() {
+                        reg.notify_observer(
+                            &outcome.snapshots,
+                            obs.as_ref(),
+                            event.correlation_id,
+                            event.position,
+                            event.event_id,
+                        );
+                    }
                 }
-                r
-            });
+            }
 
             // Subscription filter: skip + advance for events whose
             // category doesn't match any declared CATEGORY. Body never
@@ -215,9 +228,8 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                     applied += 1;
                 }
                 Err(e) => {
-                    if let (Some(reg), Some(r)) = (self.aggregators.as_ref(), rollback) {
-                        reg.restore_state(r);
-                    }
+                    // The fold above is NOT rolled back — registry state
+                    // reflects the log regardless of body success.
                     return Err(e);
                 }
             }
@@ -243,7 +255,19 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 let mut hit_cursor = false;
                 for event in batch {
                     if event.position > cursor { hit_cursor = true; break; }
-                    reg.apply_event(&event.event_type, &event.payload);
+                    crate::aggregator::fold_event(
+                        reg,
+                        None,
+                        self.log.as_ref(),
+                        &event.event_type,
+                        &event.payload,
+                        event.stream_id,
+                        &event.category,
+                        event.revision,
+                        event.position,
+                        /* strict_to_event = */ true,
+                    )
+                    .await?;
                 }
                 if hit_cursor || last_pos >= cursor { break; }
                 from = last_pos;

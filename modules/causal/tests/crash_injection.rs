@@ -169,8 +169,9 @@ async fn append_n(store: &MemoryStore, n: usize) {
             event_type: format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload: serde_json::to_value(&payload).unwrap(),
             created_at: Utc::now(),
-            category: None,
-            stream_id: None,
+            // Honest stream coordinates — what Engine::emit writes.
+            category: Some(<Recorded as Event>::CATEGORY.to_string()),
+            stream_id: Some(payload.id),
             metadata: serde_json::Map::new(),
             ephemeral: None,
             persistent: true,
@@ -296,8 +297,9 @@ async fn append_trigger(store: &MemoryStore) -> Uuid {
         event_type: format!("{}:{}", <Trigger as Event>::CATEGORY, payload.event_type()),
         payload: serde_json::to_value(&payload).unwrap(),
         created_at: Utc::now(),
-        category: None,
-        stream_id: None,
+        // Honest stream coordinates — what Engine::emit writes.
+        category: Some(<Trigger as Event>::CATEGORY.to_string()),
+        stream_id: Some(payload.id),
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
@@ -355,3 +357,134 @@ async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
 // (The outbox/relay crash-recovery tests were removed with slice 3 —
 // reactor outputs now append directly; their crash model is covered by
 // `reactor_append_then_checkpoint_crash_redelivers_idempotently` above.)
+
+// ─────────────────────────────────────────────────────────────────────
+// A2 — fold idempotency under crash/redelivery (2026-06-10 remediation)
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+struct TriggerCount { n: u32 }
+impl causal::Aggregate for TriggerCount {
+    const NAME: &'static str = "TriggerCount";
+}
+impl causal::aggregate::Apply<Trigger> for TriggerCount {
+    fn apply(&mut self, _: &Trigger) { self.n += 1; }
+}
+
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+struct EchoCount { n: u32 }
+impl causal::Aggregate for EchoCount {
+    const NAME: &'static str = "EchoCount";
+}
+impl causal::aggregate::Apply<Echoed> for EchoCount {
+    fn apply(&mut self, _: &Echoed) { self.n += 1; }
+}
+
+#[tokio::test]
+async fn crash_redelivery_folds_exactly_once_in_both_registries() {
+    // The full A2 crash model: a reactor with aggregators attached
+    // crashes between output-append and checkpoint-set. Redelivery
+    // must be exactly-once at EVERY layer:
+    //   log     — re-append dedups on the deterministic event_id
+    //             (pinned by the earlier test);
+    //   consumer registry — the trigger's re-fold is an idempotent
+    //             skip (pre-A2: double-counted);
+    //   engine registry   — the output's re-fold arrives with the
+    //             ORIGINAL WriteResult coordinates and skips
+    //             (pre-A2: reactor_runner re-folded unconditionally).
+    let inner = Arc::new(MemoryStore::new());
+    let trigger_event_id = append_trigger(&inner).await;
+    let _ = trigger_event_id;
+    let injector = FaultInjector::new(inner.clone());
+
+    let mut consumer_reg = causal::aggregator::AggregatorRegistry::new();
+    consumer_reg.register(causal::aggregator::Aggregator::for_type::<TriggerCount, Trigger>());
+    let consumer_reg = Arc::new(consumer_reg);
+
+    let mut engine_reg = causal::aggregator::AggregatorRegistry::new();
+    engine_reg.register(causal::aggregator::Aggregator::for_type::<EchoCount, Echoed>());
+    let engine_reg = Arc::new(engine_reg);
+
+    let runner = ReactorRunner::new(
+        EmitOne,
+        "r.fold-once",
+        injector.clone() as Arc<dyn EventLogBackend>,
+        injector.clone() as Arc<dyn ReactorCheckpoint>,
+    )
+    .with_aggregators(consumer_reg.clone())
+    .with_engine_aggregators(Some(engine_reg.clone()));
+
+    // The trigger's stream id (Trigger::stream_id = payload.id).
+    let events = EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
+    let trigger_stream_id = events[0].stream_id;
+
+    // Crash at the cursor advance, AFTER react + output append + folds.
+    injector.arm(FaultPoint::CheckpointSet);
+    assert!(runner.step(10).await.is_err());
+
+    // Recovery: redelivery re-reacts, re-appends (deduped), re-folds
+    // (skipped).
+    runner.step(10).await.unwrap();
+
+    let (_, trigger_count) = consumer_reg.get_transition_arc::<TriggerCount>(trigger_stream_id);
+    assert_eq!(trigger_count.n, 1,
+               "consumer registry folded the redelivered trigger exactly once");
+
+    let (_, echo_count) = engine_reg.get_transition_arc::<EchoCount>(Uuid::nil());
+    assert_eq!(echo_count.n, 1,
+               "engine registry folded the deduped output exactly once");
+}
+
+#[tokio::test]
+async fn cursor_set_failure_does_not_double_count_aggregates() {
+    // Transient checkpoint-set failure on a projection runner with
+    // aggregators: the retried step re-delivers already-folded events;
+    // each fold must be an idempotent skip. Pre-A2, the rollback
+    // machinery restored state only when the BODY failed — a
+    // checkpoint-set failure re-folded every event in the retried
+    // batch (Balance += amount double-counted).
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct RecordedCount { n: u32 }
+    impl causal::Aggregate for RecordedCount {
+        const NAME: &'static str = "RecordedCount";
+    }
+    impl causal::aggregate::Apply<Recorded> for RecordedCount {
+        fn apply(&mut self, _: &Recorded) { self.n += 1; }
+    }
+
+    let inner = Arc::new(MemoryStore::new());
+    append_n(&inner, 3).await;
+    let injector = FaultInjector::new(inner.clone());
+
+    let mut reg = causal::aggregator::AggregatorRegistry::new();
+    reg.register(causal::aggregator::Aggregator::for_type::<RecordedCount, Recorded>());
+    let reg = Arc::new(reg);
+
+    let m = CountingProjector::default();
+    let runner = ProjectionRunner::new(
+        m.clone(),
+        "m.fold-once",
+        injector.clone() as Arc<dyn EventLogBackend>,
+        injector.clone() as Arc<dyn CheckpointStore>,
+    )
+    .with_aggregators(reg.clone());
+
+    // First checkpoint.set fails after fact[0] folded + projected.
+    injector.arm(FaultPoint::CheckpointSet);
+    assert!(runner.step(10).await.is_err());
+
+    // Retry processes all three facts (fact[0] redelivered).
+    let outcome = runner.step(10).await.unwrap();
+    assert!(matches!(outcome, StepOutcome::Progressed { applied: 3 }));
+
+    // Every Recorded event has a unique stream id, so each aggregate
+    // entry must hold exactly one fold — a double-count shows as n=2
+    // on fact[0]'s entry.
+    let events = EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
+    for event in &events {
+        let (_, count) = reg.get_transition_arc::<RecordedCount>(event.stream_id);
+        assert_eq!(count.n, 1,
+                   "event at position {} folded exactly once across the retry",
+                   event.position.raw());
+    }
+}

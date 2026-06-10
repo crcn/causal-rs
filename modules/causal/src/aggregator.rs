@@ -253,36 +253,69 @@ impl Aggregator {
     }
 }
 
+/// Result of [`AggregatorRegistry::apply_event`].
+#[derive(Default)]
+pub struct FoldOutcome {
+    /// `(prev, next)` transition pairs per affected aggregate key —
+    /// exact on a real fold, reconstructed on an idempotent skip.
+    pub snapshots: TransitionSnapshots,
+    /// True if at least one aggregator actually mutated state (i.e.
+    /// not every match was an idempotent skip). Observers should only
+    /// be notified when this is set, so retries don't duplicate
+    /// timeline rows.
+    pub applied: bool,
+    /// Aggregates whose stream has events between their watermark and
+    /// this event's revision — fold them via read-through repair
+    /// ([`fold_event`]) before this event can fold.
+    pub gaps: Vec<FoldGap>,
+}
+
+/// One detected fold gap: the aggregate's stream advanced past the
+/// in-memory watermark without those events folding (out-of-order
+/// arrival between eager fold paths, or a not-yet-restored entry).
+pub struct FoldGap {
+    pub aggregate_type: String,
+    pub stream_category: String,
+    pub id: Uuid,
+    /// The next revision the entry expects (`ZERO` = nothing folded).
+    pub expected: StreamRevision,
+}
+
 // ── AggregatorRegistry ──────────────────────────────────────────────
 
-/// State entry that pairs aggregate state with its stream version.
+/// State entry that pairs aggregate state with its fold watermarks.
 ///
-/// Version travels with state in a single DashMap entry to avoid
-/// split-brain between separate maps.
+/// Watermarks travel with state in a single DashMap entry to avoid
+/// split-brain between separate maps. They are what makes folds
+/// **idempotent**: `apply_event` is a no-op for an event the entry has
+/// already seen, so checkpoint-set retries, crash redelivery, and
+/// DLQ-advance never double-count — fold tracks the log, not body
+/// success (2026-06-10 audit remediation, Phase A2; the old
+/// capture/restore rollback machinery this replaces was deleted —
+/// rolling back a fold because a *body* failed desynced state from
+/// the cursor permanently).
 #[derive(Clone)]
 struct StateEntry {
     state: Arc<dyn Any + Send + Sync>,
-    /// Stream version from the Store (ZERO = never persisted / unknown).
+    /// **Stream-aligned aggregates** (non-empty `stream_category`):
+    /// the next expected revision of the aggregate's own stream —
+    /// `last folded revision + 1`; ZERO = nothing folded. Revisions
+    /// are dense per stream, so `event.revision != version` detects
+    /// both redelivery (`<`, skip) and gaps (`>`, read-through
+    /// repair).
     version: StreamRevision,
+    /// **Fan-in aggregates** (empty `stream_category`, e.g. singleton
+    /// id_fn patterns): the `$all` position of the last folded event.
+    /// Folds gate on `position > last_pos` — exactly-once under the
+    /// in-position-order delivery every consumer runner provides.
+    /// (In the shared engine registry, where eager folds from
+    /// concurrent appends can arrive out of position order, a racing
+    /// older fold is skipped — documented trade against the silent
+    /// double-count this replaces. Consumer-registry views are always
+    /// exact.)
+    last_pos: LogCursor,
     /// Version at which last snapshot was taken (ZERO = never).
     snapshot_at_version: StreamRevision,
-}
-
-/// Captured aggregator state for rollback after a failed event-processing attempt.
-///
-/// Produced by [`AggregatorRegistry::capture_for_rollback`] before
-/// `apply_event` mutates state, consumed by
-/// [`AggregatorRegistry::restore_state`] when the engine needs to undo the
-/// mutation (e.g. projection failure → retry).
-pub(crate) struct AggregatorRollback {
-    entries: Vec<RollbackEntry>,
-}
-
-struct RollbackEntry {
-    key: String,
-    prev_key: String,
-    key_entry: Option<StateEntry>,
-    prev_entry: Option<StateEntry>,
 }
 
 /// Registry of aggregators with owned in-memory state.
@@ -325,50 +358,56 @@ impl AggregatorRegistry {
 
     /// Apply an event to all matching aggregators, using internal state.
     ///
+    /// `stream_id` / `category` / `revision` / `position` identify where
+    /// the event sits in the log: its own stream (placement) and its
+    /// `$all` position. They drive the **idempotency gate** — see
+    /// [`StateEntry`] — and the stream-alignment check below.
+    ///
     /// For each matching aggregator:
     /// 1. Read current state (or create default)
-    /// 2. Clone current state → prev snapshot
-    /// 3. Apply event to cloned current state
-    /// 4. Insert post-state + bumped version under the same per-key
-    ///    DashMap entry guard that held step 1
+    /// 2. Gate: skip if this entry already folded the event; surface a
+    ///    [`FoldGap`] if intervening stream events are missing (callers
+    ///    use [`fold_event`] which repairs gaps by read-through)
+    /// 3. Clone current state → prev snapshot
+    /// 4. Apply event to cloned current state — an apply error **fails
+    ///    the fold** (and thus the step); live fold and replay agree
+    ///    that a bad payload is fatal
+    /// 5. Insert post-state + advanced watermarks under the same
+    ///    per-key DashMap entry guard that held step 1
     ///
-    /// State is stored as concrete types via `Arc<dyn Any>` — zero
-    /// serialization overhead.
+    /// # Stream alignment (asserted)
+    ///
+    /// A *restorable* aggregator (non-empty `stream_category`) requires
+    /// every folded event to live in the aggregate's own stream:
+    /// `extract_id(payload) == event.stream_id` and `event.category ==
+    /// agg.stream_category`. Durable restore already hard-requires this
+    /// (it replays exactly `{stream_category}-{id}`); an aggregator
+    /// violating it was *already* broken — now it errors loudly instead
+    /// of silently diverging between live fold and restore.
     ///
     /// # Per-key atomicity
     ///
-    /// The RMW above is atomic per key. The DashMap `entry()` guard
-    /// holds the per-shard lock for the duration of `apply_event`'s
-    /// inner block, so concurrent callers targeting the same key
-    /// serialize: caller A reads pre=v0, writes post=v1; caller B
-    /// then reads pre=v1, writes post=v2.
-    ///
-    /// This matters because two paths fold into this registry
-    /// concurrently:
-    ///   1. `Engine::execute_emit` / `Engine::append` fold
-    ///      caller-emitted facts.
-    ///   2. `ReactorRunner` folds reactor-emitted facts right after it
-    ///      appends them to the log (for `engine.snapshot()` visibility).
-    ///
-    /// Before the entry-guarded variant landed (see the `Unreleased`
-    /// CHANGELOG entry that follows 0.4.6) these could lose updates
-    /// on the same stream key under load — a regression test
-    /// (`aggregator_apply_event_serializes_concurrent_callers`) pins
-    /// the contract.
+    /// The RMW is atomic per key: the DashMap `entry()` guard holds the
+    /// per-shard lock for the duration of the inner block, so concurrent
+    /// callers targeting the same key serialize. The idempotency gate
+    /// composes with this: caller A folds revision 5; a racing redelivery
+    /// of revision 5 skips.
     ///
     /// **Caveat: the `:prev` slot remains racy under fan-in.** It's
     /// written outside the entry guard (writing it inside risks
     /// deadlocking when `key` and `:prev` hash to the same DashMap
     /// shard). New readers should consume the `(prev, post)` pair
-    /// from the returned [`TransitionSnapshots`] instead — those are
-    /// captured under the guard and reflect this event's exact
-    /// transition.
+    /// from the returned [`TransitionSnapshots`] instead.
     pub fn apply_event(
         &self,
         event_type: &str,
         payload: &serde_json::Value,
-    ) -> TransitionSnapshots {
-        let mut snapshots = TransitionSnapshots::empty();
+        stream_id: Uuid,
+        category: &str,
+        revision: StreamRevision,
+        position: LogCursor,
+    ) -> Result<FoldOutcome> {
+        let mut outcome = FoldOutcome::default();
         let prefix = extract_prefix(event_type);
         let matching: Vec<&Aggregator> = self
             .aggregators
@@ -381,75 +420,159 @@ impl AggregatorRegistry {
                 Some(id) => id,
                 None => continue,
             };
+            let aligned = !agg.stream_category.is_empty();
+
+            // Stream-alignment assertion for restorable aggregates —
+            // see the doc comment. Loud, because live fold and durable
+            // restore would otherwise silently disagree.
+            if aligned && (aggregate_id != stream_id || agg.stream_category != category) {
+                anyhow::bail!(
+                    "aggregator for `{}` declares stream_category `{}` (restorable) but \
+                     folded event `{}` from stream `{}-{}` with extracted id {} — a \
+                     restorable aggregate must fold exactly its own stream",
+                    agg.aggregate_type, agg.stream_category,
+                    event_type, category, stream_id, aggregate_id,
+                );
+            }
 
             let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
             let prev_key = format!("{}:prev", key);
 
-            // Atomic RMW under the DashMap entry guard. Holding the
-            // entry serializes concurrent applies on the same key,
-            // closing the lost-update race between the caller-emit path
-            // (`Engine::execute_emit` / `append`) and the reactor-emit
-            // path (`ReactorRunner`).
-            let (pre_state, post_state) = {
+            // Atomic gate + RMW under the DashMap entry guard.
+            enum Action {
+                Folded {
+                    pre: Arc<dyn Any + Send + Sync>,
+                    post: Arc<dyn Any + Send + Sync>,
+                },
+                /// Idempotent skip; `exact_prev` = the skipped event is
+                /// the entry's most recent fold, so the `:prev` slot
+                /// still holds its true pre-state (retry semantics).
+                Skipped { exact_prev: bool },
+                Gap { expected: StreamRevision },
+            }
+            let action = {
                 use dashmap::mapref::entry::Entry;
                 let entry = self.state.entry(key.clone());
 
-                let (pre_state, current_version, snapshot_at) = match &entry {
-                    Entry::Occupied(occ) => {
-                        let e = occ.get();
-                        (e.state.clone(), e.version, e.snapshot_at_version)
-                    }
-                    Entry::Vacant(_) => {
+                let existing = match &entry {
+                    Entry::Occupied(occ) => Some(occ.get().clone()),
+                    Entry::Vacant(_) => None,
+                };
+                let (pre_state, version, last_pos, snapshot_at) = match &existing {
+                    Some(e) => (e.state.clone(), e.version, e.last_pos, e.snapshot_at_version),
+                    None => {
                         let default: Arc<dyn Any + Send + Sync> =
                             Arc::from(agg.default_state());
-                        (default, StreamRevision::ZERO, StreamRevision::ZERO)
+                        (default, StreamRevision::ZERO, LogCursor::ZERO, StreamRevision::ZERO)
                     }
                 };
 
-                let mut next_state = agg.clone_state(pre_state.as_ref());
-                if let Err(e) = agg.apply_to(next_state.as_mut(), payload.clone()) {
-                    tracing::error!("Failed to apply event to aggregate {}: {}", key, e);
-                }
-                let post_state: Arc<dyn Any + Send + Sync> = Arc::from(next_state);
-
-                let new_entry = StateEntry {
-                    state: post_state.clone(),
-                    version: StreamRevision::from_raw(current_version.raw() + 1),
-                    snapshot_at_version: snapshot_at,
+                // ── Idempotency gate ─────────────────────────────
+                let gate = if aligned {
+                    use std::cmp::Ordering::*;
+                    match revision.cmp(&version) {
+                        Less => Some(Action::Skipped {
+                            exact_prev: revision.raw() + 1 == version.raw(),
+                        }),
+                        Greater => Some(Action::Gap { expected: version }),
+                        Equal => None, // next-in-sequence: fold
+                    }
+                } else if existing.is_some() {
+                    // Fan-in: lexicographic (position, revision). An atomic
+                    // multi-fact batch shares one commit position; its
+                    // facts are ordered by their per-stream revisions, so
+                    // position alone would wrongly skip facts 2..n.
+                    let newer = position > last_pos
+                        || (position == last_pos && revision.raw() + 1 > version.raw());
+                    if newer {
+                        None
+                    } else {
+                        Some(Action::Skipped {
+                            exact_prev: position == last_pos
+                                && revision.raw() + 1 == version.raw(),
+                        })
+                    }
+                } else {
+                    None
                 };
-                match entry {
-                    Entry::Occupied(mut occ) => {
-                        occ.insert(new_entry);
-                    }
-                    Entry::Vacant(vac) => {
-                        vac.insert(new_entry);
-                    }
-                }
 
-                (pre_state, post_state)
+                if let Some(skip_or_gap) = gate {
+                    skip_or_gap
+                } else {
+                    let mut next_state = agg.clone_state(pre_state.as_ref());
+                    agg.apply_to(next_state.as_mut(), payload.clone())
+                        .map_err(|e| anyhow::anyhow!(
+                            "fold failed for aggregate {key} on event `{event_type}` \
+                             (revision {}): {e:#}", revision.raw(),
+                        ))?;
+                    let post_state: Arc<dyn Any + Send + Sync> = Arc::from(next_state);
+
+                    let new_entry = StateEntry {
+                        state: post_state.clone(),
+                        version: StreamRevision::from_raw(revision.raw() + 1),
+                        last_pos: position,
+                        snapshot_at_version: snapshot_at,
+                    };
+                    match entry {
+                        Entry::Occupied(mut occ) => { occ.insert(new_entry); }
+                        Entry::Vacant(vac) => { vac.insert(new_entry); }
+                    }
+                    Action::Folded { pre: pre_state, post: post_state }
+                }
             };
 
-            // `:prev` slot lives on a separate DashMap entry that may
-            // hash to a different (or the SAME) shard. Writing it
-            // under the entry guard above risks a same-shard
-            // deadlock; writing it after release keeps the slot
-            // best-effort. The slot is documented racy under fan-in;
-            // new code reads the captured transition from
-            // `TransitionSnapshots` (returned below).
-            self.state.insert(
-                prev_key,
-                StateEntry {
-                    state: pre_state.clone(),
-                    version: StreamRevision::ZERO,
-                    snapshot_at_version: StreamRevision::ZERO,
-                },
-            );
-
-            // Capture per-event (pre, post) for transition guards.
-            snapshots.insert(key, pre_state, post_state);
+            match action {
+                Action::Folded { pre, post } => {
+                    // `:prev` slot lives on a separate DashMap entry that
+                    // may hash to a different (or the SAME) shard. Writing
+                    // it under the entry guard above risks a same-shard
+                    // deadlock; writing it after release keeps the slot
+                    // best-effort (documented racy under fan-in).
+                    self.state.insert(
+                        prev_key,
+                        StateEntry {
+                            state: pre.clone(),
+                            version: StreamRevision::ZERO,
+                            last_pos: LogCursor::ZERO,
+                            snapshot_at_version: StreamRevision::ZERO,
+                        },
+                    );
+                    outcome.applied = true;
+                    outcome.snapshots.insert(key, pre, post);
+                }
+                Action::Skipped { exact_prev } => {
+                    // Redelivery of an already-folded event: reproduce the
+                    // transition pair so a retried body (e.g. checkpoint-set
+                    // failure) sees the same (prev, curr) the first attempt
+                    // did. Exact when this was the entry's latest fold;
+                    // degenerate (curr, curr) otherwise.
+                    let curr = self
+                        .state
+                        .get(&key)
+                        .map(|e| e.state.clone())
+                        .unwrap_or_else(|| Arc::from(agg.default_state()));
+                    let prev = if exact_prev {
+                        self.state
+                            .get(&prev_key)
+                            .map(|e| e.state.clone())
+                            .unwrap_or_else(|| curr.clone())
+                    } else {
+                        curr.clone()
+                    };
+                    outcome.snapshots.insert(key, prev, curr);
+                }
+                Action::Gap { expected } => {
+                    outcome.gaps.push(FoldGap {
+                        aggregate_type: agg.aggregate_type.clone(),
+                        stream_category: agg.stream_category.clone(),
+                        id: aggregate_id,
+                        expected,
+                    });
+                }
+            }
         }
 
-        snapshots
+        Ok(outcome)
     }
 
     /// Panic unless at least one aggregator was registered for `A`.
@@ -556,7 +679,24 @@ impl AggregatorRegistry {
     ///
     /// Used during cold-start hydration from the Store.
     pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: StreamRevision, snapshot_at_version: StreamRevision) {
-        self.state.insert(key.to_string(), StateEntry { state, version, snapshot_at_version });
+        self.state.insert(
+            key.to_string(),
+            StateEntry { state, version, last_pos: LogCursor::ZERO, snapshot_at_version },
+        );
+    }
+
+    /// Advance an entry's fold watermarks past `revision`/`position`
+    /// without mutating state — the identity fold for a stream event
+    /// that matches no aggregator. Monotonic; no-op on a vacant entry.
+    pub(crate) fn advance_watermark(&self, key: &str, revision: StreamRevision, position: LogCursor) {
+        if let Some(mut e) = self.state.get_mut(key) {
+            if revision.raw() + 1 > e.version.raw() {
+                e.version = StreamRevision::from_raw(revision.raw() + 1);
+            }
+            if position > e.last_pos {
+                e.last_pos = position;
+            }
+        }
     }
 
     /// Read the stream version from the DashMap entry.
@@ -681,64 +821,6 @@ impl AggregatorRegistry {
         }
     }
 
-    /// Capture pre-mutation state for the aggregates that would be affected
-    /// by `apply_event(event_type, payload)`. The returned handle can be
-    /// passed to [`restore_state`](Self::restore_state) to undo the mutation
-    /// — used by the engine to roll back aggregator state when
-    /// `process_event_inner` fails after `apply_event` already ran.
-    ///
-    /// Captures the existing entry for both `key` and `key:prev` (or absence).
-    pub(crate) fn capture_for_rollback(
-        &self,
-        event_type: &str,
-        payload: &serde_json::Value,
-    ) -> AggregatorRollback {
-        let prefix = extract_prefix(event_type);
-        let mut entries = Vec::new();
-        for agg in self.aggregators.iter().filter(|a| a.event_prefix == prefix) {
-            let aggregate_id = match agg.extract_id_from_json(payload) {
-                Some(id) => id,
-                None => continue,
-            };
-            let key = format!("{}:{}", agg.aggregate_type, aggregate_id);
-            let prev_key = format!("{}:prev", key);
-            let key_entry = self.state.get(&key).map(|e| e.clone());
-            let prev_entry = self.state.get(&prev_key).map(|e| e.clone());
-            entries.push(RollbackEntry {
-                key,
-                prev_key,
-                key_entry,
-                prev_entry,
-            });
-        }
-        AggregatorRollback { entries }
-    }
-
-    /// Restore aggregator state captured by [`capture_for_rollback`](Self::capture_for_rollback).
-    ///
-    /// Each captured entry is restored to its prior value, or removed if it
-    /// did not exist before. Idempotent if called twice with the same handle.
-    pub(crate) fn restore_state(&self, rollback: AggregatorRollback) {
-        for entry in rollback.entries {
-            match entry.key_entry {
-                Some(state_entry) => {
-                    self.state.insert(entry.key, state_entry);
-                }
-                None => {
-                    self.state.remove(&entry.key);
-                }
-            }
-            match entry.prev_entry {
-                Some(state_entry) => {
-                    self.state.insert(entry.prev_key, state_entry);
-                }
-                None => {
-                    self.state.remove(&entry.prev_key);
-                }
-            }
-        }
-    }
-
     /// Replay events onto an existing state (for snapshot + partial replay).
     ///
     /// Matches events by short type name.
@@ -778,6 +860,114 @@ impl Default for AggregatorRegistry {
 //
 // Free functions so both `Engine` (for `load_aggregate`) and the consumer
 // runners (restore-before-fold / save-after-fold) share one implementation.
+
+/// Fold one event into `reg`, repairing revision gaps by read-through
+/// on the aggregate's own stream. **This is the fold entry point** for
+/// every caller with log access (engine emit/append, runners, DLQ,
+/// hydration); raw [`AggregatorRegistry::apply_event`] never repairs.
+///
+/// Gaps arise when (a) the entry was never folded/restored (fresh
+/// process, lazily-touched aggregate), or (b) eager folds from
+/// concurrent appends arrive out of revision order — the later
+/// revision's fold reads the missing range (committed by definition:
+/// revisions are assigned at commit) before folding. A redelivered
+/// already-folded event is an idempotent skip inside `apply_event`.
+///
+/// `strict_to_event` bounds repair at this event's revision. Consumer
+/// runners MUST pass `true`: their registries promise
+/// `state == fold(log[..cursor])`, so repair must not fold stream
+/// events beyond the one being delivered (and the snapshot-restore
+/// fast path, which jumps to the stream tail, is skipped). The shared
+/// engine registry passes `false` — it is eager read-your-write state
+/// with no cursor, so folding to the tail (and snapshot-accelerated
+/// restore) is both safe and desirable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fold_event(
+    reg: &AggregatorRegistry,
+    snapshot_store: Option<&dyn SnapshotStore>,
+    log: &dyn EventLogBackend,
+    event_type: &str,
+    payload: &serde_json::Value,
+    stream_id: Uuid,
+    category: &str,
+    revision: StreamRevision,
+    position: LogCursor,
+    strict_to_event: bool,
+) -> Result<FoldOutcome> {
+    // Each round strictly advances at least one aggregator's watermark,
+    // so rounds are bounded by the number of matching aggregators.
+    // 8 is a generous ceiling.
+    for _ in 0..8 {
+        let outcome =
+            reg.apply_event(event_type, payload, stream_id, category, revision, position)?;
+        if outcome.gaps.is_empty() {
+            return Ok(outcome);
+        }
+        let bound = strict_to_event.then_some(revision);
+        for gap in &outcome.gaps {
+            repair_gap(reg, snapshot_store, log, gap, bound).await?;
+        }
+    }
+    anyhow::bail!(
+        "fold_event: gap repair did not converge for event `{event_type}` \
+         (stream {category}-{stream_id}, revision {}) — the aggregate stream \
+         is missing revisions it claims to have",
+        revision.raw(),
+    )
+}
+
+/// Bring one gapped aggregate entry up to date: snapshot-accelerated
+/// restore when the entry is vacant (unbounded mode only), otherwise
+/// fold the missing stream range through `apply_event` so watermarks
+/// advance per event. With `upto = Some(r)`, only events with
+/// `revision < r` fold — the caller delivers `r` itself next.
+async fn repair_gap(
+    reg: &AggregatorRegistry,
+    snapshot_store: Option<&dyn SnapshotStore>,
+    log: &dyn EventLogBackend,
+    gap: &FoldGap,
+    upto: Option<StreamRevision>,
+) -> Result<()> {
+    let key = format!("{}:{}", gap.aggregate_type, gap.id);
+    if upto.is_none()
+        && !reg.has_state(&key)
+        && restore_aggregate(
+            reg,
+            snapshot_store,
+            log,
+            &gap.aggregate_type,
+            &gap.stream_category,
+            gap.id,
+        )
+        .await?
+    {
+        return Ok(());
+    }
+
+    let after = if gap.expected == StreamRevision::ZERO {
+        None
+    } else {
+        Some(StreamRevision::from_raw(gap.expected.raw() - 1))
+    };
+    let tail = log.read_stream(&gap.stream_category, gap.id, after).await?;
+    for e in &tail {
+        if let Some(bound) = upto {
+            if e.revision >= bound {
+                break;
+            }
+        }
+        // Dense within one stream — no further gaps possible for THIS
+        // aggregate; other aggregates' gaps surface to fold_event's loop.
+        reg.apply_event(&e.event_type, &e.payload, e.stream_id, &e.category, e.revision, e.position)?;
+        // A stream event that matches no aggregator folds as the
+        // identity — but the watermark must still advance past it, or
+        // the next matching event re-detects the same gap forever
+        // (mixed streams: foreign events interleaved with the
+        // aggregate's own).
+        reg.advance_watermark(&key, e.revision, e.position);
+    }
+    Ok(())
+}
 
 /// Read-through restore of `(aggregate_type, id)` into `reg` from its own
 /// stream `{stream_category}-{id}`: load snapshot (if a store is wired) +
@@ -862,24 +1052,6 @@ pub(crate) async fn restore_aggregate(
     Ok(true)
 }
 
-/// Ensure every aggregate this event would fold is restored into `reg` before
-/// the live fold — so `ctx.aggregate` reads correct state after a restart.
-pub(crate) async fn restore_aggregates_for_event(
-    reg: &AggregatorRegistry,
-    snapshot_store: Option<&dyn SnapshotStore>,
-    log: &dyn EventLogBackend,
-    event_type: &str,
-    payload: &serde_json::Value,
-) -> Result<()> {
-    for (aggregate_type, stream_category, id) in reg.restore_targets(event_type, payload) {
-        if stream_category.is_empty() {
-            continue;
-        }
-        restore_aggregate(reg, snapshot_store, log, &aggregate_type, &stream_category, id).await?;
-    }
-    Ok(())
-}
-
 /// Save a snapshot for any aggregate in `snapshots` that has folded at least
 /// `snapshot_every` events since its last snapshot. Best-effort: a save failure
 /// is logged and skipped (the next threshold crossing retries). `revision` is
@@ -933,5 +1105,172 @@ pub(crate) async fn maybe_save_snapshots(
             Ok(()) => reg.update_snapshot_at_version(key, version),
             Err(e) => tracing::warn!(aggregate_key = %key, error = %e, "save_snapshot failed; will retry"),
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregate::{Aggregate, Apply};
+    use crate::event::Event;
+    use crate::memory_store::MemoryStore;
+    use crate::types::EventData;
+    use chrono::Utc;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Ping { id: Uuid }
+    impl Event for Ping {
+        const CATEGORY: &'static str = "ping";
+        fn event_type(&self) -> &str { "pinged" }
+        fn stream_id(&self) -> Uuid { self.id }
+    }
+
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct PingCount { n: u32 }
+    impl Aggregate for PingCount {
+        const NAME: &'static str = "PingCount";
+        // Restorable / stream-aligned: folds exactly the `ping` stream.
+        // This is what selects revision gating + gap repair (an
+        // aggregate without STREAM_CATEGORY is fan-in: position-gated,
+        // never repaired, never snapshotted).
+        const STREAM_CATEGORY: &'static str = "ping";
+    }
+    impl Apply<Ping> for PingCount {
+        fn apply(&mut self, _: &Ping) { self.n += 1; }
+    }
+
+    async fn append_pings(store: &MemoryStore, id: Uuid, n: usize) {
+        for _ in 0..n {
+            let payload = Ping { id };
+            let ev = EventData {
+                event_id: Uuid::new_v4(),
+                causation_id: None,
+                correlation_id: Uuid::new_v4(),
+                event_type: format!("ping:{}", payload.event_type()),
+                payload: serde_json::to_value(&payload).unwrap(),
+                created_at: Utc::now(),
+                category: Some("ping".into()),
+                stream_id: Some(id),
+                metadata: serde_json::Map::new(),
+                ephemeral: None,
+                persistent: true,
+            };
+            crate::append_event(store, ev).await.unwrap();
+        }
+    }
+
+    /// A2: an out-of-order fold arrival (a later revision folding
+    /// before an earlier one — the eager engine-registry race) detects
+    /// the gap and heals by read-through on the aggregate's own
+    /// stream. The earlier revisions' own folds then skip
+    /// idempotently. Pre-A2: out-of-order folds either misordered
+    /// state or (with a naive watermark) silently dropped folds.
+    #[tokio::test]
+    async fn out_of_order_fold_heals_via_gap_repair() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_pings(&store, id, 3).await;
+        let events = crate::event_log::EventLogBackend::read_all(
+            &store, LogCursor::ZERO, 10,
+        ).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<PingCount, Ping>());
+
+        // Fold the LAST event first — revision 2 against an empty
+        // entry → gap → repair reads revisions 0..1 from the stream,
+        // folds them, then folds revision 2.
+        let last = &events[2];
+        let _outcome = fold_event(
+            &reg, None, &store,
+            &last.event_type, &last.payload,
+            last.stream_id, &last.category, last.revision, last.position,
+            /* strict_to_event = */ false,
+        ).await.unwrap();
+        // (In unbounded mode the vacant-entry repair restores through
+        // the stream tail — which already includes this event — so the
+        // final apply registers as an idempotent skip. State is what
+        // matters:)
+
+        let key = format!("PingCount:{id}");
+        assert_eq!(reg.get_version(&key).raw(), 3, "watermark at tail");
+        let state = reg.get_state(&key).unwrap();
+        assert_eq!(state.downcast_ref::<PingCount>().unwrap().n, 3,
+                   "repair folded the missing revisions in order");
+
+        // The earlier events' own (late) folds are idempotent skips.
+        for event in &events[..2] {
+            let outcome = fold_event(
+                &reg, None, &store,
+                &event.event_type, &event.payload,
+                event.stream_id, &event.category, event.revision, event.position,
+                false,
+            ).await.unwrap();
+            assert!(!outcome.applied, "late arrival skips — already folded");
+        }
+        let state = reg.get_state(&key).unwrap();
+        assert_eq!(state.downcast_ref::<PingCount>().unwrap().n, 3,
+                   "no double-counting from late arrivals");
+    }
+
+    /// Strict mode (consumer registries): repair must NOT fold stream
+    /// events at or beyond the event being delivered — the registry
+    /// promises `state == fold(log[..cursor])`.
+    #[tokio::test]
+    async fn strict_gap_repair_stops_at_the_delivered_event() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_pings(&store, id, 4).await;
+        let events = crate::event_log::EventLogBackend::read_all(
+            &store, LogCursor::ZERO, 10,
+        ).await.unwrap();
+
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<PingCount, Ping>());
+
+        // Deliver revision 2 strictly (revisions 3 exists in the log
+        // but has not been delivered to this consumer yet).
+        let e2 = &events[2];
+        fold_event(
+            &reg, None, &store,
+            &e2.event_type, &e2.payload, e2.stream_id, &e2.category,
+            e2.revision, e2.position,
+            /* strict_to_event = */ true,
+        ).await.unwrap();
+
+        let key = format!("PingCount:{id}");
+        assert_eq!(reg.get_version(&key).raw(), 3,
+                   "watermark stops at the delivered event — revision 3 not folded");
+        let state = reg.get_state(&key).unwrap();
+        assert_eq!(state.downcast_ref::<PingCount>().unwrap().n, 3,
+                   "exactly revisions 0..=2 folded; the undelivered tail is untouched");
+    }
+
+    /// The stream-alignment assertion: a restorable aggregator whose
+    /// extracted id disagrees with the event's stream id errors loudly
+    /// instead of silently diverging from what restore would rebuild.
+    #[tokio::test]
+    async fn misaligned_restorable_aggregator_fails_loudly() {
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<PingCount, Ping>());
+
+        let payload = serde_json::to_value(Ping { id: Uuid::new_v4() }).unwrap();
+        // Event claims to live in a DIFFERENT stream than the
+        // aggregator extracts from the payload.
+        let err = reg.apply_event(
+            "ping:pinged", &payload,
+            Uuid::new_v4(), // foreign stream id
+            "ping",
+            StreamRevision::ZERO,
+            LogCursor::from_raw(1),
+        ).err().expect("misaligned fold must error");
+        assert!(err.to_string().contains("must fold exactly its own stream"),
+                "unexpected error: {err:#}");
     }
 }

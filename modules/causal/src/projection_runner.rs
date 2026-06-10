@@ -129,24 +129,37 @@ where
         let mut applied = 0usize;
         for event in events {
             // Fold into the per-runner aggregator registry BEFORE
-            // matching/dispatch, with capture/restore so a failing
-            // project doesn't double-apply on retry. Mirrors the
-            // legacy engine's capture_for_rollback / restore_state
-            // discipline.
-            let rollback = self.aggregators.as_ref().map(|reg| {
-                let r = reg.capture_for_rollback(&event.event_type, &event.payload);
-                let snapshots = reg.apply_event(&event.event_type, &event.payload);
-                if let Some(obs) = self.observer.as_ref() {
-                    reg.notify_observer(
-                        &snapshots,
-                        obs.as_ref(),
-                        event.correlation_id,
-                        event.position,
-                        event.event_id,
-                    );
+            // matching/dispatch. Folds are idempotent on the event's
+            // stream coordinates, so a failing project body retried by
+            // the supervisor re-delivers harmlessly — fold tracks the
+            // log, not body success (replaces the old capture/restore
+            // rollback discipline).
+            if let Some(reg) = self.aggregators.as_ref() {
+                let outcome = crate::aggregator::fold_event(
+                    reg,
+                    None,
+                    self.log.as_ref(),
+                    &event.event_type,
+                    &event.payload,
+                    event.stream_id,
+                    &event.category,
+                    event.revision,
+                    event.position,
+                    /* strict_to_event = */ true,
+                )
+                .await?;
+                if outcome.applied {
+                    if let Some(obs) = self.observer.as_ref() {
+                        reg.notify_observer(
+                            &outcome.snapshots,
+                            obs.as_ref(),
+                            event.correlation_id,
+                            event.position,
+                            event.event_id,
+                        );
+                    }
                 }
-                r
-            });
+            }
 
             // Filter by Event prefix. Non-matching events advance the
             // cursor but don't trigger project — the consumer
@@ -175,9 +188,8 @@ where
                     applied += 1;
                 }
                 Err(e) => {
-                    if let (Some(reg), Some(r)) = (self.aggregators.as_ref(), rollback) {
-                        reg.restore_state(r);
-                    }
+                    // The fold above is NOT rolled back — registry state
+                    // reflects the log regardless of body success.
                     return Err(e);
                 }
             }
@@ -220,7 +232,19 @@ where
                 let mut hit_cursor = false;
                 for event in batch {
                     if event.position > cursor { hit_cursor = true; break; }
-                    reg.apply_event(&event.event_type, &event.payload);
+                    crate::aggregator::fold_event(
+                        reg,
+                        None,
+                        self.log.as_ref(),
+                        &event.event_type,
+                        &event.payload,
+                        event.stream_id,
+                        &event.category,
+                        event.revision,
+                        event.position,
+                        /* strict_to_event = */ true,
+                    )
+                    .await?;
                 }
                 if hit_cursor || last_pos >= cursor { break; }
                 from = last_pos;

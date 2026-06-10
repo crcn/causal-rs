@@ -1076,16 +1076,35 @@ impl Engine {
                 Ok(result) => {
                     // Fold each fact into the engine registry so
                     // `engine.snapshot::<A>(id)` reflects the write. The
-                    // batch committed atomically, so all events are
-                    // attributed to the commit position.
+                    // batch committed atomically at one position;
+                    // `result.revision` is the LAST fact's revision, so
+                    // fact i sits at `result.revision - (n - 1 - i)`.
                     if let Some(reg) = &self.aggregators {
-                        for (event_type, payload, event_id) in &folds {
-                            let snaps = reg.apply_event(event_type, payload);
-                            if let Some(obs) = self.observer.as_ref() {
-                                reg.notify_observer(
-                                    &snaps, obs.as_ref(), correlation,
-                                    result.position, *event_id,
-                                );
+                        let n = folds.len() as u64;
+                        for (i, (event_type, payload, event_id)) in folds.iter().enumerate() {
+                            let revision = crate::types::StreamRevision::from_raw(
+                                result.revision.raw() - (n - 1 - i as u64),
+                            );
+                            let outcome = crate::aggregator::fold_event(
+                                reg.as_ref(),
+                                self.snapshot_store.as_deref(),
+                                self.log.as_ref(),
+                                event_type,
+                                payload,
+                                id,
+                                F::CATEGORY,
+                                revision,
+                                result.position,
+                                /* strict_to_event = */ false,
+                            )
+                            .await?;
+                            if outcome.applied {
+                                if let Some(obs) = self.observer.as_ref() {
+                                    reg.notify_observer(
+                                        &outcome.snapshots, obs.as_ref(), correlation,
+                                        result.position, *event_id,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1184,26 +1203,12 @@ impl Engine {
             };
 
             // Capture for engine-level aggregator fold before the log
-            // write consumes new_event.
+            // write consumes new_event. (The pre-append durable restore
+            // this path used to do is now subsumed by `fold_event`'s
+            // gap repair: a cold aggregate's first fold detects the
+            // revision gap and restores read-through before folding.)
             let agg_event_type = new_event.event_type.clone();
             let agg_payload = new_event.payload.clone();
-
-            // Restore the engine-level aggregate(s) for this event from durable
-            // storage BEFORE the append, so the fold below builds on full prior
-            // history without double-counting the event we are about to write.
-            // No-op without a snapshot store or a declared STREAM_CATEGORY.
-            if self.snapshot_store.is_some() {
-                if let Some(reg) = &self.aggregators {
-                    crate::aggregator::restore_aggregates_for_event(
-                        reg.as_ref(),
-                        self.snapshot_store.as_deref(),
-                        self.log.as_ref(),
-                        &agg_event_type,
-                        &agg_payload,
-                    )
-                    .await?;
-                }
-            }
 
             let event_id = new_event.event_id;
             // `emit` is the append-only fact path: write to the fact's own
@@ -1225,25 +1230,41 @@ impl Engine {
             // `engine.snapshot::<A>(stream_id)` reads stay fresh.
             // Consumers maintain their OWN registry clones for
             // in-body `ctx.aggregate` reads — independent state.
+            // Idempotent on stream coordinates; gap repair orders
+            // racing concurrent emits to the same aggregate stream.
             if let Some(reg) = &self.aggregators {
-                let snapshots = reg.apply_event(&agg_event_type, &agg_payload);
-                if let Some(obs) = self.observer.as_ref() {
-                    reg.notify_observer(
-                        &snapshots,
-                        obs.as_ref(),
-                        correlation,
-                        result.position,
-                        event_id,
-                    );
-                }
-                if let Some(store) = self.snapshot_store.as_ref() {
-                    crate::aggregator::maybe_save_snapshots(
-                        reg.as_ref(),
-                        store.as_ref(),
-                        self.snapshot_every,
-                        &snapshots,
-                    )
-                    .await;
+                let outcome = crate::aggregator::fold_event(
+                    reg.as_ref(),
+                    self.snapshot_store.as_deref(),
+                    self.log.as_ref(),
+                    &agg_event_type,
+                    &agg_payload,
+                    stream_id,
+                    stream_category,
+                    result.revision,
+                    result.position,
+                    /* strict_to_event = */ false,
+                )
+                .await?;
+                if outcome.applied {
+                    if let Some(obs) = self.observer.as_ref() {
+                        reg.notify_observer(
+                            &outcome.snapshots,
+                            obs.as_ref(),
+                            correlation,
+                            result.position,
+                            event_id,
+                        );
+                    }
+                    if let Some(store) = self.snapshot_store.as_ref() {
+                        crate::aggregator::maybe_save_snapshots(
+                            reg.as_ref(),
+                            store.as_ref(),
+                            self.snapshot_every,
+                            &outcome.snapshots,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -1740,23 +1761,13 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    /// Regression test for the `AggregatorRegistry::apply_event` RMW
-    /// race documented in the 0.4.4 CHANGELOG.
-    ///
-    /// Pre-fix: `apply_event` did `state.get(&key) → clone → apply →
-    /// state.insert(&key)` across separate DashMap operations.
-    /// Concurrent applies on the same key could both read the same
-    /// pre-state and the second insert would overwrite the first —
-    /// lost update.
-    ///
-    /// Post-fix: the RMW lives under a single `state.entry(key)`
-    /// guard. Per-shard locking serializes concurrent applies on
-    /// the same key.
-    ///
-    /// The test spawns N OS threads that each call `apply_event` M
-    /// times on the same stream key. Final fold count must equal
-    /// N * M; pre-fix, it would drop updates probabilistically under
-    /// load.
+    /// Concurrency contract of `AggregatorRegistry::apply_event`:
+    /// the RMW lives under a single `state.entry(key)` guard (per-shard
+    /// locking serializes concurrent applies on the same key — the
+    /// 0.4.4 lost-update fix), and folds are **idempotent on stream
+    /// coordinates** (the 2026-06-10 A2 fix): N racing redeliveries of
+    /// the same event fold exactly once, and a dense sequence of
+    /// revisions folds exactly once each.
     #[test]
     fn aggregator_apply_event_serializes_concurrent_callers() {
         use crate::aggregate::{Aggregate, Apply};
@@ -1798,14 +1809,29 @@ mod tests {
 
         const TASKS: usize = 8;
         const PER_TASK: usize = 200;
+        const REVISIONS: u64 = 50;
 
+        // Every thread redelivers the SAME dense revision sequence.
+        // 8 × 200 racing applies per revision must fold exactly once
+        // per revision: the entry guard serializes the RMW and the
+        // revision gate makes redelivery a no-op.
         let mut handles = Vec::new();
         for _ in 0..TASKS {
             let reg = reg.clone();
             let payload = payload.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..PER_TASK {
-                    reg.apply_event(event_type, &payload);
+                    for rev in 0..REVISIONS {
+                        reg.apply_event(
+                            event_type,
+                            &payload,
+                            stream_id,
+                            "race",
+                            crate::types::StreamRevision::from_raw(rev),
+                            LogCursor::from_raw(rev + 1),
+                        )
+                        .expect("fold must not error");
+                    }
                 }
             }));
         }
@@ -1816,9 +1842,9 @@ mod tests {
         let key = format!("Counter:{}", stream_id);
         let version = reg.get_version(&key);
         assert_eq!(
-            version.raw() as usize,
-            TASKS * PER_TASK,
-            "version must equal total applies — entry guard serializes RMW"
+            version.raw(),
+            REVISIONS,
+            "watermark must sit one past the last folded revision"
         );
 
         let state = reg.get_state(&key).expect("state must exist");
@@ -1826,9 +1852,9 @@ mod tests {
             .downcast_ref::<Counter>()
             .expect("type-erased state downcasts to Counter");
         assert_eq!(
-            counter.n as usize,
-            TASKS * PER_TASK,
-            "fold count must equal total applies — no lost updates"
+            counter.n as u64,
+            REVISIONS,
+            "each revision folds exactly once — redeliveries skip, none lost"
         );
     }
 
@@ -3662,11 +3688,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_failure_rolls_back_aggregator_fold() {
-        // Projector succeeds on event 1, errors on event 2. After
-        // the failed step, the aggregator registry should hold count=1
-        // — event 2's fold was rolled back via capture/restore. Without
-        // rollback, count would be 2.
+    async fn project_failure_keeps_fold_and_retry_does_not_double_count() {
+        // A2 contract: fold tracks the log, not body success. Projector
+        // succeeds on event 1, errors on event 2 — after the failed
+        // step the registry holds count=2 (event 2 IS in the log; its
+        // fold is not rolled back). The retried step re-delivers event
+        // 2; the idempotency gate skips the re-fold, so count stays 2
+        // and the body completes. (The old capture/restore rollback
+        // this replaces could permanently desync registry from cursor
+        // on the DLQ path.)
         struct FailsOnSecond { calls: Arc<AtomicUsize> }
         #[async_trait]
         impl Projector for FailsOnSecond {
@@ -3696,8 +3726,16 @@ mod tests {
         assert!(result.is_err(), "step propagates the project error");
 
         let (_, curr) = aggs.get_singleton_arc::<TickCounter>();
-        assert_eq!(curr.count, 1,
-                   "event 2's fold rolled back; only event 1's fold remains");
+        assert_eq!(curr.count, 2,
+                   "fold persists through body failure — state reflects the log");
+
+        // Supervisor retry: event 2 re-delivers, its fold skips, the
+        // body succeeds this time. No double-count.
+        let result = runner.step(10).await;
+        assert!(result.is_ok(), "retried step succeeds");
+        let (_, curr) = aggs.get_singleton_arc::<TickCounter>();
+        assert_eq!(curr.count, 2,
+                   "re-delivered fold is an idempotent skip — never double-counted");
     }
 
     /// F9.6 — pin the apply→project interleaving contract for batch

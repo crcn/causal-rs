@@ -209,49 +209,55 @@ change, migration — and under-specified: batch folds would self-no-op since
 `WriteResult` carries only the last position, and out-of-order concurrent
 folds would be *silently dropped*, recreating the bug class):
 
-- [ ] Each per-aggregate registry entry tracks `last_folded:
-      Option<StreamRevision>` (aligning the existing `version` bookkeeping at
-      aggregator.rs:881-889 to mean exactly this).
-- [ ] `apply_event` gains the event's stream revision (callers all have it:
-      `RecordedEvent.revision` in runners/hydration; `base_revision + offset`
-      per fact in `Engine`'s batch path at engine.rs:1071-1087).
-- [ ] Fold gate, per entry: `revision == last_folded + 1` → fold + advance;
-      `<= last_folded` → idempotent no-op; `> last_folded + 1` → **gap:
-      read-through repair** via `read_stream(after = last_folded)`, fold the
-      missing range in order, then the current event. Dense revisions make
-      gaps detectable and out-of-order arrival self-healing — no ordering
-      discipline required of fold sources.
-- [ ] **Stated invariant** (already hard-required by durable restore,
-      aggregator.rs:867): every event that folds into an aggregate lives in
-      that aggregate's single stream. Assert it where aggregators register.
-- [ ] **Delete the rollback machinery** (`capture_for_rollback` /
-      `restore_state`, reactor_runner.rs:241-254,341-343;
-      projection_runner.rs:137,179). With idempotent folds it is actively
-      harmful (fold advances, body errs, state restores → watermark lies).
-- [ ] DLQ path folds the event anyway — state reflects the log even when the
-      reactor body failed (keeps rootsignal's `PipelineState` correct when
-      DLQ-as-control-flow fires).
-- [ ] Mid-batch abort (deser failure at reactor_runner.rs:262 after earlier
-      folds): retry re-delivers; `<= last_folded` events skip. Regression
-      test.
-- [ ] **No snapshot schema change.** Snapshots already persist `revision`
-      (types.rs:271); restore seeds `last_folded` from `snapshot.revision`,
-      and the replayed tail advances it (aggregator.rs:867-873 already
-      computes `last_rev`). Read-through restore therefore cannot double-fold.
-- [ ] `apply_event` error behavior unified with replay: fold failure fails
-      the step (today live swallows + bumps version, replay propagates —
-      aggregator.rs:411-413 vs :789).
-- [ ] Rejected alternatives, documented in the module: global `LogCursor`
-      high-water (above); engine-registry-as-log-consumer (dissolves the
-      eager-fold ordering question structurally, but breaks read-your-write
-      immediacy after `emit` and adds a consumer to every settle — dense
-      gating achieves correctness without the restructure; revisit if eager
-      folds grow more call sites).
-- [ ] Tests: crash between output-append and checkpoint-set with aggregators
-      → **fold-once AND append-once on Kurrent** (the rev-1 test checked only
-      folds); DLQ-path fold advances state; transient checkpoint-set failure
-      → no double-count; out-of-order fold arrival heals via gap repair;
-      snapshot taken mid-failure is byte-identical to a from-scratch replay.
+- [x] Per-entry watermarks in `StateEntry` (`version` = next expected
+      revision; `last_pos` added). *(Implementation refinement discovered
+      mid-build: revision gating requires stream alignment, which only
+      **restorable** aggregates (non-empty `Aggregate::STREAM_CATEGORY`)
+      satisfy. Fan-in/singleton aggregates — `nil_id`/`id_fn` patterns
+      with no single stream — gate **lexicographically on
+      `(position, revision)`** instead: exactly-once under sequential
+      consumer delivery; the eager engine-registry race for fan-in is
+      documented as skip-not-double-count. The existing
+      `stream_category.is_empty()` flag is the discriminator, the same
+      one that already excludes fan-in from snapshots.)*
+- [x] `apply_event` gains `(stream_id, category, revision, position)`;
+      all callers wired (runners, hydration, engine emit + batch append
+      with per-fact `result.revision − (n−1−i)`).
+- [x] Fold gate + **gap repair** via the new `fold_event` entry point.
+      *(Refinement: repair is **bounded at the delivered event's
+      revision for consumer registries** (`strict_to_event`) — unbounded
+      repair would fold events beyond the cursor, breaking
+      `state == fold(log[..cursor])`. The engine registry repairs
+      unbounded with snapshot-accelerated restore. Foreign interleaved
+      stream events advance watermarks via `advance_watermark`, or
+      mixed streams would re-gap forever.)*
+- [x] Stream-alignment invariant **asserted at fold time** (loud error),
+      not just at registration — unit test pins the message.
+- [x] Rollback machinery deleted (`capture_for_rollback`/`restore_state`
+      + all three runner call sites); old rollback-asserting tests
+      rewritten to pin the new contract (fold persists, retry skips).
+- [x] DLQ path folds the event anyway (fold now precedes the body
+      unconditionally and is never restored) — pinned by
+      `dlq_advance_keeps_aggregate_fold`.
+- [x] Mid-batch abort/retry safe via the gate — pinned by
+      `cursor_set_failure_does_not_double_count_aggregates`.
+- [x] **No snapshot schema change**; restore seeds watermarks from
+      `snapshot.revision` + replayed tail; the pre-fold explicit restore
+      calls (engine + reactor_runner) are subsumed by gap repair and
+      deleted.
+- [x] Fold errors now fail the step (was: log-and-continue live vs
+      propagate on replay).
+- [x] Rejected alternatives documented in code (global LogCursor
+      high-water; engine-registry-as-consumer).
+- [x] Tests: `crash_redelivery_folds_exactly_once_in_both_registries`
+      (consumer + engine registries, deduped append), DLQ-fold,
+      checkpoint-set-failure no-double-count, out-of-order gap-repair
+      heal, strict-repair-stops-at-cursor, misalignment loud-error,
+      concurrent-redelivery exactly-once (rewritten registry race
+      test). *(Deferred: snapshot byte-identity test — the corruption
+      vector was double-folds, which the fold-layer tests pin;
+      append-once-on-Kurrent assertion lands with B3's conformance
+      scenario.)*
 
 #### A3. Postgres accepts expected revision ahead of head
 

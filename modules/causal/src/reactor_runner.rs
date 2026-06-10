@@ -233,25 +233,40 @@ where
         let prefix = <R::Trigger as Event>::CATEGORY;
         let mut applied = 0usize;
         for event in events {
-            // Fold every event into the aggregator registry, with
-            // capture/restore around the reactor call to avoid double-
-            // application on retry. Mirrors legacy engine semantics.
-            // (Per-consumer state is rebuilt from genesis by `ensure_hydrated`
-            // on restart, so no read-through restore is needed here.)
-            let rollback = self.aggregators.as_ref().map(|reg| {
-                let r = reg.capture_for_rollback(&event.event_type, &event.payload);
-                let snapshots = reg.apply_event(&event.event_type, &event.payload);
-                if let Some(obs) = self.observer.as_ref() {
-                    reg.notify_observer(
-                        &snapshots,
-                        obs.as_ref(),
-                        event.correlation_id,
-                        event.position,
-                        event.event_id,
-                    );
+            // Fold every event into the per-consumer aggregator registry.
+            // Folds are idempotent on the event's stream coordinates (see
+            // `AggregatorRegistry::apply_event`), so a step retry after a
+            // checkpoint-set failure, crash redelivery, or a DLQ advance
+            // re-delivers harmlessly — fold tracks the log, not body
+            // success. (The old capture/restore rollback this replaces
+            // un-folded state when the *body* failed, permanently
+            // desyncing registry from cursor on the DLQ path.)
+            if let Some(reg) = self.aggregators.as_ref() {
+                let outcome = crate::aggregator::fold_event(
+                    reg,
+                    None,
+                    self.log.as_ref(),
+                    &event.event_type,
+                    &event.payload,
+                    event.stream_id,
+                    &event.category,
+                    event.revision,
+                    event.position,
+                    /* strict_to_event = */ true,
+                )
+                .await?;
+                if outcome.applied {
+                    if let Some(obs) = self.observer.as_ref() {
+                        reg.notify_observer(
+                            &outcome.snapshots,
+                            obs.as_ref(),
+                            event.correlation_id,
+                            event.position,
+                            event.event_id,
+                        );
+                    }
                 }
-                r
-            });
+            }
 
             if !event.event_type.starts_with(prefix) {
                 // Non-matching trigger: just advance the cursor.
@@ -338,9 +353,8 @@ where
                 }
                 Err(e) => {
                     let completed_at = chrono::Utc::now();
-                    if let (Some(reg), Some(r)) = (self.aggregators.as_ref(), rollback) {
-                        reg.restore_state(r);
-                    }
+                    // Note: the fold above is NOT rolled back — registry
+                    // state reflects the log regardless of body success.
 
                     // attempt counter already incremented for this run;
                     // use attempt_seq for the cap check.
@@ -406,7 +420,19 @@ where
                                     tracker.lock().unwrap().bump(event.correlation_id, write.position);
                                 }
                                 if let Some(reg) = &self.engine_aggregators {
-                                    reg.apply_event(&event_type, &payload);
+                                    crate::aggregator::fold_event(
+                                        reg.as_ref(),
+                                        self.snapshot_store.as_deref(),
+                                        self.log.as_ref(),
+                                        &event_type,
+                                        &payload,
+                                        sid,
+                                        &cat,
+                                        write.revision,
+                                        write.position,
+                                        /* strict_to_event = */ false,
+                                    )
+                                    .await?;
                                 }
                             }
                             self.checkpoint.set(&self.consumer_id, event.position).await?;
@@ -440,23 +466,6 @@ where
             //    and cursor-advance re-runs react() on restart; the
             //    re-appends dedup on event_id.
             for (idx, out) in emitted.iter().enumerate() {
-                // Restore the engine-level aggregate(s) for this output from
-                // durable storage BEFORE appending — so the fold below builds on
-                // full prior history and does not double-count the output we are
-                // about to append. (Per-consumer registries are handled by
-                // `ensure_hydrated`; this is the shared engine registry only.)
-                if let Some(reg) = &self.engine_aggregators {
-                    if self.snapshot_store.is_some() {
-                        crate::aggregator::restore_aggregates_for_event(
-                            reg.as_ref(),
-                            self.snapshot_store.as_deref(),
-                            self.log.as_ref(),
-                            &out.durable_name,
-                            &out.payload,
-                        )
-                        .await?;
-                    }
-                }
                 let out_event = EventData {
                     event_id: derive_output_event_id(
                         &self.consumer_id, event.event_id, idx as u32,
@@ -485,16 +494,38 @@ where
                 if let Some(tracker) = &self.settle_tracker {
                     tracker.lock().unwrap().bump(event.correlation_id, write.position);
                 }
+                // Fold the output into the shared engine registry. The
+                // fold is idempotent on stream coordinates, so a
+                // redelivered (deduped) append — whose WriteResult
+                // carries the ORIGINAL position/revision — skips here
+                // instead of double-counting. Gap repair inside
+                // fold_event also restores cold aggregates from
+                // snapshots before folding (read-through), replacing
+                // the explicit pre-append restore this path used to do.
                 if let Some(reg) = &self.engine_aggregators {
-                    let snapshots = reg.apply_event(&out.durable_name, &out.payload);
-                    if let Some(store) = self.snapshot_store.as_ref() {
-                        crate::aggregator::maybe_save_snapshots(
-                            reg.as_ref(),
-                            store.as_ref(),
-                            self.snapshot_every,
-                            &snapshots,
-                        )
-                        .await;
+                    let outcome = crate::aggregator::fold_event(
+                        reg.as_ref(),
+                        self.snapshot_store.as_deref(),
+                        self.log.as_ref(),
+                        &out.durable_name,
+                        &out.payload,
+                        out.stream_id,
+                        &out.stream_category,
+                        write.revision,
+                        write.position,
+                        /* strict_to_event = */ false,
+                    )
+                    .await?;
+                    if outcome.applied {
+                        if let Some(store) = self.snapshot_store.as_ref() {
+                            crate::aggregator::maybe_save_snapshots(
+                                reg.as_ref(),
+                                store.as_ref(),
+                                self.snapshot_every,
+                                &outcome.snapshots,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -523,7 +554,19 @@ where
                 let mut hit_cursor = false;
                 for event in batch {
                     if event.position > cursor { hit_cursor = true; break; }
-                    reg.apply_event(&event.event_type, &event.payload);
+                    crate::aggregator::fold_event(
+                        reg,
+                        None,
+                        self.log.as_ref(),
+                        &event.event_type,
+                        &event.payload,
+                        event.stream_id,
+                        &event.category,
+                        event.revision,
+                        event.position,
+                        /* strict_to_event = */ true,
+                    )
+                    .await?;
                 }
                 if hit_cursor || last_pos >= cursor { break; }
                 from = last_pos;
@@ -989,6 +1032,69 @@ mod tests {
         assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
         assert_eq!(dlq_calls.load(Ordering::SeqCst), 1,
                    "third attempt across runners triggers mapper");
+    }
+
+    #[tokio::test]
+    async fn dlq_advance_keeps_aggregate_fold() {
+        // A2: "fold tracks the log, not body success." When a trigger
+        // dead-letters, the cursor advances past it — and the fold MUST
+        // stay applied, or the registry is permanently missing one fold
+        // relative to its cursor (the pre-A2 corruption: restore-then-
+        // advance left state diverging from fold(log[..cursor]) forever,
+        // and snapshots persisted the divergence durably).
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct OrderCount { n: u32 }
+        impl crate::aggregate::Aggregate for OrderCount {
+            const NAME: &'static str = "OrderCount";
+        }
+        impl crate::aggregate::Apply<OrderPlaced> for OrderCount {
+            fn apply(&mut self, _: &OrderPlaced) { self.n += 1; }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let payload = OrderPlaced {
+            order_id:    Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        };
+        let order_id = payload.order_id;
+        let _ = append_trigger(&store, &payload);
+
+        let mut reg = crate::aggregator::AggregatorRegistry::new();
+        reg.register(crate::aggregator::Aggregator::for_type::<OrderCount, OrderPlaced>());
+        let reg = Arc::new(reg);
+
+        let mapper: DlqMapperArc = std::sync::Arc::new(
+            |_info: DlqInfo| -> Option<Box<dyn crate::engine::ErasedFact>> { None },
+        );
+        let runner = ReactorRunner::new(
+            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            "dlq-keeps-fold",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregators(reg.clone())
+        .with_dlq(mapper, 1);
+
+        // max_attempts = 1 → the first failure dead-letters and advances.
+        let outcome = runner.step(10).await.unwrap();
+        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        assert!(store.get("dlq-keeps-fold").await.unwrap().is_some(),
+                "cursor advanced past the dead-lettered trigger");
+
+        let (_, curr) = reg.get_transition_arc::<OrderCount>(order_id);
+        assert_eq!(curr.n, 1,
+                   "the dead-lettered trigger's fold is KEPT — state reflects \
+                    the log even when the body failed terminally");
+
+        // The consumer is not wedged: a second trigger dead-letters the
+        // same way and ALSO folds.
+        let payload2 = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let order_id2 = payload2.order_id;
+        let _ = append_trigger(&store, &payload2);
+        let outcome = runner.step(10).await.unwrap();
+        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        let (_, curr) = reg.get_transition_arc::<OrderCount>(order_id2);
+        assert_eq!(curr.n, 1);
     }
 
     #[tokio::test]
