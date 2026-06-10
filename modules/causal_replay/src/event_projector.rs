@@ -21,6 +21,8 @@ mod pg {
     use causal::event_log::EventLogBackend;
     use causal::types::{LogCursor, RecordedEvent};
 
+    use crate::event_log::{ADVISORY_LOCK_CLASS, ADVISORY_LOCK_OBJID};
+
     const CONSUMER_ID: &str = "__pg_event_projector";
     const BATCH: usize = 256;
     const IDLE_POLL: Duration = Duration::from_millis(200);
@@ -55,18 +57,18 @@ mod pg {
 
             match source.read_all(cursor, BATCH).await {
                 Ok(events) if !events.is_empty() => {
-                    let mut last = cursor;
-                    for e in &events {
-                        if let Err(err) = insert(&pool, e).await {
-                            // Best-effort: log and stop advancing past the
-                            // failure so the next poll retries it.
-                            tracing::warn!(error = %err, "PgEventProjector: insert failed");
-                            break;
+                    // Best-effort, all-or-nothing per batch: a failed
+                    // batch rolls back, the checkpoint stays put, and
+                    // the next poll retries it (idempotent via
+                    // `ON CONFLICT (event_id) DO NOTHING`).
+                    match insert_batch(&pool, &events).await {
+                        Ok(()) => {
+                            let last = events.last().expect("non-empty").position;
+                            let _ = checkpoint.set(CONSUMER_ID, last).await;
                         }
-                        last = e.position;
-                    }
-                    if last > cursor {
-                        let _ = checkpoint.set(CONSUMER_ID, last).await;
+                        Err(err) => {
+                            tracing::warn!(error = %err, "PgEventProjector: batch insert failed");
+                        }
                     }
                 }
                 Ok(_) => tokio::time::sleep(IDLE_POLL).await,
@@ -78,7 +80,31 @@ mod pg {
         }
     }
 
-    async fn insert(pool: &PgPool, e: &RecordedEvent) -> anyhow::Result<()> {
+    /// Insert one mirrored batch inside a single transaction that holds
+    /// the same global advisory lock as
+    /// `PgEventLogBackend::append_to_stream` (see event_log.rs, "Position
+    /// ordering and gap visibility"). The projector assigns fresh PG
+    /// positions, so its commits MUST serialize with direct appends —
+    /// otherwise a tailer of the PG `causal_log` could checkpoint past a
+    /// mirror row whose transaction is still in flight, losing it forever.
+    async fn insert_batch(pool: &PgPool, events: &[RecordedEvent]) -> anyhow::Result<()> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(ADVISORY_LOCK_CLASS)
+            .bind(ADVISORY_LOCK_OBJID)
+            .execute(&mut *tx)
+            .await?;
+        for e in events {
+            insert(&mut tx, e).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        e: &RecordedEvent,
+    ) -> anyhow::Result<()> {
         let metadata = serde_json::Value::Object(e.metadata.clone());
         // Aggregate identity is all-set or all-NULL (the causal_log invariant a
         // half-populated row would violate). A non-aggregate event deserializes
@@ -110,7 +136,7 @@ mod pg {
         .bind(&metadata)
         .bind(e.created_at)
         .bind(e.persistent)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }

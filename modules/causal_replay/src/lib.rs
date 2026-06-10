@@ -79,7 +79,7 @@ pub use stream::{Mode, ProjectionStream, ReplayProgress};
 pub use tail::{PollTailSource, TailSource};
 
 #[cfg(feature = "postgres")]
-pub use event_log::PgEventLogBackend;
+pub use event_log::{PgEventLogBackend, ADVISORY_LOCK_CLASS, ADVISORY_LOCK_OBJID};
 
 #[cfg(feature = "postgres")]
 pub use pointer::PgPointerStore;

@@ -17,9 +17,33 @@
 //!   catches the unique violation, looks up the current revision, and
 //!   returns an `OCC conflict` error message.
 //!
-//! Position gaps are allowed (rolled-back transactions leave gaps in
-//! BIGSERIAL). Cursor consumers compare with `position > cursor`,
-//! which is correct over gaps.
+//! ## Position ordering and gap visibility
+//!
+//! `position` is a BIGSERIAL assigned at INSERT time, but concurrent
+//! transactions commit in arbitrary order. Unserialized, a tailer doing
+//! `WHERE position > $1 ORDER BY position` can read AND checkpoint
+//! position 11 while the transaction holding position 10 is still in
+//! flight; when that transaction later commits, position 10 sits
+//! permanently behind every cursor — silent, unrecoverable event loss.
+//!
+//! Fix: every `causal_log` writer (this backend's `append_to_stream`
+//! and `PgEventProjector`'s mirror inserts) takes a transaction-scoped
+//! global advisory lock (`pg_advisory_xact_lock`, released at
+//! COMMIT/ROLLBACK) before assigning positions. Writers are
+//! serialized, so commit order == position order: once a tailer has
+//! observed position N, every position <= N is either already visible
+//! or belongs to a rolled-back transaction. The remaining BIGSERIAL
+//! gaps (rollbacks) are harmless — `position > cursor` skips them and
+//! nothing can ever materialize inside them. `latest_position()` is a
+//! trustworthy high-water mark for the same reason.
+//!
+//! Rejected alternative: xmin fencing on the read side (cap `read_all`
+//! below the oldest in-flight writer's snapshot xmin). More write
+//! concurrency, but materially more complexity — per-read snapshot
+//! plumbing, and any long-lived transaction stalls every tailer.
+//! Revisit only if the advisory lock shows up in profiles; the
+//! production append path runs on Kurrent, where this lock costs
+//! nothing.
 
 #[cfg(feature = "postgres")]
 mod pg {
@@ -34,6 +58,25 @@ mod pg {
     };
     use causal::event_log::ConflictError;
     use causal::EventLogBackend;
+
+    /// Advisory-lock key serializing all `causal_log` writers (see the
+    /// module doc, "Position ordering and gap visibility").
+    ///
+    /// Why the two-arg `pg_advisory_xact_lock(classid int4, objid int4)`
+    /// form: the database may be shared infrastructure, and other
+    /// subsystems take advisory locks of their own. The single-arg form
+    /// keys on one bare i64, so two independent users picking the same
+    /// small integer collide silently and serialize against each other.
+    /// The two-arg form gives us a namespaced (classid, objid) pair:
+    /// `0xCA05` ("CAuSal") is the class for every causal-rs lock, and
+    /// `0xA1` names this one — the append-serialization lock (audit
+    /// item A1).
+    ///
+    /// Public so operators (and tests) can coordinate with — or
+    /// observe — the lock from outside the library, e.g. via
+    /// `pg_locks WHERE locktype = 'advisory' AND classid = … AND objid = …`.
+    pub const ADVISORY_LOCK_CLASS: i32 = 0xCA05;
+    pub const ADVISORY_LOCK_OBJID: i32 = 0xA1;
 
     /// Postgres-backed event log.
     ///
@@ -63,10 +106,39 @@ mod pg {
                 anyhow::bail!("append_to_stream: events must be non-empty");
             };
 
+            // Build all row data BEFORE the transaction: the global
+            // advisory lock below serializes every writer, so the time
+            // between `begin()` and `commit()` must be O(1) round-trips
+            // of pure SQL — no per-event encoding work under the lock.
+            let event_ids:       Vec<Uuid>           = events.iter().map(|e| e.event_id).collect();
+            let causation_ids:   Vec<Option<Uuid>>   = events.iter().map(|e| e.causation_id).collect();
+            let correlation_ids: Vec<Uuid>           = events.iter().map(|e| e.correlation_id).collect();
+            let event_types:     Vec<String>         = events.iter().map(|e| e.event_type.clone()).collect();
+            let payloads:        Vec<serde_json::Value> = events.iter().map(|e| e.payload.clone()).collect();
+            let metadatas:       Vec<serde_json::Value> = events
+                .iter()
+                .map(|e| serde_json::Value::Object(e.metadata.clone()))
+                .collect();
+            let created_ats:     Vec<DateTime<Utc>>  = events.iter().map(|e| e.created_at).collect();
+            let persistents:     Vec<bool>           = events.iter().map(|e| e.persistent).collect();
+
             // One transaction so the whole batch lands atomically: a
             // partial multi-fact decision is never observable, and a
             // mid-batch failure rolls back cleanly.
             let mut tx = self.pool.begin().await?;
+
+            // Serialize all causal_log writers (module doc, "Position
+            // ordering and gap visibility"): with appends serialized,
+            // commit order == position order, so `position > cursor`
+            // tailing never checkpoints past an in-flight position and
+            // `latest_position()` is a real high-water mark. The lock
+            // is transaction-scoped — released at COMMIT/ROLLBACK,
+            // including the early-return drops below.
+            sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+                .bind(ADVISORY_LOCK_CLASS)
+                .bind(ADVISORY_LOCK_OBJID)
+                .execute(&mut *tx)
+                .await?;
 
             // Revision of the FIRST event in the batch (0-indexed); the
             // rest follow at consecutive revisions.
@@ -102,114 +174,137 @@ mod pg {
                 }
             };
 
-            let mut result = WriteResult {
-                position: LogCursor::ZERO,
-                revision: StreamRevision::from_raw(0),
-            };
-            for (offset, event) in events.iter().enumerate() {
-                let revision = base_revision + offset as i64;
-                let metadata = serde_json::Value::Object(event.metadata.clone());
-                let row = sqlx::query(
-                    "INSERT INTO causal_log
-                        (event_id, causation_id, correlation_id, event_type,
-                         payload, aggregate_type, aggregate_id, revision,
-                         metadata, created_at, persistent)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                     RETURNING position",
-                )
-                .bind(event.event_id)
-                .bind(event.causation_id)
-                .bind(event.correlation_id)
-                .bind(&event.event_type)
-                .bind(&event.payload)
-                .bind(aggregate_type)
-                .bind(aggregate_id)
-                .bind(revision)
-                .bind(&metadata)
-                .bind(event.created_at)
-                .bind(event.persistent)
-                .fetch_one(&mut *tx)
-                .await;
+            let revisions: Vec<i64> =
+                (0..events.len() as i64).map(|i| base_revision + i).collect();
 
-                match row {
-                    Ok(row) => {
+            // Single multi-row INSERT: one round-trip while holding the
+            // global advisory lock (lock-span discipline). WITH
+            // ORDINALITY + ORDER BY pins insert order to batch order,
+            // so positions ascend with revisions within the batch.
+            let rows = sqlx::query(
+                "INSERT INTO causal_log
+                    (event_id, causation_id, correlation_id, event_type,
+                     payload, aggregate_type, aggregate_id, revision,
+                     metadata, created_at, persistent)
+                 SELECT u.event_id, u.causation_id, u.correlation_id,
+                        u.event_type, u.payload, $1, $2, u.revision,
+                        u.metadata, u.created_at, u.persistent
+                   FROM UNNEST($3::uuid[], $4::uuid[], $5::uuid[],
+                               $6::text[], $7::jsonb[], $8::bigint[],
+                               $9::jsonb[], $10::timestamptz[],
+                               $11::boolean[])
+                        WITH ORDINALITY
+                        AS u(event_id, causation_id, correlation_id,
+                             event_type, payload, revision, metadata,
+                             created_at, persistent, ord)
+                  ORDER BY u.ord
+                 RETURNING position, revision",
+            )
+            .bind(aggregate_type)
+            .bind(aggregate_id)
+            .bind(&event_ids)
+            .bind(&causation_ids)
+            .bind(&correlation_ids)
+            .bind(&event_types)
+            .bind(&payloads)
+            .bind(&revisions)
+            .bind(&metadatas)
+            .bind(&created_ats)
+            .bind(&persistents)
+            .fetch_all(&mut *tx)
+            .await;
+
+            match rows {
+                Ok(rows) => {
+                    // WriteResult carries the LAST event's position +
+                    // revision. Pick it by max revision rather than
+                    // trusting RETURNING row order.
+                    let mut result = WriteResult {
+                        position: LogCursor::ZERO,
+                        revision: StreamRevision::from_raw(0),
+                    };
+                    let mut best: i64 = -1;
+                    for row in &rows {
                         let position: i64 = row.try_get("position")?;
-                        result = WriteResult {
-                            position: LogCursor::from_raw(position as u64),
-                            revision: StreamRevision::from_raw(revision as u64),
-                        };
-                    }
-                    Err(e) => {
-                        let constraint =
-                            e.as_database_error().and_then(|d| d.constraint());
-                        // Idempotency (C1): a batch lands atomically, so a
-                        // duplicate event_id means the whole batch is already
-                        // persisted — return its WriteResult, never an error.
-                        // Reactors rely on this for crash-redelivery safety
-                        // (re-append after a crash before the cursor advances).
-                        if constraint == Some("causal_log_event_id_key") {
-                            drop(tx);
-                            // Idempotent retry: the batch was already written, so
-                            // its last event is present — return its result. If
-                            // the last event is ABSENT, only part of the batch
-                            // previously landed: a partial-overlap batch that
-                            // violates the all-new-or-all-present precondition.
-                            // Fail with a clear error rather than the opaque
-                            // RowNotFound a `fetch_one` would raise.
-                            let row = sqlx::query(
-                                "SELECT position, revision FROM causal_log \
-                                 WHERE event_id = $1",
-                            )
-                            .bind(last_event_id)
-                            .fetch_optional(&self.pool)
-                            .await?;
-                            let Some(row) = row else {
-                                return Err(anyhow::anyhow!(
-                                    "append_to_stream on {}:{}: a batch event_id \
-                                     already exists but the batch tail does not — \
-                                     partial-overlap batch (event_ids must be all-new \
-                                     or all-already-persisted)",
-                                    aggregate_type, aggregate_id,
-                                ));
-                            };
-                            let position: i64 = row.try_get("position")?;
-                            let revision: Option<i64> = row.try_get("revision")?;
-                            return Ok(WriteResult {
+                        let revision: i64 = row.try_get("revision")?;
+                        if revision > best {
+                            best = revision;
+                            result = WriteResult {
                                 position: LogCursor::from_raw(position as u64),
-                                revision: StreamRevision::from_raw(
-                                    revision.unwrap_or(0) as u64,
-                                ),
-                            });
+                                revision: StreamRevision::from_raw(revision as u64),
+                            };
                         }
-                        if constraint == Some("idx_causal_log_stream") {
-                            drop(tx);
-                            // Look up the current head revision so the
-                            // caller knows what to retry with.
-                            let current: Option<i64> = sqlx::query_scalar(
-                                "SELECT MAX(revision)
-                                   FROM causal_log
-                                  WHERE aggregate_type = $1
-                                    AND aggregate_id = $2",
-                            )
-                            .bind(aggregate_type)
-                            .bind(aggregate_id)
-                            .fetch_one(&self.pool)
-                            .await?;
-                            // Typed ConflictError so Engine::append can
-                            // downcast + retry (not a bare string).
-                            return Err(anyhow::Error::new(ConflictError {
-                                expected,
-                                current: current
-                                    .map(|c| StreamRevision::from_raw(c as u64)),
-                            }));
-                        }
-                        return Err(e.into());
                     }
+                    tx.commit().await?;
+                    Ok(result)
+                }
+                Err(e) => {
+                    let constraint =
+                        e.as_database_error().and_then(|d| d.constraint());
+                    // Idempotency (C1): a batch lands atomically, so a
+                    // duplicate event_id means the whole batch is already
+                    // persisted — return its WriteResult, never an error.
+                    // Reactors rely on this for crash-redelivery safety
+                    // (re-append after a crash before the cursor advances).
+                    if constraint == Some("causal_log_event_id_key") {
+                        drop(tx); // rollback — releases the advisory lock
+                        // Idempotent retry: the batch was already written, so
+                        // its last event is present — return its result. If
+                        // the last event is ABSENT, only part of the batch
+                        // previously landed: a partial-overlap batch that
+                        // violates the all-new-or-all-present precondition.
+                        // Fail with a clear error rather than the opaque
+                        // RowNotFound a `fetch_one` would raise.
+                        let row = sqlx::query(
+                            "SELECT position, revision FROM causal_log \
+                             WHERE event_id = $1",
+                        )
+                        .bind(last_event_id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                        let Some(row) = row else {
+                            return Err(anyhow::anyhow!(
+                                "append_to_stream on {}:{}: a batch event_id \
+                                 already exists but the batch tail does not — \
+                                 partial-overlap batch (event_ids must be all-new \
+                                 or all-already-persisted)",
+                                aggregate_type, aggregate_id,
+                            ));
+                        };
+                        let position: i64 = row.try_get("position")?;
+                        let revision: Option<i64> = row.try_get("revision")?;
+                        return Ok(WriteResult {
+                            position: LogCursor::from_raw(position as u64),
+                            revision: StreamRevision::from_raw(
+                                revision.unwrap_or(0) as u64,
+                            ),
+                        });
+                    }
+                    if constraint == Some("idx_causal_log_stream") {
+                        drop(tx); // rollback — releases the advisory lock
+                        // Look up the current head revision so the
+                        // caller knows what to retry with.
+                        let current: Option<i64> = sqlx::query_scalar(
+                            "SELECT MAX(revision)
+                               FROM causal_log
+                              WHERE aggregate_type = $1
+                                AND aggregate_id = $2",
+                        )
+                        .bind(aggregate_type)
+                        .bind(aggregate_id)
+                        .fetch_one(&self.pool)
+                        .await?;
+                        // Typed ConflictError so Engine::append can
+                        // downcast + retry (not a bare string).
+                        return Err(anyhow::Error::new(ConflictError {
+                            expected,
+                            current: current
+                                .map(|c| StreamRevision::from_raw(c as u64)),
+                        }));
+                    }
+                    Err(e.into())
                 }
             }
-
-            tx.commit().await?;
-            Ok(result)
         }
 
         async fn read_all(
@@ -322,4 +417,4 @@ mod pg {
 }
 
 #[cfg(feature = "postgres")]
-pub use pg::PgEventLogBackend;
+pub use pg::{PgEventLogBackend, ADVISORY_LOCK_CLASS, ADVISORY_LOCK_OBJID};

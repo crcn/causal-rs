@@ -92,3 +92,9 @@ async fn read_all_returns_events_strictly_after_cursor() -> Result<()> {
 async fn latest_position_reflects_committed_writes() -> Result<()> {
     conformance::latest_position_reflects_committed_writes(&backend()).await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires running Kurrent on KURRENT_URL"]
+async fn concurrent_appends_are_tailable_without_loss() -> Result<()> {
+    conformance::concurrent_appends_are_tailable_without_loss(&backend()).await
+}
