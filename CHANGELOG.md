@@ -4,6 +4,127 @@ All notable changes to `causal-rs` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Audit-remediation pass (2026-06-10). Fixes two data-integrity bugs,
+several cross-backend contract divergences, and a large dead API
+surface; adds CI. Pre-1.0, so breaking changes ship now while there is
+no production data. Step-by-step upgrade: [`docs/MIGRATION_0.8.md`](docs/MIGRATION_0.8.md).
+
+The core backend/consumer trait contracts — `EventLogBackend`,
+`CheckpointStore`, `ReactorCheckpoint`, `SnapshotStore`, `Event`,
+`Aggregate`, `Reactor`, `Projector`, `MultiProjector` — are
+**unchanged**; nothing you implement breaks.
+
+### Changed (breaking)
+
+- **`EngineBuilder::build()` is now `async` and returns `Result`**:
+  `build(self) -> Engine` → `async fn build(self) -> Result<Engine>`.
+  It seeds fresh reactor cursors at `latest_position()` and validates
+  categories before returning, both of which require I/O. Migration:
+  `builder.build()` → `builder.build().await?`. This is the only change
+  that touches normal application code.
+- **`ctx.aggregate` / `ctx.aggregate_of` / `Engine::snapshot` /
+  `Engine::load_aggregate` now panic** (naming the aggregate type) when
+  the aggregate was never registered, instead of silently returning
+  `A::default()` forever. A type that never folds is a configuration
+  bug, and silently defaulting it shipped a real consumer's dedup gates
+  that never fired. Register the aggregator, or remove the read.
+- **`EngineBuilder::with_observer`** takes `Arc<dyn ReactorObserver>`
+  instead of a generic `Arc<O>`. Source-compatible: a concrete
+  `Arc<MyObserver>` coerces at the call site.
+- **Reactor / projector trigger routing is colon-aware.** A bare
+  `event_type.starts_with(category)` let category `"order"` match
+  `"orders:created"` and feed a foreign payload to the trigger
+  deserializer; matching now requires the `{category}:` boundary. Only
+  affects prefix-colliding category names.
+- **A `:` in `Event::CATEGORY` is rejected at `build()`.** The colon is
+  the `{category}:{name}` separator; one inside a category silently
+  desynced reactor matching from aggregate folding. Now a loud build
+  error. Rename such categories to be colon-free.
+- **`REPLAY` env var is parsed strictly** (`causal_replay`): only `1`
+  / `true` enable replay; `0` / `false` / empty / unset stay live (the
+  old `is_ok()` treated `REPLAY=0` as replay-on).
+- `AggregatorRegistry::apply_event` and `replay_events_onto` changed
+  signature (module-path-public engine internals; not in the prelude —
+  normal code never calls these directly).
+
+### Removed (breaking — all were exported but wired to nothing)
+
+- `Upcaster`, `UpcasterRegistry` — never consulted by any read path.
+  Re-introduce wired when the first schema change needs it (read-side,
+  no storage migration).
+- The projection-ops surface: `ProjectionMode`, `RetryPolicy`,
+  `Backoff`, `FailureBehavior`, `ProjectionOps`, `ProjectionStatus`,
+  `ProjectionFailure` — configurable but read by no runner.
+  `StartPosition` is **kept** (now wired, reactor-only).
+- Legacy `#[reactor]`, `#[reactors]`, `#[projection]` proc-macros and
+  the `DistributedSafe` derive (~1,650 lines generating calls to APIs
+  that no longer exist). `#[event]`, `#[aggregator]`, `#[aggregators]`
+  are **kept**.
+- `AggregatorRegistry::replay_events` (dead), `capture_for_rollback`,
+  `restore_state` (the deleted rollback machinery).
+
+### Added
+
+- **`causal::event_type`** module — the single owner of the
+  `{category}:{name}` format: `compose`, `category_of`,
+  `matches_category`, `validate_category`.
+- **`EngineBuilder::with_reactor_start(reactor, StartPosition)`** — seed
+  a reactor's cursor explicitly. Plain `with_reactor` defaults to
+  `ResumeOrLatest` (resume a persisted cursor, else start at
+  `latest_position()` — a fresh reactor does not re-fire side effects
+  for history); `StartPosition::Zero` is the opt-in to process history.
+- **`causal_replay`**: `reconcile` / `Reconciliation` (the shared,
+  full-batch redelivery-vs-conflict decision used by every backend) and
+  `ADVISORY_LOCK_CLASS` / `ADVISORY_LOCK_OBJID` constants.
+- **CI** (`.github/workflows/ci.yml`): clippy, the unit suite,
+  `cargo test --doc`, and the `--ignored` Postgres + KurrentDB +
+  hybrid conformance suites against a dockerized stack.
+- New conformance scenarios: concurrent-appender gap-freedom,
+  expected-ahead rejection, concurrent-`Any` appends,
+  redelivery-after-foreign-write, partial-overlap rejection.
+
+### Fixed
+
+- **Postgres `read_all` silent data loss (critical).** `position` is a
+  `BIGSERIAL` assigned at insert; transactions commit out of order, so
+  a tailer could checkpoint past a still-uncommitted lower position and
+  skip that event forever. Appends now take a transaction-scoped
+  `pg_advisory_xact_lock`, making commit order == position order;
+  `latest_position()` is trustworthy as a result.
+- **Fold/checkpoint corruption (critical).** Aggregate folds desynced
+  from checkpoints on transient checkpoint-set failure, crash
+  redelivery, and the DLQ path — and snapshots then persisted the
+  corruption at inflated revisions. Folds are now idempotent on the
+  event's stream coordinates ("fold tracks the log, not body success");
+  the rollback machinery that caused the DLQ desync is deleted.
+- **Vacant-entry restore TOCTOU.** Concurrent cold-registry folds to a
+  stream with history could lose folds (and, rarely, desync
+  permanently) because read-through restore installed state
+  unconditionally after an async tail read. `set_state` is now
+  monotonic; `repair_gap` no longer advances past a concurrently-gapped
+  event.
+- **Postgres accepted an expected revision ahead of the stream head**,
+  silently punching revision holes; now validated and rejected with a
+  typed `ConflictError` (matching Kurrent + MemoryStore).
+- **Concurrent `Any`/`StreamExists` appends** no longer spuriously
+  conflict on Postgres (the advisory lock removes the read-MAX-then-
+  insert race).
+- **Within-batch duplicate `event_id`s** are rejected by `MemoryStore`
+  (matching the durable backends' `UNIQUE(event_id)`) instead of
+  persisting both rows and breaking dedup.
+- **DLQ retry-budget ordering**: `clear_reactor_attempts` moved to after
+  the synthesized append + cursor advance, so a failing DLQ append no
+  longer resets the budget each step (livelock) and a crash mid-DLQ no
+  longer replays a full `react()` retry cycle.
+- **Kurrent reconcile** verified the batch *tail* event_id only; now
+  verifies every id in the batch (the shared `reconcile`).
+- **docs.rs front pages**: the `causal` example called a nonexistent
+  `Engine::builder`; `causal_replay`'s page described only the legacy
+  replay API and the wrong version. Both rewritten and `cargo test
+  --doc`-checked.
+
 ## [0.7.4] - 2026-06-09
 
 ### Added — durable aggregate restore (read-through, revision-based)
