@@ -407,6 +407,7 @@ type RunnerFactory = Box<
     dyn FnOnce(
             Option<Arc<AggregatorRegistry>>,
             Option<Arc<AggregatorRegistry>>,
+            Arc<std::collections::HashSet<String>>,
         ) -> Arc<dyn Supervisable>
         + Send,
 >;
@@ -719,7 +720,7 @@ impl EngineBuilder {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
-        self.consumers.push(Box::new(move |aggs, _engine_aggs| {
+        self.consumers.push(Box::new(move |aggs, _engine_aggs, _occ| {
             let mut runner = ProjectionRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
@@ -746,7 +747,7 @@ impl EngineBuilder {
         let corr_hw = self.corr_hw.clone();
         let snapshot_store = self.snapshot_store.clone();
         let snapshot_every = self.snapshot_every;
-        self.consumers.push(Box::new(move |aggs, engine_aggs| {
+        self.consumers.push(Box::new(move |aggs, engine_aggs, occ| {
             let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, reactor_checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(mapper) = dlq_mapper {
@@ -757,6 +758,7 @@ impl EngineBuilder {
             runner = runner.with_engine_aggregators(engine_aggs);
             runner = runner.with_settle_tracker(corr_hw);
             runner = runner.with_snapshot_persistence(snapshot_store, snapshot_every);
+            runner = runner.with_occ_categories(occ);
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -781,7 +783,7 @@ impl EngineBuilder {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
-        self.consumers.push(Box::new(move |aggs, _engine_aggs| {
+        self.consumers.push(Box::new(move |aggs, _engine_aggs, _occ| {
             let mut runner = MultiProjectorRunner::new(p, P::GROUP_NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
@@ -898,9 +900,10 @@ impl EngineBuilder {
         // from per-consumer clones so consumer-side capture/restore
         // rollback doesn't leak into outside observers' state.
         let engine_aggregators = make_registry();
+        let occ_shared = Arc::new(self.occ_categories.clone());
         let consumers: Vec<Arc<dyn Supervisable>> = self.consumers
             .into_iter()
-            .map(|f| f(make_registry(), engine_aggregators.clone()))
+            .map(|f| f(make_registry(), engine_aggregators.clone(), occ_shared.clone()))
             .collect();
         let consumer_ids: Vec<String> = self.group_names.into_iter().collect();
         Ok(Engine::start(
@@ -1044,13 +1047,20 @@ impl Engine {
         A: Aggregate + Apply<F>,
         F: Event + DeserializeOwned,
     {
-        let events = self.log.read_stream(F::CATEGORY, id, None).await?;
+        // Read the PHYSICAL stream (STREAM_CATEGORY), which `emit` and
+        // durable restore also use. It may be co-located — holding event
+        // types other than `F` — so fold only `F`-typed events while still
+        // tracking the stream head revision across all of them.
+        let events = self.log.read_stream(F::STREAM_CATEGORY, id, None).await?;
         let mut agg = A::default();
         let mut revision = StreamRevision::ZERO;
         for event in events {
+            revision = event.revision;
+            if crate::event_type::category_of(&event.event_type) != F::CATEGORY {
+                continue; // foreign co-located type — not ours to fold
+            }
             let fact: F = serde_json::from_value(event.payload)?;
             agg.apply(&fact);
-            revision = event.revision;
         }
         Ok((agg, revision))
     }
@@ -1094,14 +1104,20 @@ impl Engine {
         let mut last_conflict: Option<anyhow::Error> = None;
 
         for attempt in 0..MAX_OCC_RETRIES {
-            // Load: fold the stream + capture the expected stream state.
-            let events = self.log.read_stream(F::CATEGORY, id, None).await?;
+            // Load: fold the PHYSICAL stream (STREAM_CATEGORY) + capture
+            // the expected stream state. `expected` is the stream head
+            // across ALL co-located types (that's the OCC fence the
+            // backend checks); the fold applies only `F`-typed events.
+            let events = self.log.read_stream(F::STREAM_CATEGORY, id, None).await?;
             let expected = match events.last() {
                 None => StreamState::NoStream,
                 Some(e) => StreamState::StreamRevision(e.revision.raw()),
             };
             let mut agg = A::default();
             for e in &events {
+                if crate::event_type::category_of(&e.event_type) != F::CATEGORY {
+                    continue; // foreign co-located type
+                }
                 let fact: F = serde_json::from_value(e.payload.clone())?;
                 agg.apply(&fact);
             }
@@ -1138,7 +1154,9 @@ impl Engine {
                     event_type:      event_type.clone(),
                     payload:         payload.clone(),
                     created_at:      fact.occurred_at().unwrap_or_else(Utc::now),
-                    category:        Some(F::CATEGORY.to_string()),
+                    // Placement uses STREAM_CATEGORY (same as emit), so
+                    // durable restore reads it back; routing stays on event_type.
+                    category:        Some(F::STREAM_CATEGORY.to_string()),
                     stream_id:       Some(id),
                     metadata:        self.default_metadata.clone(),
                     ephemeral:       None,
@@ -1148,7 +1166,7 @@ impl Engine {
                 events_data.push(event);
             }
 
-            match self.log.append_to_stream(F::CATEGORY, id, expected, events_data).await {
+            match self.log.append_to_stream(F::STREAM_CATEGORY, id, expected, events_data).await {
                 Ok(result) => {
                     // Fold each fact into the engine registry so
                     // `engine.snapshot::<A>(id)` reflects the write. The
@@ -1168,7 +1186,7 @@ impl Engine {
                                 event_type,
                                 payload,
                                 id,
-                                F::CATEGORY,
+                                F::STREAM_CATEGORY,
                                 revision,
                                 result.position,
                                 /* strict_to_event = */ false,
@@ -2458,6 +2476,144 @@ mod tests {
         let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
         assert_eq!(agg, Counter::default());
         assert_eq!(ver, StreamRevision::ZERO);
+        engine.shutdown().await.unwrap();
+    }
+
+    // ── C3 — decider keys streams on STREAM_CATEGORY, skips foreign types ──
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Deposited { account: Uuid, amount: i64 }
+    impl Event for Deposited {
+        const CATEGORY: &'static str = "deposit";
+        const STREAM_CATEGORY: &'static str = "account"; // co-located
+        fn event_type(&self) -> &str { "deposited" }
+        fn stream_id(&self) -> Uuid { self.account }
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Withdrawn { account: Uuid, amount: i64 }
+    impl Event for Withdrawn {
+        const CATEGORY: &'static str = "withdraw";
+        const STREAM_CATEGORY: &'static str = "account"; // co-located
+        fn event_type(&self) -> &str { "withdrawn" }
+        fn stream_id(&self) -> Uuid { self.account }
+    }
+    #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Balance { value: i64 }
+    impl crate::aggregate::Aggregate for Balance {
+        const NAME: &'static str = "Balance";
+        const STREAM_CATEGORY: &'static str = "account";
+    }
+    impl crate::aggregate::Apply<Deposited> for Balance {
+        fn apply(&mut self, d: &Deposited) { self.value += d.amount; }
+    }
+    impl crate::aggregate::Apply<Withdrawn> for Balance {
+        fn apply(&mut self, w: &Withdrawn) { self.value -= w.amount; }
+    }
+
+    #[tokio::test]
+    async fn decider_keys_on_stream_category_and_skips_foreign_types() {
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregators([
+            Aggregator::for_type::<Balance, Deposited>(),
+            Aggregator::for_type::<Balance, Withdrawn>(),
+        ])
+        .build().await.unwrap();
+
+        let account = Uuid::new_v4();
+        // Two co-located event types land in ONE stream ("account").
+        engine.emit(Deposited { account, amount: 100 }).settled().await.unwrap();
+        engine.emit(Withdrawn { account, amount: 30 }).settled().await.unwrap();
+
+        // Both physically live in `account-<id>`, NOT in `deposit-`/`withdraw-`.
+        let account_stream = EventLogBackend::read_stream(store.as_ref(), "account", account, None)
+            .await.unwrap();
+        assert_eq!(account_stream.len(), 2, "co-located in the account stream");
+        let deposit_stream = EventLogBackend::read_stream(store.as_ref(), "deposit", account, None)
+            .await.unwrap();
+        assert!(deposit_stream.is_empty(),
+                "C3: events must NOT be placed under their CATEGORY when STREAM_CATEGORY differs");
+
+        // load::<Balance, Deposited> reads the `account` stream, folds ONLY
+        // Deposited (skips the co-located Withdrawn without crashing on a
+        // cross-type deserialize), and reports the stream head revision.
+        let (bal, rev) = engine.load::<Balance, Deposited>(account).await.unwrap();
+        assert_eq!(bal.value, 100, "folded only the Deposited, skipped the Withdrawn");
+        assert_eq!(rev, StreamRevision::from_raw(1), "revision is the stream head (2 events)");
+
+        // append::<Balance, Deposited> writes to the `account` stream too.
+        engine.append::<Balance, Deposited, _>(account, move |_b| {
+            Ok(vec![Deposited { account, amount: 5 }])
+        }).await.unwrap();
+        let account_stream = EventLogBackend::read_stream(store.as_ref(), "account", account, None)
+            .await.unwrap();
+        assert_eq!(account_stream.len(), 3, "the decided fact landed in the account stream");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    // ── C4 — OCC fence: reactors cannot emit into OCC-required categories ──
+
+    #[tokio::test]
+    async fn reactor_emitting_into_occ_category_is_dlqd_not_appended() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A reactor that (wrongly) emits a CounterFact — whose category
+        // "counter" is OCC-required (registered via with_aggregate).
+        struct EmitsIntoOcc;
+        #[async_trait]
+        impl Reactor for EmitsIntoOcc {
+            type Trigger = UserCreated;
+            const GROUP_NAME: &'static str = "occ.fence";
+            async fn react(&self, t: &UserCreated, _: Ctx<'_>) -> Result<Events> {
+                Ok(causal::events![CounterFact::Inc {
+                    by: 1,
+                    occurred_at: t.occurred_at,
+                    counter_id: t.user_id,
+                }])
+            }
+        }
+
+        let store = store();
+        let dlq_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let dlq_hits_c = dlq_hits.clone();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregate::<Counter, CounterFact>() // marks "counter" OCC-required
+        .on_dlq(move |info: DlqInfo| {
+            dlq_hits_c.fetch_add(1, Ordering::SeqCst);
+            assert!(info.error.contains("OCC-required"), "got: {}", info.error);
+            None::<CounterFact> // no synthesized fact
+        })
+        .with_max_attempts(1)
+        .with_reactor(EmitsIntoOcc)
+        .build().await.unwrap();
+
+        engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
+            .settled().await.unwrap();
+
+        // Give the reactor a moment to process + DLQ.
+        for _ in 0..50 {
+            if dlq_hits.load(Ordering::SeqCst) > 0 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(dlq_hits.load(Ordering::SeqCst), 1,
+                   "the OCC-fence violation was routed to the DLQ");
+
+        // The CounterFact never landed in the "counter" stream.
+        let counter_stream = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 100)
+            .await.unwrap();
+        assert!(
+            counter_stream.iter().all(|e| !e.event_type.starts_with("counter:")),
+            "the reactor's OCC-category output must NOT have been appended",
+        );
         engine.shutdown().await.unwrap();
     }
 

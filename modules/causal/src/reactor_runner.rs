@@ -121,6 +121,12 @@ pub struct ReactorRunner<R: Reactor> {
     snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
     /// Snapshot cadence (events between saves). See `with_snapshot_persistence`.
     snapshot_every: u64,
+    /// Categories registered `StreamPolicy::OccRequired` via
+    /// `EngineBuilder::with_aggregate`. A reactor output whose routing
+    /// category is in this set is rejected — reactors append with
+    /// `StreamState::Any` and cannot uphold an aggregate's OCC invariant
+    /// (model it as an `Engine::append` command instead). Empty = no fence.
+    occ_categories: Arc<std::collections::HashSet<String>>,
 }
 
 impl<R: Reactor> ReactorRunner<R>
@@ -148,7 +154,19 @@ where
             settle_tracker: None,
             snapshot_store: None,
             snapshot_every: 0,
+            occ_categories: Arc::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Plumb the engine's OCC-required category set so the runner can
+    /// reject reactor outputs that would bypass an aggregate's
+    /// optimistic-concurrency fence. See the field docs.
+    pub(crate) fn with_occ_categories(
+        mut self,
+        occ_categories: Arc<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.occ_categories = occ_categories;
+        self
     }
 
     /// Attach a [`ReactorObserver`] for inspector / telemetry capture.
@@ -498,6 +516,35 @@ where
                     return Err(e);
                 }
             };
+
+            // ── OCC fence (pre-flight). A reactor appends its outputs
+            //    with `StreamState::Any`, so it cannot uphold the
+            //    optimistic-concurrency invariant of an aggregate stream
+            //    registered via `with_aggregate`. Emitting into such a
+            //    category silently corrupts that aggregate's OCC
+            //    guarantee — a deterministic config error, so route the
+            //    whole trigger to the DLQ (no retries) rather than append.
+            if !self.occ_categories.is_empty() {
+                if let Some(bad) = emitted.iter().find(|out| {
+                    self.occ_categories
+                        .contains(crate::event_type::category_of(&out.durable_name))
+                }) {
+                    let cat = crate::event_type::category_of(&bad.durable_name).to_string();
+                    let msg = format!(
+                        "reactor '{}' emitted a fact in OCC-required category '{cat}' — \
+                         reactor outputs append with StreamState::Any and cannot uphold \
+                         the aggregate's optimistic-concurrency fence; model this as an \
+                         Engine::append command, not a reactor output",
+                        self.consumer_id,
+                    );
+                    if self.dlq_mapper.is_some() {
+                        self.route_to_dlq(&event, attempt_seq, msg, chrono::Utc::now()).await?;
+                        applied += 1;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(msg));
+                }
+            }
 
             // ── Append each output directly to its own stream with a
             //    deterministic event_id (idempotent under redelivery via

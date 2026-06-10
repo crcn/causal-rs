@@ -96,15 +96,16 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
 }
 
 /// Compose the canonical Kurrent-style stream name for a fact:
-/// `{F::CATEGORY}-{stream_id}`.
+/// `{F::STREAM_CATEGORY}-{stream_id}`.
 ///
-/// Returns the same string the runtime uses when appending a fact
-/// of type `F` whose `stream_id()` returns `id`. Useful when you
+/// Returns the same string the runtime actually appends to — the
+/// *physical placement* stream, `STREAM_CATEGORY` (defaults to
+/// `CATEGORY`, but distinct for co-located event types). Useful when you
 /// need the stream name out-of-band — e.g., constructing a Kurrent
-/// admin-UI link, running a raw `read_stream` against the
-/// underlying client, or asserting a stream name in tests.
+/// admin-UI link, running a raw `read_stream` against the underlying
+/// client, or asserting a stream name in tests.
 pub fn stream_name_for<F: Event>(id: uuid::Uuid) -> String {
-    format!("{}-{}", F::CATEGORY, id)
+    format!("{}-{}", F::STREAM_CATEGORY, id)
 }
 
 /// Compose the canonical event_type for a fact:
