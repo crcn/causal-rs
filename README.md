@@ -8,48 +8,163 @@
 durable event log, with Postgres as the reactor/projection cursor
 store. It also runs entirely in-memory for tests.
 
-The library's vocabulary mirrors KurrentDB's exactly where the
-concepts overlap (`EventData` / `RecordedEvent`, `causation_id` /
-`correlation_id`, `StreamRevision`, `StreamState`,
-`$correlationId` / `$causationId` metadata). A KurrentDB developer
-should be able to read the API and recognize every term.
+## The model in one minute
+
+Everything that happens is an **event** appended to a log. From there:
+
+- **Aggregates** fold events into read-model state — `state = fold(events)`.
+  No mutable rows; the log *is* the source of truth.
+- **Reactors** are pure decisions: an event comes in, zero or more events
+  go out. The runtime appends those outputs back to the log (with
+  deterministic ids, so a crash-retry never double-emits), which can in
+  turn trigger more reactors. That's the `Event → Reactor → Event` loop.
+- **Projectors** build external read models (a Postgres table, a search
+  index) from the same stream.
+- You `emit()` an event and `await` `.settled()` — which resolves only
+  once the whole causal chain that event kicked off has drained.
+
+That's the whole idea: typed events, deterministic folds, and a
+self-driving reaction loop with at-least-once + idempotent delivery.
+
+## Install
+
+```toml
+[dependencies]
+causal = "0.8"
+
+# Durable backends (KurrentDB event log + Postgres cursors/snapshots):
+causal_replay = { version = "0.8", features = ["postgres", "kurrent"] }
+```
+
+The core `causal` crate runs entirely in-memory — you only need
+`causal_replay` for production backends.
+
+## Walkthrough
+
+A complete program: an order is placed, a reactor requests its shipment,
+and an aggregate folds both into queryable state. This is a runnable
+example —
+[`modules/causal/examples/order_walkthrough.rs`](modules/causal/examples/order_walkthrough.rs)
+(`cargo run -p causal --example order_walkthrough`).
 
 ```rust
-use causal::{Engine, EngineBuilder, EventLogBackend, CheckpointStore, ReactorCheckpoint};
-use causal::types::StreamState;
-use causal::MemoryStore;
+use causal::{
+    Aggregate, Aggregator, Apply, CheckpointStore, Ctx, EngineBuilder, Event,
+    EventLogBackend, Events, MemoryStore, Reactor, ReactorCheckpoint,
+};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use uuid::Uuid;
 
-let store = Arc::new(MemoryStore::new());
-let engine = EngineBuilder::new(
-        store.clone() as Arc<dyn EventLogBackend>,
-        store.clone() as Arc<dyn CheckpointStore>,
-        store.clone() as Arc<dyn ReactorCheckpoint>,
-    )
-    .with_aggregators(order_aggregators())   // Vec<Aggregator>
-    .with_reactor(ShipOnPlaced)               // impl Reactor
-    .build()                                  // async + fallible: seeds reactor cursors
-    .await?;
+// 1. Events are plain data. `CATEGORY` groups a type's streams;
+//    `stream_id` picks which stream this value belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderPlaced { order_id: Uuid, total: f64 }
+impl Event for OrderPlaced {
+    const CATEGORY: &'static str = "order";
+    fn event_type(&self) -> &str { "placed" }
+    fn stream_id(&self) -> Uuid { self.order_id }
+}
 
-// Emit an event. Engine derives stream name from `Event::CATEGORY +
-// Event::stream_id()`, stamps causation/correlation, persists, and
-// drives downstream reactors to quiescence on `.settled()`.
-engine.emit(OrderPlaced { order_id, total: 99.99 })
-    .causation_id(trigger_event_id)
-    .settled()
-    .await?;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShipmentRequested { order_id: Uuid }
+impl Event for ShipmentRequested {
+    const CATEGORY: &'static str = "shipment";
+    fn event_type(&self) -> &str { "requested" }
+    fn stream_id(&self) -> Uuid { self.order_id }
+}
+
+// 2. An aggregate is read-model state folded from events. `Apply<E>`
+//    is the per-event fold; impl it once per event type the aggregate
+//    cares about.
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct Order { total: f64, shipped: bool }
+impl Aggregate for Order { const NAME: &'static str = "Order"; }
+impl Apply<OrderPlaced> for Order {
+    fn apply(&mut self, e: &OrderPlaced) { self.total = e.total; }
+}
+impl Apply<ShipmentRequested> for Order {
+    fn apply(&mut self, _: &ShipmentRequested) { self.shipped = true; }
+}
+
+// 3. A reactor turns one event into others — a *pure* decision. The
+//    runtime appends the returned events to the log for you.
+struct ShipOnPlaced;
+#[async_trait::async_trait]
+impl Reactor for ShipOnPlaced {
+    type Trigger = OrderPlaced;
+    const GROUP_NAME: &'static str = "ship_on_placed";
+    async fn react(&self, t: &OrderPlaced, _ctx: Ctx<'_>) -> anyhow::Result<Events> {
+        Ok(causal::events![ShipmentRequested { order_id: t.order_id }])
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 4. Wire the engine. `MemoryStore` plays every backend role for
+    //    tests; swap in KurrentDB + Postgres for production (below).
+    let store = Arc::new(MemoryStore::new());
+    let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregators([
+            Aggregator::for_type::<Order, OrderPlaced>(),
+            Aggregator::for_type::<Order, ShipmentRequested>(),
+        ])
+        .with_reactor(ShipOnPlaced)
+        .build()             // async + fallible: seeds reactor cursors
+        .await?;
+
+    // 5. Emit one event. `.settled()` resolves only after the whole
+    //    chain drains: here, after ShipOnPlaced reacted and its
+    //    ShipmentRequested output landed in the log.
+    let order_id = Uuid::new_v4();
+    engine.emit(OrderPlaced { order_id, total: 99.99 })
+        .settled()
+        .await?;
+
+    // 6. Read the folded state back.
+    let order = engine.snapshot::<Order>(order_id).expect("order exists");
+    assert_eq!(order.total, 99.99);
+    assert!(order.shipped, "set by the reactor's downstream event");
+    Ok(())
+}
 ```
+
+Inside a reactor or projector body you read live aggregate state with
+`ctx.aggregate_of::<Order>(id).curr` — so a decision can depend on the
+fold so far. The `#[event]`, `#[aggregator]`, and `#[aggregators]`
+macros (feature `macros`, on by default) generate the boilerplate
+above from an enum; the walkthrough hand-rolls it to show the full
+surface.
+
+## Runnable examples
+
+Each lives under [`examples/`](examples/) and runs via
+`./dev.sh example run <name>` (which brings up its docker stack first):
+
+- **[`http-fetcher`](examples/http-fetcher)** — fans out HTTP fetches as
+  `FetchRequested` events; a reactor calls `reqwest` and emits
+  `Fetched` / `FetchFailed`. Production-shape backend (KurrentDB +
+  `PgReactorCheckpoint`).
+- **[`ai-summarizer`](examples/ai-summarizer)** — a reactor calls the
+  Anthropic API and emits `Summarized` / `SummaryFailed`. KurrentDB log
+  + in-memory cursors.
+- **[`inspector-demo`](examples/inspector-demo)** — a content-ingestion
+  pipeline wired to the **causal inspector** (GraphQL API + React UI on
+  `:4000`) that visualizes the event flow live, on KurrentDB + Postgres.
 
 ## Status
 
-**Pre-1.0; breaking changes expected.** The 2026-05-14/15 release
-finished a KurrentDB-vocabulary alignment pass (`parent_id` →
-`causation_id`, `NewEvent` → `EventData`, etc.). See
-[`CHANGELOG.md`](CHANGELOG.md) (the rename matrix is under `[0.5.0]`)
-and [`docs/MIGRATION_0.4.md`](docs/MIGRATION_0.4.md) for the
-step-by-step guide. The latest breaking changes are tracked under
-`[Unreleased]`, with the upgrade guide in
-[`docs/MIGRATION_0.8.md`](docs/MIGRATION_0.8.md).
+**Pre-1.0; breaking changes expected.** Latest release: **0.8.0**, an
+audit-remediation pass (data-integrity fixes, a uniform append-idempotency
+guarantee across backends, and a leaner public API). See
+[`CHANGELOG.md`](CHANGELOG.md) and the upgrade guide in
+[`docs/MIGRATION_0.8.md`](docs/MIGRATION_0.8.md); the earlier
+KurrentDB-vocabulary rename matrix is under `[0.5.0]` /
+[`docs/MIGRATION_0.4.md`](docs/MIGRATION_0.4.md).
 
 The library is being prepared for production deployment in
 [rootsignal](https://rootsignal.com) on KurrentDB.
