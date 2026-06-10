@@ -58,6 +58,8 @@ fn hybrid_construction_types_compose() {
             pg as Arc<dyn ReactorCheckpoint>,
         )
         .build()
+        .await
+        .unwrap()
     }
 }
 
@@ -138,7 +140,7 @@ async fn engine_appends_to_kurrent_with_pg_checkpoint() -> Result<()> {
         pg.clone() as Arc<dyn CheckpointStore>,
         pg.clone() as Arc<dyn ReactorCheckpoint>,
     )
-    .build();
+    .build().await.unwrap();
 
     let order_id = Uuid::new_v4();
     let fact = OrderPlaced {

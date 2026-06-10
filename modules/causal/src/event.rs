@@ -111,7 +111,7 @@ pub fn stream_name_for<F: Event>(id: uuid::Uuid) -> String {
 /// `{F::CATEGORY}:{fact.event_type()}`. Same shape `Engine::emit` writes
 /// to `RecordedEvent::event_type` and Kurrent's `event_type` field.
 pub fn event_type_for<F: Event>(fact: &F) -> String {
-    format!("{}:{}", F::CATEGORY, fact.event_type())
+    crate::event_type::compose(F::CATEGORY, fact.event_type())
 }
 
 #[cfg(test)]

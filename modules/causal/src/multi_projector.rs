@@ -282,9 +282,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
 /// the false-positive that plain `starts_with` has when one category
 /// is a prefix of another (e.g. `"world"` matching `"worldwide:..."`).
 fn starts_with_category(event_type: &str, category: &str) -> bool {
-    event_type.len() > category.len()
-        && event_type.as_bytes()[category.len()] == b':'
-        && event_type.starts_with(category)
+    crate::event_type::matches_category(event_type, category)
 }
 
 #[cfg(test)]

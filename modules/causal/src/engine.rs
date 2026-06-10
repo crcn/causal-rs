@@ -456,6 +456,11 @@ pub struct EngineBuilder {
     /// Save a snapshot every N folded events per aggregate. `0` disables saving
     /// (restore still works via full replay).
     snapshot_every:        u64,
+    /// `(group_name, start_position)` per registered reactor — consumed by
+    /// `build()` to seed absent reactor cursors BEFORE consumers spawn.
+    /// Projectors are deliberately absent: read models start from ZERO
+    /// (they want full history); side effects must not replay it.
+    reactor_seeds:         Vec<(&'static str, crate::projection::StartPosition)>,
 }
 
 impl EngineBuilder {
@@ -485,6 +490,7 @@ impl EngineBuilder {
             corr_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
+            reactor_seeds: Vec::new(),
         }
     }
 
@@ -523,7 +529,7 @@ impl EngineBuilder {
     ///     )
     ///     .with_observer(store.clone())
     ///     .with_reactor(MyReactor)
-    ///     .build();
+    ///     .build().await.unwrap();
     /// ```
     ///
     /// Takes `Arc<dyn ReactorObserver>` so callers holding a trait
@@ -727,6 +733,10 @@ impl EngineBuilder {
         R::Trigger: DeserializeOwned,
     {
         self.claim_group_name(R::GROUP_NAME);
+        self.reactor_seeds.push((
+            R::GROUP_NAME,
+            crate::projection::StartPosition::ResumeOrLatest,
+        ));
         let log = self.log.clone();
         let reactor_checkpoint = self.reactor_checkpoint.clone();
         let dlq_mapper = self.dlq_mapper.clone();
@@ -808,7 +818,62 @@ impl EngineBuilder {
         multi_projectors.into_iter().fold(self, |b, p| p.register(b))
     }
 
-    pub fn build(self) -> Engine {
+    /// Override the start position for one reactor at registration
+    /// time. The default (plain [`with_reactor`](Self::with_reactor)) is
+    /// [`StartPosition::ResumeOrLatest`]: resume a persisted cursor, or
+    /// seed a fresh one at `latest_position()` — a newly deployed
+    /// reactor must NOT re-fire side effects for the existing log.
+    /// `StartPosition::Zero` is the explicit escape hatch for "I *want*
+    /// this reactor to process history" (see its replay-hazard docs).
+    pub fn with_reactor_start<R: Reactor + 'static>(
+        self,
+        r: R,
+        start: crate::projection::StartPosition,
+    ) -> Self
+    where
+        R::Trigger: DeserializeOwned,
+    {
+        let mut b = self.with_reactor(r);
+        if let Some(seed) = b.reactor_seeds.last_mut() {
+            seed.1 = start;
+        }
+        b
+    }
+
+    /// Build the engine: seed absent reactor cursors, then spawn every
+    /// consumer's supervisor task.
+    ///
+    /// Async + fallible since the 2026-06-10 remediation (B2): seeding
+    /// reads `latest_position()` and writes cursors, and it MUST happen
+    /// before `build` returns — seeding lazily in the runner's first
+    /// step would race events emitted right after `build()` (the
+    /// canonical `build(); emit().settled()` pattern would
+    /// nondeterministically skip its own trigger).
+    ///
+    /// Projector cursors are never seeded: read models start from
+    /// `LogCursor::ZERO` and want full history. The defaults differ on
+    /// purpose — side effects must not replay; read models must.
+    pub async fn build(self) -> Result<Engine> {
+        // Seed reactor cursors per their StartPosition, before any
+        // consumer can take a step.
+        for (group, start) in &self.reactor_seeds {
+            use crate::projection::StartPosition::*;
+            let existing = self.reactor_checkpoint.get(group).await?;
+            let seed = match (start, existing) {
+                (ResumeOrLatest, Some(_)) => None,
+                (ResumeOrLatest, None)    => Some(self.log.latest_position().await?),
+                // Latest deliberately ignores a persisted cursor — the
+                // backlog is skipped on every (re)build. Ops escape
+                // hatch; see StartPosition::Latest docs.
+                (Latest, _)               => Some(self.log.latest_position().await?),
+                (Zero, _)                 => Some(LogCursor::ZERO),
+                (Specific(c), _)          => Some(*c),
+            };
+            if let Some(pos) = seed {
+                self.reactor_checkpoint.set(group, pos).await?;
+            }
+        }
+
         let aggregators = self.aggregators;
         let make_registry = || -> Option<Arc<AggregatorRegistry>> {
             if aggregators.is_empty() { return None; }
@@ -827,7 +892,7 @@ impl EngineBuilder {
             .map(|f| f(make_registry(), engine_aggregators.clone()))
             .collect();
         let consumer_ids: Vec<String> = self.group_names.into_iter().collect();
-        Engine::start(
+        Ok(Engine::start(
             self.log,
             self.checkpoint,
             consumers,
@@ -839,7 +904,7 @@ impl EngineBuilder {
             self.corr_hw,
             self.snapshot_store,
             self.snapshot_every,
-        )
+        ))
     }
 }
 
@@ -1183,7 +1248,7 @@ impl Engine {
             // event_type carries the ROUTING category (consumer/aggregator
             // matching); `category`/placement uses the STREAM category. They
             // differ only when the event overrides `STREAM_CATEGORY`.
-            let event_type = format!("{}:{}", fact.category(), fact.variant_name());
+            let event_type = crate::event_type::compose(fact.category(), fact.variant_name());
             let stream_category = fact.stream_category();
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let stream_id = fact.stream_id();
@@ -1605,6 +1670,103 @@ mod tests {
 
     fn store() -> Arc<MemoryStore> { Arc::new(MemoryStore::new()) }
 
+    /// B2: a freshly-deployed reactor against an EXISTING log must not
+    /// re-fire side effects for history — its cursor seeds at
+    /// `latest_position()` during `build()`. Events emitted after build
+    /// process normally. `StartPosition::Zero` is the explicit opt-in
+    /// for processing history.
+    #[tokio::test]
+    async fn fresh_reactor_seeds_at_latest_and_skips_history() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FIRED: AtomicUsize = AtomicUsize::new(0);
+        struct CountingReactor;
+        #[async_trait]
+        impl Reactor for CountingReactor {
+            type Trigger = UserCreated;
+            const GROUP_NAME: &'static str = "seed.counting";
+            async fn react(&self, _t: &UserCreated, _ctx: Ctx<'_>) -> Result<Events> {
+                FIRED.fetch_add(1, Ordering::SeqCst);
+                Ok(Events::new())
+            }
+        }
+
+        let store = store();
+        // Pre-existing history: an engine WITHOUT the reactor emits one.
+        {
+            let engine = EngineBuilder::new(
+                store.clone() as Arc<dyn EventLogBackend>,
+                store.clone() as Arc<dyn CheckpointStore>,
+                store.clone() as Arc<dyn ReactorCheckpoint>,
+            ).build().await.unwrap();
+            engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
+                .settled().await.unwrap();
+            engine.shutdown().await.unwrap();
+        }
+
+        // "Deploy" the reactor: cursor seeds at latest during build,
+        // so the historical trigger never reaches react().
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_reactor(CountingReactor)
+        .build().await.unwrap();
+
+        // A new trigger fires exactly once.
+        engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
+            .settled().await.unwrap();
+        assert_eq!(FIRED.load(Ordering::SeqCst), 1,
+                   "history skipped; only the post-deploy trigger fired");
+        engine.shutdown().await.unwrap();
+    }
+
+    /// B2: `StartPosition::Zero` forces the reactor through history —
+    /// the explicit replay opt-in.
+    #[tokio::test]
+    async fn with_reactor_start_zero_processes_history() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FIRED_ZERO: AtomicUsize = AtomicUsize::new(0);
+        struct CountingReactorZero;
+        #[async_trait]
+        impl Reactor for CountingReactorZero {
+            type Trigger = UserCreated;
+            const GROUP_NAME: &'static str = "seed.zero";
+            async fn react(&self, _t: &UserCreated, _ctx: Ctx<'_>) -> Result<Events> {
+                FIRED_ZERO.fetch_add(1, Ordering::SeqCst);
+                Ok(Events::new())
+            }
+        }
+
+        let store = store();
+        {
+            let engine = EngineBuilder::new(
+                store.clone() as Arc<dyn EventLogBackend>,
+                store.clone() as Arc<dyn CheckpointStore>,
+                store.clone() as Arc<dyn ReactorCheckpoint>,
+            ).build().await.unwrap();
+            engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
+                .settled().await.unwrap();
+            engine.shutdown().await.unwrap();
+        }
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_reactor_start(CountingReactorZero, crate::projection::StartPosition::Zero)
+        .build().await.unwrap();
+
+        engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
+            .settled().await.unwrap();
+        assert_eq!(FIRED_ZERO.load(Ordering::SeqCst), 2,
+                   "Zero opt-in replays the historical trigger AND fires the new one");
+        engine.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn engine_drives_projector_end_to_end() {
         let store = store();
@@ -1617,7 +1779,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
-        .build();
+        .build().await.unwrap();
 
         // Emit 3 facts.
         for _ in 0..3 {
@@ -1677,7 +1839,7 @@ mod tests {
         )
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter))
-        .build();
+        .build().await.unwrap();
 
         engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
@@ -1743,7 +1905,7 @@ mod tests {
             Aggregator::for_type::<ChainCount, WelcomeQueued>(),
         ])
         .with_reactor(WelcomeReactor)
-        .build();
+        .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
         engine.emit(UserCreated {
@@ -1926,7 +2088,7 @@ mod tests {
                 |e: &OrgUserCreated| Some(e.org_id)
             ),
         ])
-        .build();
+        .build().await.unwrap();
 
         let org_a = Uuid::new_v4();
         let org_b = Uuid::new_v4();
@@ -1996,7 +2158,7 @@ mod tests {
                 |e: &MaybeRunEvent| e.run_id
             ),
         ])
-        .build();
+        .build().await.unwrap();
 
         let run = Uuid::new_v4();
 
@@ -2073,7 +2235,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(tagged_aggs::aggregators())
-        .build();
+        .build().await.unwrap();
 
         let tag_a = Uuid::new_v4();
         let tag_b = Uuid::new_v4();
@@ -2111,7 +2273,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).build();
+        ).build().await.unwrap();
 
         engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
@@ -2137,7 +2299,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
-        .build();
+        .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
@@ -2162,7 +2324,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
-        .build();
+        .build().await.unwrap();
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct OrderPlaced { order_id: Uuid, occurred_at: DateTime<Utc> }
@@ -2240,7 +2402,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
-        .build();
+        .build().await.unwrap();
 
         let id = Uuid::new_v4();
         let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
@@ -2251,7 +2413,7 @@ mod tests {
 
     // ── Phase 3 — OCC command path (Engine::append) ──
 
-    fn occ_engine(store: &Arc<MemoryStore>) -> Engine {
+    async fn occ_engine(store: &Arc<MemoryStore>) -> Engine {
         EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
@@ -2259,12 +2421,14 @@ mod tests {
         )
         .with_aggregate::<Counter, CounterFact>()
         .build()
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
     async fn append_persists_and_folds_across_calls() {
         let store = store();
-        let engine = occ_engine(&store);
+        let engine = occ_engine(&store).await;
         let id = Uuid::new_v4();
 
         engine
@@ -2291,7 +2455,7 @@ mod tests {
     #[tokio::test]
     async fn append_empty_decision_is_noop() {
         let store = store();
-        let engine = occ_engine(&store);
+        let engine = occ_engine(&store).await;
         let id = Uuid::new_v4();
 
         engine
@@ -2307,7 +2471,7 @@ mod tests {
     #[tokio::test]
     async fn emit_rejects_occ_required_category() {
         let store = store();
-        let engine = occ_engine(&store);
+        let engine = occ_engine(&store).await;
 
         let err = engine
             .emit(CounterFact::Inc {
@@ -2332,7 +2496,7 @@ mod tests {
         // apply → value 2 (guard violated). With OCC, the loser
         // conflicts, reloads, sees value 1, and no-ops → value 1.
         let store = store();
-        let engine = Arc::new(occ_engine(&store));
+        let engine = Arc::new(occ_engine(&store).await);
         let id = Uuid::new_v4();
 
         let guard = move |c: &Counter| -> Result<Vec<CounterFact>> {
@@ -2362,7 +2526,7 @@ mod tests {
     #[tokio::test]
     async fn append_multi_fact_decision_lands_contiguously() {
         let store = store();
-        let engine = occ_engine(&store);
+        let engine = occ_engine(&store).await;
         let id = Uuid::new_v4();
 
         engine
@@ -2397,7 +2561,7 @@ mod tests {
         // budget + backoff.
         const N: i32 = 8;
         let store = store();
-        let engine = Arc::new(occ_engine(&store));
+        let engine = Arc::new(occ_engine(&store).await);
         let id = Uuid::new_v4();
 
         let mut tasks = Vec::new();
@@ -2497,7 +2661,7 @@ mod tests {
             external_calls: external_calls.clone(),
             attempts: attempts.clone(),
         })
-        .build();
+        .build().await.unwrap();
 
         engine
             .emit(Ping { id: Uuid::new_v4(), occurred_at: Utc::now() })
@@ -2530,7 +2694,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
-        .build();
+        .build().await.unwrap();
 
         let id = Uuid::new_v4();
         engine.emit(vec![
@@ -2555,7 +2719,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
-        .build();
+        .build().await.unwrap();
 
         let id = Uuid::new_v4();
         let pinned = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
@@ -2626,7 +2790,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_multi_projector(auditor)
-        .build();
+        .build().await.unwrap();
 
         engine.emit(A { a_id: Uuid::new_v4(), occurred_at: Utc::now() }).await.unwrap();
         engine.emit(B { b_id: Uuid::new_v4(), occurred_at: Utc::now() }).await.unwrap();
@@ -2654,7 +2818,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).build();
+        ).build().await.unwrap();
 
         let cmd_correlation = Uuid::new_v4();
 
@@ -2682,7 +2846,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).build();
+        ).build().await.unwrap();
 
         let parent = Uuid::new_v4();
 
@@ -2720,7 +2884,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
-        .build();
+        .build().await.unwrap();
 
         let id = Uuid::new_v4();
         let cmd_correlation = Uuid::new_v4();
@@ -2755,7 +2919,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(UserRoster::default())
-        .build();
+        .build().await.unwrap();
 
         let pos = engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
@@ -2807,7 +2971,7 @@ mod tests {
             crate::aggregator::Aggregator::for_type::<Multi, Tick>(),
             crate::aggregator::Aggregator::for_type::<Multi, Pong>(),
         ])
-        .build();
+        .build().await.unwrap();
         // No panic — different Event CATEGORYs.
     }
 
@@ -2891,7 +3055,7 @@ mod tests {
             Box::new(a) as Box<dyn ProjectorRegistration>,
             Box::new(b) as Box<dyn ProjectorRegistration>,
         ])
-        .build();
+        .build().await.unwrap();
 
         engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
@@ -2922,7 +3086,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(vec![tick_aggregator()])
-        .build();
+        .build().await.unwrap();
 
         // Tick.stream_id() returns Uuid::nil() — all ticks fold into
         // the nil-keyed slot.
@@ -2950,7 +3114,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).build();
+        ).build().await.unwrap();
         let _ = engine.snapshot::<TickCounter>(Uuid::nil());
     }
 
@@ -2993,7 +3157,7 @@ mod tests {
         }))
         .with_max_attempts(2)
         .with_reactor(AlwaysFails)
-        .build();
+        .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
             user_id: Uuid::new_v4(),
@@ -3070,7 +3234,7 @@ mod tests {
         )
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter_c))
-        .build();
+        .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
             user_id: Uuid::new_v4(),
@@ -3104,7 +3268,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
-        .build();
+        .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
@@ -3134,7 +3298,9 @@ mod tests {
                 store.clone() as Arc<dyn ReactorCheckpoint>,
             )
             .with_reactor(WelcomeReactor)
-            .build(),
+            .build()
+            .await
+            .unwrap(),
         );
 
         // Run B: a background flood that never stops moving the global head.
@@ -3191,7 +3357,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
-        .build();
+        .build().await.unwrap();
 
         // Emit some real work — consumer hasn't necessarily processed
         // it yet (async runner).
@@ -3230,7 +3396,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(roster)
-        .build();
+        .build().await.unwrap();
 
         // Without .settled(), bare .await would return before the
         // async projector ran. With .settled(), we are guaranteed
@@ -3288,7 +3454,7 @@ mod tests {
         .with_observer(store.clone())
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .with_reactor(EchoReactor { calls: calls.clone() })
-        .build();
+        .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
         engine.emit(UserCreated {
@@ -3370,7 +3536,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
-        .build();
+        .build().await.unwrap();
 
         let id = Uuid::new_v4();
         assert!(engine.snapshot::<UserAgg>(id).is_none(),
@@ -3387,7 +3553,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([Aggregator::for_type::<Counter, CounterFact>()])
-        .build();
+        .build().await.unwrap();
 
         let id = Uuid::new_v4();
         engine.emit(CounterFact::Inc {
@@ -3417,7 +3583,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).build();
+        ).build().await.unwrap();
 
         // Auto-generated correlation when not provided.
         let r1 = engine.emit(UserCreated {
@@ -3457,7 +3623,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).build();
+        ).build().await.unwrap();
 
         let result = engine.emit(Vec::<UserCreated>::new()).await.unwrap();
         assert_eq!(result.position, LogCursor::ZERO);
@@ -3487,7 +3653,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_default_metadata(defaults)
-        .build();
+        .build().await.unwrap();
 
         // Per-emit override: _run_id should win; _actor inherited; new
         // key _trace merges in.
@@ -3522,7 +3688,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(UserRoster::default())
-        .build();
+        .build().await.unwrap();
 
         let start = std::time::Instant::now();
         engine.shutdown().await.unwrap();
@@ -3589,7 +3755,7 @@ mod tests {
         )
         .with_aggregators(vec![tick_aggregator()])
         .with_projector(cap)
-        .build();
+        .build().await.unwrap();
 
         for i in 0..3 {
             engine.emit(Tick { seq: i, occurred_at: Utc::now() }).await.unwrap();
@@ -3642,7 +3808,7 @@ mod tests {
         )
         .with_aggregators(vec![tick_aggregator()])
         .with_reactor(cap)
-        .build();
+        .build().await.unwrap();
 
         for i in 0..3 {
             engine.emit(Tick { seq: i, occurred_at: Utc::now() }).await.unwrap();
@@ -4064,7 +4230,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_projector(m)
-        .build();
+        .build().await.unwrap();
 
         engine.emit(Tick { seq: 0, occurred_at: Utc::now() }).await.unwrap();
 
@@ -4134,7 +4300,7 @@ mod tests {
         .with_aggregators(vec![agg_a])     // first call
         .with_aggregators(vec![agg_b])     // second call — must accumulate
         .with_projector(v)
-        .build();
+        .build().await.unwrap();
 
         for i in 0..2 {
             engine.emit(Tick { seq: i, occurred_at: Utc::now() }).await.unwrap();
@@ -4209,7 +4375,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_multi_projector(router)
-        .build();
+        .build().await.unwrap();
 
         engine.emit(Tick { seq: 0, occurred_at: Utc::now() }).await.unwrap();
         engine.emit(OtherFact { id: Uuid::new_v4(), occurred_at: Utc::now() }).await.unwrap();

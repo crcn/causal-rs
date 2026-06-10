@@ -121,7 +121,7 @@ async fn pg_inspector_round_trip() -> Result<()> {
         Aggregator::for_type::<Pings, Pinged>(),
     ])
     .with_reactor(PongReactor::default())
-    .build();
+    .build().await.unwrap();
 
     let id = Uuid::new_v4();
     let result = engine

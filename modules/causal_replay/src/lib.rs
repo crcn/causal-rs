@@ -38,7 +38,7 @@
 //!     Arc::new(kurrent) as Arc<dyn EventLogBackend>,
 //!     pg.clone() as Arc<dyn CheckpointStore>,
 //!     pg as Arc<dyn ReactorCheckpoint>,
-//! ).build();
+//! ).build().await?;
 //! # let _ = engine;
 //! # Ok(())
 //! # }

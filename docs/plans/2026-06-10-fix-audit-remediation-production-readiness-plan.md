@@ -162,31 +162,32 @@ in flight — once it commits, 10 is behind every cursor, silently skipped
 forever (`causal_replay/src/event_log.rs:215-235`; module doc at :20-22 only
 covers harmless rollback gaps).
 
-- [ ] Take `pg_advisory_xact_lock(classid, objid)` — the **two-arg form with
+- [x] Take `pg_advisory_xact_lock(classid, objid)` — the **two-arg form with
       documented constants** (single-arg i64 risks colliding with other
       advisory-lock users; rootsignal's Pg is shared infra) — at the start of
       `append_to_stream`'s transaction. Global lock: global ordering requires
       it. Commit visibility precedes lock release, so positions become
       monotonic with commit order.
-- [ ] Lock-span discipline: build all row data before `BEGIN`, and replace
+- [x] Lock-span discipline: build all row data before `BEGIN`, and replace
       the per-event insert loop with a **single multi-row
       `INSERT … RETURNING position`** so lock hold time is O(1) round-trips.
       (The dup/conflict lookups already run outside the txn — verified,
       `drop(tx)` at :151/:185 — keep that.)
-- [ ] `PgEventProjector` mirror inserts (`event_projector.rs:95-114`) write
+- [x] `PgEventProjector` mirror inserts (`event_projector.rs:95-114`) write
       `causal_log` without `append_to_stream` — take the same lock there.
-- [ ] `latest_position()` becomes trustworthy as a consequence; rewrite the
+- [x] `latest_position()` becomes trustworthy as a consequence; rewrite the
       module doc (:20-22) to describe the in-flight-reorder hazard + fix.
-- [ ] Rejected alternative, documented in code: xmin fencing (read-side) —
+- [x] Rejected alternative, documented in code: xmin fencing (read-side) —
       more concurrency, more complexity; revisit only if the lock shows up in
       profiles. Rootsignal's prod append path is Kurrent, so the lock costs
       nothing there.
-- [ ] Conformance (backend-generic, rev-2 restatement — the trait can't hold
+- [x] Conformance (backend-generic, rev-2 restatement — the trait can't hold
       a txn open): N concurrent appenders × M events with a tailer
       checkpointing after every event; assert the tailer sees all N×M exactly
       once, in monotonic position order. Plus a Pg-specific raw-sqlx test
       reproducing the pre-fix interleaving deterministically.
-- [ ] Contention assertion (concrete): under the high-contention OCC test
+- [ ] Contention assertion (deferred by the A1 agent: the 8×25 stress scenario + existing OCC tests cover the behavior; revisit if profiles complain)
+      — original item: Contention assertion (concrete): under the high-contention OCC test
       pointed at Pg, all appends succeed with zero retry-budget exhaustion
       and all events present in `read_all`.
 

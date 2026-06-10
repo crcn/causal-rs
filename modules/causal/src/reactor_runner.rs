@@ -268,7 +268,7 @@ where
                 }
             }
 
-            if !event.event_type.starts_with(prefix) {
+            if !crate::event_type::matches_category(&event.event_type, prefix) {
                 // Non-matching trigger: just advance the cursor.
                 self.checkpoint.set(&self.consumer_id, event.position).await?;
                 continue;
@@ -395,8 +395,8 @@ where
                                 // `event_type` keeps the routing category.
                                 let cat = fact.stream_category().to_string();
                                 let sid = fact.stream_id();
-                                let event_type =
-                                    format!("{}:{}", fact.category(), fact.variant_name());
+                                let event_type = crate::event_type::compose(
+                                    fact.category(), fact.variant_name());
                                 let payload = fact.to_value()?;
                                 let out_event = EventData {
                                     event_id: derive_output_event_id(
@@ -1032,6 +1032,54 @@ mod tests {
         assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
         assert_eq!(dlq_calls.load(Ordering::SeqCst), 1,
                    "third attempt across runners triggers mapper");
+    }
+
+    #[tokio::test]
+    async fn prefix_colliding_category_does_not_reach_the_reactor() {
+        // B1 regression: the trigger filter must be colon-aware. With a
+        // bare starts_with, a reactor on category "order" matched
+        // "orders:created" — the foreign payload then hit the trigger
+        // deserializer and either wedged the consumer or, with a
+        // permissive serde shape, silently invoked react() on the
+        // wrong event.
+        let store = Arc::new(MemoryStore::new());
+        let foreign = EventData {
+            event_id:       Uuid::new_v4(),
+            causation_id:   None,
+            correlation_id: Uuid::new_v4(),
+            // Same prefix bytes as "order", different category.
+            event_type:     "orders:created".into(),
+            payload:        serde_json::json!({ "name": "not an OrderPlaced" }),
+            created_at:     Utc::now(),
+            category:       Some("orders".into()),
+            stream_id:      Some(Uuid::new_v4()),
+            metadata:       serde_json::Map::new(),
+            ephemeral:      None,
+            persistent:     true,
+        };
+        crate::append_event(store.as_ref(), foreign).await.unwrap();
+
+        struct PanicsIfCalled;
+        #[async_trait]
+        impl Reactor for PanicsIfCalled {
+            type Trigger = OrderPlaced; // CATEGORY = "order"
+            const GROUP_NAME: &'static str = "no-collision";
+            async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                panic!("reactor must never see a foreign-category event");
+            }
+        }
+
+        let runner = ReactorRunner::new(
+            PanicsIfCalled,
+            "r.no-collision",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+
+        let outcome = runner.step(10).await.unwrap();
+        assert_eq!(outcome, StepOutcome::Progressed { applied: 0 },
+                   "foreign category skipped, cursor advanced, no deser, no wedge");
+        assert!(store.get("r.no-collision").await.unwrap().is_some());
     }
 
     #[tokio::test]

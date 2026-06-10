@@ -63,7 +63,7 @@ impl Apply<Withdrawn> for Balance {
     fn apply(&mut self, e: &Withdrawn) { self.value -= e.amount; }
 }
 
-fn build(mem: &Arc<MemoryStore>, store: Option<Arc<MemoryStore>>, every: u64) -> Engine {
+async fn build(mem: &Arc<MemoryStore>, store: Option<Arc<MemoryStore>>, every: u64) -> Engine {
     let mut b = EngineBuilder::new(
         mem.clone() as Arc<dyn EventLogBackend>,
         mem.clone() as Arc<dyn CheckpointStore>,
@@ -78,7 +78,7 @@ fn build(mem: &Arc<MemoryStore>, store: Option<Arc<MemoryStore>>, every: u64) ->
             .with_snapshot_store(s as Arc<dyn SnapshotStore>)
             .with_snapshot_every(every);
     }
-    b.build()
+    b.build().await.unwrap()
 }
 
 // 1. Restart restore — the bug this feature fixes. Engine #2 (fresh registry,
@@ -89,7 +89,7 @@ async fn restart_restores_full_aggregate_state() -> Result<()> {
     let acct = Uuid::new_v4();
 
     {
-        let engine = build(&mem, Some(mem.clone()), 100);
+        let engine = build(&mem, Some(mem.clone()), 100).await;
         engine.emit(Deposited { account: acct, amount: 100 }).await?;
         engine.emit(Deposited { account: acct, amount: 50 }).await?;
         engine.emit(Withdrawn { account: acct, amount: 30 }).await?;
@@ -102,7 +102,7 @@ async fn restart_restores_full_aggregate_state() -> Result<()> {
     }
 
     // Engine #2 — fresh registry, SAME MemoryStore.
-    let engine2 = build(&mem, Some(mem.clone()), 100);
+    let engine2 = build(&mem, Some(mem.clone()), 100).await;
     let restored = engine2.load_aggregate::<Balance>(acct).await?;
     assert_eq!(
         restored,
@@ -119,7 +119,7 @@ async fn snapshot_accelerates_without_changing_result() -> Result<()> {
     let mem = Arc::new(MemoryStore::new());
     let acct = Uuid::new_v4();
 
-    let engine = build(&mem, Some(mem.clone()), 3); // snapshot every 3 folds
+    let engine = build(&mem, Some(mem.clone()), 3).await; // snapshot every 3 folds
     let mut expected = 0i64;
     for _ in 0..10 {
         engine.emit(Deposited { account: acct, amount: 10 }).await?;
@@ -131,7 +131,7 @@ async fn snapshot_accelerates_without_changing_result() -> Result<()> {
     engine.shutdown().await?;
 
     // Engine #2 restores via snapshot + tail.
-    let engine2 = build(&mem, Some(mem.clone()), 3);
+    let engine2 = build(&mem, Some(mem.clone()), 3).await;
     let restored = engine2.load_aggregate::<Balance>(acct).await?;
     assert_eq!(
         restored,
@@ -149,7 +149,7 @@ async fn corrupt_snapshot_self_heals() -> Result<()> {
     let acct = Uuid::new_v4();
 
     {
-        let engine = build(&mem, Some(mem.clone()), 100);
+        let engine = build(&mem, Some(mem.clone()), 100).await;
         engine.emit(Deposited { account: acct, amount: 100 }).await?;
         engine.emit(Withdrawn { account: acct, amount: 40 }).await?;
         engine.shutdown().await?;
@@ -168,7 +168,7 @@ async fn corrupt_snapshot_self_heals() -> Result<()> {
     )
     .await?;
 
-    let engine2 = build(&mem, Some(mem.clone()), 100);
+    let engine2 = build(&mem, Some(mem.clone()), 100).await;
     let restored = engine2.load_aggregate::<Balance>(acct).await?;
     assert_eq!(
         restored,
@@ -215,7 +215,7 @@ async fn without_snapshot_store_behavior_unchanged() -> Result<()> {
     let acct = Uuid::new_v4();
 
     {
-        let engine = build(&mem, None, 0); // no snapshot store
+        let engine = build(&mem, None, 0).await; // no snapshot store
         engine.emit(Deposited { account: acct, amount: 100 }).await?;
         assert_eq!(
             engine.snapshot::<Balance>(acct),
@@ -226,7 +226,7 @@ async fn without_snapshot_store_behavior_unchanged() -> Result<()> {
     }
 
     // Fresh engine, no store → load_aggregate does NOT restore.
-    let engine2 = build(&mem, None, 0);
+    let engine2 = build(&mem, None, 0).await;
     assert_eq!(
         engine2.load_aggregate::<Balance>(acct).await?,
         None,

@@ -278,7 +278,7 @@ mod persisted_event_tests {
     use super::*;
 
     fn mk(event_type: &str) -> RecordedEvent {
-        let category = event_type.split(':').next().unwrap_or(event_type).to_string();
+        let category = crate::event_type::category_of(&event_type).to_string();
         RecordedEvent {
             position:        LogCursor::ZERO,
             event_id:        Uuid::nil(),

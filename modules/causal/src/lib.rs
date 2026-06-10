@@ -71,7 +71,8 @@
 //!         store.clone() as Arc<dyn ReactorCheckpoint>,
 //!     )
 //!     .with_reactor(ShipOnPlaced)
-//!     .build();
+//!     .build()
+//!     .await?;
 //!
 //! // Persists the event, stamps causation/correlation, and resolves once
 //! // ShipOnPlaced has reacted and its output has landed in the log.
@@ -96,6 +97,7 @@ pub mod checkpoint_store;
 pub mod contexts;
 pub mod engine;
 pub mod event_log;
+pub mod event_type;
 pub mod event;
 pub mod multi_projector;
 pub mod projection;

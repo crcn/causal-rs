@@ -173,7 +173,7 @@ impl EventOutput {
     pub fn new<F: crate::event::Event>(fact: F) -> Self {
         let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
         let stream_category = <F as crate::event::Event>::STREAM_CATEGORY.to_string();
-        let durable_name = format!("{}:{}", event_prefix, fact.event_type());
+        let durable_name = crate::event_type::compose(&event_prefix, fact.event_type());
         let stream_id = fact.stream_id();
         let payload = serde_json::to_value(&fact).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(fact);
@@ -218,7 +218,7 @@ impl EventOutput {
 /// For the common consumer-side case, prefer
 /// [`RecordedEvent::category`](crate::RecordedEvent::category).
 pub fn extract_prefix(event_type: &str) -> &str {
-    event_type.split(':').next().unwrap_or(event_type)
+    crate::event_type::category_of(event_type)
 }
 
 /// Universal return type for [`Reactor::react`]. Builder-style; use

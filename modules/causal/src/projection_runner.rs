@@ -164,7 +164,7 @@ where
             // Filter by Event prefix. Non-matching events advance the
             // cursor but don't trigger project — the consumer
             // legitimately doesn't handle them.
-            if !event.event_type.starts_with(prefix) {
+            if !crate::event_type::matches_category(&event.event_type, prefix) {
                 self.checkpoint.set(&self.consumer_id, event.position).await?;
                 continue;
             }
