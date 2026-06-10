@@ -854,6 +854,17 @@ impl EngineBuilder {
     /// `LogCursor::ZERO` and want full history. The defaults differ on
     /// purpose — side effects must not replay; read models must.
     pub async fn build(self) -> Result<Engine> {
+        // Reject categories that can't participate in the
+        // `{category}:{name}` format before anything runs — a colon in a
+        // category silently desyncs reactor matching from aggregate
+        // folding (the aggregate never folds, with no runtime error).
+        for agg in &self.aggregators {
+            crate::event_type::validate_category("aggregator event", &agg.event_prefix)?;
+            if !agg.stream_category.is_empty() {
+                crate::event_type::validate_category("aggregate stream", &agg.stream_category)?;
+            }
+        }
+
         // Seed reactor cursors per their StartPosition, before any
         // consumer can take a step.
         for (group, start) in &self.reactor_seeds {
@@ -1720,6 +1731,45 @@ mod tests {
         assert_eq!(FIRED.load(Ordering::SeqCst), 1,
                    "history skipped; only the post-deploy trigger fired");
         engine.shutdown().await.unwrap();
+    }
+
+    /// Anti-fragility regression: a colon in `Event::CATEGORY` is the
+    /// reserved format separator and silently desyncs reactor matching
+    /// (length-based) from aggregate folding (first-colon split) — the
+    /// aggregate would never fold, with no runtime error. `build()`
+    /// rejects it loudly.
+    #[tokio::test]
+    async fn build_rejects_colon_in_aggregate_category() {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Weird { id: Uuid }
+        impl Event for Weird {
+            const CATEGORY: &'static str = "order:sub"; // colon = reserved
+            fn event_type(&self) -> &str { "weird" }
+            fn stream_id(&self) -> Uuid { self.id }
+        }
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct WeirdAgg { n: u32 }
+        impl crate::aggregate::Aggregate for WeirdAgg {
+            const NAME: &'static str = "WeirdAgg";
+        }
+        impl crate::aggregate::Apply<Weird> for WeirdAgg {
+            fn apply(&mut self, _: &Weird) { self.n += 1; }
+        }
+
+        let store = store();
+        let result = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregators(vec![Aggregator::for_type::<WeirdAgg, Weird>()])
+        .build()
+        .await;
+        let err = match result {
+            Ok(_) => panic!("build must reject a colon-bearing category"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("reserved separator"), "got: {err}");
     }
 
     /// B2: `StartPosition::Zero` forces the reactor through history —

@@ -381,9 +381,6 @@ where
                                 correlation_id:    event.correlation_id,
                             };
                             let mapped = mapper(info);
-                            self.checkpoint
-                                .clear_reactor_attempts(&self.consumer_id, event.event_id)
-                                .await?;
 
                             // DLQ-synthesized output (if any) is appended
                             // directly to its own stream; then the cursor
@@ -436,6 +433,18 @@ where
                                 }
                             }
                             self.checkpoint.set(&self.consumer_id, event.position).await?;
+                            // Clear the attempt counter LAST — only once the
+                            // DLQ output is durably appended AND the cursor
+                            // has advanced past the failing trigger. Clearing
+                            // earlier (before the append) meant a failed DLQ
+                            // append reset the budget every step (livelock),
+                            // and a crash between append and cursor-advance
+                            // re-ran react() a full extra retry cycle on
+                            // redelivery. Now the trigger is already past the
+                            // cursor, so the clear can't be replayed.
+                            self.checkpoint
+                                .clear_reactor_attempts(&self.consumer_id, event.event_id)
+                                .await?;
                             applied += 1;
                             continue;
                         }

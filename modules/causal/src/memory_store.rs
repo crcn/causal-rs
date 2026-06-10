@@ -335,6 +335,25 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         let Some(last_id) = events.last().map(|e| e.event_id) else {
             anyhow::bail!("append_to_stream: events must be non-empty");
         };
+
+        // Within-batch event_id uniqueness. The durable backends enforce
+        // this via `UNIQUE(event_id)`; MemoryStore must match or a batch
+        // carrying a duplicate id would persist both rows and silently
+        // undermine the event_id-dedup idempotency the whole runtime
+        // rests on (a later redelivery dedups on the last id and skips,
+        // making the duplicate permanent).
+        if events.len() > 1 {
+            for (i, e) in events.iter().enumerate() {
+                if events[i + 1..].iter().any(|o| o.event_id == e.event_id) {
+                    anyhow::bail!(
+                        "append_to_stream: batch contains duplicate event_id {} — \
+                         event_ids must be unique within a batch",
+                        e.event_id,
+                    );
+                }
+            }
+        }
+
         let mut log = self.global_log.lock();
 
         // Idempotency: a batch is written atomically, so if the last
@@ -483,6 +502,59 @@ impl ReactorCheckpoint for MemoryStore {
         let key = (consumer_id.to_string(), source_event_id);
         self.reactor_attempts.remove(&key);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+    use crate::event_log::EventLogBackend;
+
+    fn ev(event_id: Uuid) -> EventData {
+        EventData {
+            event_id,
+            causation_id: None,
+            correlation_id: Uuid::new_v4(),
+            event_type: "test:thing".into(),
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            category: Some("test".into()),
+            stream_id: Some(Uuid::nil()),
+            metadata: serde_json::Map::new(),
+            ephemeral: None,
+            persistent: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn within_batch_duplicate_event_ids_are_rejected() {
+        // Regression (adversarial-input fuzzer): a batch carrying the
+        // same event_id twice once persisted both rows, silently
+        // breaking the event_id-dedup idempotency the runtime rests on.
+        // The durable backends reject it via UNIQUE(event_id); MemoryStore
+        // must match.
+        let store = MemoryStore::new();
+        let dup = Uuid::new_v4();
+        let err = EventLogBackend::append_to_stream(
+            &store, "test", Uuid::nil(), StreamState::Any,
+            vec![ev(dup), ev(Uuid::new_v4()), ev(dup)],
+        ).await.unwrap_err();
+        assert!(err.to_string().contains("duplicate event_id"), "got: {err:#}");
+
+        // The whole batch rolled back — nothing persisted.
+        let all = EventLogBackend::read_all(&store, LogCursor::ZERO, 100).await.unwrap();
+        assert!(all.is_empty(), "rejected batch must not partially write");
+    }
+
+    #[tokio::test]
+    async fn distinct_event_ids_in_a_batch_still_work() {
+        let store = MemoryStore::new();
+        EventLogBackend::append_to_stream(
+            &store, "test", Uuid::nil(), StreamState::Any,
+            vec![ev(Uuid::new_v4()), ev(Uuid::new_v4()), ev(Uuid::new_v4())],
+        ).await.unwrap();
+        let all = EventLogBackend::read_all(&store, LogCursor::ZERO, 100).await.unwrap();
+        assert_eq!(all.len(), 3);
     }
 }
 

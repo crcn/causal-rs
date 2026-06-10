@@ -130,15 +130,18 @@ pub async fn append_event<B: EventLogBackend + ?Sized>(
     backend: &B,
     event: EventData,
 ) -> Result<WriteResult> {
-    let category = event.category.clone().unwrap_or_else(|| {
-        event
-            .event_type
-            .split(':')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("event")
-            .to_string()
-    });
+    // Derive the placement category from the event_type prefix when it
+    // is absent OR explicitly empty — an empty `Some("")` would match no
+    // consumer (and, worse, act as a wildcard in `matches_category`), so
+    // normalize it the same as `None`.
+    let category = event
+        .category
+        .clone()
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| {
+            let derived = crate::event_type::category_of(&event.event_type);
+            if derived.is_empty() { "event" } else { derived }.to_string()
+        });
     let stream_id = event.stream_id.unwrap_or(event.event_id);
     backend
         .append_to_stream(&category, stream_id, StreamState::Any, vec![event])
