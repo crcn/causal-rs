@@ -18,13 +18,16 @@
 //!   partial overlap — some-but-not-all ids present — fails loudly.
 //!   Under expected version, Kurrent's EventId dedup is a strong
 //!   guarantee.
-//!   Non-CAS `append` uses `StreamState::Any` + `EventData::id(event_id)`.
-//!   With `Any` the dedup is BEST-EFFORT: Kurrent compares the EventId
-//!   against the events currently at the stream head, so a retry that
-//!   interleaves with another append to the same stream can duplicate.
-//!   There is no time-based cache. **Documented gap** — prefer the CAS
-//!   path; see Decision 1 in
-//!   `docs/plans/2026-06-07-kurrent-native-consolidation.md`.
+//!   `Any` appends do NOT rely on Kurrent's best-effort EventId dedup
+//!   (which compares only against events at the stream head, so a retry
+//!   interleaved with a foreign append could duplicate). Instead they
+//!   go through `append_any_idempotent`: a scan-then-CAS that reads the
+//!   stream tail, classifies the batch with the shared `reconcile`
+//!   helper, and appends at the observed head via CAS (re-scanning if a
+//!   racing writer moved it). This makes `Any` honor the trait's
+//!   "idempotent on event_id" contract absolutely — the same guarantee
+//!   Postgres' `UNIQUE(event_id)` and MemoryStore provide. (Closes the
+//!   former best-effort gap; see the 2026-06-10 audit remediation, B3.)
 //! - **Q2 stream naming.** Every event lands in `{category}-{stream_id}`
 //!   (`Event::CATEGORY` + `Event::stream_id`). `category` and `stream_id`
 //!   are recovered on read by parsing the stream name (the trailing 36
@@ -100,6 +103,86 @@ mod kurrent {
         pub fn from_client(client: Client) -> Self {
             Self { client }
         }
+
+        /// Idempotent `Any` append: scan-then-CAS so a duplicate cannot
+        /// slip through Kurrent's best-effort EventId dedup.
+        ///
+        /// Each attempt reads the stream tail, classifies the batch with
+        /// the shared [`reconcile`] helper, and — when the batch is
+        /// absent — appends at the *observed head* via CAS. A concurrent
+        /// writer that moved the head (e.g. a blue/green twin redelivering
+        /// the same output, or an unrelated append) trips
+        /// `WrongExpectedVersion`; we re-scan. That makes the dedup scan
+        /// race-free: a redelivery is recognized (its ids are now in the
+        /// window → original `WriteResult`), and a genuine append at a
+        /// moved head simply retries at the new head. Bounded so a
+        /// pathologically hot stream surfaces a loud error rather than
+        /// spinning forever.
+        async fn append_any_idempotent(
+            &self,
+            stream: &str,
+            batch_ids: &[Uuid],
+            events: &[EventData],
+        ) -> Result<WriteResult> {
+            // Window must cover any plausible interleaving of foreign
+            // events between the original append and this redelivery.
+            let window_size = (batch_ids.len() * 4).max(64);
+            for _attempt in 0..16 {
+                let (head, window) = read_tail_window(&self.client, stream, window_size).await?;
+                let window_ids: Vec<Uuid> = window.iter().map(|(id, _)| *id).collect();
+                match reconcile(batch_ids, &window_ids) {
+                    Reconciliation::Redelivery => {
+                        let last = batch_ids.last().expect("non-empty batch");
+                        let (_, result) = window
+                            .iter()
+                            .find(|(id, _)| id == last)
+                            .expect("Redelivery ⇒ every batch id is in the window");
+                        return Ok(*result);
+                    }
+                    Reconciliation::PartialOverlap => {
+                        return Err(anyhow!(
+                            "append_to_stream on {stream}: batch partially overlaps an \
+                             earlier append — an event_id already exists but the full \
+                             batch does not (event_ids must be all-new or \
+                             all-already-persisted)"
+                        ));
+                    }
+                    Reconciliation::Conflict => {
+                        // Not present — append at the observed head. CAS so
+                        // a racing writer is caught (→ re-scan) instead of
+                        // producing a duplicate.
+                        let expected = match head {
+                            Some(r) => StreamState::StreamRevision(r),
+                            None => StreamState::NoStream,
+                        };
+                        let event_data = events
+                            .iter()
+                            .map(build_event_data)
+                            .collect::<Result<Vec<_>>>()?;
+                        let options = AppendToStreamOptions::default().stream_state(expected);
+                        match self.client.append_to_stream(stream, &options, event_data).await {
+                            Ok(write) => {
+                                return Ok(WriteResult {
+                                    position: LogCursor::from_raw(write.position.commit),
+                                    revision: StreamRevision::from_raw(
+                                        write.next_expected_version,
+                                    ),
+                                })
+                            }
+                            // Head moved between scan and append — re-scan.
+                            Err(kurrentdb::Error::WrongExpectedVersion { .. }) => continue,
+                            Err(e) => {
+                                return Err(anyhow!("kurrent Any append failed: {e}"))
+                            }
+                        }
+                    }
+                }
+            }
+            Err(anyhow!(
+                "append_to_stream on {stream}: idempotent Any append did not converge \
+                 after 16 attempts (stream under extreme write contention)"
+            ))
+        }
     }
 
     #[async_trait]
@@ -130,6 +213,20 @@ mod kurrent {
                 .iter()
                 .map(build_event_data)
                 .collect::<Result<Vec<_>>>()?;
+
+            // `Any` would map to Kurrent's best-effort EventId dedup,
+            // which the module docs (Q?) flag as unreliable: a duplicate
+            // can slip through when a redelivery races a foreign write
+            // onto the same stream. The trait contract requires
+            // idempotency on `event_id` (Postgres' UNIQUE constraint and
+            // MemoryStore both honor it absolutely). Make Kurrent honor
+            // it too via an explicit scan-then-CAS, reusing the same
+            // `reconcile` machinery the conflict path uses.
+            if matches!(expected, CausalStreamState::Any) {
+                return self
+                    .append_any_idempotent(&stream, &batch_ids, &events)
+                    .await;
+            }
 
             // causal::StreamState and kurrentdb::StreamState are
             // structurally identical; map variant-for-variant.
@@ -473,6 +570,47 @@ mod kurrent {
     /// previous append, Kurrent's EventId cache evicted it, and the
     /// server now reports the stream has events — check if they're
     /// ours).
+    /// Read the last `count` events of a stream — the tail window for
+    /// the idempotent `Any` append's dedup scan. Returns the head
+    /// revision (`None` if the stream is empty/absent) and the window as
+    /// `(event_id, WriteResult)` pairs in ascending stream order.
+    async fn read_tail_window(
+        client: &Client,
+        stream: &str,
+        count: usize,
+    ) -> Result<(Option<u64>, Vec<(Uuid, WriteResult)>)> {
+        let opts = ReadStreamOptions::default()
+            .backwards()
+            .position(StreamPosition::End)
+            .max_count(count.max(1));
+        let mut read = match client.read_stream(stream, &opts).await {
+            Ok(s) => s,
+            Err(kurrentdb::Error::ResourceNotFound) => return Ok((None, Vec::new())),
+            Err(e) => return Err(anyhow!("kurrent tail read failed: {e}")),
+        };
+        // Backwards read yields highest-revision first.
+        let mut window = Vec::new();
+        loop {
+            let resolved = match read.next().await {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(kurrentdb::Error::ResourceNotFound) => break,
+                Err(e) => return Err(anyhow!("kurrent tail next failed: {e}")),
+            };
+            let rec = resolved.get_original_event();
+            window.push((
+                rec.id,
+                WriteResult {
+                    position: LogCursor::from_raw(rec.position.commit),
+                    revision: StreamRevision::from_raw(rec.revision),
+                },
+            ));
+        }
+        let head = window.first().map(|(_, w)| w.revision.raw());
+        window.reverse(); // ascending stream order, as reconcile expects
+        Ok((head, window))
+    }
+
     async fn read_conflict_window(
         client: &Client,
         stream: &str,

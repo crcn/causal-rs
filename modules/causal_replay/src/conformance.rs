@@ -523,6 +523,73 @@ pub async fn cas_redelivery_after_foreign_write_returns_original_result<
     Ok(())
 }
 
+/// The same redelivery-after-foreign-write hazard, but on the **`Any`**
+/// path — the contract every backend must honor regardless of whether it
+/// has native expected-version dedup. Kurrent's best-effort EventId dedup
+/// only compares against the stream head, so a foreign write between the
+/// original append and the redelivery could slip a duplicate through; B3
+/// closes that with a scan-then-CAS. Postgres (`UNIQUE(event_id)`) and
+/// MemoryStore satisfy it inherently. (Backend-generic so all three are
+/// pinned identically.)
+pub async fn any_redelivery_after_foreign_write_is_idempotent<B: EventLogBackend>(
+    b: &B,
+) -> Result<()> {
+    let aggregate_type = "conformance";
+    let aggregate_id = Uuid::new_v4();
+
+    // Original Any append → revision 0.
+    let original_event = fresh_event(
+        Uuid::new_v4(),
+        "conformance:any_redeliver",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let original_id = original_event.event_id;
+    let original = b
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::Any, vec![original_event.clone()])
+        .await?;
+
+    // A foreign Any write advances the head past it.
+    let foreign = fresh_event(
+        Uuid::new_v4(),
+        "conformance:foreign",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let foreign_id = foreign.event_id;
+    b.append_to_stream(aggregate_type, aggregate_id, StreamState::Any, vec![foreign])
+        .await?;
+
+    // Crash-redelivery: the IDENTICAL event (same event_id), via Any,
+    // now that the original is buried under the foreign write.
+    let redelivered = b
+        .append_to_stream(aggregate_type, aggregate_id, StreamState::Any, vec![original_event])
+        .await?;
+    assert_eq!(
+        redelivered.position, original.position,
+        "Any redelivery must return the ORIGINAL position — not a duplicate"
+    );
+    assert_eq!(
+        redelivered.revision, original.revision,
+        "Any redelivery must return the ORIGINAL revision"
+    );
+
+    // Stream: original + foreign only, original exactly once.
+    let events = b.read_stream(aggregate_type, aggregate_id, None).await?;
+    let got: Vec<Uuid> = events.iter().map(|e| e.event_id).collect();
+    assert_eq!(
+        got,
+        vec![original_id, foreign_id],
+        "the redelivered event must not be duplicated"
+    );
+    assert_eq!(
+        count_event_id_in_log(b, original_id).await?,
+        1,
+        "exactly one copy of the redelivered event in the log"
+    );
+    Ok(())
+}
+
 /// Partial overlap under CAS: append `[e1, e2]` at expected revision r;
 /// then attempt `[e2, e3]` at the SAME expected revision — e2 is already
 /// persisted, e3 is not. That violates the all-new-or-all-already-
@@ -1026,6 +1093,7 @@ pub fn scenario_names() -> &'static [&'static str] {
         "append_to_stream_batch_idempotent_on_replay",
         "expected_revision_ahead_of_head_is_rejected",
         "cas_redelivery_after_foreign_write_returns_original_result",
+        "any_redelivery_after_foreign_write_is_idempotent",
         "cas_partial_overlap_batch_is_rejected_loudly",
         "read_stream_partitions_by_aggregate_id",
         "read_stream_after_revision_is_strict",

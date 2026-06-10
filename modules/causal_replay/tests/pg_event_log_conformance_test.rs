@@ -110,6 +110,13 @@ async fn cas_redelivery_after_foreign_write_returns_original_result() -> Result<
 
 #[tokio::test]
 #[ignore = "requires local DATABASE_URL + migration 054"]
+async fn any_redelivery_after_foreign_write_is_idempotent() -> Result<()> {
+    conformance::any_redelivery_after_foreign_write_is_idempotent(&backend().await)
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
 async fn cas_partial_overlap_batch_is_rejected_loudly() -> Result<()> {
     conformance::cas_partial_overlap_batch_is_rejected_loudly(&backend().await).await
 }

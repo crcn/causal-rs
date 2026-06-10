@@ -58,6 +58,11 @@ async fn cas_redelivery_after_foreign_write_returns_original_result() -> Result<
 }
 
 #[tokio::test]
+async fn any_redelivery_after_foreign_write_is_idempotent() -> Result<()> {
+    conformance::any_redelivery_after_foreign_write_is_idempotent(&b()).await
+}
+
+#[tokio::test]
 async fn cas_partial_overlap_batch_is_rejected_loudly() -> Result<()> {
     conformance::cas_partial_overlap_batch_is_rejected_loudly(&b()).await
 }
