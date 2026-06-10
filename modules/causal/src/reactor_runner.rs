@@ -39,7 +39,7 @@ use crate::event::Event;
 use crate::projection_runner::StepOutcome;
 use crate::reactor_observer::ReactorObserver;
 use crate::reactor::Reactor;
-use crate::types::{EventData, LogCursor, StreamState};
+use crate::types::{EventData, LogCursor, RecordedEvent, StreamState};
 
 /// Namespace UUID for deriving deterministic reactor-output event_ids
 /// via uuid v5. Hardcoded so that the same `(reactor_id, trigger_id,
@@ -219,6 +219,98 @@ where
 
     pub fn consumer_id(&self) -> &str { &self.consumer_id }
 
+    /// Terminal-failure routing into the DLQ. Invokes the mapper, appends
+    /// its synthesized fact (if any) to that fact's own stream, folds it
+    /// into the engine registry, advances the cursor past `event`, and
+    /// clears the attempt counter **last** (so a failed DLQ append can't
+    /// reset the budget and a crash mid-DLQ can't replay it). Caller
+    /// guarantees `self.dlq_mapper` is `Some` and the failure is terminal.
+    ///
+    /// Shared by the react()-error path (terminal after `max_attempts`)
+    /// and the trigger-deserialization-poison path (terminal immediately —
+    /// re-parsing is deterministic, so retries never help).
+    async fn route_to_dlq(
+        &self,
+        event: &RecordedEvent,
+        attempts: u32,
+        error: String,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let mapper = self
+            .dlq_mapper
+            .as_ref()
+            .expect("route_to_dlq requires a configured DLQ mapper");
+        if let Some(obs) = self.observer.as_ref() {
+            obs.reactor_dlq(
+                event.event_id,
+                &self.consumer_id,
+                event.correlation_id,
+                attempts,
+                &error,
+                completed_at,
+            );
+        }
+        let info = DlqInfo {
+            group_name:        self.consumer_id.clone(),
+            source_event_id:   event.event_id,
+            source_event_type: event.event_type.clone(),
+            error,
+            attempts,
+            correlation_id:    event.correlation_id,
+        };
+        // DLQ-synthesized output (if any) is appended directly to its own
+        // stream. `output_index = u32::MAX` keeps its deterministic id
+        // distinct from react() outputs.
+        if let Some(fact) = mapper(info) {
+            // `cat` is the STREAM placement category; `event_type` keeps
+            // the routing category.
+            let cat = fact.stream_category().to_string();
+            let sid = fact.stream_id();
+            let event_type = crate::event_type::compose(fact.category(), fact.variant_name());
+            let payload = fact.to_value()?;
+            let out_event = EventData {
+                event_id: derive_output_event_id(&self.consumer_id, event.event_id, u32::MAX),
+                causation_id: Some(event.event_id),
+                correlation_id: event.correlation_id,
+                event_type: event_type.clone(),
+                payload: payload.clone(),
+                created_at: chrono::Utc::now(),
+                category: Some(cat.clone()),
+                stream_id: Some(sid),
+                metadata: reactor_output_metadata(&self.consumer_id),
+                ephemeral: None,
+                persistent: true,
+            };
+            let write = self
+                .log
+                .append_to_stream(&cat, sid, StreamState::Any, vec![out_event])
+                .await?;
+            if let Some(tracker) = &self.settle_tracker {
+                tracker.lock().unwrap().bump(event.correlation_id, write.position);
+            }
+            if let Some(reg) = &self.engine_aggregators {
+                crate::aggregator::fold_event(
+                    reg.as_ref(),
+                    self.snapshot_store.as_deref(),
+                    self.log.as_ref(),
+                    &event_type,
+                    &payload,
+                    sid,
+                    &cat,
+                    write.revision,
+                    write.position,
+                    /* strict_to_event = */ false,
+                )
+                .await?;
+            }
+        }
+        self.checkpoint.set(&self.consumer_id, event.position).await?;
+        self.checkpoint
+            .clear_reactor_attempts(&self.consumer_id, event.event_id)
+            .await?;
+        Ok(())
+    }
+
     pub async fn step(&self, batch: usize) -> Result<StepOutcome> {
         let cursor = self.checkpoint.get(&self.consumer_id).await?
             .unwrap_or(LogCursor::ZERO);
@@ -274,15 +366,37 @@ where
                 continue;
             }
 
-            let trigger: R::Trigger = serde_json::from_value(event.payload.clone())?;
-
-            // ── Telemetry: record this attempt's start. `attempt_seq`
-            //    is the persistent-store counter — pre-incremented to
-            //    treat this very attempt as attempt #(prev+1).
+            // ── Record this attempt FIRST (before deserialization), so a
+            //    poison trigger engages the DLQ budget instead of wedging
+            //    the cursor before the counter ever increments.
             let attempt_seq = self.checkpoint
                 .record_reactor_attempt(&self.consumer_id, event.event_id)
                 .await?;
             let started_at = chrono::Utc::now();
+
+            // Deserialize the trigger. A failure here is a poison pill —
+            // deterministic, so retrying never helps. Route it straight to
+            // the DLQ (if a mapper is configured) so one malformed/
+            // schema-drifted payload can't block the cursor forever;
+            // without a mapper, propagate (block-until-fixed, the same
+            // contract a react() error has without a mapper — an operator
+            // fixes the schema or code, then it processes).
+            let trigger: R::Trigger = match serde_json::from_value(event.payload.clone()) {
+                Ok(t) => t,
+                Err(deser_err) => {
+                    let msg = format!(
+                        "trigger deserialization failed for {} (event {}): {deser_err}",
+                        event.event_type, event.event_id,
+                    );
+                    if self.dlq_mapper.is_some() {
+                        self.route_to_dlq(&event, attempt_seq, msg, chrono::Utc::now()).await?;
+                        applied += 1;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(msg));
+                }
+            };
+
             if let Some(obs) = self.observer.as_ref() {
                 obs.reactor_started(
                     event.event_id,
@@ -360,94 +474,11 @@ where
                     // use attempt_seq for the cap check.
                     let attempts = attempt_seq;
 
-                    if let Some(mapper) = self.dlq_mapper.as_ref() {
-                        if attempts >= self.max_attempts {
-                            if let Some(obs) = self.observer.as_ref() {
-                                obs.reactor_dlq(
-                                    event.event_id,
-                                    &self.consumer_id,
-                                    event.correlation_id,
-                                    attempts,
-                                    &format!("{:#}", e),
-                                    completed_at,
-                                );
-                            }
-                            let info = DlqInfo {
-                                group_name:        self.consumer_id.clone(),
-                                source_event_id:   event.event_id,
-                                source_event_type: event.event_type.clone(),
-                                error:             format!("{:#}", e),
-                                attempts,
-                                correlation_id:    event.correlation_id,
-                            };
-                            let mapped = mapper(info);
-
-                            // DLQ-synthesized output (if any) is appended
-                            // directly to its own stream; then the cursor
-                            // advances past the failing event.
-                            // `output_index = u32::MAX` keeps its
-                            // deterministic id distinct from react() outputs.
-                            if let Some(fact) = mapped {
-                                // `cat` is the STREAM placement category;
-                                // `event_type` keeps the routing category.
-                                let cat = fact.stream_category().to_string();
-                                let sid = fact.stream_id();
-                                let event_type = crate::event_type::compose(
-                                    fact.category(), fact.variant_name());
-                                let payload = fact.to_value()?;
-                                let out_event = EventData {
-                                    event_id: derive_output_event_id(
-                                        &self.consumer_id, event.event_id, u32::MAX,
-                                    ),
-                                    causation_id: Some(event.event_id),
-                                    correlation_id: event.correlation_id,
-                                    event_type: event_type.clone(),
-                                    payload: payload.clone(),
-                                    created_at: chrono::Utc::now(),
-                                    category: Some(cat.clone()),
-                                    stream_id: Some(sid),
-                                    metadata: reactor_output_metadata(&self.consumer_id),
-                                    ephemeral: None,
-                                    persistent: true,
-                                };
-                                let write = self.log
-                                    .append_to_stream(&cat, sid, StreamState::Any, vec![out_event])
-                                    .await?;
-                                if let Some(tracker) = &self.settle_tracker {
-                                    tracker.lock().unwrap().bump(event.correlation_id, write.position);
-                                }
-                                if let Some(reg) = &self.engine_aggregators {
-                                    crate::aggregator::fold_event(
-                                        reg.as_ref(),
-                                        self.snapshot_store.as_deref(),
-                                        self.log.as_ref(),
-                                        &event_type,
-                                        &payload,
-                                        sid,
-                                        &cat,
-                                        write.revision,
-                                        write.position,
-                                        /* strict_to_event = */ false,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            self.checkpoint.set(&self.consumer_id, event.position).await?;
-                            // Clear the attempt counter LAST — only once the
-                            // DLQ output is durably appended AND the cursor
-                            // has advanced past the failing trigger. Clearing
-                            // earlier (before the append) meant a failed DLQ
-                            // append reset the budget every step (livelock),
-                            // and a crash between append and cursor-advance
-                            // re-ran react() a full extra retry cycle on
-                            // redelivery. Now the trigger is already past the
-                            // cursor, so the clear can't be replayed.
-                            self.checkpoint
-                                .clear_reactor_attempts(&self.consumer_id, event.event_id)
-                                .await?;
-                            applied += 1;
-                            continue;
-                        }
+                    if self.dlq_mapper.is_some() && attempts >= self.max_attempts {
+                        self.route_to_dlq(&event, attempts, format!("{:#}", e), completed_at)
+                            .await?;
+                        applied += 1;
+                        continue;
                     }
                     // Retry path: record failed-attempt telemetry, then
                     // propagate to supervisor for backoff.
@@ -1089,6 +1120,112 @@ mod tests {
         assert_eq!(outcome, StepOutcome::Progressed { applied: 0 },
                    "foreign category skipped, cursor advanced, no deser, no wedge");
         assert!(store.get("r.no-collision").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn poison_trigger_routes_to_dlq_and_does_not_wedge() {
+        // B4: a payload that can't deserialize into the reactor's Trigger
+        // is a poison pill — deterministic, so retrying never helps. With
+        // a DLQ mapper it must route to the DLQ immediately and advance
+        // the cursor (not block forever before the attempt counter even
+        // increments, the pre-B4 bug). A following valid trigger must
+        // still process.
+        let store = Arc::new(MemoryStore::new());
+
+        // A malformed event in the reactor's trigger category ("order")
+        // whose payload is NOT a valid OrderPlaced.
+        let poison = EventData {
+            event_id:       Uuid::new_v4(),
+            causation_id:   None,
+            correlation_id: Uuid::new_v4(),
+            event_type:     "order:placed".into(),
+            payload:        serde_json::json!({ "not": "an order" }),
+            created_at:     Utc::now(),
+            category:       Some("order".into()),
+            stream_id:      Some(Uuid::new_v4()),
+            metadata:       serde_json::Map::new(),
+            ephemeral:      None,
+            persistent:     true,
+        };
+        crate::append_event(store.as_ref(), poison).await.unwrap();
+
+        let dlq_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let dlq_calls_c = dlq_calls.clone();
+        let mapper: DlqMapperArc = std::sync::Arc::new(move |info: DlqInfo| {
+            dlq_calls_c.fetch_add(1, Ordering::SeqCst);
+            assert!(info.error.contains("deserialization failed"),
+                    "DlqInfo carries the deser error: {}", info.error);
+            None // no synthesized fact needed for this test
+        });
+
+        // A reactor that would PANIC if it ever saw a (successfully
+        // deserialized) trigger — proving the poison never reaches react().
+        struct NeverReacts;
+        #[async_trait]
+        impl Reactor for NeverReacts {
+            type Trigger = OrderPlaced;
+            const GROUP_NAME: &'static str = "poison.dlq";
+            async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                panic!("react must never run on a poison trigger");
+            }
+        }
+
+        let runner = ReactorRunner::new(
+            NeverReacts,
+            "poison.dlq",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_dlq(mapper, 3);
+
+        let outcome = runner.step(10).await.unwrap();
+        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        assert_eq!(dlq_calls.load(Ordering::SeqCst), 1,
+                   "poison DLQ'd immediately — no retries (deterministic)");
+        assert!(store.get("poison.dlq").await.unwrap().is_some(),
+                "cursor advanced past the poison event — not wedged");
+    }
+
+    #[tokio::test]
+    async fn poison_trigger_without_dlq_propagates() {
+        // Without a DLQ mapper, a poison trigger propagates (block-until-
+        // fixed) rather than silently skipping — the same contract a
+        // react() error has without a mapper.
+        let store = Arc::new(MemoryStore::new());
+        let poison = EventData {
+            event_id:       Uuid::new_v4(),
+            causation_id:   None,
+            correlation_id: Uuid::new_v4(),
+            event_type:     "order:placed".into(),
+            payload:        serde_json::json!({ "not": "an order" }),
+            created_at:     Utc::now(),
+            category:       Some("order".into()),
+            stream_id:      Some(Uuid::new_v4()),
+            metadata:       serde_json::Map::new(),
+            ephemeral:      None,
+            persistent:     true,
+        };
+        crate::append_event(store.as_ref(), poison).await.unwrap();
+
+        struct NeverReacts;
+        #[async_trait]
+        impl Reactor for NeverReacts {
+            type Trigger = OrderPlaced;
+            const GROUP_NAME: &'static str = "poison.block";
+            async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                Ok(Events::new())
+            }
+        }
+
+        let runner = ReactorRunner::new(
+            NeverReacts,
+            "poison.block",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+        assert!(runner.step(10).await.is_err(), "poison propagates without a DLQ");
+        assert!(store.get("poison.block").await.unwrap().is_none(),
+                "cursor did NOT advance — block until fixed");
     }
 
     #[tokio::test]
