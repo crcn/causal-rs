@@ -675,14 +675,38 @@ impl AggregatorRegistry {
         self.state.contains_key(key)
     }
 
-    /// Inject hydrated state + version into the DashMap.
+    /// Install hydrated state + version into the DashMap — **monotonically**.
     ///
-    /// Used during cold-start hydration from the Store.
+    /// Used by durable restore (a read-through cache fill) and cold-start
+    /// hydration. Because `restore_aggregate` reads the stream tail
+    /// *asynchronously* before installing, two concurrent restores (or a
+    /// restore racing live folds) can each compute state from a different
+    /// tail snapshot. An unconditional insert let the one that read
+    /// *fewer* events win if it landed last, regressing both the state and
+    /// the `version` watermark and silently losing folds (and leaving a
+    /// permanently-unhealable gap when the regression tripped a concurrent
+    /// repair loop). Folds are deterministic, so a higher `version` is
+    /// strictly more state — install only when it advances the entry.
     pub fn set_state(&self, key: &str, state: Arc<dyn Any + Send + Sync>, version: StreamRevision, snapshot_at_version: StreamRevision) {
-        self.state.insert(
-            key.to_string(),
-            StateEntry { state, version, last_pos: LogCursor::ZERO, snapshot_at_version },
-        );
+        use dashmap::mapref::entry::Entry;
+        match self.state.entry(key.to_string()) {
+            Entry::Occupied(mut occ) => {
+                if version.raw() > occ.get().version.raw() {
+                    let last_pos = occ.get().last_pos;
+                    occ.insert(StateEntry {
+                        state,
+                        version,
+                        // Preserve a live fan-in/position watermark if it's
+                        // ahead; restore only knows revisions.
+                        last_pos,
+                        snapshot_at_version,
+                    });
+                }
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(StateEntry { state, version, last_pos: LogCursor::ZERO, snapshot_at_version });
+            }
+        }
     }
 
     /// Advance an entry's fold watermarks past `revision`/`position`
@@ -956,26 +980,21 @@ async fn repair_gap(
                 break;
             }
         }
-        // Dense within one stream — no further gaps possible for THIS
-        // aggregate; other aggregates' gaps surface to fold_event's loop.
-        // The density assumption is load-bearing: if a backend ever
-        // returned a sparse `read_stream`, the `advance_watermark` below
-        // would jump past an unfolded event and silently drop a fold.
-        // Fail loud in debug if that invariant is ever violated.
         let repair_outcome =
             reg.apply_event(&e.event_type, &e.payload, e.stream_id, &e.category, e.revision, e.position)?;
-        debug_assert!(
-            repair_outcome.gaps.is_empty(),
-            "read_stream returned a non-dense stream for {}-{} — gap repair \
-             cannot guarantee fold completeness over holes",
-            gap.stream_category, gap.id,
-        );
-        // A stream event that matches no aggregator folds as the
-        // identity — but the watermark must still advance past it, or
-        // the next matching event re-detects the same gap forever
-        // (mixed streams: foreign events interleaved with the
-        // aggregate's own).
-        reg.advance_watermark(&key, e.revision, e.position);
+        if repair_outcome.gaps.is_empty() {
+            // A stream event that matched no aggregator (or folded/skipped)
+            // — advance the watermark so the next matching event doesn't
+            // re-detect the same gap forever (mixed streams: foreign events
+            // interleaved with the aggregate's own).
+            reg.advance_watermark(&key, e.revision, e.position);
+        }
+        // If `apply_event` reported a gap here, a concurrent restore/fold
+        // is mid-flight on this entry; do NOT advance past it. Leave the
+        // watermark and let `fold_event`'s outer loop re-detect and
+        // re-repair on the next round (bounded; converges once the racing
+        // writer settles). Advancing here would jump past an unfolded
+        // event and drop a fold — the original TOCTOU defect.
     }
     Ok(())
 }
