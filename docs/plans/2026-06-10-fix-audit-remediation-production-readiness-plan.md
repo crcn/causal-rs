@@ -265,14 +265,14 @@ folds would be *silently dropped*, recreating the bug class):
 `StreamRevision(n) → base = n+1` with no head check (event_log.rs:76-78)
 silently creates revision holes; Kurrent and MemoryStore both reject.
 
-- [ ] Inside the (now lock-serialized) txn, validate head == n; on mismatch
+- [x] Inside the (now lock-serialized) txn, validate head == n; on mismatch
       first check whether the batch's event_ids are already present
       (idempotent redelivery → return original `WriteResult`) before typed
       `ConflictError` — **without this, B3's crash-redelivery breaks on Pg**
       (head validation fires before the `event_id` unique constraint would).
-- [ ] Use the shared reconcile helper from B3 (one decision procedure, not a
+- [x] Use the shared reconcile helper from B3 (one decision procedure, not a
       third bespoke copy).
-- [ ] Conformance: expected-ahead rejection; redelivery-after-foreign-write
+- [x] Conformance: expected-ahead rejection; redelivery-after-foreign-write
       reconcile on Pg specifically.
 
 #### A4. Postgres spurious conflicts on `Any`/`StreamExists`
@@ -281,7 +281,7 @@ Read-MAX-then-insert race made concurrent `Any` appends conflict
 (event_log.rs:79-103) — contract says `Any` skips the check. A1's lock
 serializes appends, removing the race.
 
-- [ ] Verify under the lock; concurrent-`Any`-appends conformance scenario so
+- [x] Verify under the lock; concurrent-`Any`-appends conformance scenario so
       no future backend regresses it.
 
 ---
