@@ -97,6 +97,25 @@ async fn append_to_stream_batch_idempotent_on_replay() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires local DATABASE_URL + migration 054"]
+async fn expected_revision_ahead_of_head_is_rejected() -> Result<()> {
+    conformance::expected_revision_ahead_of_head_is_rejected(&backend().await).await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
+async fn cas_redelivery_after_foreign_write_returns_original_result() -> Result<()> {
+    conformance::cas_redelivery_after_foreign_write_returns_original_result(&backend().await)
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
+async fn cas_partial_overlap_batch_is_rejected_loudly() -> Result<()> {
+    conformance::cas_partial_overlap_batch_is_rejected_loudly(&backend().await).await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
 async fn read_stream_partitions_by_aggregate_id() -> Result<()> {
     conformance::read_stream_partitions_by_aggregate_id(&backend().await).await
 }
@@ -129,4 +148,10 @@ async fn latest_position_reflects_committed_writes() -> Result<()> {
 #[ignore = "requires local DATABASE_URL + migration 054"]
 async fn concurrent_appends_are_tailable_without_loss() -> Result<()> {
     conformance::concurrent_appends_are_tailable_without_loss(&backend().await).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local DATABASE_URL + migration 054"]
+async fn concurrent_any_appends_all_succeed() -> Result<()> {
+    conformance::concurrent_any_appends_all_succeed(&backend().await).await
 }

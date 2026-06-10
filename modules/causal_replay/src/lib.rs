@@ -68,6 +68,7 @@ pub mod mirroring;
 pub mod pointer;
 pub mod reactor_checkpoint;
 pub mod reactor_observer;
+pub mod reconcile;
 pub mod snapshot_store;
 pub mod stream;
 pub mod tail;
@@ -75,6 +76,7 @@ pub mod tail;
 pub use mirroring::MirroringEventLogBackend;
 
 pub use pointer::{PointerStatus, PointerStore};
+pub use reconcile::{reconcile, Reconciliation};
 pub use stream::{Mode, ProjectionStream, ReplayProgress};
 pub use tail::{PollTailSource, TailSource};
 

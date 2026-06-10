@@ -335,6 +335,278 @@ pub async fn append_to_stream_batch_idempotent_on_replay<B: EventLogBackend>(
     Ok(())
 }
 
+/// A3: an expected revision AHEAD of the head is a conflict, not a
+/// write. Backends that compute `base = expected + 1` without checking
+/// the actual head silently create revision holes — `StreamRevision(10)`
+/// against a head of 2 lands an event at revision 11 with nothing in
+/// between. Must surface a typed `ConflictError` (current = the real
+/// head; `None` when the stream is empty) and leave the stream unchanged.
+pub async fn expected_revision_ahead_of_head_is_rejected<B: EventLogBackend>(
+    b: &B,
+) -> Result<()> {
+    let aggregate_type = "conformance";
+    let aggregate_id = Uuid::new_v4();
+
+    // Empty stream: any concrete expectation is ahead of the head.
+    let e = fresh_event(
+        Uuid::new_v4(),
+        "conformance:ahead",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let err = b
+        .append_to_stream(
+            aggregate_type,
+            aggregate_id,
+            StreamState::StreamRevision(5),
+            vec![e],
+        )
+        .await
+        .expect_err("expected revision on an EMPTY stream must conflict");
+    let conflict = err
+        .downcast_ref::<causal::event_log::ConflictError>()
+        .unwrap_or_else(|| {
+            panic!("ahead-of-head must be a typed ConflictError; got: {err:?}")
+        });
+    assert_eq!(
+        conflict.current, None,
+        "empty stream conflicts with current=None"
+    );
+
+    // Seed three events → head at revision 2.
+    let mut expected = StreamState::NoStream;
+    for _ in 0..3 {
+        let e = fresh_event(
+            Uuid::new_v4(),
+            "conformance:seed",
+            Some(aggregate_type),
+            Some(aggregate_id),
+        );
+        let r = b
+            .append_to_stream(aggregate_type, aggregate_id, expected, vec![e])
+            .await?;
+        expected = StreamState::StreamRevision(r.revision.raw());
+    }
+
+    // Expect revision 10 — far ahead of the head at 2.
+    let e = fresh_event(
+        Uuid::new_v4(),
+        "conformance:ahead",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let err = b
+        .append_to_stream(
+            aggregate_type,
+            aggregate_id,
+            StreamState::StreamRevision(10),
+            vec![e],
+        )
+        .await
+        .expect_err("expected revision ahead of the head must conflict");
+    let conflict = err
+        .downcast_ref::<causal::event_log::ConflictError>()
+        .unwrap_or_else(|| {
+            panic!("ahead-of-head must be a typed ConflictError; got: {err:?}")
+        });
+    assert_eq!(
+        conflict.current,
+        Some(StreamRevision::from_raw(2)),
+        "ConflictError.current must report the REAL head"
+    );
+
+    // The stream is unchanged — no event landed, no revision hole.
+    let events = b.read_stream(aggregate_type, aggregate_id, None).await?;
+    assert_eq!(events.len(), 3, "rejected append must not grow the stream");
+    Ok(())
+}
+
+/// Crash-redelivery under CAS: a batch appended at expected revision r
+/// succeeds; a FOREIGN event then lands on the same stream; the
+/// identical batch (same event_ids) is re-appended at the ORIGINAL
+/// expected revision r — the caller crashed before observing the `Ok`.
+/// The backend must reconcile: the whole batch is already persisted, so
+/// return the ORIGINAL WriteResult — not a conflict (the head moved past
+/// r) and not a duplicate. This is the scenario where head validation
+/// alone would break crash-redelivery (it fires before any event_id
+/// uniqueness check could).
+pub async fn cas_redelivery_after_foreign_write_returns_original_result<
+    B: EventLogBackend,
+>(
+    b: &B,
+) -> Result<()> {
+    let aggregate_type = "conformance";
+    let aggregate_id = Uuid::new_v4();
+
+    // Seed one event → head at revision 0, so the batch goes through
+    // the StreamRevision path on every backend.
+    let seed = fresh_event(
+        Uuid::new_v4(),
+        "conformance:seed",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let seed_id = seed.event_id;
+    b.append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, vec![seed])
+        .await?;
+
+    // Batch B at expected 0 → revisions 1, 2.
+    let batch: Vec<EventData> = (0..2)
+        .map(|i| {
+            fresh_event(
+                Uuid::new_v4(),
+                &format!("conformance:redeliver{i}"),
+                Some(aggregate_type),
+                Some(aggregate_id),
+            )
+        })
+        .collect();
+    let ids: Vec<Uuid> = batch.iter().map(|e| e.event_id).collect();
+    let original = b
+        .append_to_stream(
+            aggregate_type,
+            aggregate_id,
+            StreamState::StreamRevision(0),
+            batch.clone(),
+        )
+        .await?;
+
+    // A foreign write advances the head past the batch.
+    let foreign = fresh_event(
+        Uuid::new_v4(),
+        "conformance:foreign",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let foreign_id = foreign.event_id;
+    b.append_to_stream(
+        aggregate_type,
+        aggregate_id,
+        StreamState::StreamRevision(original.revision.raw()),
+        vec![foreign],
+    )
+    .await?;
+
+    // Crash-redelivery: identical batch, ORIGINAL expected revision.
+    let redelivered = b
+        .append_to_stream(
+            aggregate_type,
+            aggregate_id,
+            StreamState::StreamRevision(0),
+            batch,
+        )
+        .await?;
+    assert_eq!(
+        redelivered.position, original.position,
+        "redelivery must return the ORIGINAL WriteResult.position"
+    );
+    assert_eq!(
+        redelivered.revision, original.revision,
+        "redelivery must return the ORIGINAL WriteResult.revision"
+    );
+
+    // Stream: seed + batch (exactly once) + foreign, in order.
+    let events = b.read_stream(aggregate_type, aggregate_id, None).await?;
+    let got: Vec<Uuid> = events.iter().map(|e| e.event_id).collect();
+    assert_eq!(
+        got,
+        vec![seed_id, ids[0], ids[1], foreign_id],
+        "stream must contain the batch exactly once plus the foreign event"
+    );
+    for id in &ids {
+        assert_eq!(
+            count_event_id_in_log(b, *id).await?,
+            1,
+            "redelivery must not duplicate event {id}"
+        );
+    }
+    Ok(())
+}
+
+/// Partial overlap under CAS: append `[e1, e2]` at expected revision r;
+/// then attempt `[e2, e3]` at the SAME expected revision — e2 is already
+/// persisted, e3 is not. That violates the all-new-or-all-already-
+/// persisted precondition on `append_to_stream`: it must fail LOUDLY
+/// (a plain error, NOT a typed `ConflictError` that `Engine::append`
+/// would silently retry) and leave the stream unchanged. Pins the
+/// full-batch verification in the shared reconcile helper — a tail-only
+/// check would mistake `[e2, e3]`'s sibling shape `[e1, e2]`-tail
+/// matches for clean redeliveries.
+pub async fn cas_partial_overlap_batch_is_rejected_loudly<B: EventLogBackend>(
+    b: &B,
+) -> Result<()> {
+    let aggregate_type = "conformance";
+    let aggregate_id = Uuid::new_v4();
+
+    // Seed one event → head at revision 0.
+    let seed = fresh_event(
+        Uuid::new_v4(),
+        "conformance:seed",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    b.append_to_stream(aggregate_type, aggregate_id, StreamState::NoStream, vec![seed])
+        .await?;
+
+    // [e1, e2] at expected 0 → revisions 1, 2.
+    let e1 = fresh_event(
+        Uuid::new_v4(),
+        "conformance:overlap1",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let e2 = fresh_event(
+        Uuid::new_v4(),
+        "conformance:overlap2",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let e3 = fresh_event(
+        Uuid::new_v4(),
+        "conformance:overlap3",
+        Some(aggregate_type),
+        Some(aggregate_id),
+    );
+    let e3_id = e3.event_id;
+    b.append_to_stream(
+        aggregate_type,
+        aggregate_id,
+        StreamState::StreamRevision(0),
+        vec![e1, e2.clone()],
+    )
+    .await?;
+
+    // [e2, e3] at the same expected revision: e2 already present, e3
+    // new — a torn batch, not a redelivery and not a clean conflict.
+    let err = b
+        .append_to_stream(
+            aggregate_type,
+            aggregate_id,
+            StreamState::StreamRevision(0),
+            vec![e2, e3],
+        )
+        .await
+        .expect_err("partially-overlapping batch must error");
+    assert!(
+        err.downcast_ref::<causal::event_log::ConflictError>().is_none(),
+        "partial overlap is a caller BUG, not an OCC conflict — a typed \
+         ConflictError would make Engine::append silently retry it; got: {err:?}"
+    );
+    assert!(
+        format!("{err:#}").contains("overlap"),
+        "error must name the partial overlap; got: {err:#}"
+    );
+
+    // Stream unchanged: seed, e1, e2 — e3 never landed.
+    let events = b.read_stream(aggregate_type, aggregate_id, None).await?;
+    assert_eq!(events.len(), 3, "rejected overlap must not grow the stream");
+    assert!(
+        events.iter().all(|e| e.event_id != e3_id),
+        "no part of the rejected batch may land"
+    );
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Scenarios — `read_stream`
 // ──────────────────────────────────────────────────────────────────
@@ -633,6 +905,78 @@ pub async fn concurrent_appends_are_tailable_without_loss<B: EventLogBackend>(
     Ok(())
 }
 
+/// A4: concurrent `Any` appends to the SAME stream must all succeed.
+/// The contract says `Any` skips the expected-state check entirely, so
+/// there is nothing to conflict on — a backend that reads
+/// MAX(revision) and then inserts without serializing writers turns
+/// that read-then-write race into spurious `ConflictError`s (or worse,
+/// duplicate revisions). All N events must land, at dense revisions
+/// 0..N, each exactly once.
+pub async fn concurrent_any_appends_all_succeed<B: EventLogBackend>(
+    b: &B,
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    const N: usize = 8;
+    let aggregate_type = "conformance";
+    let stream_id = Uuid::new_v4();
+    let correlation = Uuid::new_v4();
+
+    let events: Vec<EventData> = (0..N)
+        .map(|_| {
+            fresh_event(
+                correlation,
+                "conformance:any",
+                Some(aggregate_type),
+                Some(stream_id),
+            )
+        })
+        .collect();
+    let expected_ids: HashSet<Uuid> = events.iter().map(|e| e.event_id).collect();
+
+    // N concurrent single-event `Any` appends racing on ONE stream.
+    let append = |i: usize| {
+        let event = events[i].clone();
+        async move {
+            b.append_to_stream(aggregate_type, stream_id, StreamState::Any, vec![event])
+                .await
+        }
+    };
+    let results = tokio::join!(
+        append(0), append(1), append(2), append(3),
+        append(4), append(5), append(6), append(7),
+    );
+    for r in [
+        results.0, results.1, results.2, results.3,
+        results.4, results.5, results.6, results.7,
+    ] {
+        r.map_err(|e| {
+            anyhow::anyhow!(
+                "concurrent Any append must succeed — `Any` skips the \
+                 expected-state check, so there is nothing to conflict on; \
+                 got: {e:#}"
+            )
+        })?;
+    }
+
+    // All N landed, exactly once, at dense revisions 0..N.
+    let recorded = b.read_stream(aggregate_type, stream_id, None).await?;
+    assert_eq!(recorded.len(), N, "all {N} concurrent Any appends must land");
+    for (i, ev) in recorded.iter().enumerate() {
+        assert_eq!(
+            ev.revision,
+            StreamRevision::from_raw(i as u64),
+            "revisions must be dense 0..{N} — no gaps, no duplicates"
+        );
+    }
+    let got_ids: HashSet<Uuid> = recorded.iter().map(|e| e.event_id).collect();
+    assert_eq!(
+        got_ids, expected_ids,
+        "every event must be present exactly once"
+    );
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────
@@ -680,11 +1024,15 @@ pub fn scenario_names() -> &'static [&'static str] {
         "append_to_stream_idempotent_on_event_id_retry",
         "append_to_stream_batch_lands_atomically",
         "append_to_stream_batch_idempotent_on_replay",
+        "expected_revision_ahead_of_head_is_rejected",
+        "cas_redelivery_after_foreign_write_returns_original_result",
+        "cas_partial_overlap_batch_is_rejected_loudly",
         "read_stream_partitions_by_aggregate_id",
         "read_stream_after_revision_is_strict",
         "read_stream_returns_empty_for_missing_stream",
         "read_all_returns_events_strictly_after_cursor",
         "latest_position_reflects_committed_writes",
         "concurrent_appends_are_tailable_without_loss",
+        "concurrent_any_appends_all_succeed",
     ]
 }

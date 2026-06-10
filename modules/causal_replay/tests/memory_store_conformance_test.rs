@@ -48,6 +48,21 @@ async fn append_to_stream_batch_idempotent_on_replay() -> Result<()> {
 }
 
 #[tokio::test]
+async fn expected_revision_ahead_of_head_is_rejected() -> Result<()> {
+    conformance::expected_revision_ahead_of_head_is_rejected(&b()).await
+}
+
+#[tokio::test]
+async fn cas_redelivery_after_foreign_write_returns_original_result() -> Result<()> {
+    conformance::cas_redelivery_after_foreign_write_returns_original_result(&b()).await
+}
+
+#[tokio::test]
+async fn cas_partial_overlap_batch_is_rejected_loudly() -> Result<()> {
+    conformance::cas_partial_overlap_batch_is_rejected_loudly(&b()).await
+}
+
+#[tokio::test]
 async fn read_stream_partitions_by_aggregate_id() -> Result<()> {
     conformance::read_stream_partitions_by_aggregate_id(&b()).await
 }
@@ -75,4 +90,9 @@ async fn latest_position_reflects_committed_writes() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_appends_are_tailable_without_loss() -> Result<()> {
     conformance::concurrent_appends_are_tailable_without_loss(&b()).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_any_appends_all_succeed() -> Result<()> {
+    conformance::concurrent_any_appends_all_succeed(&b()).await
 }

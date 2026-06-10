@@ -11,11 +11,16 @@
 //!   `INSERT ... ON CONFLICT DO UPDATE SET event_id = ...` trick that
 //!   makes `RETURNING position` work in both fresh and duplicate cases.
 //!
-//! - **C6 (aggregate OCC):** `append_to_stream` relies on the partial
-//!   `UNIQUE(aggregate_type, aggregate_id, revision)` index. A stale
-//!   `expected` produces the next revision that collides; the backend
-//!   catches the unique violation, looks up the current revision, and
-//!   returns an `OCC conflict` error message.
+//! - **C6 (aggregate OCC):** `StreamRevision(n)` validates the actual
+//!   head inside the (advisory-lock-serialized) transaction — an
+//!   expectation AHEAD of the head is rejected instead of silently
+//!   creating a revision hole, and an expectation BEHIND the head is
+//!   reconciled with the shared [`crate::reconcile`] helper first
+//!   (crash-redelivered batches return their original `WriteResult`;
+//!   partial overlaps fail loudly) before surfacing a typed
+//!   `ConflictError`. The partial
+//!   `UNIQUE(aggregate_type, aggregate_id, revision)` index remains
+//!   the belt-and-braces backstop for the `NoStream` path.
 //!
 //! ## Position ordering and gap visibility
 //!
@@ -58,6 +63,8 @@ mod pg {
     };
     use causal::event_log::ConflictError;
     use causal::EventLogBackend;
+
+    use crate::reconcile::{reconcile, Reconciliation};
 
     /// Advisory-lock key serializing all `causal_log` writers (see the
     /// module doc, "Position ordering and gap visibility").
@@ -143,11 +150,98 @@ mod pg {
             // Revision of the FIRST event in the batch (0-indexed); the
             // rest follow at consecutive revisions.
             //   NoStream         → 0
-            //   StreamRevision(n)→ n + 1
+            //   StreamRevision(n)→ n + 1, AFTER validating head == n
             //   StreamExists/Any → read the current tail first.
             let base_revision: i64 = match expected {
                 StreamState::NoStream => 0,
-                StreamState::StreamRevision(n) => (n + 1) as i64,
+                StreamState::StreamRevision(n) => {
+                    // A3: validate the head INSIDE the lock-serialized
+                    // transaction. Without this, an expected revision
+                    // AHEAD of the head would silently insert at n+1
+                    // and leave a revision hole (the unique stream
+                    // index only catches expectations BEHIND the head).
+                    let head: Option<i64> = sqlx::query_scalar(
+                        "SELECT MAX(revision)
+                           FROM causal_log
+                          WHERE aggregate_type = $1
+                            AND aggregate_id = $2",
+                    )
+                    .bind(aggregate_type)
+                    .bind(aggregate_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if head == Some(n as i64) {
+                        (n + 1) as i64
+                    } else {
+                        // Head mismatch. Before conflicting, check
+                        // whether this batch ALREADY landed on an
+                        // earlier attempt (crash-redelivery re-appends
+                        // the identical batch at the ORIGINAL expected
+                        // revision; the head validation fires before
+                        // the event_id unique constraint ever would).
+                        // The conflict window is everything after the
+                        // expectation; the shared `reconcile` helper
+                        // classifies the batch against it.
+                        let window_ids: Vec<Uuid> = sqlx::query_scalar(
+                            "SELECT event_id
+                               FROM causal_log
+                              WHERE aggregate_type = $1
+                                AND aggregate_id = $2
+                                AND revision > $3
+                              ORDER BY revision ASC",
+                        )
+                        .bind(aggregate_type)
+                        .bind(aggregate_id)
+                        .bind(n as i64)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                        match reconcile(&event_ids, &window_ids) {
+                            Reconciliation::Redelivery => {
+                                // Whole batch already persisted —
+                                // return the ORIGINAL WriteResult (its
+                                // last event's coordinates), mirroring
+                                // the event_id-dedup lookup below.
+                                let row = sqlx::query(
+                                    "SELECT position, revision FROM causal_log \
+                                     WHERE event_id = $1",
+                                )
+                                .bind(last_event_id)
+                                .fetch_one(&mut *tx)
+                                .await?;
+                                let position: i64 = row.try_get("position")?;
+                                let revision: i64 = row.try_get("revision")?;
+                                drop(tx); // rollback — releases the advisory lock
+                                return Ok(WriteResult {
+                                    position: LogCursor::from_raw(position as u64),
+                                    revision: StreamRevision::from_raw(revision as u64),
+                                });
+                            }
+                            Reconciliation::PartialOverlap => {
+                                drop(tx); // rollback — releases the advisory lock
+                                return Err(anyhow::anyhow!(
+                                    "append_to_stream on {}:{}: batch partially \
+                                     overlaps an earlier append — an event_id \
+                                     already exists but the full batch does not \
+                                     (event_ids must be all-new or \
+                                     all-already-persisted)",
+                                    aggregate_type, aggregate_id,
+                                ));
+                            }
+                            Reconciliation::Conflict => {
+                                drop(tx); // rollback — releases the advisory lock
+                                // Typed ConflictError so Engine::append
+                                // can downcast + retry; current is None
+                                // for an empty stream (matching
+                                // MemoryStore).
+                                return Err(anyhow::Error::new(ConflictError {
+                                    expected,
+                                    current: head
+                                        .map(|c| StreamRevision::from_raw(c as u64)),
+                                }));
+                            }
+                        }
+                    }
+                }
                 StreamState::StreamExists | StreamState::Any => {
                     let current: Option<i64> = sqlx::query_scalar(
                         "SELECT MAX(revision)
