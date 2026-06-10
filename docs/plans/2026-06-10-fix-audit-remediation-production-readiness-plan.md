@@ -339,40 +339,40 @@ existing log side-effects all of history (`reactor_runner.rs:20-24`).
 
 Rev-2 design (CAS-only had a hole — see decision 1):
 
-- [ ] Runner batches outputs **per destination stream**. For each stream:
+- [x] Runner batches outputs **per destination stream**. For each stream:
       read head revision; **scan the tail window for the batch's
       deterministic event_ids** (`read_stream(after = head − W)`, W sized to
       cover redelivery: max(4×batch, 64)). All present → skip, return
       original-append semantics. None → CAS append at the observed head.
       Partial → loud partial-overlap error.
-- [ ] On `ConflictError`: re-read head, re-scan, retry — bounded small loop
+- [x] On `ConflictError`: re-read head, re-scan, retry — bounded small loop
       (default 8; rev-2 cut from the 16-attempt OCC budget — output streams
       are low-contention, and the loop never re-runs the reactor body), then
       step error → supervisor backoff.
-- [ ] The scan is race-free *because* of CAS: a foreign write between scan
+- [x] The scan is race-free *because* of CAS: a foreign write between scan
       and append surfaces as a conflict → re-scan. Linearizable
       check-then-append.
-- [ ] **Shared reconcile helper** (review consensus): one pure decision
+- [x] **Shared reconcile helper** (review consensus): one pure decision
       procedure — given expected state, the batch's event_ids, and what the
       store contains, return Redelivery / Conflict / PartialOverlap —
       **verifying ALL batch ids, not just the tail** (fixes the known hole at
       kurrent_event_log.rs:160-176). Used by the Kurrent reconcile path, A3's
       Pg path, and B3's scan. The partial-overlap conformance scenario is
       owned here (rev-1 smuggled it in as a test with no implementing item).
-- [ ] DLQ-synthesized appends (reactor_runner.rs:402-404) use the same path,
+- [x] DLQ-synthesized appends (reactor_runner.rs:402-404) use the same path,
       and **`clear_reactor_attempts` moves after the successful DLQ append**
       (today it runs before — :370-372 — so a failed DLQ append loops with a
       reset budget forever; CAS on a hot co-located stream makes that
       reachable).
-- [ ] Nondeterministic bodies documented: output event_ids derive from
+- [x] Nondeterministic bodies documented: output event_ids derive from
       (group, trigger, index), so a redelivered body that produces different
       content reuses the same ids → the original outputs win. That is the
       contract; state it.
-- [ ] Conformance: interleaved idempotency — foreign write lands between
+- [x] Conformance: interleaved idempotency — foreign write lands between
       original append and redelivery retry; exactly-once on Kurrent, Pg,
       Memory. Two runner instances sharing a `consumer_id` stay exactly-once
       (rootsignal runs blue/green).
-- [ ] Cost note: one head-read + one bounded tail-scan per output stream per
+- [x] Cost note: one head-read + one bounded tail-scan per output stream per
       step; rootsignal's reactors are LLM/scrape-bound — negligible.
 
 #### B4. Poison pills engage the DLQ budget
@@ -381,19 +381,19 @@ Trigger-deser failures propagate before `record_reactor_attempt`
 (reactor_runner.rs:262 vs :267) — one malformed payload wedges the cursor
 forever, outside any budget.
 
-- [ ] Deser failures are deterministic → **immediate DLQ** (no N delaying
+- [x] Deser failures are deterministic → **immediate DLQ** (no N delaying
       retries), `DlqInfo` carrying the raw payload + error.
-- [ ] Depends on A2 (DLQ-advance is only aggregate-safe once folds track the
+- [x] Depends on A2 (DLQ-advance is only aggregate-safe once folds track the
       log). B1 ordering is soft — test-authoring convenience, not
       correctness; B4 may proceed in parallel with B1.
-- [ ] Test: malformed payload → DLQ'd, cursor advances, subsequent events
+- [x] Test: malformed payload → DLQ'd, cursor advances, subsequent events
       process, fold state matches log.
 
 ---
 
 ### Phase C — OCC decider unification (kept per decision 5)
 
-- [ ] **C3.** Unify `CATEGORY` vs `STREAM_CATEGORY` in the decider path:
+- [x] **C3.** Unify `CATEGORY` vs `STREAM_CATEGORY` in the decider path:
       `Engine::load`/`append` read+write `F::CATEGORY` streams
       (engine.rs:967,1018,1071) while restore and runtime appends key on
       `STREAM_CATEGORY` — for co-located streams the decider reads the wrong
@@ -402,7 +402,7 @@ forever, outside any budget.
       by event_type, skips foreign events; snapshot cadence counts folded
       events (documented). Fix `stream_name_for` (event.rs:106-108) to use
       `STREAM_CATEGORY`.
-- [ ] **C4.** Close the OCC fence: plumb `occ_categories` into
+- [x] **C4.** Close the OCC fence: plumb `occ_categories` into
       `ReactorRunner`; output appends into OCC-required categories rejected
       (one HashSet check). **Rejection routes through DLQ accounting** — it
       fires after attempt-clearing, so without budget routing it retries
@@ -413,17 +413,17 @@ forever, outside any budget.
 
 ### Phase D — Docs (last: documents what shipped)
 
-- [ ] **D1 (remainder).** `causal_replay/README.md` rewritten around actual
+- [x] **D1 (remainder).** `causal_replay/README.md` rewritten around actual
       role + version (`0.26.3` → workspace); `causal/README.md` version
       `0.5` + `#[fact]` → current.
-- [ ] **D2.** inspector-demo README (pre-0.7.0 MemoryStore architecture +
+- [x] **D2.** inspector-demo README (pre-0.7.0 MemoryStore architecture +
       missing Postgres service) and `examples/README.md:11`; archive or
       rewrite `aggregate-state-scope.md` (references removed `Materializer`
       API; thesis predates 0.7.4 durable restore); `docs/schema.sql` header
       ("v0.4") + observability tables added to README's table list;
       README:47 + MIGRATION_0.4.md:15 `[Unreleased]` → `[0.5.0]`; README:91
       macro list; stale 1-indexed claim in conformance.rs:12-20.
-- [ ] **D3.** Vocab table: `{CATEGORY}:{EventName}` moves to the
+- [x] **D3.** Vocab table: `{CATEGORY}:{EventName}` moves to the
       deliberate-divergence list with the collision rationale. Footnote on
       idempotency: trait-level idempotency is delivered via scan-then-CAS
       reactor outputs (B3); raw `Any` remains best-effort on Kurrent —

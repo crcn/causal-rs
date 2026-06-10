@@ -45,6 +45,18 @@ The core backend/consumer trait contracts — `EventLogBackend`,
 - **`REPLAY` env var is parsed strictly** (`causal_replay`): only `1`
   / `true` enable replay; `0` / `false` / empty / unset stay live (the
   old `is_ok()` treated `REPLAY=0` as replay-on).
+- **OCC decider keys streams on `STREAM_CATEGORY`** (C3). `Engine::load`
+  / `Engine::append` previously placed and read the decider stream by
+  `F::CATEGORY`; they now use `F::STREAM_CATEGORY` (matching `emit` and
+  durable restore), fold only `F`-typed events from a co-located stream,
+  and take the expected revision from the true stream head.
+  `stream_name_for::<F>` likewise returns `{STREAM_CATEGORY}-{id}`.
+  Only observable when an event type overrides `STREAM_CATEGORY`.
+- **Reactors are fenced out of OCC-required categories** (C4). A reactor
+  that emits a fact whose category was registered via `with_aggregate`
+  is now rejected (routed to the DLQ) — its `Any` append could not have
+  upheld the aggregate's optimistic-concurrency invariant. Model such a
+  write as an `Engine::append` command.
 - `AggregatorRegistry::apply_event` and `replay_events_onto` changed
   signature (module-path-public engine internals; not in the prelude —
   normal code never calls these directly).
@@ -114,6 +126,18 @@ The core backend/consumer trait contracts — `EventLogBackend`,
 - **Within-batch duplicate `event_id`s** are rejected by `MemoryStore`
   (matching the durable backends' `UNIQUE(event_id)`) instead of
   persisting both rows and breaking dedup.
+- **Kurrent `Any` appends are now fully idempotent on `event_id`** (B3).
+  Kurrent's native best-effort dedup only compares against the stream
+  head, so a redelivery racing a foreign write could duplicate; `Any`
+  appends now scan-then-CAS (reusing the shared `reconcile`) to honor the
+  trait contract absolutely, the same guarantee Postgres and MemoryStore
+  give. The reactor hot path and the already-correct backends are
+  untouched.
+- **Poison-pill triggers route to the DLQ instead of wedging** (B4). A
+  trigger payload that can't deserialize into `R::Trigger` was propagated
+  before the retry budget engaged, blocking the cursor forever. It now
+  routes to the DLQ immediately (deterministic — retries never help) when
+  a mapper is configured, or propagates (block-until-fixed) without one.
 - **DLQ retry-budget ordering**: `clear_reactor_attempts` moved to after
   the synthesized append + cursor advance, so a failing DLQ append no
   longer resets the budget each step (livelock) and a crash mid-DLQ no
