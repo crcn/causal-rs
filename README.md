@@ -28,7 +28,8 @@ let engine = EngineBuilder::new(
     )
     .with_aggregators(order_aggregators())   // Vec<Aggregator>
     .with_reactor(ShipOnPlaced)               // impl Reactor
-    .build();
+    .build()                                  // async + fallible: seeds reactor cursors
+    .await?;
 
 // Emit an event. Engine derives stream name from `Event::CATEGORY +
 // Event::stream_id()`, stamps causation/correlation, persists, and
@@ -41,12 +42,14 @@ engine.emit(OrderPlaced { order_id, total: 99.99 })
 
 ## Status
 
-**Pre-1.0; breaking changes expected.** The 2026-05-14 release
+**Pre-1.0; breaking changes expected.** The 2026-05-14/15 release
 finished a KurrentDB-vocabulary alignment pass (`parent_id` →
 `causation_id`, `NewEvent` → `EventData`, etc.). See
-[`CHANGELOG.md`](CHANGELOG.md) `[Unreleased]` for the migration
-matrix and [`docs/MIGRATION_0.4.md`](docs/MIGRATION_0.4.md) for the
-step-by-step guide.
+[`CHANGELOG.md`](CHANGELOG.md) (the rename matrix is under `[0.5.0]`)
+and [`docs/MIGRATION_0.4.md`](docs/MIGRATION_0.4.md) for the
+step-by-step guide. The latest breaking changes are tracked under
+`[Unreleased]`, with the upgrade guide in
+[`docs/MIGRATION_0.8.md`](docs/MIGRATION_0.8.md).
 
 The library is being prepared for production deployment in
 [rootsignal](https://rootsignal.com) on KurrentDB.
@@ -88,7 +91,7 @@ suites — applying migrations automatically.
   `PgEventLogBackend`, `PgReactorCheckpoint`, `PgSnapshotStore` and
   `KurrentEventLogBackend` (behind feature flags), plus the
   cross-backend conformance suite.
-- **`causal_core_macros`** — `#[fact]`, `#[aggregator]`,
+- **`causal_core_macros`** — `#[event]`, `#[aggregator]`,
   `#[aggregators]` proc macros.
 - **`causal_inspector`** — read-model API for an inspector UI.
 - **`causal_utils`** — internal helpers.
@@ -114,7 +117,7 @@ let engine = EngineBuilder::new(
     Arc::new(kurrent) as Arc<dyn EventLogBackend>,
     pg.clone()       as Arc<dyn CheckpointStore>,
     pg.clone()       as Arc<dyn ReactorCheckpoint>,
-).build();
+).build().await?;
 ```
 
 ## KurrentDB vocabulary mapping
@@ -123,7 +126,6 @@ let engine = EngineBuilder::new(
 |---|---|
 | Event (write) | `EventData` |
 | Event (read) | `RecordedEvent` |
-| `event_type` (stored field) | composed `{Event::CATEGORY}:{event.event_type()}` |
 | Category | `Event::CATEGORY` |
 | Stream id | `Event::stream_id() -> Uuid` |
 | Stream name | `{CATEGORY}-{stream_id}` (composed automatically; `causal::stream_name_for::<F>(id)` exposes it) |
@@ -138,9 +140,23 @@ let engine = EngineBuilder::new(
 | `$correlationId` metadata | stamped automatically — feeds the `$by_correlation_id` projection (enable + configure `correlationIdProperty`) |
 | `$causationId` metadata | stamped automatically — the `$by_correlation_id` projection uses it to build the causation tree (there is no `$by_causation_id`) |
 
-Deliberate divergence: `Reactor` vs Kurrent's `PersistentSubscription`
-— Reactor adds atomic emit on top of the subscription contract. The
-rest of the vocabulary is aligned 1:1.
+**Deliberate divergence** — two places causal-rs departs from Kurrent on
+purpose:
+
+- `Reactor` vs Kurrent's `PersistentSubscription` — Reactor adds atomic
+  emit on top of the subscription contract.
+- **Stored `event_type`** is composed as `{Event::CATEGORY}:{event.event_type()}`
+  (e.g. `order:placed`), not a plain event-type name. Kurrent uses bare
+  event-type names; causal-rs keeps the `{CATEGORY}:{name}` form so two
+  different event enums can each have, say, `OrderPlaced` without
+  colliding in the `$et-` streams or in typed routing.
+
+The rest of the vocabulary is aligned 1:1.
+
+Trait-level append idempotency keys on `event_id` and is now uniform
+across every backend — Postgres via `UNIQUE(event_id)`, `MemoryStore`
+in-process, and Kurrent via an explicit scan-then-CAS. Raw Kurrent `Any`
+best-effort dedup is no longer relied upon.
 
 ## Backend conformance
 
@@ -153,10 +169,15 @@ suite once and the assertion runs against every impl. See
 
 ## Schema
 
-[`docs/schema.sql`](docs/schema.sql) — authoritative Postgres schema
-(causal_log, causal_checkpoints, causal_snapshots,
-causal_projection_cursors, causal_projection_failures). There is no
-outbox table — reactors append their outputs directly to the log. The
+[`docs/schema.sql`](docs/schema.sql) — authoritative Postgres schema.
+The five core tables are `causal_log`, `causal_checkpoints`,
+`causal_snapshots`, `causal_projection_cursors`,
+`causal_projection_failures`. The schema also ships the 0.7.0
+observability tables read by the inspector —
+`causal_reactor_executions`, `causal_reactor_logs`,
+`causal_reactor_descriptions`, and `causal_aggregate_snapshots`
+(best-effort, written off the hot path by `PgReactorObserver`). There is
+no outbox table — reactors append their outputs directly to the log. The
 Kurrent-alignment column renames are in
 [`migrations/20260514_kurrent_alignment.sql`](migrations/20260514_kurrent_alignment.sql).
 

@@ -9,15 +9,15 @@
 //! ## Why a shared suite
 //!
 //! Without conformance, backends drift silently. Concrete example:
-//! the v0.4 backend trait uses 1-indexed `StreamRevision` (ZERO =
-//! empty stream, first event lands at v1). Postgres and MemoryStore
-//! agree on this; the Kurrent backend originally shipped with a
-//! 0-indexed version map and the discrepancy was caught only when
-//! someone questioned the semantics out-of-band. **A backend
-//! consumer migrating across backends would see silent divergence in
-//! `WriteResult.version`** — and likely only discover it when a
-//! cached aggregate snapshot stopped lining up with a fresh
-//! hydration.
+//! the backend trait uses 0-indexed `StreamRevision` (the first event
+//! in a fresh stream lands at revision 0; `StreamState::NoStream`
+//! expects an empty stream). All three backends must agree on this;
+//! a backend shipping a different indexing convention would be caught
+//! by the revision scenarios below rather than discovered out-of-band.
+//! **A backend consumer migrating across backends would otherwise see
+//! silent divergence in `WriteResult.version`** — and likely only
+//! discover it when a cached aggregate snapshot stopped lining up with
+//! a fresh hydration.
 //!
 //! The suite below pins every property a backend must satisfy: every
 //! impl runs every scenario; any new property is added once and

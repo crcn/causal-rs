@@ -1,24 +1,62 @@
 # Aggregate state scope and snapshots
 
-> **TL;DR** — Snapshot acceleration for `AggregatorRegistry` is a real
-> v0.2.x feature that v0.3 has *not* ported. This is correct. The
-> snapshot machinery solves a problem that v0.3's current usage patterns
-> do not have. Read this before assuming v0.3 is missing essential
-> infrastructure and "porting" it.
+> **Superseded (2026-06-10).** Durable aggregate restore *shipped* in
+> **0.7.4** (`EngineBuilder::with_snapshot_store`, `Engine::load_aggregate`,
+> `Aggregate::STREAM_CATEGORY`), and the revision-gated idempotent fold
+> model landed in the 2026-06-10 audit-remediation pass. The historical
+> framing below — written for a v0.3 line that "does not expose snapshot
+> integration in its runners" — is no longer accurate as a *capability*
+> claim. The **scoping advice** it gives (which usage patterns actually
+> *need* snapshots) is still sound; read the rest of this file for that
+> reasoning, but treat its "this integration does not exist" statements
+> as historical.
 
-## Three patterns, only two of them in scope
+> **TL;DR (current).** Durable, restart-surviving aggregate restore
+> exists. Wire `with_snapshot_store(...)` and set `Aggregate::STREAM_CATEGORY`
+> and folded state survives a restart via read-through restore
+> (`Engine::load_aggregate`, and the consumer runners restore before they
+> fold). Snapshots are an *acceleration* on top of that restore, not a
+> prerequisite for it — without a snapshot store, restore replays the
+> stream from genesis. The question this doc answers is therefore not
+> "does v0.3 have snapshots" (it does, as of 0.7.4) but **which
+> aggregates actually benefit from snapshot acceleration**.
+
+## The fold model (current)
+
+Two consumers fold aggregate state from the log, and they are *not* the
+same store:
+
+- **The shared engine registry** is eager, read-your-write state used
+  inside a single in-flight run so `ctx.aggregate::<A>(id)` sees writes
+  this run just emitted. Folds are eager (the run drives them forward as
+  it emits).
+- **Per-consumer runners** (reactor / projector) each restore the
+  aggregate read-through (snapshot, if wired, + stream-tail replay)
+  *before* folding the triggering event, so a fresh or restarted runner
+  recomputes the same state.
+
+Both paths fold through `fold_event`, which is **revision-gated and
+idempotent**: an event whose revision is `<` the folded watermark is a
+redelivery and is skipped; an event whose revision is `>` the watermark
+(a gap — e.g. the eager engine-registry race where a later event is seen
+before an earlier one) triggers a read-through repair on the aggregate's
+own stream before it folds. That makes folds safe under at-least-once
+redelivery and out-of-order observation.
+
+## Three patterns, and which ones want snapshots
 
 Causal applications use the framework at one of three scopes. Pattern
 matters because each has a different cost profile and a different
 relationship to the `AggregatorRegistry`.
 
-### 1. Per-run engine (in scope)
+### 1. Per-run engine (snapshots not needed)
 
 ```rust
-let engine = causal::Engine::new(deps)
+let engine = EngineBuilder::new(log, checkpoint, reactor_checkpoint)
     .with_aggregators(pipeline_aggregators::aggregators())
     .with_reactors(...)
-    .build();
+    .build()
+    .await?;
 // run a single workflow, then drop the engine
 ```
 
@@ -27,161 +65,97 @@ In-memory `MemoryStore` log. Aggregator registry lives for the
 duration of the run, dies when the engine is dropped. State never
 crosses run boundaries.
 
-`ctx.aggregate::<X>()` reads the **saga-pattern** aggregate state
-shared across reactors *within this run*. Cursor starts at `ZERO`,
-grows incrementally as events are emitted. **No cold-start replay
-happens** — the runner's `ensure_hydrated` short-circuits when cursor
-is `ZERO`.
+`ctx.aggregate::<X>(id)` reads the **saga-pattern** aggregate state
+shared across reactors *within this run*. The registry folds eagerly as
+events are emitted, so there's no cold-start replay. Snapshot
+acceleration buys nothing here — there's no stored stream to skip past.
 
 Cost: per-event apply, bounded by per-run event volume.
 
-### 2. Service-level materializer (in scope)
+### 2. Service-level projector (snapshots not needed)
 
 ```rust
 EngineBuilder::new(log, checkpoint, reactor_checkpoint)
-    .with_materializer(RunsMaterializer::new(...), "runs")
+    .with_projector(RunsProjector::new(...))
     .build()
+    .await?;
 ```
 
 Long-lived consumer reading from a persistent event store
-(Postgres, future Kurrent), projecting to other persistent state
-(Postgres tables, Neo4j). Typed `Materializer<Fact = F>` or
-`AnyMaterializer` (deprecated). The materializer body **does not
-call `ctx.aggregate`** — it projects events directly into external
-storage.
+(Postgres, Kurrent), projecting to other persistent state
+(Postgres tables, Neo4j). A `Projector` / `MultiProjector` body
+projects events directly into external storage and **does not call
+`ctx.aggregate`** — it folds nothing into the aggregator registry, so
+no aggregate state needs restoring regardless of how big the upstream
+log gets.
 
-`self.aggregators` on the runner is `None`. `ensure_hydrated`
-returns early. **The registry is never touched regardless of how
-big the upstream log gets.**
+Cost: per-event project, bounded by upstream event throughput. The
+projector's own cursor (`CheckpointStore`) makes it resumable; that is
+unrelated to aggregate snapshots.
 
-Cost: per-event materialize, bounded by upstream event throughput.
-
-### 3. Long-lived cross-session aggregate (NOT in scope)
+### 3. Long-lived cross-session aggregate (snapshots earn their keep)
 
 A `User`, `Order`, `Account` aggregate whose state is rebuilt from
 its event stream every time you load it. Hundreds or thousands of
 events accumulated over months or years. Read/write across many
 sessions or processes against the same persistent log.
 
-This pattern *does* need snapshot acceleration — replaying the full
-stream on every load is O(stream size) and quickly becomes
-unacceptable. v0.2.x has the integration: `hydrate_for_event` →
-`load_snapshot` → `replay_events_onto` → `set_state`, plus
-`maybe_auto_snapshot` to write fresh snapshots periodically.
+This is the pattern snapshot acceleration is *for*. Restore replays
+the stream tail; without a snapshot, "tail" means "the whole stream",
+which is O(stream size) per load and eventually unacceptable. Set
+`Aggregate::STREAM_CATEGORY` so the aggregate has a single physical
+stream (`{STREAM_CATEGORY}-{id}`) to restore from, wire
+`EngineBuilder::with_snapshot_store(...)`, and restore loads the latest
+snapshot and replays only the events after it
+(`read_stream(stream_category, id, after_snapshot_revision)`).
 
-**Causal v0.3 does not currently expose this integration in its
-runners.** This is fine because no current consumer is in pattern 3.
+## Durable restore (current)
 
-## The trap
+Restore is read-through and lives in `restore_aggregate` (called by
+`Engine::load_aggregate` and by consumer runners before they fold):
 
-The conversation that lands the library off the rails:
+1. If the registry already has state for the key, return it (idempotent,
+   no I/O).
+2. Otherwise load the snapshot (if a snapshot store is wired) and seed
+   state from it; a blob that fails to deserialize self-heals (deleted,
+   rebuilt from revision 0).
+3. Replay the stream tail with revision **>** the snapshot revision (all
+   events if there was no snapshot) via `replay_events_onto`.
+4. Install the folded state into the registry **monotonically** — a
+   concurrent install at a higher revision wins, so an out-of-order
+   restore can't clobber fresher state.
 
-> "We're going to hit millions of events soon. We need snapshot
-> integration for the AggregatorRegistry so cold-start hydration
-> doesn't take forever."
+Restore is disabled (a no-op returning "nothing to restore") when
+`Aggregate::STREAM_CATEGORY` is unset — that's the opt-out for
+aggregates that only ever live within a single run (pattern 1).
 
-Wrong premise. Re-anchor:
+## Choosing whether to snapshot
 
-- Are millions of events flowing through a **per-run engine
-  (pattern 1)**? Highly unlikely — runs are bounded by their own
-  workflow logic. If it happens, the bottleneck is the workflow
-  design, not registry hydration.
-- Are millions of events accumulating in a **service-level event
-  store (pattern 2)** consumed by long-lived materializers? Yes,
-  this happens. **But pattern-2 materializers don't use
-  `ctx.aggregate`.** Registry hydration cost is zero regardless of
-  total log size. Their scaling concern is server-side filtering
-  on the read path, which is a backend concern.
-- Are you maintaining a **long-lived aggregate that spans engine
-  instances (pattern 3)**? If yes, then snapshot integration is
-  the right answer. If no, importing the v0.2.x machinery solves
-  no problem.
+Restore works without a snapshot store; a snapshot is purely an
+acceleration on the replay tail. Decide per aggregate:
 
-The default mistake is conflating patterns 2 and 3 because both
-have "long-lived" and "lots of events" in their description.
-They're different. Pattern 2's longevity belongs to the
-*projection*, not to an in-memory aggregate. Pattern 3's longevity
-belongs to the aggregate itself.
+- **Per-run engine (pattern 1)** — millions of events are unlikely
+  (runs are bounded by their own workflow logic), and there's no
+  persisted stream to skip past. Don't snapshot.
+- **Service-level projector (pattern 2)** — the projector doesn't call
+  `ctx.aggregate`, so it folds no aggregate state. Its scaling concern
+  is its cursor and server-side read filtering, not aggregate
+  snapshots.
+- **Long-lived cross-session aggregate (pattern 3)** — set
+  `STREAM_CATEGORY`, wire a snapshot store, and tune snapshot frequency
+  once cold-start restore latency is an observed operational problem,
+  not a hypothetical one.
 
-## What v0.3's hydration actually does
-
-`ProjectionRunner::ensure_hydrated`, `ReactorRunner::ensure_hydrated`,
-`AnyMaterializerRunner::ensure_hydrated` all share this shape:
-
-```rust
-async fn ensure_hydrated(&self, cursor: LogCursor) -> Result<()> {
-    if self.aggregators.is_none() {
-        return Ok(());                                   // pattern 2
-    }
-    self.hydrated.get_or_try_init(|| async {
-        if cursor == LogCursor::ZERO {
-            return Ok::<(), anyhow::Error>(());          // pattern 1
-        }
-        // Pattern-3 path: replay log[ZERO..cursor] into the registry.
-        // Only fires when a runner inherits a non-zero checkpoint —
-        // i.e., a long-lived runner against a persistent backend that
-        // survived a process restart. O(log size), no snapshot
-        // acceleration. Acceptable for current consumers because none
-        // are in pattern 3; would need redesign before pattern 3 is
-        // viable at scale.
-        let mut from = LogCursor::ZERO;
-        loop {
-            let batch = self.log.load_from(from, 1024).await?;
-            // ...fold each event up to cursor
-        }
-        Ok(())
-    }).await?;
-    Ok(())
-}
-```
-
-The pattern-3 branch exists for correctness — a runner finding
-itself with a non-zero checkpoint *will* replay events to recreate
-registry state — but it is the slow path. It is currently untuned.
-Adding snapshot acceleration is the cure when pattern 3 enters
-scope; until then the cure has no patient.
-
-## When to reconsider
-
-Add snapshot integration to v0.3 runners only when **all** of these
-are true:
-
-1. A specific aggregate is long-lived across engine instances.
-2. It folds events from a persistent log that grows unboundedly.
-3. Cold-start hydration cost is observed to be a real operational
-   problem in production, not a hypothetical worry.
-
-If (1) and (2) are true but (3) is not, document the deferral.
-Don't preemptively port machinery for a problem you don't have.
-
-## Reference — what v0.2.x has, ready to adopt if needed
-
-If pattern 3 emerges, these are the existing primitives. The work
-is integrating them into the v0.3 runners, not redesigning them:
-
-- `crate::aggregator::AggregatorRegistry::set_state` — restore an
-  aggregate's state from a deserialized snapshot.
-- `crate::aggregator::AggregatorRegistry::get_state` — read current
-  raw state for snapshot serialization.
-- `crate::aggregator::AggregatorRegistry::get_version` — last
-  applied stream version for the aggregate.
-- `crate::aggregator::AggregatorRegistry::replay_events_onto` —
-  apply a tail of events onto a state restored from snapshot.
-- `crate::aggregator::AggregatorRegistry::update_snapshot_at_version`
-  — bookkeeping for snapshot frequency.
-- `crate::SnapshotStore` — read/write trait, blanket-implemented
-  for any `EventLog`.
-
-The orchestration to copy from v0.2.x: `crate::engine::Engine::{
-hydrate_for_event, hydrate_aggregate, maybe_auto_snapshot}`. That
-file is the spec for what pattern-3 integration would look like in
-v0.3 runners.
+The common mistake is conflating patterns 2 and 3 because both have
+"long-lived" and "lots of events" in their description. They're
+different: pattern 2's longevity belongs to the *projection*; pattern
+3's belongs to the aggregate itself, and only pattern 3 restores
+aggregate state on a cold start.
 
 ## Why this doc exists
 
-Because two agents in two separate conversations have looked at the
-v0.3 runner's `ensure_hydrated` next to v0.2.x's `hydrate_aggregate`
-and concluded that v0.3 needs the legacy snapshot machinery ported.
-Both times, the conclusion was wrong: the consumer in question was
-in pattern 1 or pattern 2, not pattern 3. This document exists so
-the third agent can read it and avoid the same mistake.
+Earlier agents repeatedly looked at the runner's restore path and
+concluded the library was missing snapshot machinery that needed
+"porting" from an older line. Durable restore now ships (0.7.4); the
+remaining judgement call is *which* aggregates benefit from snapshot
+acceleration on top of it — which is pattern 3, and only pattern 3.

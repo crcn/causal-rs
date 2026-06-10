@@ -3,25 +3,29 @@
 A content-ingestion pipeline wired to the **causal inspector** — a GraphQL API
 plus a React UI that visualizes the event flow live, on `:4000`.
 
-**KurrentDB** is the durable event log; an in-process `MemoryStore` mirrors every
-event and captures reactor observability for the inspector (only `MemoryStore`
-implements the inspector's `InspectorReadModel` + `ReactorObserver`). So this is
-the same production shape as the other examples, with the inspector attached.
+**KurrentDB** is the durable event log and the source of truth. **Postgres** is
+a best-effort observability store that backs the inspector: `PgEventProjector`
+mirrors the Kurrent `$all` log into PG `causal_log`, and `PgReactorObserver`
+records reactor executions, logs, descriptions, and aggregate snapshots. The
+inspector reads only from Postgres (`PgInspectorReadModel`), so any box in a
+fleet can serve it. This is the same KurrentDB + Postgres production shape as
+the other examples, with the inspector attached.
 
 ## Run
 
 Build the inspector UI once (the React component library, then this app's
-bundle), then start KurrentDB + the backend:
+bundle), then start KurrentDB + Postgres + the backend:
 
 ```bash
 # 1. inspector UI → dist/  (one-time)
 (cd ../../modules/causal-inspector-ui && npm install && npm run build)
 (cd ui && npm install && npm run build)
 
-# 2. KurrentDB + the pipeline + inspector server
-./dev.sh example run inspector-demo     # from the repo root: brings up Kurrent, then runs
+# 2. KurrentDB + Postgres + the pipeline + inspector server
+./dev.sh example run inspector-demo     # from the repo root: brings up the stack, then runs
 #   ── or manually ──
-# docker compose up -d                  # KurrentDB on :2113
+# docker compose up -d                  # KurrentDB on :2113, Postgres on :54330
+#                                       # (compose applies docs/schema.sql to PG on init)
 # cargo run
 ```
 

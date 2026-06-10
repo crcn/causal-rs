@@ -1,11 +1,12 @@
 -- ============================================================
--- causal-rs v0.4 — Postgres backend schema
+-- causal-rs v0.7 — Postgres backend schema
 -- ============================================================
 --
--- This is the authoritative schema for the v0.4 PG-backed
+-- This is the authoritative schema for the PG-backed
 -- `EventLogBackend` / `CheckpointStore` / `ReactorCheckpoint` /
--- `SnapshotStore` / `ProjectionOps` implementations in the
--- `causal_replay` crate.
+-- `SnapshotStore` implementations in the `causal_replay` crate, plus
+-- the 0.7.0 reactor-observability tables read by the inspector
+-- (`PgReactorObserver` / `PgInspectorReadModel`).
 --
 -- KurrentDB vocabulary aligned: column names use Kurrent's terms
 -- (`causation_id`, `revision`) so the data layout matches what a
@@ -99,8 +100,11 @@ CREATE INDEX idx_causal_snapshots_latest
 
 -- ── causal_projection_cursors: async-projection ops ─────────────────
 --
--- Backs `ProjectionOps`. Per-projection cursor + pause/resume + DLQ
--- bookkeeping for async (independent-runner) projections.
+-- Per-projection cursor + pause/resume + DLQ bookkeeping for async
+-- (independent-runner) projections. The operational surface that drove
+-- these (`ProjectionOps`) was removed pre-1.0 (2026-06-10 audit
+-- remediation); the tables are kept reserved for a future, wired
+-- re-introduction.
 CREATE TABLE causal_projection_cursors (
     projection_id        TEXT PRIMARY KEY,
     cursor_position      BIGINT NOT NULL,
@@ -109,7 +113,7 @@ CREATE TABLE causal_projection_cursors (
     last_attempt_at      TIMESTAMPTZ,
     consecutive_failures INT NOT NULL DEFAULT 0,
     -- Forward-compat columns for future multi-process leases (D3 in
-    -- async-projections plan). Unused in v0.4; reserved so adding
+    -- async-projections plan). Currently unused; reserved so adding
     -- leases later is a column-population change, not a schema
     -- migration.
     leased_by            TEXT,

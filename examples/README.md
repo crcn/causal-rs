@@ -8,7 +8,7 @@ Runnable causal-rs examples backed by KurrentDB.
 |---------|---------|---------------|
 | [`http-fetcher`](http-fetcher/) | KurrentDB + Postgres | Production-shape wiring: Kurrent for the event log, `PgReactorCheckpoint` for reactor/projection cursors. Reactor fans out HTTP fetches, emits success/failure events per request. |
 | [`ai-summarizer`](ai-summarizer/) | KurrentDB + `MemoryStore` | Minimal wiring: Kurrent for the log, in-memory cursors (single-process, ephemeral). Reactor calls the Anthropic API and emits `Summarized` / `SummaryFailed`. |
-| [`inspector-demo`](inspector-demo/) | KurrentDB + Inspector UI | A branching/converging content pipeline (retry/recovery + a singleton phase-tracking aggregate) on a KurrentDB log, served with the causal **inspector** (GraphQL + React UI) on `:4000`. An in-process `MemoryStore` mirror feeds the inspector. |
+| [`inspector-demo`](inspector-demo/) | KurrentDB + Postgres + Inspector UI | A branching/converging content pipeline (retry/recovery + a singleton phase-tracking aggregate) on a KurrentDB log, served with the causal **inspector** (GraphQL + React UI) on `:4000`. `PgEventProjector` mirrors Kurrent's `$all` into Postgres and `PgReactorObserver` records observability; the inspector reads from PG (`PgInspectorReadModel`). |
 
 ## The shape
 
@@ -16,7 +16,7 @@ Every example follows the same three steps:
 
 1. **Define `Event`s.** Typed structs implementing `causal::Event` — one `CATEGORY` per logical stream, `stream_id` for routing.
 2. **Define a `Reactor`.** A struct implementing `causal::Reactor` with `type Trigger = …` and `async fn react(…) -> Result<Events>`.
-3. **Build the engine.** `EngineBuilder::new(log, checkpoint, reactor_checkpoint)` casts three backend trait objects, `.with_reactor(R)` registers each consumer, `.build()` returns the live engine. `engine.emit(...).settled().await?` runs the full causal chain to quiescence.
+3. **Build the engine.** `EngineBuilder::new(log, checkpoint, reactor_checkpoint)` casts three backend trait objects, `.with_reactor(R)` registers each consumer, `.build().await?` (async + fallible — it seeds reactor cursors) returns the live engine. `engine.emit(...).settled().await?` runs the full causal chain to quiescence.
 
 ## Why no adapters
 

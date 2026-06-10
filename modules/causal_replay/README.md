@@ -1,8 +1,7 @@
 # causal_replay
 
-Replay and projection library for [causal](https://crates.io/crates/causal) event processing.
-
-Replay is a lifecycle state of the application, not an external tool. Same `apply()` function runs in both live and replay mode.
+Durable backends for the [`causal`](https://crates.io/crates/causal) runtime,
+plus the cross-backend conformance suite and replay/mirroring utilities.
 
 ## Install
 
@@ -10,93 +9,93 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-causal_replay = "0.26.3"
+# Postgres backends (PgEventLogBackend, PgReactorCheckpoint, PgSnapshotStore,
+# the inspector read-model, replay pointers, PG NOTIFY tail source):
+causal_replay = { version = "0.7", features = ["postgres"] }
 
-# For PgPointerStore and PgNotifyTailSource:
-causal_replay = { version = "0.26", features = ["postgres"] }
+# KurrentDB event log:
+causal_replay = { version = "0.7", features = ["kurrent"] }
 ```
 
-## Quick Start
+## What lives here
+
+- **Event logs** — `KurrentEventLogBackend` (feature `kurrent`) and
+  `PgEventLogBackend` (feature `postgres`), both implementing
+  `causal::EventLogBackend`.
+- **Cursors & snapshots** — `PgReactorCheckpoint` (projector/reactor cursors +
+  retry counters), `PgSnapshotStore` (aggregate snapshots).
+- **Observability** — `PgReactorObserver`, `PgInspectorReadModel`, and
+  `PgEventProjector` (mirrors the durable log into Postgres `causal_log` for the
+  inspector).
+- **Conformance** — `conformance`: every `EventLogBackend` impl runs the same
+  scenario suite (append idempotency on `event_id`, CAS via `StreamState`,
+  monotonic revisions, strict-after reads, stream isolation).
+- **Replay** — `ProjectionStream` / `PointerStore`: blue/green read-model
+  rebuilds driven by the `REPLAY` env var.
+
+The Postgres schema is `docs/schema.sql` in the repository; apply it via your
+migration runner — backends never auto-create the core tables.
+
+## Recommended production shape (hybrid)
+
+KurrentDB as the event log; Postgres for the cursor/snapshot work, which is
+inherently relational:
 
 ```rust
-use causal_replay::{ProjectionStream, PgPointerStore, PgNotifyTailSource};
+use std::sync::Arc;
+use causal::{CheckpointStore, EngineBuilder, EventLogBackend, ReactorCheckpoint};
+use causal_replay::{KurrentEventLogBackend, PgReactorCheckpoint};
 
-let pointer = PgPointerStore::new(db.clone()).await?;
-let tail = PgNotifyTailSource::new(&db, "events").await?;
+let kurrent = KurrentEventLogBackend::connect("kurrentdb://localhost:2113?tls=false")?;
+let pg = Arc::new(PgReactorCheckpoint::new(pool));
 
-let stream = ProjectionStream::new(&log, &pointer)
-    .tail(Box::new(tail))
-    .promote_if(|| health_check(&neo4j));
-
-let version = stream.version().await?;  // DB version for both modes
-let neo4j = connect(&format!("neo4j.v{version}")).await?;
-
-stream.run(|event| projections.apply(event)).await?;
+let engine = EngineBuilder::new(
+    Arc::new(kurrent) as Arc<dyn EventLogBackend>,
+    pg.clone() as Arc<dyn CheckpointStore>,
+    pg as Arc<dyn ReactorCheckpoint>,
+).build().await?;
 ```
 
+## Backend conformance
+
+Backends drift silently without a shared suite. `conformance` pins every
+property an `EventLogBackend` must satisfy — append idempotency on `event_id`,
+CAS via `StreamState`, monotonic 0-indexed `StreamRevision`, strict-after
+`read_stream` / `read_all` semantics, stream isolation — and every backend
+(`PgEventLogBackend`, `KurrentEventLogBackend`, `MemoryStore`) runs every
+scenario. Adding a new property extends the suite once and it's enforced
+everywhere. See `src/conformance.rs`.
+
+## Replay mode
+
+Replay is a lifecycle state of the application, not an external tool. The same
+`apply()` function runs in both live and replay mode — `ProjectionStream`
+checks the `REPLAY` env var internally:
+
 ```sh
-server                                  # live: catch up, tail
-REPLAY=1 server                         # replay: full read, promote, exit
+server                                  # live: catch up from active, then tail
+REPLAY=1 server                         # replay: full read, stage, promote, exit
 REPLAY=1 REPLAY_TARGETS=neo4j server    # replay neo4j only
 ```
 
-## Modes
+**Live** (default) — catch up from the active pointer position, then tail for
+new events. One bad event is logged and skipped so it doesn't halt everything.
 
-**Live** (default) -- catch up from the active pointer, then tail for new events.
+**Replay** (`REPLAY=1`) — read all events from `LogCursor::ZERO`, stage the
+final position, run the `promote_if` gate, exit. Fail-fast: a bug stops the
+replay before promotion.
 
-**Replay** (`REPLAY=1`) -- read all events from position 0, stage the final position, run the `promote_if` gate, exit.
+The pointer (`PointerStore`, e.g. `PgPointerStore`) tracks two positions:
+`active` (promoted, used in live mode) and `staged` (written during replay,
+promoted on success). Tail sources are pluggable via the `TailSource` trait;
+the crate ships `PollTailSource` (sleep-based polling) and `PgNotifyTailSource`
+(PG NOTIFY wake-up, `postgres` feature).
 
-Mode is detected from the `REPLAY` env var. Override with `.mode(Mode::Replay)` for testing.
+## Projections must be idempotent
 
-## Pointer
+On crash, events between the last staged checkpoint and the crash are
+re-delivered. Use `MERGE` / `ON CONFLICT DO UPDATE`.
 
-Tracks position with two columns: `active` (promoted) and `staged` (last replay).
+## License
 
-```rust
-stream.version().await?;   // DB version (active in live, latest_position in replay)
-pointer.status().await?;   // { active: 48000, staged: 50001 }
-pointer.promote().await?;  // staged -> active
-pointer.set(0).await?;     // reset for full rebuild
-```
-
-`PgPointerStore` auto-creates a singleton `causal_replay_pointer` table on construction.
-
-## Tail Source
-
-Pluggable via the `TailSource` trait. The library provides:
-
-- `PollTailSource` -- sleep-based polling (default fallback)
-- `PgNotifyTailSource` -- PG NOTIFY wake-up signal (postgres feature)
-
-Custom implementations (KurrentDB subscriptions, etc.) implement `TailSource::wait()`.
-
-In live mode, `ProjectionStream` uses `tokio::select!` between the tail source and poll fallback. In replay mode, the tail source is ignored.
-
-## Error Strategy
-
-- **Replay: fail-fast.** Bugs stop the replay before promotion.
-- **Live: log and continue.** One bad event doesn't halt everything.
-
-## Promotion
-
-Without `promote_if` -- auto-promote after replay.
-
-With `promote_if` -- gate function runs after replay. Returns `Ok(true)` to promote, `Ok(false)` or `Err` to stay staged.
-
-## Configuration
-
-```rust
-ProjectionStream::new(&log, &pointer)
-    .tail(Box::new(tail))           // custom tail source
-    .promote_if(|| health_check())  // promotion gate
-    .batch_size(5000)               // events per load_from call
-    .checkpoint_interval(500)       // stage every N events during replay
-    .poll_interval(Duration::from_secs(1))  // fallback poll interval
-    .mode(Mode::Replay)             // override env var detection
-    .run(|event| apply(event))
-    .await?;
-```
-
-## Projections Must Be Idempotent
-
-On crash, events between the last checkpoint and the crash are re-delivered. Use `MERGE` / `ON CONFLICT DO UPDATE`.
+MIT

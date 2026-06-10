@@ -72,7 +72,8 @@ async fn run() -> Result<()> {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor(ShipOnPlaced)
-        .build();
+        .build()
+        .await?;
 
     // emit() persists the event and drives the reactor chain;
     // .settled() waits for the chain to quiesce.
@@ -132,8 +133,10 @@ is no outbox and no server-side persistent subscription.
 
 ```toml
 [dependencies]
-causal = "0.5"
-causal = { version = "0.5", features = ["macros"] }  # for #[fact] / #[aggregator]
+causal = "0.7"
+# The `macros` feature is on by default and re-exports `#[event]` +
+# `#[aggregator]` + `#[aggregators]`. Disable it with default-features = false:
+causal = { version = "0.7", default-features = false }
 ```
 
 ## Design notes
