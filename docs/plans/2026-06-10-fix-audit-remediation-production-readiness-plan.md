@@ -127,30 +127,28 @@ fails CI.
 Deletions first: they shrink everything A/B has to compile, review, and CI.
 No real dependency gated these behind A/B (rev-1 sequencing error).
 
-- [ ] **C1.** Remove `Upcaster`/`UpcasterRegistry` from the public API
-      (lib.rs:128; the dead empty registry at aggregator.rs:835 goes too).
-      Follow-up plan re-introduces it wired when first needed.
-- [ ] **C2.** Remove `ProjectionMode`, `RetryPolicy`, `Backoff`,
-      `FailureBehavior`, `ProjectionOps` (+ `MemoryStore`'s impl).
-      `StartPosition` stays (B2 wires it, reactor-only). Strip the legacy
-      `#[reactor]`/`#[projection]`/`#[fact]` macros from `causal_core_macros`
-      (~2k lines generating calls to nonexistent APIs; `event` /
-      `aggregator` / `aggregators` survive).
-- [ ] **C5.** `ctx.aggregate_of` / `engine.snapshot` for an **unregistered**
-      aggregate type **panics with the aggregate type name** (decision per
-      review: an error return would change the signature at rootsignal's 17
-      call sites; panic matches the existing `expect()` precedent at
-      contexts.rs:131,149 and surfaces as a supervised step failure, not a
-      wedge).
-- [ ] **C6.** `with_observer` accepts `Arc<dyn ReactorObserver>` (rootsignal
-      explicitly works around the concrete-generic signature; breaking is
-      free now).
-- [ ] **REPLAY strict parsing** (pulled from out-of-scope: a live footgun in
-      the consumer's blue/green path): `stream.rs:46` `is_ok()` →
-      `== "1" | "true"`; anything else is off; unrecognized values warn.
-- [ ] Verify: `cargo public-api` diff contains none of the removed names;
-      rootsignal builds against a path-patched checkout with zero source
-      changes.
+- [x] **C1.** Removed `Upcaster`/`UpcasterRegistry` (module deleted; the
+      dead empty registry in restore and the upcaster threading through
+      `replay_events_onto` went too; the never-called `replay_events` was
+      deleted outright).
+- [x] **C2.** Removed `ProjectionMode`, `RetryPolicy`, `Backoff`,
+      `FailureBehavior`, `ProjectionOps`, `ProjectionStatus`,
+      `ProjectionFailure` (+ `MemoryStore` impl + its now-meaningless
+      cursor-entry fields). `StartPosition` survives, re-documented as
+      reactor-only. Legacy `#[reactor]`/`#[reactors]`/`#[projection]`
+      macros + `DistributedSafe` derive + their ~1,650 lines of expansion
+      machinery stripped (`event`/`aggregator`/`aggregators` survive).
+- [x] **C5.** `AggregatorRegistry::get_transition{,_arc}` panic with the
+      aggregate type name when `A` was never registered — covers
+      `ctx.aggregate`/`aggregate_of`; `engine.snapshot`/`load_aggregate`
+      panic likewise (old silent-`None` test updated to pin the panic).
+- [x] **C6.** `with_observer` takes `Arc<dyn ReactorObserver>` (concrete
+      `Arc`s coerce at call sites — existing callers unchanged).
+- [x] **REPLAY strict parsing**: `1`/`true` → replay; unset/empty/`0`/
+      `false` → live; anything else warns and stays live.
+- [x] Verified: workspace + all-features tests green; no removed name
+      remains exported (`cargo public-api` not installed — verified via
+      compile + grep; rootsignal path-patch build deferred to end of PR).
 
 ---
 

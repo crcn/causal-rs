@@ -525,11 +525,15 @@ impl EngineBuilder {
     ///     .with_reactor(MyReactor)
     ///     .build();
     /// ```
-    pub fn with_observer<O>(mut self, observer: Arc<O>) -> Self
-    where
-        O: crate::reactor_observer::ReactorObserver + 'static,
-    {
-        self.observer = Some(observer as Arc<dyn crate::reactor_observer::ReactorObserver>);
+    ///
+    /// Takes `Arc<dyn ReactorObserver>` so callers holding a trait
+    /// object (e.g. one chosen at runtime) can pass it directly; a
+    /// concrete `Arc<MyObserver>` coerces at the call site.
+    pub fn with_observer(
+        mut self,
+        observer: Arc<dyn crate::reactor_observer::ReactorObserver>,
+    ) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -1250,9 +1254,13 @@ impl Engine {
     }
 
     /// Inspect the current folded state of aggregate `A` for the
-    /// given `stream_id`. Returns `None` if no aggregator is
-    /// registered for `A`, or if no facts have ever been folded
-    /// for this `stream_id`.
+    /// given `stream_id`. Returns `None` if no facts have ever been
+    /// folded for this `stream_id`.
+    ///
+    /// # Panics
+    /// If no aggregator was ever registered for `A` (or no aggregators
+    /// at all): an unregistered type would otherwise read as "no state
+    /// yet" forever, hiding a configuration bug.
     ///
     /// ## Not for decisions
     ///
@@ -1272,12 +1280,21 @@ impl Engine {
     where
         A: crate::aggregate::Aggregate + Clone,
     {
-        let reg = self.aggregators.as_ref()?;
+        let reg = self.aggregators.as_ref().unwrap_or_else(|| {
+            panic!(
+                "engine.snapshot::<{}>() called but no aggregators were \
+                 registered with EngineBuilder::with_aggregators(...)",
+                std::any::type_name::<A>(),
+            )
+        });
+        // get_transition_arc panics if `A` was never registered —
+        // distinguishing "registered, no events yet" (None below) from
+        // a configuration bug (loud).
+        let (_, curr) = reg.get_transition_arc::<A>(stream_id);
         let key = format!("{}:{}", <A as crate::aggregate::Aggregate>::NAME, stream_id);
         if !reg.has_state(&key) {
             return None;
         }
-        let (_, curr) = reg.get_transition_arc::<A>(stream_id);
         Some((*curr).clone())
     }
 
@@ -1298,11 +1315,22 @@ impl Engine {
     /// Like `snapshot`, this is for ops/tests/read paths outside a consumer —
     /// in a reactor/projector body, read via `ctx.aggregate::<A>(id)` (the
     /// runner restores before folding).
+    ///
+    /// # Panics
+    /// Like [`snapshot`](Self::snapshot): if no aggregator was ever
+    /// registered for `A` (or no aggregators at all).
     pub async fn load_aggregate<A>(&self, id: Uuid) -> Result<Option<A>>
     where
         A: crate::aggregate::Aggregate + Clone + serde::de::DeserializeOwned,
     {
-        let Some(reg) = self.aggregators.as_ref() else { return Ok(None) };
+        let Some(reg) = self.aggregators.as_ref() else {
+            panic!(
+                "engine.load_aggregate::<{}>() called but no aggregators were \
+                 registered with EngineBuilder::with_aggregators(...)",
+                std::any::type_name::<A>(),
+            )
+        };
+        reg.get_transition_arc::<A>(id); // panics if `A` was never registered
         let key = format!("{}:{}", <A as crate::aggregate::Aggregate>::NAME, id);
         // Restore only when a snapshot store is wired (without it, behavior is
         // unchanged — this is a peek into in-memory state).
@@ -2885,16 +2913,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_snapshot_returns_none_without_aggregators() {
-        // No aggregators registered → snapshot returns None
-        // (no panic, no implicit registration).
+    #[should_panic(expected = "no aggregators were registered")]
+    async fn engine_snapshot_panics_without_aggregators() {
+        // No aggregators registered → snapshot panics loudly. The old
+        // behavior (silent None) read as "no state yet" forever and hid
+        // the misconfiguration — a real consumer shipped dedup gates
+        // that never fired because of it.
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build();
-        assert!(engine.snapshot::<TickCounter>(Uuid::nil()).is_none());
+        let _ = engine.snapshot::<TickCounter>(Uuid::nil());
     }
 
     #[tokio::test]

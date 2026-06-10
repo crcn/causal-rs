@@ -15,7 +15,6 @@ use crate::event_log::EventLogBackend;
 use crate::reactor::extract_prefix;
 use crate::snapshot_store::SnapshotStore;
 use crate::types::{LogCursor, Snapshot, StreamRevision};
-use crate::upcaster::UpcasterRegistry;
 
 // ── Aggregate state snapshots ────────────────────────────────────
 //
@@ -453,64 +452,41 @@ impl AggregatorRegistry {
         snapshots
     }
 
-    /// Replay a sequence of persisted events to reconstruct aggregate state.
+    /// Panic unless at least one aggregator was registered for `A`.
     ///
-    /// Takes `(event_type, payload)` pairs (decoupled from `RecordedEvent`).
-    /// Uses short name matching so persisted events (e.g. `"OrderPlaced"`)
-    /// match aggregators registered with full type paths.
-    ///
-    /// Upcasters are applied to each event payload before deserialization,
-    /// transforming old schemas to the current version.
-    ///
-    /// Returns `None` if no aggregators are registered for this aggregate type.
-    pub fn replay_events(
-        &self,
-        aggregate_type: &str,
-        events: &[(&str, &serde_json::Value)],
-        upcasters: &UpcasterRegistry,
-    ) -> Result<Option<Box<dyn Any + Send + Sync>>> {
-        // Find any aggregator for this aggregate_type to get default_state
-        let first = self
-            .aggregators
-            .iter()
-            .find(|a| a.aggregate_type == aggregate_type);
-
-        let first = match first {
-            Some(agg) => agg,
-            None => return Ok(None),
-        };
-
-        let mut state = first.default_state();
-
-        for (event_type, payload) in events {
-            // Apply upcasters before deserialization (schema_version=0 as default)
-            let upcasted_payload = upcasters.upcast(event_type, 0, (*payload).clone())?;
-
-            // Find aggregators where the prefix matches
-            let prefix = extract_prefix(event_type);
-            let matching: Vec<&Aggregator> = self
-                .aggregators
-                .iter()
-                .filter(|a| {
-                    a.aggregate_type == aggregate_type
-                        && a.event_prefix == prefix
-                })
-                .collect();
-
-            for agg in matching {
-                agg.apply_to(state.as_mut(), upcasted_payload.clone())?;
-            }
+    /// Reading an unregistered aggregate type would silently return
+    /// `A::default()` forever — state that never folds is a
+    /// configuration bug, not an empty aggregate, and silently
+    /// defaulting it is how dedup gates that never fire ship to
+    /// production. Fails loudly at the offending call site instead;
+    /// the panic is caught by the supervised consumer task.
+    fn assert_registered<A>(&self)
+    where
+        A: crate::aggregate::Aggregate,
+    {
+        if self.find_first_by_aggregate_type(A::NAME).is_none() {
+            panic!(
+                "aggregate type `{}` (NAME = \"{}\") was never registered — \
+                 no aggregator with this aggregate_type was passed to \
+                 EngineBuilder::with_aggregators(...). Its state would \
+                 silently stay at Default; register its aggregators.",
+                std::any::type_name::<A>(),
+                A::NAME,
+            );
         }
-
-        Ok(Some(state))
     }
 
     /// Get the (prev, next) transition for an aggregate from internal state.
-    /// Returns `(A::default(), A::default())` if no state exists.
+    /// Returns `(A::default(), A::default())` if no state exists yet.
+    ///
+    /// # Panics
+    /// If no aggregator was registered for `A` — see
+    /// [`Self::assert_registered`].
     pub fn get_transition<A>(&self, id: Uuid) -> (A, A)
     where
         A: crate::aggregate::Aggregate + Clone,
     {
+        self.assert_registered::<A>();
         let key = format!("{}:{}", A::NAME, id);
         let prev_key = format!("{}:prev", key);
 
@@ -534,6 +510,7 @@ impl AggregatorRegistry {
     where
         A: crate::aggregate::Aggregate,
     {
+        self.assert_registered::<A>();
         let key = format!("{}:{}", A::NAME, id);
         let prev_key = format!("{}:prev", key);
 
@@ -764,18 +741,14 @@ impl AggregatorRegistry {
 
     /// Replay events onto an existing state (for snapshot + partial replay).
     ///
-    /// Matches events by short type name (same as `replay_events`).
-    /// Upcasters are applied before deserialization.
+    /// Matches events by short type name.
     pub fn replay_events_onto(
         &self,
         aggregate_type: &str,
         state: &mut dyn Any,
         events: &[(&str, &serde_json::Value)],
-        upcasters: &UpcasterRegistry,
     ) -> Result<()> {
         for (event_type, payload) in events {
-            let upcasted = upcasters.upcast(event_type, 0, (*payload).clone())?;
-
             let prefix = extract_prefix(event_type);
             let matching: Vec<&Aggregator> = self
                 .aggregators
@@ -787,7 +760,7 @@ impl AggregatorRegistry {
                 .collect();
 
             for agg in matching {
-                agg.apply_to(state, upcasted.clone())?;
+                agg.apply_to(state, (*payload).clone())?;
             }
         }
 
@@ -832,7 +805,6 @@ pub(crate) async fn restore_aggregate(
     let Some(agg) = reg.find_first_by_aggregate_type(aggregate_type) else {
         return Ok(false);
     };
-    let upcasters = UpcasterRegistry::new();
 
     let snap = match snapshot_store {
         Some(store) => store.load_snapshot(aggregate_type, id).await?,
@@ -869,7 +841,7 @@ pub(crate) async fn restore_aggregate(
     if folded_any {
         let pairs: Vec<(&str, &serde_json::Value)> =
             tail.iter().map(|e| (e.event_type.as_str(), &e.payload)).collect();
-        reg.replay_events_onto(aggregate_type, state.as_mut(), &pairs, &upcasters)?;
+        reg.replay_events_onto(aggregate_type, state.as_mut(), &pairs)?;
         last_rev = tail.last().map(|e| e.revision);
     }
 

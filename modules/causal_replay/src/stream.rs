@@ -41,12 +41,25 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Detect mode from environment. `REPLAY=1` → Replay, otherwise Live.
+    /// Detect mode from environment. `REPLAY=1` or `REPLAY=true` →
+    /// Replay; unset, empty, `0`, or `false` → Live.
+    ///
+    /// Strict on purpose: replay rebuilds the world and exits, so a
+    /// caller writing `REPLAY=0` to *disable* it must not trigger it
+    /// (the old `is_ok()` check did exactly that). Unrecognized values
+    /// warn and stay Live.
     pub fn from_env() -> Self {
-        if std::env::var("REPLAY").is_ok() {
-            Mode::Replay
-        } else {
-            Mode::Live
+        match std::env::var("REPLAY").as_deref() {
+            Ok("1") | Ok("true") => Mode::Replay,
+            Ok("") | Ok("0") | Ok("false") | Err(_) => Mode::Live,
+            Ok(other) => {
+                tracing::warn!(
+                    value = %other,
+                    "unrecognized REPLAY value; staying in Live mode \
+                     (use REPLAY=1 to replay)"
+                );
+                Mode::Live
+            }
         }
     }
 }

@@ -1,5 +1,6 @@
 //! In-memory backend: `EventLogBackend` + `CheckpointStore` +
-//! `ReactorCheckpoint` + `SnapshotStore` + `ProjectionOps`.
+//! `ReactorCheckpoint` + `SnapshotStore` (+ `ReactorObserver` and the
+//! inspector read surface).
 //!
 //! Suitable for tests, examples, and single-process use cases. Drop in
 //! a Postgres / Kurrent backend for production durability.
@@ -15,7 +16,6 @@ use uuid::Uuid;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::checkpoint_store::ReactorCheckpoint;
-use crate::projection::{ProjectionFailure, ProjectionStatus};
 use crate::reactor_observer::ReactorObserver;
 use crate::types::*;
 
@@ -23,10 +23,6 @@ use crate::types::*;
 #[derive(Clone)]
 struct ProjectionCursorEntry {
     cursor: LogCursor,
-    paused: bool,
-    last_error: Option<String>,
-    last_attempt_at: Option<DateTime<Utc>>,
-    consecutive_failures: u32,
 }
 
 /// In-memory backend implementing the full trait surface.
@@ -40,9 +36,6 @@ pub struct MemoryStore {
     snapshots: Arc<DashMap<(String, Uuid), Snapshot>>,
     /// Per-projection cursor + status.
     projection_cursors: Arc<DashMap<String, ProjectionCursorEntry>>,
-    /// Per-projection DLQ rows. Idempotent on `(projection_id,
-    /// event_id)` — matches the unique-constraint contract.
-    projection_failures: Arc<Mutex<Vec<ProjectionFailure>>>,
     /// DLQ attempt counter keyed by (consumer_id, source_event_id).
     /// Survives ReactorRunner reconstruction within the store's
     /// lifetime; lost on process crash (matches MemoryStore's
@@ -82,7 +75,6 @@ impl MemoryStore {
             global_position: Arc::new(AtomicU64::new(1)),
             snapshots: Arc::new(DashMap::new()),
             projection_cursors: Arc::new(DashMap::new()),
-            projection_failures: Arc::new(Mutex::new(Vec::new())),
             reactor_attempts: Arc::new(DashMap::new()),
             reactor_executions: Arc::new(DashMap::new()),
             reactor_attempt_history: Arc::new(Mutex::new(Vec::new())),
@@ -461,105 +453,10 @@ impl crate::checkpoint_store::CheckpointStore for MemoryStore {
         match self.projection_cursors.entry(consumer_id.to_string()) {
             Entry::Occupied(mut slot) => { slot.get_mut().cursor = pos; }
             Entry::Vacant(slot) => {
-                slot.insert(ProjectionCursorEntry {
-                    cursor: pos,
-                    paused: false,
-                    last_error: None,
-                    last_attempt_at: None,
-                    consecutive_failures: 0,
-                });
+                slot.insert(ProjectionCursorEntry { cursor: pos });
             }
         }
         Ok(())
-    }
-}
-
-// ── ReactorCheckpoint implementation (C12 atomicity) ────────────────────
-
-// ── ProjectionOps surface ───────────────────────────────────────────
-
-#[async_trait]
-impl causal::projection::ProjectionOps for MemoryStore {
-    async fn set_paused(&self, group_name: &str, paused: bool) -> Result<()> {
-        use dashmap::mapref::entry::Entry;
-        match self.projection_cursors.entry(group_name.to_string()) {
-            Entry::Occupied(mut slot) => { slot.get_mut().paused = paused; }
-            Entry::Vacant(slot) => {
-                slot.insert(ProjectionCursorEntry {
-                    cursor: LogCursor::ZERO,
-                    paused,
-                    last_error: None,
-                    last_attempt_at: None,
-                    consecutive_failures: 0,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn record_failure(
-        &self,
-        group_name: &str,
-        event_id: Uuid,
-        error: &str,
-        attempts: u32,
-    ) -> Result<()> {
-        // Direct DLQ write. Idempotent on (group_name, event_id) —
-        // matches the unique-constraint contract documented on the
-        // trait. See trait docs re: atomicity (not bundled with
-        // cursor advance).
-        let mut failures = self.projection_failures.lock();
-        let already_present = failures.iter().any(|f| {
-            f.projection_id == group_name && f.event_id == event_id
-        });
-        if !already_present {
-            failures.push(ProjectionFailure {
-                projection_id: group_name.to_string(),
-                event_id,
-                error: error.to_string(),
-                attempts,
-                failed_at: chrono::Utc::now(),
-            });
-        }
-        Ok(())
-    }
-
-    async fn list_failures(
-        &self,
-        group_name: &str,
-        limit: usize,
-    ) -> Result<Vec<ProjectionFailure>> {
-        let failures = self.projection_failures.lock();
-        Ok(failures.iter()
-            .rev()
-            .filter(|f| f.projection_id == group_name)
-            .take(limit)
-            .cloned()
-            .collect())
-    }
-
-    async fn status(&self, group_name: &str) -> Result<Option<ProjectionStatus>> {
-        Ok(self.projection_cursors.get(group_name).map(|e| ProjectionStatus {
-            projection_id: group_name.to_string(),
-            cursor: e.cursor,
-            paused: e.paused,
-            last_error: e.last_error.clone(),
-            last_attempt_at: e.last_attempt_at,
-            consecutive_failures: e.consecutive_failures,
-        }))
-    }
-
-    async fn delete_failure(
-        &self,
-        group_name: &str,
-        event_id: Uuid,
-    ) -> Result<bool> {
-        let mut failures = self.projection_failures.lock();
-        let before = failures.len();
-        failures.retain(|f| {
-            !(f.projection_id == group_name && f.event_id == event_id)
-        });
-        Ok(failures.len() < before)
     }
 }
 
@@ -606,44 +503,4 @@ mod checkpoint_tests {
         );
     }
 
-    // ── ProjectionOps surface ───────────────────────────────────────
-
-    #[tokio::test]
-    async fn projection_ops_record_and_list_failures() {
-        use causal::projection::ProjectionOps;
-        let store = MemoryStore::new();
-        let event_id = Uuid::new_v4();
-
-        ProjectionOps::record_failure(&store, "p", event_id, "boom", 1).await.unwrap();
-        ProjectionOps::record_failure(&store, "p", event_id, "boom retry", 2).await.unwrap();
-
-        let failures = ProjectionOps::list_failures(&store, "p", 10).await.unwrap();
-        assert_eq!(failures.len(), 1,
-                   "idempotent on (group_name, event_id) — second call no-op");
-        assert_eq!(failures[0].event_id, event_id);
-        assert_eq!(failures[0].error, "boom");
-        assert_eq!(failures[0].attempts, 1);
-
-        let deleted = ProjectionOps::delete_failure(&store, "p", event_id).await.unwrap();
-        assert!(deleted);
-        assert!(ProjectionOps::list_failures(&store, "p", 10).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn projection_ops_set_paused_and_status() {
-        use causal::projection::ProjectionOps;
-        let store = MemoryStore::new();
-
-        // status() requires a cursor entry; seed one via CheckpointStore.
-        CheckpointStore::set(&store, "p", LogCursor::from_raw(5)).await.unwrap();
-
-        ProjectionOps::set_paused(&store, "p", true).await.unwrap();
-        let status = ProjectionOps::status(&store, "p").await.unwrap().unwrap();
-        assert!(status.paused);
-        assert_eq!(status.cursor, LogCursor::from_raw(5));
-
-        ProjectionOps::set_paused(&store, "p", false).await.unwrap();
-        let status = ProjectionOps::status(&store, "p").await.unwrap().unwrap();
-        assert!(!status.paused);
-    }
 }

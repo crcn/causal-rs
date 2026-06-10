@@ -109,7 +109,6 @@ pub mod snapshot_store;
 pub mod types;
 
 pub mod memory_store;
-pub mod upcaster;
 
 // ── public surface ──────────────────────────────────────────────
 //
@@ -119,7 +118,7 @@ pub mod upcaster;
 // User-facing (here): facts, aggregates, consumer traits, the engine,
 // the emit builder, registration trait objects, context types,
 // cursors/versions, backend traits (cast at builder time), MemoryStore,
-// upcasters, macros.
+// macros.
 //
 // Backend-impl-facing (module paths only): EventData, WriteResult,
 // Snapshot — backends pull these from `causal::types::*` directly.
@@ -168,17 +167,11 @@ pub use reaction_cache::{remember, InMemoryReactionCache, ReactionCache, Reactio
 // Backend traits (users typically cast `Arc<dyn ...>` at builder time)
 pub use checkpoint_store::{CheckpointStore, ReactorCheckpoint};
 pub use event_log::{append_event, EventLogBackend};
-pub use projection::{
-    Backoff, FailureBehavior, ProjectionFailure, ProjectionMode, ProjectionOps,
-    ProjectionStatus, RetryPolicy, StartPosition,
-};
+pub use projection::StartPosition;
 pub use snapshot_store::SnapshotStore;
 
 // Default backend
 pub use memory_store::MemoryStore;
-
-// Schema migration helpers
-pub use upcaster::{Upcaster, UpcasterRegistry};
 
 
 /// Universal return macro for [`Reactor::react`]. Builds an
