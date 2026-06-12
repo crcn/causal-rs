@@ -49,7 +49,7 @@ where
     A: Aggregate + Apply<F>,
     F: Event,
 {
-    let events = EventLogBackend::read_stream(store, A::STREAM_CATEGORY, id, None)
+    let events = EventLogBackend::read_stream(store, A::SUBJECT, id, None)
         .await
         .unwrap();
     let mut agg = A::default();
@@ -125,7 +125,7 @@ impl Event for Hit {
     fn event_type(&self) -> &str {
         "hit"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.stream
     }
 }
@@ -137,7 +137,7 @@ struct HitTotal {
 }
 impl Aggregate for HitTotal {
     const NAME: &'static str = "HitTotal";
-    const STREAM_CATEGORY: &'static str = "af_hit";
+    const SUBJECT: &'static str = "af_hit";
 }
 impl Apply<Hit> for HitTotal {
     fn apply(&mut self, f: &Hit) {
@@ -261,7 +261,7 @@ impl Event for Job {
     fn event_type(&self) -> &str {
         "queued"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -275,7 +275,7 @@ impl Event for EchoA {
     fn event_type(&self) -> &str {
         "echoed"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -289,7 +289,7 @@ impl Event for EchoB {
     fn event_type(&self) -> &str {
         "echoed"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -302,7 +302,7 @@ macro_rules! count_aggregate {
         }
         impl Aggregate for $name {
             const NAME: &'static str = stringify!($name);
-            const STREAM_CATEGORY: &'static str = $stream;
+            const SUBJECT: &'static str = $stream;
         }
         impl Apply<$fact> for $name {
             fn apply(&mut self, _: &$fact) {
@@ -420,7 +420,7 @@ impl Event for BgPing {
     fn event_type(&self) -> &str {
         "ping"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -434,7 +434,7 @@ impl Event for BgPong {
     fn event_type(&self) -> &str {
         "pong"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -587,7 +587,7 @@ impl Event for OccFact {
     fn event_type(&self) -> &str {
         "bumped"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.counter
     }
 }
@@ -599,7 +599,7 @@ struct OccTotal {
 }
 impl Aggregate for OccTotal {
     const NAME: &'static str = "OccTotal";
-    const STREAM_CATEGORY: &'static str = "af_occ";
+    const SUBJECT: &'static str = "af_occ";
 }
 impl Apply<OccFact> for OccTotal {
     fn apply(&mut self, f: &OccFact) {
@@ -690,7 +690,7 @@ impl Event for SeedPing {
     fn event_type(&self) -> &str {
         "ping"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -704,7 +704,7 @@ impl Event for SeedPong {
     fn event_type(&self) -> &str {
         "pong"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -840,7 +840,7 @@ impl Event for Work {
     fn event_type(&self) -> &str {
         "queued"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -854,7 +854,7 @@ impl Event for Done {
     fn event_type(&self) -> &str {
         "done"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }
@@ -929,11 +929,11 @@ struct Dep {
 }
 impl Event for Dep {
     const CATEGORY: &'static str = "af_dep";
-    const STREAM_CATEGORY: &'static str = "af_acct";
+    const SUBJECT: &'static str = "af_acct";
     fn event_type(&self) -> &str {
         "deposited"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.acct
     }
 }
@@ -945,11 +945,11 @@ struct ForeignNote {
 }
 impl Event for ForeignNote {
     const CATEGORY: &'static str = "af_noise";
-    const STREAM_CATEGORY: &'static str = "af_acct";
+    const SUBJECT: &'static str = "af_acct";
     fn event_type(&self) -> &str {
         "noted"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.acct
     }
 }
@@ -961,7 +961,7 @@ struct AcctBalance {
 }
 impl Aggregate for AcctBalance {
     const NAME: &'static str = "AcctBalance";
-    const STREAM_CATEGORY: &'static str = "af_acct";
+    const SUBJECT: &'static str = "af_acct";
 }
 impl Apply<Dep> for AcctBalance {
     fn apply(&mut self, f: &Dep) {

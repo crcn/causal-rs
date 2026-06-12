@@ -39,7 +39,7 @@ struct ProjectionCursorEntry {
 struct LogIndex {
     /// event_id → offset in the log Vec (dedup + divergence checks).
     by_event_id: HashMap<Uuid, usize>,
-    /// (category, stream_id) → that stream's log offsets, in revision
+    /// (category, subject_id) → that stream's log offsets, in revision
     /// order. `len()` is the stream's event count; offset `r` holds
     /// revision `r` (revisions are dense per stream).
     streams: HashMap<(String, Uuid), Vec<usize>>,
@@ -343,12 +343,12 @@ impl crate::event_log::EventLogBackend for MemoryStore {
     async fn read_stream(
         &self,
         category: &str,
-        stream_id: Uuid,
+        subject_id: Uuid,
         after: Option<StreamRevision>,
     ) -> Result<Vec<RecordedEvent>> {
         let log = self.global_log.lock();
         let idx = self.log_index.lock(); // lock ordering: log → index
-        let Some(offsets) = idx.streams.get(&(category.to_string(), stream_id)) else {
+        let Some(offsets) = idx.streams.get(&(category.to_string(), subject_id)) else {
             return Ok(Vec::new());
         };
         // Offset `r` holds revision `r` (dense per stream), so
@@ -372,7 +372,7 @@ impl crate::event_log::EventLogBackend for MemoryStore {
     async fn append_to_stream(
         &self,
         category: &str,
-        stream_id: Uuid,
+        subject_id: Uuid,
         expected: crate::types::StreamState,
         events: Vec<EventData>,
     ) -> Result<WriteResult> {
@@ -465,7 +465,7 @@ impl crate::event_log::EventLogBackend for MemoryStore {
             );
         }
 
-        let stream_key = (category.to_string(), stream_id);
+        let stream_key = (category.to_string(), subject_id);
         let count = idx
             .streams
             .get(&stream_key)
@@ -510,7 +510,7 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                 payload: event.payload,
                 created_at: event.created_at,
                 category: category.to_string(),
-                stream_id,
+                subject_id,
                 revision: new_revision,
                 metadata: event.metadata,
                 ephemeral: event.ephemeral,
@@ -608,7 +608,7 @@ mod append_tests {
             payload: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             category: Some("test".into()),
-            stream_id: Some(Uuid::nil()),
+            subject_id: Some(Uuid::nil()),
             metadata: serde_json::Map::new(),
             ephemeral: None,
             persistent: true,

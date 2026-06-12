@@ -1,0 +1,19 @@
+error: #[event]: this fact carries Uuid field(s) `workflow_id` but declares no subject. If it is ABOUT one of them, name it: `subject_id = "workflow_id"` — the id you fold its state by. If those ids are only references, opt out explicitly with `no_subject`: every value then shares one subject-less history, which per-subject state reads cannot serve.
+ --> tests/ui/event_struct_missing_subject_id.rs:9:8
+  |
+9 | struct EnrichmentReady {
+  |        ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_struct_missing_subject_id.rs:4:13
+  |
+4 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> tests/ui/event_struct_missing_subject_id.rs:5:5
+  |
+5 | use uuid::Uuid;
+  |     ^^^^^^^^^^

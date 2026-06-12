@@ -6,7 +6,7 @@
 //!   2. Filter by `R::Trigger::CATEGORY`.
 //!   3. Call `reactor.react(trigger, ctx)` → `Result<Events>`.
 //!   4. Append each output **directly** to its own stream
-//!      (`append_to_stream(category, stream_id, Any, …)`) with a
+//!      (`append_to_stream(category, subject_id, Any, …)`) with a
 //!      deterministic `event_id = uuid_v5(NS_REACTOR_OUTPUT,
 //!      [reactor_id, trigger_id, idx])`.
 //!   5. Advance the cursor (`checkpoint.set`).
@@ -282,8 +282,8 @@ where
         if let Some(fact) = mapper(info) {
             // `cat` is the STREAM placement category; `event_type` keeps
             // the routing category.
-            let cat = fact.stream_category().to_string();
-            let sid = fact.stream_id();
+            let cat = fact.subject().to_string();
+            let sid = fact.subject_id();
             let event_type = crate::event_type::compose(fact.category(), fact.variant_name());
             let payload = fact.to_value()?;
             let out_event = EventData {
@@ -294,7 +294,7 @@ where
                 payload: payload.clone(),
                 created_at: chrono::Utc::now(),
                 category: Some(cat.clone()),
-                stream_id: Some(sid),
+                subject_id: Some(sid),
                 metadata: reactor_output_metadata(&self.consumer_id),
                 ephemeral: None,
                 persistent: true,
@@ -358,7 +358,7 @@ where
                     self.log.as_ref(),
                     &event.event_type,
                     &event.payload,
-                    event.stream_id,
+                    event.subject_id,
                     &event.category,
                     event.revision,
                     event.position,
@@ -564,15 +564,15 @@ where
                     created_at: chrono::Utc::now(),
                     // Placement uses the STREAM category; routing stays on
                     // `event_type` (durable_name). Equal unless overridden.
-                    category: Some(out.stream_category.clone()),
-                    stream_id: Some(out.stream_id),
+                    category: Some(out.subject.clone()),
+                    subject_id: Some(out.subject_id),
                     metadata: reactor_output_metadata(&self.consumer_id),
                     ephemeral: None,
                     persistent: true,
                 };
                 let write = self.log
                     .append_to_stream(
-                        &out.stream_category, out.stream_id, StreamState::Any, vec![out_event],
+                        &out.subject, out.subject_id, StreamState::Any, vec![out_event],
                     )
                     .await?;
                 // Advance this run's scoped-settle high-water: the output
@@ -596,8 +596,8 @@ where
                         self.log.as_ref(),
                         &out.durable_name,
                         &out.payload,
-                        out.stream_id,
-                        &out.stream_category,
+                        out.subject_id,
+                        &out.subject,
                         write.revision,
                         write.position,
                         /* strict_to_event = */ false,
@@ -647,7 +647,7 @@ where
                         self.log.as_ref(),
                         &event.event_type,
                         &event.payload,
-                        event.stream_id,
+                        event.subject_id,
                         &event.category,
                         event.revision,
                         event.position,
@@ -691,7 +691,7 @@ mod tests {
     impl Event for OrderPlaced {
         const CATEGORY: &'static str = "order";
         fn event_type(&self) -> &str { "order_placed" }
-        fn stream_id(&self) -> Uuid { self.order_id }
+        fn subject_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 
@@ -703,7 +703,7 @@ mod tests {
     impl Event for ShippedNotification {
         const CATEGORY: &'static str = "shipping";
         fn event_type(&self) -> &str { "shipped_notification" }
-        fn stream_id(&self) -> Uuid { self.order_id }
+        fn subject_id(&self) -> Uuid { self.order_id }
     }
 
     fn append_trigger(store: &MemoryStore, payload: &OrderPlaced) -> Uuid {
@@ -716,7 +716,7 @@ mod tests {
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
@@ -1013,7 +1013,7 @@ mod tests {
             payload:         serde_json::json!({}),
             created_at:      Utc::now(),
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
@@ -1047,7 +1047,7 @@ mod tests {
     impl Event for HandlerFailed {
         const CATEGORY: &'static str = "ops";
         fn event_type(&self) -> &str { "handler_failed" }
-        fn stream_id(&self) -> Uuid { Uuid::nil() }
+        fn subject_id(&self) -> Uuid { Uuid::nil() }
     }
 
     struct AlwaysFails(std::sync::Arc<AtomicUsize>);
@@ -1139,7 +1139,7 @@ mod tests {
             payload:        serde_json::json!({ "name": "not an OrderPlaced" }),
             created_at:     Utc::now(),
             category:       Some("orders".into()),
-            stream_id:      Some(Uuid::new_v4()),
+            subject_id:      Some(Uuid::new_v4()),
             metadata:       serde_json::Map::new(),
             ephemeral:      None,
             persistent:     true,
@@ -1189,7 +1189,7 @@ mod tests {
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
             category:       Some("order".into()),
-            stream_id:      Some(Uuid::new_v4()),
+            subject_id:      Some(Uuid::new_v4()),
             metadata:       serde_json::Map::new(),
             ephemeral:      None,
             persistent:     true,
@@ -1247,7 +1247,7 @@ mod tests {
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
             category:       Some("order".into()),
-            stream_id:      Some(Uuid::new_v4()),
+            subject_id:      Some(Uuid::new_v4()),
             metadata:       serde_json::Map::new(),
             ephemeral:      None,
             persistent:     true,

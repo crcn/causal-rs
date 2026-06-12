@@ -20,7 +20,7 @@ use crate::types::{
 };
 
 /// Append-only event log. One write primitive — every event belongs to a
-/// stream (`{category}-{stream_id}`); see [`append_to_stream`](Self::append_to_stream).
+/// stream (`{category}-{subject_id}`); see [`append_to_stream`](Self::append_to_stream).
 ///
 /// # Idempotency contract
 ///
@@ -52,14 +52,14 @@ pub trait EventLogBackend: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RecordedEvent>>;
 
-    /// Read events from a single stream (`{category}-{stream_id}`). Pass
+    /// Read events from a single stream (`{category}-{subject_id}`). Pass
     /// `after: Some(revision)` to load only events with revision >
     /// the given value (snapshot + partial replay); `None` for full
     /// replay.
     async fn read_stream(
         &self,
         category: &str,
-        stream_id: Uuid,
+        subject_id: Uuid,
         after: Option<StreamRevision>,
     ) -> Result<Vec<RecordedEvent>>;
 
@@ -67,7 +67,7 @@ pub trait EventLogBackend: Send + Sync {
     async fn latest_position(&self) -> Result<LogCursor>;
 
     /// The append primitive — write `events` to stream
-    /// `{category}-{stream_id}` under an optimistic-concurrency check.
+    /// `{category}-{subject_id}` under an optimistic-concurrency check.
     ///
     /// The batch is **atomic**: all events land at consecutive revisions
     /// or none do. This mirrors KurrentDB's `append_to_stream`, which takes
@@ -104,7 +104,7 @@ pub trait EventLogBackend: Send + Sync {
     async fn append_to_stream(
         &self,
         category: &str,
-        stream_id: Uuid,
+        subject_id: Uuid,
         expected: StreamState,
         events: Vec<EventData>,
     ) -> Result<WriteResult>;
@@ -126,16 +126,16 @@ pub struct ConflictError {
 /// primitive: append `event` to its own stream with [`StreamState::Any`]
 /// (append-only, no concurrency check; idempotency rests on `event_id`).
 ///
-/// The destination stream is `event.category` / `event.stream_id` when
+/// The destination stream is `event.category` / `event.subject_id` when
 /// carried; otherwise it's derived — category from the `{category}:{name}`
-/// `event_type` prefix, stream_id from the event's own `event_id` (a
+/// `event_type` prefix, subject_id from the event's own `event_id` (a
 /// standalone single-event stream). So a bare fact always lands somewhere
 /// sensible, never a shared `_global`.
 ///
 /// Not a backend method — backends implement only `append_to_stream`.
 /// Sugar for seeding fixtures and ad-hoc single appends. Invariant-bearing
 /// writes go through [`Engine::append`](crate::Engine::append); the typed
-/// emit/reactor paths set `category`/`stream_id` explicitly.
+/// emit/reactor paths set `category`/`subject_id` explicitly.
 pub async fn append_event<B: EventLogBackend + ?Sized>(
     backend: &B,
     event: EventData,
@@ -152,8 +152,8 @@ pub async fn append_event<B: EventLogBackend + ?Sized>(
             let derived = crate::event_type::category_of(&event.event_type);
             if derived.is_empty() { "event" } else { derived }.to_string()
         });
-    let stream_id = event.stream_id.unwrap_or(event.event_id);
+    let subject_id = event.subject_id.unwrap_or(event.event_id);
     backend
-        .append_to_stream(&category, stream_id, StreamState::Any, vec![event])
+        .append_to_stream(&category, subject_id, StreamState::Any, vec![event])
         .await
 }

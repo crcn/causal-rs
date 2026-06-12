@@ -155,7 +155,7 @@ struct Recorded { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Recorded {
     const CATEGORY: &'static str = "test";
     fn event_type(&self) -> &str { "recorded" }
-    fn stream_id(&self) -> Uuid { self.id }
+    fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -171,7 +171,7 @@ async fn append_n(store: &MemoryStore, n: usize) {
             created_at: Utc::now(),
             // Honest stream coordinates — what Engine::emit writes.
             category: Some(<Recorded as Event>::CATEGORY.to_string()),
-            stream_id: Some(payload.id),
+            subject_id: Some(payload.id),
             metadata: serde_json::Map::new(),
             ephemeral: None,
             persistent: true,
@@ -257,7 +257,7 @@ struct Trigger { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Trigger {
     const CATEGORY: &'static str = "test";
     fn event_type(&self) -> &str { "trigger" }
-    fn stream_id(&self) -> Uuid { self.id }
+    fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -270,7 +270,7 @@ impl Event for Echoed {
     // log immediately (no outbox), this is enforced in practice.
     const CATEGORY: &'static str = "echo";
     fn event_type(&self) -> &str { "echoed" }
-    fn stream_id(&self) -> Uuid { Uuid::nil() }
+    fn subject_id(&self) -> Uuid { Uuid::nil() }
 }
 
 struct EmitOne;
@@ -299,7 +299,7 @@ async fn append_trigger(store: &MemoryStore) -> Uuid {
         created_at: Utc::now(),
         // Honest stream coordinates — what Engine::emit writes.
         category: Some(<Trigger as Event>::CATEGORY.to_string()),
-        stream_id: Some(payload.id),
+        subject_id: Some(payload.id),
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
@@ -414,9 +414,9 @@ async fn crash_redelivery_folds_exactly_once_in_both_registries() {
     .with_aggregators(consumer_reg.clone())
     .with_engine_aggregators(Some(engine_reg.clone()));
 
-    // The trigger's stream id (Trigger::stream_id = payload.id).
+    // The trigger's stream id (Trigger::subject_id = payload.id).
     let events = EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
-    let trigger_stream_id = events[0].stream_id;
+    let trigger_subject_id = events[0].subject_id;
 
     // Crash at the cursor advance, AFTER react + output append + folds.
     injector.arm(FaultPoint::CheckpointSet);
@@ -426,7 +426,7 @@ async fn crash_redelivery_folds_exactly_once_in_both_registries() {
     // (skipped).
     runner.step(10).await.unwrap();
 
-    let (_, trigger_count) = consumer_reg.get_transition_arc::<TriggerCount>(trigger_stream_id);
+    let (_, trigger_count) = consumer_reg.get_transition_arc::<TriggerCount>(trigger_subject_id);
     assert_eq!(trigger_count.n, 1,
                "consumer registry folded the redelivered trigger exactly once");
 
@@ -482,7 +482,7 @@ async fn cursor_set_failure_does_not_double_count_aggregates() {
     // on fact[0]'s entry.
     let events = EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
     for event in &events {
-        let (_, count) = reg.get_transition_arc::<RecordedCount>(event.stream_id);
+        let (_, count) = reg.get_transition_arc::<RecordedCount>(event.subject_id);
         assert_eq!(count.n, 1,
                    "event at position {} folded exactly once across the retry",
                    event.position.raw());

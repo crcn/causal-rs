@@ -32,7 +32,7 @@ fn to_stored(e: &causal::types::RecordedEvent) -> StoredEvent {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         aggregate_type: Some(e.category.clone()),
-        aggregate_id: Some(e.stream_id),
+        aggregate_id: Some(e.subject_id),
         stream_revision: Some(e.revision.raw()),
     }
 }
@@ -72,7 +72,7 @@ impl InspectorReadModel for MemoryStore {
                 }
                 // Aggregate key filter (e.g. "Order:00000000-…")
                 if let Some(ref key) = query.aggregate_key {
-                    let event_key = format!("{}:{}", e.category, e.stream_id);
+                    let event_key = format!("{}:{}", e.category, e.subject_id);
                     if event_key != *key {
                         return false;
                     }

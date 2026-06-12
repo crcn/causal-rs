@@ -29,7 +29,7 @@ fn ev(event_id: Uuid, payload: serde_json::Value) -> EventData {
         payload,
         created_at: chrono::Utc::now(),
         category: Some("assault".into()),
-        stream_id: Some(Uuid::nil()),
+        subject_id: Some(Uuid::nil()),
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
@@ -49,13 +49,13 @@ fn naive_read_all(log: &[RecordedEvent], after: LogCursor, limit: usize) -> Vec<
 fn naive_read_stream(
     log: &[RecordedEvent],
     category: &str,
-    stream_id: Uuid,
+    subject_id: Uuid,
     after: Option<StreamRevision>,
 ) -> Vec<Uuid> {
     log.iter()
         .filter(|e| {
             e.category == category
-                && e.stream_id == stream_id
+                && e.subject_id == subject_id
                 && match after {
                     None => true,
                     Some(min) => e.revision > min,
@@ -94,7 +94,7 @@ async fn indexed_reads_agree_with_naive_reference_under_random_workload() {
             .map(|i| {
                 let mut e = ev(Uuid::new_v4(), serde_json::json!({ "i": i }));
                 e.category = Some(cat.into());
-                e.stream_id = Some(sid);
+                e.subject_id = Some(sid);
                 e
             })
             .collect();
@@ -348,7 +348,7 @@ async fn concurrent_appends_and_racing_redeliveries_keep_index_consistent() {
     assert!(log.windows(2).all(|w| w[0].position < w[1].position));
     let mut revisions: Vec<u64> = log
         .iter()
-        .filter(|e| e.category == "assault" && e.stream_id == sid)
+        .filter(|e| e.category == "assault" && e.subject_id == sid)
         .map(|e| e.revision.raw())
         .collect();
     revisions.sort_unstable();

@@ -93,7 +93,7 @@ impl EventLogBackend for MirroringEventLogBackend {
     async fn append_to_stream(
         &self,
         category: &str,
-        stream_id: Uuid,
+        subject_id: Uuid,
         expected: causal::types::StreamState,
         events: Vec<EventData>,
     ) -> Result<WriteResult> {
@@ -102,7 +102,7 @@ impl EventLogBackend for MirroringEventLogBackend {
         // The mirror writes whatever the legacy write produced.
         let legacy_result = self
             .legacy
-            .append_to_stream(category, stream_id, expected, events.clone())
+            .append_to_stream(category, subject_id, expected, events.clone())
             .await?;
         // Mirror writes with `Any` (no independent OCC) — its only job is
         // to accumulate the same event_id stream. Letting it perform OCC
@@ -110,7 +110,7 @@ impl EventLogBackend for MirroringEventLogBackend {
         // writers.
         let _ = self
             .v03
-            .append_to_stream(category, stream_id, causal::types::StreamState::Any, events)
+            .append_to_stream(category, subject_id, causal::types::StreamState::Any, events)
             .await?;
         Ok(legacy_result)
     }
@@ -127,11 +127,11 @@ impl EventLogBackend for MirroringEventLogBackend {
     async fn read_stream(
         &self,
         category: &str,
-        stream_id: Uuid,
+        subject_id: Uuid,
         after: Option<StreamRevision>,
     ) -> Result<Vec<RecordedEvent>> {
         self.legacy
-            .read_stream(category, stream_id, after)
+            .read_stream(category, subject_id, after)
             .await
     }
 

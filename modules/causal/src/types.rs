@@ -177,10 +177,10 @@ pub struct RecordedEvent {
     /// `EventData::created_at` is a hint that backends MAY override).
     pub created_at: DateTime<Utc>,
     /// Stream category (`Event::CATEGORY`) — the prefix of the
-    /// `{category}-{stream_id}` stream name. Every event belongs to a stream.
+    /// `{category}-{subject_id}` stream name. Every event belongs to a stream.
     pub category: String,
-    /// Stream id (`Event::stream_id`).
-    pub stream_id: Uuid,
+    /// Stream id (`Event::subject_id`).
+    pub subject_id: Uuid,
     /// Per-stream revision (0-indexed).
     pub revision: StreamRevision,
     /// Application-level metadata (e.g. `_run_id`, `_schema_v`,
@@ -216,7 +216,7 @@ impl fmt::Debug for RecordedEvent {
             .field("payload", &self.payload)
             .field("created_at", &self.created_at)
             .field("category", &self.category)
-            .field("stream_id", &self.stream_id)
+            .field("subject_id", &self.subject_id)
             .field("revision", &self.revision)
             .field("metadata", &self.metadata)
             .field("ephemeral", &self.ephemeral.as_ref().map(|_| "..."))
@@ -236,8 +236,8 @@ pub struct EventData {
     pub created_at: DateTime<Utc>,
     /// Stream category (`Event::CATEGORY`). Present for stream-scoped events.
     pub category: Option<String>,
-    /// Stream id (`Event::stream_id`). Present for stream-scoped events.
-    pub stream_id: Option<Uuid>,
+    /// Stream id (`Event::subject_id`). Present for stream-scoped events.
+    pub subject_id: Option<Uuid>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
     /// Original typed event for zero-cost in-process dispatch. `None`
     /// for events loaded from durable stores.
@@ -256,7 +256,7 @@ impl fmt::Debug for EventData {
             .field("payload", &self.payload)
             .field("created_at", &self.created_at)
             .field("category", &self.category)
-            .field("stream_id", &self.stream_id)
+            .field("subject_id", &self.subject_id)
             .field("metadata", &self.metadata)
             .field("ephemeral", &self.ephemeral.as_ref().map(|_| "..."))
             .finish()
@@ -288,7 +288,7 @@ mod persisted_event_tests {
             payload:         serde_json::Value::Null,
             created_at:      Utc::now(),
             category,
-            stream_id:       Uuid::nil(),
+            subject_id:       Uuid::nil(),
             revision:        StreamRevision::ZERO,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,

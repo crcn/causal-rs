@@ -1,6 +1,6 @@
-// The struct form has the same trap as the enum form: no `stream_id`
+// The struct form has the same trap as the enum form: no `subject_id`
 // silently meant `Uuid::nil()`. Must not compile without the explicit
-// `nil_stream` opt-in.
+// `no_subject` opt-in.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

@@ -8,7 +8,7 @@
 //! The vocabulary mirrors KurrentDB's where the concepts overlap:
 //! [`EventData`](types::EventData) / [`RecordedEvent`], `causation_id` /
 //! `workflow_id`, [`StreamRevision`] (0-indexed), [`StreamState`] for
-//! optimistic concurrency, `{category}-{stream_id}` stream names.
+//! optimistic concurrency, `{category}-{subject_id}` stream names.
 //!
 //! ## Guarantees
 //!
@@ -38,7 +38,7 @@
 //! impl Event for OrderPlaced {
 //!     const CATEGORY: &'static str = "order";
 //!     fn event_type(&self) -> &str { "placed" }
-//!     fn stream_id(&self) -> Uuid { self.order_id }
+//!     fn subject_id(&self) -> Uuid { self.order_id }
 //! }
 //!
 //! #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +47,7 @@
 //! impl Event for ShipmentRequested {
 //!     const CATEGORY: &'static str = "shipment";
 //!     fn event_type(&self) -> &str { "requested" }
-//!     fn stream_id(&self) -> Uuid { self.order_id }
+//!     fn subject_id(&self) -> Uuid { self.order_id }
 //! }
 //!
 //! struct ShipOnPlaced;

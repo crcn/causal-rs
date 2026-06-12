@@ -3,14 +3,14 @@ use causal::Event;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[causal::event(prefix = "deposit", stream_id = "account")]
+#[causal::event(prefix = "deposit", subject_id = "account")]
 #[derive(Clone, Serialize, Deserialize)]
 struct Deposited {
     account: Uuid,
     occurred_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[causal::event(prefix = "curiosity", stream_id = "signal_id")]
+#[causal::event(prefix = "curiosity", subject_id = "signal_id")]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum CuriosityEvent {
@@ -23,10 +23,10 @@ enum CuriosityEvent {
 fn main() {
     let id = Uuid::new_v4();
     let d = Deposited { account: id, occurred_at: chrono::Utc::now() };
-    assert_eq!(d.stream_id(), id);
+    assert_eq!(d.subject_id(), id);
     let c = CuriosityEvent::SignalInvestigated {
         signal_id: id,
         occurred_at: chrono::Utc::now(),
     };
-    assert_eq!(c.stream_id(), id);
+    assert_eq!(c.subject_id(), id);
 }

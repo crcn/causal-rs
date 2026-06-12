@@ -53,8 +53,8 @@ async fn append_to_stream_rejects_stale_expected() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires running Kurrent on KURRENT_URL"]
-async fn append_to_stream_idempotent_on_event_id_retry() -> Result<()> {
-    conformance::append_to_stream_idempotent_on_event_id_retry(&backend()).await
+async fn append_to_subject_idempotent_on_event_id_retry() -> Result<()> {
+    conformance::append_to_subject_idempotent_on_event_id_retry(&backend()).await
 }
 
 #[tokio::test]

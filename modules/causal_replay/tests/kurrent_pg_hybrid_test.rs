@@ -78,7 +78,7 @@ impl Event for OrderPlaced {
     fn event_type(&self) -> &str {
         "placed"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.order_id
     }
     fn occurred_at(&self) -> Option<DateTime<Utc>> {
@@ -156,7 +156,7 @@ async fn engine_appends_to_kurrent_with_pg_checkpoint() -> Result<()> {
     assert_eq!(stream.len(), 1, "exactly the one fact we emitted");
     assert_eq!(stream[0].event_type, "order:placed");
     assert_eq!(stream[0].category, "order");
-    assert_eq!(stream[0].stream_id, order_id);
+    assert_eq!(stream[0].subject_id, order_id);
 
     engine.shutdown().await?;
     Ok(())

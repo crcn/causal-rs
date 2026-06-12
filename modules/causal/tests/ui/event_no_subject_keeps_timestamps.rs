@@ -1,12 +1,12 @@
-// A nil_stream event with timestamp fields must NOT silently lose them
+// A no_subject event with timestamp fields must NOT silently lose them
 // — occurred_at() generation follows the same presence rule as the
-// stream_id shape. Unit variants (which cannot carry fields) get honest
+// subject_id shape. Unit variants (which cannot carry fields) get honest
 // per-variant None.
 use causal::Event;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-#[causal::event(prefix = "telemetry", nil_stream)]
+#[causal::event(prefix = "telemetry", no_subject)]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TelemetryEvent {
@@ -14,7 +14,7 @@ enum TelemetryEvent {
     Heartbeat,
 }
 
-#[causal::event(nil_stream)]
+#[causal::event(no_subject)]
 #[derive(Clone, Serialize, Deserialize)]
 struct SweepCompleted {
     occurred_at: DateTime<Utc>,

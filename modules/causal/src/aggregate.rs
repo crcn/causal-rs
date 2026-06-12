@@ -56,10 +56,10 @@ pub trait Aggregate: Default + Send + Sync + 'static {
     const NAME: &'static str;
 
     /// The single stream this aggregate folds from, for **durable
-    /// restore** — `{STREAM_CATEGORY}-{id}`. Every event folded into
+    /// restore** — `{SUBJECT}-{id}`. Every event folded into
     /// this aggregate for a given id MUST live in that one stream (set
     /// each such event's
-    /// [`Event::STREAM_CATEGORY`](crate::event::Event::STREAM_CATEGORY)
+    /// [`Event::SUBJECT`](crate::event::Event::SUBJECT)
     /// to this value).
     ///
     /// Defaults to `""` — restore is **disabled** for the aggregate and
@@ -67,7 +67,7 @@ pub trait Aggregate: Default + Send + Sync + 'static {
     /// Set it (and wire `EngineBuilder::with_snapshot_store`) to make
     /// folded state survive a restart via `Engine::state_of`:
     /// load snapshot (if any) + replay the stream tail + fold.
-    const STREAM_CATEGORY: &'static str = "";
+    const SUBJECT: &'static str = "";
 }
 
 /// Per-Event fold for hydration. Called once per fact loaded from the
@@ -107,7 +107,7 @@ mod tests {
                 CounterFact::Reset { .. }       => "reset",
             }
         }
-        fn stream_id(&self) -> Uuid {
+        fn subject_id(&self) -> Uuid {
             match self {
                 CounterFact::Incremented { counter_id, .. } => *counter_id,
                 CounterFact::Reset { counter_id, .. }       => *counter_id,
@@ -161,7 +161,7 @@ mod tests {
         impl Event for Tagged {
             const CATEGORY: &'static str = "tag";
             fn event_type(&self) -> &str { "tagged" }
-            fn stream_id(&self) -> Uuid { self.tag_id }
+            fn subject_id(&self) -> Uuid { self.tag_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
 

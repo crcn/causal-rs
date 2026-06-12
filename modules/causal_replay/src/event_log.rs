@@ -552,9 +552,9 @@ mod pg {
         // half-populated row is corruption — fail loudly rather than silently
         // mis-attribute the event to the nil stream at revision 0.
         let category: Option<String> = row.try_get("aggregate_type")?;
-        let stream_id: Option<Uuid> = row.try_get("aggregate_id")?;
+        let subject_id: Option<Uuid> = row.try_get("aggregate_id")?;
         let revision: Option<i64> = row.try_get("revision")?;
-        let (category, stream_id, revision) = match (category, stream_id, revision) {
+        let (category, subject_id, revision) = match (category, subject_id, revision) {
             (Some(c), Some(s), Some(r)) => (c, s, r),
             (None, None, None) => (String::new(), Uuid::nil(), 0),
             _ => {
@@ -574,7 +574,7 @@ mod pg {
             event_type: row.try_get("event_type")?,
             payload: row.try_get("payload")?,
             category,
-            stream_id,
+            subject_id,
             revision: StreamRevision::from_raw(revision as u64),
             metadata,
             created_at,

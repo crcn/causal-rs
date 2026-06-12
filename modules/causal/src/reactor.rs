@@ -106,8 +106,8 @@ pub trait Reactor: Send + Sync {
     /// }
     /// ```
     ///
-    /// The runtime routes each output to `{CATEGORY}-{stream_id}` per
-    /// the output Event's own `CATEGORY` const and `stream_id()` — the
+    /// The runtime routes each output to `{CATEGORY}-{subject_id}` per
+    /// the output Event's own `CATEGORY` const and `subject_id()` — the
     /// trigger's category never leaks into the destination. Mixing
     /// outputs from different categories in a single `Events` return
     /// is also supported.
@@ -154,13 +154,13 @@ pub struct EventOutput {
     /// `Event::CATEGORY` — the ROUTING category (consumer/aggregator
     /// matching, via `durable_name`'s prefix).
     pub event_prefix: String,
-    /// `Event::STREAM_CATEGORY` — the physical stream this output is
-    /// stored in (`{stream_category}-{stream_id}`). Defaults to
+    /// `Event::SUBJECT` — the physical stream this output is
+    /// stored in (`{subject}-{subject_id}`). Defaults to
     /// `event_prefix`; differs only when the event overrides it.
-    pub stream_category: String,
-    /// Stream id from `Event::stream_id()` — which stream within
-    /// `stream_category` this output targets.
-    pub stream_id: Uuid,
+    pub subject: String,
+    /// Stream id from `Event::subject_id()` — which stream within
+    /// `subject` this output targets.
+    pub subject_id: Uuid,
     pub payload: serde_json::Value,
     /// Original typed fact (live dispatch only).
     pub ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -172,17 +172,17 @@ impl EventOutput {
     /// event_type shape.
     pub fn new<F: crate::event::Event>(fact: F) -> Self {
         let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
-        let stream_category = <F as crate::event::Event>::STREAM_CATEGORY.to_string();
+        let subject = <F as crate::event::Event>::SUBJECT.to_string();
         let durable_name = crate::event_type::compose(&event_prefix, fact.event_type());
-        let stream_id = fact.stream_id();
+        let subject_id = fact.subject_id();
         let payload = serde_json::to_value(&fact).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(fact);
         Self {
             type_id: TypeId::of::<F>(),
             durable_name,
             event_prefix,
-            stream_category,
-            stream_id,
+            subject,
+            subject_id,
             payload,
             ephemeral: Some(ephemeral),
         }
@@ -192,7 +192,7 @@ impl EventOutput {
     /// ephemeral copy).
     pub fn from_serialized(
         event_type: String,
-        stream_id: Uuid,
+        subject_id: Uuid,
         payload: serde_json::Value,
     ) -> Self {
         let event_prefix = extract_prefix(&event_type).to_string();
@@ -200,10 +200,10 @@ impl EventOutput {
             type_id: TypeId::of::<()>(),
             // Replay/serialized path has no separate stream-category info;
             // default it to the routing prefix (the backward-compat default).
-            stream_category: event_prefix.clone(),
+            subject: event_prefix.clone(),
             event_prefix,
             durable_name: event_type,
-            stream_id,
+            subject_id,
             payload,
             ephemeral: None,
         }
@@ -279,7 +279,7 @@ mod tests {
     impl Event for OrderPlaced {
         const CATEGORY: &'static str = "order";
         fn event_type(&self) -> &str { "order_placed" }
-        fn stream_id(&self) -> Uuid { self.order_id }
+        fn subject_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 

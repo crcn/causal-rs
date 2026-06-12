@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[causal::event(prefix = "order", stream_id = "order_id")]
+#[causal::event(prefix = "order", subject_id = "order_id")]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OrderEvent {

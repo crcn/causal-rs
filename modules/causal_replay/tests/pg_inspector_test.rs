@@ -57,7 +57,7 @@ struct Pinged { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Pinged {
     const CATEGORY: &'static str = "insp_ping";
     fn event_type(&self) -> &str { "v1" }
-    fn stream_id(&self) -> Uuid { self.id }
+    fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -66,7 +66,7 @@ struct Ponged { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Ponged {
     const CATEGORY: &'static str = "insp_pong";
     fn event_type(&self) -> &str { "v1" }
-    fn stream_id(&self) -> Uuid { self.id }
+    fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 

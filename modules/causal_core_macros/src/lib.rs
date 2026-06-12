@@ -87,10 +87,10 @@ enum IdAccess {
     Method(Ident),
     /// Singleton — uses `Uuid::nil()` as a constant ID.
     Singleton,
-    /// Default: use `Event::stream_id`. Emitted when `#[aggregator]`
+    /// Default: use `Event::subject_id`. Emitted when `#[aggregator]`
     /// has no arguments (or `#[aggregators]` has no module-level
     /// default). Factory uses the plain `Aggregator::for_type::<A,F>()`
-    /// path which delegates to `Event::stream_id` internally.
+    /// path which delegates to `Event::subject_id` internally.
     FactStreamId,
 }
 
@@ -228,15 +228,15 @@ fn expand_aggregator_with_id(
     // `Some(...)`. The singleton case returns `Some(Uuid::nil())`.
     //
     // 0.4.0–0.4.4 silently ignored this attribute and hard-coded
-    // `Event::stream_id`. 0.4.5 restores the v0.3 semantics: events
+    // `Event::subject_id`. 0.4.5 restores the v0.3 semantics: events
     // can fold into aggregators keyed by a field/method/singleton
-    // that differs from their natural stream_id.
+    // that differs from their natural subject_id.
     // User id_fn methods may return either `Uuid` or `Option<Uuid>` —
     // the `AggregatorIdValue` trait lifts both into `Option<Uuid>` so
     // either signature compiles. Field access lifts a bare `Uuid`
     // field; singleton always returns `Some(Uuid::nil())`. The default
     // (no attribute) path uses `Aggregator::for_type` which delegates
-    // to `Event::stream_id` internally — exactly what most run-scoped
+    // to `Event::subject_id` internally — exactly what most run-scoped
     // facts want.
     let factory_body = match id_access {
         IdAccess::FactStreamId => quote! {
@@ -306,7 +306,7 @@ fn expand_aggregators_module(
         ));
     };
 
-    // No module args → default to `Event::stream_id` for bare functions.
+    // No module args → default to `Event::subject_id` for bare functions.
     // Pre-0.4.5, no-args `#[aggregators]` skipped bare functions; now
     // they expand with the documented default.
     let module_id_access = if module_metas.is_empty() {
@@ -378,9 +378,9 @@ fn expand_aggregators_module(
 ///
 /// # Usage
 ///
-/// Every event names its stream identity: `stream_id = "<field>"` (the
+/// Every event names its stream identity: `subject_id = "<field>"` (the
 /// Uuid field its aggregates fold by — present on every variant), or the
-/// explicit `nil_stream` opt-in for genuinely streamless facts
+/// explicit `no_subject` opt-in for genuinely streamless facts
 /// (telemetry, ops counters), which routes every value into the single
 /// `{category}-nil` stream. Omitting both is a compile error — the old
 /// silent nil default produced fan-in aggregates no per-stream read
@@ -388,7 +388,7 @@ fn expand_aggregators_module(
 ///
 /// ```ignore
 /// // Enum with domain prefix (requires #[serde(tag = "...")])
-/// #[event(prefix = "scrape", stream_id = "source_id")]
+/// #[event(prefix = "scrape", subject_id = "source_id")]
 /// #[derive(Clone, Serialize, Deserialize)]
 /// #[serde(tag = "type", rename_all = "snake_case")]
 /// pub enum ScrapeEvent {
@@ -397,11 +397,11 @@ fn expand_aggregators_module(
 /// }
 ///
 /// // Streamless telemetry — explicit opt-in
-/// #[event(prefix = "synthesis", ephemeral, nil_stream)]
+/// #[event(prefix = "synthesis", ephemeral, no_subject)]
 /// // ...
 ///
 /// // Struct (no prefix needed — snake_case of struct name)
-/// #[event(stream_id = "order_id")]
+/// #[event(subject_id = "order_id")]
 /// #[derive(Clone, Serialize, Deserialize)]
 /// pub struct OrderPlaced { pub order_id: Uuid, pub occurred_at: DateTime<Utc> }
 /// ```
@@ -420,51 +420,50 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct EventArgs {
     prefix: Option<String>,
     ephemeral: bool,
-    /// v0.3 Event: stream category. When both `stream_category` and
-    /// `stream_id` are set, the macro additionally generates
-    /// `impl ::causal::Event` with `stream()` returning a `StreamRef`
-    /// built from the named field on each variant.
-    stream_category: Option<String>,
+    /// Routing-category override (rare; pre-0.10 surface — the `name`
+    /// rework in step-1 chunk 7 subsumes it). Sets `CATEGORY` for
+    /// structs independently of `prefix`.
+    routing_category: Option<String>,
     /// v0.3 Event: name of the field carrying the stream id. Must be
     /// present on every variant. Type must be `Uuid`.
-    stream_id: Option<String>,
+    subject_id: Option<String>,
     /// v0.3 Event: name of the field carrying the logical occurrence
     /// time. Defaults to `"occurred_at"`. Must be present on every
     /// variant when generating Event. Type must be `DateTime<Utc>`.
     occurred_at_field: Option<String>,
-    /// v0.7 Event: physical stream this event is *stored* in
-    /// (`Event::STREAM_CATEGORY`) — distinct from `prefix`/`CATEGORY`,
-    /// which stays the routing key. Set it to co-locate several distinct
-    /// event types in one stream (for durable aggregate restore). When
-    /// omitted, `STREAM_CATEGORY` defaults to `CATEGORY` (unchanged).
-    stream: Option<String>,
+    /// `subject = "job"` — the subject KIND whose history this fact
+    /// joins (`Event::SUBJECT`, the storage stream's left half). Set it
+    /// to co-locate several distinct fact families in one subject
+    /// history (the anti-god-enum valve; durable restore reads exactly
+    /// this history). Defaults to `CATEGORY`.
+    subject: Option<String>,
     /// v0.9: explicit opt-in to the streamless category-singleton shape
-    /// (`stream_id()` = `Uuid::nil()`, every value sharing one
+    /// (`subject_id()` = `Uuid::nil()`, every value sharing one
     /// `{category}-nil` stream). Before 0.9 this was the SILENT default
-    /// when `stream_id` was omitted — the trap that mass-produced
+    /// when `subject_id` was omitted — the trap that mass-produced
     /// fan-in aggregates no per-stream read can serve. Now one of
-    /// `stream_id = "..."` / `nil_stream` must be written out.
-    nil_stream: bool,
+    /// `subject_id = "..."` / `no_subject` must be written out.
+    no_subject: bool,
 }
 
 fn parse_event_args(tokens: TokenStream2) -> EventArgs {
     let mut prefix = None;
     let mut ephemeral = false;
-    let mut stream_category = None;
-    let mut stream_id = None;
+    let mut routing_category = None;
+    let mut subject_id = None;
     let mut occurred_at_field = None;
-    let mut stream = None;
-    let mut nil_stream = false;
+    let mut subject = None;
+    let mut no_subject = false;
 
     if tokens.is_empty() {
         return EventArgs {
             prefix,
             ephemeral,
-            stream_category,
-            stream_id,
+            routing_category,
+            subject_id,
             occurred_at_field,
-            stream,
-            nil_stream,
+            subject,
+            no_subject,
         };
     }
 
@@ -475,11 +474,11 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             return EventArgs {
                 prefix,
                 ephemeral,
-                stream_category,
-                stream_id,
+                routing_category,
+                subject_id,
                 occurred_at_field,
-                stream,
-                nil_stream,
+                subject,
+                no_subject,
             };
         }
     };
@@ -496,24 +495,24 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             Meta::Path(path) if path.is_ident("ephemeral") => {
                 ephemeral = true;
             }
-            Meta::Path(path) if path.is_ident("nil_stream") => {
-                nil_stream = true;
+            Meta::Path(path) if path.is_ident("no_subject") => {
+                no_subject = true;
             }
             Meta::NameValue(MetaNameValue { path, value, .. })
                 if path.is_ident("stream_category") =>
             {
                 if let Expr::Lit(expr_lit) = value {
                     if let Lit::Str(lit) = &expr_lit.lit {
-                        stream_category = Some(lit.value());
+                        routing_category = Some(lit.value());
                     }
                 }
             }
             Meta::NameValue(MetaNameValue { path, value, .. })
-                if path.is_ident("stream_id") =>
+                if path.is_ident("subject_id") =>
             {
                 if let Expr::Lit(expr_lit) = value {
                     if let Lit::Str(lit) = &expr_lit.lit {
-                        stream_id = Some(lit.value());
+                        subject_id = Some(lit.value());
                     }
                 }
             }
@@ -526,10 +525,10 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
                     }
                 }
             }
-            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("stream") => {
+            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("subject") => {
                 if let Expr::Lit(expr_lit) = value {
                     if let Lit::Str(lit) = &expr_lit.lit {
-                        stream = Some(lit.value());
+                        subject = Some(lit.value());
                     }
                 }
             }
@@ -540,45 +539,103 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
     EventArgs {
         prefix,
         ephemeral,
-        stream_category,
-        stream_id,
+        routing_category,
+        subject_id,
         occurred_at_field,
-        stream,
-        nil_stream,
+        subject,
+        no_subject,
     }
 }
 
-/// Stream identity must be explicit. Before 0.9, omitting `stream_id`
-/// silently defaulted `stream_id()` to `Uuid::nil()` — every value of
+/// Stream identity must be explicit. Before 0.9, omitting `subject_id`
+/// silently defaulted `subject_id()` to `Uuid::nil()` — every value of
 /// every entity landing in one `{category}-nil` stream. That default
 /// mass-produced fan-in aggregates that no per-stream read can serve
 /// (an aggregate's stream is the id its facts fold by), and the
 /// failure surfaced far from here, at registration or read time.
 /// Called AFTER each shape's structural checks (an enum missing its
 /// prefix gets THAT error first — no stair-stepping).
-fn require_stream_identity(args: &EventArgs, name: &Ident) -> Result<(), syn::Error> {
-    if args.stream_id.is_some() && args.nil_stream {
+fn require_subject_identity(args: &EventArgs, name: &Ident, input: &DeriveInput) -> Result<(), syn::Error> {
+    if args.subject_id.is_some() && args.no_subject {
         return Err(syn::Error::new_spanned(
             name,
-            "#[event]: `stream_id` and `nil_stream` are contradictory — \
-             pick one. `stream_id = \"<field>\"` streams each value by \
-             that Uuid field; `nil_stream` puts every value in the single \
-             `{category}-nil` stream.",
+            "#[event]: `subject_id` and `no_subject` are contradictory — \
+             pick one. `subject_id = \"<field>\"` keys each value by that \
+             Uuid field; `no_subject` puts every value in the single \
+             shared subject-less history.",
         ));
     }
-    if args.stream_id.is_none() && !args.nil_stream {
+    if args.subject_id.is_none() && !args.no_subject {
+        // Shape-gated omission: inference is allowed only where being
+        // wrong is impossible. A fact with NO scalar Uuid fields cannot
+        // name a subject — omission is unambiguous and legal. A fact
+        // that carries candidate ids and declares nothing is almost
+        // always a forgotten declaration: teaching error.
+        let candidates = candidate_subject_fields(input);
+        if candidates.is_empty() {
+            return Ok(()); // provably subject-less
+        }
         return Err(syn::Error::new_spanned(
             name,
-            "#[event] needs a stream identity. Add `stream_id = \"<field>\"` \
-             naming the Uuid field this event streams by — the id you fold \
-             its aggregate by (e.g. `stream_id = \"signal_id\"`). For a \
-             genuinely streamless fact (telemetry, ops counters) opt in \
-             explicitly with `nil_stream`: every value then shares the one \
-             `{category}-nil` stream, which per-stream aggregates cannot \
-             fold and `ctx`-side reads cannot serve.",
+            format!(
+                "#[event]: this fact carries Uuid field(s) {} but declares \
+                 no subject. If it is ABOUT one of them, name it: \
+                 `subject_id = \"{}\"` — the id you fold its state by. If \
+                 those ids are only references, opt out explicitly with \
+                 `no_subject`: every value then shares one subject-less \
+                 history, which per-subject state reads cannot serve.",
+                candidates
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                candidates[0],
+            ),
         ));
     }
     Ok(())
+}
+
+/// Scalar `Uuid`-typed named fields — the candidate subjects — across
+/// the struct or every enum variant. `Vec<Uuid>`/`Option<Uuid>` are not
+/// candidates: a subject is one id, named by one scalar field.
+fn candidate_subject_fields(input: &DeriveInput) -> Vec<String> {
+    fn is_uuid(ty: &Type) -> bool {
+        match ty {
+            Type::Path(p) => p
+                .path
+                .segments
+                .last()
+                .map(|seg| seg.ident == "Uuid" && matches!(seg.arguments, syn::PathArguments::None))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push_fields = |fields: &Fields| {
+        if let Fields::Named(named) = fields {
+            for f in &named.named {
+                if is_uuid(&f.ty) {
+                    if let Some(id) = &f.ident {
+                        let n = id.to_string();
+                        if !out.contains(&n) {
+                            out.push(n);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    match &input.data {
+        Data::Struct(d) => push_fields(&d.fields),
+        Data::Enum(e) => {
+            for v in &e.variants {
+                push_fields(&v.fields);
+            }
+        }
+        Data::Union(_) => {}
+    }
+    out
 }
 
 fn expand_event(args: EventArgs, input: DeriveInput) -> Result<TokenStream2, syn::Error> {
@@ -595,7 +652,7 @@ fn expand_event(args: EventArgs, input: DeriveInput) -> Result<TokenStream2, syn
 }
 
 /// Compute the generated `occurred_at()` impl for an enum (both the
-/// `stream_id` and `nil_stream` shapes use this, so the rules cannot
+/// `subject_id` and `no_subject` shapes use this, so the rules cannot
 /// drift):
 ///
 /// - field on ALL named-fields variants → `Some(*field)` arms; unit /
@@ -700,12 +757,12 @@ fn expand_event_enum(
             "#[event] on enums requires a prefix: #[event(prefix = \"...\")]",
         )
     })?;
-    require_stream_identity(&args, name)?;
+    require_subject_identity(&args, name, input)?;
 
-    // Optional `stream = "..."` → `const STREAM_CATEGORY` (physical stream
+    // Optional `subject = "..."` → `const SUBJECT` (subject-history
     // placement, distinct from the routing CATEGORY). Omitted = trait default.
-    let stream_const = match &args.stream {
-        Some(s) => quote! { const STREAM_CATEGORY: &'static str = #s; },
+    let stream_const = match &args.subject {
+        Some(s) => quote! { const SUBJECT: &'static str = #s; },
         None => quote! {},
     };
 
@@ -760,25 +817,25 @@ fn expand_event_enum(
     // ─── v0.4 Event impl ──
     //
     // Emit a Event impl in all cases. CATEGORY comes from
-    // `stream_category` if supplied, otherwise from `prefix`.
-    // stream_id() uses the variant field named by `stream_id` if
+    // `subject` if supplied, otherwise from `prefix`.
+    // subject_id() uses the variant field named by `subject_id` if
     // supplied, otherwise defaults to `Uuid::nil()` (acceptable for
     // category-singleton facts like telemetry where every variant
     // shares one logical "stream"). occurred_at() uses the
     // `occurred_at_field` when supplied, otherwise returns None.
-    let fact_impl = if args.stream_id.is_some() {
-        // Per-variant stream_id + occurred_at extraction. Each
-        // variant MUST have the stream_id field; occurred_at is
+    let fact_impl = if args.subject_id.is_some() {
+        // Per-variant subject_id + occurred_at extraction. Each
+        // variant MUST have the subject_id field; occurred_at is
         // optional (variants without it get None).
-        let category = args.stream_category.as_ref().unwrap_or(&prefix);
-        let id_field = args.stream_id.as_ref().unwrap();
+        let category = args.routing_category.as_ref().unwrap_or(&prefix);
+        let id_field = args.subject_id.as_ref().unwrap();
         let id_field_ident = format_ident!("{}", id_field);
         let occurred_field = args
             .occurred_at_field
             .clone()
             .unwrap_or_else(|| "occurred_at".to_string());
 
-        // Per-variant stream_id arms. Every variant MUST carry the
+        // Per-variant subject_id arms. Every variant MUST carry the
         // stream-identity field (a stream-keyed event with a keyless
         // variant has nowhere to land). occurred_at() generation is the
         // shared all/none/mixed rule — see `enum_occurred_impl`.
@@ -795,7 +852,7 @@ fn expand_event_enum(
                         return Err(syn::Error::new_spanned(
                             variant_name,
                             format!(
-                                "#[event(stream_id = \"{}\")] requires every variant to have a `{}` field",
+                                "#[event(subject_id = \"{}\")] requires every variant to have a `{}` field",
                                 id_field, id_field
                             ),
                         ));
@@ -807,7 +864,7 @@ fn expand_event_enum(
                 Fields::Unnamed(_) | Fields::Unit => {
                     return Err(syn::Error::new_spanned(
                         variant_name,
-                        "#[event] Event generation requires named-fields variants when stream_id/occurred_at_field are used",
+                        "#[event] Event generation requires named-fields variants when subject_id/occurred_at_field are used",
                     ));
                 }
             }
@@ -828,7 +885,7 @@ fn expand_event_enum(
                         #(#name_arms,)*
                     }
                 }
-                fn stream_id(&self) -> ::uuid::Uuid {
+                fn subject_id(&self) -> ::uuid::Uuid {
                     match self {
                         #(#stream_arms,)*
                     }
@@ -837,13 +894,13 @@ fn expand_event_enum(
             }
         }
     } else {
-        // Explicit `nil_stream` opt-in (`require_stream_identity`
+        // Explicit `no_subject` opt-in (`require_subject_identity`
         // rejects plain omission): emit a Event impl with the prefix as
         // CATEGORY, bare variant name as `name()`, and `Uuid::nil()` as
-        // stream_id (category-singleton). For operational/telemetry
+        // subject_id (category-singleton). For operational/telemetry
         // events that genuinely aren't per-aggregate. occurred_at()
-        // follows the same shared rule as the stream_id shape — a
-        // nil_stream event with timestamps must not silently lose them.
+        // follows the same shared rule as the subject_id shape — a
+        // no_subject event with timestamps must not silently lose them.
         let occurred_field = args
             .occurred_at_field
             .clone()
@@ -863,7 +920,7 @@ fn expand_event_enum(
                         #(#name_arms,)*
                     }
                 }
-                fn stream_id(&self) -> ::uuid::Uuid {
+                fn subject_id(&self) -> ::uuid::Uuid {
                     ::uuid::Uuid::nil()
                 }
                 #occurred_impl
@@ -886,7 +943,7 @@ fn expand_event_struct(
     input: &DeriveInput,
 ) -> Result<TokenStream2, syn::Error> {
     let name = &input.ident;
-    require_stream_identity(&args, name)?;
+    require_subject_identity(&args, name, input)?;
     let ephemeral = args.ephemeral;
 
     // For structs, the durable name is the snake_case of the struct name
@@ -899,21 +956,21 @@ fn expand_event_struct(
 
     let prefix_str = durable.clone();
 
-    // v0.9 Event impl for structs. CATEGORY = `stream_category` if
+    // v0.9 Event impl for structs. CATEGORY = `subject` if
     // supplied, else `prefix` (or the snake-cased struct name).
-    // stream_id reads the field named by the (required) `stream_id`
-    // arg; `nil_stream` is the explicit opt-in for the streamless
+    // subject_id reads the field named by the (required) `subject_id`
+    // arg; `no_subject` is the explicit opt-in for the streamless
     // shape. occurred_at() is generated when the `occurred_at` field
     // (or the `occurred_at_field` override) is present.
     let bare_name = prefix_str.clone();
-    // Optional `stream = "..."` → `const STREAM_CATEGORY` (physical stream
+    // Optional `subject = "..."` → `const SUBJECT` (subject-history
     // placement, distinct from the routing CATEGORY). Omitted = trait default.
-    let stream_const = match &args.stream {
-        Some(s) => quote! { const STREAM_CATEGORY: &'static str = #s; },
+    let stream_const = match &args.subject {
+        Some(s) => quote! { const SUBJECT: &'static str = #s; },
         None => quote! {},
     };
-    let fact_impl = if let Some(id_field) = args.stream_id.as_ref() {
-        let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
+    let fact_impl = if let Some(id_field) = args.subject_id.as_ref() {
+        let category = args.routing_category.as_ref().unwrap_or(&prefix_str);
         let id_field_ident = format_ident!("{}", id_field);
         let occurred_field = args
             .occurred_at_field
@@ -931,7 +988,7 @@ fn expand_event_struct(
                     return Err(syn::Error::new_spanned(
                         name,
                         format!(
-                            "#[event(stream_id = \"{id_field}\")] requires a named-fields \
+                            "#[event(subject_id = \"{id_field}\")] requires a named-fields \
                              struct (the macro reads `self.{id_field}`)",
                         ),
                     ));
@@ -943,7 +1000,7 @@ fn expand_event_struct(
             return Err(syn::Error::new_spanned(
                 name,
                 format!(
-                    "#[event(stream_id = \"{id_field}\")]: this struct has no \
+                    "#[event(subject_id = \"{id_field}\")]: this struct has no \
                      `{id_field}` field — name the Uuid field this event streams by",
                 ),
             ));
@@ -976,17 +1033,17 @@ fn expand_event_struct(
                 const CATEGORY: &'static str = #category;
                 #stream_const
                 fn event_type(&self) -> &str { #bare_name }
-                fn stream_id(&self) -> ::uuid::Uuid {
+                fn subject_id(&self) -> ::uuid::Uuid {
                     self.#id_field_ident
                 }
                 #occurred_impl
             }
         }
     } else {
-        // `nil_stream` opt-in. occurred_at() follows the same
-        // presence-conditional rule as the stream_id shape — a
-        // nil_stream event with a timestamp must not silently lose it.
-        let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
+        // `no_subject` opt-in. occurred_at() follows the same
+        // presence-conditional rule as the subject_id shape — a
+        // no_subject event with a timestamp must not silently lose it.
+        let category = args.routing_category.as_ref().unwrap_or(&prefix_str);
         let occurred_field = args
             .occurred_at_field
             .clone()
@@ -1025,7 +1082,7 @@ fn expand_event_struct(
                 const CATEGORY: &'static str = #category;
                 #stream_const
                 fn event_type(&self) -> &str { #bare_name }
-                fn stream_id(&self) -> ::uuid::Uuid {
+                fn subject_id(&self) -> ::uuid::Uuid {
                     ::uuid::Uuid::nil()
                 }
                 #occurred_impl

@@ -35,7 +35,7 @@ impl Event for Ping {
     fn event_type(&self) -> &str {
         "ping"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
     fn occurred_at(&self) -> Option<DateTime<Utc>> {
@@ -52,7 +52,7 @@ impl Event for Pong {
     fn event_type(&self) -> &str {
         "pong"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.id
     }
 }

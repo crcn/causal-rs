@@ -91,9 +91,9 @@ pub struct Aggregator {
     pub event_type_id: TypeId,
     /// The aggregate type string.
     pub aggregate_type: String,
-    /// `Aggregate::STREAM_CATEGORY` — the single stream this aggregate
+    /// `Aggregate::SUBJECT` — the single stream this aggregate
     /// folds from, for durable restore. `""` = restore disabled.
-    pub stream_category: String,
+    pub subject: String,
     /// Extract the aggregate ID from JSON payload (deserializes internally).
     json_extract_id: Arc<dyn Fn(&serde_json::Value) -> Option<Uuid> + Send + Sync>,
     /// Deserialize JSON and apply to a type-erased aggregate (&mut dyn Any = &mut A).
@@ -132,10 +132,10 @@ impl AggregatorIdValue for Option<Uuid> {
 impl Aggregator {
     /// Construct an Aggregator that folds facts of type `F` into
     /// aggregate state `A`. Consumers read the folded state via
-    /// `ctx.state_of::<A>(stream_id)` inside their reactor / projector
+    /// `ctx.state_of::<A>(subject_id)` inside their reactor / projector
     /// body.
     ///
-    /// Stream id comes from `Event::stream_id`; aggregate type string
+    /// Stream id comes from `Event::subject_id`; aggregate type string
     /// comes from `A::NAME` — explicit, stable across refactorings,
     /// portable to disk (backend `aggregate_type` columns).
     ///
@@ -149,16 +149,16 @@ impl Aggregator {
             + serde::de::DeserializeOwned,
         F: crate::event::Event,
     {
-        Self::for_type_with_id_fn::<A, F, _>(|f: &F| Some(<F as crate::event::Event>::stream_id(f)))
+        Self::for_type_with_id_fn::<A, F, _>(|f: &F| Some(<F as crate::event::Event>::subject_id(f)))
     }
 
     /// Construct an Aggregator that extracts the aggregate id with a
-    /// custom function instead of `Event::stream_id`. Returning `None`
+    /// custom function instead of `Event::subject_id`. Returning `None`
     /// from `id_fn` skips the fold for this aggregator on that event.
     ///
     /// **Use case.** A fact may naturally stream by signal_id (per-
     /// signal facts) but contribute to a per-run aggregate. The fact's
-    /// `Event::stream_id` is signal_id (for the per-signal stream that
+    /// `Event::subject_id` is signal_id (for the per-signal stream that
     /// owns it); the *aggregator* over that fact wants run_id. With
     /// `for_type_with_id_fn`, the same fact type can register two
     /// aggregators with different keys — one keyed by `signal_id`
@@ -178,7 +178,7 @@ impl Aggregator {
         let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
         let event_type_id = TypeId::of::<F>();
         let aggregate_type = <A as crate::aggregate::Aggregate>::NAME.to_string();
-        let stream_category = <A as crate::aggregate::Aggregate>::STREAM_CATEGORY.to_string();
+        let subject = <A as crate::aggregate::Aggregate>::SUBJECT.to_string();
         let id_fn = Arc::new(id_fn);
         let id_fn_for_extract = id_fn.clone();
 
@@ -186,7 +186,7 @@ impl Aggregator {
             event_prefix,
             event_type_id,
             aggregate_type,
-            stream_category,
+            subject,
             json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
                 let fact: F = serde_json::from_value(payload.clone()).ok()?;
                 id_fn_for_extract(&fact)
@@ -275,7 +275,7 @@ pub struct FoldOutcome {
 /// arrival between eager fold paths, or a not-yet-restored entry).
 pub struct FoldGap {
     pub aggregate_type: String,
-    pub stream_category: String,
+    pub subject: String,
     pub id: Uuid,
     /// The next revision the entry expects (`ZERO` = nothing folded).
     pub expected: StreamRevision,
@@ -297,14 +297,14 @@ pub struct FoldGap {
 #[derive(Clone)]
 struct StateEntry {
     state: Arc<dyn Any + Send + Sync>,
-    /// **Stream-aligned aggregates** (non-empty `stream_category`):
+    /// **Stream-aligned aggregates** (non-empty `subject`):
     /// the next expected revision of the aggregate's own stream —
     /// `last folded revision + 1`; ZERO = nothing folded. Revisions
     /// are dense per stream, so `event.revision != version` detects
     /// both redelivery (`<`, skip) and gaps (`>`, read-through
     /// repair).
     version: StreamRevision,
-    /// **Fan-in aggregates** (empty `stream_category`, e.g. singleton
+    /// **Fan-in aggregates** (empty `subject`, e.g. singleton
     /// id_fn patterns): the `$all` position of the last folded event.
     /// Folds gate on `position > last_pos` — exactly-once under the
     /// in-position-order delivery every consumer runner provides.
@@ -358,7 +358,7 @@ impl AggregatorRegistry {
 
     /// Apply an event to all matching aggregators, using internal state.
     ///
-    /// `stream_id` / `category` / `revision` / `position` identify where
+    /// `subject_id` / `category` / `revision` / `position` identify where
     /// the event sits in the log: its own stream (placement) and its
     /// `$all` position. They drive the **idempotency gate** — see
     /// [`StateEntry`] — and the stream-alignment check below.
@@ -377,11 +377,11 @@ impl AggregatorRegistry {
     ///
     /// # Stream alignment (asserted)
     ///
-    /// A *restorable* aggregator (non-empty `stream_category`) requires
+    /// A *restorable* aggregator (non-empty `subject`) requires
     /// every folded event to live in the aggregate's own stream:
-    /// `extract_id(payload) == event.stream_id` and `event.category ==
-    /// agg.stream_category`. Durable restore already hard-requires this
-    /// (it replays exactly `{stream_category}-{id}`); an aggregator
+    /// `extract_id(payload) == event.subject_id` and `event.category ==
+    /// agg.subject`. Durable restore already hard-requires this
+    /// (it replays exactly `{subject}-{id}`); an aggregator
     /// violating it was *already* broken — now it errors loudly instead
     /// of silently diverging between live fold and restore.
     ///
@@ -402,7 +402,7 @@ impl AggregatorRegistry {
         &self,
         event_type: &str,
         payload: &serde_json::Value,
-        stream_id: Uuid,
+        subject_id: Uuid,
         category: &str,
         revision: StreamRevision,
         position: LogCursor,
@@ -420,18 +420,18 @@ impl AggregatorRegistry {
                 Some(id) => id,
                 None => continue,
             };
-            let aligned = !agg.stream_category.is_empty();
+            let aligned = !agg.subject.is_empty();
 
             // Stream-alignment assertion for restorable aggregates —
             // see the doc comment. Loud, because live fold and durable
             // restore would otherwise silently disagree.
-            if aligned && (aggregate_id != stream_id || agg.stream_category != category) {
+            if aligned && (aggregate_id != subject_id || agg.subject != category) {
                 anyhow::bail!(
-                    "aggregator for `{}` declares stream_category `{}` (restorable) but \
+                    "aggregator for `{}` declares subject `{}` (restorable) but \
                      folded event `{}` from stream `{}-{}` with extracted id {} — a \
                      restorable aggregate must fold exactly its own stream",
-                    agg.aggregate_type, agg.stream_category,
-                    event_type, category, stream_id, aggregate_id,
+                    agg.aggregate_type, agg.subject,
+                    event_type, category, subject_id, aggregate_id,
                 );
             }
 
@@ -564,7 +564,7 @@ impl AggregatorRegistry {
                 Action::Gap { expected } => {
                     outcome.gaps.push(FoldGap {
                         aggregate_type: agg.aggregate_type.clone(),
-                        stream_category: agg.stream_category.clone(),
+                        subject: agg.subject.clone(),
                         id: aggregate_id,
                         expected,
                     });
@@ -785,7 +785,7 @@ impl AggregatorRegistry {
             .find(|a| a.aggregate_type == aggregate_type)
     }
 
-    /// The `(aggregate_type, stream_category, id)` triples this event would
+    /// The `(aggregate_type, subject, id)` triples this event would
     /// fold — one per matching aggregator that yields an id. Used to drive
     /// read-through restore before a runner folds the event.
     pub fn restore_targets(
@@ -799,7 +799,7 @@ impl AggregatorRegistry {
             .filter(|a| a.event_prefix == prefix)
             .filter_map(|a| {
                 a.extract_id_from_json(payload).map(|id| {
-                    (a.aggregate_type.clone(), a.stream_category.clone(), id)
+                    (a.aggregate_type.clone(), a.subject.clone(), id)
                 })
             })
             .collect()
@@ -912,7 +912,7 @@ pub(crate) async fn fold_event(
     log: &dyn EventLogBackend,
     event_type: &str,
     payload: &serde_json::Value,
-    stream_id: Uuid,
+    subject_id: Uuid,
     category: &str,
     revision: StreamRevision,
     position: LogCursor,
@@ -923,7 +923,7 @@ pub(crate) async fn fold_event(
     // 8 is a generous ceiling.
     for _ in 0..8 {
         let outcome =
-            reg.apply_event(event_type, payload, stream_id, category, revision, position)?;
+            reg.apply_event(event_type, payload, subject_id, category, revision, position)?;
         if outcome.gaps.is_empty() {
             return Ok(outcome);
         }
@@ -934,7 +934,7 @@ pub(crate) async fn fold_event(
     }
     anyhow::bail!(
         "fold_event: gap repair did not converge for event `{event_type}` \
-         (stream {category}-{stream_id}, revision {}) — the aggregate stream \
+         (stream {category}-{subject_id}, revision {}) — the aggregate stream \
          is missing revisions it claims to have",
         revision.raw(),
     )
@@ -960,7 +960,7 @@ async fn repair_gap(
             snapshot_store,
             log,
             &gap.aggregate_type,
-            &gap.stream_category,
+            &gap.subject,
             gap.id,
         )
         .await?
@@ -973,7 +973,7 @@ async fn repair_gap(
     } else {
         Some(StreamRevision::from_raw(gap.expected.raw() - 1))
     };
-    let tail = log.read_stream(&gap.stream_category, gap.id, after).await?;
+    let tail = log.read_stream(&gap.subject, gap.id, after).await?;
     for e in &tail {
         if let Some(bound) = upto {
             if e.revision >= bound {
@@ -981,7 +981,7 @@ async fn repair_gap(
             }
         }
         let repair_outcome =
-            reg.apply_event(&e.event_type, &e.payload, e.stream_id, &e.category, e.revision, e.position)?;
+            reg.apply_event(&e.event_type, &e.payload, e.subject_id, &e.category, e.revision, e.position)?;
         if repair_outcome.gaps.is_empty() {
             // A stream event that matched no aggregator (or folded/skipped)
             // — advance the watermark so the next matching event doesn't
@@ -1000,11 +1000,11 @@ async fn repair_gap(
 }
 
 /// Read-through restore of `(aggregate_type, id)` into `reg` from its own
-/// stream `{stream_category}-{id}`: load snapshot (if a store is wired) +
+/// stream `{subject}-{id}`: load snapshot (if a store is wired) +
 /// replay the stream tail + fold; or replay from genesis if no snapshot.
 ///
 /// Self-heals a snapshot blob that fails to deserialize (delete + rebuild from
-/// 0). No-op (returns `false`) when `stream_category` is empty (restore
+/// 0). No-op (returns `false`) when `subject` is empty (restore
 /// disabled) or the stream is empty and there is no snapshot. Idempotent: if
 /// `reg` already has state for the key, returns `true` without I/O.
 pub(crate) async fn restore_aggregate(
@@ -1012,10 +1012,10 @@ pub(crate) async fn restore_aggregate(
     snapshot_store: Option<&dyn SnapshotStore>,
     log: &dyn EventLogBackend,
     aggregate_type: &str,
-    stream_category: &str,
+    subject: &str,
     id: Uuid,
 ) -> Result<bool> {
-    if stream_category.is_empty() {
+    if subject.is_empty() {
         return Ok(false);
     }
     let key = format!("{aggregate_type}:{id}");
@@ -1056,7 +1056,7 @@ pub(crate) async fn restore_aggregate(
     let had_snapshot = after.is_some();
 
     // Replay the tail (events with revision > `after`; all of them if `None`).
-    let tail = log.read_stream(stream_category, id, after).await?;
+    let tail = log.read_stream(subject, id, after).await?;
     let folded_any = !tail.is_empty();
     if folded_any {
         let pairs: Vec<(&str, &serde_json::Value)> =
@@ -1111,7 +1111,7 @@ pub(crate) async fn maybe_save_snapshots(
             continue;
         };
         // Only snapshot restorable aggregates (those with a declared stream).
-        if agg.stream_category.is_empty() {
+        if agg.subject.is_empty() {
             continue;
         }
         let Some(state) = reg.get_state(key) else {
@@ -1157,7 +1157,7 @@ mod tests {
     impl Event for Ping {
         const CATEGORY: &'static str = "ping";
         fn event_type(&self) -> &str { "pinged" }
-        fn stream_id(&self) -> Uuid { self.id }
+        fn subject_id(&self) -> Uuid { self.id }
     }
 
     #[derive(Default, Clone, Debug, Serialize, Deserialize)]
@@ -1166,9 +1166,9 @@ mod tests {
         const NAME: &'static str = "PingCount";
         // Restorable / stream-aligned: folds exactly the `ping` stream.
         // This is what selects revision gating + gap repair (an
-        // aggregate without STREAM_CATEGORY is fan-in: position-gated,
+        // aggregate without SUBJECT is fan-in: position-gated,
         // never repaired, never snapshotted).
-        const STREAM_CATEGORY: &'static str = "ping";
+        const SUBJECT: &'static str = "ping";
     }
     impl Apply<Ping> for PingCount {
         fn apply(&mut self, _: &Ping) { self.n += 1; }
@@ -1185,7 +1185,7 @@ mod tests {
                 payload: serde_json::to_value(&payload).unwrap(),
                 created_at: Utc::now(),
                 category: Some("ping".into()),
-                stream_id: Some(id),
+                subject_id: Some(id),
                 metadata: serde_json::Map::new(),
                 ephemeral: None,
                 persistent: true,
@@ -1220,7 +1220,7 @@ mod tests {
         let _outcome = fold_event(
             &reg, None, &store,
             &last.event_type, &last.payload,
-            last.stream_id, &last.category, last.revision, last.position,
+            last.subject_id, &last.category, last.revision, last.position,
             /* strict_to_event = */ false,
         ).await.unwrap();
         // (In unbounded mode the vacant-entry repair restores through
@@ -1239,7 +1239,7 @@ mod tests {
             let outcome = fold_event(
                 &reg, None, &store,
                 &event.event_type, &event.payload,
-                event.stream_id, &event.category, event.revision, event.position,
+                event.subject_id, &event.category, event.revision, event.position,
                 false,
             ).await.unwrap();
             assert!(!outcome.applied, "late arrival skips — already folded");
@@ -1269,7 +1269,7 @@ mod tests {
         let e2 = &events[2];
         fold_event(
             &reg, None, &store,
-            &e2.event_type, &e2.payload, e2.stream_id, &e2.category,
+            &e2.event_type, &e2.payload, e2.subject_id, &e2.category,
             e2.revision, e2.position,
             /* strict_to_event = */ true,
         ).await.unwrap();

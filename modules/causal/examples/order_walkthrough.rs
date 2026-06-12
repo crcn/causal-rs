@@ -14,7 +14,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 // 1. Events are plain data. `CATEGORY` groups a type's streams;
-//    `stream_id` picks which stream this value belongs to.
+//    `subject_id` picks which stream this value belongs to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
@@ -25,7 +25,7 @@ impl Event for OrderPlaced {
     fn event_type(&self) -> &str {
         "placed"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.order_id
     }
 }
@@ -39,7 +39,7 @@ impl Event for ShipmentRequested {
     fn event_type(&self) -> &str {
         "requested"
     }
-    fn stream_id(&self) -> Uuid {
+    fn subject_id(&self) -> Uuid {
         self.order_id
     }
 }

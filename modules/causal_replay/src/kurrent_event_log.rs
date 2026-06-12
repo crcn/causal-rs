@@ -1,6 +1,6 @@
 //! KurrentDB-backed [`EventLogBackend`] implementation.
 //!
-//! The v0.4 trait shapes (`Event::CATEGORY`, `Event::stream_id`,
+//! The v0.4 trait shapes (`Event::CATEGORY`, `Event::subject_id`,
 //! `Engine::emit`, etc.) were designed against KurrentDB's primitives.
 //! This module is the actual implementation; the trait alignment lives
 //! in `docs/plans/2026-05-11-v0.4-api-sharpening-plan.md`.
@@ -28,8 +28,8 @@
 //!   "idempotent on event_id" contract absolutely — the same guarantee
 //!   Postgres' `UNIQUE(event_id)` and MemoryStore provide. (Closes the
 //!   former best-effort gap; see the 2026-06-10 audit remediation, B3.)
-//! - **Q2 stream naming.** Every event lands in `{category}-{stream_id}`
-//!   (`Event::CATEGORY` + `Event::stream_id`). `category` and `stream_id`
+//! - **Q2 stream naming.** Every event lands in `{category}-{subject_id}`
+//!   (`Event::CATEGORY` + `Event::subject_id`). `category` and `subject_id`
 //!   are recovered on read by parsing the stream name (the trailing 36
 //!   chars are the canonical UUID) — no metadata round-trip needed.
 //! - **Q3 metadata.** Mapped to Kurrent's `custom_metadata` slot.
@@ -192,7 +192,7 @@ mod kurrent {
         async fn append_to_stream(
             &self,
             category: &str,
-            stream_id: Uuid,
+            subject_id: Uuid,
             expected: causal::types::StreamState,
             events: Vec<EventData>,
         ) -> Result<WriteResult> {
@@ -203,7 +203,7 @@ mod kurrent {
                 "category '{category}' contains '-'; conflicts with \
                  Kurrent's '{{category}}-{{id}}' stream naming convention",
             );
-            let stream = format!("{}-{}", category, stream_id);
+            let stream = format!("{}-{}", category, subject_id);
             if events.is_empty() {
                 anyhow::bail!("append_to_stream: events must be non-empty");
             }
@@ -374,10 +374,10 @@ mod kurrent {
         async fn read_stream(
             &self,
             category: &str,
-            stream_id: Uuid,
+            subject_id: Uuid,
             after: Option<StreamRevision>,
         ) -> Result<Vec<RecordedEvent>> {
-            let stream_name = format!("{}-{}", category, stream_id);
+            let stream_name = format!("{}-{}", category, subject_id);
             // causal::StreamRevision is 0-indexed, matching Kurrent
             // exactly. To return events with revision > r, start
             // reading at position r + 1.
@@ -493,7 +493,7 @@ mod kurrent {
             );
         }
         // causal-specific reserved key (no Kurrent counterpart): keep `_`
-        // prefix to mark "framework-internal." (category/stream_id are
+        // prefix to mark "framework-internal." (category/subject_id are
         // recovered from the stream name, so no `_aggregateType` needed.)
         m.insert("_persistent".to_string(), Value::Bool(event.persistent));
         m
@@ -523,18 +523,18 @@ mod kurrent {
             .remove("_persistent")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        // category + stream_id are recovered from the Kurrent stream name
-        // `{category}-{stream_id}` (stream_id is a canonical 36-char UUID
+        // category + subject_id are recovered from the Kurrent stream name
+        // `{category}-{subject_id}` (subject_id is a canonical 36-char UUID
         // at the end). No `_aggregateType` metadata needed.
-        let stream_name = rec.stream_id();
-        let stream_id = stream_name
+        let stream_name = rec.subject_id();
+        let subject_id = stream_name
             .get(stream_name.len().saturating_sub(36)..)
             .and_then(|s| Uuid::parse_str(s).ok())
             .ok_or_else(|| {
                 anyhow!("Kurrent stream name '{stream_name}' does not end in a UUID")
             })?;
         let category = stream_name
-            .strip_suffix(&format!("-{stream_id}"))
+            .strip_suffix(&format!("-{subject_id}"))
             .unwrap_or_default()
             .to_string();
         // causal::StreamRevision and Kurrent revision are both 0-indexed.
@@ -553,7 +553,7 @@ mod kurrent {
             event_type: rec.event_type.clone(),
             payload,
             category,
-            stream_id,
+            subject_id,
             revision,
             metadata,
             created_at,
@@ -743,7 +743,7 @@ mod kurrent {
         fn mk_event(
             event_type: &str,
             category: Option<&str>,
-            stream_id: Option<Uuid>,
+            subject_id: Option<Uuid>,
         ) -> EventData {
             EventData {
                 event_id:        Uuid::new_v4(),
@@ -753,7 +753,7 @@ mod kurrent {
                 payload:         serde_json::json!({}),
                 created_at:      Utc::now(),
                 category:        category.map(String::from),
-                stream_id:       stream_id,
+                subject_id:       subject_id,
                 metadata:        Map::new(),
                 ephemeral:       None,
                 persistent:      true,

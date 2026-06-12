@@ -86,7 +86,7 @@ fn make_event(i: usize) -> EventData {
         payload: serde_json::json!({ "index": i }),
         created_at: Utc::now(),
         category: None,
-        stream_id: None,
+        subject_id: None,
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,

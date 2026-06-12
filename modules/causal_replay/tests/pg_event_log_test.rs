@@ -7,7 +7,7 @@
 //! - **C1** (append idempotency on event_id) — duplicate appends collapse.
 //! - **C6** (aggregate OCC) — stale `expected_version` errors out.
 //! - `read_all` returns events in monotonic position order.
-//! - `read_stream` partitions by `(category, stream_id)`.
+//! - `read_stream` partitions by `(category, subject_id)`.
 //! - `latest_position` reports the max persisted position.
 //!
 //! Schema requires migration 054_causal_v03_backend_tables.sql to have
@@ -80,7 +80,7 @@ fn make_event(workflow_id: Uuid, event_type: &str) -> EventData {
         payload: serde_json::json!({}),
         created_at: Utc::now(),
         category: None,
-        stream_id: None,
+        subject_id: None,
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,
@@ -138,13 +138,13 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
     let backend = PgEventLogBackend::new(pool.clone());
 
     let workflow = Uuid::new_v4();
-    let stream_id = Uuid::new_v4();
+    let subject_id = Uuid::new_v4();
 
     // Initial append at NoStream → lands at revision 0.
     let r1 = backend
         .append_to_stream(
             "order",
-            stream_id,
+            subject_id,
             StreamState::NoStream,
             vec![make_event(workflow, "test:order_placed")],
         )
@@ -155,7 +155,7 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
     let stale = backend
         .append_to_stream(
             "order",
-            stream_id,
+            subject_id,
             StreamState::NoStream,
             vec![make_event(workflow, "test:order_updated")],
         )
@@ -173,7 +173,7 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
     let r2 = backend
         .append_to_stream(
             "order",
-            stream_id,
+            subject_id,
             StreamState::StreamRevision(0),
             vec![make_event(workflow, "test:order_updated")],
         )
@@ -289,10 +289,10 @@ async fn concurrent_appends_serialize_and_both_land() -> Result<()> {
     let workflow = Uuid::new_v4();
     let before = backend.latest_position().await?;
 
-    let spawn_append = |stream_id: Uuid, event: EventData| {
+    let spawn_append = |subject_id: Uuid, event: EventData| {
         let b = Arc::clone(&backend);
         tokio::spawn(async move {
-            b.append_to_stream("test_concurrent", stream_id, StreamState::NoStream, vec![event])
+            b.append_to_stream("test_concurrent", subject_id, StreamState::NoStream, vec![event])
                 .await
         })
     };
@@ -364,14 +364,14 @@ async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let b = Arc::clone(&backend);
-            let stream_id = Uuid::new_v4();
+            let subject_id = Uuid::new_v4();
             let events: Vec<EventData> =
                 (0..10).map(|_| make_event(workflow, "test:hwm")).collect();
             tokio::spawn(async move {
                 let mut expected = StreamState::NoStream;
                 for event in events {
                     let r = b
-                        .append_to_stream("test_hwm", stream_id, expected, vec![event])
+                        .append_to_stream("test_hwm", subject_id, expected, vec![event])
                         .await?;
                     expected = StreamState::StreamRevision(r.revision.raw());
                 }

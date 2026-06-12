@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[causal::event(stream_id = "order_id", occurred_at_field = "happened_at")]
+#[causal::event(subject_id = "order_id", occurred_at_field = "happened_at")]
 #[derive(Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,

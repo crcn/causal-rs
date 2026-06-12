@@ -46,7 +46,7 @@ fn mk_event(
     workflow: Uuid,
     event_type: &str,
     category: Option<&str>,
-    stream_id: Option<Uuid>,
+    subject_id: Option<Uuid>,
 ) -> EventData {
     EventData {
         event_id:        Uuid::new_v4(),
@@ -56,7 +56,7 @@ fn mk_event(
         payload:         serde_json::json!({ "v": 1 }),
         created_at:      Utc::now(),
         category:  category.map(String::from),
-        stream_id,
+        subject_id,
         metadata:        serde_json::Map::new(),
         ephemeral:       None,
         persistent:      true,
@@ -273,7 +273,7 @@ async fn metadata_round_trips_with_reserved_keys_stripped() -> Result<()> {
                "$causationId was stamped and stripped back into the field");
     assert_eq!(loaded.category, "lifecycle",
                "_aggregateType was stamped and stripped back into the field");
-    assert_eq!(loaded.stream_id, agg_id);
+    assert_eq!(loaded.subject_id, agg_id);
     assert!(loaded.persistent);
     // User metadata survives.
     assert_eq!(
@@ -320,7 +320,7 @@ async fn read_stream_returns_empty_for_missing_stream() -> Result<()> {
 // ── Live end-to-end: reactor output streams to its own stream (bridge) ──
 //
 // Proves Phase 4's "bridge" slice against a REAL KurrentDB: a reactor's
-// output lands in `{output_category}-{output_stream_id}`, not a shared
+// output lands in `{output_category}-{output_subject_id}`, not a shared
 // `_global`. Hybrid wiring — Kurrent is the event log; MemoryStore is the
 // reactor outbox + checkpoint (Kurrent is a log, not a job queue).
 
@@ -329,7 +329,7 @@ struct FetchRequested { id: Uuid, occurred_at: chrono::DateTime<Utc> }
 impl causal::Event for FetchRequested {
     const CATEGORY: &'static str = "fetch_req";
     fn event_type(&self) -> &str { "requested" }
-    fn stream_id(&self) -> Uuid { self.id }
+    fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<chrono::DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -338,7 +338,7 @@ struct Fetched { id: Uuid, occurred_at: chrono::DateTime<Utc> }
 impl causal::Event for Fetched {
     const CATEGORY: &'static str = "fetched";
     fn event_type(&self) -> &str { "done" }
-    fn stream_id(&self) -> Uuid { self.id }
+    fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<chrono::DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -378,12 +378,12 @@ async fn reactor_output_lands_in_its_own_stream_not_global() {
         .unwrap();
 
     // The Fetched output must be in ITS OWN stream `fetched-{id}`, routed
-    // by the output Event's own (category, stream_id) — not `_global`.
+    // by the output Event's own (category, subject_id) — not `_global`.
     let out = kurrent.read_stream("fetched", id, None).await.unwrap();
     assert_eq!(out.len(), 1, "exactly one Fetched in fetched-{id}");
     assert_eq!(out[0].event_type, "fetched:done");
     assert_eq!(out[0].category, "fetched");
-    assert_eq!(out[0].stream_id, id);
+    assert_eq!(out[0].subject_id, id);
     assert!(out[0].causation_id.is_some(), "output carries the trigger as causation");
 
     engine.shutdown().await.unwrap();

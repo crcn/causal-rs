@@ -113,10 +113,10 @@ mod pg {
         // such events collide on that index and `ON CONFLICT (event_id)` cannot
         // catch it, erroring the insert and stalling the projector forever.
         let (aggregate_type, aggregate_id, revision): (Option<&str>, Option<Uuid>, Option<i64>) =
-            if e.category.is_empty() && e.stream_id.is_nil() {
+            if e.category.is_empty() && e.subject_id.is_nil() {
                 (None, None, None)
             } else {
-                (Some(e.category.as_str()), Some(e.stream_id), Some(e.revision.raw() as i64))
+                (Some(e.category.as_str()), Some(e.subject_id), Some(e.revision.raw() as i64))
             };
         sqlx::query(
             "INSERT INTO causal_log

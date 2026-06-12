@@ -53,7 +53,7 @@ pub fn fresh_event(
     workflow: Uuid,
     event_type: &str,
     category: Option<&str>,
-    stream_id: Option<Uuid>,
+    subject_id: Option<Uuid>,
 ) -> EventData {
     EventData {
         event_id:        Uuid::new_v4(),
@@ -63,7 +63,7 @@ pub fn fresh_event(
         payload:         serde_json::json!({}),
         created_at:      Utc::now(),
         category:        category.map(String::from),
-        stream_id,
+        subject_id,
         metadata:        serde_json::Map::new(),
         ephemeral:       None,
         persistent:      true,
@@ -244,7 +244,7 @@ pub async fn append_to_stream_rejects_stale_expected<B: EventLogBackend>(
 /// WriteResult. Without this, naive retries against a flaky network
 /// would either duplicate the event or surface a misleading OCC
 /// error.
-pub async fn append_to_stream_idempotent_on_event_id_retry<B: EventLogBackend>(
+pub async fn append_to_subject_idempotent_on_event_id_retry<B: EventLogBackend>(
     b: &B,
 ) -> Result<()> {
     let aggregate_type = "conformance";
@@ -889,17 +889,17 @@ pub async fn concurrent_appends_are_tailable_without_loss<B: EventLogBackend>(
 
     // Pre-build every batch (one distinct stream per appender) so the
     // expected event_id set is known up front.
-    let stream_ids: Vec<Uuid> = (0..APPENDERS).map(|_| Uuid::new_v4()).collect();
-    let batches: Vec<Vec<EventData>> = stream_ids
+    let subject_ids: Vec<Uuid> = (0..APPENDERS).map(|_| Uuid::new_v4()).collect();
+    let batches: Vec<Vec<EventData>> = subject_ids
         .iter()
-        .map(|stream_id| {
+        .map(|subject_id| {
             (0..EVENTS_PER_APPENDER)
                 .map(|_| {
                     fresh_event(
                         workflow,
                         "conformance:stress",
                         Some(aggregate_type),
-                        Some(*stream_id),
+                        Some(*subject_id),
                     )
                 })
                 .collect()
@@ -923,12 +923,12 @@ pub async fn concurrent_appends_are_tailable_without_loss<B: EventLogBackend>(
     // (and the tailer) in $all.
     let appender = |i: usize| {
         let batch = &batches[i];
-        let stream_id = stream_ids[i];
+        let subject_id = subject_ids[i];
         async move {
             let mut expected = StreamState::NoStream;
             for event in batch {
                 let r = b
-                    .append_to_stream(aggregate_type, stream_id, expected, vec![event.clone()])
+                    .append_to_stream(aggregate_type, subject_id, expected, vec![event.clone()])
                     .await?;
                 expected = StreamState::StreamRevision(r.revision.raw());
             }
@@ -1026,7 +1026,7 @@ pub async fn concurrent_any_appends_all_succeed<B: EventLogBackend>(
 
     const N: usize = 8;
     let aggregate_type = "conformance";
-    let stream_id = Uuid::new_v4();
+    let subject_id = Uuid::new_v4();
     let workflow = Uuid::new_v4();
 
     let events: Vec<EventData> = (0..N)
@@ -1035,7 +1035,7 @@ pub async fn concurrent_any_appends_all_succeed<B: EventLogBackend>(
                 workflow,
                 "conformance:any",
                 Some(aggregate_type),
-                Some(stream_id),
+                Some(subject_id),
             )
         })
         .collect();
@@ -1045,7 +1045,7 @@ pub async fn concurrent_any_appends_all_succeed<B: EventLogBackend>(
     let append = |i: usize| {
         let event = events[i].clone();
         async move {
-            b.append_to_stream(aggregate_type, stream_id, StreamState::Any, vec![event])
+            b.append_to_stream(aggregate_type, subject_id, StreamState::Any, vec![event])
                 .await
         }
     };
@@ -1067,7 +1067,7 @@ pub async fn concurrent_any_appends_all_succeed<B: EventLogBackend>(
     }
 
     // All N landed, exactly once, at dense revisions 0..N.
-    let recorded = b.read_stream(aggregate_type, stream_id, None).await?;
+    let recorded = b.read_stream(aggregate_type, subject_id, None).await?;
     assert_eq!(recorded.len(), N, "all {N} concurrent Any appends must land");
     for (i, ev) in recorded.iter().enumerate() {
         assert_eq!(
@@ -1150,7 +1150,7 @@ pub fn scenario_names() -> &'static [&'static str] {
         "fresh_stream_first_event_lands_at_revision_zero",
         "revision_is_monotonic_within_stream",
         "append_to_stream_rejects_stale_expected",
-        "append_to_stream_idempotent_on_event_id_retry",
+        "append_to_subject_idempotent_on_event_id_retry",
         "append_to_stream_batch_lands_atomically",
         "append_to_stream_batch_idempotent_on_replay",
         "expected_revision_ahead_of_head_is_rejected",

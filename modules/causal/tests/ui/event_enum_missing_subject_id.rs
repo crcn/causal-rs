@@ -1,4 +1,4 @@
-// Omitting `stream_id` (without the explicit `nil_stream` opt-in) must
+// Omitting `subject_id` (without the explicit `no_subject` opt-in) must
 // not compile: the old silent nil-stream default routed every variant
 // of every entity into one `{prefix}-nil` stream — unreadable by
 // per-stream aggregate folds, invisible until the read fails.

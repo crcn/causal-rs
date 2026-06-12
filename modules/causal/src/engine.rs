@@ -248,20 +248,20 @@ pub struct TerminalFailure {
 /// downstream code never names this trait.
 pub(crate) trait ErasedFact: Send + Sync {
     fn category(&self) -> &'static str;
-    /// Physical stream placement category (`Event::STREAM_CATEGORY`);
+    /// Physical stream placement category (`Event::SUBJECT`);
     /// defaults to `category()`. Routing still uses `category()`.
-    fn stream_category(&self) -> &'static str;
+    fn subject(&self) -> &'static str;
     fn variant_name(&self) -> &str;
-    fn stream_id(&self) -> Uuid;
+    fn subject_id(&self) -> Uuid;
     fn occurred_at(&self) -> Option<DateTime<Utc>>;
     fn to_value(&self) -> Result<serde_json::Value>;
 }
 
 impl<F: Event> ErasedFact for F {
     fn category(&self) -> &'static str { <F as Event>::CATEGORY }
-    fn stream_category(&self) -> &'static str { <F as Event>::STREAM_CATEGORY }
+    fn subject(&self) -> &'static str { <F as Event>::SUBJECT }
     fn variant_name(&self) -> &str { Event::event_type(self) }
-    fn stream_id(&self) -> Uuid { Event::stream_id(self) }
+    fn subject_id(&self) -> Uuid { Event::subject_id(self) }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Event::occurred_at(self) }
     fn to_value(&self) -> Result<serde_json::Value> {
         serde_json::to_value(self).map_err(Into::into)
@@ -581,7 +581,7 @@ impl EngineBuilder {
     /// Wire a durable [`SnapshotStore`](crate::snapshot_store::SnapshotStore)
     /// so folded aggregate state survives restart. With it set, an aggregate
     /// that declares an
-    /// [`Aggregate::STREAM_CATEGORY`](crate::aggregate::Aggregate::STREAM_CATEGORY)
+    /// [`Aggregate::SUBJECT`](crate::aggregate::Aggregate::SUBJECT)
     /// is restored read-through (snapshot + stream-tail replay) by
     /// [`Engine::state_of`] and by consumer runners before they fold, and
     /// is snapshotted every [`with_snapshot_every`](Self::with_snapshot_every)
@@ -862,8 +862,8 @@ impl EngineBuilder {
         // folding (the aggregate never folds, with no runtime error).
         for agg in &self.aggregators {
             crate::event_type::validate_category("aggregator event", &agg.event_prefix)?;
-            if !agg.stream_category.is_empty() {
-                crate::event_type::validate_category("aggregate stream", &agg.stream_category)?;
+            if !agg.subject.is_empty() {
+                crate::event_type::validate_category("aggregate stream", &agg.subject)?;
             }
         }
 
@@ -933,7 +933,7 @@ pub struct Engine {
     handles:               Vec<JoinHandle<()>>,
     default_metadata:      Metadata,
     /// Engine-level aggregator registry for out-of-band read access
-    /// via `engine.state_of::<A>(stream_id).await.unwrap()`. Folded on every
+    /// via `engine.state_of::<A>(subject_id).await.unwrap()`. Folded on every
     /// successful `emit()`. Each consumer holds its OWN registry
     /// clone for in-body `ctx.state_of` reads — the engine-level
     /// registry exists for the test ergonomic of reading aggregate
@@ -1059,11 +1059,11 @@ impl Engine {
         A: Aggregate + Apply<F>,
         F: Event + DeserializeOwned,
     {
-        // Read the PHYSICAL stream (STREAM_CATEGORY), which `emit` and
+        // Read the PHYSICAL stream (SUBJECT), which `emit` and
         // durable restore also use. It may be co-located — holding event
         // types other than `F` — so fold only `F`-typed events while still
         // tracking the stream head revision across all of them.
-        let events = self.log.read_stream(F::STREAM_CATEGORY, id, None).await?;
+        let events = self.log.read_stream(F::SUBJECT, id, None).await?;
         let mut agg = A::default();
         let mut revision = StreamRevision::ZERO;
         for event in events {
@@ -1097,7 +1097,7 @@ impl Engine {
     /// The whole decision is written to the single aggregate stream
     /// `{F::CATEGORY}-{id}` — this is the OCC consistency boundary, so every
     /// emitted fact must belong to aggregate `id`. Each fact's own
-    /// [`Event::stream_id`] is therefore expected to equal `id` (debug-asserted)
+    /// [`Event::subject_id`] is therefore expected to equal `id` (debug-asserted)
     /// and is not used for routing here; to affect a *different* aggregate, run
     /// a separate `append` against it.
     pub async fn append<A, F, D>(&self, id: Uuid, decide: D) -> Result<EmitResult>
@@ -1116,11 +1116,11 @@ impl Engine {
         let mut last_conflict: Option<anyhow::Error> = None;
 
         for attempt in 0..MAX_OCC_RETRIES {
-            // Load: fold the PHYSICAL stream (STREAM_CATEGORY) + capture
+            // Load: fold the PHYSICAL stream (SUBJECT) + capture
             // the expected stream state. `expected` is the stream head
             // across ALL co-located types (that's the OCC fence the
             // backend checks); the fold applies only `F`-typed events.
-            let events = self.log.read_stream(F::STREAM_CATEGORY, id, None).await?;
+            let events = self.log.read_stream(F::SUBJECT, id, None).await?;
             let expected = match events.last() {
                 None => StreamState::NoStream,
                 Some(e) => StreamState::StreamRevision(e.revision.raw()),
@@ -1151,11 +1151,11 @@ impl Engine {
                 // The whole decision is written to the (F::CATEGORY, id)
                 // aggregate stream — every fact must belong to aggregate `id`.
                 debug_assert_eq!(
-                    fact.stream_id(), id,
-                    "Engine::append: decided fact has stream_id {} but the \
+                    fact.subject_id(), id,
+                    "Engine::append: decided fact has subject_id {} but the \
                      command targets aggregate {id}; a decision may only emit \
                      facts for its own aggregate",
-                    fact.stream_id(),
+                    fact.subject_id(),
                 );
                 let event_type = crate::event::event_type_for(fact);
                 let payload = serde_json::to_value(fact)?;
@@ -1166,10 +1166,10 @@ impl Engine {
                     event_type:      event_type.clone(),
                     payload:         payload.clone(),
                     created_at:      fact.occurred_at().unwrap_or_else(Utc::now),
-                    // Placement uses STREAM_CATEGORY (same as emit), so
+                    // Placement uses SUBJECT (same as emit), so
                     // durable restore reads it back; routing stays on event_type.
-                    category:        Some(F::STREAM_CATEGORY.to_string()),
-                    stream_id:       Some(id),
+                    category:        Some(F::SUBJECT.to_string()),
+                    subject_id:       Some(id),
                     metadata:        self.default_metadata.clone(),
                     ephemeral:       None,
                     persistent:      true,
@@ -1178,7 +1178,7 @@ impl Engine {
                 events_data.push(event);
             }
 
-            match self.log.append_to_stream(F::STREAM_CATEGORY, id, expected, events_data).await {
+            match self.log.append_to_stream(F::SUBJECT, id, expected, events_data).await {
                 Ok(result) => {
                     // Fold each fact into the engine registry so
                     // `engine.state_of::<A>(id).await.unwrap()` reflects the write. The
@@ -1198,7 +1198,7 @@ impl Engine {
                                 event_type,
                                 payload,
                                 id,
-                                F::STREAM_CATEGORY,
+                                F::SUBJECT,
                                 revision,
                                 result.position,
                                 /* strict_to_event = */ false,
@@ -1279,8 +1279,8 @@ impl Engine {
         // appended one fact at a time: facts before the rejected one
         // were already durable when emit returned Err).
         struct PendingEmit {
-            stream_category: String,
-            stream_id:       Uuid,
+            subject: String,
+            subject_id:       Uuid,
             event:           EventData,
         }
         let mut pending: Vec<PendingEmit> = Vec::with_capacity(b.input.facts.len());
@@ -1299,11 +1299,11 @@ impl Engine {
             }
             // event_type carries the ROUTING category (consumer/aggregator
             // matching); `category`/placement uses the STREAM category. They
-            // differ only when the event overrides `STREAM_CATEGORY`.
+            // differ only when the event overrides `SUBJECT`.
             let event_type = crate::event_type::compose(fact.category(), fact.variant_name());
-            let stream_category = fact.stream_category().to_string();
+            let subject = fact.subject().to_string();
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
-            let stream_id = fact.stream_id();
+            let subject_id = fact.subject_id();
             let payload = fact.to_value()?;
             let event = EventData {
                 event_id:        Uuid::new_v4(),
@@ -1312,13 +1312,13 @@ impl Engine {
                 event_type,
                 payload,
                 created_at:      occurred_at,
-                category:        Some(stream_category.clone()),
-                stream_id:       Some(stream_id),
+                category:        Some(subject.clone()),
+                subject_id:       Some(subject_id),
                 metadata:        merged_metadata.clone(),
                 ephemeral:       None,
                 persistent:      true,
             };
-            pending.push(PendingEmit { stream_category, stream_id, event });
+            pending.push(PendingEmit { subject, subject_id, event });
         }
 
         // ── Append in runs of consecutive same-stream facts — each run
@@ -1337,13 +1337,13 @@ impl Engine {
         while i < pending.len() {
             let mut j = i + 1;
             while j < pending.len()
-                && pending[j].stream_category == pending[i].stream_category
-                && pending[j].stream_id == pending[i].stream_id
+                && pending[j].subject == pending[i].subject
+                && pending[j].subject_id == pending[i].subject_id
             {
                 j += 1;
             }
-            let stream_category = pending[i].stream_category.clone();
-            let stream_id = pending[i].stream_id;
+            let subject = pending[i].subject.clone();
+            let subject_id = pending[i].subject_id;
             let chunk: Vec<EventData> =
                 pending[i..j].iter().map(|p| p.event.clone()).collect();
             let n = chunk.len() as u64;
@@ -1351,8 +1351,8 @@ impl Engine {
             let result = self
                 .log
                 .append_to_stream(
-                    &stream_category,
-                    stream_id,
+                    &subject,
+                    subject_id,
                     crate::types::StreamState::Any,
                     chunk,
                 )
@@ -1382,7 +1382,7 @@ impl Engine {
                 };
 
                 // Mirror into the engine-level registry so out-of-band
-                // `engine.state_of::<A>(stream_id).await.unwrap()` reads stay fresh.
+                // `engine.state_of::<A>(subject_id).await.unwrap()` reads stay fresh.
                 // Consumers maintain their OWN registry clones for
                 // in-body `ctx.state_of` reads — independent state.
                 // Idempotent on stream coordinates; gap repair orders
@@ -1394,8 +1394,8 @@ impl Engine {
                         self.log.as_ref(),
                         &agg_event_type,
                         &agg_payload,
-                        stream_id,
-                        &stream_category,
+                        subject_id,
+                        &subject,
                         fact_write.revision,
                         fact_write.position,
                         /* strict_to_event = */ false,
@@ -1440,12 +1440,12 @@ impl Engine {
     /// If the aggregate isn't cached, this loads its snapshot (if a
     /// [`with_snapshot_store`](EngineBuilder::with_snapshot_store) is wired),
     /// replays the tail of its stream
-    /// (`{`[`A::STREAM_CATEGORY`](crate::aggregate::Aggregate::STREAM_CATEGORY)`}-{id}`),
+    /// (`{`[`A::SUBJECT`](crate::aggregate::Aggregate::SUBJECT)`}-{id}`),
     /// folds, and caches the result. A snapshot blob that fails to deserialize
     /// self-heals (deleted, rebuilt from genesis).
     ///
     /// Returns `None` when the aggregate has no events and no snapshot (or when
-    /// `A::STREAM_CATEGORY` is unset, i.e. restore is disabled).
+    /// `A::SUBJECT` is unset, i.e. restore is disabled).
     ///
     /// For ops/tests/read paths outside a consumer — in a
     /// reactor/projector body, read via `ctx.state_of::<A>(id)` (the
@@ -1476,7 +1476,7 @@ impl Engine {
                 self.snapshot_store.as_deref(),
                 self.log.as_ref(),
                 <A as crate::aggregate::Aggregate>::NAME,
-                <A as crate::aggregate::Aggregate>::STREAM_CATEGORY,
+                <A as crate::aggregate::Aggregate>::SUBJECT,
                 id,
             )
             .await?;
@@ -1672,7 +1672,7 @@ mod tests {
     impl Event for UserCreated {
         const CATEGORY: &'static str = "user";
         fn event_type(&self) -> &str { "user_created" }
-        fn stream_id(&self) -> Uuid { self.user_id }
+        fn subject_id(&self) -> Uuid { self.user_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 
@@ -1683,7 +1683,7 @@ mod tests {
     impl Event for WelcomeQueued {
         const CATEGORY: &'static str = "welcome";
         fn event_type(&self) -> &str { "welcome_queued" }
-        fn stream_id(&self) -> Uuid { self.user_id }
+        fn subject_id(&self) -> Uuid { self.user_id }
     }
 
     /// Projector that records every user_id it sees.
@@ -1784,7 +1784,7 @@ mod tests {
         impl Event for Weird {
             const CATEGORY: &'static str = "order:sub"; // colon = reserved
             fn event_type(&self) -> &str { "weird" }
-            fn stream_id(&self) -> Uuid { self.id }
+            fn subject_id(&self) -> Uuid { self.id }
         }
         #[derive(Default, Clone, Debug, Serialize, Deserialize)]
         struct WeirdAgg { n: u32 }
@@ -1907,7 +1907,7 @@ mod tests {
         impl Event for WelcomeQueuedFact {
             const CATEGORY: &'static str = "welcome";
             fn event_type(&self) -> &str { "welcome_queued" }
-            fn stream_id(&self) -> Uuid { self.user_id }
+            fn subject_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
         impl Projector for WelcomeCounter {
@@ -1950,7 +1950,7 @@ mod tests {
 
     /// Regression test for the reactor-append → engine-aggregator fold path.
     ///
-    /// Before this path existed, `engine.state_of::<A>(stream_id).await.unwrap()`
+    /// Before this path existed, `engine.state_of::<A>(subject_id).await.unwrap()`
     /// reflected only caller-emitted facts; reactor-emitted facts
     /// updated each consumer's private registry clone but were
     /// invisible to out-of-band readers. That made the saga-style
@@ -2033,15 +2033,15 @@ mod tests {
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Inc {
-            stream_id: Uuid,
+            subject_id: Uuid,
         }
         impl Event for Inc {
             const CATEGORY: &'static str = "race";
             fn event_type(&self) -> &str {
                 "inc"
             }
-            fn stream_id(&self) -> Uuid {
-                self.stream_id
+            fn subject_id(&self) -> Uuid {
+                self.subject_id
             }
         }
         impl Apply<Inc> for Counter {
@@ -2054,9 +2054,9 @@ mod tests {
         reg.register(crate::aggregator::Aggregator::for_type::<Counter, Inc>());
         let reg = Arc::new(reg);
 
-        let stream_id = Uuid::new_v4();
+        let subject_id = Uuid::new_v4();
         let event_type = "race:inc";
-        let payload = serde_json::to_value(&Inc { stream_id }).unwrap();
+        let payload = serde_json::to_value(&Inc { subject_id }).unwrap();
 
         const TASKS: usize = 8;
         const PER_TASK: usize = 200;
@@ -2076,7 +2076,7 @@ mod tests {
                         reg.apply_event(
                             event_type,
                             &payload,
-                            stream_id,
+                            subject_id,
                             "race",
                             crate::types::StreamRevision::from_raw(rev),
                             LogCursor::from_raw(rev + 1),
@@ -2090,7 +2090,7 @@ mod tests {
             h.join().expect("thread joined");
         }
 
-        let key = format!("Counter:{}", stream_id);
+        let key = format!("Counter:{}", subject_id);
         let version = reg.get_version(&key);
         assert_eq!(
             version.raw(),
@@ -2113,7 +2113,7 @@ mod tests {
     /// fact type can register two aggregators with different keys.
     ///
     /// Before 0.4.5: the `#[aggregator(id_fn = "...")]` macro accepted
-    /// the attribute but the factory hard-coded `Event::stream_id`, so
+    /// the attribute but the factory hard-coded `Event::subject_id`, so
     /// every aggregator registered for the same fact type folded into
     /// the same key. The "per-signal aggregate vs per-run aggregate"
     /// pattern was impossible without emitting twin events (a smell
@@ -2138,7 +2138,7 @@ mod tests {
         impl Event for OrgUserCreated {
             const CATEGORY: &'static str = "org_user";
             fn event_type(&self) -> &str { "org_user_created" }
-            fn stream_id(&self) -> Uuid { self.user_id }
+            fn subject_id(&self) -> Uuid { self.user_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
 
@@ -2167,7 +2167,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators([
-            // UserCount keys by the natural stream_id (user_id).
+            // UserCount keys by the natural subject_id (user_id).
             Aggregator::for_type::<UserCount, OrgUserCreated>(),
             // OrgCount keys by org_id — a different field. Pre-0.4.5
             // this was impossible; the factory ignored id_fn and
@@ -2197,7 +2197,7 @@ mod tests {
 
         // OrgCount: keyed by org_id → 2 for org_a, 1 for org_b.
         assert_eq!(engine.state_of::<OrgCount>(org_a).await.unwrap().unwrap().n, 2,
-            "id_fn must extract org_id, not user_id (Event::stream_id)");
+            "id_fn must extract org_id, not user_id (Event::subject_id)");
         assert_eq!(engine.state_of::<OrgCount>(org_b).await.unwrap().unwrap().n, 1);
 
         // Cross-check: org_a snapshot at user_1's key must be None
@@ -2216,14 +2216,14 @@ mod tests {
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct MaybeRunEvent {
-            stream_id: Uuid,
+            subject_id: Uuid,
             run_id: Option<Uuid>,
             occurred_at: DateTime<Utc>,
         }
         impl Event for MaybeRunEvent {
             const CATEGORY: &'static str = "maybe_run";
             fn event_type(&self) -> &str { "maybe_run_event" }
-            fn stream_id(&self) -> Uuid { self.stream_id }
+            fn subject_id(&self) -> Uuid { self.subject_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
 
@@ -2252,9 +2252,9 @@ mod tests {
         let run = Uuid::new_v4();
 
         // Two events with run_id, one without.
-        engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: Some(run), occurred_at: Utc::now() }).settled().await.unwrap();
-        engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: None, occurred_at: Utc::now() }).settled().await.unwrap();
-        engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: Some(run), occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(MaybeRunEvent { subject_id: Uuid::new_v4(), run_id: Some(run), occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(MaybeRunEvent { subject_id: Uuid::new_v4(), run_id: None, occurred_at: Utc::now() }).settled().await.unwrap();
+        engine.emit(MaybeRunEvent { subject_id: Uuid::new_v4(), run_id: Some(run), occurred_at: Utc::now() }).settled().await.unwrap();
 
         assert_eq!(engine.state_of::<RunCounter>(run).await.unwrap().unwrap().n, 2,
             "only the two facts with run_id Some should fold");
@@ -2279,9 +2279,9 @@ mod tests {
     impl Event for TaggedEvent {
         const CATEGORY: &'static str = "tagged";
         fn event_type(&self) -> &str { "tagged" }
-        // stream_id intentionally NOT tag_id — proves the macro
-        // uses id_fn over stream_id.
-        fn stream_id(&self) -> Uuid { self.event_id }
+        // subject_id intentionally NOT tag_id — proves the macro
+        // uses id_fn over subject_id.
+        fn subject_id(&self) -> Uuid { self.event_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
     impl TaggedEvent {
@@ -2309,12 +2309,12 @@ mod tests {
 
     /// End-to-end macro test: `#[aggregator(id_fn = "method")]` must
     /// emit a factory that keys by the user method's return value, not
-    /// by `Event::stream_id`. This is the contract the scout side
+    /// by `Event::subject_id`. This is the contract the scout side
     /// depends on (e.g. SignalLifecycle keyed by signal_id from a
-    /// CuriosityEvent whose stream_id is nil).
+    /// CuriosityEvent whose subject_id is nil).
     ///
     /// Regression: the macro must thread the `id_fn` attribute
-    /// through to the factory rather than hard-coding `Event::stream_id`.
+    /// through to the factory rather than hard-coding `Event::subject_id`.
     #[tokio::test]
     async fn macro_aggregator_id_fn_actually_keys_by_method() {
         let store = store();
@@ -2420,7 +2420,7 @@ mod tests {
         impl Event for OrderPlaced {
             const CATEGORY: &'static str = "order";
             fn event_type(&self) -> &str { "order_placed" }
-            fn stream_id(&self) -> Uuid { self.order_id }
+            fn subject_id(&self) -> Uuid { self.order_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
 
@@ -2454,7 +2454,7 @@ mod tests {
                 CounterFact::Reset { .. } => "reset",
             }
         }
-        fn stream_id(&self) -> Uuid {
+        fn subject_id(&self) -> Uuid {
             match self {
                 CounterFact::Inc { counter_id, .. }
               | CounterFact::Reset { counter_id, .. } => *counter_id,
@@ -2500,29 +2500,29 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    // ── C3 — decider keys streams on STREAM_CATEGORY, skips foreign types ──
+    // ── C3 — decider keys streams on SUBJECT, skips foreign types ──
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Deposited { account: Uuid, amount: i64 }
     impl Event for Deposited {
         const CATEGORY: &'static str = "deposit";
-        const STREAM_CATEGORY: &'static str = "account"; // co-located
+        const SUBJECT: &'static str = "account"; // co-located
         fn event_type(&self) -> &str { "deposited" }
-        fn stream_id(&self) -> Uuid { self.account }
+        fn subject_id(&self) -> Uuid { self.account }
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Withdrawn { account: Uuid, amount: i64 }
     impl Event for Withdrawn {
         const CATEGORY: &'static str = "withdraw";
-        const STREAM_CATEGORY: &'static str = "account"; // co-located
+        const SUBJECT: &'static str = "account"; // co-located
         fn event_type(&self) -> &str { "withdrawn" }
-        fn stream_id(&self) -> Uuid { self.account }
+        fn subject_id(&self) -> Uuid { self.account }
     }
     #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct Balance { value: i64 }
     impl crate::aggregate::Aggregate for Balance {
         const NAME: &'static str = "Balance";
-        const STREAM_CATEGORY: &'static str = "account";
+        const SUBJECT: &'static str = "account";
     }
     impl crate::aggregate::Apply<Deposited> for Balance {
         fn apply(&mut self, d: &Deposited) { self.value += d.amount; }
@@ -2532,7 +2532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decider_keys_on_stream_category_and_skips_foreign_types() {
+    async fn decider_keys_on_subject_and_skips_foreign_types() {
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -2557,7 +2557,7 @@ mod tests {
         let deposit_stream = EventLogBackend::read_stream(store.as_ref(), "deposit", account, None)
             .await.unwrap();
         assert!(deposit_stream.is_empty(),
-                "C3: events must NOT be placed under their CATEGORY when STREAM_CATEGORY differs");
+                "C3: events must NOT be placed under their CATEGORY when SUBJECT differs");
 
         // load::<Balance, Deposited> reads the `account` stream, folds ONLY
         // Deposited (skips the co-located Withdrawn without crashing on a
@@ -2831,7 +2831,7 @@ mod tests {
         impl Event for Ping {
             const CATEGORY: &'static str = "ping";
             fn event_type(&self) -> &str { "ping" }
-            fn stream_id(&self) -> Uuid { self.id }
+            fn subject_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2839,7 +2839,7 @@ mod tests {
         impl Event for Pong {
             const CATEGORY: &'static str = "pong";
             fn event_type(&self) -> &str { "pong" }
-            fn stream_id(&self) -> Uuid { self.id }
+            fn subject_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
 
@@ -2943,9 +2943,9 @@ mod tests {
             EventLogBackend::read_all(self.inner.as_ref(), after, limit).await
         }
         async fn read_stream(
-            &self, category: &str, stream_id: Uuid, after: Option<StreamRevision>,
+            &self, category: &str, subject_id: Uuid, after: Option<StreamRevision>,
         ) -> Result<Vec<crate::types::RecordedEvent>> {
-            EventLogBackend::read_stream(self.inner.as_ref(), category, stream_id, after).await
+            EventLogBackend::read_stream(self.inner.as_ref(), category, subject_id, after).await
         }
         async fn latest_position(&self) -> Result<LogCursor> {
             self.inner.latest_position().await
@@ -2953,7 +2953,7 @@ mod tests {
         async fn append_to_stream(
             &self,
             category: &str,
-            stream_id: Uuid,
+            subject_id: Uuid,
             expected: crate::types::StreamState,
             events: Vec<EventData>,
         ) -> Result<crate::types::WriteResult> {
@@ -2961,7 +2961,7 @@ mod tests {
             if n == self.fail_on {
                 anyhow::bail!("injected append failure (call {n})");
             }
-            self.inner.append_to_stream(category, stream_id, expected, events).await
+            self.inner.append_to_stream(category, subject_id, expected, events).await
         }
     }
 
@@ -3109,7 +3109,7 @@ mod tests {
         impl Event for A {
             const CATEGORY: &'static str = "alpha";
             fn event_type(&self) -> &str { "a" }
-            fn stream_id(&self) -> Uuid { self.a_id }
+            fn subject_id(&self) -> Uuid { self.a_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3117,7 +3117,7 @@ mod tests {
         impl Event for B {
             const CATEGORY: &'static str = "beta";
             fn event_type(&self) -> &str { "b" }
-            fn stream_id(&self) -> Uuid { self.b_id }
+            fn subject_id(&self) -> Uuid { self.b_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
 
@@ -3295,7 +3295,7 @@ mod tests {
         impl Event for Pong {
             const CATEGORY: &'static str = "pong";
             fn event_type(&self) -> &str { "pong" }
-            fn stream_id(&self) -> Uuid { self.pong_id }
+            fn subject_id(&self) -> Uuid { self.pong_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
         impl crate::aggregate::Apply<Pong> for Multi {
@@ -3417,7 +3417,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_snapshot_reads_state_folded_on_emit() {
-        // Inspection path: emit Ticks for one stream_id, then read
+        // Inspection path: emit Ticks for one subject_id, then read
         // TickCounter via engine.state_of::<A>(id).await.unwrap() without going
         // through a consumer.
         let store = store();
@@ -3429,7 +3429,7 @@ mod tests {
         .with_aggregators(vec![tick_aggregator()])
         .build().await.unwrap();
 
-        // Tick.stream_id() returns Uuid::nil() — all ticks fold into
+        // Tick.subject_id() returns Uuid::nil() — all ticks fold into
         // the nil-keyed slot.
         for i in 0..5 {
             engine.emit(Tick { seq: i, occurred_at: Utc::now() }).await.unwrap();
@@ -3473,7 +3473,7 @@ mod tests {
         impl Event for HandlerFailed {
             const CATEGORY: &'static str = "ops";
             fn event_type(&self) -> &str { "handler_failed" }
-            fn stream_id(&self) -> Uuid { Uuid::nil() }
+            fn subject_id(&self) -> Uuid { Uuid::nil() }
         }
 
         struct AlwaysFails;
@@ -3554,7 +3554,7 @@ mod tests {
         impl Event for WelcomeQueuedFact {
             const CATEGORY: &'static str = "welcome";
             fn event_type(&self) -> &str { "welcome_queued" }
-            fn stream_id(&self) -> Uuid { self.user_id }
+            fn subject_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
         impl Projector for WelcomeCounter {
@@ -3867,7 +3867,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_returns_none_for_id_with_no_facts() {
         // Snapshot is for inspection only. When no facts have been
-        // emitted for a given stream_id, the aggregate hasn't been
+        // emitted for a given subject_id, the aggregate hasn't been
         // materialized — return None rather than a fresh default
         // (which would silently fool callers asserting on existence).
         let store = store();
@@ -3918,7 +3918,7 @@ mod tests {
         // EmitResult.workflow_id must surface the chain id that was
         // stamped on the emitted fact(s). Clients use it to poll
         // workflow projections; tests use it to scope `settle_to`
-        // and `snapshot::<A>(stream_id)` to one run.
+        // and `snapshot::<A>(subject_id)` to one run.
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -4047,7 +4047,7 @@ mod tests {
     impl Event for Tick {
         const CATEGORY: &'static str = "ticker";
         fn event_type(&self) -> &str { "tick" }
-        fn stream_id(&self) -> Uuid { Uuid::nil() }
+        fn subject_id(&self) -> Uuid { Uuid::nil() }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 
@@ -4179,7 +4179,7 @@ mod tests {
             payload:         serde_json::to_value(&tick).unwrap(),
             created_at:      tick.occurred_at,
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        Metadata::new(),
             ephemeral:       None,
             persistent:      true,
@@ -4509,7 +4509,7 @@ mod tests {
             payload,
             created_at:      tick.occurred_at,
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        Metadata::new(),
             ephemeral:       None,
             persistent:      true,
@@ -4682,7 +4682,7 @@ mod tests {
         impl Event for OtherFact {
             const CATEGORY: &'static str = "other";
             fn event_type(&self) -> &str { "happening" }
-            fn stream_id(&self) -> Uuid { self.id }
+            fn subject_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
 

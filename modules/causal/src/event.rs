@@ -10,9 +10,9 @@
 //! - [`event_type`](Event::event_type): per-variant event type name.
 //!   The runtime composes Kurrent's stored `event_type` as
 //!   `format!("{}:{}", Self::CATEGORY, self.event_type())`.
-//! - [`stream_id`](Event::stream_id): per-variant stream id. The
+//! - [`subject_id`](Event::subject_id): per-variant stream id. The
 //!   runtime composes the stream name as `format!("{}-{}",
-//!   Self::CATEGORY, self.stream_id())`.
+//!   Self::CATEGORY, self.subject_id())`.
 //! - [`occurred_at`](Event::occurred_at): optional producer-claimed
 //!   occurrence time. Defaults to `None`; runners fall back to
 //!   `event.created_at` (the persistence-side envelope timestamp).
@@ -37,7 +37,7 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// support filter by the `category` field (= `CATEGORY`).
     const CATEGORY: &'static str;
 
-    /// Stream the event is *stored* in — `{STREAM_CATEGORY}-{stream_id}`.
+    /// Stream the event is *stored* in — `{SUBJECT}-{subject_id}`.
     /// Defaults to [`CATEGORY`](Self::CATEGORY), so by default an event
     /// streams by its own category (the original behavior).
     ///
@@ -45,9 +45,9 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// (e.g. every event a single aggregate folds) while each type keeps
     /// its own `CATEGORY` for consumer/aggregator routing. Routing always
     /// uses `event_type` (`{CATEGORY}:{name}`); only physical stream
-    /// placement uses `STREAM_CATEGORY`. An aggregate that wants durable
-    /// restore reads from this stream via `Aggregate::STREAM_CATEGORY`.
-    const STREAM_CATEGORY: &'static str = Self::CATEGORY;
+    /// placement uses `SUBJECT`. An aggregate that wants durable
+    /// restore reads from this stream via `Aggregate::SUBJECT`.
+    const SUBJECT: &'static str = Self::CATEGORY;
 
     /// Per-variant event type name. The runtime composes the
     /// stored `event_type` field as `format!("{}:{}", Self::CATEGORY,
@@ -57,8 +57,8 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
 
     /// Per-variant stream id. Combined with [`Self::CATEGORY`] the
     /// runtime composes the Kurrent-style stream name
-    /// `format!("{}-{}", Self::CATEGORY, self.stream_id())`.
-    fn stream_id(&self) -> Uuid;
+    /// `format!("{}-{}", Self::CATEGORY, self.subject_id())`.
+    fn subject_id(&self) -> Uuid;
 
     /// Optional producer-claimed occurrence time. Defaults to `None` —
     /// runners fall back to `event.created_at` (the persistence-side
@@ -96,16 +96,16 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
 }
 
 /// Compose the canonical Kurrent-style stream name for a fact:
-/// `{F::STREAM_CATEGORY}-{stream_id}`.
+/// `{F::SUBJECT}-{subject_id}`.
 ///
 /// Returns the same string the runtime actually appends to — the
-/// *physical placement* stream, `STREAM_CATEGORY` (defaults to
+/// *physical placement* stream, `SUBJECT` (defaults to
 /// `CATEGORY`, but distinct for co-located event types). Useful when you
 /// need the stream name out-of-band — e.g., constructing a Kurrent
 /// admin-UI link, running a raw `read_stream` against the underlying
 /// client, or asserting a stream name in tests.
 pub fn stream_name_for<F: Event>(id: uuid::Uuid) -> String {
-    format!("{}-{}", F::STREAM_CATEGORY, id)
+    format!("{}-{}", F::SUBJECT, id)
 }
 
 /// Compose the canonical event_type for a fact:
@@ -129,7 +129,7 @@ mod tests {
     impl Event for ScheduleCreated {
         const CATEGORY: &'static str = "schedule";
         fn event_type(&self) -> &str { "created" }
-        fn stream_id(&self) -> Uuid { self.schedule_id }
+        fn subject_id(&self) -> Uuid { self.schedule_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 
@@ -162,20 +162,20 @@ mod tests {
     }
 
     #[test]
-    fn stream_id_is_per_variant() {
+    fn subject_id_is_per_variant() {
         let id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
         let f = ScheduleCreated { schedule_id: id, occurred_at: Utc::now() };
-        assert_eq!(f.stream_id(), id);
+        assert_eq!(f.subject_id(), id);
     }
 
     #[test]
-    fn runtime_stream_name_composes_category_dash_stream_id() {
+    fn runtime_stream_name_composes_category_dash_subject_id() {
         // The Kurrent-style stream name is built from CATEGORY +
-        // stream_id with `-` separator. Runtime does this; the
+        // subject_id with `-` separator. Runtime does this; the
         // trait surface narrows to providing the components.
         let id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
         let f = ScheduleCreated { schedule_id: id, occurred_at: Utc::now() };
-        let stream_name = format!("{}-{}", <ScheduleCreated as Event>::CATEGORY, f.stream_id());
+        let stream_name = format!("{}-{}", <ScheduleCreated as Event>::CATEGORY, f.subject_id());
         assert_eq!(stream_name, format!("schedule-{}", id));
     }
 

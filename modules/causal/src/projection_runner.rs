@@ -141,7 +141,7 @@ where
                     self.log.as_ref(),
                     &event.event_type,
                     &event.payload,
-                    event.stream_id,
+                    event.subject_id,
                     &event.category,
                     event.revision,
                     event.position,
@@ -238,7 +238,7 @@ where
                         self.log.as_ref(),
                         &event.event_type,
                         &event.payload,
-                        event.stream_id,
+                        event.subject_id,
                         &event.category,
                         event.revision,
                         event.position,
@@ -280,7 +280,7 @@ mod tests {
     impl Event for Recorded {
         const CATEGORY: &'static str = "test";
         fn event_type(&self) -> &str { "recorded" }
-        fn stream_id(&self) -> Uuid { self.id }
+        fn subject_id(&self) -> Uuid { self.id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
 
@@ -338,7 +338,7 @@ mod tests {
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
@@ -398,7 +398,7 @@ mod tests {
             payload:         serde_json::to_value(&payload).unwrap(),
             created_at:      Utc::now(),
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
@@ -585,7 +585,7 @@ mod tests {
             payload:         serde_json::json!({}),
             created_at:      Utc::now(),
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
@@ -622,7 +622,7 @@ mod tests {
         impl Event for NoTimeFact {
             const CATEGORY: &'static str = "test";
             fn event_type(&self) -> &str { "notime" }
-            fn stream_id(&self) -> Uuid { self.id }
+            fn subject_id(&self) -> Uuid { self.id }
             // occurred_at — uses trait default returning None
         }
 
@@ -655,7 +655,7 @@ mod tests {
             payload:         serde_json::to_value(&fact).unwrap(),
             created_at:      pinned,
             category:  None,
-            stream_id:    None,
+            subject_id:    None,
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,

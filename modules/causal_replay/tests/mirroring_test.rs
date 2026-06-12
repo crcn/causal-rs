@@ -23,7 +23,7 @@ fn make_event(workflow: Uuid, event_type: &str) -> EventData {
         payload: serde_json::json!({}),
         created_at: Utc::now(),
         category: None,
-        stream_id: None,
+        subject_id: None,
         metadata: serde_json::Map::new(),
         ephemeral: None,
         persistent: true,

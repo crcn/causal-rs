@@ -21,7 +21,7 @@ use causal::{
 };
 
 // ── Fixtures: two DISTINCT event types co-located in ONE stream ──────────
-// Both override STREAM_CATEGORY to "account" (shared stream) while keeping
+// Both override SUBJECT to "account" (shared stream) while keeping
 // distinct routing categories ("deposit" / "withdraw").
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -31,9 +31,9 @@ struct Deposited {
 }
 impl Event for Deposited {
     const CATEGORY: &'static str = "deposit";
-    const STREAM_CATEGORY: &'static str = "account";
+    const SUBJECT: &'static str = "account";
     fn event_type(&self) -> &str { "v1" }
-    fn stream_id(&self) -> Uuid { self.account }
+    fn subject_id(&self) -> Uuid { self.account }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -43,9 +43,9 @@ struct Withdrawn {
 }
 impl Event for Withdrawn {
     const CATEGORY: &'static str = "withdraw";
-    const STREAM_CATEGORY: &'static str = "account";
+    const SUBJECT: &'static str = "account";
     fn event_type(&self) -> &str { "v1" }
-    fn stream_id(&self) -> Uuid { self.account }
+    fn subject_id(&self) -> Uuid { self.account }
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ struct Balance {
 }
 impl Aggregate for Balance {
     const NAME: &'static str = "Balance";
-    const STREAM_CATEGORY: &'static str = "account";
+    const SUBJECT: &'static str = "account";
 }
 impl Apply<Deposited> for Balance {
     fn apply(&mut self, e: &Deposited) { self.value += e.amount; }
@@ -180,18 +180,18 @@ async fn corrupt_snapshot_self_heals() -> Result<()> {
     Ok(())
 }
 
-// 5. The `#[event(..., stream = "...")]` macro generates a `STREAM_CATEGORY`
-//    distinct from the routing `CATEGORY`; omitting it defaults to `CATEGORY`.
+// 5. The `#[event(..., subject = "...")]` macro generates a `SUBJECT`
+
 #[test]
-fn event_macro_stream_attribute_sets_stream_category() {
-    #[causal::event(prefix = "deposit", stream_id = "account", stream = "ledger")]
+fn event_macro_subject_attribute_sets_subject() {
+    #[causal::event(prefix = "deposit", subject_id = "account", subject = "ledger")]
     #[derive(Clone, Serialize, Deserialize)]
     struct MacroDeposited {
         account: Uuid,
         occurred_at: chrono::DateTime<Utc>,
     }
 
-    #[causal::event(prefix = "withdraw", stream_id = "account")]
+    #[causal::event(prefix = "withdraw", subject_id = "account")]
     #[derive(Clone, Serialize, Deserialize)]
     struct MacroWithdrawn {
         account: Uuid,
@@ -200,12 +200,12 @@ fn event_macro_stream_attribute_sets_stream_category() {
 
     assert_eq!(<MacroDeposited as Event>::CATEGORY, "deposit", "routing category");
     assert_eq!(
-        <MacroDeposited as Event>::STREAM_CATEGORY, "ledger",
+        <MacroDeposited as Event>::SUBJECT, "ledger",
         "stream = co-located placement category"
     );
-    // No `stream` → STREAM_CATEGORY defaults to CATEGORY.
+    // No `stream` → SUBJECT defaults to CATEGORY.
     assert_eq!(<MacroWithdrawn as Event>::CATEGORY, "withdraw");
-    assert_eq!(<MacroWithdrawn as Event>::STREAM_CATEGORY, "withdraw");
+    assert_eq!(<MacroWithdrawn as Event>::SUBJECT, "withdraw");
 }
 
 // 4. No snapshot store → unchanged behavior (no read-through restore).
