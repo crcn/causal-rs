@@ -433,6 +433,13 @@ struct EventArgs {
     /// history (the anti-god-enum valve; durable restore reads exactly
     /// this history). Defaults to `CATEGORY`.
     subject: Option<String>,
+    /// 0.10 §3: `workflow_id = "field"` — declares this fact a
+    /// workflow ROOT whose workflow is named BY the given payload
+    /// field (macro-generated `declared_workflow_id()` accessor, the
+    /// same machinery as `subject_id`). Omitted = chain member
+    /// (inherits the emitter's workflow). Constitutional: a type is a
+    /// root or a member at every emit site.
+    workflow_id: Option<String>,
     /// v0.9: explicit opt-in to the streamless category-singleton shape
     /// (`subject_id()` = `Uuid::nil()`, every value sharing one
     /// `{category}-nil` stream). Before 0.9 this was the SILENT default
@@ -448,6 +455,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
     let mut subject_id = None;
     let mut occurred_at_field = None;
     let mut subject = None;
+    let mut workflow_id = None;
     let mut no_subject = false;
 
     if tokens.is_empty() {
@@ -457,6 +465,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             subject_id,
             occurred_at_field,
             subject,
+            workflow_id,
             no_subject,
         };
     }
@@ -471,6 +480,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
                 subject_id,
                 occurred_at_field,
                 subject,
+                workflow_id,
                 no_subject,
             };
         }
@@ -516,6 +526,15 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
                     }
                 }
             }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("workflow_id") =>
+            {
+                if let Expr::Lit(expr_lit) = value {
+                    if let Lit::Str(lit) = &expr_lit.lit {
+                        workflow_id = Some(lit.value());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -526,6 +545,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
         subject_id,
         occurred_at_field,
         subject,
+        workflow_id,
         no_subject,
     }
 }
@@ -684,6 +704,42 @@ fn expand_event_struct(
         Some(s) => quote! { const SUBJECT: &'static str = #s; },
         None => quote! {},
     };
+    // Optional `workflow_id = "field"` → this fact is a workflow ROOT:
+    // its envelope workflow is stamped FROM the named payload field
+    // (one source of truth — payload and envelope cannot disagree).
+    // Omitted = trait default `None` (chain member).
+    let workflow_impl = match &args.workflow_id {
+        Some(wf_field) => {
+            let wf_ident = format_ident!("{}", wf_field);
+            let has_field = match &input.data {
+                Data::Struct(d) => match &d.fields {
+                    Fields::Named(f) => f
+                        .named
+                        .iter()
+                        .any(|f| f.ident.as_ref() == Some(&wf_ident)),
+                    _ => false,
+                },
+                _ => unreachable!("expand_event_struct only receives structs"),
+            };
+            if !has_field {
+                return Err(syn::Error::new_spanned(
+                    name,
+                    format!(
+                        "#[event(workflow_id = \"{wf_field}\")]: this struct has no \
+                         `{wf_field}` field — name the Uuid field that roots this \
+                         fact's workflow (derive its value with ctx.derive_id; a \
+                         new_v4() workflow id mints a phantom workflow on redelivery)",
+                    ),
+                ));
+            }
+            quote! {
+                fn declared_workflow_id(&self) -> ::core::option::Option<::uuid::Uuid> {
+                    ::core::option::Option::Some(self.#wf_ident)
+                }
+            }
+        }
+        None => quote! {},
+    };
     let fact_impl = if let Some(id_field) = args.subject_id.as_ref() {
         let id_field_ident = format_ident!("{}", id_field);
         let occurred_field = args
@@ -750,6 +806,7 @@ fn expand_event_struct(
                     self.#id_field_ident
                 }
                 #occurred_impl
+                #workflow_impl
             }
         }
     } else {
@@ -797,6 +854,7 @@ fn expand_event_struct(
                     ::uuid::Uuid::nil()
                 }
                 #occurred_impl
+                #workflow_impl
             }
         }
     };

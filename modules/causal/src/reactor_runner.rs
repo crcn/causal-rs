@@ -975,6 +975,12 @@ where
                 .or_insert(0);
             let this_nth = *n;
             *n += 1;
+            // Which workflow this output belongs to: a workflow-ROOT
+            // fact roots the one its own payload field names (the 0.8
+            // always-inherit hardcode is deleted, not escaped); a chain
+            // member inherits the trigger's. Causation links either
+            // way — it's how settle_tree discovers the boundary.
+            let out_workflow = out.workflow.unwrap_or(event.workflow_id);
             let out_event = EventData {
                 event_id: derive_output_event_id(
                     &self.consumer_id,
@@ -984,7 +990,7 @@ where
                     this_nth,
                 ),
                 causation_id: Some(event.event_id),
-                workflow_id: event.workflow_id,
+                workflow_id: out_workflow,
                 event_type: out.durable_name.clone(),
                 payload: out.payload.clone(),
                 created_at: self.clock.now(),
@@ -1001,10 +1007,13 @@ where
                     &out.subject, out.subject_id, StreamState::Any, vec![out_event],
                 )
                 .await?;
-            // Advance this run's scoped-settle high-water: the output
-            // inherits the trigger's workflow_id.
+            // Advance the OUTPUT's workflow high-water. For a chain
+            // member that's the trigger's run; for a workflow root it
+            // seeds the CHILD's — the parent's settle does not wait for
+            // the child's chain (that's the point of rooting), only for
+            // this append, which the trigger's ack already covers.
             if let Some(tracker) = &self.settle_tracker {
-                tracker.lock().unwrap().bump(event.workflow_id, write.position);
+                tracker.lock().unwrap().bump(out_workflow, write.position);
             }
             // Fold the output into the shared engine registry (folds
             // are idempotent on stream coordinates, so a deduped
@@ -1067,10 +1076,13 @@ where
                 completed_at,
             );
         }
-        // (kind, subject placement, subject_id, payload) of the
-        // terminal fact to append — mapper's fact, the built-in, or
-        // nothing (mapper returned None: park silently).
-        let terminal: Option<(String, String, Uuid, serde_json::Value)> =
+        // (kind, subject placement, subject_id, workflow, payload) of
+        // the terminal fact to append — mapper's fact, the built-in,
+        // or nothing (mapper returned None: park silently). A mapper
+        // fact that declares a workflow root keeps that declaration
+        // (the named-mailbox pattern: a per-run HandlerFailed joins
+        // its run's workflow); the built-in inherits the trigger's.
+        let terminal: Option<(String, String, Uuid, Uuid, serde_json::Value)> =
             match self.failure_mapper.as_ref() {
                 Some(mapper) => {
                     let info = TerminalFailure {
@@ -1089,6 +1101,7 @@ where
                             fact.name().to_string(),
                             fact.subject().to_string(),
                             fact.subject_id(),
+                            fact.declared_workflow_id().unwrap_or(event.workflow_id),
                             fact.to_value()?,
                         )),
                         None => None,
@@ -1100,6 +1113,7 @@ where
                     // completion fold reads.
                     event.category.clone(),
                     event.subject_id,
+                    event.workflow_id,
                     serde_json::json!({
                         "consumer": self.consumer_id,
                         "trigger_id": event.event_id,
@@ -1113,13 +1127,13 @@ where
 
         // `nth = u32::MAX` keeps the terminal fact's deterministic id
         // distinct from react() outputs of the same identity.
-        if let Some((event_type, cat, sid, payload)) = terminal {
+        if let Some((event_type, cat, sid, wf, payload)) = terminal {
             let out_event = EventData {
                 event_id: derive_output_event_id(
                     &self.consumer_id, event.event_id, &event_type, sid, u32::MAX,
                 ),
                 causation_id: Some(event.event_id),
-                workflow_id: event.workflow_id,
+                workflow_id: wf,
                 event_type: event_type.clone(),
                 payload: payload.clone(),
                 created_at: self.clock.now(),
@@ -1134,7 +1148,7 @@ where
                 .append_to_stream(&cat, sid, StreamState::Any, vec![out_event])
                 .await?;
             if let Some(tracker) = &self.settle_tracker {
-                tracker.lock().unwrap().bump(event.workflow_id, write.position);
+                tracker.lock().unwrap().bump(wf, write.position);
             }
             if let Some(reg) = &self.engine_aggregators {
                 crate::aggregator::fold_event(

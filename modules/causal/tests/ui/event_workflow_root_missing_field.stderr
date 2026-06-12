@@ -1,0 +1,19 @@
+error: #[event(workflow_id = "jobid")]: this struct has no `jobid` field — name the Uuid field that roots this fact's workflow (derive its value with ctx.derive_id; a new_v4() workflow id mints a phantom workflow on redelivery)
+ --> tests/ui/event_workflow_root_missing_field.rs:8:8
+  |
+8 | struct JobOpened {
+  |        ^^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_workflow_root_missing_field.rs:3:13
+  |
+3 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> tests/ui/event_workflow_root_missing_field.rs:4:5
+  |
+4 | use uuid::Uuid;
+  |     ^^^^^^^^^^

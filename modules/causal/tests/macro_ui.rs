@@ -16,9 +16,11 @@ fn event_macro_ui() {
     t.pass("tests/ui/event_timeless_facts_compile.rs");
     t.pass("tests/ui/event_subjectless_omission_legal.rs");
     t.pass("tests/ui/event_no_subject_keeps_timestamps.rs");
+    t.pass("tests/ui/event_workflow_root.rs");
     t.compile_fail("tests/ui/event_struct_missing_subject_id.rs");
     t.compile_fail("tests/ui/event_enum_retracted.rs");
     t.compile_fail("tests/ui/event_subject_id_no_subject_conflict.rs");
     t.compile_fail("tests/ui/event_struct_subject_id_typo.rs");
     t.compile_fail("tests/ui/event_explicit_occurred_at_field_missing.rs");
+    t.compile_fail("tests/ui/event_workflow_root_missing_field.rs");
 }

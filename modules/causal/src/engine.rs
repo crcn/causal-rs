@@ -286,6 +286,8 @@ pub(crate) trait ErasedFact: Send + Sync {
     fn subject(&self) -> &'static str;
     fn subject_id(&self) -> Uuid;
     fn occurred_at(&self) -> Option<DateTime<Utc>>;
+    /// `Some` = workflow root (see `Event::declared_workflow_id`).
+    fn declared_workflow_id(&self) -> Option<Uuid>;
     fn to_value(&self) -> Result<serde_json::Value>;
 }
 
@@ -294,6 +296,7 @@ impl<F: Event> ErasedFact for F {
     fn subject(&self) -> &'static str { <F as Event>::SUBJECT }
     fn subject_id(&self) -> Uuid { Event::subject_id(self) }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Event::occurred_at(self) }
+    fn declared_workflow_id(&self) -> Option<Uuid> { Event::declared_workflow_id(self) }
     fn to_value(&self) -> Result<serde_json::Value> {
         serde_json::to_value(self).map_err(Into::into)
     }
@@ -1332,7 +1335,38 @@ impl Engine {
             return Ok(EmitResult { position, workflow_id });
         }
 
-        let workflow = b.workflow_id.unwrap_or_else(Uuid::new_v4);
+        // ── Workflow resolution. A fact type that declares
+        // `workflow_id = "field"` is a workflow ROOT: its envelope
+        // workflow comes from its own payload, constitutionally, at
+        // every emit site. One source of truth — so a builder
+        // `.workflow_id(x)` against a declaring type is a loud error,
+        // never a silent precedence; and a batch can't mix roots with
+        // members (or roots of different workflows): that's two
+        // workflows wearing one emit — emit them separately.
+        let declared: Vec<Option<Uuid>> =
+            b.input.facts.iter().map(|f| f.declared_workflow_id()).collect();
+        let workflow = if let Some(first_declared) = declared.iter().flatten().next() {
+            if let Some(explicit) = b.workflow_id {
+                anyhow::bail!(
+                    "emit().workflow_id({explicit}) conflicts with a workflow-ROOT \
+                     fact in this batch (its type declares its workflow from its \
+                     own payload field, naming workflow {first_declared}). The \
+                     declaration is the single source of truth — drop the builder \
+                     override.",
+                );
+            }
+            let first = *first_declared;
+            if declared.iter().any(|d| *d != Some(first)) {
+                anyhow::bail!(
+                    "emit() batch mixes workflow-ROOT facts with chain members (or \
+                     roots of different workflows). A batch shares one workflow; \
+                     emit roots separately.",
+                );
+            }
+            first
+        } else {
+            b.workflow_id.unwrap_or_else(Uuid::new_v4)
+        };
         let mut last_position = LogCursor::ZERO;
 
         // Merge engine defaults under per-emit metadata. Per-emit
@@ -1637,6 +1671,110 @@ impl Engine {
         }
     }
 
+    /// Settle a workflow AND every workflow transitively rooted from
+    /// inside it — child roots are discovered through causation links,
+    /// which cross workflow boundaries.
+    ///
+    /// **Test/ops-only. Do not reach for this in production code.**
+    /// A workflow root exists precisely so the parent does NOT wait
+    /// for the child's lifecycle; production code that needs a child's
+    /// result writes a *reaction to the child's completion fact*, not
+    /// a wait. Using `settle_tree` to await a slow child locally
+    /// rebuilds the settle-hostage problem this design removed. Its
+    /// legitimate users are test harnesses awaiting full pipelines and
+    /// operators draining a system.
+    ///
+    /// Termination: same contract as [`Engine::settle`] — well-formed
+    /// topologies produce bounded trees. A re-entrant mailbox cycle
+    /// (a child emitting facts that join an ancestor's workflow,
+    /// which roots new children, …) loops here exactly as a
+    /// self-feedback reactor loops `settle`.
+    pub async fn settle_tree(&self, result: EmitResult) -> Result<()> {
+        let mut settled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut queue: Vec<EmitResult> = vec![result];
+        loop {
+            while let Some(r) = queue.pop() {
+                if !settled.insert(r.workflow_id) {
+                    continue;
+                }
+                self.settle(r).await?;
+            }
+            // Rescan for roots caused by any settled workflow but not
+            // yet settled themselves (a settle may have appended new
+            // children; a mailbox fact may have re-entered a settled
+            // workflow). Stable ⇒ done.
+            let children = self.scan_child_roots(&settled).await?;
+            if children.is_empty() {
+                return Ok(());
+            }
+            queue.extend(children);
+        }
+    }
+
+    /// Find workflow roots caused by events of any workflow in `parents`
+    /// but not in `parents` themselves: scan the log for events whose
+    /// `causation_id` belongs to a parent workflow while their own
+    /// `workflow_id` differs. Returns one `EmitResult` per child
+    /// (furthest position seen). Full-log scan — test/ops tooling.
+    async fn scan_child_roots(
+        &self,
+        parents: &std::collections::HashSet<Uuid>,
+    ) -> Result<Vec<EmitResult>> {
+        let mut parent_events: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::new();
+        let mut children: std::collections::HashMap<Uuid, LogCursor> =
+            std::collections::HashMap::new();
+        let mut from = LogCursor::ZERO;
+        loop {
+            let batch = self.log.read_all(from, 1024).await?;
+            if batch.is_empty() {
+                break;
+            }
+            from = batch.last().unwrap().position;
+            for e in batch {
+                if parents.contains(&e.workflow_id) {
+                    parent_events.insert(e.event_id);
+                    continue;
+                }
+                // Causation appears before its child in the log, so a
+                // single forward pass sees parents first.
+                if let Some(cause) = e.causation_id {
+                    if parent_events.contains(&cause) {
+                        let entry = children.entry(e.workflow_id).or_insert(e.position);
+                        if e.position > *entry {
+                            *entry = e.position;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(children
+            .into_iter()
+            .map(|(workflow_id, position)| EmitResult { position, workflow_id })
+            .collect())
+    }
+
+    /// A named entry point for genuinely exogenous signals — clock
+    /// ticks, HTTP mutations, webhook callbacks. Emits made through it
+    /// stamp `_origin = <name>` into the envelope metadata, so every
+    /// fact's provenance is attributable: it either has a causation
+    /// parent (in-spine) or an origin (boundary).
+    ///
+    /// Workflow-root declarations pay double here: a `RunRequested`
+    /// declaring `workflow_id = "run_id"` roots the same workflow the
+    /// same way whether it enters from GraphQL, an ops tool, or a
+    /// scheduler — no builder discipline at any of them. A healthy
+    /// app has very few boundaries.
+    ///
+    /// ```ignore
+    /// engine.boundary("due_sweep")
+    ///     .emit(SweepRequested { sweep_id, .. })
+    ///     .await?;
+    /// ```
+    pub fn boundary<'a>(&'a self, name: &'a str) -> Boundary<'a> {
+        Boundary { engine: self, name }
+    }
+
     /// Block until consumer `id` has caught up to `pos`. Polls the
     /// engine's internal CheckpointStore. A runtime that wires in
     /// LISTEN/NOTIFY or similar can override this later.
@@ -1666,6 +1804,22 @@ impl Engine {
             let _ = handle.await;
         }
         Ok(())
+    }
+}
+
+/// Named boundary handle — see [`Engine::boundary`]. Every emit made
+/// through it carries `_origin = <name>` in the envelope metadata.
+pub struct Boundary<'a> {
+    engine: &'a Engine,
+    name: &'a str,
+}
+
+impl<'a> Boundary<'a> {
+    /// Emit through this boundary: a regular [`EmitBuilder`] with the
+    /// origin already stamped. Chain `.metadata()` / `.settled()` /
+    /// `.await` as usual.
+    pub fn emit<I: Into<EmitInput>>(&self, input: I) -> EmitBuilder<'a> {
+        self.engine.emit(input).metadata("_origin", self.name)
     }
 }
 

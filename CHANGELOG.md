@@ -6,6 +6,46 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### 0.10 step 5 — workflow roots declared on the fact (2026-06-12, breaking)
+
+Which workflow a fact belongs to is part of what the fact IS, declared
+where its subject is declared (Primitive 3; `detach!` stays retracted —
+nothing at an emit site may carry execution semantics).
+
+- **`#[causal::event(..., workflow_id = "job_id")]`** declares a
+  workflow ROOT: the envelope `workflow_id` is stamped FROM that
+  payload field (generated `Event::declared_workflow_id()`, same
+  machinery as `subject_id`) — at every emit site, from any emitter.
+  Omitted = chain member, inherits the emitter's workflow. The 0.8
+  always-inherit hardcode in the reactor runner is deleted. The field's
+  value must be derived (`ctx.derive_id`); it may also carry an
+  EXISTING workflow's id (the named-mailbox pattern — the emit-site
+  derivation is what reviewers review). Missing field = teaching
+  compile error.
+- **Conflict is loud**: `.workflow_id(x)` on the emit builder against
+  a declaring type errors — never a silent precedence. A batch mixing
+  roots with members (or roots of different workflows) errors: a batch
+  shares one workflow; emit roots separately. Same-workflow root
+  batches are fine, and `EmitResult.workflow_id` carries the declared
+  value so `settled()` waits the right chain.
+- **Parent settle does not wait the child**: a root emitted by a
+  reactor seeds the CHILD workflow's high-water; the parent settles
+  once its own decisions drained (that's the point of rooting — slow
+  external labor gets its own lifecycle). Causation still links across
+  the boundary.
+- **`engine.settle_tree(result)`** — test/ops-ONLY transitive settle:
+  follows causation links to child roots, recursively, until the tree
+  is stable. Production code that needs a child's result reacts to the
+  child's completion fact; reaching for `settle_tree` locally rebuilds
+  the settle-hostage problem.
+- **Boundary handles**: `engine.boundary("due_sweep").emit(..)` —
+  named entry points for genuinely exogenous signals, stamping
+  `_origin` into envelope metadata. Root declarations pay double here:
+  the same fact roots the same workflow from GraphQL, an ops tool, or
+  a scheduler with no builder discipline at any of them.
+- Terminal-failure mapper facts that declare a root keep their
+  declaration (a per-run `HandlerFailed` joins its run's workflow).
+
 ### 0.10 step 4 — the deterministic Ctx (2026-06-12, breaking)
 
 `react()` gets no ambient world: the `Ctx` is the only door, and every

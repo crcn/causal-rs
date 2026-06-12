@@ -76,6 +76,26 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// emit-time and replay-time `ctx.time()` silently disagree — and
     /// replay determinism is the whole point of the trait.
     fn occurred_at(&self) -> Option<DateTime<Utc>> { None }
+
+    /// Which workflow this fact roots, named BY its own payload field —
+    /// `Some` makes the fact a **workflow ROOT** (macro
+    /// `workflow_id = "field"`); `None` (the default) makes it a chain
+    /// member that inherits its emitter's workflow.
+    ///
+    /// Constitutional, not per-call-site: a fact type is a root or a
+    /// member at every emit site, from any emitter. The envelope
+    /// `workflow_id` is stamped FROM this value, so payload and
+    /// envelope cannot disagree; `.workflow_id(x)` on the emit builder
+    /// against a declaring type is a loud error, never a silent
+    /// precedence.
+    ///
+    /// The field's value must be derived (`ctx.derive_id`) — a
+    /// `new_v4()` workflow id mints a phantom workflow on redelivery.
+    /// The field may also carry an EXISTING workflow's id (the
+    /// named-mailbox pattern: the fact joins that live workflow's
+    /// ordering and settle scope) — the derivation at the emit site is
+    /// what reviewers review.
+    fn declared_workflow_id(&self) -> Option<Uuid> { None }
 }
 
 /// Compose the canonical stream name for a fact's subject history:

@@ -199,6 +199,10 @@ pub struct EventOutput {
     /// Stream id from `Event::subject_id()` — which stream within
     /// `subject` this output targets.
     pub subject_id: Uuid,
+    /// `Some` = this fact roots its own workflow, named by its payload
+    /// field (`Event::declared_workflow_id`). `None` = chain member;
+    /// the runner stamps the trigger's workflow.
+    pub workflow: Option<Uuid>,
     pub payload: serde_json::Value,
     /// Original typed fact (live dispatch only).
     pub ephemeral: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -211,6 +215,7 @@ impl EventOutput {
         let subject = <F as crate::event::Event>::SUBJECT.to_string();
         let durable_name = <F as crate::event::Event>::NAME.to_string();
         let subject_id = fact.subject_id();
+        let workflow = fact.declared_workflow_id();
         let payload = serde_json::to_value(&fact).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(fact);
         Self {
@@ -218,6 +223,7 @@ impl EventOutput {
             durable_name,
             subject,
             subject_id,
+            workflow,
             payload,
             ephemeral: Some(ephemeral),
         }
@@ -237,6 +243,7 @@ impl EventOutput {
             subject: event_type.clone(),
             durable_name: event_type,
             subject_id,
+            workflow: None,
             payload,
             ephemeral: None,
         }
