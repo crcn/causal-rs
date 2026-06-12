@@ -600,6 +600,7 @@ struct OccTotal {
 impl Aggregate for OccTotal {
     const NAME: &'static str = "OccTotal";
     const SUBJECT: &'static str = "af_occ";
+    const INVARIANT: bool = true;   // OCC-fenced: append-only door
 }
 impl Apply<OccFact> for OccTotal {
     fn apply(&mut self, f: &OccFact) {
@@ -613,7 +614,7 @@ async fn occ_append_8way_multi_fact_contention() {
     let store = Arc::new(MemoryStore::new());
     let engine = Arc::new(
         backend(&store)
-            .with_aggregate::<OccTotal, OccFact>()
+            .with_aggregators([Aggregator::for_type::<OccTotal, OccFact>()])
             .build()
             .await
             .unwrap(),

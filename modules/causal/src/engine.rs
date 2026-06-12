@@ -677,39 +677,17 @@ impl EngineBuilder {
                     agg.aggregate_type, existing.event_prefix,
                 );
             }
+            // INVARIANT aggregates install the OCC fence as part of
+            // ordinary registration: their fact kinds are rejected by
+            // `emit` and by reactor outputs (C4); `Engine::append` is
+            // the only write door. The fence is a property of the
+            // state's declaration, not a separate builder call.
+            if agg.invariant {
+                self.occ_categories.insert(agg.event_prefix.clone());
+            }
             self.aggregators.push(agg);
         }
         self
-    }
-
-    /// Register aggregate `A` (folded from event stream `F`) as an
-    /// **OCC-required** stream. Two effects:
-    ///
-    /// 1. Registers an aggregator so the stream folds for
-    ///    [`Engine::load`] / [`Engine::append`].
-    /// 2. Marks `F::CATEGORY` as `StreamPolicy::OccRequired`, so
-    ///    [`Engine::emit`] **rejects** facts in this category — they
-    ///    carry invariants and must go through the optimistic-
-    ///    concurrency command path [`Engine::append`].
-    ///
-    /// ```ignore
-    /// EngineBuilder::new(...)
-    ///     .with_aggregate::<Counter, CounterFact>();
-    /// // engine.emit(CounterFact { .. })  → Err (OCC-required)
-    /// // engine.append::<Counter, CounterFact>(id, |c| Ok(decide(c)))  → ok
-    /// ```
-    pub fn with_aggregate<A, F>(mut self) -> Self
-    where
-        A: crate::aggregate::Aggregate
-            + crate::aggregate::Apply<F>
-            + Clone
-            + serde::Serialize
-            + serde::de::DeserializeOwned,
-        F: crate::event::Event,
-    {
-        self.occ_categories
-            .insert(<F as crate::event::Event>::CATEGORY.to_string());
-        self.with_aggregators(std::iter::once(Aggregator::for_type::<A, F>()))
     }
 
     pub fn with_projector<P: Projector + 'static>(mut self, p: P) -> Self
@@ -2473,6 +2451,24 @@ mod tests {
     impl crate::aggregate::Aggregate for Counter {
         const NAME: &'static str = "Counter";
     }
+
+    /// The INVARIANT twin: same fold, fenced fact kind. Used by the
+    /// OCC tests; `Counter` stays unfenced so emit-path tests can
+    /// write CounterFact freely.
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct GuardedCounter { value: i32 }
+    impl crate::aggregate::Aggregate for GuardedCounter {
+        const NAME: &'static str = "GuardedCounter";
+        const INVARIANT: bool = true;
+    }
+    impl crate::aggregate::Apply<CounterFact> for GuardedCounter {
+        fn apply(&mut self, fact: &CounterFact) {
+            match fact {
+                CounterFact::Inc { by, .. } => self.value += by,
+                CounterFact::Reset { .. }   => self.value = 0,
+            }
+        }
+    }
     impl crate::aggregate::Apply<CounterFact> for Counter {
         fn apply(&mut self, fact: &CounterFact) {
             match fact {
@@ -2494,8 +2490,8 @@ mod tests {
         .build().await.unwrap();
 
         let id = Uuid::new_v4();
-        let (agg, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
-        assert_eq!(agg, Counter::default());
+        let (agg, ver) = engine.load::<GuardedCounter, CounterFact>(id).await.unwrap();
+        assert_eq!(agg.value, GuardedCounter::default().value);
         assert_eq!(ver, StreamRevision::ZERO);
         engine.shutdown().await.unwrap();
     }
@@ -2607,7 +2603,9 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
-        .with_aggregate::<Counter, CounterFact>() // marks "counter" OCC-required
+        // GuardedCounter::INVARIANT = true ⇒ "counter" facts are fenced —
+        // ordinary registration installs the fence.
+        .with_aggregators([Aggregator::for_type::<GuardedCounter, CounterFact>()])
         .on_terminal_failure(move |info: TerminalFailure| {
             terminal_failure_hits_c.fetch_add(1, Ordering::SeqCst);
             assert!(info.error.contains("OCC-required"), "got: {}", info.error);
@@ -2646,7 +2644,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
-        .with_aggregate::<Counter, CounterFact>()
+        .with_aggregators([Aggregator::for_type::<GuardedCounter, CounterFact>()])
         .build()
         .await
         .unwrap()
@@ -2659,21 +2657,21 @@ mod tests {
         let id = Uuid::new_v4();
 
         engine
-            .append::<Counter, CounterFact, _>(id, move |_c| {
+            .append::<GuardedCounter, CounterFact, _>(id, move |_c| {
                 Ok(vec![CounterFact::Inc { by: 3, occurred_at: Utc::now(), counter_id: id }])
             })
             .await
             .unwrap();
         // Second decision folds the first append's state.
         engine
-            .append::<Counter, CounterFact, _>(id, move |c| {
+            .append::<GuardedCounter, CounterFact, _>(id, move |c| {
                 assert_eq!(c.value, 3, "decide sees the prior append folded in");
                 Ok(vec![CounterFact::Inc { by: 7, occurred_at: Utc::now(), counter_id: id }])
             })
             .await
             .unwrap();
 
-        let (c, ver) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        let (c, ver) = engine.load::<GuardedCounter, CounterFact>(id).await.unwrap();
         assert_eq!(c.value, 10);
         assert_eq!(ver, StreamRevision::from_raw(1), "two events → tail revision 1");
         engine.shutdown().await.unwrap();
@@ -2686,11 +2684,11 @@ mod tests {
         let id = Uuid::new_v4();
 
         engine
-            .append::<Counter, CounterFact, _>(id, |_c| Ok(Vec::new()))
+            .append::<GuardedCounter, CounterFact, _>(id, |_c| Ok(Vec::new()))
             .await
             .unwrap();
 
-        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        let (c, _) = engine.load::<GuardedCounter, CounterFact>(id).await.unwrap();
         assert_eq!(c.value, 0, "empty decision wrote nothing");
         engine.shutdown().await.unwrap();
     }
@@ -2726,7 +2724,7 @@ mod tests {
         let engine = Arc::new(occ_engine(&store).await);
         let id = Uuid::new_v4();
 
-        let guard = move |c: &Counter| -> Result<Vec<CounterFact>> {
+        let guard = move |c: &GuardedCounter| -> Result<Vec<CounterFact>> {
             if c.value == 0 {
                 Ok(vec![CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id }])
             } else {
@@ -2735,12 +2733,12 @@ mod tests {
         };
 
         let (e1, e2) = (engine.clone(), engine.clone());
-        let t1 = tokio::spawn(async move { e1.append::<Counter, CounterFact, _>(id, guard).await });
-        let t2 = tokio::spawn(async move { e2.append::<Counter, CounterFact, _>(id, guard).await });
+        let t1 = tokio::spawn(async move { e1.append::<GuardedCounter, CounterFact, _>(id, guard).await });
+        let t2 = tokio::spawn(async move { e2.append::<GuardedCounter, CounterFact, _>(id, guard).await });
         t1.await.unwrap().unwrap();
         t2.await.unwrap().unwrap();
 
-        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        let (c, _) = engine.load::<GuardedCounter, CounterFact>(id).await.unwrap();
         assert_eq!(c.value, 1, "OCC prevented the double-apply (would be 2 without it)");
 
         Arc::try_unwrap(engine)
@@ -2757,7 +2755,7 @@ mod tests {
         let id = Uuid::new_v4();
 
         engine
-            .append::<Counter, CounterFact, _>(id, move |_c| {
+            .append::<GuardedCounter, CounterFact, _>(id, move |_c| {
                 Ok(vec![
                     CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
                     CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
@@ -2775,7 +2773,7 @@ mod tests {
         assert_eq!(events[1].revision, StreamRevision::from_raw(1));
         assert_eq!(events[2].revision, StreamRevision::from_raw(2));
 
-        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        let (c, _) = engine.load::<GuardedCounter, CounterFact>(id).await.unwrap();
         assert_eq!(c.value, 7);
         engine.shutdown().await.unwrap();
     }
@@ -2795,7 +2793,7 @@ mod tests {
         for _ in 0..N {
             let e = engine.clone();
             tasks.push(tokio::spawn(async move {
-                e.append::<Counter, CounterFact, _>(id, move |_c| {
+                e.append::<GuardedCounter, CounterFact, _>(id, move |_c| {
                     Ok(vec![CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id }])
                 })
                 .await
@@ -2808,7 +2806,7 @@ mod tests {
             }
         }
 
-        let (c, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        let (c, _) = engine.load::<GuardedCounter, CounterFact>(id).await.unwrap();
         assert_eq!(ok, N, "all {N} appends succeeded (none exhausted OCC retries)");
         assert_eq!(c.value, N, "every increment applied — no lost update");
 
@@ -3043,7 +3041,7 @@ mod tests {
             CounterFact::Inc { by: 5, occurred_at: Utc::now(), counter_id: id },
         ]).await.unwrap();
 
-        let (agg, _) = engine.load::<Counter, CounterFact>(id).await.unwrap();
+        let (agg, _) = engine.load::<GuardedCounter, CounterFact>(id).await.unwrap();
         assert_eq!(agg.value, 8);
 
         engine.shutdown().await.unwrap();

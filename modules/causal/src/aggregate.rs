@@ -9,7 +9,7 @@
 //!
 //! Per C11, Reactors cannot emit into Aggregate streams; saga-shaped
 //! "emit only if aggregate at version V" operations must be modeled
-//! as command handlers. `EngineBuilder::with_aggregate<A, F>`
+//! as command handlers. `Aggregate::INVARIANT = true`
 //! registers `F::CATEGORY` as `StreamPolicy::OccRequired` so
 //! `Engine::emit` rejects writes to it; `load<A, F>` / `append<A, F>`
 //! do the OCC work.
@@ -68,6 +68,21 @@ pub trait Aggregate: Default + Send + Sync + 'static {
     /// folded state survive a restart via `Engine::state_of`:
     /// load snapshot (if any) + replay the stream tail + fold.
     const SUBJECT: &'static str = "";
+
+    /// Declare that this state carries an **invariant** — something
+    /// that must not race ("at most one active run per source").
+    ///
+    /// `true` ⇒ every fact kind this aggregate folds is fenced:
+    /// [`Engine::emit`](../engine/struct.Engine.html#method.emit)
+    /// rejects them, reactors are fenced out (C4 — an `Any` append
+    /// cannot uphold an invariant), and the only write path is the
+    /// OCC command door [`Engine::append`]. Registration is the same
+    /// `with_aggregators(...)` call as any other fold — the invariant
+    /// is a property of the state that owns it, not of the wiring.
+    /// (Replaces the deleted `EngineBuilder::with_aggregate`, whose
+    /// name was one keystroke from `with_aggregators` and whose
+    /// semantics were a fence.)
+    const INVARIANT: bool = false;
 }
 
 /// Per-Event fold for hydration. Called once per fact loaded from the

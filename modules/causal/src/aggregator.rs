@@ -94,6 +94,10 @@ pub struct Aggregator {
     /// `Aggregate::SUBJECT` — the single stream this aggregate
     /// folds from, for durable restore. `""` = restore disabled.
     pub subject: String,
+    /// `Aggregate::INVARIANT` — when true, the engine fences this
+    /// aggregate's fact kinds out of `emit` and reactor outputs; the
+    /// OCC command path (`Engine::append`) is the only write door.
+    pub invariant: bool,
     /// Extract the aggregate ID from JSON payload (deserializes internally).
     json_extract_id: Arc<dyn Fn(&serde_json::Value) -> Option<Uuid> + Send + Sync>,
     /// Deserialize JSON and apply to a type-erased aggregate (&mut dyn Any = &mut A).
@@ -179,6 +183,7 @@ impl Aggregator {
         let event_type_id = TypeId::of::<F>();
         let aggregate_type = <A as crate::aggregate::Aggregate>::NAME.to_string();
         let subject = <A as crate::aggregate::Aggregate>::SUBJECT.to_string();
+        let invariant = <A as crate::aggregate::Aggregate>::INVARIANT;
         let id_fn = Arc::new(id_fn);
         let id_fn_for_extract = id_fn.clone();
 
@@ -187,6 +192,7 @@ impl Aggregator {
             event_type_id,
             aggregate_type,
             subject,
+            invariant,
             json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
                 let fact: F = serde_json::from_value(payload.clone()).ok()?;
                 id_fn_for_extract(&fact)
