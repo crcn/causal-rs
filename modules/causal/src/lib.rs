@@ -139,7 +139,7 @@ pub use aggregator::Aggregator;
 // Consumers
 pub use projector::Projector;
 pub use multi_projector::MultiProjector;
-pub use reactor::{Events, Reactor};
+pub use reactor::{Events, Ordering, Reactor};
 
 // Engine + emit
 pub use engine::{

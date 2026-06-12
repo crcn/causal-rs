@@ -20,6 +20,35 @@ use uuid::Uuid;
 use crate::contexts::Ctx;
 use crate::event::Event;
 
+/// Processing-order requirement a reactor declares for its triggers —
+/// the partition key the runner uses for this consumer. Decided in the
+/// BLOCKING-4 memo (`docs/plans/2026-06-12-memo-partition-key.md`):
+/// there is no global key; each reactor declares its own, so dependence
+/// on ordering is reviewable in the same diff as the body it governs.
+///
+/// Causation already orders parent→child under every variant (a trigger
+/// doesn't exist until its producer appended it); this declaration only
+/// chooses how *sibling* triggers may interleave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ordering {
+    /// One subject's triggers process in log order, across all
+    /// workflows. The default: entity lifecycles and dedup gates are
+    /// race-free by construction, and a trigger's own subject history
+    /// cannot advance under it mid-reaction.
+    ///
+    /// Subject-less facts (`Uuid::nil()` subjects) share one partition
+    /// per consumer — a high-volume subject-less feed should declare
+    /// [`Ordering::None`] instead.
+    PerSubject,
+    /// One workflow's triggers process in log order, across subjects.
+    /// The run-pipeline shape: stages reading run-scoped state.
+    PerWorkflow,
+    /// No ordering beyond causation — every trigger may process
+    /// concurrently. For commutative work (e.g. per-file enrichment
+    /// fanned out via workflow-root facts).
+    None,
+}
+
 /// Pure decision producing `Events`. Forward-only; outputs are appended
 /// directly to the log by the runner.
 ///
@@ -76,6 +105,10 @@ pub trait Reactor: Send + Sync {
     /// [`crate::Projector::NAME`] for the full uniqueness
     /// contract (in-builder enforcement, cross-engine caveat).
     const NAME: &'static str;
+
+    /// How this reactor's triggers partition for concurrent processing
+    /// — see [`Ordering`]. Defaults to [`Ordering::PerSubject`].
+    const ORDERING: Ordering = Ordering::PerSubject;
 
     /// Decide on output facts in response to a trigger. Pure — no I/O
     /// to external systems beyond what's exposed via the trigger and
