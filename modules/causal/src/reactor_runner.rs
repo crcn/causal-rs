@@ -13,7 +13,7 @@
 //!   6. Idempotency: a crash between step 4 and step 5 re-runs `react()`
 //!      on restart; the re-append dedups on `event_id` (C1), so exactly
 //!      one output lands and the cursor advances. The reaction itself is
-//!      kept replayable by the side-effect `ReactionCache`.
+//!      kept replayable by the side-effect `EffectStore`.
 //!
 //! On `react()` Err: cursor unchanged, nothing appended; the function
 //! propagates the error and the outer supervisor decides retry timing.
@@ -102,9 +102,9 @@ pub struct ReactorRunner<R: Reactor> {
     /// Inspector / telemetry hook. Default `None` = zero overhead.
     observer:    Option<Arc<dyn ReactorObserver>>,
     /// Reaction-result cache (Phase 4). Surfaced to the reactor body via
-    /// `ctx.reaction_cache()` so side-effecting reactors memoize their
+    /// `ctx.effect_store()` so side-effecting reactors memoize their
     /// external call under the reaction key — safe under retry/redelivery.
-    reaction_cache: Option<Arc<dyn crate::reaction_cache::ReactionCache>>,
+    effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
     /// Engine-level aggregator registry. Reactor outputs are folded into
     /// it after they're appended, so `engine.snapshot::<A>(id)` reflects
     /// reactor-emitted events (not just caller-emitted ones). Separate
@@ -149,7 +149,7 @@ where
             failure_mapper: None,
             max_attempts: 0,
             observer: None,
-            reaction_cache: None,
+            effect_store: None,
             engine_aggregators: None,
             settle_tracker: None,
             snapshot_store: None,
@@ -185,12 +185,12 @@ where
     }
 
     /// Attach the reaction-result cache, surfaced to the reactor body via
-    /// `ctx.reaction_cache()`.
-    pub fn with_reaction_cache(
+    /// `ctx.effect_store()`.
+    pub fn with_effect_store(
         mut self,
-        cache: Arc<dyn crate::reaction_cache::ReactionCache>,
+        cache: Arc<dyn crate::effect_store::EffectStore>,
     ) -> Self {
-        self.reaction_cache = Some(cache);
+        self.effect_store = Some(cache);
         self
     }
 
@@ -450,7 +450,7 @@ where
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
                 logs:           Some(&log_sink),
-                reaction_cache: self.reaction_cache.as_ref(),
+                effect_store: self.effect_store.as_ref(),
             };
 
             // ── Decision. On Err, cursor stays where it was; no rows

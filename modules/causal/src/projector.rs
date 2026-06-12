@@ -135,7 +135,7 @@ mod tests {
                 metadata:       &meta,
                 aggregators:    None,
                 logs:           None,
-                reaction_cache: None,
+                effect_store: None,
             },
         ).await.unwrap();
 
@@ -165,7 +165,7 @@ mod tests {
                     metadata:       &meta,
                     aggregators:    None,
                 logs:           None,
-                reaction_cache: None,
+                effect_store: None,
                 },
             ).await.unwrap();
         }

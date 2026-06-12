@@ -178,7 +178,7 @@ where
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
                 logs:           None,
-                reaction_cache: None,
+                effect_store: None,
             };
 
             match self.projector.project(&fact, ctx).await {

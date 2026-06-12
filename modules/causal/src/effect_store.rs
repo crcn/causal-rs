@@ -1,4 +1,4 @@
-//! `ReactionCache` — make side-effecting reactors safe under
+//! `EffectStore` — make side-effecting reactors safe under
 //! at-least-once delivery.
 //!
 //! Reactors are at-least-once catch-up consumers, so the same trigger can
@@ -9,11 +9,11 @@
 //! re-running it produces different output, so the log can't dedup it.
 //!
 //! The fix is to memoize the reaction's result under its
-//! [`ReactionKey`] = `(reactor group, trigger event_id)`. The first
+//! [`EffectKey`] = `(reactor group, trigger event_id)`. The first
 //! execution caches its result; every redelivery returns the **cached**
 //! value instead of re-calling the external service. That makes the
 //! reactor replayable/deterministic — after which the deterministic
-//! [`ReactionKey::output_event_id`] lets Kurrent's append-dedup collapse
+//! [`EffectKey::output_event_id`] lets Kurrent's append-dedup collapse
 //! duplicate emits. No separate inbox/outbox: the event store is the
 //! ledger; this cache only guards the *side effect*.
 //!
@@ -39,14 +39,14 @@ use crate::reactor_runner::derive_output_event_id;
 /// Identifies one reaction: reactor `group` processing one trigger
 /// event. The unit of idempotency for the reactor path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ReactionKey {
+pub struct EffectKey {
     /// The reacting consumer group — `Reactor::NAME`.
     pub group: String,
     /// The triggering event's id (the reaction's `causation_id`).
     pub trigger_event_id: Uuid,
 }
 
-impl ReactionKey {
+impl EffectKey {
     pub fn new(group: impl Into<String>, trigger_event_id: Uuid) -> Self {
         Self { group: group.into(), trigger_event_id }
     }
@@ -61,11 +61,11 @@ impl ReactionKey {
 }
 
 /// Durable memo of a reactor's side-effecting result, keyed by
-/// [`ReactionKey`]. See module docs.
+/// [`EffectKey`]. See module docs.
 #[async_trait]
-pub trait ReactionCache: Send + Sync {
+pub trait EffectStore: Send + Sync {
     /// Cached result for `key`, if a prior execution stored one.
-    async fn get(&self, key: &ReactionKey) -> Result<Option<serde_json::Value>>;
+    async fn get(&self, key: &EffectKey) -> Result<Option<serde_json::Value>>;
 
     /// Store `value` for `key`, **first-write-wins**: an existing entry
     /// MUST NOT be overwritten (a redelivery that raced past `get` must
@@ -73,7 +73,7 @@ pub trait ReactionCache: Send + Sync {
     /// cache — the pre-existing one if present, else `value`.
     async fn put(
         &self,
-        key: &ReactionKey,
+        key: &EffectKey,
         value: serde_json::Value,
     ) -> Result<serde_json::Value>;
 }
@@ -88,11 +88,11 @@ pub trait ReactionCache: Send + Sync {
 /// ```
 pub async fn remember<Cache, Compute, Fut, T>(
     cache: &Cache,
-    key: &ReactionKey,
+    key: &EffectKey,
     compute: Compute,
 ) -> Result<T>
 where
-    Cache: ReactionCache + ?Sized,
+    Cache: EffectStore + ?Sized,
     Compute: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
     T: Serialize + DeserializeOwned,
@@ -107,28 +107,28 @@ where
     Ok(serde_json::from_value(canonical)?)
 }
 
-/// In-memory [`ReactionCache`] for tests, examples, and single-process
+/// In-memory [`EffectStore`] for tests, examples, and single-process
 /// use. No durability across restarts.
 #[derive(Default)]
-pub struct InMemoryReactionCache {
-    inner: Mutex<HashMap<ReactionKey, serde_json::Value>>,
+pub struct InMemoryEffectStore {
+    inner: Mutex<HashMap<EffectKey, serde_json::Value>>,
 }
 
-impl InMemoryReactionCache {
+impl InMemoryEffectStore {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
 #[async_trait]
-impl ReactionCache for InMemoryReactionCache {
-    async fn get(&self, key: &ReactionKey) -> Result<Option<serde_json::Value>> {
+impl EffectStore for InMemoryEffectStore {
+    async fn get(&self, key: &EffectKey) -> Result<Option<serde_json::Value>> {
         Ok(self.inner.lock().unwrap().get(key).cloned())
     }
 
     async fn put(
         &self,
-        key: &ReactionKey,
+        key: &EffectKey,
         value: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let mut map = self.inner.lock().unwrap();
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn output_event_id_is_deterministic_and_matches_runner() {
-        let key = ReactionKey::new("welcome_reactor", Uuid::nil());
+        let key = EffectKey::new("welcome_reactor", Uuid::nil());
         // Stable across calls.
         assert_eq!(key.output_event_id(0), key.output_event_id(0));
         // Distinct per index.
@@ -159,8 +159,8 @@ mod tests {
 
     #[tokio::test]
     async fn remember_computes_once_then_replays() {
-        let cache = InMemoryReactionCache::new();
-        let key = ReactionKey::new("r", Uuid::new_v4());
+        let cache = InMemoryEffectStore::new();
+        let key = EffectKey::new("r", Uuid::new_v4());
         let calls = Arc::new(AtomicU32::new(0));
 
         let c1 = calls.clone();
@@ -187,8 +187,8 @@ mod tests {
 
     #[tokio::test]
     async fn put_is_first_write_wins() {
-        let cache = InMemoryReactionCache::new();
-        let key = ReactionKey::new("r", Uuid::new_v4());
+        let cache = InMemoryEffectStore::new();
+        let key = EffectKey::new("r", Uuid::new_v4());
 
         let a = cache.put(&key, serde_json::json!("first")).await.unwrap();
         assert_eq!(a, serde_json::json!("first"));

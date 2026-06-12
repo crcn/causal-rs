@@ -316,7 +316,7 @@ mod tests {
             metadata:       &meta,
             aggregators:    None,
             logs:           None,
-            reaction_cache: None,
+            effect_store: None,
         };
 
         let events = r.react(&trigger, ctx).await.unwrap();

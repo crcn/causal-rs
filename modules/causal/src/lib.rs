@@ -103,7 +103,7 @@ pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
 pub mod projector;
-pub mod reaction_cache;
+pub mod effect_store;
 pub mod reactor_observer;
 pub mod reactor_runner;
 pub mod reactor;
@@ -164,7 +164,7 @@ pub use reactor_observer::{NoopObserver, ReactorObserver};
 
 // Reactor idempotency (Phase 4 foundation): memoize side-effecting
 // reactions so at-least-once delivery is safe; deterministic emit ids.
-pub use reaction_cache::{remember, InMemoryReactionCache, ReactionCache, ReactionKey};
+pub use effect_store::{remember, InMemoryEffectStore, EffectStore, EffectKey};
 
 // Backend traits (users typically cast `Arc<dyn ...>` at builder time)
 pub use checkpoint_store::{CheckpointStore, ReactorCheckpoint};

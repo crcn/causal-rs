@@ -58,11 +58,11 @@ pub struct Ctx<'a> {
     /// path, projector body, tests that construct Ctx by hand).
     pub(crate) logs: Option<&'a Mutex<Vec<LogEntry>>>,
     /// Optional reaction-result cache (Phase 4). Lets a side-effecting
-    /// reactor memoize its external call under its [`ReactionKey`] so
+    /// reactor memoize its external call under its [`EffectKey`] so
     /// redelivery / retry runs the call effectively once. `None` unless
-    /// the engine was built with `EngineBuilder::with_reaction_cache`.
-    pub(crate) reaction_cache:
-        Option<&'a Arc<dyn crate::reaction_cache::ReactionCache>>,
+    /// the engine was built with `EngineBuilder::with_effect_store`.
+    pub(crate) effect_store:
+        Option<&'a Arc<dyn crate::effect_store::EffectStore>>,
 }
 
 impl<'a> std::fmt::Debug for Ctx<'a> {
@@ -74,7 +74,7 @@ impl<'a> std::fmt::Debug for Ctx<'a> {
             .field("correlation_id", &self.correlation_id)
             .field("metadata", &self.metadata)
             .field("has_aggregators", &self.aggregators.is_some())
-            .field("has_reaction_cache", &self.reaction_cache.is_some())
+            .field("has_effect_store", &self.effect_store.is_some())
             .finish()
     }
 }
@@ -155,25 +155,25 @@ impl<'a> Ctx<'a> {
     }
 
     /// The reaction-result cache, if the engine was built with one via
-    /// `EngineBuilder::with_reaction_cache`. Combine with
-    /// [`Ctx::reaction_key`] + [`crate::remember`] to make a
+    /// `EngineBuilder::with_effect_store`. Combine with
+    /// [`Ctx::effect_key`] + [`crate::remember`] to make a
     /// side-effecting reactor idempotent under redelivery / retry:
     ///
     /// ```ignore
-    /// let key = ctx.reaction_key(Self::NAME);
-    /// let out = causal::remember(ctx.reaction_cache().unwrap(), &key, || async {
+    /// let key = ctx.effect_key(Self::NAME);
+    /// let out = causal::remember(ctx.effect_store().unwrap(), &key, || async {
     ///     expensive_external_call().await   // runs once per reaction
     /// }).await?;
     /// ```
-    pub fn reaction_cache(&self) -> Option<&Arc<dyn crate::reaction_cache::ReactionCache>> {
-        self.reaction_cache
+    pub fn effect_store(&self) -> Option<&Arc<dyn crate::effect_store::EffectStore>> {
+        self.effect_store
     }
 
-    /// Build the [`ReactionKey`](crate::reaction_cache::ReactionKey) for
+    /// Build the [`EffectKey`](crate::effect_store::EffectKey) for
     /// this reaction — `(group, this trigger's event_id)`. Pass your
     /// `Reactor::NAME`.
-    pub fn reaction_key(&self, group: &str) -> crate::reaction_cache::ReactionKey {
-        crate::reaction_cache::ReactionKey::new(group, self.event_id)
+    pub fn effect_key(&self, group: &str) -> crate::effect_store::EffectKey {
+        crate::effect_store::EffectKey::new(group, self.event_id)
     }
 
     /// Memoize a side-effecting computation under this reaction's key.
@@ -188,21 +188,21 @@ impl<'a> Ctx<'a> {
     /// ```
     ///
     /// Errors if no cache was configured
-    /// (`EngineBuilder::with_reaction_cache`).
+    /// (`EngineBuilder::with_effect_store`).
     pub async fn remember<F, Fut, T>(&self, group: &str, compute: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let cache = self.reaction_cache.ok_or_else(|| {
+        let cache = self.effect_store.ok_or_else(|| {
             anyhow::anyhow!(
-                "ctx.remember called but no ReactionCache was configured \
-                 (EngineBuilder::with_reaction_cache)"
+                "ctx.remember called but no EffectStore was configured \
+                 (EngineBuilder::with_effect_store)"
             )
         })?;
-        let key = crate::reaction_cache::ReactionKey::new(group, self.event_id);
-        crate::reaction_cache::remember(&**cache, &key, compute).await
+        let key = crate::effect_store::EffectKey::new(group, self.event_id);
+        crate::effect_store::remember(&**cache, &key, compute).await
     }
 }
 
@@ -228,7 +228,7 @@ mod tests {
             metadata:       &meta,
             aggregators:    None,
             logs:           None,
-            reaction_cache: None,
+            effect_store: None,
         };
         assert_eq!(ctx.now(), occurred);
     }
@@ -247,7 +247,7 @@ mod tests {
             metadata:       &meta,
             aggregators:    None,
             logs:           None,
-            reaction_cache: None,
+            effect_store: None,
         };
         assert_eq!(
             ctx.metadata.get("_phase").and_then(|v| v.as_str()),

@@ -443,8 +443,8 @@ pub struct EngineBuilder {
     observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     /// Reaction-result cache (Phase 4). Plumbed into every `ReactorRunner`
     /// registered *after* this is set (same ordering rule as `observer`),
-    /// surfaced to reactor bodies via `ctx.reaction_cache()`.
-    reaction_cache:        Option<Arc<dyn crate::reaction_cache::ReactionCache>>,
+    /// surfaced to reactor bodies via `ctx.effect_store()`.
+    effect_store:        Option<Arc<dyn crate::effect_store::EffectStore>>,
     /// Per-correlation high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
@@ -487,7 +487,7 @@ impl EngineBuilder {
             failure_mapper: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             observer: None,
-            reaction_cache: None,
+            effect_store: None,
             corr_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
@@ -495,20 +495,20 @@ impl EngineBuilder {
         }
     }
 
-    /// Register a [`ReactionCache`](crate::reaction_cache::ReactionCache)
-    /// surfaced to reactor bodies via `ctx.reaction_cache()`. Lets a
+    /// Register a [`EffectStore`](crate::effect_store::EffectStore)
+    /// surfaced to reactor bodies via `ctx.effect_store()`. Lets a
     /// side-effecting reactor memoize its external call under its
-    /// [`ReactionKey`](crate::reaction_cache::ReactionKey) so retry /
+    /// [`EffectKey`](crate::effect_store::EffectKey) so retry /
     /// redelivery runs the call effectively once.
     ///
     /// Ordering: like [`with_observer`](Self::with_observer), this is
     /// plumbed into reactors registered *after* this call. Set it before
     /// `with_reactor(...)`.
-    pub fn with_reaction_cache(
+    pub fn with_effect_store(
         mut self,
-        cache: Arc<dyn crate::reaction_cache::ReactionCache>,
+        cache: Arc<dyn crate::effect_store::EffectStore>,
     ) -> Self {
-        self.reaction_cache = Some(cache);
+        self.effect_store = Some(cache);
         self
     }
 
@@ -743,7 +743,7 @@ impl EngineBuilder {
         let failure_mapper = self.failure_mapper.clone();
         let max_attempts = self.max_attempts;
         let observer = self.observer.clone();
-        let reaction_cache = self.reaction_cache.clone();
+        let effect_store = self.effect_store.clone();
         let corr_hw = self.corr_hw.clone();
         let snapshot_store = self.snapshot_store.clone();
         let snapshot_every = self.snapshot_every;
@@ -754,7 +754,7 @@ impl EngineBuilder {
                 runner = runner.with_terminal_failure(mapper, max_attempts);
             }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
-            if let Some(rc) = reaction_cache { runner = runner.with_reaction_cache(rc); }
+            if let Some(rc) = effect_store { runner = runner.with_effect_store(rc); }
             runner = runner.with_engine_aggregators(engine_aggs);
             runner = runner.with_settle_tracker(corr_hw);
             runner = runner.with_snapshot_persistence(snapshot_store, snapshot_every);
@@ -2861,11 +2861,11 @@ mod tests {
             .unwrap();
     }
 
-    // ── Phase 4 — ReactionCache wired into the reactor path ──
+    // ── Phase 4 — EffectStore wired into the reactor path ──
 
     #[tokio::test]
-    async fn reaction_cache_dedups_side_effect_across_retry() {
-        use crate::reaction_cache::{InMemoryReactionCache, ReactionCache};
+    async fn effect_store_dedups_side_effect_across_retry() {
+        use crate::effect_store::{InMemoryEffectStore, EffectStore};
         use std::sync::atomic::{AtomicU32, Ordering};
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2918,14 +2918,14 @@ mod tests {
         let store = store();
         let external_calls = Arc::new(AtomicU32::new(0));
         let attempts = Arc::new(AtomicU32::new(0));
-        let cache = Arc::new(InMemoryReactionCache::new());
+        let cache = Arc::new(InMemoryEffectStore::new());
 
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
-        .with_reaction_cache(cache.clone() as Arc<dyn ReactionCache>)
+        .with_effect_store(cache.clone() as Arc<dyn EffectStore>)
         .with_reactor(CachedSideEffect {
             external_calls: external_calls.clone(),
             attempts: attempts.clone(),
@@ -2946,7 +2946,7 @@ mod tests {
         assert_eq!(
             external_calls.load(Ordering::SeqCst),
             1,
-            "external call ran once despite the retry — ReactionCache deduped it",
+            "external call ran once despite the retry — EffectStore deduped it",
         );
         engine.shutdown().await.unwrap();
     }
