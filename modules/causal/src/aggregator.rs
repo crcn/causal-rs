@@ -289,7 +289,7 @@ pub struct FoldGap {
 /// split-brain between separate maps. They are what makes folds
 /// **idempotent**: `apply_event` is a no-op for an event the entry has
 /// already seen, so checkpoint-set retries, crash redelivery, and
-/// DLQ-advance never double-count — fold tracks the log, not body
+/// terminal-failure advance never double-count — fold tracks the log, not body
 /// success (2026-06-10 audit remediation, Phase A2; the old
 /// capture/restore rollback machinery this replaces was deleted —
 /// rolling back a fold because a *body* failed desynced state from
@@ -887,7 +887,7 @@ impl Default for AggregatorRegistry {
 
 /// Fold one event into `reg`, repairing revision gaps by read-through
 /// on the aggregate's own stream. **This is the fold entry point** for
-/// every caller with log access (engine emit/append, runners, DLQ,
+/// every caller with log access (engine emit/append, runners, terminal-failure,
 /// hydration); raw [`AggregatorRegistry::apply_event`] never repairs.
 ///
 /// Gaps arise when (a) the entry was never folded/restored (fresh

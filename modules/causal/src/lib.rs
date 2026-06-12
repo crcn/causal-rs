@@ -146,7 +146,7 @@ pub use reactor::{Events, Reactor};
 pub use engine::{
     Engine, EngineBuilder,
     EmitBuilder, EmitResult, SettledEmit,
-    DlqInfo,
+    TerminalFailure,
     MultiProjectorRegistration, ProjectorRegistration, ReactorRegistration,
 };
 

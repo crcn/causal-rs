@@ -4,7 +4,7 @@
 //! This is the configuration `rootsignal` plans to ship: KurrentDB
 //! as the durable event log (per-aggregate streams, `$all`,
 //! server-side projections) and Postgres as the reactor/projection
-//! cursor + DLQ-attempt store (`PgReactorCheckpoint`). The roadmap
+//! cursor + terminal-failure-attempt store (`PgReactorCheckpoint`). The roadmap
 //! calls this "Option B (hybrid)" — see
 //! `docs/plans/2026-03-06-kurrentdb-integration-roadmap.md`.
 //!

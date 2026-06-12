@@ -3,7 +3,7 @@
 //! Reactors append their outputs directly to the log and advance their
 //! cursor (at-least-once + idempotent) — there's no outbox. This type
 //! provides per-consumer checkpoint storage (`causal_checkpoints`) plus
-//! the DLQ retry-attempt counters used to enforce a reactor's retry budget.
+//! the failure store retry-attempt counters used to enforce a reactor's retry budget.
 
 #[cfg(feature = "postgres")]
 mod pg {
@@ -25,7 +25,7 @@ mod pg {
     ///
     /// Reactor-attempt counters are held in-memory in a DashMap (not
     /// persisted). Survives within one PgReactorCheckpoint instance;
-    /// process restart resets counts. Acceptable for the DLQ
+    /// process restart resets counts. Acceptable for the failure store
     /// retry-budget use case — restarting a process effectively
     /// retries everything from scratch anyway, and re-incrementing
     /// the counter from zero hits the cap again before too long.
@@ -81,9 +81,9 @@ mod pg {
         async fn record_reactor_attempt(
             &self,
             consumer_id: &str,
-            source_event_id: Uuid,
+            trigger_id: Uuid,
         ) -> Result<u32> {
-            let key = (consumer_id.to_string(), source_event_id);
+            let key = (consumer_id.to_string(), trigger_id);
             let mut entry = self.reactor_attempts.entry(key).or_insert(0);
             *entry += 1;
             Ok(*entry)
@@ -92,10 +92,10 @@ mod pg {
         async fn clear_reactor_attempts(
             &self,
             consumer_id: &str,
-            source_event_id: Uuid,
+            trigger_id: Uuid,
         ) -> Result<()> {
             self.reactor_attempts
-                .remove(&(consumer_id.to_string(), source_event_id));
+                .remove(&(consumer_id.to_string(), trigger_id));
             Ok(())
         }
     }

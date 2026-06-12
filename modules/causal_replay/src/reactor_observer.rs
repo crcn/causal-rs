@@ -159,7 +159,7 @@ mod pg {
             });
         }
 
-        fn reactor_dlq(
+        fn reactor_terminal_failure(
             &self,
             event_id: Uuid,
             reactor_id: &str,

@@ -60,8 +60,8 @@ pub trait ReactorObserver: Send + Sync + 'static {
 
     /// Called after `react()` exhausted its retry budget — terminal
     /// failure. The runner advances its cursor past this event and
-    /// (if `on_dlq` is configured) synthesizes a downstream fact.
-    fn reactor_dlq(
+    /// (if `on_terminal_failure` is configured) synthesizes a downstream fact.
+    fn reactor_terminal_failure(
         &self,
         _event_id: Uuid,
         _reactor_id: &str,

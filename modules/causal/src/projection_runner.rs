@@ -10,7 +10,7 @@
 //!
 //! Failure handling is `BlockUntilFixed` only (per the impl plan):
 //! `project` errors stop cursor advance and propagate up; the
-//! supervisor decides retry timing. `AdvanceAfter` (DLQ-skip) lands
+//! supervisor decides retry timing. `AdvanceAfter` (park-and-skip) lands
 //! in a later phase together with the runner-level `RetryPolicy`.
 
 use std::sync::Arc;

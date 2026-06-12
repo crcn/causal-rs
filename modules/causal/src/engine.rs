@@ -213,7 +213,7 @@ impl SettleTracker {
 pub(crate) type CorrHighWater = Arc<std::sync::Mutex<SettleTracker>>;
 
 /// Metadata about a reactor that has exhausted its retry budget,
-/// passed to the [`EngineBuilder::on_dlq`] mapper. The mapper
+/// passed to the [`EngineBuilder::on_terminal_failure`] mapper. The mapper
 /// decides whether to synthesize a terminal-failure Event and append
 /// it to its stream so downstream consumers can react.
 ///
@@ -221,20 +221,20 @@ pub(crate) type CorrHighWater = Arc<std::sync::Mutex<SettleTracker>>;
 /// emitted on terminal reactor failure so `PipelineState` can fold
 /// it and unblock downstream gates.
 #[derive(Debug, Clone)]
-pub struct DlqInfo {
+pub struct TerminalFailure {
     /// `Reactor::NAME` of the failing reactor.
-    pub group_name:        String,
+    pub consumer:        String,
     /// `event_id` of the trigger that caused the failure.
-    pub source_event_id:   Uuid,
+    pub trigger_id:   Uuid,
     /// `event_type` of the trigger (canonical `{CATEGORY}:{name}`).
-    pub source_event_type: String,
+    pub trigger_event_type: String,
     /// Last error message from the reactor's `react()`.
     pub error:             String,
     /// Number of attempts that ran before declaring terminal
     /// failure (equal to `max_attempts`).
     pub attempts:          u32,
     /// `correlation_id` of the failing trigger — its run / causal chain.
-    /// The DLQ-synthesized event already inherits this; exposing it lets the
+    /// The terminal-failure-synthesized event already inherits this; exposing it lets the
     /// mapper key its terminal-failure event per-run (e.g. stream-by-`run_id`)
     /// so a dead-letter can still unblock that run's downstream gates.
     pub correlation_id:    Uuid,
@@ -412,13 +412,13 @@ type RunnerFactory = Box<
         + Send,
 >;
 
-/// Type-erased DLQ mapper plumbed from
-/// `EngineBuilder::on_dlq` into each `ReactorRunner`.
-pub(crate) type DlqMapperArc = Arc<
-    dyn Fn(DlqInfo) -> Option<Box<dyn ErasedFact>> + Send + Sync,
+/// Type-erased terminal-failure mapper plumbed from
+/// `EngineBuilder::on_terminal_failure` into each `ReactorRunner`.
+pub(crate) type TerminalFailureMapper = Arc<
+    dyn Fn(TerminalFailure) -> Option<Box<dyn ErasedFact>> + Send + Sync,
 >;
 
-/// Framework default for `max_attempts` when `on_dlq` is configured.
+/// Framework default for `max_attempts` when `on_terminal_failure` is configured.
 /// Reactors retry up to this many times before the mapper fires.
 pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
@@ -431,14 +431,14 @@ pub struct EngineBuilder {
     reactor_checkpoint:    Arc<dyn ReactorCheckpoint>,
     consumers:             Vec<RunnerFactory>,
     aggregators:           Vec<Aggregator>,
-    group_names:           std::collections::HashSet<String>,
+    consumer_names:           std::collections::HashSet<String>,
     /// Categories registered via [`with_aggregate`](Self::with_aggregate)
     /// as `StreamPolicy::OccRequired`. `Engine::emit` rejects facts in
     /// these categories — they must go through the OCC command path
     /// [`Engine::append`].
     occ_categories:        std::collections::HashSet<String>,
     default_metadata:      Metadata,
-    dlq_mapper:            Option<DlqMapperArc>,
+    failure_mapper:            Option<TerminalFailureMapper>,
     max_attempts:          u32,
     observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     /// Reaction-result cache (Phase 4). Plumbed into every `ReactorRunner`
@@ -457,7 +457,7 @@ pub struct EngineBuilder {
     /// Save a snapshot every N folded events per aggregate. `0` disables saving
     /// (restore still works via full replay).
     snapshot_every:        u64,
-    /// `(group_name, start_position)` per registered reactor — consumed by
+    /// `(consumer, start_position)` per registered reactor — consumed by
     /// `build()` to seed absent reactor cursors BEFORE consumers spawn.
     /// Projectors are deliberately absent: read models start from ZERO
     /// (they want full history); side effects must not replay it.
@@ -481,10 +481,10 @@ impl EngineBuilder {
             reactor_checkpoint,
             consumers: Vec::new(),
             aggregators: Vec::new(),
-            group_names: std::collections::HashSet::new(),
+            consumer_names: std::collections::HashSet::new(),
             occ_categories: std::collections::HashSet::new(),
             default_metadata: Metadata::new(),
-            dlq_mapper: None,
+            failure_mapper: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             observer: None,
             reaction_cache: None,
@@ -544,7 +544,7 @@ impl EngineBuilder {
         self
     }
 
-    /// Register a DLQ mapper. When any reactor's `react()` errors
+    /// Register a terminal-failure mapper. When any reactor's `react()` errors
     /// `max_attempts` times in a row on the same trigger event, the
     /// runner stops retrying and invokes the mapper with the
     /// failure details. If the mapper returns `Some(fact)`, the
@@ -556,14 +556,14 @@ impl EngineBuilder {
     /// downstream progress.
     ///
     /// Use case in scout: synthesize `PipelineEvent::HandlerFailed`
-    /// from `DlqInfo`; `PipelineState` folds it and unblocks
-    /// downstream gates based on `info.group_name`.
-    pub fn on_dlq<F, Out>(mut self, mapper: F) -> Self
+    /// from `TerminalFailure`; `PipelineState` folds it and unblocks
+    /// downstream gates based on `info.consumer`.
+    pub fn on_terminal_failure<F, Out>(mut self, mapper: F) -> Self
     where
-        F: Fn(DlqInfo) -> Option<Out> + Send + Sync + 'static,
+        F: Fn(TerminalFailure) -> Option<Out> + Send + Sync + 'static,
         Out: Event,
     {
-        self.dlq_mapper = Some(Arc::new(move |info| {
+        self.failure_mapper = Some(Arc::new(move |info| {
             mapper(info).map(|f| Box::new(f) as Box<dyn ErasedFact>)
         }));
         self
@@ -571,7 +571,7 @@ impl EngineBuilder {
 
     /// Override the framework's default retry budget for reactors.
     /// Default is [`DEFAULT_MAX_ATTEMPTS`] (3). Applies only when
-    /// `on_dlq` is also configured — without a mapper, reactors
+    /// `on_terminal_failure` is also configured — without a mapper, reactors
     /// retry indefinitely (supervisor backoff).
     pub fn with_max_attempts(mut self, n: u32) -> Self {
         self.max_attempts = n;
@@ -619,12 +619,12 @@ impl EngineBuilder {
     /// Reserve a `NAME` for a consumer. Panics if another
     /// consumer in this builder already claimed it — two consumers
     /// sharing a cursor key would silently corrupt each other.
-    fn claim_group_name(&mut self, group_name: &'static str) {
+    fn claim_name(&mut self, consumer: &'static str) {
         assert!(
-            self.group_names.insert(group_name.into()),
+            self.consumer_names.insert(consumer.into()),
             "duplicate NAME `{}` registered on EngineBuilder — \
              two consumers MUST NOT share a cursor key",
-            group_name,
+            consumer,
         );
     }
 
@@ -655,7 +655,7 @@ impl EngineBuilder {
             // Reject duplicate Aggregate::NAME within one builder —
             // two aggregators sharing the registry key
             // `{NAME}:{id}` would silently overwrite each other's
-            // state. Same protective pattern as `claim_group_name`.
+            // state. Same protective pattern as `claim_name`.
             //
             // Multiple aggregators with the same NAME folding
             // DIFFERENT Event types into one Aggregate (the multi-Event
@@ -716,7 +716,7 @@ impl EngineBuilder {
     where
         P::Event: DeserializeOwned,
     {
-        self.claim_group_name(P::NAME);
+        self.claim_name(P::NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
@@ -733,14 +733,14 @@ impl EngineBuilder {
     where
         R::Trigger: DeserializeOwned,
     {
-        self.claim_group_name(R::NAME);
+        self.claim_name(R::NAME);
         self.reactor_seeds.push((
             R::NAME,
             crate::projection::StartPosition::ResumeOrLatest,
         ));
         let log = self.log.clone();
         let reactor_checkpoint = self.reactor_checkpoint.clone();
-        let dlq_mapper = self.dlq_mapper.clone();
+        let failure_mapper = self.failure_mapper.clone();
         let max_attempts = self.max_attempts;
         let observer = self.observer.clone();
         let reaction_cache = self.reaction_cache.clone();
@@ -750,8 +750,8 @@ impl EngineBuilder {
         self.consumers.push(Box::new(move |aggs, engine_aggs, occ| {
             let mut runner = ReactorRunner::new(r, R::NAME, log, reactor_checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
-            if let Some(mapper) = dlq_mapper {
-                runner = runner.with_dlq(mapper, max_attempts);
+            if let Some(mapper) = failure_mapper {
+                runner = runner.with_terminal_failure(mapper, max_attempts);
             }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
             if let Some(rc) = reaction_cache { runner = runner.with_reaction_cache(rc); }
@@ -779,7 +779,7 @@ impl EngineBuilder {
     /// For single-Event consumers, use [`Self::with_projector`] — it
     /// deserializes for you.
     pub fn with_multi_projector<P: MultiProjector + 'static>(mut self, p: P) -> Self {
-        self.claim_group_name(P::NAME);
+        self.claim_name(P::NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
@@ -905,7 +905,7 @@ impl EngineBuilder {
             .into_iter()
             .map(|f| f(make_registry(), engine_aggregators.clone(), occ_shared.clone()))
             .collect();
-        let consumer_ids: Vec<String> = self.group_names.into_iter().collect();
+        let consumer_ids: Vec<String> = self.consumer_names.into_iter().collect();
         Ok(Engine::start(
             self.log,
             self.checkpoint,
@@ -2622,7 +2622,7 @@ mod tests {
     // ── C4 — OCC fence: reactors cannot emit into OCC-required categories ──
 
     #[tokio::test]
-    async fn reactor_emitting_into_occ_category_is_dlqd_not_appended() {
+    async fn reactor_emitting_into_occ_category_is_terminal_failured_not_appended() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // A reactor that (wrongly) emits a CounterFact — whose category
@@ -2642,16 +2642,16 @@ mod tests {
         }
 
         let store = store();
-        let dlq_hits = std::sync::Arc::new(AtomicUsize::new(0));
-        let dlq_hits_c = dlq_hits.clone();
+        let terminal_failure_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let terminal_failure_hits_c = terminal_failure_hits.clone();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregate::<Counter, CounterFact>() // marks "counter" OCC-required
-        .on_dlq(move |info: DlqInfo| {
-            dlq_hits_c.fetch_add(1, Ordering::SeqCst);
+        .on_terminal_failure(move |info: TerminalFailure| {
+            terminal_failure_hits_c.fetch_add(1, Ordering::SeqCst);
             assert!(info.error.contains("OCC-required"), "got: {}", info.error);
             None::<CounterFact> // no synthesized fact
         })
@@ -2662,13 +2662,13 @@ mod tests {
         engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
             .settled().await.unwrap();
 
-        // Give the reactor a moment to process + DLQ.
+        // Give the reactor a moment to process + terminal-failure.
         for _ in 0..50 {
-            if dlq_hits.load(Ordering::SeqCst) > 0 { break; }
+            if terminal_failure_hits.load(Ordering::SeqCst) > 0 { break; }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(dlq_hits.load(Ordering::SeqCst), 1,
-                   "the OCC-fence violation was routed to the DLQ");
+        assert_eq!(terminal_failure_hits.load(Ordering::SeqCst), 1,
+                   "the OCC-fence violation was routed to the failure store");
 
         // The CounterFact never landed in the "counter" stream.
         let counter_stream = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 100)
@@ -3381,7 +3381,7 @@ mod tests {
 
     #[tokio::test]
     #[should_panic(expected = "duplicate NAME `users`")]
-    async fn registering_two_consumers_with_same_group_name_panics() {
+    async fn registering_two_consumers_with_same_consumer_panics() {
         // Two UserRoster instances would share a cursor key — silent
         // corruption. EngineBuilder catches this at registration time.
         let store = store();
@@ -3502,14 +3502,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_on_dlq_mapper_drains_synthesized_fact_to_log() {
+    async fn engine_on_terminal_failure_mapper_drains_synthesized_fact_to_log() {
         // End-to-end: register a reactor that always fails on
-        // UserCreated. Configure on_dlq to synthesize HandlerFailed.
+        // UserCreated. Configure on_terminal_failure to synthesize HandlerFailed.
         // After settle, the log contains the synthesized fact.
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct HandlerFailed {
-            group_name: String,
+            consumer: String,
             attempts: u32,
         }
         impl Event for HandlerFailed {
@@ -3534,8 +3534,8 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
-        .on_dlq(|info: DlqInfo| Some(HandlerFailed {
-            group_name: info.group_name,
+        .on_terminal_failure(|info: TerminalFailure| Some(HandlerFailed {
+            consumer: info.consumer,
             attempts: info.attempts,
         }))
         .with_max_attempts(2)
@@ -3547,18 +3547,18 @@ mod tests {
             occurred_at: Utc::now(),
         }).await.unwrap();
 
-        // Wait until the reactor has retried + DLQ-mapped + the
+        // Wait until the reactor has retried + terminal-failure-mapped + the
         // synthetic fact has been appended to the log.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             let events = EventLogBackend::read_all(
                 store.as_ref(), LogCursor::ZERO, 10,
             ).await.unwrap();
-            let dlq_emitted = events.iter()
+            let terminal_failure_emitted = events.iter()
                 .any(|e| e.event_type == "ops:handler_failed");
-            if dlq_emitted { break; }
+            if terminal_failure_emitted { break; }
             assert!(std::time::Instant::now() < deadline,
-                    "DLQ-mapped fact never made it to the log");
+                    "terminal-failure-mapped fact never made it to the log");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -4245,7 +4245,7 @@ mod tests {
         // 2; the idempotency gate skips the re-fold, so count stays 2
         // and the body completes. (The old capture/restore rollback
         // this replaces could permanently desync registry from cursor
-        // on the DLQ path.)
+        // on the terminal-failure path.)
         struct FailsOnSecond { calls: Arc<AtomicUsize> }
         #[async_trait]
         impl Projector for FailsOnSecond {

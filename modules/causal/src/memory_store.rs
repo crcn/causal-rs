@@ -77,7 +77,7 @@ pub struct MemoryStore {
     snapshots: Arc<DashMap<(String, Uuid), Snapshot>>,
     /// Per-projection cursor + status.
     projection_cursors: Arc<DashMap<String, ProjectionCursorEntry>>,
-    /// DLQ attempt counter keyed by (consumer_id, source_event_id).
+    /// terminal-failure attempt counter keyed by (consumer_id, trigger_id).
     /// Survives ReactorRunner reconstruction within the store's
     /// lifetime; lost on process crash (matches MemoryStore's
     /// "no durability" position).
@@ -269,7 +269,7 @@ impl ReactorObserver for MemoryStore {
         }
     }
 
-    fn reactor_dlq(
+    fn reactor_terminal_failure(
         &self,
         event_id: Uuid,
         reactor_id: &str,
@@ -575,9 +575,9 @@ impl ReactorCheckpoint for MemoryStore {
     async fn record_reactor_attempt(
         &self,
         consumer_id: &str,
-        source_event_id: Uuid,
+        trigger_id: Uuid,
     ) -> Result<u32> {
-        let key = (consumer_id.to_string(), source_event_id);
+        let key = (consumer_id.to_string(), trigger_id);
         let mut entry = self.reactor_attempts.entry(key).or_insert(0);
         *entry += 1;
         Ok(*entry)
@@ -586,9 +586,9 @@ impl ReactorCheckpoint for MemoryStore {
     async fn clear_reactor_attempts(
         &self,
         consumer_id: &str,
-        source_event_id: Uuid,
+        trigger_id: Uuid,
     ) -> Result<()> {
-        let key = (consumer_id.to_string(), source_event_id);
+        let key = (consumer_id.to_string(), trigger_id);
         self.reactor_attempts.remove(&key);
         Ok(())
     }

@@ -132,17 +132,17 @@ impl ReactorCheckpoint for FaultInjector {
     async fn record_reactor_attempt(
         &self,
         consumer_id: &str,
-        source_event_id: Uuid,
+        trigger_id: Uuid,
     ) -> Result<u32> {
-        self.inner.record_reactor_attempt(consumer_id, source_event_id).await
+        self.inner.record_reactor_attempt(consumer_id, trigger_id).await
     }
 
     async fn clear_reactor_attempts(
         &self,
         consumer_id: &str,
-        source_event_id: Uuid,
+        trigger_id: Uuid,
     ) -> Result<()> {
-        self.inner.clear_reactor_attempts(consumer_id, source_event_id).await
+        self.inner.clear_reactor_attempts(consumer_id, trigger_id).await
     }
 }
 

@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::ReactorCheckpoint;
 use crate::contexts::Ctx;
-use crate::engine::{DlqInfo, DlqMapperArc};
+use crate::engine::{TerminalFailure, TerminalFailureMapper};
 use crate::event_log::EventLogBackend;
 use crate::event::Event;
 use crate::projection_runner::StepOutcome;
@@ -90,13 +90,13 @@ pub struct ReactorRunner<R: Reactor> {
     checkpoint:  Arc<dyn ReactorCheckpoint>,
     aggregators: Option<Arc<AggregatorRegistry>>,
     hydrated:    OnceCell<()>,
-    /// DLQ mapper for terminal-failure handling. When `react()`
+    /// terminal-failure mapper for terminal-failure handling. When `react()`
     /// errors `max_attempts` times on the same trigger, the mapper
     /// is invoked; if it returns `Some(fact)`, the synthesized
     /// fact is appended directly to its stream and the cursor advances
     /// past the failing event.
-    dlq_mapper:  Option<DlqMapperArc>,
-    /// Retry budget — applies only when `dlq_mapper` is set. Without
+    failure_mapper:  Option<TerminalFailureMapper>,
+    /// Retry budget — applies only when `failure_mapper` is set. Without
     /// a mapper, reactors retry indefinitely (supervisor backoff).
     max_attempts: u32,
     /// Inspector / telemetry hook. Default `None` = zero overhead.
@@ -146,7 +146,7 @@ where
             checkpoint,
             aggregators: None,
             hydrated: OnceCell::new(),
-            dlq_mapper: None,
+            failure_mapper: None,
             max_attempts: 0,
             observer: None,
             reaction_cache: None,
@@ -224,30 +224,30 @@ where
         self
     }
 
-    /// Configure terminal-failure DLQ handling. After `max_attempts`
+    /// Configure terminal-failure terminal-failure handling. After `max_attempts`
     /// consecutive `react()` errors on the same trigger, the mapper
     /// is invoked; on `Some(fact)`, the fact is appended directly to its
     /// stream and the cursor advances past the failing event.
     /// Without this, errored reactors retry indefinitely.
-    pub(crate) fn with_dlq(mut self, mapper: DlqMapperArc, max_attempts: u32) -> Self {
-        self.dlq_mapper = Some(mapper);
+    pub(crate) fn with_terminal_failure(mut self, mapper: TerminalFailureMapper, max_attempts: u32) -> Self {
+        self.failure_mapper = Some(mapper);
         self.max_attempts = max_attempts;
         self
     }
 
     pub fn consumer_id(&self) -> &str { &self.consumer_id }
 
-    /// Terminal-failure routing into the DLQ. Invokes the mapper, appends
+    /// Terminal-failure routing into the failure store. Invokes the mapper, appends
     /// its synthesized fact (if any) to that fact's own stream, folds it
     /// into the engine registry, advances the cursor past `event`, and
-    /// clears the attempt counter **last** (so a failed DLQ append can't
-    /// reset the budget and a crash mid-DLQ can't replay it). Caller
-    /// guarantees `self.dlq_mapper` is `Some` and the failure is terminal.
+    /// clears the attempt counter **last** (so a failed terminal-failure append can't
+    /// reset the budget and a crash mid-terminal-failure can't replay it). Caller
+    /// guarantees `self.failure_mapper` is `Some` and the failure is terminal.
     ///
     /// Shared by the react()-error path (terminal after `max_attempts`)
     /// and the trigger-deserialization-poison path (terminal immediately —
     /// re-parsing is deterministic, so retries never help).
-    async fn route_to_dlq(
+    async fn park_terminal_failure(
         &self,
         event: &RecordedEvent,
         attempts: u32,
@@ -255,11 +255,11 @@ where
         completed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
         let mapper = self
-            .dlq_mapper
+            .failure_mapper
             .as_ref()
-            .expect("route_to_dlq requires a configured DLQ mapper");
+            .expect("park_terminal_failure requires a configured terminal-failure mapper");
         if let Some(obs) = self.observer.as_ref() {
-            obs.reactor_dlq(
+            obs.reactor_terminal_failure(
                 event.event_id,
                 &self.consumer_id,
                 event.correlation_id,
@@ -268,15 +268,15 @@ where
                 completed_at,
             );
         }
-        let info = DlqInfo {
-            group_name:        self.consumer_id.clone(),
-            source_event_id:   event.event_id,
-            source_event_type: event.event_type.clone(),
+        let info = TerminalFailure {
+            consumer:        self.consumer_id.clone(),
+            trigger_id:   event.event_id,
+            trigger_event_type: event.event_type.clone(),
             error,
             attempts,
             correlation_id:    event.correlation_id,
         };
-        // DLQ-synthesized output (if any) is appended directly to its own
+        // terminal-failure-synthesized output (if any) is appended directly to its own
         // stream. `output_index = u32::MAX` keeps its deterministic id
         // distinct from react() outputs.
         if let Some(fact) = mapper(info) {
@@ -346,11 +346,11 @@ where
             // Fold every event into the per-consumer aggregator registry.
             // Folds are idempotent on the event's stream coordinates (see
             // `AggregatorRegistry::apply_event`), so a step retry after a
-            // checkpoint-set failure, crash redelivery, or a DLQ advance
+            // checkpoint-set failure, crash redelivery, or a terminal-failure advance
             // re-delivers harmlessly — fold tracks the log, not body
             // success. (The old capture/restore rollback this replaces
             // un-folded state when the *body* failed, permanently
-            // desyncing registry from cursor on the DLQ path.)
+            // desyncing registry from cursor on the terminal-failure path.)
             if let Some(reg) = self.aggregators.as_ref() {
                 let outcome = crate::aggregator::fold_event(
                     reg,
@@ -385,7 +385,7 @@ where
             }
 
             // ── Record this attempt FIRST (before deserialization), so a
-            //    poison trigger engages the DLQ budget instead of wedging
+            //    poison trigger engages the terminal-failure budget instead of wedging
             //    the cursor before the counter ever increments.
             let attempt_seq = self.checkpoint
                 .record_reactor_attempt(&self.consumer_id, event.event_id)
@@ -394,7 +394,7 @@ where
 
             // Deserialize the trigger. A failure here is a poison pill —
             // deterministic, so retrying never helps. Route it straight to
-            // the DLQ (if a mapper is configured) so one malformed/
+            // the failure store (if a mapper is configured) so one malformed/
             // schema-drifted payload can't block the cursor forever;
             // without a mapper, propagate (block-until-fixed, the same
             // contract a react() error has without a mapper — an operator
@@ -406,8 +406,8 @@ where
                         "trigger deserialization failed for {} (event {}): {deser_err}",
                         event.event_type, event.event_id,
                     );
-                    if self.dlq_mapper.is_some() {
-                        self.route_to_dlq(&event, attempt_seq, msg, chrono::Utc::now()).await?;
+                    if self.failure_mapper.is_some() {
+                        self.park_terminal_failure(&event, attempt_seq, msg, chrono::Utc::now()).await?;
                         applied += 1;
                         continue;
                     }
@@ -457,7 +457,7 @@ where
             //    persisted. The whole batch from this trigger forward
             //    is retried on next step.
             //
-            //    UNLESS a DLQ mapper is configured AND attempts have
+            //    UNLESS a terminal-failure mapper is configured AND attempts have
             //    reached max — then synthesize the mapper's fact,
             //    append it directly to its stream, advance the cursor past
             //    the failing event, and clear the attempt counter.
@@ -492,8 +492,8 @@ where
                     // use attempt_seq for the cap check.
                     let attempts = attempt_seq;
 
-                    if self.dlq_mapper.is_some() && attempts >= self.max_attempts {
-                        self.route_to_dlq(&event, attempts, format!("{:#}", e), completed_at)
+                    if self.failure_mapper.is_some() && attempts >= self.max_attempts {
+                        self.park_terminal_failure(&event, attempts, format!("{:#}", e), completed_at)
                             .await?;
                         applied += 1;
                         continue;
@@ -523,7 +523,7 @@ where
             //    registered via `with_aggregate`. Emitting into such a
             //    category silently corrupts that aggregate's OCC
             //    guarantee — a deterministic config error, so route the
-            //    whole trigger to the DLQ (no retries) rather than append.
+            //    whole trigger to the failure store (no retries) rather than append.
             if !self.occ_categories.is_empty() {
                 if let Some(bad) = emitted.iter().find(|out| {
                     self.occ_categories
@@ -537,8 +537,8 @@ where
                          Engine::append command, not a reactor output",
                         self.consumer_id,
                     );
-                    if self.dlq_mapper.is_some() {
-                        self.route_to_dlq(&event, attempt_seq, msg, chrono::Utc::now()).await?;
+                    if self.failure_mapper.is_some() {
+                        self.park_terminal_failure(&event, attempt_seq, msg, chrono::Utc::now()).await?;
                         applied += 1;
                         continue;
                     }
@@ -1037,11 +1037,11 @@ mod tests {
         assert!(store.get("r.skip").await.unwrap().is_some());
     }
 
-    // ── DLQ — terminal-failure mapper after retry exhaustion ──
+    // ── terminal-failure — terminal-failure mapper after retry exhaustion ──
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct HandlerFailed {
-        group_name: String,
+        consumer: String,
         attempts:   u32,
     }
     impl Event for HandlerFailed {
@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dlq_attempt_count_persists_across_runner_instances() {
+    async fn terminal_failure_attempt_count_persists_across_runner_instances() {
         // The bug: ReactorRunner tracked attempts in an in-memory
         // HashMap. Process crash → on restart attempts reset to 0
         // → retry storm.
@@ -1078,13 +1078,13 @@ mod tests {
         };
         let _ = append_trigger(&store, &payload);
 
-        let dlq_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let mk_mapper = || -> DlqMapperArc {
-            let dlq_calls = dlq_calls.clone();
-            std::sync::Arc::new(move |info: DlqInfo| {
-                dlq_calls.fetch_add(1, Ordering::SeqCst);
+        let mapper_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mk_mapper = || -> TerminalFailureMapper {
+            let mapper_calls = mapper_calls.clone();
+            std::sync::Arc::new(move |info: TerminalFailure| {
+                mapper_calls.fetch_add(1, Ordering::SeqCst);
                 Some(Box::new(HandlerFailed {
-                    group_name: info.group_name,
+                    consumer: info.consumer,
                     attempts:   info.attempts,
                 }) as Box<dyn crate::engine::ErasedFact>)
             })
@@ -1096,11 +1096,11 @@ mod tests {
             "persist-attempts",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_dlq(mk_mapper(), 3);
+        ).with_terminal_failure(mk_mapper(), 3);
         assert!(runner_a.step(10).await.is_err());
         assert!(runner_a.step(10).await.is_err());
-        assert_eq!(dlq_calls.load(Ordering::SeqCst), 0,
-                   "no DLQ yet (2 attempts < 3)");
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0,
+                   "no terminal-failure mapper yet (2 attempts < 3)");
 
         // Drop runner_a — simulates engine restart.
         drop(runner_a);
@@ -1113,11 +1113,11 @@ mod tests {
             "persist-attempts",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_dlq(mk_mapper(), 3);
+        ).with_terminal_failure(mk_mapper(), 3);
 
         let outcome = runner_b.step(10).await.unwrap();
         assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
-        assert_eq!(dlq_calls.load(Ordering::SeqCst), 1,
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 1,
                    "third attempt across runners triggers mapper");
     }
 
@@ -1170,10 +1170,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poison_trigger_routes_to_dlq_and_does_not_wedge() {
+    async fn poison_trigger_parks_as_terminal_failure_and_does_not_wedge() {
         // B4: a payload that can't deserialize into the reactor's Trigger
         // is a poison pill — deterministic, so retrying never helps. With
-        // a DLQ mapper it must route to the DLQ immediately and advance
+        // a terminal-failure mapper it must route to the failure store immediately and advance
         // the cursor (not block forever before the attempt counter even
         // increments, the pre-B4 bug). A following valid trigger must
         // still process.
@@ -1196,12 +1196,12 @@ mod tests {
         };
         crate::append_event(store.as_ref(), poison).await.unwrap();
 
-        let dlq_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let dlq_calls_c = dlq_calls.clone();
-        let mapper: DlqMapperArc = std::sync::Arc::new(move |info: DlqInfo| {
-            dlq_calls_c.fetch_add(1, Ordering::SeqCst);
+        let mapper_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mapper_calls_c = mapper_calls.clone();
+        let mapper: TerminalFailureMapper = std::sync::Arc::new(move |info: TerminalFailure| {
+            mapper_calls_c.fetch_add(1, Ordering::SeqCst);
             assert!(info.error.contains("deserialization failed"),
-                    "DlqInfo carries the deser error: {}", info.error);
+                    "TerminalFailure carries the deser error: {}", info.error);
             None // no synthesized fact needed for this test
         });
 
@@ -1211,7 +1211,7 @@ mod tests {
         #[async_trait]
         impl Reactor for NeverReacts {
             type Trigger = OrderPlaced;
-            const NAME: &'static str = "poison.dlq";
+            const NAME: &'static str = "poison.park";
             async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
                 panic!("react must never run on a poison trigger");
             }
@@ -1219,23 +1219,23 @@ mod tests {
 
         let runner = ReactorRunner::new(
             NeverReacts,
-            "poison.dlq",
+            "poison.park",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
-        .with_dlq(mapper, 3);
+        .with_terminal_failure(mapper, 3);
 
         let outcome = runner.step(10).await.unwrap();
         assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
-        assert_eq!(dlq_calls.load(Ordering::SeqCst), 1,
-                   "poison DLQ'd immediately — no retries (deterministic)");
-        assert!(store.get("poison.dlq").await.unwrap().is_some(),
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 1,
+                   "poison parked as a terminal failure immediately — no retries (deterministic)");
+        assert!(store.get("poison.park").await.unwrap().is_some(),
                 "cursor advanced past the poison event — not wedged");
     }
 
     #[tokio::test]
-    async fn poison_trigger_without_dlq_propagates() {
-        // Without a DLQ mapper, a poison trigger propagates (block-until-
+    async fn poison_trigger_without_terminal_failure_propagates() {
+        // Without a terminal-failure mapper, a poison trigger propagates (block-until-
         // fixed) rather than silently skipping — the same contract a
         // react() error has without a mapper.
         let store = Arc::new(MemoryStore::new());
@@ -1270,13 +1270,13 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
-        assert!(runner.step(10).await.is_err(), "poison propagates without a DLQ");
+        assert!(runner.step(10).await.is_err(), "poison propagates without a terminal-failure");
         assert!(store.get("poison.block").await.unwrap().is_none(),
                 "cursor did NOT advance — block until fixed");
     }
 
     #[tokio::test]
-    async fn dlq_advance_keeps_aggregate_fold() {
+    async fn terminal_failure_advance_keeps_aggregate_fold() {
         // A2: "fold tracks the log, not body success." When a trigger
         // dead-letters, the cursor advances past it — and the fold MUST
         // stay applied, or the registry is permanently missing one fold
@@ -1304,22 +1304,22 @@ mod tests {
         reg.register(crate::aggregator::Aggregator::for_type::<OrderCount, OrderPlaced>());
         let reg = Arc::new(reg);
 
-        let mapper: DlqMapperArc = std::sync::Arc::new(
-            |_info: DlqInfo| -> Option<Box<dyn crate::engine::ErasedFact>> { None },
+        let mapper: TerminalFailureMapper = std::sync::Arc::new(
+            |_info: TerminalFailure| -> Option<Box<dyn crate::engine::ErasedFact>> { None },
         );
         let runner = ReactorRunner::new(
             AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
-            "dlq-keeps-fold",
+            "park-keeps-fold",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_aggregators(reg.clone())
-        .with_dlq(mapper, 1);
+        .with_terminal_failure(mapper, 1);
 
         // max_attempts = 1 → the first failure dead-letters and advances.
         let outcome = runner.step(10).await.unwrap();
         assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
-        assert!(store.get("dlq-keeps-fold").await.unwrap().is_some(),
+        assert!(store.get("park-keeps-fold").await.unwrap().is_some(),
                 "cursor advanced past the dead-lettered trigger");
 
         let (_, curr) = reg.get_transition_arc::<OrderCount>(order_id);
@@ -1339,7 +1339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_step_invokes_dlq_mapper_after_retry_exhaustion() {
+    async fn reactor_step_invokes_failure_mapper_after_retry_exhaustion() {
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
@@ -1348,18 +1348,18 @@ mod tests {
         let trigger_id = append_trigger(&store, &payload);
 
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let dlq_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let dlq_calls_c = dlq_calls.clone();
+        let mapper_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mapper_calls_c = mapper_calls.clone();
         // Capture the correlation_id the mapper is handed, so we can assert the
-        // mapper can see the failing trigger's run (per-run DLQ keying).
+        // mapper can see the failing trigger's run (per-run terminal-failure keying).
         let seen_corr = std::sync::Arc::new(std::sync::Mutex::new(None::<Uuid>));
         let seen_corr_c = seen_corr.clone();
 
-        let mapper: DlqMapperArc = std::sync::Arc::new(move |info: DlqInfo| {
-            dlq_calls_c.fetch_add(1, Ordering::SeqCst);
+        let mapper: TerminalFailureMapper = std::sync::Arc::new(move |info: TerminalFailure| {
+            mapper_calls_c.fetch_add(1, Ordering::SeqCst);
             *seen_corr_c.lock().unwrap() = Some(info.correlation_id);
             Some(Box::new(HandlerFailed {
-                group_name: info.group_name,
+                consumer: info.consumer,
                 attempts:   info.attempts,
             }) as Box<dyn crate::engine::ErasedFact>)
         });
@@ -1369,41 +1369,41 @@ mod tests {
             "always-fails",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_dlq(mapper, 3);
+        ).with_terminal_failure(mapper, 3);
 
-        // Attempt 1: fails, no DLQ yet (1 < 3).
+        // Attempt 1: fails, no terminal-failure mapper yet (1 < 3).
         assert!(runner.step(10).await.is_err());
-        assert_eq!(dlq_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0);
 
-        // Attempt 2: fails, no DLQ yet (2 < 3).
+        // Attempt 2: fails, no terminal-failure mapper yet (2 < 3).
         assert!(runner.step(10).await.is_err());
-        assert_eq!(dlq_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0);
 
-        // Attempt 3: fails, DLQ mapper fires (3 >= 3). DLQ fact
+        // Attempt 3: fails, terminal-failure mapper fires (3 >= 3). terminal-failure fact
         // appended; cursor advances.
         let outcome = runner.step(10).await.unwrap();
         assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
-        assert_eq!(dlq_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-        // The DLQ-synthesized HandlerFailed Event is appended directly to
+        // The terminal-failure-synthesized HandlerFailed Event is appended directly to
         // the log (its own `ops` stream), with the deterministic u32::MAX
         // id that distinguishes it from react() outputs.
         let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10)
             .await
             .unwrap();
-        let dlq = all
+        let terminal_failure = all
             .iter()
             .find(|e| e.event_type == "ops:handler_failed")
-            .expect("DLQ-synthesized fact in log");
-        assert_eq!(dlq.causation_id, Some(trigger_id));
+            .expect("terminal-failure-synthesized fact in log");
+        assert_eq!(terminal_failure.causation_id, Some(trigger_id));
         assert_eq!(
-            dlq.event_id,
+            terminal_failure.event_id,
             derive_output_event_id("always-fails", trigger_id, u32::MAX),
-            "DLQ output uses u32::MAX for its deterministic id",
+            "terminal-failure output uses u32::MAX for its deterministic id",
         );
 
-        // The DLQ fact inherits the trigger's correlation_id — without
+        // The terminal-failure fact inherits the trigger's correlation_id — without
         // this, a failing reactor's downstream "HandlerFailed" would be
         // untraceable back to the trigger (the causal-chain debugging
         // story rootsignal depends on).
@@ -1412,20 +1412,20 @@ mod tests {
             .find(|e| e.event_id == trigger_id)
             .expect("trigger in log");
         assert_eq!(
-            dlq.correlation_id, trigger.correlation_id,
-            "DLQ-synthesized fact MUST inherit trigger correlation_id",
+            terminal_failure.correlation_id, trigger.correlation_id,
+            "terminal-failure-synthesized fact MUST inherit trigger correlation_id",
         );
 
-        // DlqInfo exposes that same correlation_id to the mapper, so a mapper
+        // TerminalFailure exposes that same correlation_id to the mapper, so a mapper
         // can key its terminal-failure event per-run (rootsignal's use case).
         let seen = seen_corr.lock().unwrap().expect("mapper ran");
         assert_eq!(
             seen, trigger.correlation_id,
-            "DlqInfo.correlation_id MUST be the failing trigger's run",
+            "TerminalFailure.correlation_id MUST be the failing trigger's run",
         );
 
         // Cursor is past the failing trigger — the runner is done with
-        // it. A further step only sees the non-matching DLQ output (a
+        // it. A further step only sees the non-matching terminal-failure output (a
         // different category) and produces no new reaction.
         let next = runner.step(10).await.unwrap();
         assert!(
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_step_dlq_mapper_returning_none_still_advances_cursor() {
+    async fn reactor_step_failure_mapper_returning_none_still_advances_cursor() {
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
@@ -1443,14 +1443,14 @@ mod tests {
         };
         let _ = append_trigger(&store, &payload);
 
-        let mapper: DlqMapperArc = std::sync::Arc::new(move |_info| None);
+        let mapper: TerminalFailureMapper = std::sync::Arc::new(move |_info| None);
 
         let runner = ReactorRunner::new(
             AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
-            "drop-on-dlq",
+            "drop-on-park",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_dlq(mapper, 2);
+        ).with_terminal_failure(mapper, 2);
 
         // 1st fails, 2nd hits max + maps to None: cursor advances,
         // nothing appended.
@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_step_without_dlq_mapper_returns_err_indefinitely() {
+    async fn reactor_step_without_failure_mapper_returns_err_indefinitely() {
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
@@ -1475,17 +1475,17 @@ mod tests {
 
         let runner = ReactorRunner::new(
             AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
-            "no-dlq",
+            "no-terminal_failure",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        // Many attempts, all Err — without DLQ, no cap on retries.
+        // Many attempts, all Err — without a terminal-failure mapper, no cap on retries.
         for _ in 0..10 {
             assert!(runner.step(10).await.is_err());
         }
         // Cursor stayed at zero.
-        let cursor = store.get("no-dlq").await.unwrap();
+        let cursor = store.get("no-terminal_failure").await.unwrap();
         assert!(cursor.is_none() || cursor == Some(LogCursor::ZERO));
     }
 }

@@ -215,7 +215,7 @@ mod pg {
             let Some(cid) = parse_corr(correlation_id) else { return Ok(vec![]) };
             // One outcome per reactor: the TERMINAL status (a reactor that failed
             // then recovered is `completed`, not `failed`), its paired error,
-            // attempt count, time span, triggering events. The DLQ upsert
+            // attempt count, time span, triggering events. The terminal-failure upsert
             // overwrites the highest-attempt row to `dead_letter`, so the latest
             // attempt's status/error is the true terminal state. `bool_or` is a
             // belt-and-suspenders guard so a dead-letter can never be masked.

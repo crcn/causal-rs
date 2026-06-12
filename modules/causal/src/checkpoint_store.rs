@@ -2,12 +2,12 @@
 //!
 //! - [`CheckpointStore`] — minimal cursor read/write. Required by
 //!   `Projector` / `MultiProjector` / `Reactor` runners.
-//! - [`ReactorCheckpoint`] — extends `CheckpointStore` with the DLQ
+//! - [`ReactorCheckpoint`] — extends `CheckpointStore` with the failure store
 //!   attempt-counter surface `ReactorRunner` uses to track retries
 //!   across step boundaries.
 //!
 //! Reactor outputs append **directly** to the log (no outbox); these
-//! traits carry only the per-consumer cursor and the DLQ-attempt counters.
+//! traits carry only the per-consumer cursor and the failure store-attempt counters.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,17 +23,17 @@ pub trait CheckpointStore: Send + Sync {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// ReactorCheckpoint — checkpoint + DLQ retry-attempt tracking
+// ReactorCheckpoint — checkpoint + terminal-failure retry-attempt tracking
 // ─────────────────────────────────────────────────────────────────────
 
 /// Extends [`CheckpointStore`] with reactor retry-attempt tracking for
-/// the DLQ path. Required only for engines hosting reactors.
+/// the terminal-failure path. Required only for engines hosting reactors.
 #[async_trait]
 pub trait ReactorCheckpoint: CheckpointStore {
     /// Increment the attempt counter for a `(consumer_id,
-    /// source_event_id)` pair and return the new count. Called by
+    /// trigger_id)` pair and return the new count. Called by
     /// `ReactorRunner` on every `react()` failure to track retries
-    /// for the DLQ path. The returned value is the count INCLUDING this
+    /// for the terminal-failure path. The returned value is the count INCLUDING this
     /// attempt (first failure returns 1).
     ///
     /// This is an in-process retry budget, not durable state. Both
@@ -45,16 +45,16 @@ pub trait ReactorCheckpoint: CheckpointStore {
     async fn record_reactor_attempt(
         &self,
         consumer_id: &str,
-        source_event_id: Uuid,
+        trigger_id: Uuid,
     ) -> Result<u32>;
 
     /// Clear the attempt counter for a `(consumer_id,
-    /// source_event_id)` pair. Called on successful `react()` (the
-    /// next failure should start fresh) and after the DLQ mapper
+    /// trigger_id)` pair. Called on successful `react()` (the
+    /// next failure should start fresh) and after the terminal-failure mapper
     /// has fired. Idempotent.
     async fn clear_reactor_attempts(
         &self,
         consumer_id: &str,
-        source_event_id: Uuid,
+        trigger_id: Uuid,
     ) -> Result<()>;
 }
