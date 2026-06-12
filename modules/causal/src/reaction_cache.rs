@@ -40,7 +40,7 @@ use crate::reactor_runner::derive_output_event_id;
 /// event. The unit of idempotency for the reactor path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReactionKey {
-    /// The reacting consumer group — `Reactor::GROUP_NAME`.
+    /// The reacting consumer group — `Reactor::NAME`.
     pub group: String,
     /// The triggering event's id (the reaction's `causation_id`).
     pub trigger_event_id: Uuid,

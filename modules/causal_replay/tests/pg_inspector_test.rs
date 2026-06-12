@@ -84,7 +84,7 @@ struct PongReactor {
 #[async_trait]
 impl Reactor for PongReactor {
     type Trigger = Pinged;
-    const GROUP_NAME: &'static str = "insp_pong_reactor";
+    const NAME: &'static str = "insp_pong_reactor";
     async fn react(&self, t: &Pinged, ctx: Ctx<'_>) -> Result<Events> {
         ctx.log(LogLevel::Info, "pong reacting");
         let first = {

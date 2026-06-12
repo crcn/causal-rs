@@ -19,7 +19,7 @@
 //! Subscription model: a Projector is a **catch-up subscription** — the
 //! runner reads the log from a client-managed cursor (`read_all` from the
 //! position stored in `CheckpointStore`) and advances that cursor per
-//! fact. `GROUP_NAME` is the cursor key. (Kurrent's server-side
+//! fact. `NAME` is the cursor key. (Kurrent's server-side
 //! *persistent* subscriptions — server checkpoints, ack/nack, competing
 //! consumers — are a possible future backend optimization, not what ships;
 //! against Kurrent the cursor reads `$et-{CATEGORY}:*` / `$ce-{CATEGORY}`.)
@@ -44,12 +44,12 @@ pub trait Projector: Send + Sync {
     ///   duplicate registration.
     /// - Across engines sharing one `CheckpointStore`: **NOT
     ///   enforced by the framework.** Two engines concurrently
-    ///   running with the same `GROUP_NAME` against the same backend
+    ///   running with the same `NAME` against the same backend
     ///   will silently corrupt each other's cursors. Backends that
     ///   support advisory locks (Postgres) should acquire one keyed
-    ///   on `GROUP_NAME` at engine build time. Single-process
+    ///   on `NAME` at engine build time. Single-process
     ///   deployments (one engine per process) are unaffected.
-    const GROUP_NAME: &'static str;
+    const NAME: &'static str;
 
     /// Cross-consumer dependency declaration. The runner refuses to
     /// advance this projector's cursor past position P until every
@@ -101,7 +101,7 @@ mod tests {
     #[async_trait]
     impl Projector for CountingSink {
         type Event = Recorded;
-        const GROUP_NAME: &'static str = "counting-sink";
+        const NAME: &'static str = "counting-sink";
 
         async fn project(
             &self,

@@ -160,7 +160,7 @@ impl<'a> Ctx<'a> {
     /// side-effecting reactor idempotent under redelivery / retry:
     ///
     /// ```ignore
-    /// let key = ctx.reaction_key(Self::GROUP_NAME);
+    /// let key = ctx.reaction_key(Self::NAME);
     /// let out = causal::remember(ctx.reaction_cache().unwrap(), &key, || async {
     ///     expensive_external_call().await   // runs once per reaction
     /// }).await?;
@@ -171,7 +171,7 @@ impl<'a> Ctx<'a> {
 
     /// Build the [`ReactionKey`](crate::reaction_cache::ReactionKey) for
     /// this reaction — `(group, this trigger's event_id)`. Pass your
-    /// `Reactor::GROUP_NAME`.
+    /// `Reactor::NAME`.
     pub fn reaction_key(&self, group: &str) -> crate::reaction_cache::ReactionKey {
         crate::reaction_cache::ReactionKey::new(group, self.event_id)
     }
@@ -179,10 +179,10 @@ impl<'a> Ctx<'a> {
     /// Memoize a side-effecting computation under this reaction's key.
     /// `compute` runs at most once per reaction — retry / redelivery
     /// returns the cached result, so the expensive external call (LLM,
-    /// HTTP, graph) effectively runs once. Pass your `Reactor::GROUP_NAME`.
+    /// HTTP, graph) effectively runs once. Pass your `Reactor::NAME`.
     ///
     /// ```ignore
-    /// let summary: String = ctx.remember(Self::GROUP_NAME, || async {
+    /// let summary: String = ctx.remember(Self::NAME, || async {
     ///     anthropic.summarize(&doc).await   // runs once per reaction
     /// }).await?;
     /// ```

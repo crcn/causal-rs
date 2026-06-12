@@ -61,7 +61,7 @@ struct Echo;
 #[async_trait]
 impl Reactor for Echo {
     type Trigger = Ping;
-    const GROUP_NAME: &'static str = "nuke.echo";
+    const NAME: &'static str = "nuke.echo";
     async fn react(&self, t: &Ping, _ctx: Ctx<'_>) -> Result<Events> {
         Ok(causal::events![Pong { id: t.id }])
     }
@@ -74,7 +74,7 @@ struct CountPings {
 #[async_trait]
 impl Projector for CountPings {
     type Event = Ping;
-    const GROUP_NAME: &'static str = "nuke.count";
+    const NAME: &'static str = "nuke.count";
     async fn project(&self, _f: &Ping, _ctx: Ctx<'_>) -> Result<()> {
         self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -267,7 +267,7 @@ async fn chase_scenario(n: u64) -> Result<()> {
     #[async_trait]
     impl Projector for CountPongs {
         type Event = Pong;
-        const GROUP_NAME: &'static str = "nuke.count_pongs";
+        const NAME: &'static str = "nuke.count_pongs";
         async fn project(&self, _f: &Pong, _ctx: Ctx<'_>) -> Result<()> {
             self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())

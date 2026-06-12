@@ -346,7 +346,7 @@ struct DoFetch;
 #[async_trait::async_trait]
 impl causal::Reactor for DoFetch {
     type Trigger = FetchRequested;
-    const GROUP_NAME: &'static str = "do_fetch_reactor";
+    const NAME: &'static str = "do_fetch_reactor";
     async fn react(&self, t: &FetchRequested, ctx: causal::Ctx<'_>) -> Result<causal::Events> {
         let mut out = causal::Events::new();
         out.push(Fetched { id: t.id, occurred_at: ctx.now() });

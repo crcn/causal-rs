@@ -222,7 +222,7 @@ pub(crate) type CorrHighWater = Arc<std::sync::Mutex<SettleTracker>>;
 /// it and unblock downstream gates.
 #[derive(Debug, Clone)]
 pub struct DlqInfo {
-    /// `Reactor::GROUP_NAME` of the failing reactor.
+    /// `Reactor::NAME` of the failing reactor.
     pub group_name:        String,
     /// `event_id` of the trigger that caused the failure.
     pub source_event_id:   Uuid,
@@ -616,13 +616,13 @@ impl EngineBuilder {
         self
     }
 
-    /// Reserve a `GROUP_NAME` for a consumer. Panics if another
+    /// Reserve a `NAME` for a consumer. Panics if another
     /// consumer in this builder already claimed it — two consumers
     /// sharing a cursor key would silently corrupt each other.
     fn claim_group_name(&mut self, group_name: &'static str) {
         assert!(
             self.group_names.insert(group_name.into()),
-            "duplicate GROUP_NAME `{}` registered on EngineBuilder — \
+            "duplicate NAME `{}` registered on EngineBuilder — \
              two consumers MUST NOT share a cursor key",
             group_name,
         );
@@ -716,12 +716,12 @@ impl EngineBuilder {
     where
         P::Event: DeserializeOwned,
     {
-        self.claim_group_name(P::GROUP_NAME);
+        self.claim_group_name(P::NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
         self.consumers.push(Box::new(move |aggs, _engine_aggs, _occ| {
-            let mut runner = ProjectionRunner::new(p, P::GROUP_NAME, log, checkpoint);
+            let mut runner = ProjectionRunner::new(p, P::NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
             Arc::new(runner) as Arc<dyn Supervisable>
@@ -733,9 +733,9 @@ impl EngineBuilder {
     where
         R::Trigger: DeserializeOwned,
     {
-        self.claim_group_name(R::GROUP_NAME);
+        self.claim_group_name(R::NAME);
         self.reactor_seeds.push((
-            R::GROUP_NAME,
+            R::NAME,
             crate::projection::StartPosition::ResumeOrLatest,
         ));
         let log = self.log.clone();
@@ -748,7 +748,7 @@ impl EngineBuilder {
         let snapshot_store = self.snapshot_store.clone();
         let snapshot_every = self.snapshot_every;
         self.consumers.push(Box::new(move |aggs, engine_aggs, occ| {
-            let mut runner = ReactorRunner::new(r, R::GROUP_NAME, log, reactor_checkpoint);
+            let mut runner = ReactorRunner::new(r, R::NAME, log, reactor_checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(mapper) = dlq_mapper {
                 runner = runner.with_dlq(mapper, max_attempts);
@@ -779,12 +779,12 @@ impl EngineBuilder {
     /// For single-Event consumers, use [`Self::with_projector`] — it
     /// deserializes for you.
     pub fn with_multi_projector<P: MultiProjector + 'static>(mut self, p: P) -> Self {
-        self.claim_group_name(P::GROUP_NAME);
+        self.claim_group_name(P::NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         let observer = self.observer.clone();
         self.consumers.push(Box::new(move |aggs, _engine_aggs, _occ| {
-            let mut runner = MultiProjectorRunner::new(p, P::GROUP_NAME, log, checkpoint);
+            let mut runner = MultiProjectorRunner::new(p, P::NAME, log, checkpoint);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
             Arc::new(runner) as Arc<dyn Supervisable>
@@ -1736,7 +1736,7 @@ mod tests {
     #[async_trait]
     impl Projector for UserRoster {
         type Event = UserCreated;
-        const GROUP_NAME: &'static str = "users";
+        const NAME: &'static str = "users";
         async fn project(
             &self, fact: &UserCreated, _ctx: Ctx<'_>,
         ) -> Result<()> {
@@ -1750,7 +1750,7 @@ mod tests {
     #[async_trait]
     impl Reactor for WelcomeReactor {
         type Trigger = UserCreated;
-        const GROUP_NAME: &'static str = "welcome.reactor";
+        const NAME: &'static str = "welcome.reactor";
         async fn react(
             &self, trigger: &UserCreated, _ctx: Ctx<'_>,
         ) -> Result<Events> {
@@ -1776,7 +1776,7 @@ mod tests {
         #[async_trait]
         impl Reactor for CountingReactor {
             type Trigger = UserCreated;
-            const GROUP_NAME: &'static str = "seed.counting";
+            const NAME: &'static str = "seed.counting";
             async fn react(&self, _t: &UserCreated, _ctx: Ctx<'_>) -> Result<Events> {
                 FIRED.fetch_add(1, Ordering::SeqCst);
                 Ok(Events::new())
@@ -1864,7 +1864,7 @@ mod tests {
         #[async_trait]
         impl Reactor for CountingReactorZero {
             type Trigger = UserCreated;
-            const GROUP_NAME: &'static str = "seed.zero";
+            const NAME: &'static str = "seed.zero";
             async fn react(&self, _t: &UserCreated, _ctx: Ctx<'_>) -> Result<Events> {
                 FIRED_ZERO.fetch_add(1, Ordering::SeqCst);
                 Ok(Events::new())
@@ -1954,7 +1954,7 @@ mod tests {
         #[async_trait]
         impl Projector for WelcomeCounter {
             type Event = WelcomeQueuedFact;
-            const GROUP_NAME: &'static str = "welcome.counter";
+            const NAME: &'static str = "welcome.counter";
             async fn project(
                 &self, _fact: &WelcomeQueuedFact, _ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -2631,7 +2631,7 @@ mod tests {
         #[async_trait]
         impl Reactor for EmitsIntoOcc {
             type Trigger = UserCreated;
-            const GROUP_NAME: &'static str = "occ.fence";
+            const NAME: &'static str = "occ.fence";
             async fn react(&self, t: &UserCreated, _: Ctx<'_>) -> Result<Events> {
                 Ok(causal::events![CounterFact::Inc {
                     by: 1,
@@ -2892,12 +2892,12 @@ mod tests {
         #[async_trait::async_trait]
         impl Reactor for CachedSideEffect {
             type Trigger = Ping;
-            const GROUP_NAME: &'static str = "cached_side_effect";
+            const NAME: &'static str = "cached_side_effect";
             async fn react(&self, trigger: &Ping, ctx: Ctx<'_>) -> anyhow::Result<Events> {
                 // The "expensive external call" — memoized by reaction key.
                 let calls = self.external_calls.clone();
                 let value: i64 = ctx
-                    .remember(Self::GROUP_NAME, || async move {
+                    .remember(Self::NAME, || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         Ok(42)
                     })
@@ -3133,7 +3133,7 @@ mod tests {
         }
         #[async_trait]
         impl MultiProjector for AuditAll {
-            const GROUP_NAME: &'static str = "audit";
+            const NAME: &'static str = "audit";
             const CATEGORIES: &'static [&'static str] = &["alpha", "beta"];
 
             async fn project(
@@ -3380,7 +3380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "duplicate GROUP_NAME `users`")]
+    #[should_panic(expected = "duplicate NAME `users`")]
     async fn registering_two_consumers_with_same_group_name_panics() {
         // Two UserRoster instances would share a cursor key — silent
         // corruption. EngineBuilder catches this at registration time.
@@ -3404,7 +3404,7 @@ mod tests {
         #[async_trait]
         impl Projector for A {
             type Event = UserCreated;
-            const GROUP_NAME: &'static str = "bulk.a";
+            const NAME: &'static str = "bulk.a";
             async fn project(&self, _f: &UserCreated, _: Ctx<'_>) -> Result<()> {
                 self.hit.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -3416,7 +3416,7 @@ mod tests {
         #[async_trait]
         impl Projector for B {
             type Event = UserCreated;
-            const GROUP_NAME: &'static str = "bulk.b";
+            const NAME: &'static str = "bulk.b";
             async fn project(&self, _f: &UserCreated, _: Ctx<'_>) -> Result<()> {
                 self.hit.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -3522,7 +3522,7 @@ mod tests {
         #[async_trait]
         impl Reactor for AlwaysFails {
             type Trigger = UserCreated;
-            const GROUP_NAME: &'static str = "always-fails-e2e";
+            const NAME: &'static str = "always-fails-e2e";
             async fn react(&self, _t: &UserCreated, _: Ctx<'_>) -> Result<Events> {
                 Err(anyhow!("boom"))
             }
@@ -3601,7 +3601,7 @@ mod tests {
         #[async_trait]
         impl Projector for WelcomeCounter {
             type Event = WelcomeQueuedFact;
-            const GROUP_NAME: &'static str = "settle.chain.counter";
+            const NAME: &'static str = "settle.chain.counter";
             async fn project(
                 &self, _f: &WelcomeQueuedFact, _ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -3812,7 +3812,7 @@ mod tests {
         #[async_trait]
         impl Reactor for EchoReactor {
             type Trigger = UserCreated;
-            const GROUP_NAME: &'static str = "observer-echo";
+            const NAME: &'static str = "observer-echo";
             async fn react(
                 &self,
                 _t: &UserCreated,
@@ -3849,14 +3849,14 @@ mod tests {
         assert!(calls.load(Ordering::SeqCst) >= 1, "reactor fired");
 
         // Observer hook #1: reactor_started + reactor_completed populated
-        // reactor_executions for (event_id, GROUP_NAME).
+        // reactor_executions for (event_id, NAME).
         let execs = store.reactor_executions();
         assert!(
             execs.iter().any(|e| {
                 let (_eid, rid) = e.key();
                 rid == "observer-echo"
             }),
-            "reactor_executions populated with the reactor's GROUP_NAME"
+            "reactor_executions populated with the reactor's NAME"
         );
 
         // Observer hook #2: reactor_completed pushed the attempt row.
@@ -4117,7 +4117,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "ticks";
+            const NAME: &'static str = "ticks";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -4170,7 +4170,7 @@ mod tests {
         #[async_trait]
         impl Reactor for Capture {
             type Trigger = Tick;
-            const GROUP_NAME: &'static str = "ticker.reactor";
+            const NAME: &'static str = "ticker.reactor";
             async fn react(
                 &self, _t: &Tick, ctx: Ctx<'_>,
             ) -> Result<crate::reactor::Events> {
@@ -4250,7 +4250,7 @@ mod tests {
         #[async_trait]
         impl Projector for FailsOnSecond {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "rollback.test";
+            const NAME: &'static str = "rollback.test";
             async fn project(
                 &self, _f: &Tick, _ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -4317,7 +4317,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "batch.interleave";
+            const NAME: &'static str = "batch.interleave";
             async fn project(
                 &self,
                 _f: &Tick,
@@ -4373,7 +4373,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "hydration.bug";
+            const NAME: &'static str = "hydration.bug";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -4424,7 +4424,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "hydrate.cold";
+            const NAME: &'static str = "hydrate.cold";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -4481,7 +4481,7 @@ mod tests {
         #[async_trait]
         impl Projector for Capture {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "hydrate.transition";
+            const NAME: &'static str = "hydrate.transition";
             async fn project(
                 &self,
                 _f: &Tick,
@@ -4530,7 +4530,7 @@ mod tests {
         #[async_trait]
         impl Projector for Reader {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "reader";
+            const NAME: &'static str = "reader";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -4589,7 +4589,7 @@ mod tests {
         #[async_trait]
         impl Projector for PanicsThenSucceeds {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "panic.recovery";
+            const NAME: &'static str = "panic.recovery";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -4654,7 +4654,7 @@ mod tests {
         #[async_trait]
         impl Projector for VerifyBoth {
             type Event = Tick;
-            const GROUP_NAME: &'static str = "accum.test";
+            const NAME: &'static str = "accum.test";
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -4734,7 +4734,7 @@ mod tests {
         }
         #[async_trait]
         impl MultiProjector for OnlyTickRouter {
-            const GROUP_NAME: &'static str = "tick.only";
+            const NAME: &'static str = "tick.only";
             const CATEGORIES: &'static [&'static str] = &["ticker"];
             async fn project(
                 &self,

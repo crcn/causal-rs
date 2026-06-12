@@ -733,7 +733,7 @@ mod tests {
     #[async_trait]
     impl Reactor for EmitOne {
         type Trigger = OrderPlaced;
-        const GROUP_NAME: &'static str = "emit-one";
+        const NAME: &'static str = "emit-one";
         async fn react(
             &self,
             trigger: &OrderPlaced,
@@ -750,7 +750,7 @@ mod tests {
     #[async_trait]
     impl Reactor for EmitN {
         type Trigger = OrderPlaced;
-        const GROUP_NAME: &'static str = "emit-n";
+        const NAME: &'static str = "emit-n";
         async fn react(
             &self,
             trigger: &OrderPlaced,
@@ -769,7 +769,7 @@ mod tests {
     #[async_trait]
     impl Reactor for FailsOnNth {
         type Trigger = OrderPlaced;
-        const GROUP_NAME: &'static str = "fails-on-nth";
+        const NAME: &'static str = "fails-on-nth";
         async fn react(
             &self,
             _trigger: &OrderPlaced,
@@ -882,7 +882,7 @@ mod tests {
         #[async_trait]
         impl Reactor for Silent {
             type Trigger = OrderPlaced;
-            const GROUP_NAME: &'static str = "silent";
+            const NAME: &'static str = "silent";
             async fn react(
                 &self,
                 _trigger: &OrderPlaced,
@@ -1054,7 +1054,7 @@ mod tests {
     #[async_trait]
     impl Reactor for AlwaysFails {
         type Trigger = OrderPlaced;
-        const GROUP_NAME: &'static str = "always-fails";
+        const NAME: &'static str = "always-fails";
         async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(anyhow!("boom"))
@@ -1150,7 +1150,7 @@ mod tests {
         #[async_trait]
         impl Reactor for PanicsIfCalled {
             type Trigger = OrderPlaced; // CATEGORY = "order"
-            const GROUP_NAME: &'static str = "no-collision";
+            const NAME: &'static str = "no-collision";
             async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
                 panic!("reactor must never see a foreign-category event");
             }
@@ -1211,7 +1211,7 @@ mod tests {
         #[async_trait]
         impl Reactor for NeverReacts {
             type Trigger = OrderPlaced;
-            const GROUP_NAME: &'static str = "poison.dlq";
+            const NAME: &'static str = "poison.dlq";
             async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
                 panic!("react must never run on a poison trigger");
             }
@@ -1258,7 +1258,7 @@ mod tests {
         #[async_trait]
         impl Reactor for NeverReacts {
             type Trigger = OrderPlaced;
-            const GROUP_NAME: &'static str = "poison.block";
+            const NAME: &'static str = "poison.block";
             async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
                 Ok(Events::new())
             }

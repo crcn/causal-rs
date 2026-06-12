@@ -71,7 +71,7 @@ struct ShipOnPlaced;
 #[async_trait::async_trait]
 impl Reactor for ShipOnPlaced {
     type Trigger = OrderPlaced;
-    const GROUP_NAME: &'static str = "ship_on_placed";
+    const NAME: &'static str = "ship_on_placed";
     async fn react(&self, t: &OrderPlaced, _ctx: Ctx<'_>) -> anyhow::Result<Events> {
         Ok(causal::events![ShipmentRequested { order_id: t.order_id }])
     }

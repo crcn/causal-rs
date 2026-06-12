@@ -292,7 +292,7 @@ mod tests {
     #[async_trait]
     impl Projector for CollectingProjector {
         type Event = Recorded;
-        const GROUP_NAME: &'static str = "collecting";
+        const NAME: &'static str = "collecting";
 
         async fn project(
             &self,
@@ -313,7 +313,7 @@ mod tests {
     #[async_trait]
     impl Projector for FailsOnNth {
         type Event = Recorded;
-        const GROUP_NAME: &'static str = "fails-on-nth";
+        const NAME: &'static str = "fails-on-nth";
 
         async fn project(
             &self,
@@ -373,7 +373,7 @@ mod tests {
         #[async_trait]
         impl Projector for CorrelationCapture {
             type Event = Recorded;
-            const GROUP_NAME: &'static str = "correlation-capture";
+            const NAME: &'static str = "correlation-capture";
             async fn project(
                 &self, _fact: &Recorded, ctx: Ctx<'_>,
             ) -> Result<()> {
@@ -495,7 +495,7 @@ mod tests {
         #[async_trait]
         impl Projector for DepM {
             type Event = Recorded;
-            const GROUP_NAME: &'static str = "downstream";
+            const NAME: &'static str = "downstream";
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
             async fn project(
                 &self,
@@ -536,7 +536,7 @@ mod tests {
         #[async_trait]
         impl Projector for DepM {
             type Event = Recorded;
-            const GROUP_NAME: &'static str = "downstream-2";
+            const NAME: &'static str = "downstream-2";
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
             async fn project(
                 &self,
@@ -631,7 +631,7 @@ mod tests {
         #[async_trait]
         impl Projector for CaptureNow {
             type Event = NoTimeFact;
-            const GROUP_NAME: &'static str = "capture-now";
+            const NAME: &'static str = "capture-now";
             async fn project(
                 &self, _f: &NoTimeFact, ctx: Ctx<'_>,
             ) -> Result<()> {

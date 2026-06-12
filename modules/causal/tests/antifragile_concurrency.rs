@@ -320,7 +320,7 @@ struct ReactA;
 #[async_trait]
 impl Reactor for ReactA {
     type Trigger = Job;
-    const GROUP_NAME: &'static str = "af.echo-a";
+    const NAME: &'static str = "af.echo-a";
     async fn react(&self, t: &Job, _ctx: Ctx<'_>) -> Result<Events> {
         Ok(causal::events![EchoA { id: t.id }])
     }
@@ -330,7 +330,7 @@ struct ReactB;
 #[async_trait]
 impl Reactor for ReactB {
     type Trigger = Job;
-    const GROUP_NAME: &'static str = "af.echo-b";
+    const NAME: &'static str = "af.echo-b";
     async fn react(&self, t: &Job, _ctx: Ctx<'_>) -> Result<Events> {
         Ok(causal::events![EchoB { id: t.id }])
     }
@@ -406,7 +406,7 @@ async fn fanout_reactors_no_cross_chain_interference() {
 
 // ─────────────────────────────────────────────────────────────────────
 // Attack 4 — blue/green: two Engines, one MemoryStore, SAME reactor
-// GROUP_NAME (shared cursor). Outputs must land exactly once
+// NAME (shared cursor). Outputs must land exactly once
 // (deterministic event_ids), both registries must stay exact for any
 // state they hold.
 // ─────────────────────────────────────────────────────────────────────
@@ -446,7 +446,7 @@ struct BgEcho;
 #[async_trait]
 impl Reactor for BgEcho {
     type Trigger = BgPing;
-    const GROUP_NAME: &'static str = "af.bg-echo";
+    const NAME: &'static str = "af.bg-echo";
     async fn react(&self, t: &BgPing, _ctx: Ctx<'_>) -> Result<Events> {
         Ok(causal::events![BgPong { id: t.id }])
     }
@@ -506,7 +506,7 @@ async fn blue_green_shared_cursor_outputs_exactly_once() {
             .cloned()
             .collect();
         let all_present = triggers.iter().all(|t| {
-            let want = derive_output_event_id(BgEcho::GROUP_NAME, t.event_id, 0);
+            let want = derive_output_event_id(BgEcho::NAME, t.event_id, 0);
             log.iter().any(|e| e.event_id == want)
         });
         if triggers.len() == ids.len() && all_present {
@@ -534,7 +534,7 @@ async fn blue_green_shared_cursor_outputs_exactly_once() {
         .iter()
         .filter(|e| e.event_type == "af_bgping:ping")
     {
-        let want = derive_output_event_id(BgEcho::GROUP_NAME, t.event_id, 0);
+        let want = derive_output_event_id(BgEcho::NAME, t.event_id, 0);
         assert_eq!(
             triggers_and_outputs
                 .iter()
@@ -713,7 +713,7 @@ struct SeedEcho;
 #[async_trait]
 impl Reactor for SeedEcho {
     type Trigger = SeedPing;
-    const GROUP_NAME: &'static str = "af.seed-echo";
+    const NAME: &'static str = "af.seed-echo";
     async fn react(&self, t: &SeedPing, _ctx: Ctx<'_>) -> Result<Events> {
         Ok(causal::events![SeedPong { id: t.id }])
     }
@@ -771,7 +771,7 @@ async fn seeding_race_reacted_set_is_clean_suffix() {
         let latest = EventLogBackend::latest_position(store.as_ref())
             .await
             .unwrap();
-        let cur = CheckpointStore::get(store.as_ref(), SeedEcho::GROUP_NAME)
+        let cur = CheckpointStore::get(store.as_ref(), SeedEcho::NAME)
             .await
             .unwrap();
         if cur.map_or(false, |c| c >= latest) {
@@ -794,7 +794,7 @@ async fn seeding_race_reacted_set_is_clean_suffix() {
     let reacted: Vec<bool> = triggers
         .iter()
         .map(|t| {
-            let want = derive_output_event_id(SeedEcho::GROUP_NAME, t.event_id, 0);
+            let want = derive_output_event_id(SeedEcho::NAME, t.event_id, 0);
             log.iter().any(|e| e.event_id == want)
         })
         .collect();
@@ -863,7 +863,7 @@ struct WorkEcho;
 #[async_trait]
 impl Reactor for WorkEcho {
     type Trigger = Work;
-    const GROUP_NAME: &'static str = "af.work-echo";
+    const NAME: &'static str = "af.work-echo";
     async fn react(&self, t: &Work, _ctx: Ctx<'_>) -> Result<Events> {
         Ok(causal::events![Done { id: t.id }])
     }
