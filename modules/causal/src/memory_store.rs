@@ -432,15 +432,31 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                     || row.workflow_id != e.workflow_id
                     || row.causation_id != e.causation_id
                 {
+                    // Name WHERE it diverged — the nondeterminism is
+                    // usually in a dependency far from the reactor, and
+                    // the JSON path is the difference between a grep
+                    // and a debugging session.
+                    let where_ = if row.payload != e.payload {
+                        format!(
+                            "payload at `{}`",
+                            crate::event_log::first_diff_path(&row.payload, &e.payload)
+                                .unwrap_or_else(|| "(root)".into()),
+                        )
+                    } else if row.event_type != e.event_type {
+                        format!("event_type ({} vs {})", row.event_type, e.event_type)
+                    } else if row.workflow_id != e.workflow_id {
+                        "workflow_id".to_string()
+                    } else {
+                        "causation_id".to_string()
+                    };
                     anyhow::bail!(
                         "append_to_stream: divergent redelivery for event_id {} — \
-                         the persisted row differs from this batch's event \
-                         (payload/event_type/workflow/causation). A dedup-hit \
-                         must be byte-identical; a differing re-emission means the \
-                         producer is nondeterministic under redelivery (wall \
-                         clock, rand, or an external call not under \
-                         ctx.remember). The persisted row is kept unchanged.",
-                        e.event_id,
+                         the persisted row differs from this batch's event at {}. \
+                         A dedup-hit must be byte-identical; a differing \
+                         re-emission means the producer is nondeterministic under \
+                         redelivery (wall clock, rand, or an external call not \
+                         under ctx.effect). The persisted row is kept unchanged.",
+                        e.event_id, where_,
                     );
                 }
             }

@@ -335,6 +335,8 @@ mod tests {
             occurred_at:    trigger.occurred_at,
             workflow_id: Uuid::nil(),
             metadata:       &meta,
+            consumer: "",
+            labels:   None,
             state:    crate::contexts::StateSource::None,
             logs:           None,
             effect_store: None,

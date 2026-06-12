@@ -2,11 +2,49 @@
 //! context types would add no safety beyond what the runtime already
 //! enforces.
 //!
-//! Critical property — no wall-clock accessor. `ctx.now()` returns
-//! the fact's logical `occurred_at`, set at emit by the producer.
-//! Replay reproduces byte-identical state because deterministic time
-//! is the only reachable time. Migration-boundary tagging belongs in
-//! `ctx.metadata`, not a dedicated enum.
+//! ## The deterministic `Ctx` (0.10 Primitive 2)
+//!
+//! `react()` gets no ambient world. The `Ctx` is the only door, and
+//! every door is deterministic-or-memoized:
+//!
+//! ```ignore
+//! async fn react(&self, t: &Trigger, ctx: Ctx<'_>) -> Result<Events> {
+//!     let id   = ctx.derive_id("group")?;   // v5(consumer ∥ trigger ∥ label); never new_v4
+//!     let when = ctx.time();                // the TRIGGER's recorded time
+//!     let text: String = ctx.effect("ocr", || async {
+//!         claude.ocr(&t.url).await          // memoized by construction
+//!     }).await?;
+//!     ...
+//! }
+//! ```
+//!
+//! No wall-clock accessor exists. `ctx.time()` returns the fact's
+//! logical `occurred_at`, set at emit by the producer — append-time
+//! `created_at` stays envelope-only; wall clock must never enter a
+//! payload. Replay reproduces byte-identical state because
+//! deterministic time is the only reachable time. Migration-boundary
+//! tagging belongs in `ctx.metadata`, not a dedicated enum.
+//!
+//! ## The guardrail layer
+//!
+//! Rust cannot make nondeterminism inexpressible — nothing *stops*
+//! `Uuid::new_v4()` inside `react()`. Three layers, none sufficient
+//! alone: this deterministic `Ctx` is the paved road; a clippy
+//! `disallowed-methods` lint in application crates is the guardrail;
+//! the runtime divergence check is the backstop. Recommended
+//! `clippy.toml` for crates that hold reactor bodies:
+//!
+//! ```toml
+//! [[disallowed-methods]]
+//! path = "uuid::Uuid::new_v4"
+//! reason = "in consumer bodies, mint ids with ctx.derive_id(label)"
+//! [[disallowed-methods]]
+//! path = "chrono::Utc::now"
+//! reason = "in consumer bodies, use ctx.time(); wall clock breaks replay"
+//! ```
+//! (Allow at non-consumer call sites with
+//! `#[allow(clippy::disallowed_methods)]` — the boundary that *emits*
+//! facts legitimately mints fresh identities.)
 
 use std::sync::Arc;
 
@@ -18,6 +56,20 @@ use uuid::Uuid;
 use crate::aggregate::Aggregate;
 use crate::aggregator::{AggregatorRegistry, FoldOnReadCache};
 use crate::types::{LogCursor, LogEntry, LogLevel};
+
+/// Namespace UUID for `ctx.derive_id` — distinct from the reactor
+/// runner's output-id namespace so a derived identity can never
+/// collide with an output event_id.
+const NS_DERIVED_ID: Uuid = Uuid::from_bytes([
+    0x9c, 0x1a, 0x2b, 0x77, 0x41, 0x5d, 0x4e, 0x02,
+    0x8f, 0x66, 0x0d, 0xe9, 0x5a, 0x33, 0x70, 0x1b,
+]);
+
+/// Per-invocation label registry for `ctx.derive_id` / `ctx.effect`
+/// duplicate detection. The runner owns one per attempt; duplicate
+/// labels silently yielding the same id/result would be a silent-
+/// correctness bug, so reuse is a runtime error (domain class).
+pub(crate) type LabelSet = Mutex<std::collections::HashSet<(&'static str, String)>>;
 
 /// Where `ctx.state_of` reads aggregate state from.
 ///
@@ -62,7 +114,7 @@ pub type Metadata = serde_json::Map<String, serde_json::Value>;
 /// Context passed to every consumer body
 /// (`Projector::project`, `Reactor::react`, `MultiProjector::project`).
 ///
-/// Deliberately absent: any wall-clock accessor. `ctx.now()` returns
+/// Deliberately absent: any wall-clock accessor. `ctx.time()` returns
 /// `occurred_at`, never the system clock.
 #[derive(Clone, Copy)]
 pub struct Ctx<'a> {
@@ -71,6 +123,14 @@ pub struct Ctx<'a> {
     pub occurred_at:    DateTime<Utc>,
     pub workflow_id: Uuid,
     pub metadata:       &'a Metadata,
+    /// The consuming `Reactor::NAME` / `Projector::NAME` — keys
+    /// `derive_id` and `effect` derivations. Empty string when the Ctx
+    /// is hand-constructed outside a runner (tests).
+    pub(crate) consumer: &'a str,
+    /// Per-invocation duplicate-label registry for `derive_id` /
+    /// `effect`. `None` outside a reactor attempt (duplicate detection
+    /// is then skipped).
+    pub(crate) labels: Option<&'a LabelSet>,
     /// Read-side access to aggregate state — see [`StateSource`].
     /// Query via [`Ctx::state_of`].
     pub(crate) state: StateSource<'a>,
@@ -111,11 +171,49 @@ impl<'a> std::fmt::Debug for Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    /// The fact's logical occurrence time. Consumers that need a
-    /// timestamp use this — never wall-clock — so replay reproduces
-    /// state byte-identically.
+    /// The TRIGGER's recorded time — the fact's logical `occurred_at`.
+    /// Consumers that need a timestamp use this, never wall-clock, so
+    /// replay reproduces state byte-identically. (Append-time
+    /// `created_at` stays envelope-only; wall clock must never enter a
+    /// payload.)
     #[inline]
-    pub fn now(&self) -> DateTime<Utc> { self.occurred_at }
+    pub fn time(&self) -> DateTime<Utc> { self.occurred_at }
+
+    /// Mint a deterministic identity for something this reaction
+    /// creates: `v5(consumer ∥ trigger event_id ∥ label)`. The same
+    /// trigger redelivered derives the same id, so the entity the
+    /// reaction creates exists once — never `Uuid::new_v4()` in a
+    /// consumer body.
+    ///
+    /// The label names *which* identity (a reaction may mint several);
+    /// it's the one argument with genuinely nothing else to derive
+    /// from. Reusing a label within one invocation would silently
+    /// yield the same id — a silent-correctness bug — so it errors
+    /// (domain class: bounded retries, then parks).
+    pub fn derive_id(&self, label: &str) -> Result<Uuid> {
+        self.claim_label("derive_id", label)?;
+        let mut key: Vec<u8> =
+            Vec::with_capacity(self.consumer.len() + 16 + label.len() + 2);
+        key.extend_from_slice(self.consumer.as_bytes());
+        key.push(0);
+        key.extend_from_slice(self.event_id.as_bytes());
+        key.push(0);
+        key.extend_from_slice(label.as_bytes());
+        Ok(Uuid::new_v5(&NS_DERIVED_ID, &key))
+    }
+
+    fn claim_label(&self, kind: &'static str, label: &str) -> Result<()> {
+        if let Some(labels) = self.labels {
+            if !labels.lock().insert((kind, label.to_string())) {
+                return Err(crate::failure::domain(anyhow::anyhow!(
+                    "duplicate ctx.{kind}(\"{label}\") in one reaction — each \
+                     call would silently yield the same result; give each \
+                     identity/effect its own label",
+                )));
+            }
+        }
+        Ok(())
+    }
 
     /// Append a log entry to this attempt's per-event log. Captured
     /// by the `ReactorObserver` and surfaced in the inspector's
@@ -206,41 +304,40 @@ impl<'a> Ctx<'a> {
     }
 
     /// The reaction-result cache, if the engine was built with one via
-    /// `EngineBuilder::with_effect_store`. Combine with
-    /// [`Ctx::effect_key`] + [`crate::remember`] to make a
-    /// side-effecting reactor idempotent under redelivery / retry:
-    ///
-    /// ```ignore
-    /// let key = ctx.effect_key(Self::NAME);
-    /// let out = causal::remember(ctx.effect_store().unwrap(), &key, || async {
-    ///     expensive_external_call().await   // runs once per reaction
-    /// }).await?;
-    /// ```
+    /// `EngineBuilder::with_effect_store`. Most code wants
+    /// [`Ctx::effect`] instead — this accessor exists for tooling that
+    /// inspects the store directly.
     pub fn effect_store(&self) -> Option<&Arc<dyn crate::effect_store::EffectStore>> {
         self.effect_store
     }
 
-    /// Build the [`EffectKey`](crate::effect_store::EffectKey) for
-    /// this reaction — `(group, this trigger's event_id)`. Pass your
-    /// `Reactor::NAME`.
-    pub fn effect_key(&self, group: &str) -> crate::effect_store::EffectKey {
-        crate::effect_store::EffectKey::new(group, self.event_id)
-    }
-
-    /// Memoize a side-effecting computation under this reaction's key.
-    /// `compute` runs at most once per reaction — retry / redelivery
-    /// returns the cached result, so the expensive external call (LLM,
-    /// HTTP, graph) effectively runs once. Pass your `Reactor::NAME`.
+    /// Memoize a side-effecting computation under
+    /// `(consumer, trigger event_id, label)`. `compute` runs at most
+    /// once per reaction — retry / redelivery returns the cached
+    /// result, so the expensive external call (LLM, HTTP, graph)
+    /// effectively runs once and the reaction is deterministic by
+    /// construction. Projection-store queries (similarity search,
+    /// "hottest ungrouped") are effects too: nondeterministic under
+    /// redelivery, so they go under the same door.
     ///
     /// ```ignore
-    /// let summary: String = ctx.remember(Self::NAME, || async {
+    /// let summary: String = ctx.effect("summarize", || async {
     ///     anthropic.summarize(&doc).await   // runs once per reaction
     /// }).await?;
     /// ```
     ///
+    /// The label distinguishes multiple effects in one reaction;
+    /// reusing one within an invocation errors (domain class), since
+    /// the second call would silently replay the first call's result.
+    ///
+    /// Entries are garbage-collected once the consumer's durable
+    /// ack-floor passes the trigger (they exist only to make
+    /// redelivery deterministic); parked terminal failures keep theirs
+    /// for failure replay.
+    ///
     /// Errors if no cache was configured
     /// (`EngineBuilder::with_effect_store`).
-    pub async fn remember<F, Fut, T>(&self, group: &str, compute: F) -> Result<T>
+    pub async fn effect<F, Fut, T>(&self, label: &str, compute: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -248,11 +345,13 @@ impl<'a> Ctx<'a> {
     {
         let cache = self.effect_store.ok_or_else(|| {
             anyhow::anyhow!(
-                "ctx.remember called but no EffectStore was configured \
+                "ctx.effect called but no EffectStore was configured \
                  (EngineBuilder::with_effect_store)"
             )
         })?;
-        let key = crate::effect_store::EffectKey::new(group, self.event_id);
+        self.claim_label("effect", label)?;
+        let key =
+            crate::effect_store::EffectKey::new(self.consumer, self.event_id, label);
         crate::effect_store::remember(&**cache, &key, compute).await
     }
 }
@@ -265,23 +364,33 @@ mod tests {
         Metadata::new()
     }
 
-    #[test]
-    fn ctx_now_returns_occurred_at_not_wall_clock() {
-        let occurred = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let meta = fixed_meta();
-        let ctx = Ctx {
+    fn test_ctx<'a>(
+        meta: &'a Metadata,
+        labels: Option<&'a LabelSet>,
+        occurred: DateTime<Utc>,
+    ) -> Ctx<'a> {
+        Ctx {
             event_id:       Uuid::nil(),
             log_position:   LogCursor::ZERO,
             occurred_at:    occurred,
             workflow_id: Uuid::nil(),
-            metadata:       &meta,
-            state:    crate::contexts::StateSource::None,
+            metadata:       meta,
+            consumer:       "test.consumer",
+            labels,
+            state:    StateSource::None,
             logs:           None,
             effect_store: None,
-        };
-        assert_eq!(ctx.now(), occurred);
+        }
+    }
+
+    #[test]
+    fn ctx_time_returns_occurred_at_not_wall_clock() {
+        let occurred = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let meta = fixed_meta();
+        let ctx = test_ctx(&meta, None, occurred);
+        assert_eq!(ctx.time(), occurred);
     }
 
     #[test]
@@ -290,16 +399,7 @@ mod tests {
         meta.insert("_phase".into(), serde_json::json!("pre_migration"));
         meta.insert("_schema_v".into(), serde_json::json!(2));
 
-        let ctx = Ctx {
-            event_id:       Uuid::nil(),
-            log_position:   LogCursor::ZERO,
-            occurred_at:    Utc::now(),
-            workflow_id: Uuid::nil(),
-            metadata:       &meta,
-            state:    crate::contexts::StateSource::None,
-            logs:           None,
-            effect_store: None,
-        };
+        let ctx = test_ctx(&meta, None, Utc::now());
         assert_eq!(
             ctx.metadata.get("_phase").and_then(|v| v.as_str()),
             Some("pre_migration"),
@@ -308,5 +408,41 @@ mod tests {
             ctx.metadata.get("_schema_v").and_then(|v| v.as_i64()),
             Some(2),
         );
+    }
+
+    #[test]
+    fn derive_id_is_deterministic_and_label_scoped() {
+        let meta = fixed_meta();
+        let labels_a = LabelSet::default();
+        let ctx_a = test_ctx(&meta, Some(&labels_a), Utc::now());
+        let labels_b = LabelSet::default();
+        let ctx_b = test_ctx(&meta, Some(&labels_b), Utc::now());
+
+        // Same consumer + trigger + label ⇒ same id across invocations
+        // (redelivery mints the same identity).
+        let a = ctx_a.derive_id("group").unwrap();
+        let b = ctx_b.derive_id("group").unwrap();
+        assert_eq!(a, b, "redelivery derives the same identity");
+
+        // Different labels mint different identities.
+        let c = ctx_a.derive_id("other").unwrap();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn duplicate_derive_id_label_is_a_domain_error() {
+        let meta = fixed_meta();
+        let labels = LabelSet::default();
+        let ctx = test_ctx(&meta, Some(&labels), Utc::now());
+        ctx.derive_id("group").unwrap();
+        let err = ctx.derive_id("group").unwrap_err();
+        assert_eq!(
+            crate::failure::classify(&err),
+            Some(crate::failure::ErrorClass::Domain),
+            "duplicate label errors with domain class",
+        );
+        assert!(format!("{err:#}").contains("duplicate"), "the error teaches");
+        // Same label under a DIFFERENT kind (effect) is not a duplicate.
+        assert!(labels.lock().insert(("effect", "group".into())));
     }
 }

@@ -54,7 +54,9 @@ use uuid::Uuid;
 
 use crate::aggregator::{AggregatorRegistry, FoldOnReadCache};
 use crate::checkpoint_store::ReactorCheckpoint;
-use crate::contexts::{Ctx, StateSource};
+use crate::clock::Clock;
+use crate::contexts::{Ctx, LabelSet, StateSource};
+use crate::effect_store::EffectKey;
 use crate::engine::{TerminalFailure, TerminalFailureMapper};
 use crate::failure::{classify, poison, ErrorClass, FailureClass};
 use crate::event_log::EventLogBackend;
@@ -196,7 +198,14 @@ struct PartitionHandle {
 }
 
 struct PendingTrigger {
+    event_id: Uuid,
     acked: bool,
+    /// True when the trigger parked as a terminal failure — its effect
+    /// entries are exempt from floor-GC (failure replay needs them).
+    parked: bool,
+    /// `ctx.effect` labels this trigger used (union across attempts) —
+    /// the floor-GC's deletion list.
+    effect_labels: Vec<String>,
 }
 
 struct DispatchState {
@@ -223,6 +232,8 @@ struct DispatchState {
 struct Completion {
     position: LogCursor,
     workflow: Uuid,
+    parked: bool,
+    effect_labels: Vec<String>,
 }
 
 enum AttemptOutcome {
@@ -237,6 +248,14 @@ enum AttemptOutcome {
     /// never this variant — they retry indefinitely and can never park
     /// a trigger.
     BodyFailed { error: anyhow::Error, attempts: u32 },
+}
+
+/// What `process_trigger` reports back to the worker loop: how the
+/// trigger finished, and which effect labels it used (the floor-GC's
+/// deletion list).
+struct TriggerDone {
+    parked: bool,
+    effect_labels: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -291,6 +310,11 @@ struct Core<R: Reactor> {
     /// reactors append with `StreamState::Any` and cannot uphold an
     /// aggregate's OCC invariant. Empty = no fence.
     occ_categories: Arc<std::collections::HashSet<String>>,
+    /// Calendar clock for every timestamp this runner stamps
+    /// (`created_at` on outputs and terminal facts, observer attempt
+    /// times). Injected so tests pin it; liveness decisions never use
+    /// it (those are tokio time).
+    clock: Arc<dyn Clock>,
 
     dispatch: parking_lot::Mutex<DispatchState>,
     completions_tx: mpsc::UnboundedSender<Completion>,
@@ -327,6 +351,7 @@ where
                 snapshot_store: None,
                 snapshot_every: 0,
                 occ_categories: Arc::new(std::collections::HashSet::new()),
+                clock: Arc::new(crate::clock::SystemClock),
                 dispatch: parking_lot::Mutex::new(DispatchState {
                     started: false,
                     ingest_pos: LogCursor::ZERO,
@@ -434,6 +459,12 @@ where
         self
     }
 
+    /// Inject the calendar clock for runner-stamped timestamps.
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.core_mut().clock = clock;
+        self
+    }
+
     pub fn consumer_id(&self) -> &str { &self.core.consumer_id }
 
     /// Stop taking new work: workers exit at their next loop boundary
@@ -469,7 +500,12 @@ where
                     }
                     d.pending.insert(
                         event.position,
-                        PendingTrigger { acked: false },
+                        PendingTrigger {
+                            event_id: event.event_id,
+                            acked: false,
+                            parked: false,
+                            effect_labels: Vec::new(),
+                        },
                     );
                     *d.wf_pending.entry(event.workflow_id).or_insert(0) += 1;
                     d.ingest_pos = event.position;
@@ -625,15 +661,20 @@ where
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             };
-            if core.process_trigger(&event, &fold_cache).await {
-                let _ = core.completions_tx.send(Completion {
-                    position: event.position,
-                    workflow: event.workflow_id,
-                });
-            } else {
-                // Halted mid-processing: no ack; floor stays below the
-                // trigger so restart redelivers it.
-                return;
+            match core.process_trigger(&event, &fold_cache).await {
+                Some(done) => {
+                    let _ = core.completions_tx.send(Completion {
+                        position: event.position,
+                        workflow: event.workflow_id,
+                        parked: done.parked,
+                        effect_labels: done.effect_labels,
+                    });
+                }
+                None => {
+                    // Halted mid-processing: no ack; floor stays below
+                    // the trigger so restart redelivers it.
+                    return;
+                }
             }
         }
     }
@@ -660,15 +701,34 @@ where
         self: &Arc<Self>,
         event: &RecordedEvent,
         fold_cache: &FoldOnReadCache,
-    ) -> bool {
+    ) -> Option<TriggerDone> {
         let mut local_attempt: u32 = 0;
         let mut transient_since: Option<tokio::time::Instant> = None;
+        // Union of ctx.effect labels across attempts — the floor-GC's
+        // deletion list (an early attempt may have memoized an effect
+        // a later attempt's path never touches).
+        let mut used_effects: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         loop {
             if self.stopped() {
-                return false;
+                return None;
             }
-            let failure = match self.attempt_trigger(event, fold_cache).await {
-                Ok(AttemptOutcome::Done) => return true,
+            let labels = LabelSet::default();
+            let attempted = self.attempt_trigger(event, fold_cache, &labels).await;
+            used_effects.extend(
+                labels
+                    .into_inner()
+                    .into_iter()
+                    .filter(|(kind, _)| *kind == "effect")
+                    .map(|(_, label)| label),
+            );
+            let failure = match attempted {
+                Ok(AttemptOutcome::Done) => {
+                    return Some(TriggerDone {
+                        parked: false,
+                        effect_labels: used_effects.into_iter().collect(),
+                    });
+                }
                 Ok(AttemptOutcome::BodyFailed { error, attempts }) => Some((error, attempts)),
                 Err(e) => {
                     tracing::warn!(
@@ -712,11 +772,16 @@ where
                             attempts,
                             format!("{:#}", error),
                             failure_class,
-                            chrono::Utc::now(),
+                            self.clock.now(),
                         )
                         .await
                     {
-                        Ok(()) => return true,
+                        Ok(()) => {
+                            return Some(TriggerDone {
+                                parked: true,
+                                effect_labels: used_effects.into_iter().collect(),
+                            });
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 consumer = self.consumer_id,
@@ -740,7 +805,7 @@ where
 
             local_attempt += 1;
             tokio::select! {
-                _ = self.stop_notify.notified() => return false,
+                _ = self.stop_notify.notified() => return None,
                 _ = tokio::time::sleep(backoff_for(local_attempt)) => {}
             }
         }
@@ -752,6 +817,7 @@ where
         self: &Arc<Self>,
         event: &RecordedEvent,
         fold_cache: &FoldOnReadCache,
+        labels: &LabelSet,
     ) -> Result<AttemptOutcome> {
         // Record the attempt FIRST (before deserialization), so a
         // poison trigger engages the terminal-failure budget instead of
@@ -759,7 +825,7 @@ where
         let attempt_seq = self.checkpoint
             .record_reactor_attempt(&self.consumer_id, event.event_id)
             .await?;
-        let started_at = chrono::Utc::now();
+        let started_at = self.clock.now();
 
         // Deserialize the trigger. A failure here is structurally
         // poison — deterministic, so retrying never helps. Classified
@@ -815,6 +881,8 @@ where
             occurred_at:    trigger.occurred_at().unwrap_or(event.created_at),
             workflow_id: event.workflow_id,
             metadata:       &event.metadata,
+            consumer:       &self.consumer_id,
+            labels:         Some(labels),
             state,
             logs:           Some(&log_sink),
             effect_store: self.effect_store.as_ref(),
@@ -835,7 +903,7 @@ where
 
         let emitted = match reacted {
             Ok(events) => {
-                let completed_at = chrono::Utc::now();
+                let completed_at = self.clock.now();
                 if let Some(obs) = self.observer.as_ref() {
                     let drained = log_sink.into_inner();
                     obs.reactor_completed(
@@ -856,7 +924,7 @@ where
                 events
             }
             Err(e) => {
-                let completed_at = chrono::Utc::now();
+                let completed_at = self.clock.now();
                 if let Some(obs) = self.observer.as_ref() {
                     let drained = log_sink.into_inner();
                     obs.reactor_failed(
@@ -919,7 +987,7 @@ where
                 workflow_id: event.workflow_id,
                 event_type: out.durable_name.clone(),
                 payload: out.payload.clone(),
-                created_at: chrono::Utc::now(),
+                created_at: self.clock.now(),
                 // Placement uses the STREAM category; routing stays on
                 // `event_type` (durable_name). Equal unless overridden.
                 category: Some(out.subject.clone()),
@@ -1054,7 +1122,7 @@ where
                 workflow_id: event.workflow_id,
                 event_type: event_type.clone(),
                 payload: payload.clone(),
-                created_at: chrono::Utc::now(),
+                created_at: self.clock.now(),
                 category: Some(cat.clone()),
                 subject_id: Some(sid),
                 metadata: reactor_output_metadata(&self.consumer_id),
@@ -1100,11 +1168,14 @@ where
                 acks.push(c);
             }
         }
+        let count = acks.len();
         if !acks.is_empty() {
             let mut d = self.dispatch.lock();
-            for c in &acks {
+            for c in acks.drain(..) {
                 if let Some(p) = d.pending.get_mut(&c.position) {
                     p.acked = true;
+                    p.parked = c.parked;
+                    p.effect_labels = c.effect_labels;
                 }
                 if let Some(n) = d.wf_pending.get_mut(&c.workflow) {
                     *n -= 1;
@@ -1114,15 +1185,19 @@ where
                 }
             }
         }
-        let count = acks.len();
         self.advance_floor().await?;
         Ok(count)
     }
 
     /// Advance the ack-floor: pop the contiguous acked prefix of
     /// `pending`; with nothing outstanding the floor is the ingestion
-    /// cursor itself. Persist when it moved (or a prior persist failed).
+    /// cursor itself. Persist when it moved (or a prior persist failed),
+    /// then garbage-collect passed triggers' effect entries — they
+    /// existed only to make redelivery deterministic, and the floor
+    /// passing a trigger is what retires redelivery. Parked terminal
+    /// failures keep theirs (failure replay restores from them).
     async fn advance_floor(&self) -> Result<()> {
+        let mut gc: Vec<EffectKey> = Vec::new();
         let to_persist = {
             let mut d = self.dispatch.lock();
             if !d.started {
@@ -1132,9 +1207,14 @@ where
                 if !entry.get().acked {
                     break;
                 }
-                let (pos, _) = entry.remove_entry();
+                let (pos, done) = entry.remove_entry();
                 if pos > d.floor {
                     d.floor = pos;
+                }
+                if !done.parked && self.effect_store.is_some() {
+                    gc.extend(done.effect_labels.into_iter().map(|label| {
+                        EffectKey::new(&self.consumer_id, done.event_id, label)
+                    }));
                 }
             }
             if d.pending.is_empty() && d.ingest_pos > d.floor {
@@ -1151,6 +1231,19 @@ where
             let mut d = self.dispatch.lock();
             if d.persisted_floor.map_or(true, |p| p < pos) {
                 d.persisted_floor = Some(pos);
+            }
+        }
+        // Best-effort: a GC failure must never wedge the floor — a
+        // missed delete is a leaked entry, not a correctness problem.
+        if let Some(store) = self.effect_store.as_ref() {
+            for key in gc {
+                if let Err(e) = store.remove(&key).await {
+                    tracing::warn!(
+                        consumer = self.consumer_id,
+                        error = %format!("{e:#}"),
+                        "effect-store GC failed; entry leaked",
+                    );
+                }
             }
         }
         Ok(())

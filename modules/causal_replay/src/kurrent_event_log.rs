@@ -657,7 +657,7 @@ mod kurrent {
                      (payload/event_type/workflow/causation). A dedup-hit \
                      must be byte-identical; a differing re-emission means the \
                      producer is nondeterministic under redelivery (wall \
-                     clock, rand, or an external call not under ctx.remember). \
+                     clock, rand, or an external call not under ctx.effect). \
                      The persisted row is kept unchanged.",
                     e.event_id,
                 );

@@ -430,18 +430,34 @@ impl<'a> std::future::IntoFuture for SettledEmit<'a> {
 // EngineBuilder
 // ─────────────────────────────────────────────────────────────────────
 
-/// Constructs an `Arc<dyn Supervisable>` runner once a per-consumer
-/// aggregator registry has been built. Stored on the builder so
-/// registry creation can happen at `build()` time after every
-/// `.with_aggregators(...)` call has accumulated.
-type RunnerFactory = Box<
-    dyn FnOnce(
-            Option<Arc<AggregatorRegistry>>,
-            Option<Arc<AggregatorRegistry>>,
-            Arc<std::collections::HashSet<String>>,
-        ) -> Arc<dyn Supervisable>
-        + Send,
->;
+/// Cross-cutting wiring handed to every consumer factory at `build()`
+/// time. Factories receive the builder's FINAL configuration — never a
+/// snapshot captured at registration — so `.with_reactor(r)
+/// .on_terminal_failure(..)` and `.on_terminal_failure(..)
+/// .with_reactor(r)` mean the same thing. (The eager-capture version
+/// silently dropped any mapper/observer/effect-store/clock configured
+/// after a consumer was registered — an ordering-dependent lying
+/// default.)
+pub(crate) struct ConsumerWiring {
+    /// Fresh per-consumer aggregator registry (fold-function table for
+    /// reactors; scan-folded state for serial projectors).
+    pub aggs: Option<Arc<AggregatorRegistry>>,
+    /// The shared engine-level registry.
+    pub engine_aggs: Option<Arc<AggregatorRegistry>>,
+    pub occ: Arc<std::collections::HashSet<String>>,
+    pub failure_mapper: Option<TerminalFailureMapper>,
+    pub max_attempts: u32,
+    pub observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
+    pub effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
+    pub workflow_hw: WorkflowHighWater,
+    pub snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
+    pub snapshot_every: u64,
+    pub clock: Arc<dyn crate::clock::Clock>,
+}
+
+/// Constructs an `Arc<dyn Supervisable>` runner at `build()` time,
+/// once the builder's full configuration has accumulated.
+type RunnerFactory = Box<dyn FnOnce(ConsumerWiring) -> Arc<dyn Supervisable> + Send>;
 
 /// Type-erased terminal-failure mapper plumbed from
 /// `EngineBuilder::on_terminal_failure` into each `ReactorRunner`.
@@ -493,6 +509,11 @@ pub struct EngineBuilder {
     /// Projectors are deliberately absent: read models start from ZERO
     /// (they want full history); side effects must not replay it.
     reactor_seeds:         Vec<(&'static str, crate::projection::StartPosition)>,
+    /// Calendar clock for framework-stamped timestamps (`created_at`
+    /// fallbacks, terminal-failure record times). Injected so tests pin
+    /// it; defaults to the system clock. Liveness decisions never use
+    /// it (Primitive 6's two-clock rule).
+    clock:                 Arc<dyn crate::clock::Clock>,
 }
 
 impl EngineBuilder {
@@ -523,7 +544,20 @@ impl EngineBuilder {
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
             reactor_seeds: Vec::new(),
+            clock: Arc::new(crate::clock::SystemClock),
         }
+    }
+
+    /// Inject the calendar clock. Every timestamp the framework stamps
+    /// (`created_at` when a fact declares no `occurred_at`,
+    /// terminal-failure record times, observer attempt times) comes
+    /// from it — `FixedClock` in tests makes appended envelopes
+    /// reproducible. Replay is byte-stable only when all three hold:
+    /// injected clock, effects memoized (`ctx.effect`), canonical
+    /// payload serialization.
+    pub fn with_clock(mut self, clock: Arc<dyn crate::clock::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Register a [`EffectStore`](crate::effect_store::EffectStore)
@@ -743,11 +777,10 @@ impl EngineBuilder {
         self.claim_name(P::NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
-        let observer = self.observer.clone();
-        self.consumers.push(Box::new(move |aggs, _engine_aggs, _occ| {
+        self.consumers.push(Box::new(move |w: ConsumerWiring| {
             let mut runner = ProjectionRunner::new(p, P::NAME, log, checkpoint);
-            if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
-            if let Some(obs) = observer { runner = runner.with_observer(obs); }
+            if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
+            if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -764,26 +797,20 @@ impl EngineBuilder {
         ));
         let log = self.log.clone();
         let reactor_checkpoint = self.reactor_checkpoint.clone();
-        let failure_mapper = self.failure_mapper.clone();
-        let max_attempts = self.max_attempts;
-        let observer = self.observer.clone();
-        let effect_store = self.effect_store.clone();
-        let workflow_hw = self.workflow_hw.clone();
-        let snapshot_store = self.snapshot_store.clone();
-        let snapshot_every = self.snapshot_every;
-        self.consumers.push(Box::new(move |aggs, engine_aggs, occ| {
+        self.consumers.push(Box::new(move |w: ConsumerWiring| {
             let mut runner = ReactorRunner::new(r, R::NAME, log, reactor_checkpoint)
-                .with_max_attempts(max_attempts);
-            if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
-            if let Some(mapper) = failure_mapper {
+                .with_max_attempts(w.max_attempts)
+                .with_clock(w.clock);
+            if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
+            if let Some(mapper) = w.failure_mapper {
                 runner = runner.with_terminal_failure(mapper);
             }
-            if let Some(obs) = observer { runner = runner.with_observer(obs); }
-            if let Some(rc) = effect_store { runner = runner.with_effect_store(rc); }
-            runner = runner.with_engine_aggregators(engine_aggs);
-            runner = runner.with_settle_tracker(workflow_hw);
-            runner = runner.with_snapshot_persistence(snapshot_store, snapshot_every);
-            runner = runner.with_occ_categories(occ);
+            if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
+            if let Some(rc) = w.effect_store { runner = runner.with_effect_store(rc); }
+            runner = runner.with_engine_aggregators(w.engine_aggs);
+            runner = runner.with_settle_tracker(w.workflow_hw);
+            runner = runner.with_snapshot_persistence(w.snapshot_store, w.snapshot_every);
+            runner = runner.with_occ_categories(w.occ);
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -807,11 +834,10 @@ impl EngineBuilder {
         self.claim_name(P::NAME);
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
-        let observer = self.observer.clone();
-        self.consumers.push(Box::new(move |aggs, _engine_aggs, _occ| {
+        self.consumers.push(Box::new(move |w: ConsumerWiring| {
             let mut runner = MultiProjectorRunner::new(p, P::NAME, log, checkpoint);
-            if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
-            if let Some(obs) = observer { runner = runner.with_observer(obs); }
+            if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
+            if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -926,9 +952,27 @@ impl EngineBuilder {
         // rollback doesn't leak into outside observers' state.
         let engine_aggregators = make_registry();
         let occ_shared = Arc::new(self.occ_categories.clone());
+        // Wiring is assembled HERE, from the builder's final state —
+        // factories never see a registration-time snapshot, so the
+        // order of with_reactor vs on_terminal_failure / with_observer
+        // / with_effect_store / with_clock cannot change meaning.
         let consumers: Vec<Arc<dyn Supervisable>> = self.consumers
             .into_iter()
-            .map(|f| f(make_registry(), engine_aggregators.clone(), occ_shared.clone()))
+            .map(|f| {
+                f(ConsumerWiring {
+                    aggs: make_registry(),
+                    engine_aggs: engine_aggregators.clone(),
+                    occ: occ_shared.clone(),
+                    failure_mapper: self.failure_mapper.clone(),
+                    max_attempts: self.max_attempts,
+                    observer: self.observer.clone(),
+                    effect_store: self.effect_store.clone(),
+                    workflow_hw: self.workflow_hw.clone(),
+                    snapshot_store: self.snapshot_store.clone(),
+                    snapshot_every: self.snapshot_every,
+                    clock: self.clock.clone(),
+                })
+            })
             .collect();
         Ok(Engine::start(
             self.log,
@@ -941,6 +985,7 @@ impl EngineBuilder {
             self.workflow_hw,
             self.snapshot_store,
             self.snapshot_every,
+            self.clock,
         ))
     }
 }
@@ -980,6 +1025,8 @@ pub struct Engine {
     snapshot_store:        Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
     /// Snapshot cadence for the engine-level save path.
     snapshot_every:        u64,
+    /// Calendar clock for emit-path stamping (see `EngineBuilder::with_clock`).
+    clock:                 Arc<dyn crate::clock::Clock>,
 }
 
 impl Engine {
@@ -995,6 +1042,7 @@ impl Engine {
         workflow_hw: WorkflowHighWater,
         snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
         snapshot_every: u64,
+        clock: Arc<dyn crate::clock::Clock>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len());
@@ -1019,6 +1067,7 @@ impl Engine {
             workflow_hw,
             snapshot_store,
             snapshot_every,
+            clock,
         }
     }
 
@@ -1188,7 +1237,7 @@ impl Engine {
                     workflow_id:  workflow,
                     event_type:      event_type.clone(),
                     payload:         payload.clone(),
-                    created_at:      fact.occurred_at().unwrap_or_else(Utc::now),
+                    created_at:      fact.occurred_at().unwrap_or_else(|| self.clock.now()),
                     // Placement uses SUBJECT (same as emit), so
                     // durable restore reads it back; routing stays on event_type.
                     category:        Some(F::SUBJECT.to_string()),
@@ -1325,7 +1374,7 @@ impl Engine {
             // differ only when the event overrides `SUBJECT`.
             let event_type = fact.name().to_string();
             let subject = fact.subject().to_string();
-            let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
+            let occurred_at = fact.occurred_at().unwrap_or_else(|| self.clock.now());
             let subject_id = fact.subject_id();
             let payload = fact.to_value()?;
             let event = EventData {
@@ -2889,7 +2938,7 @@ mod tests {
                 // The "expensive external call" — memoized by reaction key.
                 let calls = self.external_calls.clone();
                 let value: i64 = ctx
-                    .remember(Self::NAME, || async move {
+                    .effect("external_call", || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         Ok(42)
                     })
@@ -2902,7 +2951,7 @@ mod tests {
                 }
 
                 let mut out = Events::new();
-                out.push(Pong { id: trigger.id, value, occurred_at: ctx.now() });
+                out.push(Pong { id: trigger.id, value, occurred_at: ctx.time() });
                 Ok(out)
             }
         }

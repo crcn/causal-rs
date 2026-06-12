@@ -224,6 +224,8 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 occurred_at,
                 workflow_id: event.workflow_id,
                 metadata:       &event.metadata,
+                consumer: &self.consumer_id,
+                labels:   None,
                 state:    match self.aggregators.as_ref() {
                     Some(reg) => crate::contexts::StateSource::Registry(reg),
                     None => crate::contexts::StateSource::None,

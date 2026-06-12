@@ -6,6 +6,61 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### 0.10 step 4 — the deterministic Ctx (2026-06-12, breaking)
+
+`react()` gets no ambient world: the `Ctx` is the only door, and every
+door is deterministic-or-memoized (Primitive 2). Replay is byte-stable
+when all three hold — injected clock, effects memoized, canonical
+payloads.
+
+- **`ctx.derive_id(label)`**: mints a deterministic identity —
+  `v5(consumer ∥ trigger event_id ∥ label)` — so redelivery re-creates
+  the same entity instead of a duplicate. Never `Uuid::new_v4()` in a
+  consumer body.
+- **`ctx.time()`** (was `ctx.now()`): the trigger's recorded time, the
+  only reachable time. Append-time `created_at` stays envelope-only.
+- **`ctx.effect(label, || async { .. })`** (replaces `ctx.remember` /
+  `ctx.effect_key`): memoizes an external call under
+  `(consumer, trigger, label)` — the consumer name comes from the
+  runner, not a hand-passed string, and the label distinguishes
+  multiple effects per reaction. `EffectKey` is now
+  `{ consumer, trigger_event_id, label }`. Projection-store queries
+  are effects too (nondeterministic under redelivery by construction).
+- **Duplicate `derive_id`/`effect` labels in one invocation are a
+  runtime error** (domain class): the second call would silently
+  replay the first's result.
+- **Effect-store floor-GC**: entries exist only to make redelivery
+  deterministic, so the runner deletes them once the durable ack-floor
+  passes their trigger (`EffectStore` gained `remove`); without GC the
+  cache grows to the size of the log. Exception: parked terminal
+  failures keep theirs — failure replay happens after the floor has
+  passed and must restore the original effects, or replay re-runs them
+  fresh and poisons itself.
+- **Calendar-clock injection**: `EngineBuilder::with_clock`
+  (`Clock` / `SystemClock` / `FixedClock`). Every framework-stamped
+  timestamp (`created_at` fallback, terminal-failure record times,
+  observer attempt times) comes from it; liveness waits stay on tokio
+  time (the two-clock rule).
+- **Builder wiring is order-independent**: consumer factories now
+  receive the builder's *final* configuration at `build()` —
+  previously `.with_reactor(r).on_terminal_failure(..)` silently
+  dropped the mapper (and observer/effect-store/clock likewise),
+  because registration captured a snapshot. An ordering-dependent
+  lying default, found by this step's own tests.
+- **Divergence errors print the first differing JSON path**
+  (`outputs[1].candidates[0].signal_id`), not just "payload differs" —
+  the nondeterminism is usually in a dependency far from the reactor.
+  (`causal::event_log::first_diff_path`, shared with backends.)
+- **The clippy guardrail** ships as documented config (module docs on
+  `causal::contexts`): `disallowed-methods` for `Uuid::new_v4` /
+  `Utc::now` in application crates. Rust can't make nondeterminism
+  inexpressible; paved road (this Ctx) + guardrail (the lint) +
+  backstop (the divergence check).
+- **Breaking**: `ctx.now()` → `ctx.time()`; `ctx.remember(group, f)` →
+  `ctx.effect(label, f)`; `ctx.effect_key` deleted; `EffectKey` shape
+  changed (`group` → `consumer`, + `label`); `EffectStore` impls must
+  add `remove`.
+
 ### 0.10 step 3 — the retry taxonomy (2026-06-12, breaking)
 
 BLOCKING-2: blanket bounded-retry amplifies outages (a ten-minute

@@ -54,7 +54,7 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// default — no carrier-event payload bloat for a value the
     /// consumer would never read differently from `event.created_at`.
     ///
-    /// Consumers see the resolved value as `ctx.now()`. Replay
+    /// Consumers see the resolved value as `ctx.time()`. Replay
     /// reproduces byte-identical state because no wall-clock accessor
     /// is exposed inside apply bodies.
     ///
@@ -73,7 +73,7 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// In practice: read from a serde-visible field. NEVER read from
     /// a `#[serde(skip)]` field, a computed-on-construction value, or
     /// a non-deterministic source (`Utc::now()`). Violating this makes
-    /// emit-time and replay-time `ctx.now()` silently disagree — and
+    /// emit-time and replay-time `ctx.time()` silently disagree — and
     /// replay determinism is the whole point of the trait.
     fn occurred_at(&self) -> Option<DateTime<Utc>> { None }
 }

@@ -93,6 +93,7 @@ extern crate self as causal;
 pub mod aggregate;
 pub mod aggregator;
 pub mod checkpoint_store;
+pub mod clock;
 pub mod contexts;
 pub mod engine;
 pub mod event_log;
@@ -169,6 +170,7 @@ pub use effect_store::{remember, InMemoryEffectStore, EffectStore, EffectKey};
 
 // Backend traits (users typically cast `Arc<dyn ...>` at builder time)
 pub use checkpoint_store::{CheckpointStore, ReactorCheckpoint};
+pub use clock::{Clock, FixedClock, SystemClock};
 pub use event_log::{append_event, EventLogBackend};
 pub use projection::StartPosition;
 pub use snapshot_store::SnapshotStore;

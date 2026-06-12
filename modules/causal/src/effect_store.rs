@@ -9,7 +9,7 @@
 //! re-running it produces different output, so the log can't dedup it.
 //!
 //! The fix is to memoize the reaction's result under its
-//! [`EffectKey`] = `(reactor group, trigger event_id)`. The first
+//! [`EffectKey`] = `(consumer, trigger event_id, label)`. The first
 //! execution caches its result; every redelivery returns the **cached**
 //! value instead of re-calling the external service. That makes the
 //! reactor replayable/deterministic — after which the deterministic
@@ -36,19 +36,28 @@ use uuid::Uuid;
 
 use crate::reactor_runner::derive_output_event_id;
 
-/// Identifies one reaction: reactor `group` processing one trigger
-/// event. The unit of idempotency for the reactor path.
+/// Identifies one memoized effect: consumer × trigger × label. The
+/// label distinguishes multiple external calls within one reaction
+/// (`ctx.effect("ocr", ..)` and `ctx.effect("embed", ..)` memoize
+/// independently); duplicate labels in one invocation are a runtime
+/// error caught by the runner.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EffectKey {
-    /// The reacting consumer group — `Reactor::NAME`.
-    pub group: String,
+    /// The reacting consumer — `Reactor::NAME`.
+    pub consumer: String,
     /// The triggering event's id (the reaction's `causation_id`).
     pub trigger_event_id: Uuid,
+    /// The call-site label passed to `ctx.effect(label, ..)`.
+    pub label: String,
 }
 
 impl EffectKey {
-    pub fn new(group: impl Into<String>, trigger_event_id: Uuid) -> Self {
-        Self { group: group.into(), trigger_event_id }
+    pub fn new(
+        consumer: impl Into<String>,
+        trigger_event_id: Uuid,
+        label: impl Into<String>,
+    ) -> Self {
+        Self { consumer: consumer.into(), trigger_event_id, label: label.into() }
     }
 
     /// Deterministic event_id for an emitted output of this reaction,
@@ -58,7 +67,7 @@ impl EffectKey {
     /// redelivery. Shares the exact derivation the reactor runner uses
     /// ([`derive_output_event_id`]).
     pub fn output_event_id(&self, kind: &str, subject_id: Uuid, nth: u32) -> Uuid {
-        derive_output_event_id(&self.group, self.trigger_event_id, kind, subject_id, nth)
+        derive_output_event_id(&self.consumer, self.trigger_event_id, kind, subject_id, nth)
     }
 }
 
@@ -78,6 +87,16 @@ pub trait EffectStore: Send + Sync {
         key: &EffectKey,
         value: serde_json::Value,
     ) -> Result<serde_json::Value>;
+
+    /// Delete the entry for `key` (idempotent — absent is fine).
+    ///
+    /// Called by the runner's floor-GC: an effect entry exists only to
+    /// make *redelivery* deterministic, so once the durable ack-floor
+    /// has passed its trigger the entry is dead — without this the
+    /// cache grows to the size of the log. Triggers that PARK as
+    /// terminal failures are exempted by the runner (their entries
+    /// must survive for failure replay).
+    async fn remove(&self, key: &EffectKey) -> Result<()>;
 }
 
 /// Run `compute` only if `key` has no cached result; otherwise return
@@ -137,6 +156,11 @@ impl EffectStore for InMemoryEffectStore {
         let canonical = map.entry(key.clone()).or_insert(value).clone();
         Ok(canonical)
     }
+
+    async fn remove(&self, key: &EffectKey) -> Result<()> {
+        self.inner.lock().unwrap().remove(key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +171,7 @@ mod tests {
 
     #[test]
     fn output_event_id_is_deterministic_and_matches_runner() {
-        let key = EffectKey::new("welcome_reactor", Uuid::nil());
+        let key = EffectKey::new("welcome_reactor", Uuid::nil(), "main");
         // Stable across calls.
         assert_eq!(key.output_event_id("k", Uuid::nil(), 0), key.output_event_id("k", Uuid::nil(), 0));
         // Distinct per index.
@@ -162,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn remember_computes_once_then_replays() {
         let cache = InMemoryEffectStore::new();
-        let key = EffectKey::new("r", Uuid::new_v4());
+        let key = EffectKey::new("r", Uuid::new_v4(), "call");
         let calls = Arc::new(AtomicU32::new(0));
 
         let c1 = calls.clone();
@@ -190,7 +214,7 @@ mod tests {
     #[tokio::test]
     async fn put_is_first_write_wins() {
         let cache = InMemoryEffectStore::new();
-        let key = EffectKey::new("r", Uuid::new_v4());
+        let key = EffectKey::new("r", Uuid::new_v4(), "call");
 
         let a = cache.put(&key, serde_json::json!("first")).await.unwrap();
         assert_eq!(a, serde_json::json!("first"));

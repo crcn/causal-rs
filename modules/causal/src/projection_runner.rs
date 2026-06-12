@@ -182,6 +182,8 @@ where
                 occurred_at:    fact.occurred_at().unwrap_or(event.created_at),
                 workflow_id: event.workflow_id,
                 metadata:       &event.metadata,
+                consumer: &self.consumer_id,
+                labels:   None,
                 state:    match self.aggregators.as_ref() {
                     Some(reg) => crate::contexts::StateSource::Registry(reg),
                     None => crate::contexts::StateSource::None,
@@ -618,11 +620,11 @@ mod tests {
     #[tokio::test]
     async fn fact_without_occurred_at_falls_back_to_event_created_at() {
         // 0.3.4: Event::occurred_at returns Option, default None. When
-        // a fact opts out, the runner sets ctx.now() to
+        // a fact opts out, the runner sets ctx.time() to
         // event.created_at (the persistence-side envelope timestamp).
         // Verifies the fallback path: append a fact whose Event impl
         // uses the default `None`, pin event.created_at to a known
-        // value, assert ctx.now() resolves to that pinned timestamp.
+        // value, assert ctx.time() resolves to that pinned timestamp.
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct NoTimeFact { id: Uuid }
@@ -642,7 +644,7 @@ mod tests {
             async fn project(
                 &self, _f: &NoTimeFact, ctx: Ctx<'_>,
             ) -> Result<()> {
-                *self.snap.lock() = Some(ctx.now());
+                *self.snap.lock() = Some(ctx.time());
                 Ok(())
             }
         }
@@ -680,6 +682,6 @@ mod tests {
         runner.step(10).await.unwrap();
 
         assert_eq!(*snap.lock(), Some(pinned),
-                   "ctx.now() falls back to event.created_at when Event::occurred_at is None");
+                   "ctx.time() falls back to event.created_at when Event::occurred_at is None");
     }
 }

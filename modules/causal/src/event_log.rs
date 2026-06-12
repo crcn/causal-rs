@@ -157,3 +157,111 @@ pub async fn append_event<B: EventLogBackend + ?Sized>(
         .append_to_stream(&category, subject_id, StreamState::Any, vec![event])
         .await
 }
+
+/// First differing JSON path between two values (e.g.
+/// `outputs[2].candidates[0].signal_id`), or `None` when equal.
+///
+/// Divergent-redelivery errors print this: the producer's
+/// nondeterminism is usually in a dependency crate far from the
+/// reactor body, and the path is the difference between a grep and a
+/// debugging session. Backends share it so all three stores report
+/// the same way.
+pub fn first_diff_path(a: &serde_json::Value, b: &serde_json::Value) -> Option<String> {
+    fn walk(a: &serde_json::Value, b: &serde_json::Value, path: &mut String) -> bool {
+        use serde_json::Value::*;
+        match (a, b) {
+            (Object(ma), Object(mb)) => {
+                // Union of keys, in a's order then b-only keys.
+                for (k, va) in ma {
+                    let len = path.len();
+                    if !path.is_empty() {
+                        path.push('.');
+                    }
+                    path.push_str(k);
+                    match mb.get(k) {
+                        Some(vb) => {
+                            if walk(va, vb, path) {
+                                return true;
+                            }
+                        }
+                        None => return true, // key missing on one side
+                    }
+                    path.truncate(len);
+                }
+                for k in mb.keys() {
+                    if !ma.contains_key(k) {
+                        if !path.is_empty() {
+                            path.push('.');
+                        }
+                        path.push_str(k);
+                        return true;
+                    }
+                }
+                false
+            }
+            (Array(va), Array(vb)) => {
+                for (i, (ea, eb)) in va.iter().zip(vb.iter()).enumerate() {
+                    let len = path.len();
+                    path.push_str(&format!("[{i}]"));
+                    if walk(ea, eb, path) {
+                        return true;
+                    }
+                    path.truncate(len);
+                }
+                if va.len() != vb.len() {
+                    path.push_str(&format!("[{}]", va.len().min(vb.len())));
+                    return true;
+                }
+                false
+            }
+            _ => a != b,
+        }
+    }
+    let mut path = String::new();
+    if walk(a, b, &mut path) {
+        Some(if path.is_empty() { "(root)".to_string() } else { path })
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod diff_path_tests {
+    use super::first_diff_path;
+    use serde_json::json;
+
+    #[test]
+    fn equal_values_have_no_diff() {
+        let v = json!({"a": [1, {"b": 2}]});
+        assert_eq!(first_diff_path(&v, &v), None);
+    }
+
+    #[test]
+    fn nested_diff_prints_the_full_path() {
+        let a = json!({"outputs": [{"x": 1}, {"candidates": [{"signal_id": "s1"}]}]});
+        let b = json!({"outputs": [{"x": 1}, {"candidates": [{"signal_id": "s2"}]}]});
+        assert_eq!(
+            first_diff_path(&a, &b).as_deref(),
+            Some("outputs[1].candidates[0].signal_id"),
+        );
+    }
+
+    #[test]
+    fn missing_key_and_length_mismatch_are_located() {
+        let a = json!({"k": {"present": 1}});
+        let b = json!({"k": {}});
+        assert_eq!(first_diff_path(&a, &b).as_deref(), Some("k.present"));
+
+        let a = json!([1, 2, 3]);
+        let b = json!([1, 2]);
+        assert_eq!(first_diff_path(&a, &b).as_deref(), Some("[2]"));
+    }
+
+    #[test]
+    fn scalar_root_diff_is_root() {
+        assert_eq!(
+            first_diff_path(&json!(1), &json!(2)).as_deref(),
+            Some("(root)"),
+        );
+    }
+}
