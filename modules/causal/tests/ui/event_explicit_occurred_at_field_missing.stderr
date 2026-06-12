@@ -1,0 +1,19 @@
+error: #[event(occurred_at_field = "happened_at")]: this struct has no `happened_at` field
+ --> tests/ui/event_explicit_occurred_at_field_missing.rs:8:8
+  |
+8 | struct OrderPlaced {
+  |        ^^^^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_explicit_occurred_at_field_missing.rs:3:13
+  |
+3 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> tests/ui/event_explicit_occurred_at_field_missing.rs:4:5
+  |
+4 | use uuid::Uuid;
+  |     ^^^^^^^^^^

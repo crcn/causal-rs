@@ -29,6 +29,12 @@ async fn append_is_idempotent_on_event_id() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires running Kurrent on KURRENT_URL"]
+async fn divergent_redelivery_is_rejected() -> Result<()> {
+    conformance::divergent_redelivery_is_rejected(&backend()).await
+}
+
+#[tokio::test]
+#[ignore = "requires running Kurrent on KURRENT_URL"]
 async fn fresh_stream_first_event_lands_at_revision_zero() -> Result<()> {
     conformance::fresh_stream_first_event_lands_at_revision_zero(&backend()).await
 }

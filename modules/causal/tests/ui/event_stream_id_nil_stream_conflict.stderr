@@ -1,0 +1,19 @@
+error: #[event]: `stream_id` and `nil_stream` are contradictory — pick one. `stream_id = "<field>"` streams each value by that Uuid field; `nil_stream` puts every value in the single `{category}-nil` stream.
+ --> tests/ui/event_stream_id_nil_stream_conflict.rs:7:8
+  |
+7 | struct OrderPlaced {
+  |        ^^^^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_stream_id_nil_stream_conflict.rs:2:13
+  |
+2 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> tests/ui/event_stream_id_nil_stream_conflict.rs:3:5
+  |
+3 | use uuid::Uuid;
+  |     ^^^^^^^^^^

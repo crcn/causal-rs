@@ -100,6 +100,61 @@ mod pg {
         }
     }
 
+    /// A dedup-hit must be a **byte-identical** redelivery (see the
+    /// `EventLogBackend` idempotency contract): a persisted row whose
+    /// `payload` / `event_type` / `correlation_id` / `causation_id`
+    /// differs from the redelivered batch means the producer re-decided
+    /// differently on redelivery — error loudly instead of silently
+    /// keeping the old row. `created_at` and `metadata` are exempt
+    /// (documented hints that redeliveries re-stamp).
+    ///
+    /// One round-trip: UNNEST the batch, join on `event_id`, return the
+    /// first divergent id (if any).
+    async fn ensure_redelivery_identical<'e, E>(
+        executor: E,
+        event_ids: &[Uuid],
+        event_types: &[String],
+        payloads: &[serde_json::Value],
+        correlation_ids: &[Uuid],
+        causation_ids: &[Option<Uuid>],
+    ) -> Result<()>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let divergent: Option<Uuid> = sqlx::query_scalar(
+            "SELECT b.event_id
+               FROM UNNEST($1::uuid[], $2::text[], $3::jsonb[],
+                           $4::uuid[], $5::uuid[])
+                    AS b(event_id, event_type, payload,
+                         correlation_id, causation_id)
+               JOIN causal_log e ON e.event_id = b.event_id
+              WHERE e.event_type     IS DISTINCT FROM b.event_type
+                 OR e.payload        IS DISTINCT FROM b.payload
+                 OR e.correlation_id IS DISTINCT FROM b.correlation_id
+                 OR e.causation_id   IS DISTINCT FROM b.causation_id
+              LIMIT 1",
+        )
+        .bind(event_ids)
+        .bind(event_types)
+        .bind(payloads)
+        .bind(correlation_ids)
+        .bind(causation_ids)
+        .fetch_optional(executor)
+        .await?;
+        if let Some(id) = divergent {
+            anyhow::bail!(
+                "append_to_stream: divergent redelivery for event_id {id} — \
+                 the persisted row differs from this batch's event \
+                 (payload/event_type/correlation/causation). A dedup-hit \
+                 must be byte-identical; a differing re-emission means the \
+                 producer is nondeterministic under redelivery (wall clock, \
+                 rand, or an external call not under ctx.remember). The \
+                 persisted row is kept unchanged.",
+            );
+        }
+        Ok(())
+    }
+
     #[async_trait]
     impl EventLogBackend for PgEventLogBackend {
         async fn append_to_stream(
@@ -198,9 +253,19 @@ mod pg {
                         match reconcile(&event_ids, &window_ids) {
                             Reconciliation::Redelivery => {
                                 // Whole batch already persisted —
+                                // verify it's byte-identical, then
                                 // return the ORIGINAL WriteResult (its
                                 // last event's coordinates), mirroring
                                 // the event_id-dedup lookup below.
+                                ensure_redelivery_identical(
+                                    &mut *tx,
+                                    &event_ids,
+                                    &event_types,
+                                    &payloads,
+                                    &correlation_ids,
+                                    &causation_ids,
+                                )
+                                .await?;
                                 let row = sqlx::query(
                                     "SELECT position, revision FROM causal_log \
                                      WHERE event_id = $1",
@@ -349,6 +414,15 @@ mod pg {
                         // violates the all-new-or-all-present precondition.
                         // Fail with a clear error rather than the opaque
                         // RowNotFound a `fetch_one` would raise.
+                        ensure_redelivery_identical(
+                            &self.pool,
+                            &event_ids,
+                            &event_types,
+                            &payloads,
+                            &correlation_ids,
+                            &causation_ids,
+                        )
+                        .await?;
                         let row = sqlx::query(
                             "SELECT position, revision FROM causal_log \
                              WHERE event_id = $1",

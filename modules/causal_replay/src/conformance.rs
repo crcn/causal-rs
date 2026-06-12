@@ -74,18 +74,21 @@ pub fn fresh_event(
 // Scenarios — `append` (non-CAS path)
 // ──────────────────────────────────────────────────────────────────
 
-/// C1: `append` is totally idempotent on `event_id`. A second call
-/// with the same `event_id` returns an equivalent `WriteResult` and
-/// does not create a duplicate log entry.
+/// C1: `append` is idempotent on `event_id` for **byte-identical**
+/// redelivery. A second call with the same `event_id` and the same
+/// content returns an equivalent `WriteResult` and does not create a
+/// duplicate log entry. (`created_at` may differ — it's a documented
+/// hint that redeliveries re-stamp.)
 pub async fn append_is_idempotent_on_event_id<B: EventLogBackend>(b: &B) -> Result<()> {
     let correlation = Uuid::new_v4();
     let mut event = fresh_event(correlation, "conformance:c1", None, None);
     let event_id = event.event_id;
 
     let first = causal::append_event(b, event.clone()).await?;
-    // Second call: same event_id, different payload — backend must
-    // collapse to the first write's result.
-    event.payload = serde_json::json!({"this_should_not": "overwrite"});
+    // Second call: identical redelivery modulo created_at (reactor
+    // redelivery re-stamps it) — backend must collapse to the first
+    // write's result.
+    event.created_at = Utc::now();
     let second = causal::append_event(b, event).await?;
 
     assert_eq!(
@@ -97,6 +100,43 @@ pub async fn append_is_idempotent_on_event_id<B: EventLogBackend>(b: &B) -> Resu
     // walking $all and counting matches.
     let count = count_event_id_in_log(b, event_id).await?;
     assert_eq!(count, 1, "C1: duplicate append must NOT create a second log entry");
+    Ok(())
+}
+
+/// C1b: a dedup-hit must be byte-identical. A redelivery whose
+/// `payload` (or `event_type` / `correlation_id` / `causation_id`)
+/// differs from the persisted row is an upstream determinism violation
+/// — the producer re-decided differently on redelivery. The backend
+/// MUST error loudly (never silently keep the old row while reporting
+/// success) and MUST leave the original row untouched.
+pub async fn divergent_redelivery_is_rejected<B: EventLogBackend>(b: &B) -> Result<()> {
+    let correlation = Uuid::new_v4();
+    let mut event = fresh_event(correlation, "conformance:c1b", None, None);
+    let event_id = event.event_id;
+    event.payload = serde_json::json!({"decision": "ship"});
+
+    let first = causal::append_event(b, event.clone()).await?;
+
+    // Same event_id, different payload: must be rejected.
+    event.payload = serde_json::json!({"decision": "cancel"});
+    let err = causal::append_event(b, event)
+        .await
+        .expect_err("C1b: divergent-payload redelivery must error, not collapse silently");
+    anyhow::ensure!(
+        err.to_string().contains("divergent"),
+        "C1b: the error should name the violation (got: {err:#})",
+    );
+
+    // Original row untouched, still exactly one.
+    let count = count_event_id_in_log(b, event_id).await?;
+    anyhow::ensure!(count == 1, "C1b: divergent redelivery must not write");
+    let row = find_event_in_log(b, event_id).await?
+        .ok_or_else(|| anyhow::anyhow!("C1b: original row missing"))?;
+    anyhow::ensure!(
+        row.payload == serde_json::json!({"decision": "ship"}),
+        "C1b: original payload must win (got: {})", row.payload,
+    );
+    let _ = first;
     Ok(())
 }
 
@@ -1074,6 +1114,27 @@ async fn count_event_id_in_log<B: EventLogBackend>(
     Ok(count)
 }
 
+/// Find one event by id in `$all` (same bounded scan as
+/// [`count_event_id_in_log`]). Used by scenarios that assert the
+/// persisted row's CONTENT, not just its presence.
+async fn find_event_in_log<B: EventLogBackend>(
+    b: &B,
+    event_id: Uuid,
+) -> Result<Option<causal::types::RecordedEvent>> {
+    let mut cursor = LogCursor::ZERO;
+    for _ in 0..100 {
+        let batch = b.read_all(cursor, 1000).await?;
+        if batch.is_empty() {
+            break;
+        }
+        if let Some(ev) = batch.iter().find(|e| e.event_id == event_id) {
+            return Ok(Some(ev.clone()));
+        }
+        cursor = batch.last().unwrap().position;
+    }
+    Ok(None)
+}
+
 /// Roll-call: every scenario in the suite. Useful for backends that
 /// want to enumerate all tests in one place. Returns
 /// (scenario_name, async fn) pairs.
@@ -1085,6 +1146,7 @@ async fn count_event_id_in_log<B: EventLogBackend>(
 pub fn scenario_names() -> &'static [&'static str] {
     &[
         "append_is_idempotent_on_event_id",
+        "divergent_redelivery_is_rejected",
         "fresh_stream_first_event_lands_at_revision_zero",
         "revision_is_monotonic_within_stream",
         "append_to_stream_rejects_stale_expected",

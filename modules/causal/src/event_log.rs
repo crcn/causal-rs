@@ -28,6 +28,16 @@ use crate::types::{
 /// events carry already-persisted `event_id`s returns an equivalent
 /// [`WriteResult`] without creating duplicate entries.
 ///
+/// A dedup-hit MUST be a **byte-identical** redelivery: backends MUST
+/// error (not silently keep the old row) when a redelivered event's
+/// `payload`, `event_type`, `correlation_id`, or `causation_id` differs
+/// from the persisted row. A divergent re-emission means the producer is
+/// nondeterministic under redelivery (wall clock, rand, or an external
+/// call not under `ctx.remember`) — silently keeping the old row while
+/// the caller believes its new decision won lets state diverge invisibly
+/// from intent. `created_at` and `metadata` are exempt: both are
+/// documented hints that legitimate redeliveries may re-stamp.
+///
 /// **`EventData::created_at` is a hint, not authoritative.** Backends MAY
 /// override with a server-assigned timestamp on write (KurrentDB does this
 /// unconditionally; `MemoryStore` preserves the client value). Consumers

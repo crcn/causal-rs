@@ -1020,6 +1020,18 @@ impl Engine {
     /// // wait for the whole causal chain (tests, sync handlers)
     /// engine.emit(fact).settled().await?;
     /// ```
+    ///
+    /// # Atomicity & retries
+    ///
+    /// Consecutive facts targeting the **same stream** land as one
+    /// atomic batch — all or nothing, so a failed emit leaves nothing
+    /// behind and retrying it cannot duplicate a torn prefix. A batch
+    /// spanning **multiple streams** is atomic per same-stream run, in
+    /// input order; a failure between runs leaves earlier runs durable
+    /// (the backend primitive is per-stream — there is no cross-stream
+    /// transaction). Each `emit` call mints fresh `event_id`s, so
+    /// retrying an emit that *succeeded* writes the facts again —
+    /// retry only on `Err`.
     pub fn emit<I: Into<EmitInput>>(&self, input: I) -> EmitBuilder<'_> {
         EmitBuilder {
             engine: self,
@@ -1261,6 +1273,17 @@ impl Engine {
             m
         };
 
+        // ── Build + validate the WHOLE batch before any write. The OCC
+        // guard and serialization run per fact up front, so a rejected
+        // fact mid-batch can't tear the batch (the pre-2026-06 path
+        // appended one fact at a time: facts before the rejected one
+        // were already durable when emit returned Err).
+        struct PendingEmit {
+            stream_category: String,
+            stream_id:       Uuid,
+            event:           EventData,
+        }
+        let mut pending: Vec<PendingEmit> = Vec::with_capacity(b.input.facts.len());
         for fact in b.input.facts {
             // StreamPolicy::OccRequired guard. Facts in a category
             // registered via `with_aggregate` carry invariants and must
@@ -1278,89 +1301,129 @@ impl Engine {
             // matching); `category`/placement uses the STREAM category. They
             // differ only when the event overrides `STREAM_CATEGORY`.
             let event_type = crate::event_type::compose(fact.category(), fact.variant_name());
-            let stream_category = fact.stream_category();
+            let stream_category = fact.stream_category().to_string();
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let stream_id = fact.stream_id();
             let payload = fact.to_value()?;
-            let new_event = EventData {
+            let event = EventData {
                 event_id:        Uuid::new_v4(),
-                causation_id:       b.causation_id,
+                causation_id:    b.causation_id,
                 correlation_id:  correlation,
                 event_type,
                 payload,
                 created_at:      occurred_at,
-                category:        Some(stream_category.to_string()),
+                category:        Some(stream_category.clone()),
                 stream_id:       Some(stream_id),
                 metadata:        merged_metadata.clone(),
                 ephemeral:       None,
                 persistent:      true,
             };
+            pending.push(PendingEmit { stream_category, stream_id, event });
+        }
 
-            // Capture for engine-level aggregator fold before the log
-            // write consumes new_event. (The pre-append durable restore
-            // this path used to do is now subsumed by `fold_event`'s
-            // gap repair: a cold aggregate's first fold detects the
-            // revision gap and restores read-through before folding.)
-            let agg_event_type = new_event.event_type.clone();
-            let agg_payload = new_event.payload.clone();
+        // ── Append in runs of consecutive same-stream facts — each run
+        // is ONE atomic `append_to_stream` batch. The common shapes
+        // (single fact; multi-fact batch on one stream) land all-or-
+        // nothing, so a failed emit leaves nothing behind and a caller
+        // retry can't duplicate a torn prefix. A mixed-stream batch is
+        // atomic per run, in input order — atomicity ACROSS streams is
+        // not provided (the backend primitive is per-stream); see the
+        // `emit` docs.
+        //
+        // `emit` writes with `StreamState::Any` (no concurrency
+        // invariant — OCC-bearing streams are rejected above and go
+        // through `Engine::append`). Idempotency rests on `event_id`.
+        let mut i = 0;
+        while i < pending.len() {
+            let mut j = i + 1;
+            while j < pending.len()
+                && pending[j].stream_category == pending[i].stream_category
+                && pending[j].stream_id == pending[i].stream_id
+            {
+                j += 1;
+            }
+            let stream_category = pending[i].stream_category.clone();
+            let stream_id = pending[i].stream_id;
+            let chunk: Vec<EventData> =
+                pending[i..j].iter().map(|p| p.event.clone()).collect();
+            let n = chunk.len() as u64;
 
-            let event_id = new_event.event_id;
-            // `emit` is the append-only fact path: write to the fact's own
-            // stream with `StreamState::Any` (no concurrency invariant —
-            // OCC-bearing streams are rejected above and go through
-            // `Engine::append`). Idempotency rests on `event_id`.
             let result = self
                 .log
                 .append_to_stream(
-                    stream_category,
+                    &stream_category,
                     stream_id,
                     crate::types::StreamState::Any,
-                    vec![new_event],
+                    chunk,
                 )
                 .await?;
             last_position = result.position;
 
-            // Mirror into the engine-level registry so out-of-band
-            // `engine.snapshot::<A>(stream_id)` reads stay fresh.
-            // Consumers maintain their OWN registry clones for
-            // in-body `ctx.aggregate` reads — independent state.
-            // Idempotent on stream coordinates; gap repair orders
-            // racing concurrent emits to the same aggregate stream.
-            if let Some(reg) = &self.aggregators {
-                let outcome = crate::aggregator::fold_event(
-                    reg.as_ref(),
-                    self.snapshot_store.as_deref(),
-                    self.log.as_ref(),
-                    &agg_event_type,
-                    &agg_payload,
-                    stream_id,
-                    stream_category,
-                    result.revision,
-                    result.position,
-                    /* strict_to_event = */ false,
-                )
-                .await?;
-                if outcome.applied {
-                    if let Some(obs) = self.observer.as_ref() {
-                        reg.notify_observer(
-                            &outcome.snapshots,
-                            obs.as_ref(),
-                            correlation,
-                            result.position,
-                            event_id,
-                        );
-                    }
-                    if let Some(store) = self.snapshot_store.as_ref() {
-                        crate::aggregator::maybe_save_snapshots(
-                            reg.as_ref(),
-                            store.as_ref(),
-                            self.snapshot_every,
-                            &outcome.snapshots,
-                        )
-                        .await;
+            // Fold each fact of the run into the engine registry. The
+            // run committed atomically; `result.revision` is the LAST
+            // fact's revision, so fact k sits at `revision - (n-1-k)`
+            // (same math as `Engine::append`). `result.position` is the
+            // last fact's position — used for every fold in the run,
+            // mirroring `Engine::append`'s existing approximation.
+            // (The pre-append durable restore this path used to do is
+            // subsumed by `fold_event`'s gap repair: a cold aggregate's
+            // first fold detects the revision gap and restores
+            // read-through before folding.)
+            for (k, p) in pending[i..j].iter().enumerate() {
+                let agg_event_type = p.event.event_type.clone();
+                let agg_payload = p.event.payload.clone();
+                let event_id = p.event.event_id;
+                let revision = StreamRevision::from_raw(
+                    result.revision.raw() - (n - 1 - k as u64),
+                );
+                let fact_write = crate::types::WriteResult {
+                    position: result.position,
+                    revision,
+                };
+
+                // Mirror into the engine-level registry so out-of-band
+                // `engine.snapshot::<A>(stream_id)` reads stay fresh.
+                // Consumers maintain their OWN registry clones for
+                // in-body `ctx.aggregate` reads — independent state.
+                // Idempotent on stream coordinates; gap repair orders
+                // racing concurrent emits to the same aggregate stream.
+                if let Some(reg) = &self.aggregators {
+                    let outcome = crate::aggregator::fold_event(
+                        reg.as_ref(),
+                        self.snapshot_store.as_deref(),
+                        self.log.as_ref(),
+                        &agg_event_type,
+                        &agg_payload,
+                        stream_id,
+                        &stream_category,
+                        fact_write.revision,
+                        fact_write.position,
+                        /* strict_to_event = */ false,
+                    )
+                    .await?;
+                    if outcome.applied {
+                        if let Some(obs) = self.observer.as_ref() {
+                            reg.notify_observer(
+                                &outcome.snapshots,
+                                obs.as_ref(),
+                                correlation,
+                                fact_write.position,
+                                event_id,
+                            );
+                        }
+                        if let Some(store) = self.snapshot_store.as_ref() {
+                            crate::aggregator::maybe_save_snapshots(
+                                reg.as_ref(),
+                                store.as_ref(),
+                                self.snapshot_every,
+                                &outcome.snapshots,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
+            i = j;
         }
         Ok(EmitResult {
             position: last_position,
@@ -2885,6 +2948,120 @@ mod tests {
             1,
             "external call ran once despite the retry — ReactionCache deduped it",
         );
+        engine.shutdown().await.unwrap();
+    }
+
+    async fn batch_emit_atomicity_fixture(
+        fail_on: usize,
+    ) -> (Arc<MemoryStore>, Engine) {
+        let mem = Arc::new(MemoryStore::new());
+        let flaky = Arc::new(FailsNthAppend {
+            inner: mem.clone(),
+            calls: AtomicUsize::new(0),
+            fail_on,
+        });
+        let engine = EngineBuilder::new(
+            flaky as Arc<dyn EventLogBackend>,
+            mem.clone() as Arc<dyn CheckpointStore>,
+            mem.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .build().await.unwrap();
+        (mem, engine)
+    }
+
+    /// Log wrapper that fails its Nth `append_to_stream` call (1-based),
+    /// delegating everything else to the inner MemoryStore. Fault
+    /// injection for batch-atomicity tests.
+    struct FailsNthAppend {
+        inner:   Arc<MemoryStore>,
+        calls:   AtomicUsize,
+        fail_on: usize,
+    }
+    #[async_trait]
+    impl EventLogBackend for FailsNthAppend {
+        async fn read_all(
+            &self, after: LogCursor, limit: usize,
+        ) -> Result<Vec<crate::types::RecordedEvent>> {
+            EventLogBackend::read_all(self.inner.as_ref(), after, limit).await
+        }
+        async fn read_stream(
+            &self, category: &str, stream_id: Uuid, after: Option<StreamRevision>,
+        ) -> Result<Vec<crate::types::RecordedEvent>> {
+            EventLogBackend::read_stream(self.inner.as_ref(), category, stream_id, after).await
+        }
+        async fn latest_position(&self) -> Result<LogCursor> {
+            self.inner.latest_position().await
+        }
+        async fn append_to_stream(
+            &self,
+            category: &str,
+            stream_id: Uuid,
+            expected: crate::types::StreamState,
+            events: Vec<EventData>,
+        ) -> Result<crate::types::WriteResult> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.fail_on {
+                anyhow::bail!("injected append failure (call {n})");
+            }
+            self.inner.append_to_stream(category, stream_id, expected, events).await
+        }
+    }
+
+    #[tokio::test]
+    async fn same_stream_batch_emit_never_tears() {
+        // A multi-fact emit to ONE stream must land all-or-nothing.
+        // The torn outcome — emit returns Err but a prefix of the batch
+        // is durably in the log — is the bug: the caller can neither
+        // trust the Err (something landed) nor retry it (the retried
+        // prefix duplicates under fresh event_ids).
+        let (mem, engine) = batch_emit_atomicity_fixture(2).await;
+
+        let id = Uuid::new_v4();
+        let result = engine.emit(vec![
+            CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
+            CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
+        ]).await;
+
+        let rows = EventLogBackend::read_all(mem.as_ref(), LogCursor::ZERO, 100)
+            .await.unwrap();
+        match result {
+            Ok(_) => assert_eq!(rows.len(), 2, "Ok ⇒ the whole batch landed"),
+            Err(_) => assert!(
+                rows.is_empty(),
+                "Err ⇒ nothing landed — got a TORN batch of {} row(s)",
+                rows.len(),
+            ),
+        }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_stream_batch_emit_retry_after_error_does_not_duplicate() {
+        // Retry-after-Err is the natural caller response to a failed
+        // emit. emit mints fresh event_ids per call (no cross-call
+        // dedup), so retry safety rests ENTIRELY on failed emits being
+        // all-or-nothing: if a failed attempt left a prefix behind, the
+        // successful retry duplicates that prefix.
+        let (mem, engine) = batch_emit_atomicity_fixture(2).await;
+
+        let id = Uuid::new_v4();
+        let mut succeeded = false;
+        for _ in 0..3 {
+            let r = engine.emit(vec![
+                CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
+                CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
+            ]).await;
+            if r.is_ok() { succeeded = true; break; }
+        }
+        assert!(succeeded, "emit must eventually succeed past the injected fault");
+
+        let rows = EventLogBackend::read_all(mem.as_ref(), LogCursor::ZERO, 100)
+            .await.unwrap();
+        let by_1 = rows.iter().filter(|e| e.payload["Inc"]["by"] == 1).count();
+        let by_2 = rows.iter().filter(|e| e.payload["Inc"]["by"] == 2).count();
+        assert_eq!((by_1, by_2), (1, 1),
+                   "each fact exactly once after retry; rows: {:?}",
+                   rows.iter().map(|e| &e.payload).collect::<Vec<_>>());
         engine.shutdown().await.unwrap();
     }
 

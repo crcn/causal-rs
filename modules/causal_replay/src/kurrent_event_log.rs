@@ -129,15 +129,17 @@ mod kurrent {
             let window_size = (batch_ids.len() * 4).max(64);
             for _attempt in 0..16 {
                 let (head, window) = read_tail_window(&self.client, stream, window_size).await?;
-                let window_ids: Vec<Uuid> = window.iter().map(|(id, _)| *id).collect();
+                let window_ids: Vec<Uuid> = window.iter().map(|w| w.id).collect();
                 match reconcile(batch_ids, &window_ids) {
                     Reconciliation::Redelivery => {
+                        ensure_redelivery_identical(events, &window)?;
                         let last = batch_ids.last().expect("non-empty batch");
-                        let (_, result) = window
+                        let result = window
                             .iter()
-                            .find(|(id, _)| id == last)
-                            .expect("Redelivery ⇒ every batch id is in the window");
-                        return Ok(*result);
+                            .find(|w| &w.id == last)
+                            .expect("Redelivery ⇒ every batch id is in the window")
+                            .result;
+                        return Ok(result);
                     }
                     Reconciliation::PartialOverlap => {
                         return Err(anyhow!(
@@ -285,19 +287,22 @@ mod kurrent {
                     };
                     if let Some(window) = window {
                         let window_ids: Vec<Uuid> =
-                            window.iter().map(|(id, _)| *id).collect();
+                            window.iter().map(|w| w.id).collect();
                         match reconcile(&batch_ids, &window_ids) {
                             Reconciliation::Redelivery => {
                                 // The whole batch already landed on an
-                                // earlier attempt — return the ORIGINAL
+                                // earlier attempt — verify it's byte-
+                                // identical, then return the ORIGINAL
                                 // WriteResult (last batch event's
                                 // coordinates), never an error.
+                                ensure_redelivery_identical(&events, &window)?;
                                 let last = batch_ids.last().expect("non-empty");
-                                let (_, result) = window
+                                let result = window
                                     .iter()
-                                    .find(|(id, _)| id == last)
-                                    .expect("Redelivery ⇒ every batch id is in the window");
-                                return Ok(*result);
+                                    .find(|w| &w.id == last)
+                                    .expect("Redelivery ⇒ every batch id is in the window")
+                                    .result;
+                                return Ok(result);
                             }
                             Reconciliation::PartialOverlap => {
                                 return Err(anyhow!(
@@ -570,15 +575,106 @@ mod kurrent {
     /// previous append, Kurrent's EventId cache evicted it, and the
     /// server now reports the stream has events — check if they're
     /// ours).
+    /// One event of a dedup/conflict window: its id, original append
+    /// coordinates, and the content fields the byte-identical-redelivery
+    /// check compares. `content` is `None` when the persisted record
+    /// isn't causal-shaped (a foreign writer's event — never a batch
+    /// match unless ids collide, in which case the comparison fails
+    /// loudly rather than assuming identity).
+    struct WindowEvent {
+        id:      Uuid,
+        result:  WriteResult,
+        content: Option<WindowContent>,
+    }
+
+    struct WindowContent {
+        event_type:     String,
+        payload:        Value,
+        correlation_id: Option<Uuid>,
+        causation_id:   Option<Uuid>,
+    }
+
+    fn window_event_from(rec: &KurrentRecordedEvent) -> WindowEvent {
+        let content = (|| {
+            let payload: Value = serde_json::from_slice(&rec.data).ok()?;
+            let metadata: Value = if rec.custom_metadata.is_empty() {
+                Value::Object(Map::new())
+            } else {
+                serde_json::from_slice(&rec.custom_metadata).ok()?
+            };
+            let correlation_id = metadata
+                .get("$correlationId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let causation_id = metadata
+                .get("$causationId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            Some(WindowContent {
+                event_type: rec.event_type.clone(),
+                payload,
+                correlation_id,
+                causation_id,
+            })
+        })();
+        WindowEvent {
+            id: rec.id,
+            result: WriteResult {
+                position: LogCursor::from_raw(rec.position.commit),
+                revision: StreamRevision::from_raw(rec.revision),
+            },
+            content,
+        }
+    }
+
+    /// A dedup-hit must be a **byte-identical** redelivery (see the
+    /// `EventLogBackend` idempotency contract): a persisted row whose
+    /// `payload` / `event_type` / `correlation_id` / `causation_id`
+    /// differs from the redelivered batch means the producer re-decided
+    /// differently on redelivery — error loudly instead of silently
+    /// keeping the old row. `created_at` and `metadata` are exempt
+    /// (documented hints that redeliveries re-stamp). Pure; called on
+    /// the `Redelivery` reconciliation branches, where every batch id
+    /// is known to be present in the window.
+    fn ensure_redelivery_identical(
+        batch: &[EventData],
+        window: &[WindowEvent],
+    ) -> Result<()> {
+        for e in batch {
+            let Some(row) = window.iter().find(|w| w.id == e.event_id) else {
+                continue; // not a dedup-hit for this id
+            };
+            let identical = row.content.as_ref().is_some_and(|c| {
+                c.payload == e.payload
+                    && c.event_type == e.event_type
+                    && c.correlation_id == Some(e.correlation_id)
+                    && c.causation_id == e.causation_id
+            });
+            if !identical {
+                anyhow::bail!(
+                    "append_to_stream: divergent redelivery for event_id {} — \
+                     the persisted row differs from this batch's event \
+                     (payload/event_type/correlation/causation). A dedup-hit \
+                     must be byte-identical; a differing re-emission means the \
+                     producer is nondeterministic under redelivery (wall \
+                     clock, rand, or an external call not under ctx.remember). \
+                     The persisted row is kept unchanged.",
+                    e.event_id,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Read the last `count` events of a stream — the tail window for
     /// the idempotent `Any` append's dedup scan. Returns the head
     /// revision (`None` if the stream is empty/absent) and the window as
-    /// `(event_id, WriteResult)` pairs in ascending stream order.
+    /// [`WindowEvent`]s in ascending stream order.
     async fn read_tail_window(
         client: &Client,
         stream: &str,
         count: usize,
-    ) -> Result<(Option<u64>, Vec<(Uuid, WriteResult)>)> {
+    ) -> Result<(Option<u64>, Vec<WindowEvent>)> {
         let opts = ReadStreamOptions::default()
             .backwards()
             .position(StreamPosition::End)
@@ -598,15 +694,9 @@ mod kurrent {
                 Err(e) => return Err(anyhow!("kurrent tail next failed: {e}")),
             };
             let rec = resolved.get_original_event();
-            window.push((
-                rec.id,
-                WriteResult {
-                    position: LogCursor::from_raw(rec.position.commit),
-                    revision: StreamRevision::from_raw(rec.revision),
-                },
-            ));
+            window.push(window_event_from(rec));
         }
-        let head = window.first().map(|(_, w)| w.revision.raw());
+        let head = window.first().map(|w| w.result.revision.raw());
         window.reverse(); // ascending stream order, as reconcile expects
         Ok((head, window))
     }
@@ -616,7 +706,7 @@ mod kurrent {
         stream: &str,
         from: StreamPosition<u64>,
         count: usize,
-    ) -> Result<Vec<(Uuid, WriteResult)>> {
+    ) -> Result<Vec<WindowEvent>> {
         let opts = ReadStreamOptions::default()
             .forwards()
             .position(from)
@@ -636,13 +726,7 @@ mod kurrent {
                 Err(e) => return Err(anyhow!("kurrent reconcile next failed: {e}")),
             };
             let rec = resolved.get_original_event();
-            window.push((
-                rec.id,
-                WriteResult {
-                    position: LogCursor::from_raw(rec.position.commit),
-                    revision: StreamRevision::from_raw(rec.revision),
-                },
-            ));
+            window.push(window_event_from(rec));
         }
         Ok(window)
     }
@@ -683,6 +767,73 @@ mod kurrent {
         // covered by the conformance suite running against a live
         // Kurrent (see
         // `tests/kurrent_event_log_conformance_test.rs`).
+
+        fn window_row_for(e: &EventData) -> WindowEvent {
+            WindowEvent {
+                id: e.event_id,
+                result: WriteResult {
+                    position: LogCursor::from_raw(7),
+                    revision: StreamRevision::from_raw(3),
+                },
+                content: Some(WindowContent {
+                    event_type:     e.event_type.clone(),
+                    payload:        e.payload.clone(),
+                    correlation_id: Some(e.correlation_id),
+                    causation_id:   e.causation_id,
+                }),
+            }
+        }
+
+        #[test]
+        fn identical_redelivery_passes_divergence_check() {
+            let e = mk_event("conformance:c1", None, None);
+            let window = vec![window_row_for(&e)];
+            ensure_redelivery_identical(&[e], &window)
+                .expect("byte-identical redelivery must pass");
+        }
+
+        #[test]
+        fn divergent_payload_fails_divergence_check() {
+            let mut e = mk_event("conformance:c1b", None, None);
+            e.payload = serde_json::json!({"decision": "ship"});
+            let mut row = window_row_for(&e);
+            row.content.as_mut().unwrap().payload =
+                serde_json::json!({"decision": "cancel"});
+            let err = ensure_redelivery_identical(&[e], &[row])
+                .expect_err("divergent payload must be rejected");
+            assert!(err.to_string().contains("divergent"), "got: {err:#}");
+        }
+
+        #[test]
+        fn divergent_correlation_fails_divergence_check() {
+            let e = mk_event("conformance:c1b", None, None);
+            let mut row = window_row_for(&e);
+            row.content.as_mut().unwrap().correlation_id = Some(Uuid::new_v4());
+            assert!(ensure_redelivery_identical(&[e], &[row]).is_err());
+        }
+
+        #[test]
+        fn unparseable_persisted_row_fails_divergence_check() {
+            // Same event_id but the persisted record isn't causal-shaped:
+            // identity can't be verified, so fail loudly rather than
+            // assume.
+            let e = mk_event("conformance:c1b", None, None);
+            let mut row = window_row_for(&e);
+            row.content = None;
+            assert!(ensure_redelivery_identical(&[e], &[row]).is_err());
+        }
+
+        #[test]
+        fn foreign_window_rows_are_ignored_by_divergence_check() {
+            // A window event with a DIFFERENT id is a foreign neighbor,
+            // not a dedup-hit — never compared.
+            let e = mk_event("conformance:c1", None, None);
+            let mut foreign = window_row_for(&e);
+            foreign.id = Uuid::new_v4();
+            foreign.content = None;
+            ensure_redelivery_identical(&[e], &[foreign])
+                .expect("foreign rows must not trip the check");
+        }
 
         #[test]
         fn build_metadata_stamps_reserved_keys() {

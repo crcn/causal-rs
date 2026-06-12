@@ -1,0 +1,13 @@
+error: #[event] on enums requires a prefix: #[event(prefix = "...")]
+ --> tests/ui/event_no_args_gets_prefix_error_first.rs:9:6
+  |
+9 | enum Bare {
+  |      ^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_no_args_gets_prefix_error_first.rs:4:13
+  |
+4 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

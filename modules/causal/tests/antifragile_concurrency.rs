@@ -913,11 +913,13 @@ async fn settle_returns_promptly_under_unrelated_flood() {
 // (fold_event errors loudly on non-convergence, which would surface as
 // an emit Err here).
 //
-// NOTE: this test fails INTERMITTENTLY (~1/20 runs) by losing a fold —
-// observed and diagnosed as the same vacant-entry restore TOCTOU pinned
-// by `vacant_registry_restore_race_loses_folds` below (the racing first
+// HISTORY: this test used to fail intermittently (~1/20 runs) by losing
+// a fold — the vacant-entry restore TOCTOU pinned by
+// `vacant_registry_restore_race_loses_folds` below (the racing first
 // folds of this stream go through the same restore path, with foreign
-// events widening the read-tail/replay window). Not a separate bug.
+// events widening the read-tail/replay window). FIXED by the 2026-06-10
+// monotonic-`set_state` remediation (see attack 9c's header); verified
+// 2026-06-12 with 0 failures in 300 runs (200 release + 100 debug).
 // ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

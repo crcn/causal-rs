@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -25,11 +26,51 @@ struct ProjectionCursorEntry {
     cursor: LogCursor,
 }
 
+/// Derived indices over the global log, maintained by
+/// `append_to_stream`. They exist so the hot paths stay sub-linear as
+/// the log grows into the millions — without them, every append paid an
+/// O(N) stream-count scan plus an O(N) dedup scan (quadratic total),
+/// and `read_stream` walked the whole log per call.
+///
+/// **Lock ordering:** always acquire `global_log` BEFORE `log_index`.
+/// The index is only ever written under both locks, so a reader holding
+/// the log lock sees an index consistent with the Vec.
+#[derive(Default)]
+struct LogIndex {
+    /// event_id → offset in the log Vec (dedup + divergence checks).
+    by_event_id: HashMap<Uuid, usize>,
+    /// (category, stream_id) → that stream's log offsets, in revision
+    /// order. `len()` is the stream's event count; offset `r` holds
+    /// revision `r` (revisions are dense per stream).
+    streams: HashMap<(String, Uuid), Vec<usize>>,
+}
+
+/// Read-only lock guard over the global event log, returned by
+/// [`MemoryStore::global_log`]. Derefs to `[RecordedEvent]`; no
+/// mutable access exists, because the store's [`LogIndex`] is derived
+/// from this Vec and external mutation would silently desync it.
+///
+/// **This holds the log lock.** Copy what you need and drop it before
+/// calling any store method (`read_all`, `append_to_stream`, ...) —
+/// the lock is not reentrant, so calling back into the store while
+/// holding the guard deadlocks. Holding it across an `.await` blocks
+/// every writer for the duration.
+pub struct GlobalLogGuard<'a>(parking_lot::MutexGuard<'a, Vec<RecordedEvent>>);
+
+impl std::ops::Deref for GlobalLogGuard<'_> {
+    type Target = [RecordedEvent];
+    fn deref(&self) -> &[RecordedEvent] {
+        &self.0
+    }
+}
+
 /// In-memory backend implementing the full trait surface.
 #[derive(Clone)]
 pub struct MemoryStore {
     /// Global event log.
     global_log: Arc<Mutex<Vec<RecordedEvent>>>,
+    /// Derived indices over `global_log` — see [`LogIndex`].
+    log_index: Arc<Mutex<LogIndex>>,
     /// Global position counter for event ordering.
     global_position: Arc<AtomicU64>,
     /// Snapshot store keyed by (aggregate_type, aggregate_id).
@@ -72,6 +113,7 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self {
             global_log: Arc::new(Mutex::new(Vec::new())),
+            log_index: Arc::new(Mutex::new(LogIndex::default())),
             global_position: Arc::new(AtomicU64::new(1)),
             snapshots: Arc::new(DashMap::new()),
             projection_cursors: Arc::new(DashMap::new()),
@@ -84,9 +126,16 @@ impl MemoryStore {
         }
     }
 
-    /// Access the underlying global event log (for test assertions).
-    pub fn global_log(&self) -> &Mutex<Vec<RecordedEvent>> {
-        &self.global_log
+    /// Read-only view of the global event log (test assertions, the
+    /// inspector's read surface).
+    ///
+    /// Read-only **by construction**: `append_to_stream` maintains
+    /// derived indices over this Vec (see [`LogIndex`]), so external
+    /// mutation would silently desync them and corrupt dedup/stream
+    /// reads later. Pre-0.9 this returned the raw `&Mutex<Vec<_>>` —
+    /// callers migrate by dropping the `.lock()` call.
+    pub fn global_log(&self) -> GlobalLogGuard<'_> {
+        GlobalLogGuard(self.global_log.lock())
     }
 
     // ── Inspector accessors ──────────────────────────────────────
@@ -284,13 +333,11 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         limit: usize,
     ) -> Result<Vec<RecordedEvent>> {
         let log = self.global_log.lock();
-        let events = log
-            .iter()
-            .filter(|e| e.position > after)
-            .take(limit)
-            .cloned()
-            .collect();
-        Ok(events)
+        // Positions ascend with Vec order (assigned under this lock),
+        // so the first event past `after` is found by binary search —
+        // O(log N + limit), not an O(N) front-scan per poll.
+        let start = log.partition_point(|e| e.position <= after);
+        Ok(log[start..].iter().take(limit).cloned().collect())
     }
 
     async fn read_stream(
@@ -300,19 +347,17 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         after: Option<StreamRevision>,
     ) -> Result<Vec<RecordedEvent>> {
         let log = self.global_log.lock();
-        let events = log
+        let idx = self.log_index.lock(); // lock ordering: log → index
+        let Some(offsets) = idx.streams.get(&(category.to_string(), stream_id)) else {
+            return Ok(Vec::new());
+        };
+        // Offset `r` holds revision `r` (dense per stream), so
+        // `revision > min` is a suffix starting at `min + 1`.
+        let skip = after.map(|min| min.raw().saturating_add(1) as usize).unwrap_or(0);
+        Ok(offsets[skip.min(offsets.len())..]
             .iter()
-            .filter(|e| {
-                e.category == category
-                    && e.stream_id == stream_id
-                    && match after {
-                        None => true,
-                        Some(min) => e.revision > min,
-                    }
-            })
-            .cloned()
-            .collect();
-        Ok(events)
+            .map(|&i| log[i].clone())
+            .collect())
     }
 
     async fn latest_position(&self) -> Result<LogCursor> {
@@ -355,11 +400,51 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         }
 
         let mut log = self.global_log.lock();
+        let mut idx = self.log_index.lock(); // lock ordering: log → index
 
         // Idempotency: a batch is written atomically, so if the last
         // event_id is already present the whole batch is — return its
         // result regardless of expected state.
-        if let Some(existing) = log.iter().find(|e| e.event_id == last_id) {
+        //
+        // BUT a dedup-hit must be a *byte-identical* redelivery. A
+        // divergent payload means the producer re-decided differently on
+        // redelivery (nondeterministic react body: wall clock, rand, an
+        // un-remember()ed external call). Returning Ok while keeping the
+        // old row would let the caller believe its new decision won —
+        // state diverging silently from intent. Scream instead; the fix
+        // is always upstream (make the producer deterministic).
+        // `created_at` is exempt: it's documented as a hint and legit
+        // redeliveries re-stamp it. `metadata` is exempt for the same
+        // reason (engine defaults may differ across deploys).
+        if let Some(&existing_at) = idx.by_event_id.get(&last_id) {
+            for e in &events {
+                let Some(&at) = idx.by_event_id.get(&e.event_id) else {
+                    anyhow::bail!(
+                        "append_to_stream: partial-overlap batch — the batch tail \
+                         {last_id} is persisted but event_id {} is not (event_ids \
+                         must be all-new or all-already-persisted)",
+                        e.event_id,
+                    );
+                };
+                let row = &log[at];
+                if row.payload != e.payload
+                    || row.event_type != e.event_type
+                    || row.correlation_id != e.correlation_id
+                    || row.causation_id != e.causation_id
+                {
+                    anyhow::bail!(
+                        "append_to_stream: divergent redelivery for event_id {} — \
+                         the persisted row differs from this batch's event \
+                         (payload/event_type/correlation/causation). A dedup-hit \
+                         must be byte-identical; a differing re-emission means the \
+                         producer is nondeterministic under redelivery (wall \
+                         clock, rand, or an external call not under \
+                         ctx.remember). The persisted row is kept unchanged.",
+                        e.event_id,
+                    );
+                }
+            }
+            let existing = &log[existing_at];
             return Ok(WriteResult {
                 position: existing.position,
                 revision: existing.revision,
@@ -371,7 +456,7 @@ impl crate::event_log::EventLogBackend for MemoryStore {
         // id is already present this is a torn/partial batch — reject rather
         // than double-write. Only multi-event batches can be torn.
         if events.len() > 1
-            && events.iter().any(|e| log.iter().any(|r| r.event_id == e.event_id))
+            && events.iter().any(|e| idx.by_event_id.contains_key(&e.event_id))
         {
             anyhow::bail!(
                 "append_to_stream: partial-overlap batch — an event_id already \
@@ -380,10 +465,12 @@ impl crate::event_log::EventLogBackend for MemoryStore {
             );
         }
 
-        let count = log
-            .iter()
-            .filter(|e| e.category == category && e.stream_id == stream_id)
-            .count() as u64;
+        let stream_key = (category.to_string(), stream_id);
+        let count = idx
+            .streams
+            .get(&stream_key)
+            .map(|offsets| offsets.len() as u64)
+            .unwrap_or(0);
         let current_tail: Option<StreamRevision> = if count == 0 {
             None
         } else {
@@ -412,6 +499,8 @@ impl crate::event_log::EventLogBackend for MemoryStore {
             let position =
                 LogCursor::from_raw(self.global_position.fetch_add(1, Ordering::SeqCst));
             let new_revision = StreamRevision::from_raw(count + offset as u64);
+            idx.by_event_id.insert(event.event_id, log.len());
+            idx.streams.entry(stream_key.clone()).or_default().push(log.len());
             log.push(RecordedEvent {
                 position,
                 event_id: event.event_id,
@@ -544,6 +633,57 @@ mod append_tests {
         // The whole batch rolled back — nothing persisted.
         let all = EventLogBackend::read_all(&store, LogCursor::ZERO, 100).await.unwrap();
         assert!(all.is_empty(), "rejected batch must not partially write");
+    }
+
+    #[tokio::test]
+    async fn byte_identical_redelivery_dedups_to_original_write() {
+        // The idempotency contract's happy path: a crash between append
+        // and checkpoint redelivers the IDENTICAL batch; the backend
+        // returns the original WriteResult without a second row.
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        let event = ev(id);
+        let first = EventLogBackend::append_to_stream(
+            &store, "test", Uuid::nil(), StreamState::Any, vec![event.clone()],
+        ).await.unwrap();
+        let second = EventLogBackend::append_to_stream(
+            &store, "test", Uuid::nil(), StreamState::Any, vec![event],
+        ).await.unwrap();
+        assert_eq!(first.position, second.position);
+        let all = EventLogBackend::read_all(&store, LogCursor::ZERO, 100).await.unwrap();
+        assert_eq!(all.len(), 1, "redelivery must not create a second row");
+    }
+
+    #[tokio::test]
+    async fn divergent_payload_redelivery_errors_loudly() {
+        // A dedup-hit whose payload DIFFERS from the persisted row is
+        // always an upstream determinism violation — a reactor that
+        // re-decided differently on redelivery (wall clock, rand, an
+        // un-remember()ed external call). Silently keeping the old row
+        // while the caller believes the new decision won is how state
+        // diverges invisibly. The backend must scream instead.
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        let mut a = ev(id);
+        a.payload = serde_json::json!({ "decision": "ship" });
+        EventLogBackend::append_to_stream(
+            &store, "test", Uuid::nil(), StreamState::Any, vec![a],
+        ).await.unwrap();
+
+        let mut b = ev(id);
+        b.payload = serde_json::json!({ "decision": "cancel" });
+        let err = EventLogBackend::append_to_stream(
+            &store, "test", Uuid::nil(), StreamState::Any, vec![b],
+        ).await.unwrap_err();
+        assert!(
+            err.to_string().contains("divergent"),
+            "divergent redelivery must error loudly, got: {err:#}",
+        );
+
+        // The original row is untouched.
+        let all = EventLogBackend::read_all(&store, LogCursor::ZERO, 100).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].payload, serde_json::json!({ "decision": "ship" }));
     }
 
     #[tokio::test]

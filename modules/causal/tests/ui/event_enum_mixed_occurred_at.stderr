@@ -1,0 +1,19 @@
+error: #[event]: some variants have an `occurred_at` field and some don't — occurred_at() is generated only when ALL named-fields variants carry it, so this is almost always a typo on the odd variant out. Add `occurred_at` to this variant, or remove it everywhere for the trait default (None), or name a different field with `occurred_at_field = "..."`.
+  --> tests/ui/event_enum_mixed_occurred_at.rs:15:5
+   |
+15 |     Shipped {
+   |     ^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_enum_mixed_occurred_at.rs:4:13
+  |
+4 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> tests/ui/event_enum_mixed_occurred_at.rs:5:5
+  |
+5 | use uuid::Uuid;
+  |     ^^^^^^^^^^

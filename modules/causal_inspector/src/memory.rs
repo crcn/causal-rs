@@ -40,7 +40,7 @@ fn to_stored(e: &causal::types::RecordedEvent) -> StoredEvent {
 #[async_trait]
 impl InspectorReadModel for MemoryStore {
     async fn list_events(&self, query: &EventQuery) -> Result<Vec<StoredEvent>> {
-        let log = self.global_log().lock();
+        let log = self.global_log();
         let limit = query.limit.min(200);
 
         let iter = log.iter().rev();
@@ -101,7 +101,7 @@ impl InspectorReadModel for MemoryStore {
     }
 
     async fn get_event(&self, seq: i64) -> Result<Option<StoredEvent>> {
-        let log = self.global_log().lock();
+        let log = self.global_log();
         Ok(log
             .iter()
             .find(|e| e.position.raw() as i64 == seq)
@@ -109,7 +109,7 @@ impl InspectorReadModel for MemoryStore {
     }
 
     async fn causal_tree(&self, seq: i64) -> Result<(Vec<StoredEvent>, i64)> {
-        let log = self.global_log().lock();
+        let log = self.global_log();
 
         // Find the target event's correlation_id
         let correlation_id = log
@@ -140,7 +140,7 @@ impl InspectorReadModel for MemoryStore {
         let Ok(cid) = Uuid::parse_str(correlation_id) else {
             return Ok(vec![]);
         };
-        let log = self.global_log().lock();
+        let log = self.global_log();
         Ok(log
             .iter()
             .filter(|e| e.correlation_id == cid)
@@ -149,7 +149,7 @@ impl InspectorReadModel for MemoryStore {
     }
 
     async fn events_from_seq(&self, start_seq: i64, limit: usize) -> Result<Vec<StoredEvent>> {
-        let log = self.global_log().lock();
+        let log = self.global_log();
         let limit = limit.min(500);
         Ok(log
             .iter()
@@ -188,7 +188,7 @@ impl InspectorReadModel for MemoryStore {
         };
         // Build set of event IDs in this correlation
         let event_ids: std::collections::HashSet<Uuid> = {
-            let log = self.global_log().lock();
+            let log = self.global_log();
             log.iter()
                 .filter(|e| e.correlation_id == cid)
                 .map(|e| e.event_id)
@@ -361,7 +361,7 @@ impl InspectorReadModel for MemoryStore {
 
         // Build event_id → event_type lookup from global log
         let event_types: std::collections::HashMap<Uuid, String> = {
-            let log = self.global_log().lock();
+            let log = self.global_log();
             log.iter()
                 .filter(|e| e.correlation_id == cid)
                 .map(|e| (e.event_id, e.event_type.clone()))
@@ -396,7 +396,7 @@ impl InspectorReadModel for MemoryStore {
         limit: usize,
         cursor: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<CorrelationSummaryEntry>> {
-        let log = self.global_log().lock();
+        let log = self.global_log();
 
         // Group events by correlation_id, skipping nil UUIDs
         let mut by_corr: std::collections::HashMap<
@@ -476,7 +476,7 @@ impl InspectorReadModel for MemoryStore {
     }
 
     async fn reactor_dependencies(&self) -> Result<Vec<ReactorDependencyEntry>> {
-        let log = self.global_log().lock();
+        let log = self.global_log();
 
         // For each reactor, track which event types triggered it and which it produced.
         // A reactor execution is triggered by an event_id — look up its event_type.
@@ -555,7 +555,7 @@ impl InspectorReadModel for MemoryStore {
 
         // Build lookup: event_id → (event_type, ts)
         let event_info: std::collections::HashMap<Uuid, (String, chrono::DateTime<chrono::Utc>)> = {
-            let log = self.global_log().lock();
+            let log = self.global_log();
             log.iter()
                 .map(|e| (e.event_id, (e.event_type.clone(), e.created_at)))
                 .collect()

@@ -1,0 +1,19 @@
+error: #[event(stream_id = "oder_id")]: this struct has no `oder_id` field — name the Uuid field this event streams by
+ --> tests/ui/event_struct_stream_id_typo.rs:8:8
+  |
+8 | struct OrderPlaced {
+  |        ^^^^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_struct_stream_id_typo.rs:3:13
+  |
+3 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> tests/ui/event_struct_stream_id_typo.rs:4:5
+  |
+4 | use uuid::Uuid;
+  |     ^^^^^^^^^^

@@ -378,28 +378,32 @@ fn expand_aggregators_module(
 ///
 /// # Usage
 ///
+/// Every event names its stream identity: `stream_id = "<field>"` (the
+/// Uuid field its aggregates fold by — present on every variant), or the
+/// explicit `nil_stream` opt-in for genuinely streamless facts
+/// (telemetry, ops counters), which routes every value into the single
+/// `{category}-nil` stream. Omitting both is a compile error — the old
+/// silent nil default produced fan-in aggregates no per-stream read
+/// could serve.
+///
 /// ```ignore
 /// // Enum with domain prefix (requires #[serde(tag = "...")])
-/// #[event(prefix = "scrape")]
+/// #[event(prefix = "scrape", stream_id = "source_id")]
 /// #[derive(Clone, Serialize, Deserialize)]
 /// #[serde(tag = "type", rename_all = "snake_case")]
 /// pub enum ScrapeEvent {
-///     WebScrapeCompleted { urls_scraped: usize },
-///     SourcesResolved { sources: Vec<Uuid> },
+///     WebScrapeCompleted { source_id: Uuid, occurred_at: DateTime<Utc>, urls_scraped: usize },
+///     SourcesResolved { source_id: Uuid, occurred_at: DateTime<Utc> },
 /// }
 ///
-/// // Ephemeral enum
-/// #[event(prefix = "synthesis", ephemeral)]
+/// // Streamless telemetry — explicit opt-in
+/// #[event(prefix = "synthesis", ephemeral, nil_stream)]
 /// // ...
 ///
 /// // Struct (no prefix needed — snake_case of struct name)
-/// #[event]
+/// #[event(stream_id = "order_id")]
 /// #[derive(Clone, Serialize, Deserialize)]
-/// pub struct OrderPlaced { pub order_id: Uuid }
-///
-/// // Ephemeral struct
-/// #[event(ephemeral)]
-/// pub struct EnrichmentReady { pub correlation_id: Uuid }
+/// pub struct OrderPlaced { pub order_id: Uuid, pub occurred_at: DateTime<Utc> }
 /// ```
 #[proc_macro_attribute]
 pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -434,6 +438,13 @@ struct EventArgs {
     /// event types in one stream (for durable aggregate restore). When
     /// omitted, `STREAM_CATEGORY` defaults to `CATEGORY` (unchanged).
     stream: Option<String>,
+    /// v0.9: explicit opt-in to the streamless category-singleton shape
+    /// (`stream_id()` = `Uuid::nil()`, every value sharing one
+    /// `{category}-nil` stream). Before 0.9 this was the SILENT default
+    /// when `stream_id` was omitted — the trap that mass-produced
+    /// fan-in aggregates no per-stream read can serve. Now one of
+    /// `stream_id = "..."` / `nil_stream` must be written out.
+    nil_stream: bool,
 }
 
 fn parse_event_args(tokens: TokenStream2) -> EventArgs {
@@ -443,6 +454,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
     let mut stream_id = None;
     let mut occurred_at_field = None;
     let mut stream = None;
+    let mut nil_stream = false;
 
     if tokens.is_empty() {
         return EventArgs {
@@ -452,6 +464,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             stream_id,
             occurred_at_field,
             stream,
+            nil_stream,
         };
     }
 
@@ -466,6 +479,7 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
                 stream_id,
                 occurred_at_field,
                 stream,
+                nil_stream,
             };
         }
     };
@@ -481,6 +495,9 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             }
             Meta::Path(path) if path.is_ident("ephemeral") => {
                 ephemeral = true;
+            }
+            Meta::Path(path) if path.is_ident("nil_stream") => {
+                nil_stream = true;
             }
             Meta::NameValue(MetaNameValue { path, value, .. })
                 if path.is_ident("stream_category") =>
@@ -527,7 +544,41 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
         stream_id,
         occurred_at_field,
         stream,
+        nil_stream,
     }
+}
+
+/// Stream identity must be explicit. Before 0.9, omitting `stream_id`
+/// silently defaulted `stream_id()` to `Uuid::nil()` — every value of
+/// every entity landing in one `{category}-nil` stream. That default
+/// mass-produced fan-in aggregates that no per-stream read can serve
+/// (an aggregate's stream is the id its facts fold by), and the
+/// failure surfaced far from here, at registration or read time.
+/// Called AFTER each shape's structural checks (an enum missing its
+/// prefix gets THAT error first — no stair-stepping).
+fn require_stream_identity(args: &EventArgs, name: &Ident) -> Result<(), syn::Error> {
+    if args.stream_id.is_some() && args.nil_stream {
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[event]: `stream_id` and `nil_stream` are contradictory — \
+             pick one. `stream_id = \"<field>\"` streams each value by \
+             that Uuid field; `nil_stream` puts every value in the single \
+             `{category}-nil` stream.",
+        ));
+    }
+    if args.stream_id.is_none() && !args.nil_stream {
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[event] needs a stream identity. Add `stream_id = \"<field>\"` \
+             naming the Uuid field this event streams by — the id you fold \
+             its aggregate by (e.g. `stream_id = \"signal_id\"`). For a \
+             genuinely streamless fact (telemetry, ops counters) opt in \
+             explicitly with `nil_stream`: every value then shares the one \
+             `{category}-nil` stream, which per-stream aggregates cannot \
+             fold and `ctx`-side reads cannot serve.",
+        ));
+    }
+    Ok(())
 }
 
 fn expand_event(args: EventArgs, input: DeriveInput) -> Result<TokenStream2, syn::Error> {
@@ -543,6 +594,98 @@ fn expand_event(args: EventArgs, input: DeriveInput) -> Result<TokenStream2, syn
     }
 }
 
+/// Compute the generated `occurred_at()` impl for an enum (both the
+/// `stream_id` and `nil_stream` shapes use this, so the rules cannot
+/// drift):
+///
+/// - field on ALL named-fields variants → `Some(*field)` arms; unit /
+///   tuple variants (which cannot carry fields) get honest `None` arms;
+/// - field on NO variant → no impl (trait default `None`);
+/// - MIXED presence among named variants → error naming the odd
+///   variant out — that is almost always a typo, and silently
+///   returning `None` for one variant makes its events sort by the
+///   `created_at` fallback, a quiet data bug;
+/// - an explicit `occurred_at_field = "..."` states intent: every
+///   named variant must carry it, and at least one variant must be
+///   named-fields.
+fn enum_occurred_impl(
+    name: &Ident,
+    data_enum: &syn::DataEnum,
+    occurred_field: &str,
+    explicit: bool,
+) -> Result<TokenStream2, syn::Error> {
+    let field_ident = format_ident!("{}", occurred_field);
+    let mut have: Vec<&syn::Ident> = Vec::new();
+    let mut lack: Vec<&syn::Ident> = Vec::new();
+    let mut fieldless: Vec<&syn::Variant> = Vec::new();
+    for v in &data_enum.variants {
+        match &v.fields {
+            Fields::Named(f)
+                if f.named.iter().any(|f| f.ident.as_ref() == Some(&field_ident)) =>
+            {
+                have.push(&v.ident)
+            }
+            Fields::Named(_) => lack.push(&v.ident),
+            Fields::Unnamed(_) | Fields::Unit => fieldless.push(v),
+        }
+    }
+    if explicit {
+        if let Some(missing) = lack.first() {
+            return Err(syn::Error::new_spanned(
+                missing,
+                format!(
+                    "#[event(occurred_at_field = \"{occurred_field}\")] requires every \
+                     named-fields variant to have a `{occurred_field}` field — this \
+                     variant lacks it",
+                ),
+            ));
+        }
+        if have.is_empty() {
+            return Err(syn::Error::new_spanned(
+                name,
+                format!(
+                    "#[event(occurred_at_field = \"{occurred_field}\")]: no variant \
+                     carries a `{occurred_field}` field",
+                ),
+            ));
+        }
+    }
+    if !have.is_empty() && !lack.is_empty() {
+        return Err(syn::Error::new_spanned(
+            lack[0],
+            format!(
+                "#[event]: some variants have an `{occurred_field}` field and some \
+                 don't — occurred_at() is generated only when ALL named-fields \
+                 variants carry it, so this is almost always a typo on the odd \
+                 variant out. Add `{occurred_field}` to this variant, or remove it \
+                 everywhere for the trait default (None), or name a different field \
+                 with `occurred_at_field = \"...\"`.",
+            ),
+        ));
+    }
+    if have.is_empty() {
+        return Ok(quote! {});
+    }
+    let some_arms = have.iter().map(|vn| {
+        quote! { #name::#vn { #field_ident, .. } => ::core::option::Option::Some(*#field_ident) }
+    });
+    let none_arms = fieldless.iter().map(|v| {
+        let vn = &v.ident;
+        match &v.fields {
+            Fields::Unnamed(_) => quote! { #name::#vn(..) => ::core::option::Option::None },
+            _ => quote! { #name::#vn => ::core::option::Option::None },
+        }
+    });
+    Ok(quote! {
+        fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
+            match self {
+                #(#some_arms,)*
+                #(#none_arms,)*
+            }
+        }
+    })
+}
+
 fn expand_event_enum(
     args: EventArgs,
     input: &DeriveInput,
@@ -551,12 +694,13 @@ fn expand_event_enum(
     let name = &input.ident;
 
     // Require a prefix for enums
-    let prefix = args.prefix.ok_or_else(|| {
+    let prefix = args.prefix.clone().ok_or_else(|| {
         syn::Error::new_spanned(
             name,
             "#[event] on enums requires a prefix: #[event(prefix = \"...\")]",
         )
     })?;
+    require_stream_identity(&args, name)?;
 
     // Optional `stream = "..."` → `const STREAM_CATEGORY` (physical stream
     // placement, distinct from the routing CATEGORY). Omitted = trait default.
@@ -633,14 +777,12 @@ fn expand_event_enum(
             .occurred_at_field
             .clone()
             .unwrap_or_else(|| "occurred_at".to_string());
-        let occurred_field_ident = format_ident!("{}", occurred_field);
 
-        // Build per-variant arms for stream() and occurred_at(). Every
-        // variant MUST have a named-fields shape with both the stream
-        // id field and the occurred-at field; tuple/unit variants are
-        // rejected with a clear compile error.
+        // Per-variant stream_id arms. Every variant MUST carry the
+        // stream-identity field (a stream-keyed event with a keyless
+        // variant has nowhere to land). occurred_at() generation is the
+        // shared all/none/mixed rule — see `enum_occurred_impl`.
         let mut stream_arms = Vec::new();
-        let mut occurred_arms = Vec::new();
         for variant in &data_enum.variants {
             let variant_name = &variant.ident;
             match &variant.fields {
@@ -649,12 +791,6 @@ fn expand_event_enum(
                         .named
                         .iter()
                         .any(|f| f.ident.as_ref().map(|i| i == &id_field_ident).unwrap_or(false));
-                    let has_occurred = fields.named.iter().any(|f| {
-                        f.ident
-                            .as_ref()
-                            .map(|i| i == &occurred_field_ident)
-                            .unwrap_or(false)
-                    });
                     if !has_id {
                         return Err(syn::Error::new_spanned(
                             variant_name,
@@ -664,20 +800,8 @@ fn expand_event_enum(
                             ),
                         ));
                     }
-                    if !has_occurred {
-                        return Err(syn::Error::new_spanned(
-                            variant_name,
-                            format!(
-                                "#[event] Event generation requires every variant to have an `{}` field (override with `occurred_at_field = \"...\"`)",
-                                occurred_field
-                            ),
-                        ));
-                    }
                     stream_arms.push(quote! {
                         #name::#variant_name { #id_field_ident, .. } => *#id_field_ident
-                    });
-                    occurred_arms.push(quote! {
-                        #name::#variant_name { #occurred_field_ident, .. } => *#occurred_field_ident
                     });
                 }
                 Fields::Unnamed(_) | Fields::Unit => {
@@ -688,6 +812,12 @@ fn expand_event_enum(
                 }
             }
         }
+        let occurred_impl = enum_occurred_impl(
+            name,
+            data_enum,
+            &occurred_field,
+            args.occurred_at_field.is_some(),
+        )?;
 
         quote! {
             impl ::causal::Event for #name {
@@ -703,18 +833,27 @@ fn expand_event_enum(
                         #(#stream_arms,)*
                     }
                 }
-                fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
-                    ::core::option::Option::Some(match self {
-                        #(#occurred_arms,)*
-                    })
-                }
+                #occurred_impl
             }
         }
     } else {
-        // No `stream_id` arg: emit a Event impl with the prefix as
-        // CATEGORY, bare variant name as `name()`, and
-        // `Uuid::nil()` as stream_id (category-singleton). Used by
-        // operational/telemetry events that aren't per-aggregate.
+        // Explicit `nil_stream` opt-in (`require_stream_identity`
+        // rejects plain omission): emit a Event impl with the prefix as
+        // CATEGORY, bare variant name as `name()`, and `Uuid::nil()` as
+        // stream_id (category-singleton). For operational/telemetry
+        // events that genuinely aren't per-aggregate. occurred_at()
+        // follows the same shared rule as the stream_id shape — a
+        // nil_stream event with timestamps must not silently lose them.
+        let occurred_field = args
+            .occurred_at_field
+            .clone()
+            .unwrap_or_else(|| "occurred_at".to_string());
+        let occurred_impl = enum_occurred_impl(
+            name,
+            data_enum,
+            &occurred_field,
+            args.occurred_at_field.is_some(),
+        )?;
         quote! {
             impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #prefix;
@@ -727,6 +866,7 @@ fn expand_event_enum(
                 fn stream_id(&self) -> ::uuid::Uuid {
                     ::uuid::Uuid::nil()
                 }
+                #occurred_impl
             }
         }
     };
@@ -746,6 +886,7 @@ fn expand_event_struct(
     input: &DeriveInput,
 ) -> Result<TokenStream2, syn::Error> {
     let name = &input.ident;
+    require_stream_identity(&args, name)?;
     let ephemeral = args.ephemeral;
 
     // For structs, the durable name is the snake_case of the struct name
@@ -758,11 +899,12 @@ fn expand_event_struct(
 
     let prefix_str = durable.clone();
 
-    // v0.4 Event impl for structs. CATEGORY = `stream_category` if
+    // v0.9 Event impl for structs. CATEGORY = `stream_category` if
     // supplied, else `prefix` (or the snake-cased struct name).
-    // stream_id uses the `stream_id` field name if supplied, else
-    // `Uuid::nil()` (category-singleton). occurred_at uses
-    // `occurred_at_field` if supplied, else None.
+    // stream_id reads the field named by the (required) `stream_id`
+    // arg; `nil_stream` is the explicit opt-in for the streamless
+    // shape. occurred_at() is generated when the `occurred_at` field
+    // (or the `occurred_at_field` override) is present.
     let bare_name = prefix_str.clone();
     // Optional `stream = "..."` → `const STREAM_CATEGORY` (physical stream
     // placement, distinct from the routing CATEGORY). Omitted = trait default.
@@ -773,12 +915,62 @@ fn expand_event_struct(
     let fact_impl = if let Some(id_field) = args.stream_id.as_ref() {
         let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
         let id_field_ident = format_ident!("{}", id_field);
-        let occurred_field_ident = format_ident!(
-            "{}",
-            args.occurred_at_field
-                .clone()
-                .unwrap_or_else(|| "occurred_at".to_string())
-        );
+        let occurred_field = args
+            .occurred_at_field
+            .clone()
+            .unwrap_or_else(|| "occurred_at".to_string());
+        let occurred_field_ident = format_ident!("{}", occurred_field);
+
+        // Struct fields are in view at expansion time, so a missing
+        // field must be a teaching error HERE — not a raw rustc
+        // "no field" error pointing into generated code.
+        let named_fields: Vec<&Ident> = match &input.data {
+            Data::Struct(d) => match &d.fields {
+                Fields::Named(f) => f.named.iter().filter_map(|f| f.ident.as_ref()).collect(),
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        name,
+                        format!(
+                            "#[event(stream_id = \"{id_field}\")] requires a named-fields \
+                             struct (the macro reads `self.{id_field}`)",
+                        ),
+                    ));
+                }
+            },
+            _ => unreachable!("expand_event_struct only receives structs"),
+        };
+        if !named_fields.iter().any(|f| **f == id_field_ident) {
+            return Err(syn::Error::new_spanned(
+                name,
+                format!(
+                    "#[event(stream_id = \"{id_field}\")]: this struct has no \
+                     `{id_field}` field — name the Uuid field this event streams by",
+                ),
+            ));
+        }
+        let has_occurred = named_fields.iter().any(|f| **f == occurred_field_ident);
+        if args.occurred_at_field.is_some() && !has_occurred {
+            return Err(syn::Error::new_spanned(
+                name,
+                format!(
+                    "#[event(occurred_at_field = \"{occurred_field}\")]: this struct \
+                     has no `{occurred_field}` field",
+                ),
+            ));
+        }
+        // occurred_at() is generated only when the field exists —
+        // absent = the trait's default `None` (timeless facts are
+        // legitimate; requiring a timestamp to satisfy the macro
+        // would be ceremony).
+        let occurred_impl = if has_occurred {
+            quote! {
+                fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
+                    ::core::option::Option::Some(self.#occurred_field_ident)
+                }
+            }
+        } else {
+            quote! {}
+        };
         quote! {
             impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
@@ -787,13 +979,47 @@ fn expand_event_struct(
                 fn stream_id(&self) -> ::uuid::Uuid {
                     self.#id_field_ident
                 }
+                #occurred_impl
+            }
+        }
+    } else {
+        // `nil_stream` opt-in. occurred_at() follows the same
+        // presence-conditional rule as the stream_id shape — a
+        // nil_stream event with a timestamp must not silently lose it.
+        let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
+        let occurred_field = args
+            .occurred_at_field
+            .clone()
+            .unwrap_or_else(|| "occurred_at".to_string());
+        let occurred_field_ident = format_ident!("{}", occurred_field);
+        let has_occurred = match &input.data {
+            Data::Struct(d) => match &d.fields {
+                Fields::Named(f) => f
+                    .named
+                    .iter()
+                    .any(|f| f.ident.as_ref() == Some(&occurred_field_ident)),
+                _ => false, // unit/tuple struct — no named fields to read
+            },
+            _ => unreachable!("expand_event_struct only receives structs"),
+        };
+        if args.occurred_at_field.is_some() && !has_occurred {
+            return Err(syn::Error::new_spanned(
+                name,
+                format!(
+                    "#[event(occurred_at_field = \"{occurred_field}\")]: this struct \
+                     has no `{occurred_field}` field",
+                ),
+            ));
+        }
+        let occurred_impl = if has_occurred {
+            quote! {
                 fn occurred_at(&self) -> ::core::option::Option<::chrono::DateTime<::chrono::Utc>> {
                     ::core::option::Option::Some(self.#occurred_field_ident)
                 }
             }
-        }
-    } else {
-        let category = args.stream_category.as_ref().unwrap_or(&prefix_str);
+        } else {
+            quote! {}
+        };
         quote! {
             impl ::causal::Event for #name {
                 const CATEGORY: &'static str = #category;
@@ -802,6 +1028,7 @@ fn expand_event_struct(
                 fn stream_id(&self) -> ::uuid::Uuid {
                     ::uuid::Uuid::nil()
                 }
+                #occurred_impl
             }
         }
     };

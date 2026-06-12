@@ -6,6 +6,88 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Bug-fix + scale pass (2026-06-12). Four real defects found by an
+adversarial design review, fixed test-first, plus a quadratic→linear
+rework of `MemoryStore`'s hot paths after a million-event assault.
+
+### Changed (breaking)
+
+- **`#[causal::event]` requires an explicit stream identity.** Omitting
+  `stream_id` used to silently default `stream_id()` to `Uuid::nil()`,
+  routing every value of every entity into one `{category}-nil` stream —
+  the trap that mass-produces fan-in aggregates no per-stream read can
+  serve. It is now a compile error whose message teaches the fix; a
+  genuinely streamless fact (telemetry, ops counters) opts in with the
+  new `nil_stream` flag. Migration: add `stream_id = "<the Uuid field
+  your aggregates fold by>"`, or `nil_stream` where the singleton shape
+  is intended.
+
+  Anti-stair-step guarantees, so fixing the new error never raises a
+  second one: `occurred_at()` is now generated **only when the field is
+  present** (on the struct, or on ALL enum variants — absent everywhere
+  = the trait default `None`; mixed presence across variants errors
+  naming the odd variant out, since that's almost always a typo); a
+  typo'd `stream_id`/`occurred_at_field` on a struct is a teaching
+  error at the macro instead of a raw "no field" rustc error inside
+  generated code. (Previously the `stream_id` path *required* an
+  `occurred_at` field on every variant; enums without one simply could
+  not use `stream_id`.)
+- **`MemoryStore::global_log()` returns a read-only guard** instead of
+  `&Mutex<Vec<RecordedEvent>>`. The store now maintains derived indices
+  over that Vec, so external mutation would silently desync them — the
+  guard makes it impossible by construction. Migration: drop the
+  `.lock()` call (`store.global_log().lock().len()` →
+  `store.global_log().len()`); the guard derefs to `[RecordedEvent]`.
+- **Divergent redeliveries are rejected loudly** (all backends:
+  MemoryStore, Postgres, Kurrent). A dedup-hit on `event_id` whose
+  `payload` / `event_type` / `correlation_id` / `causation_id` differs
+  from the persisted row now errors instead of silently keeping the old
+  row while reporting success — a differing re-emission means the
+  producer is nondeterministic under redelivery (wall clock, rand, or
+  an external call not under `ctx.remember`), and the old behavior let
+  state diverge invisibly from intent. Byte-identical redelivery
+  (modulo `created_at`/`metadata`, which legit redeliveries re-stamp)
+  still collapses to the original `WriteResult`. New conformance
+  scenario: `divergent_redelivery_is_rejected`.
+
+### Fixed
+
+- **Multi-fact `emit` could tear.** `emit(vec![a, b])` appended one
+  fact at a time with fresh `event_id`s per call: a mid-batch failure
+  left a torn prefix durably in the log, and the caller's natural
+  retry-after-`Err` duplicated it. Consecutive same-stream facts now
+  land as **one atomic batch** (all-or-nothing), so a failed emit
+  leaves nothing behind and retrying cannot duplicate. Cross-stream
+  batches remain atomic per same-stream run, in input order — the
+  backend primitive is per-stream; the `emit` docs now state the
+  contract. The OCC-required-category guard also moved ahead of any
+  write, so a rejected fact mid-batch can no longer leave earlier
+  facts behind.
+- **`MemoryStore` was quadratic; now linear.** Every append paid an
+  O(N) stream-count scan + O(N) dedup scan, and every `read_all` poll
+  scanned from the log's front — at 100k events, emit throughput had
+  already fallen 15× (58k → 3.9k ev/s), and a million-event log was
+  minutes of pure scanning. `read_all` now binary-searches the
+  position-ordered log; appends use derived indices (`event_id` →
+  offset, stream → offsets). Measured after: flat ~260k emits/s through
+  2M events (7.7s total), 1M-event projector catch-up in 0.4s. The
+  public `global_log()` accessor is unchanged.
+- **Stale flake note on antifragile attack 8.** The "fails ~1/20 by
+  losing a fold" NOTE described pre-remediation behavior; the
+  vacant-restore TOCTOU it pointed at was fixed 2026-06-10 (monotonic
+  `set_state`). Verified 2026-06-12 with 0 failures across 600 runs
+  (release + debug); the comment now records the fix instead of
+  re-reporting the bug to every reader.
+
+### Added
+
+- `examples/nuke.rs` — scale-assault harness (`emit` / `drain` /
+  `settle_flood` scenarios with per-decile timing reports).
+- trybuild UI tests for the `#[event]` macro (missing `stream_id`,
+  struct + enum forms, `nil_stream` conflict and opt-in).
+
+---
+
 Audit-remediation pass (2026-06-10). Fixes two data-integrity bugs,
 several cross-backend contract divergences, and a large dead API
 surface; adds CI. Pre-1.0, so breaking changes ship now while there is
