@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::event_log::EventLogBackend;
 use crate::snapshot_store::SnapshotStore;
-use crate::types::{LogCursor, Snapshot, StreamRevision};
+use crate::types::{LogCursor, RecordedEvent, Snapshot, StreamRevision};
 
 // ── Aggregate state snapshots ────────────────────────────────────
 //
@@ -97,6 +97,20 @@ pub struct Aggregator {
     /// aggregate's fact kinds out of `emit` and reactor outputs; the
     /// OCC command path (`Engine::append`) is the only write door.
     pub invariant: bool,
+    /// `F::SUBJECT` of the event type this aggregator folds — the
+    /// placement category of the stream that holds F's events
+    /// (`{event_subject}-{id}`). Drives fold-on-read (`ctx.state_of`
+    /// inside partitioned reactors): the subject history to fold is
+    /// the event's stream, regardless of whether the *aggregate*
+    /// declared a restore SUBJECT.
+    pub event_subject: String,
+    /// True when this aggregator extracts its key with a custom
+    /// `id_fn` (cross-subject fan-in: events streamed by one id,
+    /// aggregated under another). Such state cannot be folded from a
+    /// single subject history, so fold-on-read rejects it with a
+    /// teaching error; serial consumers (projectors) still fold it
+    /// from their scan.
+    pub custom_id: bool,
     /// Extract the aggregate ID from JSON payload (deserializes internally).
     json_extract_id: Arc<dyn Fn(&serde_json::Value) -> Option<Uuid> + Send + Sync>,
     /// Deserialize JSON and apply to a type-erased aggregate (&mut dyn Any = &mut A).
@@ -152,7 +166,13 @@ impl Aggregator {
             + serde::de::DeserializeOwned,
         F: crate::event::Event,
     {
-        Self::for_type_with_id_fn::<A, F, _>(|f: &F| Some(<F as crate::event::Event>::subject_id(f)))
+        let mut agg = Self::for_type_with_id_fn::<A, F, _>(|f: &F| {
+            Some(<F as crate::event::Event>::subject_id(f))
+        });
+        // The default key IS the event's subject_id — single-subject
+        // fold, eligible for fold-on-read.
+        agg.custom_id = false;
+        agg
     }
 
     /// Construct an Aggregator that extracts the aggregate id with a
@@ -183,6 +203,7 @@ impl Aggregator {
         let aggregate_type = <A as crate::aggregate::Aggregate>::NAME.to_string();
         let subject = <A as crate::aggregate::Aggregate>::SUBJECT.to_string();
         let invariant = <A as crate::aggregate::Aggregate>::INVARIANT;
+        let event_subject = <F as crate::event::Event>::SUBJECT.to_string();
         let id_fn = Arc::new(id_fn);
         let id_fn_for_extract = id_fn.clone();
 
@@ -192,6 +213,10 @@ impl Aggregator {
             aggregate_type,
             subject,
             invariant,
+            event_subject,
+            // for_type_with_id_fn means the caller supplied a key
+            // function; `for_type` (the common path) resets this.
+            custom_id: true,
             json_extract_id: Arc::new(move |payload: &serde_json::Value| -> Option<Uuid> {
                 let fact: F = serde_json::from_value(payload.clone()).ok()?;
                 id_fn_for_extract(&fact)
@@ -1137,6 +1162,159 @@ pub(crate) async fn maybe_save_snapshots(
             Err(e) => tracing::warn!(aggregate_key = %key, error = %e, "save_snapshot failed; will retry"),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Fold-on-read (BLOCKING-1) — position-bounded state for partitioned
+// reactors
+// ─────────────────────────────────────────────────────────────────────
+
+/// Worker-local incremental cache for [`fold_bounded`]. One per
+/// partition worker; dies with its partition (eviction-on-drain), so
+/// it never outlives the ordering guarantee that makes it cheap.
+///
+/// Correctness needs no version check against other writers: the log
+/// is append-only, so `fold(events ≤ p)` + `fold(events in (p, b])` ≡
+/// `fold(events ≤ b)` for any later bound `b`. The only cache-bypass
+/// case is a bound *below* the cached watermark (a cross-subject read
+/// at an older position), which folds cold and leaves the cache
+/// untouched.
+#[derive(Default)]
+pub struct FoldOnReadCache {
+    entries: parking_lot::Mutex<
+        std::collections::HashMap<(String, Uuid), FoldCacheEntry>,
+    >,
+}
+
+struct FoldCacheEntry {
+    /// `fold(stream events with position <= folded_to)`.
+    state: Box<dyn Any + Send + Sync>,
+    /// Position of the last event folded into `state`.
+    folded_to: LogCursor,
+    /// Per-stream tail: last revision read from each `{subject}-{id}`
+    /// stream (including foreign-kind events that didn't fold) —
+    /// the resume point for incremental tail reads.
+    stream_tails: std::collections::HashMap<String, StreamRevision>,
+}
+
+/// Position-bounded fold of an aggregate's subject history — the state
+/// source behind `ctx.state_of` in partitioned reactors.
+///
+/// Returns `(prev, curr)`: `curr` = fold of all matching events with
+/// `position <= bound`; `prev` = the same fold *excluding* the event at
+/// exactly `bound` (the trigger), so a reactor reading its own
+/// subject sees the transition its trigger caused. When no event of
+/// this aggregate sits at `bound`, `prev == curr`.
+///
+/// The streams to read come from each registered `(A, F)` pair's
+/// `event_subject` (`F::SUBJECT`) — the placement of the events that
+/// fold into `A` — keyed by `id`. Aggregators registered with a custom
+/// `id_fn` (cross-subject fan-in) cannot be folded from one subject
+/// history and are rejected with a teaching error.
+///
+/// # Panics
+/// Panics when no aggregator for `aggregate_type` is registered —
+/// the same configuration-bug teaching panic `ctx.state_of` always had.
+pub(crate) async fn fold_bounded(
+    reg: &AggregatorRegistry,
+    log: &dyn crate::event_log::EventLogBackend,
+    aggregate_type: &str,
+    id: Uuid,
+    bound: LogCursor,
+    cache: &FoldOnReadCache,
+) -> Result<(Box<dyn Any + Send + Sync>, Box<dyn Any + Send + Sync>)> {
+    let aggs: Vec<&Aggregator> = reg
+        .aggregators
+        .iter()
+        .filter(|a| a.aggregate_type == aggregate_type)
+        .collect();
+    assert!(
+        !aggs.is_empty(),
+        "ctx.state_of::<{aggregate_type}>() called but no aggregator for \
+         {aggregate_type} was registered with \
+         EngineBuilder::with_aggregators(...)",
+    );
+    if let Some(bad) = aggs.iter().find(|a| a.custom_id) {
+        anyhow::bail!(
+            "ctx.state_of::<{aggregate_type}>() cannot fold on read: the \
+             aggregator over '{}' uses a custom id_fn (cross-subject \
+             fan-in), so its state is not a single subject's history. \
+             Fold it in a projector-maintained read model, or key the \
+             aggregate by the event's own subject_id.",
+            bad.event_prefix,
+        );
+    }
+
+    // The set of subject histories that feed this aggregate.
+    let mut streams: Vec<&str> = aggs.iter().map(|a| a.event_subject.as_str()).collect();
+    streams.sort_unstable();
+    streams.dedup();
+
+    let key = (aggregate_type.to_string(), id);
+    // Take the entry out (never hold the lock across log I/O); the
+    // worker is this cache's only writer, so take-work-put is race-free.
+    let entry = cache.entries.lock().remove(&key);
+
+    let (mut state, mut folded_to, mut tails, cacheable) = match entry {
+        Some(e) if e.folded_to <= bound => (e.state, e.folded_to, e.stream_tails, true),
+        Some(e) => {
+            // Bound below the watermark: fold cold, put the (still
+            // valid) entry back untouched.
+            cache.entries.lock().insert(key.clone(), e);
+            (
+                aggs[0].default_state(),
+                LogCursor::ZERO,
+                std::collections::HashMap::new(),
+                false,
+            )
+        }
+        None => (
+            aggs[0].default_state(),
+            LogCursor::ZERO,
+            std::collections::HashMap::new(),
+            true,
+        ),
+    };
+
+    // Read each stream's unfolded tail, bounded at `bound`.
+    let mut merged: Vec<RecordedEvent> = Vec::new();
+    for s in &streams {
+        let after = tails.get(*s).copied();
+        let events = log.read_stream(s, id, after).await?;
+        merged.extend(
+            events
+                .into_iter()
+                .filter(|e| e.position <= bound && e.position > folded_to),
+        );
+    }
+    merged.sort_by_key(|e| e.position);
+
+    let mut prev: Option<Box<dyn Any + Send + Sync>> = None;
+    for event in &merged {
+        let Some(agg) = aggs.iter().find(|a| a.event_prefix == event.event_type) else {
+            // Foreign kind co-located in the stream — advances the
+            // tail (below) but folds nothing.
+            tails.insert(event.category.clone(), event.revision);
+            folded_to = event.position;
+            continue;
+        };
+        if event.position == bound {
+            prev = Some(agg.clone_state(state.as_ref()));
+        }
+        agg.apply_to(state.as_mut(), event.payload.clone())?;
+        tails.insert(event.category.clone(), event.revision);
+        folded_to = event.position;
+    }
+
+    let curr_clone = aggs[0].clone_state(state.as_ref());
+    let prev = prev.unwrap_or_else(|| aggs[0].clone_state(state.as_ref()));
+    if cacheable {
+        cache.entries.lock().insert(
+            key,
+            FoldCacheEntry { state, folded_to, stream_tails: tails },
+        );
+    }
+    Ok((prev, curr_clone))
 }
 
 // ─────────────────────────────────────────────────────────────────────

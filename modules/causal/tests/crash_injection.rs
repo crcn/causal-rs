@@ -307,12 +307,13 @@ async fn append_trigger(store: &MemoryStore) -> Uuid {
 
 #[tokio::test]
 async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
-    // New crash model (no outbox): the runner appends the output, then
-    // advances the cursor. A crash AFTER append but BEFORE checkpoint.set
-    // leaves the output in the log with the cursor un-advanced. On the
-    // next step the trigger redelivers; the runner re-reacts and
-    // re-appends — the log's deterministic-event_id dedup (C1) absorbs
-    // the duplicate, so exactly ONE output exists and the cursor advances.
+    // Crash model under the partitioned runner: the worker appends the
+    // output and acks; the dispatcher's ack-floor persist (checkpoint
+    // .set) then fails — the moral kill -9 between output-append and
+    // cursor-advance. The output is durable, the floor is not. A fresh
+    // runner (the restarted process) redelivers the trigger; the
+    // re-append dedups on the deterministic event_id (C1), so exactly
+    // ONE output exists and the floor advances.
     let inner = Arc::new(MemoryStore::new());
     append_trigger(&inner).await;
     let injector = FaultInjector::new(inner.clone());
@@ -324,11 +325,24 @@ async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
         injector.clone() as Arc<dyn ReactorCheckpoint>,
     );
 
-    // Crash at the cursor advance, AFTER the output append.
+    // Crash at the floor persist, AFTER the output append: step until
+    // the armed fault surfaces (the persist happens on the step that
+    // reaps the worker's ack).
     injector.arm(FaultPoint::CheckpointSet);
-    assert!(runner.step(10).await.is_err());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match runner.step(10).await {
+            Err(_) => break,
+            Ok(_) => {
+                assert!(std::time::Instant::now() < deadline,
+                        "armed checkpoint fault never surfaced");
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+    }
+    runner.halt(); // the "crash" — this process takes no further steps
 
-    // Output is in the log; cursor NOT advanced.
+    // Output is in the log; cursor NOT durably advanced.
     let after_crash =
         EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
     let outs1 = after_crash
@@ -338,9 +352,20 @@ async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
     assert_eq!(outs1, 1, "output appended before the crash");
     assert!(inner.get("r.crash").await.unwrap().is_none(), "cursor not advanced");
 
-    // Recovery: next step re-reacts + re-appends (deduped on event_id),
-    // then advances the cursor.
-    runner.step(10).await.unwrap();
+    // Recovery: a FRESH runner (restarted process) redelivers from the
+    // floor, re-reacts, re-appends (deduped on event_id), advances.
+    let recovered = ReactorRunner::new(
+        EmitOne,
+        "r.crash",
+        injector.clone() as Arc<dyn EventLogBackend>,
+        injector.clone() as Arc<dyn ReactorCheckpoint>,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while inner.get("r.crash").await.unwrap().is_none() {
+        recovered.step(10).await.unwrap();
+        assert!(std::time::Instant::now() < deadline, "recovery never advanced the cursor");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
     let after_recovery =
         EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
     let outs2 = after_recovery
@@ -348,7 +373,7 @@ async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
         .filter(|e| e.event_type == "echoed")
         .count();
     assert_eq!(outs2, 1, "re-append deduped on event_id — exactly one output");
-    assert!(inner.get("r.crash").await.unwrap().is_some(), "cursor advanced on recovery");
+    recovered.halt();
 }
 
 // (The outbox/relay crash-recovery tests were removed with slice 3 —
@@ -360,15 +385,6 @@ async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
 // ─────────────────────────────────────────────────────────────────────
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
-struct TriggerCount { n: u32 }
-impl causal::Aggregate for TriggerCount {
-    const NAME: &'static str = "TriggerCount";
-}
-impl causal::aggregate::Apply<Trigger> for TriggerCount {
-    fn apply(&mut self, _: &Trigger) { self.n += 1; }
-}
-
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
 struct EchoCount { n: u32 }
 impl causal::Aggregate for EchoCount {
     const NAME: &'static str = "EchoCount";
@@ -378,25 +394,19 @@ impl causal::aggregate::Apply<Echoed> for EchoCount {
 }
 
 #[tokio::test]
-async fn crash_redelivery_folds_exactly_once_in_both_registries() {
-    // The full A2 crash model: a reactor with aggregators attached
-    // crashes between output-append and checkpoint-set. Redelivery
-    // must be exactly-once at EVERY layer:
-    //   log     — re-append dedups on the deterministic event_id
-    //             (pinned by the earlier test);
-    //   consumer registry — the trigger's re-fold is an idempotent
-    //             skip (pre-A2: double-counted);
-    //   engine registry   — the output's re-fold arrives with the
-    //             ORIGINAL WriteResult coordinates and skips
-    //             (pre-A2: reactor_runner re-folded unconditionally).
+async fn crash_redelivery_folds_exactly_once_in_engine_registry() {
+    // The A2 crash model under the partitioned runner. The
+    // per-consumer scan-folded registry no longer exists (reactor
+    // state reads are position-bounded folds from the log — stateless,
+    // nothing to desync), so the layers left to pin are:
+    //   log             — re-append dedups on the deterministic
+    //                     event_id (pinned by the earlier test);
+    //   engine registry — the redelivered output's re-fold arrives
+    //                     with the ORIGINAL WriteResult coordinates
+    //                     and skips (pre-A2: re-folded unconditionally).
     let inner = Arc::new(MemoryStore::new());
-    let trigger_event_id = append_trigger(&inner).await;
-    let _ = trigger_event_id;
+    append_trigger(&inner).await;
     let injector = FaultInjector::new(inner.clone());
-
-    let mut consumer_reg = causal::aggregator::AggregatorRegistry::new();
-    consumer_reg.register(causal::aggregator::Aggregator::for_type::<TriggerCount, Trigger>());
-    let consumer_reg = Arc::new(consumer_reg);
 
     let mut engine_reg = causal::aggregator::AggregatorRegistry::new();
     engine_reg.register(causal::aggregator::Aggregator::for_type::<EchoCount, Echoed>());
@@ -408,28 +418,45 @@ async fn crash_redelivery_folds_exactly_once_in_both_registries() {
         injector.clone() as Arc<dyn EventLogBackend>,
         injector.clone() as Arc<dyn ReactorCheckpoint>,
     )
-    .with_aggregators(consumer_reg.clone())
     .with_engine_aggregators(Some(engine_reg.clone()));
 
-    // The trigger's stream id (Trigger::subject_id = payload.id).
-    let events = EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
-    let trigger_subject_id = events[0].subject_id;
-
-    // Crash at the cursor advance, AFTER react + output append + folds.
+    // Crash at the floor persist, AFTER react + output append + fold.
     injector.arm(FaultPoint::CheckpointSet);
-    assert!(runner.step(10).await.is_err());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match runner.step(10).await {
+            Err(_) => break,
+            Ok(_) => {
+                assert!(std::time::Instant::now() < deadline,
+                        "armed checkpoint fault never surfaced");
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+    }
+    runner.halt();
 
-    // Recovery: redelivery re-reacts, re-appends (deduped), re-folds
-    // (skipped).
-    runner.step(10).await.unwrap();
-
-    let (_, trigger_count) = consumer_reg.get_transition_arc::<TriggerCount>(trigger_subject_id);
-    assert_eq!(trigger_count.n, 1,
-               "consumer registry folded the redelivered trigger exactly once");
+    // Recovery in a fresh runner sharing the SAME engine registry (the
+    // restarted process re-wires the registry it rebuilt): redelivery
+    // re-reacts, re-appends (deduped), re-folds (skipped on original
+    // stream coordinates).
+    let recovered = ReactorRunner::new(
+        EmitOne,
+        "r.fold-once",
+        injector.clone() as Arc<dyn EventLogBackend>,
+        injector.clone() as Arc<dyn ReactorCheckpoint>,
+    )
+    .with_engine_aggregators(Some(engine_reg.clone()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while inner.get("r.fold-once").await.unwrap().is_none() {
+        recovered.step(10).await.unwrap();
+        assert!(std::time::Instant::now() < deadline, "recovery never advanced the cursor");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
 
     let (_, echo_count) = engine_reg.get_transition_arc::<EchoCount>(Uuid::nil());
     assert_eq!(echo_count.n, 1,
                "engine registry folded the deduped output exactly once");
+    recovered.halt();
 }
 
 #[tokio::test]

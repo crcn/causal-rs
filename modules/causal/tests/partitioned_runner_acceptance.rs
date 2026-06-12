@@ -1,12 +1,9 @@
 //! Acceptance suite for the partitioned runner (0.10 step 2).
 //!
-//! These tests define what the partitioned runner must make true. The
-//! `#[ignore]`d ones are RED against today's serial runner — written
-//! first, per the plan, so the build has a gate instead of a hope.
-//! Un-ignore them as the runner lands; the non-ignored ones pin
-//! behavior that must SURVIVE the rewrite.
-//!
-//! Run the red set: cargo test -p causal --test partitioned_runner_acceptance -- --ignored
+//! Written RED against the serial runner before the build (per the
+//! plan's test discipline), un-ignored when the partitioned runner
+//! landed. The first three define what the runner makes true; the
+//! last two pin serial-era behavior that had to survive the rewrite.
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -117,16 +114,14 @@ impl Reactor for Barrier {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// RED until step 2 — the partitioned runner's definition of done
+// The partitioned runner's definition of done (red before it landed)
 // ─────────────────────────────────────────────────────────────────────
 
 /// THE settle-hostage acceptance: a reactor wedged on an UNRELATED
 /// workflow's trigger must not delay another workflow's `settled()`.
-/// Red today because settle waits on every consumer's global cursor,
-/// and acc.wedge's cursor can never pass the fast workflow's
-/// high-water while wedged.
+/// (Red under the serial runner: settle waited on every consumer's
+/// global cursor, which the wedge pinned forever.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "RED until 0.10 step 2 (partitioned runner) lands"]
 async fn settle_is_not_hostage_to_an_unrelated_wedged_reactor() {
     let store = Arc::new(MemoryStore::new());
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -154,7 +149,6 @@ async fn settle_is_not_hostage_to_an_unrelated_wedged_reactor() {
 /// Emit twice ⇒ two partitions ⇒ both reactor invocations in flight at
 /// once. The barrier proves real overlap, not interleaving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "RED until 0.10 step 2 (partitioned runner) lands"]
 async fn two_emits_run_concurrently_in_the_same_reactor() {
     let store = Arc::new(MemoryStore::new());
     let inside = Arc::new(AtomicU64::new(0));
@@ -188,7 +182,6 @@ async fn two_emits_run_concurrently_in_the_same_reactor() {
 /// A poison trigger (no terminal-failure mapper) wedges ONLY its own
 /// partition; other subjects keep flowing and settling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "RED until 0.10 step 2 (partitioned runner) lands"]
 async fn poison_isolates_to_its_partition() {
     let store = Arc::new(MemoryStore::new());
     let engine = backend(&store)
@@ -222,7 +215,7 @@ async fn poison_isolates_to_its_partition() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// MUST SURVIVE the rewrite — green today, stay green
+// MUST SURVIVE the rewrite — green under the serial runner, still green
 // ─────────────────────────────────────────────────────────────────────
 
 /// Same subject ⇒ log order, regardless of runner internals

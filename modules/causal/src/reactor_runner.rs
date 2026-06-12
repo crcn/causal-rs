@@ -1,45 +1,79 @@
-//! Runner for [`Reactor`](crate::reactor::Reactor) consumers.
+//! Partitioned runner for [`Reactor`](crate::reactor::Reactor)
+//! consumers (0.10 step 2).
 //!
-//! At-least-once + idempotent reactor execution (no outbox):
+//! One dispatcher per consumer, many partitions, one worker task per
+//! active partition:
 //!
-//!   1. Read trigger fact from the log (`read_all` from the cursor).
-//!   2. Filter by `R::Trigger::NAME`.
-//!   3. Call `reactor.react(trigger, ctx)` → `Result<Events>`.
-//!   4. Append each output **directly** to its own stream
-//!      (`append_to_stream(category, subject_id, Any, …)`) with a
-//!      deterministic `event_id = uuid_v5(NS_REACTOR_OUTPUT,
-//!      [reactor_id, trigger_id, idx])`.
-//!   5. Advance the cursor (`checkpoint.set`).
-//!   6. Idempotency: a crash between step 4 and step 5 re-runs `react()`
-//!      on restart; the re-append dedups on `event_id` (C1), so exactly
-//!      one output lands and the cursor advances. The reaction itself is
-//!      kept replayable by the side-effect `EffectStore`.
+//!   1. **Ingest** — the dispatcher reads the log from an in-memory
+//!      ingestion cursor, routes each matching trigger to its
+//!      partition per the reactor's declared
+//!      [`Ordering`](crate::reactor::Ordering) (BLOCKING-4 memo:
+//!      `PerSubject` keys on the trigger's `(SUBJECT, subject_id)`,
+//!      `PerWorkflow` on its `workflow_id`, `None` per event), and
+//!      skips non-matching events.
+//!   2. **Process** — each partition's worker pops triggers FIFO and
+//!      runs the reaction: deserialize → `react()` → append each
+//!      output directly to its own stream with a deterministic
+//!      identity-keyed `event_id` (see [`derive_output_event_id`]).
+//!      Failures retry **worker-local** with capped backoff — a
+//!      failing trigger wedges only its own partition, never the
+//!      consumer. With a terminal-failure mapper, retries cap at
+//!      `max_attempts` and the trigger parks.
+//!   3. **Ack-floor checkpoint** (BLOCKING-3) — the durable cursor is
+//!      the highest position with no unacked matching trigger at or
+//!      below it. Crash redelivery replays at most the pending-work
+//!      window (`MAX_PENDING` matching triggers), never the log
+//!      distance a slow partition fell behind. Redelivered reactions
+//!      dedup on their identity-keyed `event_id`s (C1).
 //!
-//! On `react()` Err: cursor unchanged, nothing appended; the function
-//! propagates the error and the outer supervisor decides retry timing.
+//! State reads inside `react()` (`ctx.state_of`) are position-bounded
+//! **fold-on-read** from the log (BLOCKING-1): deterministic at the
+//! trigger's position regardless of partition interleaving, cached
+//! incrementally per worker (the cache dies with its partition).
 //!
-//! Per C5, a fresh reactor cursor would initialize at
-//! `EventLogBackend::latest_position()` rather than at `LogCursor::ZERO`
-//! — but that initialization is the engine builder's job, not the
-//! runner's. The runner just consumes from the cursor it finds.
+//! `settle` no longer reads this consumer's durable cursor — it asks
+//! [`ReactorRunner::drained`]: ingestion reached the workflow's
+//! high-water AND no queued/in-flight triggers remain for that
+//! workflow here. A reactor wedged on one workflow's trigger cannot
+//! hold another workflow's settle hostage.
 
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use futures::FutureExt;
 use serde::de::DeserializeOwned;
-use tokio::sync::OnceCell;
+use std::panic::AssertUnwindSafe;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::aggregator::AggregatorRegistry;
+use crate::aggregator::{AggregatorRegistry, FoldOnReadCache};
 use crate::checkpoint_store::ReactorCheckpoint;
-use crate::contexts::Ctx;
+use crate::contexts::{Ctx, StateSource};
 use crate::engine::{TerminalFailure, TerminalFailureMapper};
 use crate::event_log::EventLogBackend;
 use crate::event::Event;
 use crate::projection_runner::StepOutcome;
 use crate::reactor_observer::ReactorObserver;
-use crate::reactor::Reactor;
+use crate::reactor::{Ordering, Reactor};
 use crate::types::{EventData, LogCursor, RecordedEvent, StreamState};
+
+/// Pending-work window (BLOCKING-3): the maximum number of matching
+/// triggers queued + in-flight per consumer. Ingestion pauses at the
+/// cap, which bounds crash-redelivery span by *work outstanding* —
+/// never by how far the log head ran ahead of a slow partition.
+const MAX_PENDING: usize = 4096;
+
+/// Worker-local retry pacing: capped exponential backoff.
+const WORKER_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(25);
+const WORKER_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn backoff_for(attempt: u32) -> std::time::Duration {
+    WORKER_BACKOFF_BASE
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(WORKER_BACKOFF_CAP)
+}
 
 /// Namespace UUID for deriving deterministic reactor-output event_ids
 /// via uuid v5. Hardcoded so the same identity inputs always produce
@@ -105,53 +139,136 @@ fn reactor_output_metadata(reactor_id: &str) -> serde_json::Map<String, serde_js
     m
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Dispatch state
+// ─────────────────────────────────────────────────────────────────────
+
+/// Partition identity per the reactor's declared `Ordering`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PartitionKey {
+    /// `Ordering::PerSubject` — the trigger's placement stream.
+    Subject(String, Uuid),
+    /// `Ordering::PerWorkflow` — the trigger's workflow.
+    Workflow(Uuid),
+    /// `Ordering::None` — every trigger is its own partition.
+    Event(Uuid),
+}
+
+fn partition_key_for(ordering: Ordering, event: &RecordedEvent) -> PartitionKey {
+    match ordering {
+        Ordering::PerSubject => {
+            PartitionKey::Subject(event.category.clone(), event.subject_id)
+        }
+        Ordering::PerWorkflow => PartitionKey::Workflow(event.workflow_id),
+        Ordering::None => PartitionKey::Event(event.event_id),
+    }
+}
+
+struct PartitionHandle {
+    tx: mpsc::UnboundedSender<RecordedEvent>,
+    /// Generation guard for self-eviction: a worker deregisters its
+    /// partition only if the map still holds *its* generation, so an
+    /// exit racing a respawn can't evict the successor.
+    gen: u64,
+}
+
+struct PendingTrigger {
+    acked: bool,
+}
+
+struct DispatchState {
+    /// True once the durable checkpoint has seeded `ingest_pos`.
+    started: bool,
+    /// In-memory ingestion cursor — how far this consumer has SCANNED
+    /// (not how far it has finished; that's `floor`).
+    ingest_pos: LogCursor,
+    /// Matching triggers outstanding (queued or in-flight), by log
+    /// position. The ack-floor is the contiguous acked prefix.
+    pending: BTreeMap<LogCursor, PendingTrigger>,
+    /// Durable-checkpoint mirror.
+    floor: LogCursor,
+    /// Last floor actually persisted (so a failed persist retries).
+    persisted_floor: Option<LogCursor>,
+    /// Live partitions.
+    partitions: HashMap<PartitionKey, PartitionHandle>,
+    next_gen: u64,
+    /// Outstanding trigger count per workflow — the `drained` probe's
+    /// "no queued/in-flight work for this workflow" half.
+    wf_pending: HashMap<Uuid, u32>,
+}
+
+struct Completion {
+    position: LogCursor,
+    workflow: Uuid,
+}
+
+enum AttemptOutcome {
+    /// Reaction succeeded; outputs are durable.
+    Done,
+    /// Trigger parked as a terminal failure; cursor may pass it.
+    Parked,
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Runner
+// ─────────────────────────────────────────────────────────────────────
+
 pub struct ReactorRunner<R: Reactor> {
+    core: Arc<Core<R>>,
+}
+
+struct Core<R: Reactor> {
     reactor:     R,
     consumer_id: String,
     log:         Arc<dyn EventLogBackend>,
     checkpoint:  Arc<dyn ReactorCheckpoint>,
-    aggregators: Option<Arc<AggregatorRegistry>>,
-    hydrated:    OnceCell<()>,
-    /// terminal-failure mapper for terminal-failure handling. When `react()`
-    /// errors `max_attempts` times on the same trigger, the mapper
-    /// is invoked; if it returns `Some(fact)`, the synthesized
-    /// fact is appended directly to its stream and the cursor advances
-    /// past the failing event.
+    /// Fold-function table for `ctx.state_of` fold-on-read. The
+    /// registry's own mutable state is unused on this path — the
+    /// partitioned runner reads bounded folds from the log instead of
+    /// maintaining a scan-folded copy (which would race ahead of a
+    /// worker's trigger).
+    fold_registry: Option<Arc<AggregatorRegistry>>,
+    /// Terminal-failure mapper. When `react()` errors `max_attempts`
+    /// times on the same trigger (or the trigger payload is poison),
+    /// the mapper is invoked; if it returns `Some(fact)`, the
+    /// synthesized fact is appended directly to its stream and the
+    /// trigger parks (its partition moves on).
     failure_mapper:  Option<TerminalFailureMapper>,
     /// Retry budget — applies only when `failure_mapper` is set. Without
-    /// a mapper, reactors retry indefinitely (supervisor backoff).
+    /// a mapper, a failing trigger retries indefinitely (worker-local
+    /// backoff), wedging only its own partition.
     max_attempts: u32,
     /// Inspector / telemetry hook. Default `None` = zero overhead.
     observer:    Option<Arc<dyn ReactorObserver>>,
-    /// Reaction-result cache (Phase 4). Surfaced to the reactor body via
+    /// Reaction-result cache. Surfaced to the reactor body via
     /// `ctx.effect_store()` so side-effecting reactors memoize their
     /// external call under the reaction key — safe under retry/redelivery.
     effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
     /// Engine-level aggregator registry. Reactor outputs are folded into
-    /// it after they're appended, so `engine.state_of::<A>(id).await.unwrap()` reflects
-    /// reactor-emitted events (not just caller-emitted ones). Separate
-    /// from the per-runner `aggregators` clone above.
+    /// it after they're appended, so `engine.state_of::<A>(id)` reflects
+    /// reactor-emitted events (not just caller-emitted ones).
     engine_aggregators: Option<Arc<AggregatorRegistry>>,
     /// Shared per-workflow high-water tracker for scoped `Engine::settle`.
-    /// After appending an output, the runner records the output's position
-    /// under the trigger's `workflow_id` so `settle` knows the run's chain
-    /// has advanced. `None` outside an engine (e.g. unit tests).
     settle_tracker: Option<crate::engine::WorkflowHighWater>,
-    /// Durable snapshot store for aggregate restore-before-fold (per-consumer
-    /// registry) and save-after-output-fold (shared engine registry).
-    /// `None` = no durable restore.
+    /// Durable snapshot store for save-after-output-fold (shared engine
+    /// registry). `None` = no durable persistence.
     snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
-    /// Snapshot cadence (events between saves). See `with_snapshot_persistence`.
     snapshot_every: u64,
-    /// Categories registered `StreamPolicy::OccRequired` via
-    /// `EngineBuilder::with_aggregate`. A reactor output whose routing
-    /// category is in this set is rejected — reactors append with
-    /// `StreamState::Any` and cannot uphold an aggregate's OCC invariant
-    /// (model it as an `Engine::append` command instead). Empty = no fence.
+    /// Categories registered `StreamPolicy::OccRequired`. A reactor
+    /// output whose routing category is in this set is rejected —
+    /// reactors append with `StreamState::Any` and cannot uphold an
+    /// aggregate's OCC invariant. Empty = no fence.
     occ_categories: Arc<std::collections::HashSet<String>>,
+
+    dispatch: parking_lot::Mutex<DispatchState>,
+    completions_tx: mpsc::UnboundedSender<Completion>,
+    completions_rx: parking_lot::Mutex<mpsc::UnboundedReceiver<Completion>>,
+    /// Halt flag: workers stop taking new triggers / retry attempts.
+    stopped: AtomicBool,
+    stop_notify: tokio::sync::Notify,
 }
 
-impl<R: Reactor> ReactorRunner<R>
+impl<R: Reactor + 'static> ReactorRunner<R>
 where
     R::Trigger: DeserializeOwned,
 {
@@ -161,48 +278,72 @@ where
         log: Arc<dyn EventLogBackend>,
         checkpoint: Arc<dyn ReactorCheckpoint>,
     ) -> Self {
+        let (completions_tx, completions_rx) = mpsc::unbounded_channel();
         Self {
-            reactor,
-            consumer_id: consumer_id.into(),
-            log,
-            checkpoint,
-            aggregators: None,
-            hydrated: OnceCell::new(),
-            failure_mapper: None,
-            max_attempts: 0,
-            observer: None,
-            effect_store: None,
-            engine_aggregators: None,
-            settle_tracker: None,
-            snapshot_store: None,
-            snapshot_every: 0,
-            occ_categories: Arc::new(std::collections::HashSet::new()),
+            core: Arc::new(Core {
+                reactor,
+                consumer_id: consumer_id.into(),
+                log,
+                checkpoint,
+                fold_registry: None,
+                failure_mapper: None,
+                max_attempts: 0,
+                observer: None,
+                effect_store: None,
+                engine_aggregators: None,
+                settle_tracker: None,
+                snapshot_store: None,
+                snapshot_every: 0,
+                occ_categories: Arc::new(std::collections::HashSet::new()),
+                dispatch: parking_lot::Mutex::new(DispatchState {
+                    started: false,
+                    ingest_pos: LogCursor::ZERO,
+                    pending: BTreeMap::new(),
+                    floor: LogCursor::ZERO,
+                    persisted_floor: None,
+                    partitions: HashMap::new(),
+                    next_gen: 0,
+                    wf_pending: HashMap::new(),
+                }),
+                completions_tx,
+                completions_rx: parking_lot::Mutex::new(completions_rx),
+                stopped: AtomicBool::new(false),
+                stop_notify: tokio::sync::Notify::new(),
+            }),
         }
+    }
+
+    /// Builder-time mutable access. Valid only before any worker has
+    /// been spawned (construction happens before `step` ever runs, so
+    /// the Arc is still uniquely owned).
+    fn core_mut(&mut self) -> &mut Core<R> {
+        Arc::get_mut(&mut self.core)
+            .expect("ReactorRunner builder methods must run before the runner starts")
     }
 
     /// Plumb the engine's OCC-required category set so the runner can
     /// reject reactor outputs that would bypass an aggregate's
-    /// optimistic-concurrency fence. See the field docs.
+    /// optimistic-concurrency fence.
     pub(crate) fn with_occ_categories(
         mut self,
         occ_categories: Arc<std::collections::HashSet<String>>,
     ) -> Self {
-        self.occ_categories = occ_categories;
+        self.core_mut().occ_categories = occ_categories;
         self
     }
 
     /// Attach a [`ReactorObserver`] for inspector / telemetry capture.
-    /// Default: no observer = noop hot path.
     pub fn with_observer(mut self, observer: Arc<dyn ReactorObserver>) -> Self {
-        self.observer = Some(observer);
+        self.core_mut().observer = Some(observer);
         self
     }
 
-    /// Attach a per-runner [`AggregatorRegistry`] copy. See
-    /// [`crate::projection_runner::ProjectionRunner::with_aggregators`]
-    /// for semantics.
+    /// Attach the aggregator fold-function table backing
+    /// `ctx.state_of` fold-on-read. (The partitioned runner keeps no
+    /// scan-folded registry state — reads are position-bounded folds
+    /// from the log.)
     pub fn with_aggregators(mut self, aggregators: Arc<AggregatorRegistry>) -> Self {
-        self.aggregators = Some(aggregators);
+        self.core_mut().fold_registry = Some(aggregators);
         self
     }
 
@@ -212,7 +353,7 @@ where
         mut self,
         cache: Arc<dyn crate::effect_store::EffectStore>,
     ) -> Self {
-        self.effect_store = Some(cache);
+        self.core_mut().effect_store = Some(cache);
         self
     }
 
@@ -222,55 +363,521 @@ where
         mut self,
         engine_aggregators: Option<Arc<AggregatorRegistry>>,
     ) -> Self {
-        self.engine_aggregators = engine_aggregators;
+        self.core_mut().engine_aggregators = engine_aggregators;
         self
     }
 
     /// Attach the shared per-workflow high-water tracker so appended
     /// outputs advance their run's `settle` mark.
     pub(crate) fn with_settle_tracker(mut self, tracker: crate::engine::WorkflowHighWater) -> Self {
-        self.settle_tracker = Some(tracker);
+        self.core_mut().settle_tracker = Some(tracker);
         self
     }
 
-    /// Wire durable snapshot persistence: restore aggregates before folding
-    /// (so `ctx.aggregate` survives restart) and snapshot every `every`
-    /// events. `None` store disables both (unchanged behavior).
+    /// Wire durable snapshot persistence for the engine-registry folds
+    /// of reactor outputs. `None` store disables (unchanged behavior).
     pub(crate) fn with_snapshot_persistence(
         mut self,
         store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
         every: u64,
     ) -> Self {
-        self.snapshot_store = store;
-        self.snapshot_every = every;
+        self.core_mut().snapshot_store = store;
+        self.core_mut().snapshot_every = every;
         self
     }
 
-    /// Configure terminal-failure terminal-failure handling. After `max_attempts`
+    /// Configure terminal-failure handling. After `max_attempts`
     /// consecutive `react()` errors on the same trigger, the mapper
     /// is invoked; on `Some(fact)`, the fact is appended directly to its
-    /// stream and the cursor advances past the failing event.
-    /// Without this, errored reactors retry indefinitely.
+    /// stream and the trigger parks. Without this, a failing trigger
+    /// retries indefinitely (wedging only its own partition).
     pub(crate) fn with_terminal_failure(mut self, mapper: TerminalFailureMapper, max_attempts: u32) -> Self {
-        self.failure_mapper = Some(mapper);
-        self.max_attempts = max_attempts;
+        self.core_mut().failure_mapper = Some(mapper);
+        self.core_mut().max_attempts = max_attempts;
         self
     }
 
-    pub fn consumer_id(&self) -> &str { &self.consumer_id }
+    pub fn consumer_id(&self) -> &str { &self.core.consumer_id }
 
-    /// Terminal-failure routing into the failure store. Invokes the mapper, appends
-    /// its synthesized fact (if any) to that fact's own stream, folds it
-    /// into the engine registry, advances the cursor past `event`, and
-    /// clears the attempt counter **last** (so a failed terminal-failure append can't
-    /// reset the budget and a crash mid-terminal-failure can't replay it). Caller
-    /// guarantees `self.failure_mapper` is `Some` and the failure is terminal.
-    ///
-    /// Shared by the react()-error path (terminal after `max_attempts`)
-    /// and the trigger-deserialization-poison path (terminal immediately —
-    /// re-parsing is deterministic, so retries never help).
+    /// Stop taking new work: workers exit at their next loop boundary
+    /// (an in-flight `react()` completes; it is not cancelled).
+    pub fn halt(&self) {
+        self.core.stopped.store(true, AtomicOrdering::SeqCst);
+        self.core.stop_notify.notify_waiters();
+    }
+
+    /// One dispatcher turn: reap completions (advancing the ack-floor
+    /// checkpoint), then ingest up to `batch` events into partitions,
+    /// window permitting. Body failures never surface here — they are
+    /// the owning worker's business (retry / park). `Err` means
+    /// infrastructure failure (log read, checkpoint write).
+    pub async fn step(&self, batch: usize) -> Result<StepOutcome> {
+        self.core.ensure_started().await?;
+        let reaped = self.core.reap().await?;
+
+        // Ingest, window permitting.
+        let (from, room) = {
+            let d = self.core.dispatch.lock();
+            (d.ingest_pos, MAX_PENDING.saturating_sub(d.pending.len()))
+        };
+        let mut ingested = 0usize;
+        if room > 0 {
+            let events = self.core.log.read_all(from, batch).await?;
+            let kind = <R::Trigger as Event>::NAME;
+            let mut d = self.core.dispatch.lock();
+            for event in events {
+                if crate::event_type::matches_kind(&event.event_type, kind) {
+                    if d.pending.len() >= MAX_PENDING {
+                        break; // window full — do not scan past this trigger
+                    }
+                    d.pending.insert(
+                        event.position,
+                        PendingTrigger { acked: false },
+                    );
+                    *d.wf_pending.entry(event.workflow_id).or_insert(0) += 1;
+                    d.ingest_pos = event.position;
+                    let key = partition_key_for(R::ORDERING, &event);
+                    Core::enqueue(&self.core, &mut d, key, event);
+                } else {
+                    // Non-matching: scan past. (No scan-folds — reactor
+                    // state reads are fold-on-read from the log.)
+                    d.ingest_pos = event.position;
+                }
+                ingested += 1;
+            }
+        }
+        // A scan with no outstanding triggers moves the floor too.
+        self.core.advance_floor().await?;
+
+        if reaped + ingested > 0 {
+            Ok(StepOutcome::Progressed { applied: reaped })
+        } else {
+            Ok(StepOutcome::Idle)
+        }
+    }
+
+    /// The settle probe: has this consumer fully finished workflow `wf`
+    /// up to high-water `hw`? True iff ingestion has scanned to `hw`
+    /// AND no trigger of `wf` is queued or in flight here. Reaps
+    /// completions first so acks register without waiting on the
+    /// supervisor's next step.
+    pub async fn drained(&self, wf: Uuid, hw: LogCursor) -> Result<bool> {
+        let started = { self.core.dispatch.lock().started };
+        if !started {
+            // Not yet stepped: the durable cursor is all there is.
+            let c = self.core.checkpoint.get(&self.core.consumer_id).await?
+                .unwrap_or(LogCursor::ZERO);
+            return Ok(c >= hw);
+        }
+        self.core.reap().await?;
+        let d = self.core.dispatch.lock();
+        Ok(d.ingest_pos >= hw && !d.wf_pending.contains_key(&wf))
+    }
+
+    /// Test helper: step until every ingested trigger is acked and the
+    /// log is fully scanned. Panics if quiescence takes > 10s (a wedged
+    /// fixture — use explicit waits for those scenarios instead).
+    #[cfg(test)]
+    pub(crate) async fn quiesce(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            self.step(256).await?;
+            let (done_pending, from) = {
+                let d = self.core.dispatch.lock();
+                (d.pending.is_empty(), d.ingest_pos)
+            };
+            if done_pending && self.core.log.read_all(from, 1).await?.is_empty() {
+                return Ok(());
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runner did not quiesce within 10s",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+}
+
+impl<R: Reactor + 'static> Core<R>
+where
+    R::Trigger: DeserializeOwned,
+{
+    fn stopped(&self) -> bool {
+        self.stopped.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Seed `ingest_pos` / `floor` from the durable checkpoint, once.
+    async fn ensure_started(&self) -> Result<()> {
+        if self.dispatch.lock().started {
+            return Ok(());
+        }
+        let cursor = self.checkpoint.get(&self.consumer_id).await?
+            .unwrap_or(LogCursor::ZERO);
+        let mut d = self.dispatch.lock();
+        if !d.started {
+            d.ingest_pos = cursor;
+            d.floor = cursor;
+            d.persisted_floor = Some(cursor);
+            d.started = true;
+        }
+        Ok(())
+    }
+
+    /// Route one trigger into its partition, spawning the worker if the
+    /// partition is cold (or its previous worker died out-of-band — the
+    /// failed send returns the event, so nothing is lost). Caller holds
+    /// the dispatch lock.
+    fn enqueue(
+        core: &Arc<Self>,
+        d: &mut DispatchState,
+        key: PartitionKey,
+        mut event: RecordedEvent,
+    ) {
+        if let Some(handle) = d.partitions.get(&key) {
+            match handle.tx.send(event) {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(ev)) => {
+                    // Receiver gone without deregistering (worker task
+                    // killed out-of-band). Reclaim the event, respawn.
+                    d.partitions.remove(&key);
+                    event = ev;
+                }
+            }
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(event).expect("fresh channel send cannot fail");
+        let gen = d.next_gen;
+        d.next_gen += 1;
+        d.partitions.insert(key.clone(), PartitionHandle { tx, gen });
+        let core = core.clone();
+        tokio::spawn(async move {
+            Self::worker_loop(core, key, gen, rx).await;
+        });
+    }
+
+    /// One partition's worker: pop FIFO, process to completion (retry /
+    /// park), ack. Exits when the queue is empty (re-checked under the
+    /// dispatch lock so a racing enqueue can't strand a trigger) or on
+    /// halt. The fold-on-read cache lives here — partition-scoped by
+    /// construction.
+    async fn worker_loop(
+        core: Arc<Self>,
+        key: PartitionKey,
+        gen: u64,
+        mut rx: mpsc::UnboundedReceiver<RecordedEvent>,
+    ) {
+        let fold_cache = FoldOnReadCache::default();
+        loop {
+            if core.stopped() {
+                return;
+            }
+            let event = match rx.try_recv() {
+                Ok(ev) => ev,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Deregister-or-continue, atomically vs. enqueue.
+                    let mut d = core.dispatch.lock();
+                    match rx.try_recv() {
+                        Ok(ev) => ev,
+                        Err(_) => {
+                            if d.partitions.get(&key).map(|h| h.gen) == Some(gen) {
+                                d.partitions.remove(&key);
+                            }
+                            return;
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => return,
+            };
+            if core.process_trigger(&event, &fold_cache).await {
+                let _ = core.completions_tx.send(Completion {
+                    position: event.position,
+                    workflow: event.workflow_id,
+                });
+            } else {
+                // Halted mid-processing: no ack; floor stays below the
+                // trigger so restart redelivers it.
+                return;
+            }
+        }
+    }
+
+    /// Drive one trigger to completion: attempt, retry worker-locally
+    /// with capped backoff on failure, park terminally when the budget
+    /// is exhausted (mapper configured). Returns false only on halt.
+    async fn process_trigger(
+        self: &Arc<Self>,
+        event: &RecordedEvent,
+        fold_cache: &FoldOnReadCache,
+    ) -> bool {
+        let mut local_attempt: u32 = 0;
+        loop {
+            if self.stopped() {
+                return false;
+            }
+            match self.attempt_trigger(event, fold_cache).await {
+                Ok(AttemptOutcome::Done) | Ok(AttemptOutcome::Parked) => return true,
+                Err(e) => {
+                    local_attempt += 1;
+                    tracing::warn!(
+                        consumer = self.consumer_id,
+                        event_id = %event.event_id,
+                        error = %format!("{e:#}"),
+                        "reactor attempt failed; retrying in partition",
+                    );
+                    tokio::select! {
+                        _ = self.stop_notify.notified() => return false,
+                        _ = tokio::time::sleep(backoff_for(local_attempt)) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// One attempt at one trigger — the reaction body from the serial
+    /// runner, minus cursor movement (the ack-floor owns checkpoints).
+    async fn attempt_trigger(
+        self: &Arc<Self>,
+        event: &RecordedEvent,
+        fold_cache: &FoldOnReadCache,
+    ) -> Result<AttemptOutcome> {
+        // Record the attempt FIRST (before deserialization), so a
+        // poison trigger engages the terminal-failure budget instead of
+        // wedging before the counter ever increments.
+        let attempt_seq = self.checkpoint
+            .record_reactor_attempt(&self.consumer_id, event.event_id)
+            .await?;
+        let started_at = chrono::Utc::now();
+
+        // Deserialize the trigger. A failure here is a poison pill —
+        // deterministic, so retrying never helps. With a mapper, park
+        // immediately; without one, error (the partition wedges and
+        // retries — block-until-fixed, scoped to this partition).
+        let trigger: R::Trigger = match serde_json::from_value(event.payload.clone()) {
+            Ok(t) => t,
+            Err(deser_err) => {
+                let msg = format!(
+                    "trigger deserialization failed for {} (event {}): {deser_err}",
+                    event.event_type, event.event_id,
+                );
+                if self.failure_mapper.is_some() {
+                    self.park_terminal_failure(event, attempt_seq, msg, chrono::Utc::now())
+                        .await?;
+                    return Ok(AttemptOutcome::Parked);
+                }
+                return Err(anyhow::anyhow!(msg));
+            }
+        };
+
+        if let Some(obs) = self.observer.as_ref() {
+            obs.reactor_started(
+                event.event_id,
+                &self.consumer_id,
+                event.workflow_id,
+                attempt_seq,
+                started_at,
+            );
+            if let Some(descr) = self.reactor.describe(&trigger) {
+                obs.reactor_description(
+                    event.workflow_id,
+                    event.position,
+                    event.event_id,
+                    &self.consumer_id,
+                    descr,
+                );
+            }
+        }
+
+        // Per-attempt log sink — react body pushes via `ctx.log(...)`.
+        let log_sink: parking_lot::Mutex<Vec<crate::types::LogEntry>> =
+            parking_lot::Mutex::new(Vec::new());
+        let state = match self.fold_registry.as_ref() {
+            Some(reg) => StateSource::FoldOnRead {
+                registry: reg,
+                log: self.log.as_ref(),
+                bound: event.position,
+                cache: fold_cache,
+            },
+            None => StateSource::None,
+        };
+        let ctx = Ctx {
+            event_id:       event.event_id,
+            log_position:   event.position,
+            occurred_at:    trigger.occurred_at().unwrap_or(event.created_at),
+            workflow_id: event.workflow_id,
+            metadata:       &event.metadata,
+            state,
+            logs:           Some(&log_sink),
+            effect_store: self.effect_store.as_ref(),
+        };
+
+        // ── Decision. A panic is caught and treated as an attempt
+        //    failure (worker-local retry), mirroring the serial
+        //    supervisor's catch_unwind.
+        let reacted = AssertUnwindSafe(self.reactor.react(&trigger, ctx))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "reactor panicked: {}",
+                    crate::engine::panic_payload_message(&panic),
+                ))
+            });
+
+        let emitted = match reacted {
+            Ok(events) => {
+                let completed_at = chrono::Utc::now();
+                if let Some(obs) = self.observer.as_ref() {
+                    let drained = log_sink.into_inner();
+                    obs.reactor_completed(
+                        event.event_id,
+                        &self.consumer_id,
+                        event.workflow_id,
+                        attempt_seq,
+                        started_at,
+                        completed_at,
+                        &drained,
+                    );
+                }
+                // Clear persisted attempt count on success so a
+                // future failure starts fresh.
+                self.checkpoint
+                    .clear_reactor_attempts(&self.consumer_id, event.event_id)
+                    .await?;
+                events
+            }
+            Err(e) => {
+                let completed_at = chrono::Utc::now();
+                if self.failure_mapper.is_some() && attempt_seq >= self.max_attempts {
+                    self.park_terminal_failure(
+                        event, attempt_seq, format!("{:#}", e), completed_at,
+                    )
+                    .await?;
+                    return Ok(AttemptOutcome::Parked);
+                }
+                if let Some(obs) = self.observer.as_ref() {
+                    let drained = log_sink.into_inner();
+                    obs.reactor_failed(
+                        event.event_id,
+                        &self.consumer_id,
+                        event.workflow_id,
+                        attempt_seq,
+                        started_at,
+                        completed_at,
+                        &format!("{:#}", e),
+                        &drained,
+                    );
+                }
+                return Err(e);
+            }
+        };
+
+        // ── OCC fence (pre-flight). A reactor appends its outputs with
+        //    `StreamState::Any`, so it cannot uphold the OCC invariant
+        //    of an INVARIANT aggregate's stream. A deterministic config
+        //    error: park (no retries) rather than append.
+        if !self.occ_categories.is_empty() {
+            if let Some(bad) = emitted.iter().find(|out| {
+                self.occ_categories.contains(out.durable_name.as_str())
+            }) {
+                let cat = bad.durable_name.as_str().to_string();
+                let msg = format!(
+                    "reactor '{}' emitted a fact in OCC-required category '{cat}' — \
+                     reactor outputs append with StreamState::Any and cannot uphold \
+                     the aggregate's optimistic-concurrency fence; model this as an \
+                     Engine::append command, not a reactor output",
+                    self.consumer_id,
+                );
+                if self.failure_mapper.is_some() {
+                    self.park_terminal_failure(event, attempt_seq, msg, chrono::Utc::now())
+                        .await?;
+                    return Ok(AttemptOutcome::Parked);
+                }
+                return Err(anyhow::anyhow!(msg));
+            }
+        }
+
+        // ── Append each output directly to its own stream with a
+        //    deterministic identity-keyed event_id (idempotent under
+        //    redelivery via the log's append-dedup, C1).
+        let mut nth: HashMap<(&str, Uuid), u32> = HashMap::new();
+        for out in emitted.iter() {
+            let n = nth
+                .entry((out.durable_name.as_str(), out.subject_id))
+                .or_insert(0);
+            let this_nth = *n;
+            *n += 1;
+            let out_event = EventData {
+                event_id: derive_output_event_id(
+                    &self.consumer_id,
+                    event.event_id,
+                    &out.durable_name,
+                    out.subject_id,
+                    this_nth,
+                ),
+                causation_id: Some(event.event_id),
+                workflow_id: event.workflow_id,
+                event_type: out.durable_name.clone(),
+                payload: out.payload.clone(),
+                created_at: chrono::Utc::now(),
+                // Placement uses the STREAM category; routing stays on
+                // `event_type` (durable_name). Equal unless overridden.
+                category: Some(out.subject.clone()),
+                subject_id: Some(out.subject_id),
+                metadata: reactor_output_metadata(&self.consumer_id),
+                ephemeral: None,
+                persistent: true,
+            };
+            let write = self.log
+                .append_to_stream(
+                    &out.subject, out.subject_id, StreamState::Any, vec![out_event],
+                )
+                .await?;
+            // Advance this run's scoped-settle high-water: the output
+            // inherits the trigger's workflow_id.
+            if let Some(tracker) = &self.settle_tracker {
+                tracker.lock().unwrap().bump(event.workflow_id, write.position);
+            }
+            // Fold the output into the shared engine registry (folds
+            // are idempotent on stream coordinates, so a deduped
+            // re-append skips instead of double-counting).
+            if let Some(reg) = &self.engine_aggregators {
+                let outcome = crate::aggregator::fold_event(
+                    reg.as_ref(),
+                    self.snapshot_store.as_deref(),
+                    self.log.as_ref(),
+                    &out.durable_name,
+                    &out.payload,
+                    out.subject_id,
+                    &out.subject,
+                    write.revision,
+                    write.position,
+                    /* strict_to_event = */ false,
+                )
+                .await?;
+                if outcome.applied {
+                    if let Some(store) = self.snapshot_store.as_ref() {
+                        crate::aggregator::maybe_save_snapshots(
+                            reg.as_ref(),
+                            store.as_ref(),
+                            self.snapshot_every,
+                            &outcome.snapshots,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Ok(AttemptOutcome::Done)
+    }
+
+    /// Terminal-failure routing. Invokes the mapper, appends its
+    /// synthesized fact (if any) to that fact's own stream, folds it
+    /// into the engine registry, and clears the attempt counter
+    /// **last** (so a failed park can't reset the budget). The caller
+    /// acks the trigger afterwards — the ack-floor, not this function,
+    /// moves the durable cursor.
     async fn park_terminal_failure(
-        &self,
+        self: &Arc<Self>,
         event: &RecordedEvent,
         attempts: u32,
         error: String,
@@ -298,8 +905,8 @@ where
             attempts,
             workflow_id:    event.workflow_id,
         };
-        // terminal-failure-synthesized output (if any) is appended directly
-        // to its own stream. `nth = u32::MAX` keeps its deterministic id
+        // The synthesized output (if any) is appended directly to its
+        // own stream. `nth = u32::MAX` keeps its deterministic id
         // distinct from react() outputs of the same identity.
         if let Some(fact) = mapper(info) {
             let cat = fact.subject().to_string();
@@ -344,358 +951,75 @@ where
                 .await?;
             }
         }
-        self.checkpoint.set(&self.consumer_id, event.position).await?;
         self.checkpoint
             .clear_reactor_attempts(&self.consumer_id, event.event_id)
             .await?;
         Ok(())
     }
 
-    pub async fn step(&self, batch: usize) -> Result<StepOutcome> {
-        let cursor = self.checkpoint.get(&self.consumer_id).await?
-            .unwrap_or(LogCursor::ZERO);
-
-        self.ensure_hydrated(cursor).await?;
-
-        let events = self.log.read_all(cursor, batch).await?;
-        if events.is_empty() {
-            return Ok(StepOutcome::Idle);
+    /// Drain the completion channel, mark acks, advance + persist the
+    /// floor. Returns the number of completions reaped.
+    async fn reap(&self) -> Result<usize> {
+        let mut acks = Vec::new();
+        {
+            let mut rx = self.completions_rx.lock();
+            while let Ok(c) = rx.try_recv() {
+                acks.push(c);
+            }
         }
-
-        let prefix = <R::Trigger as Event>::NAME;
-        let mut applied = 0usize;
-        for event in events {
-            // Fold every event into the per-consumer aggregator registry.
-            // Folds are idempotent on the event's stream coordinates (see
-            // `AggregatorRegistry::apply_event`), so a step retry after a
-            // checkpoint-set failure, crash redelivery, or a terminal-failure advance
-            // re-delivers harmlessly — fold tracks the log, not body
-            // success. (The old capture/restore rollback this replaces
-            // un-folded state when the *body* failed, permanently
-            // desyncing registry from cursor on the terminal-failure path.)
-            if let Some(reg) = self.aggregators.as_ref() {
-                let outcome = crate::aggregator::fold_event(
-                    reg,
-                    None,
-                    self.log.as_ref(),
-                    &event.event_type,
-                    &event.payload,
-                    event.subject_id,
-                    &event.category,
-                    event.revision,
-                    event.position,
-                    /* strict_to_event = */ true,
-                )
-                .await?;
-                if outcome.applied {
-                    if let Some(obs) = self.observer.as_ref() {
-                        reg.notify_observer(
-                            &outcome.snapshots,
-                            obs.as_ref(),
-                            event.workflow_id,
-                            event.position,
-                            event.event_id,
-                        );
+        if !acks.is_empty() {
+            let mut d = self.dispatch.lock();
+            for c in &acks {
+                if let Some(p) = d.pending.get_mut(&c.position) {
+                    p.acked = true;
+                }
+                if let Some(n) = d.wf_pending.get_mut(&c.workflow) {
+                    *n -= 1;
+                    if *n == 0 {
+                        d.wf_pending.remove(&c.workflow);
                     }
                 }
             }
-
-            if !crate::event_type::matches_kind(&event.event_type, prefix) {
-                // Non-matching trigger: just advance the cursor.
-                self.checkpoint.set(&self.consumer_id, event.position).await?;
-                continue;
-            }
-
-            // ── Record this attempt FIRST (before deserialization), so a
-            //    poison trigger engages the terminal-failure budget instead of wedging
-            //    the cursor before the counter ever increments.
-            let attempt_seq = self.checkpoint
-                .record_reactor_attempt(&self.consumer_id, event.event_id)
-                .await?;
-            let started_at = chrono::Utc::now();
-
-            // Deserialize the trigger. A failure here is a poison pill —
-            // deterministic, so retrying never helps. Route it straight to
-            // the failure store (if a mapper is configured) so one malformed/
-            // schema-drifted payload can't block the cursor forever;
-            // without a mapper, propagate (block-until-fixed, the same
-            // contract a react() error has without a mapper — an operator
-            // fixes the schema or code, then it processes).
-            let trigger: R::Trigger = match serde_json::from_value(event.payload.clone()) {
-                Ok(t) => t,
-                Err(deser_err) => {
-                    let msg = format!(
-                        "trigger deserialization failed for {} (event {}): {deser_err}",
-                        event.event_type, event.event_id,
-                    );
-                    if self.failure_mapper.is_some() {
-                        self.park_terminal_failure(&event, attempt_seq, msg, chrono::Utc::now()).await?;
-                        applied += 1;
-                        continue;
-                    }
-                    return Err(anyhow::anyhow!(msg));
-                }
-            };
-
-            if let Some(obs) = self.observer.as_ref() {
-                obs.reactor_started(
-                    event.event_id,
-                    &self.consumer_id,
-                    event.workflow_id,
-                    attempt_seq,
-                    started_at,
-                );
-                // describe() runs once per attempt, BEFORE react().
-                // Optional: reactors that don't override the default
-                // return `None` and the observer hook is skipped.
-                if let Some(descr) = self.reactor.describe(&trigger) {
-                    obs.reactor_description(
-                        event.workflow_id,
-                        event.position,
-                        event.event_id,
-                        &self.consumer_id,
-                        descr,
-                    );
-                }
-            }
-
-            // Per-attempt log sink — react body pushes via `ctx.log(...)`.
-            // Drained below into the observer's reactor_completed /
-            // reactor_failed hooks.
-            let log_sink: parking_lot::Mutex<Vec<crate::types::LogEntry>> =
-                parking_lot::Mutex::new(Vec::new());
-            let ctx = Ctx {
-                event_id:       event.event_id,
-                log_position:   event.position,
-                occurred_at:    trigger.occurred_at().unwrap_or(event.created_at),
-                workflow_id: event.workflow_id,
-                metadata:       &event.metadata,
-                aggregators:    self.aggregators.as_ref(),
-                logs:           Some(&log_sink),
-                effect_store: self.effect_store.as_ref(),
-            };
-
-            // ── Decision. On Err, cursor stays where it was; no rows
-            //    persisted. The whole batch from this trigger forward
-            //    is retried on next step.
-            //
-            //    UNLESS a terminal-failure mapper is configured AND attempts have
-            //    reached max — then synthesize the mapper's fact,
-            //    append it directly to its stream, advance the cursor past
-            //    the failing event, and clear the attempt counter.
-            let emitted = match self.reactor.react(&trigger, ctx).await {
-                Ok(events) => {
-                    let completed_at = chrono::Utc::now();
-                    if let Some(obs) = self.observer.as_ref() {
-                        let drained = log_sink.into_inner();
-                        obs.reactor_completed(
-                            event.event_id,
-                            &self.consumer_id,
-                            event.workflow_id,
-                            attempt_seq,
-                            started_at,
-                            completed_at,
-                            &drained,
-                        );
-                    }
-                    // Clear persisted attempt count on success so a
-                    // future failure starts fresh.
-                    self.checkpoint
-                        .clear_reactor_attempts(&self.consumer_id, event.event_id)
-                        .await?;
-                    events
-                }
-                Err(e) => {
-                    let completed_at = chrono::Utc::now();
-                    // Note: the fold above is NOT rolled back — registry
-                    // state reflects the log regardless of body success.
-
-                    // attempt counter already incremented for this run;
-                    // use attempt_seq for the cap check.
-                    let attempts = attempt_seq;
-
-                    if self.failure_mapper.is_some() && attempts >= self.max_attempts {
-                        self.park_terminal_failure(&event, attempts, format!("{:#}", e), completed_at)
-                            .await?;
-                        applied += 1;
-                        continue;
-                    }
-                    // Retry path: record failed-attempt telemetry, then
-                    // propagate to supervisor for backoff.
-                    if let Some(obs) = self.observer.as_ref() {
-                        let drained = log_sink.into_inner();
-                        obs.reactor_failed(
-                            event.event_id,
-                            &self.consumer_id,
-                            event.workflow_id,
-                            attempts,
-                            started_at,
-                            completed_at,
-                            &format!("{:#}", e),
-                            &drained,
-                        );
-                    }
-                    return Err(e);
-                }
-            };
-
-            // ── OCC fence (pre-flight). A reactor appends its outputs
-            //    with `StreamState::Any`, so it cannot uphold the
-            //    optimistic-concurrency invariant of an aggregate stream
-            //    registered via `with_aggregate`. Emitting into such a
-            //    category silently corrupts that aggregate's OCC
-            //    guarantee — a deterministic config error, so route the
-            //    whole trigger to the failure store (no retries) rather than append.
-            if !self.occ_categories.is_empty() {
-                if let Some(bad) = emitted.iter().find(|out| {
-                    self.occ_categories
-                        .contains(out.durable_name.as_str())
-                }) {
-                    let cat = bad.durable_name.as_str().to_string();
-                    let msg = format!(
-                        "reactor '{}' emitted a fact in OCC-required category '{cat}' — \
-                         reactor outputs append with StreamState::Any and cannot uphold \
-                         the aggregate's optimistic-concurrency fence; model this as an \
-                         Engine::append command, not a reactor output",
-                        self.consumer_id,
-                    );
-                    if self.failure_mapper.is_some() {
-                        self.park_terminal_failure(&event, attempt_seq, msg, chrono::Utc::now()).await?;
-                        applied += 1;
-                        continue;
-                    }
-                    return Err(anyhow::anyhow!(msg));
-                }
-            }
-
-            // ── Append each output directly to its own stream with a
-            //    deterministic event_id (idempotent under redelivery via
-            //    the log's append-dedup, C1), then advance the cursor.
-            //    At-least-once + idempotent emit: a crash between append
-            //    and cursor-advance re-runs react() on restart; the
-            //    re-appends dedup on event_id. Ids are identity-keyed
-            //    (kind + subject + nth-of-that-pair), so reordering or
-            //    inserting outputs across a deploy never re-keys the
-            //    survivors — see `derive_output_event_id`.
-            let mut nth: std::collections::HashMap<(&str, Uuid), u32> =
-                std::collections::HashMap::new();
-            for out in emitted.iter() {
-                let n = nth
-                    .entry((out.durable_name.as_str(), out.subject_id))
-                    .or_insert(0);
-                let this_nth = *n;
-                *n += 1;
-                let out_event = EventData {
-                    event_id: derive_output_event_id(
-                        &self.consumer_id,
-                        event.event_id,
-                        &out.durable_name,
-                        out.subject_id,
-                        this_nth,
-                    ),
-                    causation_id: Some(event.event_id),
-                    workflow_id: event.workflow_id,
-                    event_type: out.durable_name.clone(),
-                    payload: out.payload.clone(),
-                    created_at: chrono::Utc::now(),
-                    // Placement uses the STREAM category; routing stays on
-                    // `event_type` (durable_name). Equal unless overridden.
-                    category: Some(out.subject.clone()),
-                    subject_id: Some(out.subject_id),
-                    metadata: reactor_output_metadata(&self.consumer_id),
-                    ephemeral: None,
-                    persistent: true,
-                };
-                let write = self.log
-                    .append_to_stream(
-                        &out.subject, out.subject_id, StreamState::Any, vec![out_event],
-                    )
-                    .await?;
-                // Advance this run's scoped-settle high-water: the output
-                // inherits the trigger's workflow_id, so it belongs to the
-                // same chain.
-                if let Some(tracker) = &self.settle_tracker {
-                    tracker.lock().unwrap().bump(event.workflow_id, write.position);
-                }
-                // Fold the output into the shared engine registry. The
-                // fold is idempotent on stream coordinates, so a
-                // redelivered (deduped) append — whose WriteResult
-                // carries the ORIGINAL position/revision — skips here
-                // instead of double-counting. Gap repair inside
-                // fold_event also restores cold aggregates from
-                // snapshots before folding (read-through), replacing
-                // the explicit pre-append restore this path used to do.
-                if let Some(reg) = &self.engine_aggregators {
-                    let outcome = crate::aggregator::fold_event(
-                        reg.as_ref(),
-                        self.snapshot_store.as_deref(),
-                        self.log.as_ref(),
-                        &out.durable_name,
-                        &out.payload,
-                        out.subject_id,
-                        &out.subject,
-                        write.revision,
-                        write.position,
-                        /* strict_to_event = */ false,
-                    )
-                    .await?;
-                    if outcome.applied {
-                        if let Some(store) = self.snapshot_store.as_ref() {
-                            crate::aggregator::maybe_save_snapshots(
-                                reg.as_ref(),
-                                store.as_ref(),
-                                self.snapshot_every,
-                                &outcome.snapshots,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-            self.checkpoint.set(&self.consumer_id, event.position).await?;
-
-            applied += 1;
         }
-
-        Ok(StepOutcome::Progressed { applied })
+        let count = acks.len();
+        self.advance_floor().await?;
+        Ok(count)
     }
 
-    async fn ensure_hydrated(&self, cursor: LogCursor) -> Result<()> {
-        if self.aggregators.is_none() {
-            return Ok(());
-        }
-        self.hydrated.get_or_try_init(|| async {
-            if cursor == LogCursor::ZERO {
-                return Ok::<(), anyhow::Error>(());
+    /// Advance the ack-floor: pop the contiguous acked prefix of
+    /// `pending`; with nothing outstanding the floor is the ingestion
+    /// cursor itself. Persist when it moved (or a prior persist failed).
+    async fn advance_floor(&self) -> Result<()> {
+        let to_persist = {
+            let mut d = self.dispatch.lock();
+            if !d.started {
+                return Ok(());
             }
-            let reg = self.aggregators.as_ref().unwrap();
-            let mut from = LogCursor::ZERO;
-            loop {
-                let batch = self.log.read_all(from, 1024).await?;
-                if batch.is_empty() { break; }
-                let last_pos = batch.last().unwrap().position;
-                let mut hit_cursor = false;
-                for event in batch {
-                    if event.position > cursor { hit_cursor = true; break; }
-                    crate::aggregator::fold_event(
-                        reg,
-                        None,
-                        self.log.as_ref(),
-                        &event.event_type,
-                        &event.payload,
-                        event.subject_id,
-                        &event.category,
-                        event.revision,
-                        event.position,
-                        /* strict_to_event = */ true,
-                    )
-                    .await?;
+            while let Some(entry) = d.pending.first_entry() {
+                if !entry.get().acked {
+                    break;
                 }
-                if hit_cursor || last_pos >= cursor { break; }
-                from = last_pos;
+                let (pos, _) = entry.remove_entry();
+                if pos > d.floor {
+                    d.floor = pos;
+                }
             }
-            Ok(())
-        }).await?;
+            if d.pending.is_empty() && d.ingest_pos > d.floor {
+                d.floor = d.ingest_pos;
+            }
+            if d.persisted_floor != Some(d.floor) {
+                Some(d.floor)
+            } else {
+                None
+            }
+        };
+        if let Some(pos) = to_persist {
+            self.checkpoint.set(&self.consumer_id, pos).await?;
+            let mut d = self.dispatch.lock();
+            if d.persisted_floor.is_none_or(|p| p < pos) {
+                d.persisted_floor = Some(pos);
+            }
+        }
         Ok(())
     }
 }
@@ -717,6 +1041,19 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Poll until `cond` is true, panicking after `secs` seconds.
+    async fn wait_until(secs: u64, what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for: {what}",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 
     // ── Trigger fact ──
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -749,8 +1086,11 @@ mod tests {
             event_type:      <OrderPlaced as Event>::NAME.to_string(),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
-            category:  None,
-            subject_id:    None,
+            // Stamp placement like Engine::emit does — fold-on-read
+            // reads the subject history, so fixtures must put triggers
+            // in their stream.
+            category:  Some(<OrderPlaced as Event>::NAME.to_string()),
+            subject_id:    Some(payload.order_id),
             metadata:        serde_json::Map::new(),
             ephemeral:       None,
             persistent:      true,
@@ -843,7 +1183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_step_appends_output_directly_and_advances_cursor() {
+    async fn reactor_appends_output_directly_and_advances_floor() {
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
         let order_id = trigger.order_id;
@@ -856,10 +1196,9 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        let outcome = runner.step(10).await.unwrap();
-        assert!(matches!(outcome, StepOutcome::Progressed { applied: 1 }));
+        runner.quiesce().await.unwrap();
 
-        // Cursor advanced
+        // Floor advanced (ack-floor checkpoint persisted).
         assert!(store.get("r.shipper").await.unwrap().is_some());
 
         // Output appended DIRECTLY to its own stream in the log (no outbox).
@@ -878,20 +1217,17 @@ mod tests {
             derive_output_event_id("r.shipper", trigger_event_id,
                                    "shipped_notification", order_id, 0),
         );
+        runner.halt();
     }
 
     #[tokio::test]
     async fn reactor_output_propagates_trigger_workflow_id() {
-        // The whole point of workflow_id propagation: a fact
-        // emitted in response to a trigger should carry the trigger's
-        // workflow_id so cross-system tracing chains through the
-        // reactor.
+        // A fact emitted in response to a trigger carries the trigger's
+        // workflow_id so cross-system tracing chains through the reactor.
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
         let trigger_event_id = append_trigger(&store, &trigger);
 
-        // Read the persisted event to get the workflow_id the helper
-        // generated.
         let persisted = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
@@ -903,11 +1239,8 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
-        runner.step(10).await.unwrap();
+        runner.quiesce().await.unwrap();
 
-        // The output is appended directly to the log and carries the
-        // trigger's workflow_id (cross-system tracing chains through
-        // the reactor) + the trigger as its causation_id.
         let all_events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
@@ -918,10 +1251,11 @@ mod tests {
                    "output MUST carry trigger's workflow_id");
         assert_eq!(output_event.causation_id, Some(trigger_event_id),
                    "output's causation_id MUST be the trigger's event_id");
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn reactor_step_with_empty_react_advances_cursor_only() {
+    async fn empty_react_advances_floor_only() {
         struct Silent;
         #[async_trait]
         impl Reactor for Silent {
@@ -947,17 +1281,18 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        runner.step(10).await.unwrap();
+        runner.quiesce().await.unwrap();
         assert!(store.get("r.silent").await.unwrap().is_some());
         assert_eq!(
             EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10).await.unwrap().len(),
             1,
             "only the trigger in the log — no reactor output",
         );
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn reactor_step_with_n_outputs_appends_n_in_order() {
+    async fn n_outputs_append_n_with_identity_keyed_ids() {
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
         let order_id = trigger.order_id;
@@ -970,7 +1305,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        runner.step(10).await.unwrap();
+        runner.quiesce().await.unwrap();
 
         let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
             .await
@@ -981,23 +1316,26 @@ mod tests {
             .collect();
         assert_eq!(outs.len(), 5, "all 5 outputs appended to the log");
 
-        // Each output index has its deterministic event_id present.
         for i in 0..5u32 {
             let want = derive_output_event_id("r.fanout", trigger_event_id,
                                               "shipped_notification", order_id, i);
             assert!(
                 outs.iter().any(|e| e.event_id == want),
-                "output index {i} present in log",
+                "output nth {i} present in log",
             );
         }
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn reactor_failure_leaves_cursor_at_first_trigger() {
+    async fn failed_attempt_retries_in_worker_without_skipping() {
+        // Worker-local retry: a transient failure on the 2nd call
+        // retries the SAME trigger in its partition until it succeeds —
+        // the floor never skips it, and every trigger's output lands.
         let store = Arc::new(MemoryStore::new());
-        // 3 triggers; reactor fails on the 2nd.
+        let subject = Uuid::new_v4(); // same subject → one partition, strict order
         for _ in 0..3 {
-            let t = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+            let t = OrderPlaced { order_id: subject, occurred_at: Utc::now() };
             append_trigger(&store, &t);
         }
 
@@ -1009,12 +1347,8 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        let result = runner.step(10).await;
-        assert!(result.is_err());
+        runner.quiesce().await.unwrap();
 
-        // First trigger's output was appended + cursor advanced; the
-        // second trigger failed before appending, so exactly one reactor
-        // output is in the log.
         let appended = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
             .await
             .unwrap();
@@ -1022,21 +1356,88 @@ mod tests {
             .iter()
             .filter(|e| e.event_type == "shipped_notification")
             .count();
-        assert_eq!(outs, 1, "only the first trigger's output was appended");
+        assert_eq!(outs, 3, "all three triggers produced outputs (2nd recovered)");
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "exactly one retry happened");
 
+        // Floor reached the end of the log.
         let cursor = store.get("r.flaky").await.unwrap().unwrap();
-
-        let events = EventLogBackend::read_all(
-            store.as_ref(),
-            LogCursor::ZERO,
-            10,
-        ).await.unwrap();
-        assert_eq!(cursor, events[0].position,
-                   "cursor at first trigger; second's failure rolled back");
+        let last = appended.last().unwrap().position;
+        assert_eq!(cursor, last, "ack-floor caught up after recovery");
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn reactor_step_idle_when_log_caught_up() {
+    async fn floor_holds_below_failing_trigger_while_other_partitions_proceed() {
+        // BLOCKING-3's honesty: a permanently failing trigger (no
+        // mapper) pins the durable floor BELOW its position — restart
+        // redelivers it — while other subjects keep flowing.
+        struct FailsForSubject { bad: Uuid, calls: Arc<AtomicUsize> }
+        #[async_trait]
+        impl Reactor for FailsForSubject {
+            type Trigger = OrderPlaced;
+            const NAME: &'static str = "per-subject-fail";
+            async fn react(&self, t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                if t.order_id == self.bad {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    return Err(anyhow!("permanently broken subject"));
+                }
+                let mut out = Events::new();
+                out.push(ShippedNotification { order_id: t.order_id });
+                Ok(out)
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let bad = Uuid::new_v4();
+        let good = Uuid::new_v4();
+        append_trigger(&store, &OrderPlaced { order_id: bad, occurred_at: Utc::now() });
+        append_trigger(&store, &OrderPlaced { order_id: good, occurred_at: Utc::now() });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = ReactorRunner::new(
+            FailsForSubject { bad, calls: calls.clone() },
+            "r.isolate",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+
+        // Step until the good subject's output lands (can't quiesce — the
+        // bad partition never drains).
+        let store_c = store.clone();
+        let saw_output = move || {
+            futures::executor::block_on(async {
+                EventLogBackend::read_all(store_c.as_ref(), LogCursor::ZERO, 20)
+                    .await.unwrap()
+                    .iter()
+                    .any(|e| e.event_type == "shipped_notification")
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            runner.step(64).await.unwrap();
+            if saw_output() { break; }
+            assert!(std::time::Instant::now() < deadline,
+                    "good subject's output never landed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The failing trigger is position 1 (first in the log); the
+        // floor must NOT have passed it.
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap();
+        let bad_pos = all.iter()
+            .find(|e| e.subject_id == bad && e.event_type == "order_placed")
+            .unwrap().position;
+        runner.step(64).await.unwrap(); // one more reap/persist pass
+        let cursor = store.get("r.isolate").await.unwrap().unwrap_or(LogCursor::ZERO);
+        assert!(cursor < bad_pos,
+                "floor {cursor} must hold below the unacked trigger at {bad_pos}");
+        assert!(calls.load(Ordering::SeqCst) >= 1, "bad subject was attempted");
+        runner.halt();
+    }
+
+    #[tokio::test]
+    async fn step_idle_when_log_caught_up() {
         let store = Arc::new(MemoryStore::new());
         let runner = ReactorRunner::new(
             EmitOne,
@@ -1073,17 +1474,18 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        let outcome = runner.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 0 });
+        runner.quiesce().await.unwrap();
         assert_eq!(
             EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10).await.unwrap().len(),
             1,
-            "only the trigger in the log — no reactor output",
+            "only the foreign event in the log — no reactor output",
         );
-        assert!(store.get("r.skip").await.unwrap().is_some());
+        assert!(store.get("r.skip").await.unwrap().is_some(),
+                "floor advanced past the non-matching event");
+        runner.halt();
     }
 
-    // ── terminal-failure — terminal-failure mapper after retry exhaustion ──
+    // ── terminal failure — mapper after retry exhaustion ──
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct HandlerFailed {
@@ -1108,14 +1510,10 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_failure_attempt_count_persists_across_runner_instances() {
-        // The bug: ReactorRunner tracked attempts in an in-memory
-        // HashMap. Process crash → on restart attempts reset to 0
-        // → retry storm.
-        //
-        // After fix: attempts live in the ReactorCheckpoint via
-        // `record_reactor_attempt` / `clear_reactor_attempts`. A
-        // new ReactorRunner pointing at the same checkpoint store sees
-        // the same count.
+        // Attempts live in the ReactorCheckpoint (not in-memory) so a
+        // process crash mid-retry can't reset the budget. Runner A
+        // accumulates failures; runner B (fresh memory, same store)
+        // continues the count instead of starting from zero.
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
@@ -1124,10 +1522,13 @@ mod tests {
         let _ = append_trigger(&store, &payload);
 
         let mapper_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen_attempts = std::sync::Arc::new(AtomicUsize::new(0));
         let mk_mapper = || -> TerminalFailureMapper {
             let mapper_calls = mapper_calls.clone();
+            let seen_attempts = seen_attempts.clone();
             std::sync::Arc::new(move |info: TerminalFailure| {
                 mapper_calls.fetch_add(1, Ordering::SeqCst);
+                seen_attempts.store(info.attempts as usize, Ordering::SeqCst);
                 Some(Box::new(HandlerFailed {
                     consumer: info.consumer,
                     attempts:   info.attempts,
@@ -1135,51 +1536,52 @@ mod tests {
             })
         };
 
-        // Runner A: fail twice. Attempts tracked in the checkpoint store.
+        // Runner A: budget too high to park — accumulate 2+ attempts,
+        // then halt mid-retry (the "crash").
+        let calls_a = std::sync::Arc::new(AtomicUsize::new(0));
         let runner_a = ReactorRunner::new(
-            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            AlwaysFails(calls_a.clone()),
             "persist-attempts",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_terminal_failure(mk_mapper(), 3);
-        assert!(runner_a.step(10).await.is_err());
-        assert!(runner_a.step(10).await.is_err());
-        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0,
-                   "no terminal-failure mapper yet (2 attempts < 3)");
+        ).with_terminal_failure(mk_mapper(), 100);
+        runner_a.step(10).await.unwrap();
+        wait_until(5, "runner A to fail twice", || {
+            calls_a.load(Ordering::SeqCst) >= 2
+        }).await;
+        runner_a.halt();
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0, "no park under budget 100");
 
-        // Drop runner_a — simulates engine restart.
-        drop(runner_a);
-
-        // Runner B: same backend, same consumer_id, fresh in-memory
-        // state. With persistent attempts, one more failure triggers
-        // the mapper.
+        // Runner B: same store, budget 3. Its FIRST react failure sees
+        // a persisted attempt count >= 3 → parks immediately.
+        let calls_b = std::sync::Arc::new(AtomicUsize::new(0));
         let runner_b = ReactorRunner::new(
-            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            AlwaysFails(calls_b.clone()),
             "persist-attempts",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         ).with_terminal_failure(mk_mapper(), 3);
-
-        let outcome = runner_b.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        runner_b.quiesce().await.unwrap();
         assert_eq!(mapper_calls.load(Ordering::SeqCst), 1,
-                   "third attempt across runners triggers mapper");
+                   "attempt count persisted: runner B parks without re-earning 3 failures");
+        assert!(seen_attempts.load(Ordering::SeqCst) >= 3,
+                "mapper saw the cross-instance attempt total");
+        assert!(calls_b.load(Ordering::SeqCst) <= 2,
+                "runner B did not restart the retry budget from zero");
+        runner_b.halt();
     }
 
     #[tokio::test]
     async fn prefix_colliding_category_does_not_reach_the_reactor() {
-        // B1 regression: the trigger filter must be colon-aware. With a
-        // bare starts_with, a reactor on category "order" matched
-        // "orders:created" — the foreign payload then hit the trigger
-        // deserializer and either wedged the consumer or, with a
-        // permissive serde shape, silently invoked react() on the
-        // wrong event.
+        // B1 regression: routing is exact-kind equality. A reactor on
+        // "order_placed" must not match "orders:created" (or any other
+        // sharing-a-prefix kind) — the foreign payload would hit the
+        // trigger deserializer.
         let store = Arc::new(MemoryStore::new());
         let foreign = EventData {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
             workflow_id: Uuid::new_v4(),
-            // Same prefix bytes as "order", different category.
             event_type:     "orders:created".into(),
             payload:        serde_json::json!({ "name": "not an OrderPlaced" }),
             created_at:     Utc::now(),
@@ -1194,10 +1596,10 @@ mod tests {
         struct PanicsIfCalled;
         #[async_trait]
         impl Reactor for PanicsIfCalled {
-            type Trigger = OrderPlaced; // CATEGORY = "order"
+            type Trigger = OrderPlaced;
             const NAME: &'static str = "no-collision";
             async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
-                panic!("reactor must never see a foreign-category event");
+                panic!("reactor must never see a foreign-kind event");
             }
         }
 
@@ -1208,24 +1610,20 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        let outcome = runner.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 0 },
-                   "foreign category skipped, cursor advanced, no deser, no wedge");
-        assert!(store.get("r.no-collision").await.unwrap().is_some());
+        runner.quiesce().await.unwrap();
+        assert!(store.get("r.no-collision").await.unwrap().is_some(),
+                "foreign kind skipped, floor advanced, no deser, no wedge");
+        runner.halt();
     }
 
     #[tokio::test]
     async fn poison_trigger_parks_as_terminal_failure_and_does_not_wedge() {
-        // B4: a payload that can't deserialize into the reactor's Trigger
-        // is a poison pill — deterministic, so retrying never helps. With
-        // a terminal-failure mapper it must route to the failure store immediately and advance
-        // the cursor (not block forever before the attempt counter even
-        // increments, the pre-B4 bug). A following valid trigger must
-        // still process.
+        // B4: a payload that can't deserialize into the reactor's
+        // Trigger is a poison pill — deterministic, so retrying never
+        // helps. With a mapper it parks immediately and the floor
+        // advances.
         let store = Arc::new(MemoryStore::new());
 
-        // A malformed event in the reactor's trigger category ("order")
-        // whose payload is NOT a valid OrderPlaced.
         let poison = EventData {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
@@ -1250,8 +1648,6 @@ mod tests {
             None // no synthesized fact needed for this test
         });
 
-        // A reactor that would PANIC if it ever saw a (successfully
-        // deserialized) trigger — proving the poison never reaches react().
         struct NeverReacts;
         #[async_trait]
         impl Reactor for NeverReacts {
@@ -1270,19 +1666,19 @@ mod tests {
         )
         .with_terminal_failure(mapper, 3);
 
-        let outcome = runner.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        runner.quiesce().await.unwrap();
         assert_eq!(mapper_calls.load(Ordering::SeqCst), 1,
                    "poison parked as a terminal failure immediately — no retries (deterministic)");
         assert!(store.get("poison.park").await.unwrap().is_some(),
-                "cursor advanced past the poison event — not wedged");
+                "floor advanced past the poison event — not wedged");
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn poison_trigger_without_terminal_failure_propagates() {
-        // Without a terminal-failure mapper, a poison trigger propagates (block-until-
-        // fixed) rather than silently skipping — the same contract a
-        // react() error has without a mapper.
+    async fn poison_without_mapper_wedges_only_its_partition() {
+        // Without a terminal-failure mapper, a poison trigger blocks
+        // until fixed — but the blast radius is its PARTITION, not the
+        // consumer. The floor never passes it; other subjects flow.
         let store = Arc::new(MemoryStore::new());
         let poison = EventData {
             event_id:       Uuid::new_v4(),
@@ -1291,43 +1687,51 @@ mod tests {
             event_type:     "order_placed".into(),
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
-            category:       Some("order".into()),
+            category:       Some("order_placed".into()),
             subject_id:      Some(Uuid::new_v4()),
             metadata:       serde_json::Map::new(),
             ephemeral:      None,
             persistent:     true,
         };
         crate::append_event(store.as_ref(), poison).await.unwrap();
-
-        struct NeverReacts;
-        #[async_trait]
-        impl Reactor for NeverReacts {
-            type Trigger = OrderPlaced;
-            const NAME: &'static str = "poison.block";
-            async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
-                Ok(Events::new())
-            }
-        }
+        // A healthy trigger on a different subject, after the poison.
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
 
         let runner = ReactorRunner::new(
-            NeverReacts,
+            EmitOne,
             "poison.block",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
-        assert!(runner.step(10).await.is_err(), "poison propagates without a terminal-failure");
-        assert!(store.get("poison.block").await.unwrap().is_none(),
-                "cursor did NOT advance — block until fixed");
+
+        let store_c = store.clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            runner.step(64).await.unwrap();
+            let outs = EventLogBackend::read_all(store_c.as_ref(), LogCursor::ZERO, 20)
+                .await.unwrap()
+                .iter()
+                .filter(|e| e.event_type == "shipped_notification")
+                .count();
+            if outs == 1 { break; }
+            assert!(std::time::Instant::now() < deadline,
+                    "healthy subject blocked behind another partition's poison");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Floor must hold below the poison (position 1).
+        let cursor = store.get("poison.block").await.unwrap().unwrap_or(LogCursor::ZERO);
+        let poison_pos = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 1)
+            .await.unwrap()[0].position;
+        assert!(cursor < poison_pos, "floor never passes an unacked poison");
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn terminal_failure_advance_keeps_aggregate_fold() {
-        // A2: "fold tracks the log, not body success." When a trigger
-        // dead-letters, the cursor advances past it — and the fold MUST
-        // stay applied, or the registry is permanently missing one fold
-        // relative to its cursor (the pre-A2 corruption: restore-then-
-        // advance left state diverging from fold(log[..cursor]) forever,
-        // and snapshots persisted the divergence durably).
+    async fn fold_on_read_state_is_bounded_at_trigger() {
+        // ctx.state_of in a reactor folds the subject history bounded
+        // at THE TRIGGER's position — even when later events for the
+        // same subject are already in the log when the worker runs.
         #[derive(Default, Clone, Debug, Serialize, Deserialize)]
         struct OrderCount { n: u32 }
         impl crate::aggregate::Aggregate for OrderCount {
@@ -1337,54 +1741,46 @@ mod tests {
             fn apply(&mut self, _: &OrderPlaced) { self.n += 1; }
         }
 
+        #[derive(Clone)]
+        struct CaptureCounts { seen: Arc<parking_lot::Mutex<Vec<(u32, u32)>>> }
+        #[async_trait]
+        impl Reactor for CaptureCounts {
+            type Trigger = OrderPlaced;
+            const NAME: &'static str = "capture-counts";
+            async fn react(&self, t: &OrderPlaced, ctx: Ctx<'_>) -> Result<Events> {
+                let s = ctx.state_of::<OrderCount>(t.order_id).await?;
+                self.seen.lock().push((s.prev.n, s.curr.n));
+                Ok(Events::new())
+            }
+        }
+
         let store = Arc::new(MemoryStore::new());
-        let payload = OrderPlaced {
-            order_id:    Uuid::new_v4(),
-            occurred_at: Utc::now(),
-        };
-        let order_id = payload.order_id;
-        let _ = append_trigger(&store, &payload);
+        let subject = Uuid::new_v4();
+        // Both triggers are in the log BEFORE the runner takes a step —
+        // an at-ingest fold would show the second event to the first.
+        append_trigger(&store, &OrderPlaced { order_id: subject, occurred_at: Utc::now() });
+        append_trigger(&store, &OrderPlaced { order_id: subject, occurred_at: Utc::now() });
 
         let mut reg = crate::aggregator::AggregatorRegistry::new();
         reg.register(crate::aggregator::Aggregator::for_type::<OrderCount, OrderPlaced>());
-        let reg = Arc::new(reg);
 
-        let mapper: TerminalFailureMapper = std::sync::Arc::new(
-            |_info: TerminalFailure| -> Option<Box<dyn crate::engine::ErasedFact>> { None },
-        );
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let runner = ReactorRunner::new(
-            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
-            "park-keeps-fold",
+            CaptureCounts { seen: seen.clone() },
+            "fold-bounded",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
-        .with_aggregators(reg.clone())
-        .with_terminal_failure(mapper, 1);
+        .with_aggregators(Arc::new(reg));
 
-        // max_attempts = 1 → the first failure dead-letters and advances.
-        let outcome = runner.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
-        assert!(store.get("park-keeps-fold").await.unwrap().is_some(),
-                "cursor advanced past the dead-lettered trigger");
-
-        let (_, curr) = reg.get_transition_arc::<OrderCount>(order_id);
-        assert_eq!(curr.n, 1,
-                   "the dead-lettered trigger's fold is KEPT — state reflects \
-                    the log even when the body failed terminally");
-
-        // The consumer is not wedged: a second trigger dead-letters the
-        // same way and ALSO folds.
-        let payload2 = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
-        let order_id2 = payload2.order_id;
-        let _ = append_trigger(&store, &payload2);
-        let outcome = runner.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
-        let (_, curr) = reg.get_transition_arc::<OrderCount>(order_id2);
-        assert_eq!(curr.n, 1);
+        runner.quiesce().await.unwrap();
+        assert_eq!(*seen.lock(), vec![(0, 1), (1, 2)],
+                   "each reaction sees the fold AT ITS OWN trigger, not the log head");
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn reactor_step_invokes_failure_mapper_after_retry_exhaustion() {
+    async fn reactor_invokes_failure_mapper_after_retry_exhaustion() {
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
@@ -1395,8 +1791,6 @@ mod tests {
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mapper_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mapper_calls_c = mapper_calls.clone();
-        // Capture the workflow_id the mapper is handed, so we can assert the
-        // mapper can see the failing trigger's run (per-run terminal-failure keying).
         let seen_corr = std::sync::Arc::new(std::sync::Mutex::new(None::<Uuid>));
         let seen_corr_c = seen_corr.clone();
 
@@ -1416,24 +1810,12 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         ).with_terminal_failure(mapper, 3);
 
-        // Attempt 1: fails, no terminal-failure mapper yet (1 < 3).
-        assert!(runner.step(10).await.is_err());
-        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0);
-
-        // Attempt 2: fails, no terminal-failure mapper yet (2 < 3).
-        assert!(runner.step(10).await.is_err());
-        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0);
-
-        // Attempt 3: fails, terminal-failure mapper fires (3 >= 3). terminal-failure fact
-        // appended; cursor advances.
-        let outcome = runner.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        // Worker retries internally; after 3 attempts the mapper fires,
+        // the synthesized fact appends, and the floor advances.
+        runner.quiesce().await.unwrap();
         assert_eq!(mapper_calls.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-        // The terminal-failure-synthesized HandlerFailed Event is appended directly to
-        // the log (its own `ops` stream), with the deterministic u32::MAX
-        // id that distinguishes it from react() outputs.
         let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10)
             .await
             .unwrap();
@@ -1449,10 +1831,7 @@ mod tests {
             "terminal-failure output uses u32::MAX for its deterministic id",
         );
 
-        // The terminal-failure fact inherits the trigger's workflow_id — without
-        // this, a failing reactor's downstream "HandlerFailed" would be
-        // untraceable back to the trigger (the causal-chain debugging
-        // story rootsignal depends on).
+        // The terminal-failure fact inherits the trigger's workflow_id.
         let trigger = all
             .iter()
             .find(|e| e.event_id == trigger_id)
@@ -1461,27 +1840,24 @@ mod tests {
             terminal_failure.workflow_id, trigger.workflow_id,
             "terminal-failure-synthesized fact MUST inherit trigger workflow_id",
         );
-
-        // TerminalFailure exposes that same workflow_id to the mapper, so a mapper
-        // can key its terminal-failure event per-run (rootsignal's use case).
         let seen = seen_corr.lock().unwrap().expect("mapper ran");
         assert_eq!(
             seen, trigger.workflow_id,
             "TerminalFailure.workflow_id MUST be the failing trigger's run",
         );
 
-        // Cursor is past the failing trigger — the runner is done with
-        // it. A further step only sees the non-matching terminal-failure output (a
-        // different category) and produces no new reaction.
+        // Floor is past the failing trigger; no further reaction occurs.
         let next = runner.step(10).await.unwrap();
         assert!(
             matches!(next, StepOutcome::Idle | StepOutcome::Progressed { applied: 0 }),
             "no further reaction on the failed trigger; got {next:?}",
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "no retry storm after park");
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn reactor_step_failure_mapper_returning_none_still_advances_cursor() {
+    async fn failure_mapper_returning_none_still_advances_floor() {
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
@@ -1498,20 +1874,19 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         ).with_terminal_failure(mapper, 2);
 
-        // 1st fails, 2nd hits max + maps to None: cursor advances,
-        // nothing appended.
-        let _ = runner.step(10).await;
-        let outcome = runner.step(10).await.unwrap();
-        assert_eq!(outcome, StepOutcome::Progressed { applied: 1 });
+        runner.quiesce().await.unwrap();
+        assert!(store.get("drop-on-park").await.unwrap().is_some(),
+                "floor advanced past the parked trigger");
         assert_eq!(
             EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10).await.unwrap().len(),
             1,
-            "only the trigger in the log — no reactor output",
+            "only the trigger in the log — mapper returned None, nothing appended",
         );
+        runner.halt();
     }
 
     #[tokio::test]
-    async fn reactor_step_without_failure_mapper_returns_err_indefinitely() {
+    async fn without_failure_mapper_a_failing_trigger_retries_indefinitely() {
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
@@ -1519,19 +1894,73 @@ mod tests {
         };
         let _ = append_trigger(&store, &payload);
 
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let runner = ReactorRunner::new(
-            AlwaysFails(std::sync::Arc::new(AtomicUsize::new(0))),
+            AlwaysFails(calls.clone()),
             "no-terminal_failure",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        // Many attempts, all Err — without a terminal-failure mapper, no cap on retries.
-        for _ in 0..10 {
-            assert!(runner.step(10).await.is_err());
-        }
-        // Cursor stayed at zero.
+        runner.step(10).await.unwrap();
+        // Worker-local retry keeps attempting (with backoff) — no cap.
+        wait_until(5, "at least 3 retry attempts", || {
+            calls.load(Ordering::SeqCst) >= 3
+        }).await;
+        runner.step(10).await.unwrap();
+        // Floor never passes the failing trigger.
         let cursor = store.get("no-terminal_failure").await.unwrap();
-        assert!(cursor.is_none() || cursor == Some(LogCursor::ZERO));
+        assert!(cursor.is_none() || cursor == Some(LogCursor::ZERO),
+                "floor pinned below the failing trigger");
+        runner.halt();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn different_subjects_process_concurrently() {
+        // The point of partitioning: two subjects' triggers run in
+        // overlapping time in the SAME consumer.
+        use std::sync::atomic::AtomicU64;
+        struct Barrier2 { inside: Arc<AtomicU64>, peak: Arc<AtomicU64>, gate: Arc<tokio::sync::Notify> }
+        #[async_trait]
+        impl Reactor for Barrier2 {
+            type Trigger = OrderPlaced;
+            const NAME: &'static str = "barrier2";
+            async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                let now = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                if now >= 2 {
+                    self.gate.notify_waiters();
+                } else {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2), self.gate.notified(),
+                    ).await;
+                }
+                self.inside.fetch_sub(1, Ordering::SeqCst);
+                Ok(Events::new())
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+
+        let inside = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+        let runner = ReactorRunner::new(
+            Barrier2 {
+                inside: inside.clone(),
+                peak: peak.clone(),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            },
+            "r.concurrent",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+
+        runner.quiesce().await.unwrap();
+        assert!(peak.load(Ordering::SeqCst) >= 2,
+                "two subjects' reactions overlapped (peak in-flight = {})",
+                peak.load(Ordering::SeqCst));
+        runner.halt();
     }
 }

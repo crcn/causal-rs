@@ -94,6 +94,12 @@ where
 
     pub fn consumer_id(&self) -> &str { &self.consumer_id }
 
+    /// This consumer's durable cursor — its settle progress (serial
+    /// consumers finish each event before advancing it).
+    pub(crate) async fn cursor(&self) -> Result<Option<crate::types::LogCursor>> {
+        self.checkpoint.get(&self.consumer_id).await
+    }
+
     /// Process up to `batch` facts from the log.
     ///
     /// Per C2: cursor advances per-fact, only after `project`
@@ -176,7 +182,10 @@ where
                 occurred_at:    fact.occurred_at().unwrap_or(event.created_at),
                 workflow_id: event.workflow_id,
                 metadata:       &event.metadata,
-                aggregators:    self.aggregators.as_ref(),
+                state:    match self.aggregators.as_ref() {
+                    Some(reg) => crate::contexts::StateSource::Registry(reg),
+                    None => crate::contexts::StateSource::None,
+                },
                 logs:           None,
                 effect_store: None,
             };

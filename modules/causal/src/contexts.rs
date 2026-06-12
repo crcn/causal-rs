@@ -16,8 +16,34 @@ use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::aggregate::Aggregate;
-use crate::aggregator::AggregatorRegistry;
+use crate::aggregator::{AggregatorRegistry, FoldOnReadCache};
 use crate::types::{LogCursor, LogEntry, LogLevel};
+
+/// Where `ctx.state_of` reads aggregate state from.
+///
+/// Serial consumers (projectors, multi-projectors) read the shared
+/// per-consumer registry, folded in scan order before the body runs —
+/// today's semantics, unchanged. Partitioned reactors fold on read:
+/// the subject history from the log, bounded at the trigger's
+/// position, so the answer is deterministic regardless of what other
+/// partitions are doing (BLOCKING-1).
+#[derive(Clone, Copy)]
+pub(crate) enum StateSource<'a> {
+    /// No aggregators wired.
+    None,
+    /// Shared per-consumer registry (serial consumers).
+    Registry(&'a Arc<AggregatorRegistry>),
+    /// Position-bounded fold from the log (partitioned reactors).
+    FoldOnRead {
+        /// Fold-function table (the registry's state is unused here).
+        registry: &'a Arc<AggregatorRegistry>,
+        log: &'a dyn crate::event_log::EventLogBackend,
+        /// The trigger's position — reads answer "as of this event".
+        bound: LogCursor,
+        /// Worker-local incremental cache; dies with the partition.
+        cache: &'a FoldOnReadCache,
+    },
+}
 
 /// Aggregate state snapshot pair returned by [`Ctx::state_of`]. `prev` is the state before the current
 /// event was folded; `curr` is the state after. Both are `Arc<A>`
@@ -45,10 +71,9 @@ pub struct Ctx<'a> {
     pub occurred_at:    DateTime<Utc>,
     pub workflow_id: Uuid,
     pub metadata:       &'a Metadata,
-    /// Optional read-side access to in-process aggregator state folded
-    /// from events. `None` if the runner wasn't configured with an
-    /// aggregator registry. Use [`Ctx::aggregate`] to query.
-    pub(crate) aggregators: Option<&'a Arc<AggregatorRegistry>>,
+    /// Read-side access to aggregate state — see [`StateSource`].
+    /// Query via [`Ctx::state_of`].
+    pub(crate) state: StateSource<'a>,
     /// Per-attempt sink for `ctx.log(...)` entries. The runner owns
     /// the underlying Vec and drains it after `react()` returns,
     /// routing the entries through the configured
@@ -72,7 +97,14 @@ impl<'a> std::fmt::Debug for Ctx<'a> {
             .field("occurred_at", &self.occurred_at)
             .field("workflow_id", &self.workflow_id)
             .field("metadata", &self.metadata)
-            .field("has_aggregators", &self.aggregators.is_some())
+            .field(
+                "state_source",
+                &match self.state {
+                    StateSource::None => "none",
+                    StateSource::Registry(_) => "registry",
+                    StateSource::FoldOnRead { .. } => "fold-on-read",
+                },
+            )
             .field("has_effect_store", &self.effect_store.is_some())
             .finish()
     }
@@ -110,31 +142,67 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Read a subject's folded state — `(prev, curr)` snapshots
-    /// captured by the runner around folding the current event.
-    /// `curr` reflects state INCLUDING the current event because the
-    /// runner folds before invoking the consumer body.
+    /// Read a subject's folded state — `(prev, curr)` around the
+    /// current event. `curr` reflects state INCLUDING the current
+    /// event; `prev` excludes it.
+    ///
+    /// In projector bodies this reads the per-consumer registry the
+    /// runner folded before invoking you (today's semantics). In
+    /// reactor bodies it is a **position-bounded fold-on-read**: the
+    /// subject's history from the log, bounded at your trigger's
+    /// position — deterministic regardless of how other partitions
+    /// interleave, and exclusive over your own subject under the
+    /// default `Ordering::PerSubject` (nothing can advance your
+    /// subject's history mid-reaction within this consumer).
     ///
     /// The no-arg singleton read (`ctx.aggregate()`) was deleted in the
     /// 0.10 step-1 rename: a magic nil-keyed global was a lying default
     /// (keying invisible at the call site). State keyed to "the whole
     /// system" is still expressible — explicitly, with `Uuid::nil()`.
     ///
+    /// # Errors
+    /// Log-read failures (fold-on-read path) propagate. An aggregator
+    /// registered with a custom `id_fn` (cross-subject fan-in) cannot
+    /// be folded from one subject history and errors with a teaching
+    /// message in reactor bodies.
+    ///
     /// # Panics
-    /// Panics if no aggregators were registered with the engine via
-    /// `EngineBuilder::with_aggregators(...)`. Calling `state_of()`
-    /// in a body that has no aggregator wiring is a configuration bug
-    /// — the panic surfaces it loudly at the offending call site.
-    pub fn state_of<A>(&self, id: Uuid) -> AggregateState<A>
+    /// Panics if no aggregator for `A` was registered with the engine
+    /// via `EngineBuilder::with_aggregators(...)` — a configuration
+    /// bug, surfaced loudly at the offending call site.
+    pub async fn state_of<A>(&self, id: Uuid) -> Result<AggregateState<A>>
     where
         A: Aggregate,
     {
-        let reg = self.aggregators.expect(
-            "ctx.state_of::<A>(id) called but no aggregators were registered \
-             with EngineBuilder::with_aggregators(...)",
-        );
-        let (prev, curr) = reg.get_transition_arc::<A>(id);
-        AggregateState { prev, curr }
+        match self.state {
+            StateSource::None => panic!(
+                "ctx.state_of::<{}>(id) called but no aggregators were \
+                 registered with EngineBuilder::with_aggregators(...)",
+                std::any::type_name::<A>(),
+            ),
+            StateSource::Registry(reg) => {
+                let (prev, curr) = reg.get_transition_arc::<A>(id);
+                Ok(AggregateState { prev, curr })
+            }
+            StateSource::FoldOnRead { registry, log, bound, cache } => {
+                let (prev, curr) = crate::aggregator::fold_bounded(
+                    registry,
+                    log,
+                    <A as Aggregate>::NAME,
+                    id,
+                    bound,
+                    cache,
+                )
+                .await?;
+                let downcast = |b: Box<dyn std::any::Any + Send + Sync>| -> Arc<A> {
+                    Arc::new(*b.downcast::<A>().expect(
+                        "fold_bounded returned a state of the wrong type \
+                         (aggregate NAME registered against a different type?)",
+                    ))
+                };
+                Ok(AggregateState { prev: downcast(prev), curr: downcast(curr) })
+            }
+        }
     }
 
     /// The reaction-result cache, if the engine was built with one via
@@ -209,7 +277,7 @@ mod tests {
             occurred_at:    occurred,
             workflow_id: Uuid::nil(),
             metadata:       &meta,
-            aggregators:    None,
+            state:    crate::contexts::StateSource::None,
             logs:           None,
             effect_store: None,
         };
@@ -228,7 +296,7 @@ mod tests {
             occurred_at:    Utc::now(),
             workflow_id: Uuid::nil(),
             metadata:       &meta,
-            aggregators:    None,
+            state:    crate::contexts::StateSource::None,
             logs:           None,
             effect_store: None,
         };

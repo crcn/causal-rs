@@ -49,6 +49,15 @@ const SUPERVISOR_BATCH: usize = 256;
 trait Supervisable: Send + Sync {
     async fn step(&self, batch: usize) -> Result<StepOutcome>;
     fn consumer_id(&self) -> &str;
+    /// The settle probe: has this consumer fully finished workflow `wf`
+    /// up to high-water `hw`? Serial consumers answer with their durable
+    /// cursor; the partitioned reactor runner answers with its
+    /// ingestion cursor + per-workflow pending work, so one wedged
+    /// partition can't hold an unrelated workflow's settle hostage.
+    async fn drained(&self, wf: Uuid, hw: LogCursor) -> Result<bool>;
+    /// Stop taking new work (in-flight bodies finish). Default no-op
+    /// for serial consumers, whose supervisor exit is sufficient.
+    fn halt(&self) {}
 }
 
 #[async_trait]
@@ -60,6 +69,9 @@ where
         ProjectionRunner::step(self, batch).await
     }
     fn consumer_id(&self) -> &str { ProjectionRunner::consumer_id(self) }
+    async fn drained(&self, _wf: Uuid, hw: LogCursor) -> Result<bool> {
+        Ok(ProjectionRunner::cursor(self).await?.is_some_and(|c| c >= hw))
+    }
 }
 
 #[async_trait]
@@ -71,6 +83,10 @@ where
         ReactorRunner::step(self, batch).await
     }
     fn consumer_id(&self) -> &str { ReactorRunner::consumer_id(self) }
+    async fn drained(&self, wf: Uuid, hw: LogCursor) -> Result<bool> {
+        ReactorRunner::drained(self, wf, hw).await
+    }
+    fn halt(&self) { ReactorRunner::halt(self) }
 }
 
 #[async_trait]
@@ -79,6 +95,9 @@ impl<P: MultiProjector + 'static> Supervisable for MultiProjectorRunner<P> {
         MultiProjectorRunner::step(self, batch).await
     }
     fn consumer_id(&self) -> &str { MultiProjectorRunner::consumer_id(self) }
+    async fn drained(&self, _wf: Uuid, hw: LogCursor) -> Result<bool> {
+        Ok(MultiProjectorRunner::cursor(self).await?.is_some_and(|c| c >= hw))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -882,14 +901,12 @@ impl EngineBuilder {
             .into_iter()
             .map(|f| f(make_registry(), engine_aggregators.clone(), occ_shared.clone()))
             .collect();
-        let consumer_ids: Vec<String> = self.consumer_names.into_iter().collect();
         Ok(Engine::start(
             self.log,
             self.checkpoint,
             consumers,
             self.default_metadata,
             engine_aggregators,
-            consumer_ids,
             self.observer,
             self.occ_categories,
             self.workflow_hw,
@@ -908,6 +925,10 @@ pub struct Engine {
     checkpoint:            Arc<dyn CheckpointStore>,
     shutdown_tx:           broadcast::Sender<()>,
     handles:               Vec<JoinHandle<()>>,
+    /// The supervised consumers, retained for the `settle` drained
+    /// probes and for `halt` on shutdown (each also lives in its
+    /// supervisor task via an Arc clone).
+    consumers:             Vec<Arc<dyn Supervisable>>,
     default_metadata:      Metadata,
     /// Engine-level aggregator registry for out-of-band read access
     /// via `engine.state_of::<A>(subject_id).await.unwrap()`. Folded on every
@@ -916,10 +937,6 @@ pub struct Engine {
     /// registry exists for the test ergonomic of reading aggregate
     /// state without going through a consumer.
     aggregators:           Option<Arc<AggregatorRegistry>>,
-    /// Consumer group names registered with the builder, in
-    /// registration order. Used by `Engine::settle` to await every
-    /// consumer catching up to an emit position.
-    consumer_ids:          Vec<String>,
     /// Telemetry hook for inspector / external observability sinks.
     observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     /// Categories marked `StreamPolicy::OccRequired` via
@@ -944,7 +961,6 @@ impl Engine {
         consumers: Vec<Arc<dyn Supervisable>>,
         default_metadata: Metadata,
         aggregators: Option<Arc<AggregatorRegistry>>,
-        consumer_ids: Vec<String>,
         observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
         occ_categories: std::collections::HashSet<String>,
         workflow_hw: WorkflowHighWater,
@@ -957,7 +973,8 @@ impl Engine {
         // Each consumer (reactor / projector runner) is supervised; it
         // reads the log from its cursor and, for reactors, appends outputs
         // directly. No relay — reactor outputs go straight to the log.
-        for consumer in consumers {
+        for consumer in &consumers {
+            let consumer = consumer.clone();
             let mut rx = shutdown_tx.subscribe();
             let task = tokio::spawn(async move {
                 supervise_one(consumer, &mut rx).await;
@@ -966,9 +983,9 @@ impl Engine {
         }
 
         Self {
-            log, checkpoint, shutdown_tx, handles,
+            log, checkpoint, shutdown_tx, handles, consumers,
             default_metadata,
-            aggregators, consumer_ids, observer,
+            aggregators, observer,
             occ_categories,
             workflow_hw,
             snapshot_store,
@@ -1494,9 +1511,15 @@ impl Engine {
     /// here and `settle` may return early — that topology needs a
     /// backend-queried high-water instead.
     ///
-    /// `settle` still waits on *every* registered consumer's cursor (cursors
-    /// are shared/global), so a consumer wedged on an unrelated run's event can
-    /// still delay it — per-run consumer isolation is a separate concern.
+    /// **Isolation (0.10 step 2).** `settle` asks each consumer's
+    /// `drained(workflow, hw)` probe, not its global durable cursor.
+    /// For reactors that probe is "ingestion scanned to `hw` AND no
+    /// queued/in-flight trigger of this workflow remains" — a reactor
+    /// wedged on an *unrelated* workflow's trigger no longer delays
+    /// this one. The remaining coupling is the pending-work window
+    /// (BLOCKING-3): a consumer whose window is saturated by wedged
+    /// work stops ingesting, which does delay settle — visibly, by
+    /// design, instead of unbounded redelivery debt.
     ///
     /// Reactors run asynchronously in supervisor tasks; bounded latency depends
     /// on consumer batch size + supervisor poll interval.
@@ -1514,13 +1537,16 @@ impl Engine {
                 .get(&wf)
                 .unwrap_or(result.position);
 
-            // Wait for every consumer to catch up to hw. Because a consumer's
-            // cursor advances only after its output is appended (and outputs
-            // inherit this workflow_id), "all consumers past hw" plus "no
-            // new chain event appeared" means this run has drained — regardless
-            // of how busy other runs keep the global log head.
-            for id in &self.consumer_ids {
-                self.await_observed_by(id, hw).await?;
+            // Wait for every consumer to drain THIS workflow to hw. An
+            // output appended while we wait inherits this workflow_id
+            // and bumps the tracker — the hw re-check below catches it.
+            for consumer in &self.consumers {
+                loop {
+                    if consumer.drained(wf, hw).await? {
+                        break;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
             }
 
             // Fall back to the prior hw (not the floor) if the entry was evicted
@@ -1550,9 +1576,14 @@ impl Engine {
         }
     }
 
-    /// Signal shutdown; drain in-flight consumer steps; halt.
+    /// Signal shutdown; drain in-flight consumer steps; halt. Reactor
+    /// partition workers stop at their next loop boundary (an in-flight
+    /// `react()` completes; it is not cancelled).
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.shutdown_tx.send(());
+        for consumer in &self.consumers {
+            consumer.halt();
+        }
         for handle in self.handles {
             let _ = handle.await;
         }
@@ -1617,7 +1648,7 @@ async fn supervise_one(
 /// payload. Standard panics (`panic!("string")`, `panic!("{} {}", ...)`)
 /// produce `&'static str` or `String` payloads; non-string payloads
 /// (custom types passed to `panic_any`) fall through to a placeholder.
-fn panic_payload_message(payload: &Box<dyn Any + Send>) -> String {
+pub(crate) fn panic_payload_message(payload: &Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -4047,7 +4078,7 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                let s = ctx.state_of::<TickCounter>(Uuid::nil()).curr;
+                let s = ctx.state_of::<TickCounter>(Uuid::nil()).await?.curr;
                 self.snaps.lock().push(s.count);
                 Ok(())
             }
@@ -4100,7 +4131,7 @@ mod tests {
             async fn react(
                 &self, _t: &Tick, ctx: Ctx<'_>,
             ) -> Result<crate::reactor::Events> {
-                let s = ctx.state_of::<TickCounter>(Uuid::nil());
+                let s = ctx.state_of::<TickCounter>(Uuid::nil()).await?;
                 self.transitions.lock().push((s.prev.count, s.curr.count));
                 Ok(crate::reactor::Events::new())
             }
@@ -4249,7 +4280,7 @@ mod tests {
                 _f: &Tick,
                 ctx: Ctx<'_>,
             ) -> Result<()> {
-                let s = ctx.state_of::<TickCounter>(Uuid::nil());
+                let s = ctx.state_of::<TickCounter>(Uuid::nil()).await?;
                 self.transitions.lock().push((s.prev.count, s.curr.count));
                 Ok(())
             }
@@ -4303,7 +4334,8 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                self.snaps.lock().push(ctx.state_of::<TickCounter>(Uuid::nil()).curr.count);
+                let n = ctx.state_of::<TickCounter>(Uuid::nil()).await?.curr.count;
+                self.snaps.lock().push(n);
                 Ok(())
             }
         }
@@ -4354,7 +4386,7 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                *self.snap.lock() = Some(ctx.state_of::<TickCounter>(Uuid::nil()).curr.count);
+                *self.snap.lock() = Some(ctx.state_of::<TickCounter>(Uuid::nil()).await?.curr.count);
                 Ok(())
             }
         }
@@ -4413,7 +4445,7 @@ mod tests {
                 _f: &Tick,
                 ctx: Ctx<'_>,
             ) -> Result<()> {
-                let s = ctx.state_of::<TickCounter>(Uuid::nil());
+                let s = ctx.state_of::<TickCounter>(Uuid::nil()).await?;
                 *self.prev_curr.lock() = Some((s.prev.count, s.curr.count));
                 Ok(())
             }
@@ -4460,7 +4492,7 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                let _ = ctx.state_of::<TickCounter>(Uuid::nil()).curr;
+                let _ = ctx.state_of::<TickCounter>(Uuid::nil()).await?.curr;
                 Ok(())
             }
         }
@@ -4584,8 +4616,10 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                self.a.lock().push(ctx.state_of::<TickCounter>(Uuid::nil()).curr.count);
-                self.b.lock().push(ctx.state_of::<OtherCounter>(Uuid::nil()).curr.count);
+                let na = ctx.state_of::<TickCounter>(Uuid::nil()).await?.curr.count;
+                self.a.lock().push(na);
+                let nb = ctx.state_of::<OtherCounter>(Uuid::nil()).await?.curr.count;
+                self.b.lock().push(nb);
                 Ok(())
             }
         }

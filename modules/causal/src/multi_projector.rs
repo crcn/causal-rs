@@ -143,6 +143,12 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
 
     pub fn consumer_id(&self) -> &str { &self.consumer_id }
 
+    /// This consumer's durable cursor — its settle progress (serial
+    /// consumers finish each event before advancing it).
+    pub(crate) async fn cursor(&self) -> Result<Option<crate::types::LogCursor>> {
+        self.checkpoint.get(&self.consumer_id).await
+    }
+
     pub async fn step(&self, batch: usize) -> Result<StepOutcome> {
         let cursor = self.checkpoint.get(&self.consumer_id).await?
             .unwrap_or(LogCursor::ZERO);
@@ -218,7 +224,10 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 occurred_at,
                 workflow_id: event.workflow_id,
                 metadata:       &event.metadata,
-                aggregators:    self.aggregators.as_ref(),
+                state:    match self.aggregators.as_ref() {
+                    Some(reg) => crate::contexts::StateSource::Registry(reg),
+                    None => crate::contexts::StateSource::None,
+                },
                 logs:           None,
                 effect_store: None,
             };
