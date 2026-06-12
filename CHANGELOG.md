@@ -6,6 +6,56 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### 0.10 step 2 — the partitioned reactor runner (2026-06-12, breaking)
+
+Settle unhostaged: reactors execute concurrently across declared
+partitions, one wedged trigger blocks only its own partition, and
+`settled()` waits only on its own workflow's work. Landed as one
+correctness unit (runner + BLOCKING-1 + BLOCKING-3 + BLOCKING-4) per
+the design doc's sequencing, gated by a red-first acceptance suite
+(`tests/partitioned_runner_acceptance.rs`).
+
+- **`Reactor::ORDERING`** (BLOCKING-4, decided in
+  `docs/plans/2026-06-12-memo-partition-key.md`): no global partition
+  key — each reactor declares `Ordering::PerSubject` (default; one
+  subject's triggers in log order, across workflows), `PerWorkflow`
+  (run-pipeline shape), or `None` (per-event concurrency for
+  commutative work).
+- **The runner** (`reactor_runner.rs` rewritten): per-consumer
+  dispatcher, one worker task per active partition (spawned on demand,
+  evicted when drained). Failures retry worker-local with capped
+  backoff; terminal-failure parking and the OCC output fence are
+  unchanged; a poison or failing trigger without a mapper wedges only
+  its partition (block-until-fixed, scoped).
+- **Ack-floor checkpoint** (BLOCKING-3): the durable cursor is the
+  highest position with no unacked matching trigger at or below it;
+  ingestion pauses at the pending-work window (4096 outstanding
+  triggers). Crash redelivery replays at most the window — never the
+  log distance behind a slow partition — and never silently skips an
+  unfinished trigger. Redelivered reactions dedup byte-identically on
+  their identity-keyed event_ids.
+- **Fold-on-read state** (BLOCKING-1): `ctx.state_of` in reactors is
+  an async position-bounded fold of the subject history from the log —
+  deterministic at the trigger's position regardless of partition
+  interleaving; exclusive over the trigger's own subject under
+  `PerSubject`. Worker-local incremental cache, correct by
+  append-only construction, dies with its partition. The per-consumer
+  scan-folded registry for reactors (and its startup hydration scan)
+  is deleted; serial projectors keep registry semantics. Cross-subject
+  fan-in aggregators (custom `id_fn`) get a teaching error on this
+  path — fold them in a projector-maintained read model.
+- **Settle rewire**: `Engine::settle` polls per-consumer
+  `drained(workflow, hw)` probes (for reactors: ingestion scanned to
+  `hw` ∧ no queued/in-flight trigger of that workflow) instead of
+  every consumer's global durable cursor.
+- **Breaking**: `ctx.state_of` is `async` and returns `Result`;
+  reactors no longer execute in serial total order (by design — that
+  order was the settle hostage); `Engine::shutdown` halts partition
+  workers (in-flight reactions complete, new attempts stop).
+- Scale-checked with the `nuke` harness: emit ~260k ev/s flat to
+  500k; chase flat to 200k; settle_flood 128-concurrent mean settle
+  ≈ 2× the 50ms drained-poll interval, no collapse.
+
 ### 0.10 step 1 — the naming + shape decoupling (2026-06-12, breaking)
 
 Every identity is declared, named for meaning, and matched exactly.

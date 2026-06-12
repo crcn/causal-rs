@@ -1963,4 +1963,126 @@ mod tests {
                 peak.load(Ordering::SeqCst));
         runner.halt();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordering_none_runs_same_subject_concurrently() {
+        // Ordering::None — per-event partitions: even SAME-subject
+        // triggers overlap. (Under the PerSubject default they would
+        // serialize; this is the declared opt-out for commutative work.)
+        use std::sync::atomic::AtomicU64;
+        struct FreeBarrier { inside: Arc<AtomicU64>, peak: Arc<AtomicU64>, gate: Arc<tokio::sync::Notify> }
+        #[async_trait]
+        impl Reactor for FreeBarrier {
+            type Trigger = OrderPlaced;
+            const NAME: &'static str = "free-barrier";
+            const ORDERING: crate::reactor::Ordering = crate::reactor::Ordering::None;
+            async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                let now = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                if now >= 2 {
+                    self.gate.notify_waiters();
+                } else {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2), self.gate.notified(),
+                    ).await;
+                }
+                self.inside.fetch_sub(1, Ordering::SeqCst);
+                Ok(Events::new())
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let subject = Uuid::new_v4(); // SAME subject for both triggers
+        append_trigger(&store, &OrderPlaced { order_id: subject, occurred_at: Utc::now() });
+        append_trigger(&store, &OrderPlaced { order_id: subject, occurred_at: Utc::now() });
+
+        let peak = Arc::new(AtomicU64::new(0));
+        let runner = ReactorRunner::new(
+            FreeBarrier {
+                inside: Arc::new(AtomicU64::new(0)),
+                peak: peak.clone(),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            },
+            "r.free",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+
+        runner.quiesce().await.unwrap();
+        assert!(peak.load(Ordering::SeqCst) >= 2,
+                "Ordering::None must overlap same-subject triggers (peak = {})",
+                peak.load(Ordering::SeqCst));
+        runner.halt();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordering_per_workflow_serializes_across_subjects() {
+        // Ordering::PerWorkflow — one workflow's triggers process in
+        // log order even across DIFFERENT subjects (the run-pipeline
+        // shape). Probe: track overlap and order; expect strictly
+        // serial, log-ordered execution.
+        use std::sync::atomic::AtomicU64;
+        struct SerialProbe {
+            inside: Arc<AtomicU64>,
+            peak: Arc<AtomicU64>,
+            order: Arc<parking_lot::Mutex<Vec<Uuid>>>,
+        }
+        #[async_trait]
+        impl Reactor for SerialProbe {
+            type Trigger = OrderPlaced;
+            const NAME: &'static str = "serial-probe";
+            const ORDERING: crate::reactor::Ordering = crate::reactor::Ordering::PerWorkflow;
+            async fn react(&self, t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                let now = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                // Dwell long enough that a concurrent dispatch WOULD
+                // overlap if the partitioning were per-subject.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                self.order.lock().push(t.order_id);
+                self.inside.fetch_sub(1, Ordering::SeqCst);
+                Ok(Events::new())
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let workflow = Uuid::new_v4();
+        let subjects: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for s in &subjects {
+            let payload = OrderPlaced { order_id: *s, occurred_at: Utc::now() };
+            let ev = EventData {
+                event_id: Uuid::new_v4(),
+                causation_id: None,
+                workflow_id: workflow, // SAME workflow, different subjects
+                event_type: <OrderPlaced as Event>::NAME.to_string(),
+                payload: serde_json::to_value(&payload).unwrap(),
+                created_at: Utc::now(),
+                category: Some(<OrderPlaced as Event>::NAME.to_string()),
+                subject_id: Some(*s),
+                metadata: serde_json::Map::new(),
+                ephemeral: None,
+                persistent: true,
+            };
+            crate::append_event(store.as_ref(), ev).await.unwrap();
+        }
+
+        let peak = Arc::new(AtomicU64::new(0));
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let runner = ReactorRunner::new(
+            SerialProbe {
+                inside: Arc::new(AtomicU64::new(0)),
+                peak: peak.clone(),
+                order: order.clone(),
+            },
+            "r.workflow",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+
+        runner.quiesce().await.unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 1,
+                   "one workflow's triggers must never overlap under PerWorkflow");
+        assert_eq!(*order.lock(), subjects,
+                   "one workflow's triggers process in log order across subjects");
+        runner.halt();
+    }
 }
