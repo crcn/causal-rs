@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[causal::event(prefix = "job", subject_id = "job_id")]
+#[causal::event(name = "job_event", subject_id = "job_id")]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum JobEvent {

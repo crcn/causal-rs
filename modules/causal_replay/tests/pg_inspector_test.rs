@@ -55,8 +55,7 @@ async fn connect() -> PgPool {
 #[derive(Clone, Serialize, Deserialize)]
 struct Pinged { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Pinged {
-    const CATEGORY: &'static str = "insp_ping";
-    fn event_type(&self) -> &str { "v1" }
+    const NAME: &'static str = "v1";
     fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
@@ -64,8 +63,7 @@ impl Event for Pinged {
 #[derive(Clone, Serialize, Deserialize)]
 struct Ponged { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Ponged {
-    const CATEGORY: &'static str = "insp_pong";
-    fn event_type(&self) -> &str { "v1" }
+    const NAME: &'static str = "v1";
     fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
@@ -142,8 +140,8 @@ async fn pg_inspector_round_trip() -> Result<()> {
     // Events: Pinged + Ponged in this workflow.
     let flow = read.causal_flow(&corr).await?;
     assert!(flow.len() >= 2, "expected Pinged + Ponged, got {}", flow.len());
-    assert!(flow.iter().any(|e| e.event_type == "insp_ping:v1"));
-    assert!(flow.iter().any(|e| e.event_type == "insp_pong:v1"));
+    assert!(flow.iter().any(|e| e.event_type == "v1"));
+    assert!(flow.iter().any(|e| e.event_type == "v1"));
 
     // Reactor observability. Terminal status: a reactor that failed then
     // recovered must read as `completed` (not `failed`), with no terminal error.

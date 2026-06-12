@@ -26,7 +26,7 @@ use crate::event::Event;
 /// # Footgun — self-feedback loops
 ///
 /// A reactor whose output `Events` include a fact that matches its
-/// own `Trigger::type_prefix()` will react to its own output. The
+/// own `Trigger::NAME` will react to its own output. The
 /// runner appends the output to the log, picks it up as a new
 /// trigger, the reactor fires again, emits again — ad infinitum.
 /// The framework does NOT detect this; per-emit prefix-comparison
@@ -137,26 +137,21 @@ pub trait Reactor: Send + Sync {
 //
 // `Events` is the universal `Reactor::react` return type — a
 // type-erased collection of output facts that the runtime appends
-// directly to the log. `EventOutput::new<F: Event>` derives the
-// canonical `{CATEGORY}:{name}` event_type from the Event's trait
-// methods, matching what `Engine::emit` writes for caller-emitted
-// facts.
+// directly to the log. `EventOutput::new<F: Event>` carries the fact's
+// `NAME` as its event_type — verbatim, matching what `Engine::emit`
+// writes for caller-emitted facts.
 
 /// One unit of reactor output. Eagerly serialized so the runtime can
 /// journal it without re-walking the type.
 #[derive(Clone)]
 pub struct EventOutput {
     pub type_id: TypeId,
-    /// Canonical event_type: `format!("{CATEGORY}:{name}")` — same
-    /// shape `Engine::emit` writes on the producer side. Field name
-    /// kept as `durable_name` for backend-impl compatibility.
+    /// The event kind on the wire — `Event::NAME`, verbatim. Field
+    /// name kept as `durable_name` for backend-impl compatibility.
     pub durable_name: String,
-    /// `Event::CATEGORY` — the ROUTING category (consumer/aggregator
-    /// matching, via `durable_name`'s prefix).
-    pub event_prefix: String,
-    /// `Event::SUBJECT` — the physical stream this output is
-    /// stored in (`{subject}-{subject_id}`). Defaults to
-    /// `event_prefix`; differs only when the event overrides it.
+    /// `Event::SUBJECT` — the subject history this output joins
+    /// (`{subject}-{subject_id}`). Defaults to `NAME`; differs when
+    /// the event co-locates.
     pub subject: String,
     /// Stream id from `Event::subject_id()` — which stream within
     /// `subject` this output targets.
@@ -167,20 +162,17 @@ pub struct EventOutput {
 }
 
 impl EventOutput {
-    /// Create from a typed Event. The durable_name is composed as
-    /// `format!("{CATEGORY}:{name}")` to match the Kurrent-aligned
-    /// event_type shape.
+    /// Create from a typed Event. `durable_name` is `Event::NAME`,
+    /// verbatim — the same string `Engine::emit` writes.
     pub fn new<F: crate::event::Event>(fact: F) -> Self {
-        let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
         let subject = <F as crate::event::Event>::SUBJECT.to_string();
-        let durable_name = crate::event_type::compose(&event_prefix, fact.event_type());
+        let durable_name = <F as crate::event::Event>::NAME.to_string();
         let subject_id = fact.subject_id();
         let payload = serde_json::to_value(&fact).expect("Event must be serializable");
         let ephemeral: Arc<dyn std::any::Any + Send + Sync> = Arc::new(fact);
         Self {
             type_id: TypeId::of::<F>(),
             durable_name,
-            event_prefix,
             subject,
             subject_id,
             payload,
@@ -195,30 +187,17 @@ impl EventOutput {
         subject_id: Uuid,
         payload: serde_json::Value,
     ) -> Self {
-        let event_prefix = extract_prefix(&event_type).to_string();
         Self {
             type_id: TypeId::of::<()>(),
-            // Replay/serialized path has no separate stream-category info;
-            // default it to the routing prefix (the backward-compat default).
-            subject: event_prefix.clone(),
-            event_prefix,
+            // Replay/serialized path has no separate subject info;
+            // default to the kind (SUBJECT's own default).
+            subject: event_type.clone(),
             durable_name: event_type,
             subject_id,
             payload,
             ephemeral: None,
         }
     }
-}
-
-/// Extract the category prefix from an event_type.
-///
-/// `"scrape:web_scrape_completed"` → `"scrape"`
-/// `"order_placed"` → `"order_placed"` (no colon = whole string)
-///
-/// For the common consumer-side case, prefer
-/// [`RecordedEvent::category`](crate::RecordedEvent::category).
-pub fn extract_prefix(event_type: &str) -> &str {
-    crate::event_type::category_of(event_type)
 }
 
 /// Universal return type for [`Reactor::react`]. Builder-style; use
@@ -277,8 +256,7 @@ mod tests {
     }
 
     impl Event for OrderPlaced {
-        const CATEGORY: &'static str = "order";
-        fn event_type(&self) -> &str { "order_placed" }
+        const NAME: &'static str = "order_placed";
         fn subject_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }

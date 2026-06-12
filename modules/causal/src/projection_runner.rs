@@ -125,7 +125,7 @@ where
             return Ok(StepOutcome::Idle);
         }
 
-        let prefix = <M::Event as Event>::CATEGORY;
+        let prefix = <M::Event as Event>::NAME;
         let mut applied = 0usize;
         for event in events {
             // Fold into the per-runner aggregator registry BEFORE
@@ -164,7 +164,7 @@ where
             // Filter by Event prefix. Non-matching events advance the
             // cursor but don't trigger project — the consumer
             // legitimately doesn't handle them.
-            if !crate::event_type::matches_category(&event.event_type, prefix) {
+            if !crate::event_type::matches_kind(&event.event_type, prefix) {
                 self.checkpoint.set(&self.consumer_id, event.position).await?;
                 continue;
             }
@@ -278,8 +278,7 @@ mod tests {
     }
 
     impl Event for Recorded {
-        const CATEGORY: &'static str = "test";
-        fn event_type(&self) -> &str { "recorded" }
+        const NAME: &'static str = "recorded";
         fn subject_id(&self) -> Uuid { self.id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -334,7 +333,7 @@ mod tests {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
             workflow_id:  Uuid::new_v4(),
-            event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
+            event_type:      <Recorded as Event>::NAME.to_string(),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             category:  None,
@@ -394,7 +393,7 @@ mod tests {
             event_id,
             causation_id:       None,
             workflow_id:  cmd_correlation,
-            event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
+            event_type:      <Recorded as Event>::NAME.to_string(),
             payload:         serde_json::to_value(&payload).unwrap(),
             created_at:      Utc::now(),
             category:  None,
@@ -620,8 +619,7 @@ mod tests {
         struct NoTimeFact { id: Uuid }
 
         impl Event for NoTimeFact {
-            const CATEGORY: &'static str = "test";
-            fn event_type(&self) -> &str { "notime" }
+            const NAME: &'static str = "notime";
             fn subject_id(&self) -> Uuid { self.id }
             // occurred_at — uses trait default returning None
         }
@@ -651,7 +649,7 @@ mod tests {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
             workflow_id:  Uuid::new_v4(),
-            event_type:      format!("{}:{}", <NoTimeFact as Event>::CATEGORY, fact.event_type()),
+            event_type:      <NoTimeFact as Event>::NAME.to_string(),
             payload:         serde_json::to_value(&fact).unwrap(),
             created_at:      pinned,
             category:  None,

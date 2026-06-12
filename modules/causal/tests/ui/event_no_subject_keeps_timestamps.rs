@@ -5,7 +5,7 @@ use causal::Event;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-#[causal::event(prefix = "sweep", no_subject)]
+#[causal::event(name = "sweep_completed", no_subject)]
 #[derive(Clone, Serialize, Deserialize)]
 struct SweepCompleted {
     occurred_at: DateTime<Utc>,

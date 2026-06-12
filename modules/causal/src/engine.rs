@@ -247,20 +247,19 @@ pub struct TerminalFailure {
 /// batched. The blanket impl below covers every `Event` automatically;
 /// downstream code never names this trait.
 pub(crate) trait ErasedFact: Send + Sync {
-    fn category(&self) -> &'static str;
-    /// Physical stream placement category (`Event::SUBJECT`);
-    /// defaults to `category()`. Routing still uses `category()`.
+    /// The fact's kind — `Event::NAME`, the exact wire `event_type`.
+    fn name(&self) -> &'static str;
+    /// Subject history this fact joins (`Event::SUBJECT`; defaults to
+    /// the kind).
     fn subject(&self) -> &'static str;
-    fn variant_name(&self) -> &str;
     fn subject_id(&self) -> Uuid;
     fn occurred_at(&self) -> Option<DateTime<Utc>>;
     fn to_value(&self) -> Result<serde_json::Value>;
 }
 
 impl<F: Event> ErasedFact for F {
-    fn category(&self) -> &'static str { <F as Event>::CATEGORY }
+    fn name(&self) -> &'static str { <F as Event>::NAME }
     fn subject(&self) -> &'static str { <F as Event>::SUBJECT }
-    fn variant_name(&self) -> &str { Event::event_type(self) }
     fn subject_id(&self) -> Uuid { Event::subject_id(self) }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Event::occurred_at(self) }
     fn to_value(&self) -> Result<serde_json::Value> {
@@ -745,7 +744,7 @@ impl EngineBuilder {
     /// Register a [`MultiProjector`] — cross-domain projection
     /// consumer with declared subscription. The runner filters events
     /// to those whose `event_type` matches any category in
-    /// `P::CATEGORIES` (matching `{CATEGORY}:*`) before invoking the
+    /// `P::KINDS` (exact event-kind equality) before invoking the
     /// body. Body receives raw `&RecordedEvent` for cross-domain
     /// payload routing.
     ///
@@ -839,9 +838,9 @@ impl EngineBuilder {
         // category silently desyncs reactor matching from aggregate
         // folding (the aggregate never folds, with no runtime error).
         for agg in &self.aggregators {
-            crate::event_type::validate_category("aggregator event", &agg.event_prefix)?;
+            crate::event_type::validate_name("aggregator event", &agg.event_prefix)?;
             if !agg.subject.is_empty() {
-                crate::event_type::validate_category("aggregate stream", &agg.subject)?;
+                crate::event_type::validate_name("aggregate stream", &agg.subject)?;
             }
         }
 
@@ -1025,7 +1024,7 @@ impl Engine {
     /// (informational — backend-internal cursor, not used for user-
     /// facing CAS).
     ///
-    /// Stream identity comes from `F::CATEGORY` + `id`; the same
+    /// Stream identity comes from `F::NAME` + `id`; the same
     /// convention `Engine::emit` uses on write. Caller picks both
     /// type params so the same `Aggregate` impl can fold different
     /// Event streams (e.g. `load::<PipelineState, ScrapeEvent>`).
@@ -1046,7 +1045,7 @@ impl Engine {
         let mut revision = StreamRevision::ZERO;
         for event in events {
             revision = event.revision;
-            if crate::event_type::category_of(&event.event_type) != F::CATEGORY {
+            if event.event_type.as_str() != F::NAME {
                 continue; // foreign co-located type — not ours to fold
             }
             let fact: F = serde_json::from_value(event.payload)?;
@@ -1058,7 +1057,7 @@ impl Engine {
     /// OCC-protected command path — the decider pattern, and the
     /// counterpart to [`with_aggregate`](EngineBuilder::with_aggregate).
     ///
-    /// Folds aggregate `A` from stream `{F::CATEGORY}-{id}`, hands the
+    /// Folds aggregate `A` from stream `{F::NAME}-{id}`, hands the
     /// state to `decide`, then appends the resulting facts with an
     /// expected-revision check. On a concurrent write the backend
     /// returns a [`ConflictError`](crate::event_log::ConflictError);
@@ -1073,7 +1072,7 @@ impl Engine {
     /// whole decision lands or none of it does, so a crash can't tear it.
     ///
     /// The whole decision is written to the single aggregate stream
-    /// `{F::CATEGORY}-{id}` — this is the OCC consistency boundary, so every
+    /// `{F::NAME}-{id}` — this is the OCC consistency boundary, so every
     /// emitted fact must belong to aggregate `id`. Each fact's own
     /// [`Event::subject_id`] is therefore expected to equal `id` (debug-asserted)
     /// and is not used for routing here; to affect a *different* aggregate, run
@@ -1105,7 +1104,7 @@ impl Engine {
             };
             let mut agg = A::default();
             for e in &events {
-                if crate::event_type::category_of(&e.event_type) != F::CATEGORY {
+                if e.event_type != F::NAME {
                     continue; // foreign co-located type
                 }
                 let fact: F = serde_json::from_value(e.payload.clone())?;
@@ -1126,7 +1125,7 @@ impl Engine {
             // (event_type, payload, event_id) for the post-append fold.
             let mut folds = Vec::with_capacity(facts.len());
             for fact in &facts {
-                // The whole decision is written to the (F::CATEGORY, id)
+                // The whole decision is written to the (F::NAME, id)
                 // aggregate stream — every fact must belong to aggregate `id`.
                 debug_assert_eq!(
                     fact.subject_id(), id,
@@ -1222,7 +1221,7 @@ impl Engine {
             anyhow::anyhow!(
                 "Engine::append exhausted {MAX_OCC_RETRIES} OCC retries for \
                  '{}-{}'",
-                F::CATEGORY, id,
+                F::NAME, id,
             )
         }))
     }
@@ -1267,18 +1266,18 @@ impl Engine {
             // registered via `with_aggregate` carry invariants and must
             // go through the optimistic-concurrency command path
             // `Engine::append`, not the no-check `emit` path.
-            if self.occ_categories.contains(fact.category()) {
+            if self.occ_categories.contains(fact.name()) {
                 return Err(anyhow::anyhow!(
                     "category '{}' is OCC-required (registered via \
                      with_aggregate); use Engine::append::<A, F>(id, decide) \
                      instead of emit()",
-                    fact.category(),
+                    fact.name(),
                 ));
             }
             // event_type carries the ROUTING category (consumer/aggregator
             // matching); `category`/placement uses the STREAM category. They
             // differ only when the event overrides `SUBJECT`.
-            let event_type = crate::event_type::compose(fact.category(), fact.variant_name());
+            let event_type = fact.name().to_string();
             let subject = fact.subject().to_string();
             let occurred_at = fact.occurred_at().unwrap_or_else(Utc::now);
             let subject_id = fact.subject_id();
@@ -1648,8 +1647,7 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
     impl Event for UserCreated {
-        const CATEGORY: &'static str = "user";
-        fn event_type(&self) -> &str { "user_created" }
+        const NAME: &'static str = "user_created";
         fn subject_id(&self) -> Uuid { self.user_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -1659,8 +1657,7 @@ mod tests {
         user_id: Uuid,
     }
     impl Event for WelcomeQueued {
-        const CATEGORY: &'static str = "welcome";
-        fn event_type(&self) -> &str { "welcome_queued" }
+        const NAME: &'static str = "welcome_queued";
         fn subject_id(&self) -> Uuid { self.user_id }
     }
 
@@ -1750,18 +1747,15 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    /// Anti-fragility regression: a colon in `Event::CATEGORY` is the
-    /// reserved format separator and silently desyncs reactor matching
-    /// (length-based) from aggregate folding (first-colon split) — the
-    /// aggregate would never fold, with no runtime error. `build()`
-    /// rejects it loudly.
+    /// Flat routing made colons legal (no separator to protect), but
+    /// an EMPTY kind is still a broken wire identity — `build()`
+    /// rejects it loudly rather than registering an unmatchable fold.
     #[tokio::test]
-    async fn build_rejects_colon_in_aggregate_category() {
+    async fn build_rejects_empty_event_kind() {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Weird { id: Uuid }
         impl Event for Weird {
-            const CATEGORY: &'static str = "order:sub"; // colon = reserved
-            fn event_type(&self) -> &str { "weird" }
+            const NAME: &'static str = ""; // empty = invalid wire identity
             fn subject_id(&self) -> Uuid { self.id }
         }
         #[derive(Default, Clone, Debug, Serialize, Deserialize)]
@@ -1783,10 +1777,10 @@ mod tests {
         .build()
         .await;
         let err = match result {
-            Ok(_) => panic!("build must reject a colon-bearing category"),
+            Ok(_) => panic!("build must reject an empty event kind"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("reserved separator"), "got: {err}");
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     /// B2: `StartPosition::Zero` forces the reactor through history —
@@ -1883,8 +1877,7 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct WelcomeQueuedFact { user_id: Uuid }
         impl Event for WelcomeQueuedFact {
-            const CATEGORY: &'static str = "welcome";
-            fn event_type(&self) -> &str { "welcome_queued" }
+            const NAME: &'static str = "welcome_queued";
             fn subject_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
@@ -2014,10 +2007,7 @@ mod tests {
             subject_id: Uuid,
         }
         impl Event for Inc {
-            const CATEGORY: &'static str = "race";
-            fn event_type(&self) -> &str {
-                "inc"
-            }
+            const NAME: &'static str = "inc";
             fn subject_id(&self) -> Uuid {
                 self.subject_id
             }
@@ -2033,7 +2023,7 @@ mod tests {
         let reg = Arc::new(reg);
 
         let subject_id = Uuid::new_v4();
-        let event_type = "race:inc";
+        let event_type = "inc";
         let payload = serde_json::to_value(&Inc { subject_id }).unwrap();
 
         const TASKS: usize = 8;
@@ -2114,8 +2104,7 @@ mod tests {
             occurred_at: DateTime<Utc>,
         }
         impl Event for OrgUserCreated {
-            const CATEGORY: &'static str = "org_user";
-            fn event_type(&self) -> &str { "org_user_created" }
+            const NAME: &'static str = "org_user_created";
             fn subject_id(&self) -> Uuid { self.user_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -2199,8 +2188,7 @@ mod tests {
             occurred_at: DateTime<Utc>,
         }
         impl Event for MaybeRunEvent {
-            const CATEGORY: &'static str = "maybe_run";
-            fn event_type(&self) -> &str { "maybe_run_event" }
+            const NAME: &'static str = "maybe_run_event";
             fn subject_id(&self) -> Uuid { self.subject_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -2255,8 +2243,7 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
     impl Event for TaggedEvent {
-        const CATEGORY: &'static str = "tagged";
-        fn event_type(&self) -> &str { "tagged" }
+        const NAME: &'static str = "tagged";
         // subject_id intentionally NOT tag_id — proves the macro
         // uses id_fn over subject_id.
         fn subject_id(&self) -> Uuid { self.event_id }
@@ -2396,8 +2383,7 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct OrderPlaced { order_id: Uuid, occurred_at: DateTime<Utc> }
         impl Event for OrderPlaced {
-            const CATEGORY: &'static str = "order";
-            fn event_type(&self) -> &str { "order_placed" }
+            const NAME: &'static str = "order_placed";
             fn subject_id(&self) -> Uuid { self.order_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -2425,13 +2411,7 @@ mod tests {
         Reset { occurred_at: DateTime<Utc>, counter_id: Uuid },
     }
     impl Event for CounterFact {
-        const CATEGORY: &'static str = "counter";
-        fn event_type(&self) -> &str {
-            match self {
-                CounterFact::Inc { .. }   => "inc",
-                CounterFact::Reset { .. } => "reset",
-            }
-        }
+        const NAME: &'static str = "counter";
         fn subject_id(&self) -> Uuid {
             match self {
                 CounterFact::Inc { counter_id, .. }
@@ -2501,17 +2481,15 @@ mod tests {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Deposited { account: Uuid, amount: i64 }
     impl Event for Deposited {
-        const CATEGORY: &'static str = "deposit";
+        const NAME: &'static str = "deposited";
         const SUBJECT: &'static str = "account"; // co-located
-        fn event_type(&self) -> &str { "deposited" }
         fn subject_id(&self) -> Uuid { self.account }
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Withdrawn { account: Uuid, amount: i64 }
     impl Event for Withdrawn {
-        const CATEGORY: &'static str = "withdraw";
+        const NAME: &'static str = "withdrawn";
         const SUBJECT: &'static str = "account"; // co-located
-        fn event_type(&self) -> &str { "withdrawn" }
         fn subject_id(&self) -> Uuid { self.account }
     }
     #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2827,16 +2805,14 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Ping { id: Uuid, occurred_at: DateTime<Utc> }
         impl Event for Ping {
-            const CATEGORY: &'static str = "ping";
-            fn event_type(&self) -> &str { "ping" }
+            const NAME: &'static str = "ping";
             fn subject_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Pong { id: Uuid, value: i64, occurred_at: DateTime<Utc> }
         impl Event for Pong {
-            const CATEGORY: &'static str = "pong";
-            fn event_type(&self) -> &str { "pong" }
+            const NAME: &'static str = "pong";
             fn subject_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -3068,7 +3044,7 @@ mod tests {
         ]).await.unwrap();
 
         let events = EventLogBackend::read_stream(
-            store.as_ref(), <CounterFact as Event>::CATEGORY, id, None,
+            store.as_ref(), <CounterFact as Event>::NAME, id, None,
         ).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].created_at, pinned,
@@ -3090,7 +3066,7 @@ mod tests {
         #[async_trait]
         impl MultiProjector for AuditAll {
             const NAME: &'static str = "audit";
-            const CATEGORIES: &'static [&'static str] = &["alpha", "beta"];
+            const KINDS: &'static [&'static str] = &["a", "b"];
 
             async fn project(
                 &self,
@@ -3105,16 +3081,14 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct A { a_id: Uuid, occurred_at: DateTime<Utc> }
         impl Event for A {
-            const CATEGORY: &'static str = "alpha";
-            fn event_type(&self) -> &str { "a" }
+            const NAME: &'static str = "a";
             fn subject_id(&self) -> Uuid { self.a_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct B { b_id: Uuid, occurred_at: DateTime<Utc> }
         impl Event for B {
-            const CATEGORY: &'static str = "beta";
-            fn event_type(&self) -> &str { "b" }
+            const NAME: &'static str = "b";
             fn subject_id(&self) -> Uuid { self.b_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -3143,7 +3117,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let names = seen.lock().clone();
-        assert_eq!(names, vec!["alpha:a", "beta:b", "alpha:a"]);
+        assert_eq!(names, vec!["a", "b", "a"]);
 
         engine.shutdown().await.unwrap();
     }
@@ -3236,7 +3210,7 @@ mod tests {
         .await.unwrap();
 
         let events = EventLogBackend::read_stream(
-            store.as_ref(), <CounterFact as Event>::CATEGORY, id, None,
+            store.as_ref(), <CounterFact as Event>::NAME, id, None,
         ).await.unwrap();
         assert_eq!(events.len(), 2);
         for ev in &events {
@@ -3291,8 +3265,7 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Pong { pong_id: Uuid, occurred_at: DateTime<Utc> }
         impl Event for Pong {
-            const CATEGORY: &'static str = "pong";
-            fn event_type(&self) -> &str { "pong" }
+            const NAME: &'static str = "pong";
             fn subject_id(&self) -> Uuid { self.pong_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -3469,8 +3442,7 @@ mod tests {
             attempts: u32,
         }
         impl Event for HandlerFailed {
-            const CATEGORY: &'static str = "ops";
-            fn event_type(&self) -> &str { "handler_failed" }
+            const NAME: &'static str = "handler_failed";
             fn subject_id(&self) -> Uuid { Uuid::nil() }
         }
 
@@ -3511,7 +3483,7 @@ mod tests {
                 store.as_ref(), LogCursor::ZERO, 10,
             ).await.unwrap();
             let terminal_failure_emitted = events.iter()
-                .any(|e| e.event_type == "ops:handler_failed");
+                .any(|e| e.event_type == "handler_failed");
             if terminal_failure_emitted { break; }
             assert!(std::time::Instant::now() < deadline,
                     "terminal-failure-mapped fact never made it to the log");
@@ -3522,8 +3494,8 @@ mod tests {
         let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
-        assert!(events.iter().any(|e| e.event_type == "user:user_created"));
-        assert!(events.iter().any(|e| e.event_type == "ops:handler_failed"));
+        assert!(events.iter().any(|e| e.event_type == "user_created"));
+        assert!(events.iter().any(|e| e.event_type == "handler_failed"));
 
         let _ = result;
         engine.shutdown().await.unwrap();
@@ -3550,8 +3522,7 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct WelcomeQueuedFact { user_id: Uuid }
         impl Event for WelcomeQueuedFact {
-            const CATEGORY: &'static str = "welcome";
-            fn event_type(&self) -> &str { "welcome_queued" }
+            const NAME: &'static str = "welcome_queued";
             fn subject_id(&self) -> Uuid { self.user_id }
         }
         #[async_trait]
@@ -4043,8 +4014,7 @@ mod tests {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Tick { seq: u32, occurred_at: DateTime<Utc> }
     impl Event for Tick {
-        const CATEGORY: &'static str = "ticker";
-        fn event_type(&self) -> &str { "tick" }
+        const NAME: &'static str = "tick";
         fn subject_id(&self) -> Uuid { Uuid::nil() }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -4173,7 +4143,7 @@ mod tests {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
             workflow_id:  Uuid::new_v4(),
-            event_type:      "ticker:tick".into(),
+            event_type:      "tick".into(),
             payload:         serde_json::to_value(&tick).unwrap(),
             created_at:      tick.occurred_at,
             category:  None,
@@ -4503,7 +4473,7 @@ mod tests {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
             workflow_id:  Uuid::new_v4(),
-            event_type:      "ticker:tick".into(),
+            event_type:      "tick".into(),
             payload,
             created_at:      tick.occurred_at,
             category:  None,
@@ -4678,8 +4648,7 @@ mod tests {
             occurred_at: DateTime<Utc>,
         }
         impl Event for OtherFact {
-            const CATEGORY: &'static str = "other";
-            fn event_type(&self) -> &str { "happening" }
+            const NAME: &'static str = "happening";
             fn subject_id(&self) -> Uuid { self.id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }
@@ -4691,7 +4660,7 @@ mod tests {
         #[async_trait]
         impl MultiProjector for OnlyTickRouter {
             const NAME: &'static str = "tick.only";
-            const CATEGORIES: &'static [&'static str] = &["ticker"];
+            const KINDS: &'static [&'static str] = &["tick"];
             async fn project(
                 &self,
                 event: &crate::types::RecordedEvent,
@@ -4733,7 +4702,7 @@ mod tests {
 
         let s = seen.lock();
         assert_eq!(s.len(), 2, "exactly 2 events delivered (the OtherFact filtered)");
-        assert!(s.iter().all(|t| t.starts_with("ticker:")),
+        assert!(s.iter().all(|t| t == "tick"),
                 "every delivered event matches the declared subscription");
 
         engine.shutdown().await.unwrap();

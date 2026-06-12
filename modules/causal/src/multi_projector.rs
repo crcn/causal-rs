@@ -8,7 +8,7 @@
 //!
 //! Body shape: `&RecordedEvent` plus `Ctx`. The runner filters to
 //! events whose `event_type` matches `format!("{CATEGORY}:*")` for any
-//! `CATEGORY` in `CATEGORIES` before invoking the body, so the
+//! `CATEGORY` in `KINDS` before invoking the body, so the
 //! consumer never sees events outside its declared subscription.
 //!
 //! Backend mapping:
@@ -60,7 +60,7 @@ pub trait MultiProjector: Send + Sync {
     const NAME: &'static str;
 
     /// Declared subscription. Non-empty. Each entry is a bare
-    /// `Event::CATEGORY` value (e.g. `"world"`, `"discovery"`). The
+    /// `Event::NAME` value (e.g. `"thing_happened"`). The
     /// runner matches events whose `event_type` starts with
     /// `format!("{CATEGORY}:")`. Compile-time const so the runner can
     /// plan subscriptions at registration time without needing an
@@ -69,7 +69,7 @@ pub trait MultiProjector: Send + Sync {
     /// Runtime panic at runner construction if empty (Rust's stable
     /// const generics can't yet express `where N >= 1`; this is the
     /// strongest enforcement available).
-    const CATEGORIES: &'static [&'static str];
+    const KINDS: &'static [&'static str];
 
     /// Cross-consumer dependency declaration (per C2b). Default empty.
     const DEPENDS_ON: &'static [&'static str] = &[];
@@ -96,7 +96,7 @@ pub struct MultiProjectorRunner<P: MultiProjector> {
 
 impl<P: MultiProjector> MultiProjectorRunner<P> {
     /// # Panics
-    /// Panics if `P::CATEGORIES` is empty. An empty subscription
+    /// Panics if `P::KINDS` is empty. An empty subscription
     /// declaration is a programmer error — use [`crate::Projector`]
     /// for single-Event consumers, or reconsider whether you need a
     /// consumer at all.
@@ -107,8 +107,8 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
         checkpoint: Arc<dyn CheckpointStore>,
     ) -> Self {
         assert!(
-            !P::CATEGORIES.is_empty(),
-            "MultiProjector::CATEGORIES must be non-empty. \
+            !P::KINDS.is_empty(),
+            "MultiProjector::KINDS must be non-empty. \
              For single-Event consumers, use the typed `Projector` \
              trait instead."
         );
@@ -203,9 +203,9 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             // Subscription filter: skip + advance for events whose
             // category doesn't match any declared CATEGORY. Body never
             // sees them.
-            let matches_subscription = P::CATEGORIES
+            let matches_subscription = P::KINDS
                 .iter()
-                .any(|c| starts_with_category(&event.event_type, c));
+                .any(|k| is_subscribed_kind(&event.event_type, k));
             if !matches_subscription {
                 self.checkpoint.set(&self.consumer_id, event.position).await?;
                 continue;
@@ -278,11 +278,11 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
     }
 }
 
-/// True iff `event_type` matches `format!("{category}:*")`. Avoids
-/// the false-positive that plain `starts_with` has when one category
-/// is a prefix of another (e.g. `"world"` matching `"worldwide:..."`).
-fn starts_with_category(event_type: &str, category: &str) -> bool {
-    crate::event_type::matches_category(event_type, category)
+/// True iff `event_type` IS one of the subscribed kinds — exact
+/// equality (flat routing, 0.10 chunk 7c). The kinds list is a
+/// settle-latency surface: subscribe to what you render, no more.
+fn is_subscribed_kind(event_type: &str, kind: &str) -> bool {
+    crate::event_type::matches_kind(event_type, kind)
 }
 
 #[cfg(test)]
@@ -309,7 +309,7 @@ mod tests {
     #[async_trait]
     impl MultiProjector for AuditTrail {
         const NAME: &'static str = "audit-trail";
-        const CATEGORIES: &'static [&'static str] = &["world", "system"];
+        const KINDS: &'static [&'static str] = &["thing_happened", "tag_assigned"];
 
         async fn project(
             &self,
@@ -343,10 +343,10 @@ mod tests {
     #[tokio::test]
     async fn delivers_only_events_matching_declared_categories() {
         let store = Arc::new(MemoryStore::new());
-        let id_world  = append_event(&store, "world:thing_happened").await;
-        let _ignored1 = append_event(&store, "discovery:source_seen").await;
-        let id_system = append_event(&store, "system:tag_assigned").await;
-        let _ignored2 = append_event(&store, "scheduling:schedule_created").await;
+        let id_world  = append_event(&store, "thing_happened").await;
+        let _ignored1 = append_event(&store, "source_seen").await;
+        let id_system = append_event(&store, "tag_assigned").await;
+        let _ignored2 = append_event(&store, "schedule_created").await;
 
         let trail = AuditTrail::new();
         let seen = trail.seen.clone();
@@ -364,17 +364,17 @@ mod tests {
         let s = seen.lock();
         assert_eq!(s.len(), 2, "body invoked exactly for matched events");
         assert_eq!(s[0].0, id_world);
-        assert_eq!(s[0].1, "world:thing_happened");
+        assert_eq!(s[0].1, "thing_happened");
         assert_eq!(s[1].0, id_system);
-        assert_eq!(s[1].1, "system:tag_assigned");
+        assert_eq!(s[1].1, "tag_assigned");
     }
 
     #[tokio::test]
     async fn cursor_advances_past_filtered_events() {
         let store = Arc::new(MemoryStore::new());
-        append_event(&store, "discovery:a").await;          // skip
-        append_event(&store, "world:b").await;              // deliver
-        append_event(&store, "scheduling:c").await;         // skip
+        append_event(&store, "source_seen").await;          // skip (not subscribed)
+        append_event(&store, "thing_happened").await;       // deliver
+        append_event(&store, "schedule_created").await;     // skip (not subscribed)
 
         let trail = AuditTrail::new();
         let seen = trail.seen.clone();
@@ -395,7 +395,7 @@ mod tests {
             .map(|e| e.position)
             .unwrap();
         assert_eq!(cursor, last_pos);
-        assert_eq!(seen.lock().len(), 1, "only the world: event delivered");
+        assert_eq!(seen.lock().len(), 1, "only the subscribed kind delivered");
     }
 
     #[tokio::test]
@@ -417,7 +417,7 @@ mod tests {
         #[async_trait]
         impl MultiProjector for DepM {
             const NAME: &'static str = "downstream";
-            const CATEGORIES: &'static [&'static str] = &["world"];
+            const KINDS: &'static [&'static str] = &["world_event"];
             const DEPENDS_ON: &'static [&'static str] = &["upstream"];
             async fn project(
                 &self,
@@ -431,7 +431,7 @@ mod tests {
 
         let store = Arc::new(MemoryStore::new());
         for _ in 0..2 {
-            append_event(&store, "world:event").await;
+            append_event(&store, "world_event").await;
         }
         let last_pos = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
@@ -450,13 +450,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "CATEGORIES must be non-empty")]
+    #[should_panic(expected = "KINDS must be non-empty")]
     async fn empty_categories_panics_at_construction() {
         struct BadlyDeclared;
         #[async_trait]
         impl MultiProjector for BadlyDeclared {
             const NAME: &'static str = "badly-declared";
-            const CATEGORIES: &'static [&'static str] = &[];
+            const KINDS: &'static [&'static str] = &[];
             async fn project(
                 &self,
                 _event: &RecordedEvent,

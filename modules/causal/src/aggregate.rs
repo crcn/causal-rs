@@ -10,7 +10,7 @@
 //! Per C11, Reactors cannot emit into Aggregate streams; saga-shaped
 //! "emit only if aggregate at version V" operations must be modeled
 //! as command handlers. `Aggregate::INVARIANT = true`
-//! registers `F::CATEGORY` as `StreamPolicy::OccRequired` so
+//! registers `F::NAME` as `StreamPolicy::OccRequired` so
 //! `Engine::emit` rejects writes to it; `load<A, F>` / `append<A, F>`
 //! do the OCC work.
 //!
@@ -115,13 +115,7 @@ mod tests {
     }
 
     impl Event for CounterFact {
-        const CATEGORY: &'static str = "counter";
-        fn event_type(&self) -> &str {
-            match self {
-                CounterFact::Incremented { .. } => "incremented",
-                CounterFact::Reset { .. }       => "reset",
-            }
-        }
+        const NAME: &'static str = "counter";
         fn subject_id(&self) -> Uuid {
             match self {
                 CounterFact::Incremented { counter_id, .. } => *counter_id,
@@ -174,8 +168,7 @@ mod tests {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct Tagged { tag_id: Uuid, occurred_at: DateTime<Utc> }
         impl Event for Tagged {
-            const CATEGORY: &'static str = "tag";
-            fn event_type(&self) -> &str { "tagged" }
+            const NAME: &'static str = "tagged";
             fn subject_id(&self) -> Uuid { self.tag_id }
             fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
         }

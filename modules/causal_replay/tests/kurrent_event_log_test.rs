@@ -327,8 +327,7 @@ async fn read_stream_returns_empty_for_missing_stream() -> Result<()> {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct FetchRequested { id: Uuid, occurred_at: chrono::DateTime<Utc> }
 impl causal::Event for FetchRequested {
-    const CATEGORY: &'static str = "fetch_req";
-    fn event_type(&self) -> &str { "requested" }
+    const NAME: &'static str = "requested";
     fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<chrono::DateTime<Utc>> { Some(self.occurred_at) }
 }
@@ -336,8 +335,7 @@ impl causal::Event for FetchRequested {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Fetched { id: Uuid, occurred_at: chrono::DateTime<Utc> }
 impl causal::Event for Fetched {
-    const CATEGORY: &'static str = "fetched";
-    fn event_type(&self) -> &str { "done" }
+    const NAME: &'static str = "done";
     fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<chrono::DateTime<Utc>> { Some(self.occurred_at) }
 }
@@ -381,7 +379,7 @@ async fn reactor_output_lands_in_its_own_stream_not_global() {
     // by the output Event's own (category, subject_id) — not `_global`.
     let out = kurrent.read_stream("fetched", id, None).await.unwrap();
     assert_eq!(out.len(), 1, "exactly one Fetched in fetched-{id}");
-    assert_eq!(out[0].event_type, "fetched:done");
+    assert_eq!(out[0].event_type, "done");
     assert_eq!(out[0].category, "fetched");
     assert_eq!(out[0].subject_id, id);
     assert!(out[0].causation_id.is_some(), "output carries the trigger as causation");

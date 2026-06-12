@@ -176,7 +176,7 @@ pub struct RecordedEvent {
     /// When the event was persisted (backend-authoritative —
     /// `EventData::created_at` is a hint that backends MAY override).
     pub created_at: DateTime<Utc>,
-    /// Stream category (`Event::CATEGORY`) — the prefix of the
+    /// Stream category (`Event::NAME`) — the prefix of the
     /// `{category}-{subject_id}` stream name. Every event belongs to a stream.
     pub category: String,
     /// Stream id (`Event::subject_id`).
@@ -197,7 +197,7 @@ pub struct RecordedEvent {
 }
 
 impl RecordedEvent {
-    /// The stream category (`Event::CATEGORY`) this event belongs to —
+    /// The stream category (`Event::NAME`) this event belongs to —
     /// a `&str` accessor over the `category` field. Useful in
     /// `MultiProjector::project` bodies routing across categories.
     pub fn category(&self) -> &str {
@@ -234,7 +234,7 @@ pub struct EventData {
     pub payload: serde_json::Value,
     /// Hint for `created_at` — backends MAY override server-side.
     pub created_at: DateTime<Utc>,
-    /// Stream category (`Event::CATEGORY`). Present for stream-scoped events.
+    /// Stream category (`Event::NAME`). Present for stream-scoped events.
     pub category: Option<String>,
     /// Stream id (`Event::subject_id`). Present for stream-scoped events.
     pub subject_id: Option<Uuid>,
@@ -278,7 +278,7 @@ mod persisted_event_tests {
     use super::*;
 
     fn mk(event_type: &str) -> RecordedEvent {
-        let category = crate::event_type::category_of(&event_type).to_string();
+        let category = event_type.to_string();
         RecordedEvent {
             position:        LogCursor::ZERO,
             event_id:        Uuid::nil(),
@@ -297,16 +297,11 @@ mod persisted_event_tests {
     }
 
     #[test]
-    fn category_returns_prefix_before_colon() {
-        assert_eq!(mk("scrape:web_scrape_completed").category(), "scrape");
-        assert_eq!(mk("world:tick").category(), "world");
-    }
-
-    #[test]
-    fn category_returns_full_string_when_no_colon() {
-        // Legacy events that pre-date the `{CATEGORY}:{name}` convention
-        // surface here too — bare `order_placed`-style strings have no
-        // separator, so `category()` returns the whole thing.
+    fn category_is_the_kind_verbatim_under_flat_routing() {
+        // Flat routing (0.10 chunk 7c): no composition, no prefixes.
+        // A derived category is the event kind itself; historical
+        // composed names are opaque strings.
         assert_eq!(mk("order_placed").category(), "order_placed");
+        assert_eq!(mk("scrape:web_scrape_completed").category(), "scrape:web_scrape_completed");
     }
 }

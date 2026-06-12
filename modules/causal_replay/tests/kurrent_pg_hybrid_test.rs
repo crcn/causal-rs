@@ -74,10 +74,7 @@ struct OrderPlaced {
 }
 
 impl Event for OrderPlaced {
-    const CATEGORY: &'static str = "order";
-    fn event_type(&self) -> &str {
-        "placed"
-    }
+    const NAME: &'static str = "placed";
     fn subject_id(&self) -> Uuid {
         self.order_id
     }
@@ -154,7 +151,7 @@ async fn engine_appends_to_kurrent_with_pg_checkpoint() -> Result<()> {
         .read_stream("order", order_id, None)
         .await?;
     assert_eq!(stream.len(), 1, "exactly the one fact we emitted");
-    assert_eq!(stream[0].event_type, "order:placed");
+    assert_eq!(stream[0].event_type, "order");
     assert_eq!(stream[0].category, "order");
     assert_eq!(stream[0].subject_id, order_id);
 

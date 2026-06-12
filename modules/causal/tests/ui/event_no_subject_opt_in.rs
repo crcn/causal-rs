@@ -4,7 +4,7 @@ use causal::Event;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[causal::event(prefix = "cache", no_subject)]
+#[causal::event(name = "cache_purged", no_subject)]
 #[derive(Clone, Serialize, Deserialize)]
 struct CachePurged {
     requested_by: Uuid,   // a reference — without no_subject this is a

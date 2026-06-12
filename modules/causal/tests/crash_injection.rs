@@ -153,8 +153,7 @@ impl ReactorCheckpoint for FaultInjector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Recorded { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Recorded {
-    const CATEGORY: &'static str = "test";
-    fn event_type(&self) -> &str { "recorded" }
+    const NAME: &'static str = "recorded";
     fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
@@ -166,11 +165,11 @@ async fn append_n(store: &MemoryStore, n: usize) {
             event_id: Uuid::new_v4(),
             causation_id: None,
             workflow_id: Uuid::new_v4(),
-            event_type: format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
+            event_type: <Recorded as Event>::NAME.to_string(),
             payload: serde_json::to_value(&payload).unwrap(),
             created_at: Utc::now(),
             // Honest stream coordinates — what Engine::emit writes.
-            category: Some(<Recorded as Event>::CATEGORY.to_string()),
+            category: Some(<Recorded as Event>::NAME.to_string()),
             subject_id: Some(payload.id),
             metadata: serde_json::Map::new(),
             ephemeral: None,
@@ -255,8 +254,7 @@ async fn cursor_set_failure_after_project_redelivers_idempotently() {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Trigger { id: Uuid, occurred_at: DateTime<Utc> }
 impl Event for Trigger {
-    const CATEGORY: &'static str = "test";
-    fn event_type(&self) -> &str { "trigger" }
+    const NAME: &'static str = "trigger";
     fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
@@ -268,8 +266,7 @@ impl Event for Echoed {
     // discipline: a reactor must not emit into its own trigger category,
     // else it would consume its own output. Now that outputs land in the
     // log immediately (no outbox), this is enforced in practice.
-    const CATEGORY: &'static str = "echo";
-    fn event_type(&self) -> &str { "echoed" }
+    const NAME: &'static str = "echoed";
     fn subject_id(&self) -> Uuid { Uuid::nil() }
 }
 
@@ -294,11 +291,11 @@ async fn append_trigger(store: &MemoryStore) -> Uuid {
         event_id,
         causation_id: None,
         workflow_id: Uuid::new_v4(),
-        event_type: format!("{}:{}", <Trigger as Event>::CATEGORY, payload.event_type()),
+        event_type: <Trigger as Event>::NAME.to_string(),
         payload: serde_json::to_value(&payload).unwrap(),
         created_at: Utc::now(),
         // Honest stream coordinates — what Engine::emit writes.
-        category: Some(<Trigger as Event>::CATEGORY.to_string()),
+        category: Some(<Trigger as Event>::NAME.to_string()),
         subject_id: Some(payload.id),
         metadata: serde_json::Map::new(),
         ephemeral: None,
@@ -336,7 +333,7 @@ async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
         EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
     let outs1 = after_crash
         .iter()
-        .filter(|e| e.event_type == "echo:echoed")
+        .filter(|e| e.event_type == "echoed")
         .count();
     assert_eq!(outs1, 1, "output appended before the crash");
     assert!(inner.get("r.crash").await.unwrap().is_none(), "cursor not advanced");
@@ -348,7 +345,7 @@ async fn reactor_append_then_checkpoint_crash_redelivers_idempotently() {
         EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 10).await.unwrap();
     let outs2 = after_recovery
         .iter()
-        .filter(|e| e.event_type == "echo:echoed")
+        .filter(|e| e.event_type == "echoed")
         .count();
     assert_eq!(outs2, 1, "re-append deduped on event_id — exactly one output");
     assert!(inner.get("r.crash").await.unwrap().is_some(), "cursor advanced on recovery");

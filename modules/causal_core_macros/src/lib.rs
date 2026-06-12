@@ -374,37 +374,33 @@ fn expand_aggregators_module(
 
 // ── #[event] proc macro ─────────────────────────────────────────────
 
-/// Marks a type as a causal Event, generating a `causal::Event` impl.
+/// Marks a struct as a causal fact, generating its `causal::Event` impl.
 ///
-/// # Usage
-///
-/// Every event names its stream identity: `subject_id = "<field>"` (the
-/// Uuid field its aggregates fold by — present on every variant), or the
-/// explicit `no_subject` opt-in for genuinely streamless facts
-/// (telemetry, ops counters), which routes every value into the single
-/// `{category}-nil` stream. Omitting both is a compile error — the old
-/// silent nil default produced fan-in aggregates no per-stream read
-/// could serve.
+/// Every fact declares its identities; machinery is derived:
 ///
 /// ```ignore
-/// // Enum with domain prefix (requires #[serde(tag = "...")])
-/// #[event(prefix = "scrape", subject_id = "source_id")]
+/// // what it's CALLED        about which THING     (workflow_id: which WORK — 0.10 §3)
+/// #[event(name = "job_opened", subject_id = "job_id")]
 /// #[derive(Clone, Serialize, Deserialize)]
-/// #[serde(tag = "type", rename_all = "snake_case")]
-/// pub enum ScrapeEvent {
-///     WebScrapeCompleted { source_id: Uuid, occurred_at: DateTime<Utc>, urls_scraped: usize },
-///     SourcesResolved { source_id: Uuid, occurred_at: DateTime<Utc> },
-/// }
+/// pub struct JobOpened { pub job_id: Uuid, pub occurred_at: DateTime<Utc> }
 ///
-/// // Streamless telemetry — explicit opt-in
-/// #[event(prefix = "synthesis", ephemeral, no_subject)]
-/// // ...
+/// // co-location: several fact families, one subject history
+/// #[event(name = "job_billed", subject_id = "job_id", subject = "job")]
+/// pub struct JobBilled { pub job_id: Uuid, pub cents: u64 }
 ///
-/// // Struct (no prefix needed — snake_case of struct name)
-/// #[event(subject_id = "order_id")]
-/// #[derive(Clone, Serialize, Deserialize)]
-/// pub struct OrderPlaced { pub order_id: Uuid, pub occurred_at: DateTime<Utc> }
+/// // provably subject-less (no Uuid fields): omission is legal
+/// #[event(name = "tick", ephemeral)]
+/// pub struct TickRecorded { pub n: u64 }
+///
+/// // reference-carrying subject-less: explicit opt-out
+/// #[event(name = "cache_purged", no_subject)]
+/// pub struct CachePurged { pub requested_by: Uuid }
 /// ```
+///
+/// `name` is REQUIRED and never derived from the type name: it is the
+/// wire `event_type`, matched by equality — a type rename must not
+/// silently re-vocabulary the log. Enums are retracted (one fact = one
+/// struct); see the error for the variant-poison argument.
 #[proc_macro_attribute]
 pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
@@ -418,12 +414,12 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Parsed arguments for #[event(...)].
 struct EventArgs {
-    prefix: Option<String>,
+    /// `name = "job_opened"` — the fact's kind, the exact `event_type`
+    /// on the wire, matched by consumers by equality. REQUIRED and
+    /// never derived from the type name: it is a wire format, and a
+    /// type rename must not silently re-vocabulary the log.
+    name: Option<String>,
     ephemeral: bool,
-    /// Routing-category override (rare; pre-0.10 surface — the `name`
-    /// rework in step-1 chunk 7 subsumes it). Sets `CATEGORY` for
-    /// structs independently of `prefix`.
-    routing_category: Option<String>,
     /// v0.3 Event: name of the field carrying the stream id. Must be
     /// present on every variant. Type must be `Uuid`.
     subject_id: Option<String>,
@@ -447,9 +443,8 @@ struct EventArgs {
 }
 
 fn parse_event_args(tokens: TokenStream2) -> EventArgs {
-    let mut prefix = None;
+    let mut name_arg = None;
     let mut ephemeral = false;
-    let mut routing_category = None;
     let mut subject_id = None;
     let mut occurred_at_field = None;
     let mut subject = None;
@@ -457,9 +452,8 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
 
     if tokens.is_empty() {
         return EventArgs {
-            prefix,
+            name: name_arg,
             ephemeral,
-            routing_category,
             subject_id,
             occurred_at_field,
             subject,
@@ -472,9 +466,8 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
         Ok(m) => m,
         Err(_) => {
             return EventArgs {
-                prefix,
+                name: name_arg,
                 ephemeral,
-                routing_category,
                 subject_id,
                 occurred_at_field,
                 subject,
@@ -485,10 +478,10 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
 
     for meta in &metas {
         match meta {
-            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("prefix") => {
+            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("name") => {
                 if let Expr::Lit(expr_lit) = value {
                     if let Lit::Str(lit) = &expr_lit.lit {
-                        prefix = Some(lit.value());
+                        name_arg = Some(lit.value());
                     }
                 }
             }
@@ -497,15 +490,6 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
             }
             Meta::Path(path) if path.is_ident("no_subject") => {
                 no_subject = true;
-            }
-            Meta::NameValue(MetaNameValue { path, value, .. })
-                if path.is_ident("stream_category") =>
-            {
-                if let Expr::Lit(expr_lit) = value {
-                    if let Lit::Str(lit) = &expr_lit.lit {
-                        routing_category = Some(lit.value());
-                    }
-                }
             }
             Meta::NameValue(MetaNameValue { path, value, .. })
                 if path.is_ident("subject_id") =>
@@ -537,9 +521,8 @@ fn parse_event_args(tokens: TokenStream2) -> EventArgs {
     }
 
     EventArgs {
-        prefix,
+        name: name_arg,
         ephemeral,
-        routing_category,
         subject_id,
         occurred_at_field,
         subject,
@@ -661,6 +644,17 @@ fn expand_event(args: EventArgs, input: DeriveInput) -> Result<TokenStream2, syn
     }
 }
 
+/// Non-empty check for the declared kind, at expansion time.
+fn crate_validate_kind(kind: &str, span: &Ident) -> Result<(), syn::Error> {
+    if kind.is_empty() {
+        return Err(syn::Error::new_spanned(
+            span,
+            "#[event]: `name` is empty — the kind is a wire identity",
+        ));
+    }
+    Ok(())
+}
+
 fn expand_event_struct(
     args: EventArgs,
     input: &DeriveInput,
@@ -669,23 +663,21 @@ fn expand_event_struct(
     require_subject_identity(&args, name, input)?;
     let ephemeral = args.ephemeral;
 
-    // For structs, the durable name is the snake_case of the struct name
-    // OR the prefix if provided
-    let durable = if let Some(ref prefix) = args.prefix {
-        prefix.clone()
-    } else {
-        to_snake_case(&name.to_string())
+    // `name` is REQUIRED: the wire event_type is a format you pick
+    // once. Deriving it from the type name would turn a rename
+    // refactor into a silent vocabulary change (new emits stop
+    // matching deployed consumers; old events stop matching new code).
+    let Some(kind) = args.name.clone() else {
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[event] needs a `name` — the fact's kind, written verbatim \
+             to the wire and matched by consumers by equality (e.g. \
+             `#[event(name = \"job_opened\", subject_id = \"job_id\")]`). \
+             It is never derived from the type name: renaming a type must \
+             not silently re-vocabulary the log.",
+        ));
     };
-
-    let prefix_str = durable.clone();
-
-    // v0.9 Event impl for structs. CATEGORY = `subject` if
-    // supplied, else `prefix` (or the snake-cased struct name).
-    // subject_id reads the field named by the (required) `subject_id`
-    // arg; `no_subject` is the explicit opt-in for the streamless
-    // shape. occurred_at() is generated when the `occurred_at` field
-    // (or the `occurred_at_field` override) is present.
-    let bare_name = prefix_str.clone();
+    crate_validate_kind(&kind, name)?;
     // Optional `subject = "..."` → `const SUBJECT` (subject-history
     // placement, distinct from the routing CATEGORY). Omitted = trait default.
     let stream_const = match &args.subject {
@@ -693,7 +685,6 @@ fn expand_event_struct(
         None => quote! {},
     };
     let fact_impl = if let Some(id_field) = args.subject_id.as_ref() {
-        let category = args.routing_category.as_ref().unwrap_or(&prefix_str);
         let id_field_ident = format_ident!("{}", id_field);
         let occurred_field = args
             .occurred_at_field
@@ -753,9 +744,8 @@ fn expand_event_struct(
         };
         quote! {
             impl ::causal::Event for #name {
-                const CATEGORY: &'static str = #category;
+                const NAME: &'static str = #kind;
                 #stream_const
-                fn event_type(&self) -> &str { #bare_name }
                 fn subject_id(&self) -> ::uuid::Uuid {
                     self.#id_field_ident
                 }
@@ -766,7 +756,6 @@ fn expand_event_struct(
         // `no_subject` opt-in. occurred_at() follows the same
         // presence-conditional rule as the subject_id shape — a
         // no_subject event with a timestamp must not silently lose it.
-        let category = args.routing_category.as_ref().unwrap_or(&prefix_str);
         let occurred_field = args
             .occurred_at_field
             .clone()
@@ -802,9 +791,8 @@ fn expand_event_struct(
         };
         quote! {
             impl ::causal::Event for #name {
-                const CATEGORY: &'static str = #category;
+                const NAME: &'static str = #kind;
                 #stream_const
-                fn event_type(&self) -> &str { #bare_name }
                 fn subject_id(&self) -> ::uuid::Uuid {
                     ::uuid::Uuid::nil()
                 }
@@ -813,51 +801,10 @@ fn expand_event_struct(
         }
     };
 
-    // Legacy `Event` impl emission removed in P11.d — see the enum
-    // path above for rationale.
-    let _ = (durable, prefix_str, ephemeral);
+    let _ = ephemeral;
     Ok(quote! {
         #input
 
         #fact_impl
     })
-}
-
-fn to_snake_case(s: &str) -> String {
-    let mut result = String::new();
-    let mut prev_was_upper = false;
-    let mut prev_was_underscore = true; // treat start as underscore
-
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() {
-            // Insert underscore before uppercase if:
-            // - not at start
-            // - previous char was NOT uppercase (camelCase boundary)
-            // - OR next char is lowercase (acronym end like "HTTPServer" → "http_server")
-            if i > 0 && !prev_was_underscore {
-                if !prev_was_upper {
-                    result.push('_');
-                } else {
-                    // Check if next char is lowercase (end of acronym)
-                    let next_is_lower = s.chars().nth(i + 1).map_or(false, |c| c.is_lowercase());
-                    if next_is_lower {
-                        result.push('_');
-                    }
-                }
-            }
-            result.push(ch.to_lowercase().next().unwrap());
-            prev_was_upper = true;
-            prev_was_underscore = false;
-        } else if ch == '_' {
-            result.push('_');
-            prev_was_upper = false;
-            prev_was_underscore = true;
-        } else {
-            result.push(ch);
-            prev_was_upper = false;
-            prev_was_underscore = false;
-        }
-    }
-
-    result
 }

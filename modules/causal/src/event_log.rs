@@ -149,7 +149,7 @@ pub async fn append_event<B: EventLogBackend + ?Sized>(
         .clone()
         .filter(|c| !c.is_empty())
         .unwrap_or_else(|| {
-            let derived = crate::event_type::category_of(&event.event_type);
+            let derived = event.event_type.as_str();
             if derived.is_empty() { "event" } else { derived }.to_string()
         });
     let subject_id = event.subject_id.unwrap_or(event.event_id);

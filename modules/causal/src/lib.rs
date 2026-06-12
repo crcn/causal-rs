@@ -36,8 +36,7 @@
 //! struct OrderPlaced { order_id: Uuid, total: f64 }
 //!
 //! impl Event for OrderPlaced {
-//!     const CATEGORY: &'static str = "order";
-//!     fn event_type(&self) -> &str { "placed" }
+//!     const NAME: &'static str = "order_placed";
 //!     fn subject_id(&self) -> Uuid { self.order_id }
 //! }
 //!
@@ -45,8 +44,7 @@
 //! struct ShipmentRequested { order_id: Uuid }
 //!
 //! impl Event for ShipmentRequested {
-//!     const CATEGORY: &'static str = "shipment";
-//!     fn event_type(&self) -> &str { "requested" }
+//!     const NAME: &'static str = "shipment_requested";
 //!     fn subject_id(&self) -> Uuid { self.order_id }
 //! }
 //!
@@ -85,8 +83,9 @@
 //! ```
 //!
 //! The `#[event]` macro (feature `macros`, on by default) generates the
-//! [`Event`] impl from an enum; the example hand-rolls it to show the
-//! full trait surface.
+//! [`Event`] impl from a struct declaration
+//! (`#[event(name = "order_placed", subject_id = "order_id")]`); the
+//! example hand-rolls it to show the full trait surface.
 
 extern crate self as causal;
 

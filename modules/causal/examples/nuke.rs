@@ -31,10 +31,7 @@ struct Ping {
     occurred_at: DateTime<Utc>,
 }
 impl Event for Ping {
-    const CATEGORY: &'static str = "nuke_ping";
-    fn event_type(&self) -> &str {
-        "ping"
-    }
+    const NAME: &'static str = "ping";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -48,10 +45,7 @@ struct Pong {
     id: Uuid,
 }
 impl Event for Pong {
-    const CATEGORY: &'static str = "nuke_pong";
-    fn event_type(&self) -> &str {
-        "pong"
-    }
+    const NAME: &'static str = "pong";
     fn subject_id(&self) -> Uuid {
         self.id
     }

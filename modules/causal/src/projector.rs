@@ -85,8 +85,7 @@ mod tests {
     }
 
     impl Event for Recorded {
-        const CATEGORY: &'static str = "records";
-        fn event_type(&self) -> &str { "recorded" }
+        const NAME: &'static str = "recorded";
         fn subject_id(&self) -> Uuid { self.id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }

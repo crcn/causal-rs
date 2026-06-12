@@ -3,7 +3,7 @@
 //! At-least-once + idempotent reactor execution (no outbox):
 //!
 //!   1. Read trigger fact from the log (`read_all` from the cursor).
-//!   2. Filter by `R::Trigger::CATEGORY`.
+//!   2. Filter by `R::Trigger::NAME`.
 //!   3. Call `reactor.react(trigger, ctx)` → `Result<Events>`.
 //!   4. Append each output **directly** to its own stream
 //!      (`append_to_stream(category, subject_id, Any, …)`) with a
@@ -284,7 +284,7 @@ where
             // the routing category.
             let cat = fact.subject().to_string();
             let sid = fact.subject_id();
-            let event_type = crate::event_type::compose(fact.category(), fact.variant_name());
+            let event_type = fact.name().to_string();
             let payload = fact.to_value()?;
             let out_event = EventData {
                 event_id: derive_output_event_id(&self.consumer_id, event.event_id, u32::MAX),
@@ -340,7 +340,7 @@ where
             return Ok(StepOutcome::Idle);
         }
 
-        let prefix = <R::Trigger as Event>::CATEGORY;
+        let prefix = <R::Trigger as Event>::NAME;
         let mut applied = 0usize;
         for event in events {
             // Fold every event into the per-consumer aggregator registry.
@@ -378,7 +378,7 @@ where
                 }
             }
 
-            if !crate::event_type::matches_category(&event.event_type, prefix) {
+            if !crate::event_type::matches_kind(&event.event_type, prefix) {
                 // Non-matching trigger: just advance the cursor.
                 self.checkpoint.set(&self.consumer_id, event.position).await?;
                 continue;
@@ -527,9 +527,9 @@ where
             if !self.occ_categories.is_empty() {
                 if let Some(bad) = emitted.iter().find(|out| {
                     self.occ_categories
-                        .contains(crate::event_type::category_of(&out.durable_name))
+                        .contains(out.durable_name.as_str())
                 }) {
-                    let cat = crate::event_type::category_of(&bad.durable_name).to_string();
+                    let cat = bad.durable_name.as_str().to_string();
                     let msg = format!(
                         "reactor '{}' emitted a fact in OCC-required category '{cat}' — \
                          reactor outputs append with StreamState::Any and cannot uphold \
@@ -689,8 +689,7 @@ mod tests {
         occurred_at: DateTime<Utc>,
     }
     impl Event for OrderPlaced {
-        const CATEGORY: &'static str = "order";
-        fn event_type(&self) -> &str { "order_placed" }
+        const NAME: &'static str = "order_placed";
         fn subject_id(&self) -> Uuid { self.order_id }
         fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
     }
@@ -701,8 +700,7 @@ mod tests {
         order_id: Uuid,
     }
     impl Event for ShippedNotification {
-        const CATEGORY: &'static str = "shipping";
-        fn event_type(&self) -> &str { "shipped_notification" }
+        const NAME: &'static str = "shipped_notification";
         fn subject_id(&self) -> Uuid { self.order_id }
     }
 
@@ -712,7 +710,7 @@ mod tests {
             event_id,
             causation_id:       None,
             workflow_id:  Uuid::new_v4(),
-            event_type:      format!("{}:{}", <OrderPlaced as Event>::CATEGORY, payload.event_type()),
+            event_type:      <OrderPlaced as Event>::NAME.to_string(),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
             category:  None,
@@ -825,9 +823,9 @@ mod tests {
             .unwrap();
         let out = all
             .iter()
-            .find(|e| e.event_type == "shipping:shipped_notification")
+            .find(|e| e.event_type == "shipped_notification")
             .expect("reactor output appended to the log");
-        assert_eq!(out.category, "shipping");
+        assert_eq!(out.category, "shipped_notification"); // SUBJECT defaults to NAME
         assert_eq!(out.causation_id, Some(trigger_event_id));
         // Deterministic id matches the helper's output (idempotent on redelivery).
         assert_eq!(
@@ -868,7 +866,7 @@ mod tests {
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         let output_event = all_events.iter()
-            .find(|e| e.event_type == "shipping:shipped_notification")
+            .find(|e| e.event_type == "shipped_notification")
             .expect("reactor output present in log");
         assert_eq!(output_event.workflow_id, trigger_correlation,
                    "output MUST carry trigger's workflow_id");
@@ -932,7 +930,7 @@ mod tests {
             .unwrap();
         let outs: Vec<_> = all
             .iter()
-            .filter(|e| e.event_type == "shipping:shipped_notification")
+            .filter(|e| e.event_type == "shipped_notification")
             .collect();
         assert_eq!(outs.len(), 5, "all 5 outputs appended to the log");
 
@@ -974,7 +972,7 @@ mod tests {
             .unwrap();
         let outs = appended
             .iter()
-            .filter(|e| e.event_type == "shipping:shipped_notification")
+            .filter(|e| e.event_type == "shipped_notification")
             .count();
         assert_eq!(outs, 1, "only the first trigger's output was appended");
 
@@ -1045,8 +1043,7 @@ mod tests {
         attempts:   u32,
     }
     impl Event for HandlerFailed {
-        const CATEGORY: &'static str = "ops";
-        fn event_type(&self) -> &str { "handler_failed" }
+        const NAME: &'static str = "handler_failed";
         fn subject_id(&self) -> Uuid { Uuid::nil() }
     }
 
@@ -1185,7 +1182,7 @@ mod tests {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
             workflow_id: Uuid::new_v4(),
-            event_type:     "order:placed".into(),
+            event_type:     "order_placed".into(),
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
             category:       Some("order".into()),
@@ -1243,7 +1240,7 @@ mod tests {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
             workflow_id: Uuid::new_v4(),
-            event_type:     "order:placed".into(),
+            event_type:     "order_placed".into(),
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
             category:       Some("order".into()),
@@ -1394,7 +1391,7 @@ mod tests {
             .unwrap();
         let terminal_failure = all
             .iter()
-            .find(|e| e.event_type == "ops:handler_failed")
+            .find(|e| e.event_type == "handler_failed")
             .expect("terminal-failure-synthesized fact in log");
         assert_eq!(terminal_failure.causation_id, Some(trigger_id));
         assert_eq!(

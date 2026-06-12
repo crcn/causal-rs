@@ -6,7 +6,7 @@ use causal::Event;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[causal::event(subject_id = "order_id")]
+#[causal::event(name = "order_tagged", subject_id = "order_id")]
 #[derive(Clone, Serialize, Deserialize)]
 struct OrderTagged {
     order_id: Uuid,

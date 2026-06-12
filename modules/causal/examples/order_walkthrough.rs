@@ -21,10 +21,7 @@ struct OrderPlaced {
     total: f64,
 }
 impl Event for OrderPlaced {
-    const CATEGORY: &'static str = "order";
-    fn event_type(&self) -> &str {
-        "placed"
-    }
+    const NAME: &'static str = "placed";
     fn subject_id(&self) -> Uuid {
         self.order_id
     }
@@ -35,10 +32,7 @@ struct ShipmentRequested {
     order_id: Uuid,
 }
 impl Event for ShipmentRequested {
-    const CATEGORY: &'static str = "shipment";
-    fn event_type(&self) -> &str {
-        "requested"
-    }
+    const NAME: &'static str = "requested";
     fn subject_id(&self) -> Uuid {
         self.order_id
     }

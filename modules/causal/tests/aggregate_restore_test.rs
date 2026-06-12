@@ -30,9 +30,8 @@ struct Deposited {
     amount: i64,
 }
 impl Event for Deposited {
-    const CATEGORY: &'static str = "deposit";
+    const NAME: &'static str = "deposit";
     const SUBJECT: &'static str = "account";
-    fn event_type(&self) -> &str { "v1" }
     fn subject_id(&self) -> Uuid { self.account }
 }
 
@@ -42,9 +41,8 @@ struct Withdrawn {
     amount: i64,
 }
 impl Event for Withdrawn {
-    const CATEGORY: &'static str = "withdraw";
+    const NAME: &'static str = "withdraw";
     const SUBJECT: &'static str = "account";
-    fn event_type(&self) -> &str { "v1" }
     fn subject_id(&self) -> Uuid { self.account }
 }
 
@@ -184,27 +182,27 @@ async fn corrupt_snapshot_self_heals() -> Result<()> {
 
 #[test]
 fn event_macro_subject_attribute_sets_subject() {
-    #[causal::event(prefix = "deposit", subject_id = "account", subject = "ledger")]
+    #[causal::event(name = "deposit", subject_id = "account", subject = "ledger")]
     #[derive(Clone, Serialize, Deserialize)]
     struct MacroDeposited {
         account: Uuid,
         occurred_at: chrono::DateTime<Utc>,
     }
 
-    #[causal::event(prefix = "withdraw", subject_id = "account")]
+    #[causal::event(name = "withdraw", subject_id = "account")]
     #[derive(Clone, Serialize, Deserialize)]
     struct MacroWithdrawn {
         account: Uuid,
         occurred_at: chrono::DateTime<Utc>,
     }
 
-    assert_eq!(<MacroDeposited as Event>::CATEGORY, "deposit", "routing category");
+    assert_eq!(<MacroDeposited as Event>::NAME, "deposit", "routing category");
     assert_eq!(
         <MacroDeposited as Event>::SUBJECT, "ledger",
         "stream = co-located placement category"
     );
     // No `stream` → SUBJECT defaults to CATEGORY.
-    assert_eq!(<MacroWithdrawn as Event>::CATEGORY, "withdraw");
+    assert_eq!(<MacroWithdrawn as Event>::NAME, "withdraw");
     assert_eq!(<MacroWithdrawn as Event>::SUBJECT, "withdraw");
 }
 

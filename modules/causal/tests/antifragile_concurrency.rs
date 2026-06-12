@@ -55,7 +55,7 @@ where
     let mut agg = A::default();
     let mut applied = 0usize;
     for e in &events {
-        if e.event_type.split(':').next() == Some(F::CATEGORY) {
+        if e.event_type == F::NAME {
             let fact: F = serde_json::from_value(e.payload.clone()).unwrap();
             agg.apply(&fact);
             applied += 1;
@@ -121,10 +121,7 @@ struct Hit {
     amount: i64,
 }
 impl Event for Hit {
-    const CATEGORY: &'static str = "af_hit";
-    fn event_type(&self) -> &str {
-        "hit"
-    }
+    const NAME: &'static str = "af_hit";
     fn subject_id(&self) -> Uuid {
         self.stream
     }
@@ -257,10 +254,7 @@ struct Job {
     id: Uuid,
 }
 impl Event for Job {
-    const CATEGORY: &'static str = "af_job";
-    fn event_type(&self) -> &str {
-        "queued"
-    }
+    const NAME: &'static str = "af_job";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -271,10 +265,7 @@ struct EchoA {
     id: Uuid,
 }
 impl Event for EchoA {
-    const CATEGORY: &'static str = "af_echo_a";
-    fn event_type(&self) -> &str {
-        "echoed"
-    }
+    const NAME: &'static str = "af_echo_a";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -285,10 +276,7 @@ struct EchoB {
     id: Uuid,
 }
 impl Event for EchoB {
-    const CATEGORY: &'static str = "af_echo_b";
-    fn event_type(&self) -> &str {
-        "echoed"
-    }
+    const NAME: &'static str = "af_echo_b";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -416,10 +404,7 @@ struct BgPing {
     id: Uuid,
 }
 impl Event for BgPing {
-    const CATEGORY: &'static str = "af_bgping";
-    fn event_type(&self) -> &str {
-        "ping"
-    }
+    const NAME: &'static str = "af_bgping";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -430,10 +415,7 @@ struct BgPong {
     id: Uuid,
 }
 impl Event for BgPong {
-    const CATEGORY: &'static str = "af_bgpong";
-    fn event_type(&self) -> &str {
-        "pong"
-    }
+    const NAME: &'static str = "af_bgpong";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -502,7 +484,7 @@ async fn blue_green_shared_cursor_outputs_exactly_once() {
             .unwrap();
         let triggers: Vec<_> = log
             .iter()
-            .filter(|e| e.event_type == "af_bgping:ping")
+            .filter(|e| e.event_type == "af_bgping")
             .cloned()
             .collect();
         let all_present = triggers.iter().all(|t| {
@@ -523,7 +505,7 @@ async fn blue_green_shared_cursor_outputs_exactly_once() {
     // with a non-deterministic id would show up as a surplus pong).
     let pongs: Vec<_> = triggers_and_outputs
         .iter()
-        .filter(|e| e.event_type == "af_bgpong:pong")
+        .filter(|e| e.event_type == "af_bgpong")
         .collect();
     assert_eq!(
         pongs.len(),
@@ -532,7 +514,7 @@ async fn blue_green_shared_cursor_outputs_exactly_once() {
     );
     for t in triggers_and_outputs
         .iter()
-        .filter(|e| e.event_type == "af_bgping:ping")
+        .filter(|e| e.event_type == "af_bgping")
     {
         let want = derive_output_event_id(BgEcho::NAME, t.event_id, 0);
         assert_eq!(
@@ -583,10 +565,7 @@ struct OccFact {
     by: i64,
 }
 impl Event for OccFact {
-    const CATEGORY: &'static str = "af_occ";
-    fn event_type(&self) -> &str {
-        "bumped"
-    }
+    const NAME: &'static str = "af_occ";
     fn subject_id(&self) -> Uuid {
         self.counter
     }
@@ -687,10 +666,7 @@ struct SeedPing {
     id: Uuid,
 }
 impl Event for SeedPing {
-    const CATEGORY: &'static str = "af_seed";
-    fn event_type(&self) -> &str {
-        "ping"
-    }
+    const NAME: &'static str = "af_seed";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -701,10 +677,7 @@ struct SeedPong {
     id: Uuid,
 }
 impl Event for SeedPong {
-    const CATEGORY: &'static str = "af_seedpong";
-    fn event_type(&self) -> &str {
-        "pong"
-    }
+    const NAME: &'static str = "af_seedpong";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -790,7 +763,7 @@ async fn seeding_race_reacted_set_is_clean_suffix() {
         .unwrap();
     let triggers: Vec<_> = log
         .iter()
-        .filter(|e| e.event_type == "af_seed:ping")
+        .filter(|e| e.event_type == "af_seed")
         .collect();
     let reacted: Vec<bool> = triggers
         .iter()
@@ -837,10 +810,7 @@ struct Work {
     id: Uuid,
 }
 impl Event for Work {
-    const CATEGORY: &'static str = "af_work";
-    fn event_type(&self) -> &str {
-        "queued"
-    }
+    const NAME: &'static str = "af_work";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -851,10 +821,7 @@ struct Done {
     id: Uuid,
 }
 impl Event for Done {
-    const CATEGORY: &'static str = "af_done";
-    fn event_type(&self) -> &str {
-        "done"
-    }
+    const NAME: &'static str = "af_done";
     fn subject_id(&self) -> Uuid {
         self.id
     }
@@ -929,11 +896,8 @@ struct Dep {
     amt: i64,
 }
 impl Event for Dep {
-    const CATEGORY: &'static str = "af_dep";
+    const NAME: &'static str = "af_dep";
     const SUBJECT: &'static str = "af_acct";
-    fn event_type(&self) -> &str {
-        "deposited"
-    }
     fn subject_id(&self) -> Uuid {
         self.acct
     }
@@ -945,11 +909,8 @@ struct ForeignNote {
     acct: Uuid,
 }
 impl Event for ForeignNote {
-    const CATEGORY: &'static str = "af_noise";
+    const NAME: &'static str = "af_noise";
     const SUBJECT: &'static str = "af_acct";
-    fn event_type(&self) -> &str {
-        "noted"
-    }
     fn subject_id(&self) -> Uuid {
         self.acct
     }

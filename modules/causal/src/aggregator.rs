@@ -12,7 +12,6 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::event_log::EventLogBackend;
-use crate::reactor::extract_prefix;
 use crate::snapshot_store::SnapshotStore;
 use crate::types::{LogCursor, Snapshot, StreamRevision};
 
@@ -179,7 +178,7 @@ impl Aggregator {
         F: crate::event::Event,
         IdFn: Fn(&F) -> Option<Uuid> + Send + Sync + 'static,
     {
-        let event_prefix = <F as crate::event::Event>::CATEGORY.to_string();
+        let event_prefix = <F as crate::event::Event>::NAME.to_string();
         let event_type_id = TypeId::of::<F>();
         let aggregate_type = <A as crate::aggregate::Aggregate>::NAME.to_string();
         let subject = <A as crate::aggregate::Aggregate>::SUBJECT.to_string();
@@ -351,10 +350,9 @@ impl AggregatorRegistry {
     /// Extracts the prefix from the durable name and matches against
     /// registered aggregator prefixes.
     pub fn find_by_durable_name(&self, durable_name: &str) -> Vec<&Aggregator> {
-        let prefix = extract_prefix(durable_name);
         self.aggregators
             .iter()
-            .filter(|a| a.event_prefix == prefix)
+            .filter(|a| a.event_prefix == durable_name)
             .collect()
     }
 
@@ -414,11 +412,10 @@ impl AggregatorRegistry {
         position: LogCursor,
     ) -> Result<FoldOutcome> {
         let mut outcome = FoldOutcome::default();
-        let prefix = extract_prefix(event_type);
         let matching: Vec<&Aggregator> = self
             .aggregators
             .iter()
-            .filter(|a| a.event_prefix == prefix)
+            .filter(|a| a.event_prefix == event_type)
             .collect();
 
         for agg in matching {
@@ -799,10 +796,9 @@ impl AggregatorRegistry {
         event_type: &str,
         payload: &serde_json::Value,
     ) -> Vec<(String, String, Uuid)> {
-        let prefix = extract_prefix(event_type);
         self.aggregators
             .iter()
-            .filter(|a| a.event_prefix == prefix)
+            .filter(|a| a.event_prefix == event_type)
             .filter_map(|a| {
                 a.extract_id_from_json(payload).map(|id| {
                     (a.aggregate_type.clone(), a.subject.clone(), id)
@@ -861,13 +857,12 @@ impl AggregatorRegistry {
         events: &[(&str, &serde_json::Value)],
     ) -> Result<()> {
         for (event_type, payload) in events {
-            let prefix = extract_prefix(event_type);
             let matching: Vec<&Aggregator> = self
                 .aggregators
                 .iter()
                 .filter(|a| {
                     a.aggregate_type == aggregate_type
-                        && a.event_prefix == prefix
+                        && a.event_prefix == *event_type
                 })
                 .collect();
 
@@ -1161,8 +1156,7 @@ mod tests {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Ping { id: Uuid }
     impl Event for Ping {
-        const CATEGORY: &'static str = "ping";
-        fn event_type(&self) -> &str { "pinged" }
+        const NAME: &'static str = "pinged";
         fn subject_id(&self) -> Uuid { self.id }
     }
 
@@ -1187,7 +1181,7 @@ mod tests {
                 event_id: Uuid::new_v4(),
                 causation_id: None,
                 workflow_id: Uuid::new_v4(),
-                event_type: format!("ping:{}", payload.event_type()),
+                event_type: "pinged".to_string(),
                 payload: serde_json::to_value(&payload).unwrap(),
                 created_at: Utc::now(),
                 category: Some("ping".into()),
@@ -1300,7 +1294,7 @@ mod tests {
         // Event claims to live in a DIFFERENT stream than the
         // aggregator extracts from the payload.
         let err = reg.apply_event(
-            "ping:pinged", &payload,
+            "pinged", &payload,
             Uuid::new_v4(), // foreign stream id
             "ping",
             StreamRevision::ZERO,
