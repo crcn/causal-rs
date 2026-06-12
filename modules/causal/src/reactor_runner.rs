@@ -42,32 +42,54 @@ use crate::reactor::Reactor;
 use crate::types::{EventData, LogCursor, RecordedEvent, StreamState};
 
 /// Namespace UUID for deriving deterministic reactor-output event_ids
-/// via uuid v5. Hardcoded so that the same `(reactor_id, trigger_id,
-/// idx)` always produces the same event_id across processes / restarts
-/// — that's what makes the log's idempotent-append-on-event_id collapse
-/// retried reactor runs into a single durable entry (C1 + C12).
+/// via uuid v5. Hardcoded so the same identity inputs always produce
+/// the same event_id across processes / restarts — that's what makes
+/// the log's idempotent-append-on-event_id collapse retried reactor
+/// runs into a single durable entry (C1 + C12).
 pub const NS_REACTOR_OUTPUT: Uuid = Uuid::from_bytes([
     0x4d, 0xfe, 0xc4, 0xf2, 0x6e, 0x88, 0x4f, 0x3a,
     0xa9, 0xb1, 0x7c, 0x5e, 0xb3, 0x39, 0x21, 0x0a,
 ]);
 
-/// Compute the deterministic event_id for the `idx`-th output of a
-/// reactor with id `reactor_id` triggered by event `trigger_event_id`.
+/// Compute the deterministic event_id for one reactor output —
+/// **identity-keyed, not position-keyed** (0.10 step 1, chunk 7d):
+///
+/// ```text
+/// v5( consumer NAME ∥ trigger event_id ∥ fact NAME ∥ subject_id ∥ nth )
+/// ```
+///
+/// `nth` is the ordinal among outputs of the SAME (kind, subject)
+/// within one reaction — the only place position survives, exactly
+/// where it's semantically honest (a second identical-identity output
+/// IS a new item). The old positional key (`v5(reactor ∥ trigger ∥
+/// index)`) was deploy-brittle: a reactor emitting `[A, B]` today and
+/// `[A, NEW, B]` tomorrow shifted B's index, so a redelivery straddling
+/// the deploy derived a different id for the same logical output — B
+/// appended twice (0.8) or tripped the divergence check (0.9). Keys
+/// derived from what the fact declares are stable under reordering and
+/// insertion by construction.
 ///
 /// Public so backend impls and tests can reproduce the derivation.
 pub fn derive_output_event_id(
-    reactor_id: &str,
+    consumer: &str,
     trigger_event_id: Uuid,
-    output_index: u32,
+    kind: &str,
+    subject_id: Uuid,
+    nth: u32,
 ) -> Uuid {
     // NUL-byte separator: never appears in valid identifiers or UUIDs,
-    // so the encoding is unambiguous regardless of reactor_id contents.
-    let mut key: Vec<u8> = Vec::with_capacity(reactor_id.len() + 36 + 16);
-    key.extend_from_slice(reactor_id.as_bytes());
+    // so the encoding is unambiguous regardless of name contents.
+    let mut key: Vec<u8> =
+        Vec::with_capacity(consumer.len() + kind.len() + 16 + 16 + 4 + 4);
+    key.extend_from_slice(consumer.as_bytes());
     key.push(0);
     key.extend_from_slice(trigger_event_id.as_bytes());
     key.push(0);
-    key.extend_from_slice(&output_index.to_le_bytes());
+    key.extend_from_slice(kind.as_bytes());
+    key.push(0);
+    key.extend_from_slice(subject_id.as_bytes());
+    key.push(0);
+    key.extend_from_slice(&nth.to_le_bytes());
     Uuid::new_v5(&NS_REACTOR_OUTPUT, &key)
 }
 
@@ -276,18 +298,18 @@ where
             attempts,
             workflow_id:    event.workflow_id,
         };
-        // terminal-failure-synthesized output (if any) is appended directly to its own
-        // stream. `output_index = u32::MAX` keeps its deterministic id
-        // distinct from react() outputs.
+        // terminal-failure-synthesized output (if any) is appended directly
+        // to its own stream. `nth = u32::MAX` keeps its deterministic id
+        // distinct from react() outputs of the same identity.
         if let Some(fact) = mapper(info) {
-            // `cat` is the STREAM placement category; `event_type` keeps
-            // the routing category.
             let cat = fact.subject().to_string();
             let sid = fact.subject_id();
             let event_type = fact.name().to_string();
             let payload = fact.to_value()?;
             let out_event = EventData {
-                event_id: derive_output_event_id(&self.consumer_id, event.event_id, u32::MAX),
+                event_id: derive_output_event_id(
+                    &self.consumer_id, event.event_id, &event_type, sid, u32::MAX,
+                ),
                 causation_id: Some(event.event_id),
                 workflow_id: event.workflow_id,
                 event_type: event_type.clone(),
@@ -551,11 +573,25 @@ where
             //    the log's append-dedup, C1), then advance the cursor.
             //    At-least-once + idempotent emit: a crash between append
             //    and cursor-advance re-runs react() on restart; the
-            //    re-appends dedup on event_id.
-            for (idx, out) in emitted.iter().enumerate() {
+            //    re-appends dedup on event_id. Ids are identity-keyed
+            //    (kind + subject + nth-of-that-pair), so reordering or
+            //    inserting outputs across a deploy never re-keys the
+            //    survivors — see `derive_output_event_id`.
+            let mut nth: std::collections::HashMap<(&str, Uuid), u32> =
+                std::collections::HashMap::new();
+            for out in emitted.iter() {
+                let n = nth
+                    .entry((out.durable_name.as_str(), out.subject_id))
+                    .or_insert(0);
+                let this_nth = *n;
+                *n += 1;
                 let out_event = EventData {
                     event_id: derive_output_event_id(
-                        &self.consumer_id, event.event_id, idx as u32,
+                        &self.consumer_id,
+                        event.event_id,
+                        &out.durable_name,
+                        out.subject_id,
+                        this_nth,
                     ),
                     causation_id: Some(event.event_id),
                     workflow_id: event.workflow_id,
@@ -787,21 +823,30 @@ mod tests {
     #[tokio::test]
     async fn derive_event_id_is_deterministic() {
         let trigger = Uuid::new_v4();
-        let a = derive_output_event_id("reactor.a", trigger, 0);
-        let b = derive_output_event_id("reactor.a", trigger, 0);
-        assert_eq!(a, b, "same inputs MUST produce same event_id");
+        let sid = Uuid::new_v4();
+        let a = derive_output_event_id("reactor.a", trigger, "shipped", sid, 0);
+        let b = derive_output_event_id("reactor.a", trigger, "shipped", sid, 0);
+        assert_eq!(a, b, "same identity MUST produce same event_id");
 
-        let c = derive_output_event_id("reactor.a", trigger, 1);
-        assert_ne!(a, c, "different output_index MUST produce different ids");
+        let c = derive_output_event_id("reactor.a", trigger, "shipped", sid, 1);
+        assert_ne!(a, c, "different nth (same kind+subject) MUST differ");
 
-        let d = derive_output_event_id("reactor.b", trigger, 0);
-        assert_ne!(a, d, "different reactor_id MUST produce different ids");
+        let d = derive_output_event_id("reactor.b", trigger, "shipped", sid, 0);
+        assert_ne!(a, d, "different consumer MUST produce different ids");
+
+        let e = derive_output_event_id("reactor.a", trigger, "billed", sid, 0);
+        assert_ne!(a, e, "different KIND must produce different ids — reordering
+                          or inserting other kinds never re-keys this output");
+
+        let f = derive_output_event_id("reactor.a", trigger, "shipped", Uuid::new_v4(), 0);
+        assert_ne!(a, f, "different SUBJECT must produce different ids");
     }
 
     #[tokio::test]
     async fn reactor_step_appends_output_directly_and_advances_cursor() {
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let order_id = trigger.order_id;
         let trigger_event_id = append_trigger(&store, &trigger);
 
         let runner = ReactorRunner::new(
@@ -830,7 +875,8 @@ mod tests {
         // Deterministic id matches the helper's output (idempotent on redelivery).
         assert_eq!(
             out.event_id,
-            derive_output_event_id("r.shipper", trigger_event_id, 0),
+            derive_output_event_id("r.shipper", trigger_event_id,
+                                   "shipped_notification", order_id, 0),
         );
     }
 
@@ -914,6 +960,7 @@ mod tests {
     async fn reactor_step_with_n_outputs_appends_n_in_order() {
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let order_id = trigger.order_id;
         let trigger_event_id = append_trigger(&store, &trigger);
 
         let runner = ReactorRunner::new(
@@ -936,7 +983,8 @@ mod tests {
 
         // Each output index has its deterministic event_id present.
         for i in 0..5u32 {
-            let want = derive_output_event_id("r.fanout", trigger_event_id, i);
+            let want = derive_output_event_id("r.fanout", trigger_event_id,
+                                              "shipped_notification", order_id, i);
             assert!(
                 outs.iter().any(|e| e.event_id == want),
                 "output index {i} present in log",
@@ -1396,7 +1444,8 @@ mod tests {
         assert_eq!(terminal_failure.causation_id, Some(trigger_id));
         assert_eq!(
             terminal_failure.event_id,
-            derive_output_event_id("always-fails", trigger_id, u32::MAX),
+            derive_output_event_id("always-fails", trigger_id,
+                                   "handler_failed", Uuid::nil(), u32::MAX),
             "terminal-failure output uses u32::MAX for its deterministic id",
         );
 

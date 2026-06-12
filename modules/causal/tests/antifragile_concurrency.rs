@@ -488,7 +488,7 @@ async fn blue_green_shared_cursor_outputs_exactly_once() {
             .cloned()
             .collect();
         let all_present = triggers.iter().all(|t| {
-            let want = derive_output_event_id(BgEcho::NAME, t.event_id, 0);
+            let want = derive_output_event_id(BgEcho::NAME, t.event_id, "af_bgpong", t.subject_id, 0);
             log.iter().any(|e| e.event_id == want)
         });
         if triggers.len() == ids.len() && all_present {
@@ -516,7 +516,7 @@ async fn blue_green_shared_cursor_outputs_exactly_once() {
         .iter()
         .filter(|e| e.event_type == "af_bgping")
     {
-        let want = derive_output_event_id(BgEcho::NAME, t.event_id, 0);
+        let want = derive_output_event_id(BgEcho::NAME, t.event_id, "af_bgpong", t.subject_id, 0);
         assert_eq!(
             triggers_and_outputs
                 .iter()
@@ -768,7 +768,7 @@ async fn seeding_race_reacted_set_is_clean_suffix() {
     let reacted: Vec<bool> = triggers
         .iter()
         .map(|t| {
-            let want = derive_output_event_id(SeedEcho::NAME, t.event_id, 0);
+            let want = derive_output_event_id(SeedEcho::NAME, t.event_id, "af_seedpong", t.subject_id, 0);
             log.iter().any(|e| e.event_id == want)
         })
         .collect();

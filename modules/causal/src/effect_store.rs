@@ -51,12 +51,14 @@ impl EffectKey {
         Self { group: group.into(), trigger_event_id }
     }
 
-    /// Deterministic event_id for the `idx`-th emitted output of this
-    /// reaction. Stable across retries/restarts, so the log collapses
-    /// duplicate emits on redelivery. Shares the exact derivation the
-    /// reactor runner uses ([`derive_output_event_id`]).
-    pub fn output_event_id(&self, idx: u32) -> Uuid {
-        derive_output_event_id(&self.group, self.trigger_event_id, idx)
+    /// Deterministic event_id for an emitted output of this reaction,
+    /// identity-keyed (kind + subject + nth-of-that-pair). Stable
+    /// across retries/restarts AND across deploys that reorder or
+    /// insert outputs, so the log collapses duplicate emits on
+    /// redelivery. Shares the exact derivation the reactor runner uses
+    /// ([`derive_output_event_id`]).
+    pub fn output_event_id(&self, kind: &str, subject_id: Uuid, nth: u32) -> Uuid {
+        derive_output_event_id(&self.group, self.trigger_event_id, kind, subject_id, nth)
     }
 }
 
@@ -147,13 +149,13 @@ mod tests {
     fn output_event_id_is_deterministic_and_matches_runner() {
         let key = EffectKey::new("welcome_reactor", Uuid::nil());
         // Stable across calls.
-        assert_eq!(key.output_event_id(0), key.output_event_id(0));
+        assert_eq!(key.output_event_id("k", Uuid::nil(), 0), key.output_event_id("k", Uuid::nil(), 0));
         // Distinct per index.
-        assert_ne!(key.output_event_id(0), key.output_event_id(1));
+        assert_ne!(key.output_event_id("k", Uuid::nil(), 0), key.output_event_id("k", Uuid::nil(), 1));
         // Matches the reactor runner's derivation exactly.
         assert_eq!(
-            key.output_event_id(3),
-            derive_output_event_id("welcome_reactor", Uuid::nil(), 3),
+            key.output_event_id("welcome_queued", Uuid::nil(), 3),
+            derive_output_event_id("welcome_reactor", Uuid::nil(), "welcome_queued", Uuid::nil(), 3),
         );
     }
 

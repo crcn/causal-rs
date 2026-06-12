@@ -6,6 +6,44 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### 0.10 step 1 — the naming + shape decoupling (2026-06-12, breaking)
+
+Every identity is declared, named for meaning, and matched exactly.
+One mechanical ripple, landed before any new machinery (see
+`docs/plans/2026-06-12-design-0.10-no-lying-defaults.md`):
+
+- **Facts**: `#[causal::event(name = "...", subject_id = "...",
+  subject = "...")]` — `name` is required (the wire `event_type`,
+  verbatim; never derived from the type name); the enum form is
+  retracted (one fact = one struct; a family enum's new variant
+  poisoned every deployed consumer); subject omission is shape-gated
+  (no Uuid fields = legal; candidates present = teaching error that
+  lists them; `no_subject` for reference-carrying facts).
+- **Routing is flat**: `Event::NAME` replaces `CATEGORY` +
+  `event_type()`; matching is equality (prefix collisions
+  unconstructable; vocabulary growth additive); `MultiProjector::KINDS`
+  replaces `CATEGORIES`; colons are just characters.
+- **Output dedup is identity-keyed**: `derive_output_event_id` =
+  v5(consumer ∥ trigger ∥ kind ∥ subject ∥ nth-of-that-pair) — stable
+  under output reordering/insertion across deploys (was positional).
+- **Workflow vocabulary**: `correlation_id` → `workflow_id` everywhere
+  domain-facing (envelope, `EmitResult`, `Ctx`, settle tracker,
+  inspector + UI). Storage keeps its native names (PG column, Kurrent
+  `$correlationId`).
+- **Consumers**: `GROUP_NAME` → `NAME` (all three traits).
+- **Reads**: `ctx.state_of` / `engine.state_of` (were
+  `aggregate_of`/`load_aggregate`); `engine.snapshot()` and
+  `ctx.aggregate()` deleted.
+- **Failure vocabulary**: `on_terminal_failure` + `TerminalFailure`
+  (were `on_dlq`/`DlqInfo`); DLQ jargon removed.
+- **Effects**: `EffectStore`/`EffectKey`/`with_effect_store` (were
+  ReactionCache names).
+- **Invariants**: `Aggregate::INVARIANT = true` installs the OCC fence
+  via ordinary `with_aggregators` registration; `with_aggregate`
+  deleted.
+
+---
+
 Bug-fix + scale pass (2026-06-12). Four real defects found by an
 adversarial design review, fixed test-first, plus a quadratic→linear
 rework of `MemoryStore`'s hot paths after a million-event assault.
