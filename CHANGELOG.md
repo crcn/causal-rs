@@ -6,6 +6,46 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### 0.10 step 3 — the retry taxonomy (2026-06-12, breaking)
+
+BLOCKING-2: blanket bounded-retry amplifies outages (a ten-minute
+Neo4j blip mass-parks every graph-touching trigger into a manual
+replay incident); blanket infinite-retry wedges partitions forever.
+Neither default survives. Errors now carry a declared class, and the
+terminal-failure path is **mandatory**.
+
+- **`causal::transient(e)` / `causal::poison(e)` / `causal::domain(e)`**
+  (`causal::failure`): wrap errors in reactor bodies —
+  `.map_err(causal::transient)?`. The outermost classification in the
+  anyhow chain wins; `.context(...)` doesn't disturb it.
+  - *Transient* (connection refused, 5xx, 429): capped backoff up to a
+    **liveness-time ceiling** (6h of tokio time — virtualizable under
+    `start_paused`; chrono never participates), then parks as
+    `transient_exhausted` — mass-replayable as a class. The attempt
+    budget does not apply.
+  - *Poison*: parks immediately — deterministic, retry is pointless.
+    Trigger-deserialization failures and OCC-fence violations are
+    structurally poison.
+  - *Domain*: bounded attempts (`with_max_attempts`, default 3), then
+    parks as `domain`.
+  - *Unclassified* `anyhow::Error`: domain policy, parked labeled
+    `unclassified` — honest, not masqueraded as a declared class.
+- **The terminal path is mandatory** (Primitive 5 flip): without an
+  `on_terminal_failure` mapper, the runner appends the built-in
+  `causal:reaction_failed { consumer, trigger_id, trigger_event_type,
+  class, error, attempts }` fact to the **trigger's own subject
+  history**, so a completion fold over that subject folds the failure
+  as completion-with-error. Retry-forever no longer exists;
+  transient-class backoff is the sanctioned wait-out-the-outage
+  behavior.
+- **`TerminalFailure` carries the trigger's `subject` / `subject_id`
+  and the `FailureClass`** — the mapper can stamp its fact with the
+  identity completion folds need (the old `DlqInfo` lacked it).
+- **Breaking**: a failing no-mapper reactor parks (built-in fact)
+  after 3 attempts instead of retrying forever; `with_max_attempts`
+  now applies with or without a mapper; `TerminalFailure` gained
+  `subject` / `subject_id` / `class`.
+
 ### 0.10 step 2 — the partitioned reactor runner (2026-06-12, breaking)
 
 Settle unhostaged: reactors execute concurrently across declared

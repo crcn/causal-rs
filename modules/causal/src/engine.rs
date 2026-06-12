@@ -245,12 +245,25 @@ pub struct TerminalFailure {
     pub consumer:        String,
     /// `event_id` of the trigger that caused the failure.
     pub trigger_id:   Uuid,
-    /// `event_type` of the trigger (canonical `{CATEGORY}:{name}`).
+    /// `event_type` of the trigger (the fact kind, verbatim).
     pub trigger_event_type: String,
+    /// The trigger's subject placement category — with `subject_id`,
+    /// the subject history the trigger belongs to. BLOCKING-2's
+    /// contract: a terminal failure mid-workflow means the workflow's
+    /// completion event never arrives, so downstream completion logic
+    /// MUST be able to fold the failure as completion-with-error — the
+    /// mapper has the subject identity to stamp its fact with.
+    pub subject:           String,
+    /// The trigger's `subject_id`.
+    pub subject_id:        Uuid,
+    /// How the failing error was classified (BLOCKING-2):
+    /// `transient_exhausted` is mass-replayable as a class after a real
+    /// outage; `unclassified` is visible instead of masquerading as a
+    /// declared `domain`.
+    pub class:             crate::failure::FailureClass,
     /// Last error message from the reactor's `react()`.
     pub error:             String,
-    /// Number of attempts that ran before declaring terminal
-    /// failure (equal to `max_attempts`).
+    /// Number of attempts that ran before declaring terminal failure.
     pub attempts:          u32,
     /// `workflow_id` of the failing trigger — its run / causal chain.
     /// The terminal-failure-synthesized event already inherits this; exposing it lets the
@@ -562,16 +575,30 @@ impl EngineBuilder {
         self
     }
 
-    /// Register a terminal-failure mapper. When any reactor's `react()` errors
-    /// `max_attempts` times in a row on the same trigger event, the
-    /// runner stops retrying and invokes the mapper with the
-    /// failure details. If the mapper returns `Some(fact)`, the
-    /// fact is appended to its stream (so downstream consumers
-    /// react to it) and the cursor advances past the failing event.
+    /// Register a terminal-failure mapper, replacing the built-in
+    /// terminal fact. When a trigger exhausts its retry policy (per
+    /// the BLOCKING-2 class taxonomy — see [`crate::failure`]), the
+    /// runner invokes the mapper with the failure details. If the
+    /// mapper returns `Some(fact)`, the fact is appended to its own
+    /// stream (so downstream consumers react to it); either way the
+    /// trigger parks and its partition moves on.
     ///
-    /// Without this, terminal failures park forever — the
-    /// supervisor backs off + retries indefinitely, blocking
-    /// downstream progress.
+    /// **The terminal path is mandatory, not optional.** Without a
+    /// mapper, the runner appends the built-in fact
+    /// `causal:reaction_failed { consumer, trigger_id,
+    /// trigger_event_type, class, error, attempts }` to the TRIGGER's
+    /// own subject history — so a completion fold over that subject
+    /// can see the failure. There is no retry-forever mode; the
+    /// transient class's ceilinged backoff is the sanctioned "wait out
+    /// the outage" behavior.
+    ///
+    /// **Contract for whoever consumes the terminal fact** (mapper
+    /// output or built-in): a terminal failure mid-workflow means the
+    /// workflow's completion event never arrives. Downstream completion
+    /// logic MUST fold terminal-failure facts as completion-with-error,
+    /// or workflows leak (a run wedged "running" busy-gates its source
+    /// forever). `TerminalFailure` carries the trigger's `subject` /
+    /// `subject_id` so the mapper can stamp its fact accordingly.
     ///
     /// Use case in scout: synthesize `PipelineEvent::HandlerFailed`
     /// from `TerminalFailure`; `PipelineState` folds it and unblocks
@@ -587,10 +614,11 @@ impl EngineBuilder {
         self
     }
 
-    /// Override the framework's default retry budget for reactors.
-    /// Default is [`DEFAULT_MAX_ATTEMPTS`] (3). Applies only when
-    /// `on_terminal_failure` is also configured — without a mapper, reactors
-    /// retry indefinitely (supervisor backoff).
+    /// Override the framework's default retry budget for
+    /// domain-class / unclassified reactor errors. Default is
+    /// [`DEFAULT_MAX_ATTEMPTS`] (3). Transient-class errors are
+    /// governed by the liveness-time ceiling, not this budget; poison
+    /// parks immediately (see [`crate::failure`]).
     pub fn with_max_attempts(mut self, n: u32) -> Self {
         self.max_attempts = n;
         self
@@ -744,10 +772,11 @@ impl EngineBuilder {
         let snapshot_store = self.snapshot_store.clone();
         let snapshot_every = self.snapshot_every;
         self.consumers.push(Box::new(move |aggs, engine_aggs, occ| {
-            let mut runner = ReactorRunner::new(r, R::NAME, log, reactor_checkpoint);
+            let mut runner = ReactorRunner::new(r, R::NAME, log, reactor_checkpoint)
+                .with_max_attempts(max_attempts);
             if let Some(aggs) = aggs { runner = runner.with_aggregators(aggs); }
             if let Some(mapper) = failure_mapper {
-                runner = runner.with_terminal_failure(mapper, max_attempts);
+                runner = runner.with_terminal_failure(mapper);
             }
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
             if let Some(rc) = effect_store { runner = runner.with_effect_store(rc); }

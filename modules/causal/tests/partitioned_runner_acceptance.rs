@@ -179,8 +179,11 @@ async fn two_emits_run_concurrently_in_the_same_reactor() {
     engine.shutdown().await.unwrap();
 }
 
-/// A poison trigger (no terminal-failure mapper) wedges ONLY its own
-/// partition; other subjects keep flowing and settling.
+/// A poison trigger must not affect other subjects' flow or settle.
+/// (Under the BLOCKING-2 taxonomy it parks immediately via the
+/// built-in `causal:reaction_failed` fact — no mapper required; the
+/// original red assertion was only that it can't hold an unrelated
+/// workflow's settle hostage, which holds a fortiori.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn poison_isolates_to_its_partition() {
     let store = Arc::new(MemoryStore::new());

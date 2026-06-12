@@ -15,10 +15,14 @@
 //!      runs the reaction: deserialize → `react()` → append each
 //!      output directly to its own stream with a deterministic
 //!      identity-keyed `event_id` (see [`derive_output_event_id`]).
-//!      Failures retry **worker-local** with capped backoff — a
-//!      failing trigger wedges only its own partition, never the
-//!      consumer. With a terminal-failure mapper, retries cap at
-//!      `max_attempts` and the trigger parks.
+//!      Failures retry **worker-local** per the BLOCKING-2 class
+//!      taxonomy (see [`crate::failure`]): transient backs off under a
+//!      liveness-time ceiling, poison parks immediately, domain /
+//!      unclassified parks after bounded attempts — always via a
+//!      terminal fact (the registered mapper's, or the built-in
+//!      [`REACTION_FAILED_KIND`] on the trigger's own subject
+//!      history). A retrying trigger occupies only its own partition,
+//!      never the consumer.
 //!   3. **Ack-floor checkpoint** (BLOCKING-3) — the durable cursor is
 //!      the highest position with no unacked matching trigger at or
 //!      below it. Crash redelivery replays at most the pending-work
@@ -52,6 +56,7 @@ use crate::aggregator::{AggregatorRegistry, FoldOnReadCache};
 use crate::checkpoint_store::ReactorCheckpoint;
 use crate::contexts::{Ctx, StateSource};
 use crate::engine::{TerminalFailure, TerminalFailureMapper};
+use crate::failure::{classify, poison, ErrorClass, FailureClass};
 use crate::event_log::EventLogBackend;
 use crate::event::Event;
 use crate::projection_runner::StepOutcome;
@@ -68,6 +73,24 @@ const MAX_PENDING: usize = 4096;
 /// Worker-local retry pacing: capped exponential backoff.
 const WORKER_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(25);
 const WORKER_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The transient-class retry ceiling (BLOCKING-2): how long a
+/// transient-classified failure may back off before parking as
+/// `transient_exhausted`. Measured in **liveness time** (tokio
+/// `Instant` — virtualizable under `start_paused`), never chrono:
+/// a wall-clock ceiling would make this machinery testable only in
+/// production. Hours, not attempts — a ten-minute infra outage must
+/// self-heal instead of mass-parking every graph-touching trigger.
+/// Ceilinged rather than unbounded because misclassification is
+/// inevitable, and an unbounded-transient partition is a silent
+/// permanent wedge.
+const TRANSIENT_CEILING: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// The built-in terminal fact's kind, appended when no
+/// `on_terminal_failure` mapper is registered. The colon namespaces it
+/// out of user vocabularies (kinds are matched exactly; colons are just
+/// characters since 0.10 step 1).
+pub const REACTION_FAILED_KIND: &str = "causal:reaction_failed";
 
 fn backoff_for(attempt: u32) -> std::time::Duration {
     WORKER_BACKOFF_BASE
@@ -205,8 +228,15 @@ struct Completion {
 enum AttemptOutcome {
     /// Reaction succeeded; outputs are durable.
     Done,
-    /// Trigger parked as a terminal failure; cursor may pass it.
-    Parked,
+    /// The reaction body failed (deserialization, `react()` error or
+    /// panic, OCC-fence violation). Carries the error — classified per
+    /// the BLOCKING-2 taxonomy where the failure is structurally
+    /// deterministic — and the persisted attempt count. The retry-loop
+    /// owner ([`Core::process_trigger`]) decides retry vs. park.
+    /// Runner-infrastructure failures (log/checkpoint I/O) are `Err`,
+    /// never this variant — they retry indefinitely and can never park
+    /// a trigger.
+    BodyFailed { error: anyhow::Error, attempts: u32 },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -228,15 +258,17 @@ struct Core<R: Reactor> {
     /// maintaining a scan-folded copy (which would race ahead of a
     /// worker's trigger).
     fold_registry: Option<Arc<AggregatorRegistry>>,
-    /// Terminal-failure mapper. When `react()` errors `max_attempts`
-    /// times on the same trigger (or the trigger payload is poison),
-    /// the mapper is invoked; if it returns `Some(fact)`, the
-    /// synthesized fact is appended directly to its stream and the
-    /// trigger parks (its partition moves on).
+    /// Terminal-failure mapper. When a trigger exhausts its retry
+    /// policy (per the BLOCKING-2 class taxonomy), the mapper is
+    /// invoked; on `Some(fact)`, the synthesized fact is appended
+    /// directly to its stream. Without a mapper the runner appends the
+    /// built-in [`REACTION_FAILED_KIND`] fact to the TRIGGER's own
+    /// subject history — the terminal path is mandatory; there is no
+    /// retry-forever mode.
     failure_mapper:  Option<TerminalFailureMapper>,
-    /// Retry budget — applies only when `failure_mapper` is set. Without
-    /// a mapper, a failing trigger retries indefinitely (worker-local
-    /// backoff), wedging only its own partition.
+    /// Retry budget for domain-class / unclassified errors. Transient
+    /// errors are governed by [`TRANSIENT_CEILING`] (liveness time);
+    /// poison parks immediately.
     max_attempts: u32,
     /// Inspector / telemetry hook. Default `None` = zero overhead.
     observer:    Option<Arc<dyn ReactorObserver>>,
@@ -287,7 +319,7 @@ where
                 checkpoint,
                 fold_registry: None,
                 failure_mapper: None,
-                max_attempts: 0,
+                max_attempts: crate::engine::DEFAULT_MAX_ATTEMPTS,
                 observer: None,
                 effect_store: None,
                 engine_aggregators: None,
@@ -386,14 +418,19 @@ where
         self
     }
 
-    /// Configure terminal-failure handling. After `max_attempts`
-    /// consecutive `react()` errors on the same trigger, the mapper
-    /// is invoked; on `Some(fact)`, the fact is appended directly to its
-    /// stream and the trigger parks. Without this, a failing trigger
-    /// retries indefinitely (wedging only its own partition).
-    pub(crate) fn with_terminal_failure(mut self, mapper: TerminalFailureMapper, max_attempts: u32) -> Self {
+    /// Replace the built-in terminal fact with a user mapper. When a
+    /// trigger exhausts its retry policy (BLOCKING-2 taxonomy), the
+    /// mapper is invoked; on `Some(fact)`, the fact is appended
+    /// directly to its stream and the trigger parks.
+    pub(crate) fn with_terminal_failure(mut self, mapper: TerminalFailureMapper) -> Self {
         self.core_mut().failure_mapper = Some(mapper);
-        self.core_mut().max_attempts = max_attempts;
+        self
+    }
+
+    /// Retry budget for domain-class / unclassified errors (default
+    /// [`crate::engine::DEFAULT_MAX_ATTEMPTS`]).
+    pub(crate) fn with_max_attempts(mut self, n: u32) -> Self {
+        self.core_mut().max_attempts = n;
         self
     }
 
@@ -601,34 +638,110 @@ where
         }
     }
 
-    /// Drive one trigger to completion: attempt, retry worker-locally
-    /// with capped backoff on failure, park terminally when the budget
-    /// is exhausted (mapper configured). Returns false only on halt.
+    /// Drive one trigger to completion under the BLOCKING-2 retry
+    /// taxonomy. Returns false only on halt.
+    ///
+    /// - **Poison** (declared, or structurally deterministic: trigger
+    ///   deserialization failure, OCC-fence violation) parks
+    ///   immediately — retry reproduces the failure.
+    /// - **Transient** backs off (capped exponential) up to
+    ///   [`TRANSIENT_CEILING`] of liveness time since the first
+    ///   transient failure, then parks as `transient_exhausted`. The
+    ///   attempt budget does NOT apply — a ten-minute outage must not
+    ///   mass-park triggers. (The ceiling clock is in-memory; a process
+    ///   restart restarts it — at worst an outage straddling crashes
+    ///   parks later, never silently looping forever.)
+    /// - **Domain / unclassified** retries up to `max_attempts`, then
+    ///   parks (labeled `domain` vs `unclassified` honestly).
+    /// - **Runner-infrastructure errors** (`Err` from the attempt:
+    ///   log/checkpoint I/O) back off and retry indefinitely — the
+    ///   runner's own failures never park a trigger.
     async fn process_trigger(
         self: &Arc<Self>,
         event: &RecordedEvent,
         fold_cache: &FoldOnReadCache,
     ) -> bool {
         let mut local_attempt: u32 = 0;
+        let mut transient_since: Option<tokio::time::Instant> = None;
         loop {
             if self.stopped() {
                 return false;
             }
-            match self.attempt_trigger(event, fold_cache).await {
-                Ok(AttemptOutcome::Done) | Ok(AttemptOutcome::Parked) => return true,
+            let failure = match self.attempt_trigger(event, fold_cache).await {
+                Ok(AttemptOutcome::Done) => return true,
+                Ok(AttemptOutcome::BodyFailed { error, attempts }) => Some((error, attempts)),
                 Err(e) => {
-                    local_attempt += 1;
                     tracing::warn!(
                         consumer = self.consumer_id,
                         event_id = %event.event_id,
                         error = %format!("{e:#}"),
+                        "reactor runner infrastructure error; retrying in partition",
+                    );
+                    None // infra: backoff + retry, never park
+                }
+            };
+
+            if let Some((error, attempts)) = failure {
+                let class = classify(&error);
+                let park = match class {
+                    Some(ErrorClass::Poison) => Some(FailureClass::Poison),
+                    Some(ErrorClass::Transient) => {
+                        let since = *transient_since
+                            .get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() >= TRANSIENT_CEILING {
+                            Some(FailureClass::TransientExhausted)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(ErrorClass::Domain) if attempts >= self.max_attempts => {
+                        Some(FailureClass::Domain)
+                    }
+                    None if attempts >= self.max_attempts => {
+                        Some(FailureClass::Unclassified)
+                    }
+                    _ => None,
+                };
+                if let Some(failure_class) = park {
+                    // Park is itself made of log/checkpoint I/O; its
+                    // errors are infra errors — retry the park, don't
+                    // lose the trigger.
+                    match self
+                        .park_terminal_failure(
+                            event,
+                            attempts,
+                            format!("{:#}", error),
+                            failure_class,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                    {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            tracing::warn!(
+                                consumer = self.consumer_id,
+                                event_id = %event.event_id,
+                                error = %format!("{e:#}"),
+                                "terminal-failure park hit an infrastructure error; retrying",
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        consumer = self.consumer_id,
+                        event_id = %event.event_id,
+                        attempts,
+                        class = ?class,
+                        error = %format!("{error:#}"),
                         "reactor attempt failed; retrying in partition",
                     );
-                    tokio::select! {
-                        _ = self.stop_notify.notified() => return false,
-                        _ = tokio::time::sleep(backoff_for(local_attempt)) => {}
-                    }
                 }
+            }
+
+            local_attempt += 1;
+            tokio::select! {
+                _ = self.stop_notify.notified() => return false,
+                _ = tokio::time::sleep(backoff_for(local_attempt)) => {}
             }
         }
     }
@@ -648,10 +761,9 @@ where
             .await?;
         let started_at = chrono::Utc::now();
 
-        // Deserialize the trigger. A failure here is a poison pill —
-        // deterministic, so retrying never helps. With a mapper, park
-        // immediately; without one, error (the partition wedges and
-        // retries — block-until-fixed, scoped to this partition).
+        // Deserialize the trigger. A failure here is structurally
+        // poison — deterministic, so retrying never helps. Classified
+        // as such; the policy loop parks it immediately.
         let trigger: R::Trigger = match serde_json::from_value(event.payload.clone()) {
             Ok(t) => t,
             Err(deser_err) => {
@@ -659,12 +771,10 @@ where
                     "trigger deserialization failed for {} (event {}): {deser_err}",
                     event.event_type, event.event_id,
                 );
-                if self.failure_mapper.is_some() {
-                    self.park_terminal_failure(event, attempt_seq, msg, chrono::Utc::now())
-                        .await?;
-                    return Ok(AttemptOutcome::Parked);
-                }
-                return Err(anyhow::anyhow!(msg));
+                return Ok(AttemptOutcome::BodyFailed {
+                    error: poison(anyhow::anyhow!(msg)),
+                    attempts: attempt_seq,
+                });
             }
         };
 
@@ -747,13 +857,6 @@ where
             }
             Err(e) => {
                 let completed_at = chrono::Utc::now();
-                if self.failure_mapper.is_some() && attempt_seq >= self.max_attempts {
-                    self.park_terminal_failure(
-                        event, attempt_seq, format!("{:#}", e), completed_at,
-                    )
-                    .await?;
-                    return Ok(AttemptOutcome::Parked);
-                }
                 if let Some(obs) = self.observer.as_ref() {
                     let drained = log_sink.into_inner();
                     obs.reactor_failed(
@@ -767,14 +870,14 @@ where
                         &drained,
                     );
                 }
-                return Err(e);
+                return Ok(AttemptOutcome::BodyFailed { error: e, attempts: attempt_seq });
             }
         };
 
         // ── OCC fence (pre-flight). A reactor appends its outputs with
         //    `StreamState::Any`, so it cannot uphold the OCC invariant
         //    of an INVARIANT aggregate's stream. A deterministic config
-        //    error: park (no retries) rather than append.
+        //    error — structurally poison: park rather than append.
         if !self.occ_categories.is_empty() {
             if let Some(bad) = emitted.iter().find(|out| {
                 self.occ_categories.contains(out.durable_name.as_str())
@@ -787,12 +890,10 @@ where
                      Engine::append command, not a reactor output",
                     self.consumer_id,
                 );
-                if self.failure_mapper.is_some() {
-                    self.park_terminal_failure(event, attempt_seq, msg, chrono::Utc::now())
-                        .await?;
-                    return Ok(AttemptOutcome::Parked);
-                }
-                return Err(anyhow::anyhow!(msg));
+                return Ok(AttemptOutcome::BodyFailed {
+                    error: poison(anyhow::anyhow!(msg)),
+                    attempts: attempt_seq,
+                });
             }
         }
 
@@ -870,23 +971,24 @@ where
         Ok(AttemptOutcome::Done)
     }
 
-    /// Terminal-failure routing. Invokes the mapper, appends its
-    /// synthesized fact (if any) to that fact's own stream, folds it
-    /// into the engine registry, and clears the attempt counter
-    /// **last** (so a failed park can't reset the budget). The caller
-    /// acks the trigger afterwards — the ack-floor, not this function,
-    /// moves the durable cursor.
+    /// Terminal-failure routing — **mandatory** (BLOCKING-2 / Primitive
+    /// 5): with a mapper, its synthesized fact (if any) appends to that
+    /// fact's own stream; without one, the built-in
+    /// [`REACTION_FAILED_KIND`] fact appends to the **trigger's own
+    /// subject history**, so a completion fold over that subject can
+    /// fold the failure as completion-with-error. Folds into the engine
+    /// registry, then clears the attempt counter **last** (so a failed
+    /// park can't reset the budget). The caller acks the trigger
+    /// afterwards — the ack-floor, not this function, moves the
+    /// durable cursor.
     async fn park_terminal_failure(
         self: &Arc<Self>,
         event: &RecordedEvent,
         attempts: u32,
         error: String,
+        class: FailureClass,
         completed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        let mapper = self
-            .failure_mapper
-            .as_ref()
-            .expect("park_terminal_failure requires a configured terminal-failure mapper");
         if let Some(obs) = self.observer.as_ref() {
             obs.reactor_terminal_failure(
                 event.event_id,
@@ -897,22 +999,53 @@ where
                 completed_at,
             );
         }
-        let info = TerminalFailure {
-            consumer:        self.consumer_id.clone(),
-            trigger_id:   event.event_id,
-            trigger_event_type: event.event_type.clone(),
-            error,
-            attempts,
-            workflow_id:    event.workflow_id,
-        };
-        // The synthesized output (if any) is appended directly to its
-        // own stream. `nth = u32::MAX` keeps its deterministic id
+        // (kind, subject placement, subject_id, payload) of the
+        // terminal fact to append — mapper's fact, the built-in, or
+        // nothing (mapper returned None: park silently).
+        let terminal: Option<(String, String, Uuid, serde_json::Value)> =
+            match self.failure_mapper.as_ref() {
+                Some(mapper) => {
+                    let info = TerminalFailure {
+                        consumer:        self.consumer_id.clone(),
+                        trigger_id:   event.event_id,
+                        trigger_event_type: event.event_type.clone(),
+                        subject:         event.category.clone(),
+                        subject_id:      event.subject_id,
+                        class,
+                        error,
+                        attempts,
+                        workflow_id:    event.workflow_id,
+                    };
+                    match mapper(info) {
+                        Some(fact) => Some((
+                            fact.name().to_string(),
+                            fact.subject().to_string(),
+                            fact.subject_id(),
+                            fact.to_value()?,
+                        )),
+                        None => None,
+                    }
+                }
+                None => Some((
+                    REACTION_FAILED_KIND.to_string(),
+                    // The trigger's own subject history — where its
+                    // completion fold reads.
+                    event.category.clone(),
+                    event.subject_id,
+                    serde_json::json!({
+                        "consumer": self.consumer_id,
+                        "trigger_id": event.event_id,
+                        "trigger_event_type": event.event_type,
+                        "class": class.as_str(),
+                        "error": error,
+                        "attempts": attempts,
+                    }),
+                )),
+            };
+
+        // `nth = u32::MAX` keeps the terminal fact's deterministic id
         // distinct from react() outputs of the same identity.
-        if let Some(fact) = mapper(info) {
-            let cat = fact.subject().to_string();
-            let sid = fact.subject_id();
-            let event_type = fact.name().to_string();
-            let payload = fact.to_value()?;
+        if let Some((event_type, cat, sid, payload)) = terminal {
             let out_event = EventData {
                 event_id: derive_output_event_id(
                     &self.consumer_id, event.event_id, &event_type, sid, u32::MAX,
@@ -1016,7 +1149,7 @@ where
         if let Some(pos) = to_persist {
             self.checkpoint.set(&self.consumer_id, pos).await?;
             let mut d = self.dispatch.lock();
-            if d.persisted_floor.is_none_or(|p| p < pos) {
+            if d.persisted_floor.map_or(true, |p| p < pos) {
                 d.persisted_floor = Some(pos);
             }
         }
@@ -1368,9 +1501,12 @@ mod tests {
 
     #[tokio::test]
     async fn floor_holds_below_failing_trigger_while_other_partitions_proceed() {
-        // BLOCKING-3's honesty: a permanently failing trigger (no
-        // mapper) pins the durable floor BELOW its position — restart
-        // redelivers it — while other subjects keep flowing.
+        // BLOCKING-3's honesty during an outage: a transient-classified
+        // failure backs off under the liveness ceiling, pinning the
+        // durable floor BELOW its position — restart redelivers it —
+        // while other subjects keep flowing. (Transient is the
+        // sanctioned wait-it-out class; domain/unclassified would park
+        // after bounded attempts instead.)
         struct FailsForSubject { bad: Uuid, calls: Arc<AtomicUsize> }
         #[async_trait]
         impl Reactor for FailsForSubject {
@@ -1379,7 +1515,9 @@ mod tests {
             async fn react(&self, t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
                 if t.order_id == self.bad {
                     self.calls.fetch_add(1, Ordering::SeqCst);
-                    return Err(anyhow!("permanently broken subject"));
+                    return Err(crate::failure::transient(anyhow!(
+                        "graph store connection refused"
+                    )));
                 }
                 let mut out = Events::new();
                 out.push(ShippedNotification { order_id: t.order_id });
@@ -1544,7 +1682,7 @@ mod tests {
             "persist-attempts",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_terminal_failure(mk_mapper(), 100);
+        ).with_terminal_failure(mk_mapper()).with_max_attempts(100);
         runner_a.step(10).await.unwrap();
         wait_until(5, "runner A to fail twice", || {
             calls_a.load(Ordering::SeqCst) >= 2
@@ -1560,7 +1698,7 @@ mod tests {
             "persist-attempts",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_terminal_failure(mk_mapper(), 3);
+        ).with_terminal_failure(mk_mapper()).with_max_attempts(3);
         runner_b.quiesce().await.unwrap();
         assert_eq!(mapper_calls.load(Ordering::SeqCst), 1,
                    "attempt count persisted: runner B parks without re-earning 3 failures");
@@ -1664,7 +1802,7 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
-        .with_terminal_failure(mapper, 3);
+        .with_terminal_failure(mapper).with_max_attempts(3);
 
         runner.quiesce().await.unwrap();
         assert_eq!(mapper_calls.load(Ordering::SeqCst), 1,
@@ -1675,11 +1813,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poison_without_mapper_wedges_only_its_partition() {
-        // Without a terminal-failure mapper, a poison trigger blocks
-        // until fixed — but the blast radius is its PARTITION, not the
-        // consumer. The floor never passes it; other subjects flow.
+    async fn poison_without_mapper_parks_immediately_with_builtin_fact() {
+        // The taxonomy's poison policy is mapper-independent: a payload
+        // that can't deserialize is deterministic, so it parks on the
+        // FIRST attempt — via the built-in causal:reaction_failed fact
+        // on the trigger's own subject history — and the floor moves
+        // on. (Pre-taxonomy, no-mapper poison wedged its partition
+        // forever; the mandatory terminal path replaced that.)
         let store = Arc::new(MemoryStore::new());
+        let poison_subject = Uuid::new_v4();
         let poison = EventData {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
@@ -1688,7 +1830,7 @@ mod tests {
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
             category:       Some("order_placed".into()),
-            subject_id:      Some(Uuid::new_v4()),
+            subject_id:      Some(poison_subject),
             metadata:       serde_json::Map::new(),
             ephemeral:      None,
             persistent:     true,
@@ -1699,31 +1841,32 @@ mod tests {
 
         let runner = ReactorRunner::new(
             EmitOne,
-            "poison.block",
+            "poison.park.builtin",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        let store_c = store.clone();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            runner.step(64).await.unwrap();
-            let outs = EventLogBackend::read_all(store_c.as_ref(), LogCursor::ZERO, 20)
-                .await.unwrap()
-                .iter()
-                .filter(|e| e.event_type == "shipped_notification")
-                .count();
-            if outs == 1 { break; }
-            assert!(std::time::Instant::now() < deadline,
-                    "healthy subject blocked behind another partition's poison");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        runner.quiesce().await.unwrap();
 
-        // Floor must hold below the poison (position 1).
-        let cursor = store.get("poison.block").await.unwrap().unwrap_or(LogCursor::ZERO);
-        let poison_pos = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 1)
-            .await.unwrap()[0].position;
-        assert!(cursor < poison_pos, "floor never passes an unacked poison");
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.event_type == "shipped_notification").count(),
+            1,
+            "the healthy subject processed normally",
+        );
+        let parked = all.iter()
+            .find(|e| e.event_type == REACTION_FAILED_KIND)
+            .expect("built-in terminal fact for the poison");
+        assert_eq!(parked.payload["class"], "poison");
+        assert_eq!(parked.payload["attempts"], 1,
+                   "poison parks on the FIRST attempt — deterministic, no retries");
+        assert_eq!(parked.subject_id, poison_subject,
+                   "terminal fact lands in the poison trigger's subject history");
+        // Floor passed the poison: it is parked work, not pending work.
+        let cursor = store.get("poison.park.builtin").await.unwrap().unwrap();
+        let last = all.last().unwrap().position;
+        assert_eq!(cursor, last, "floor caught up past the parked poison");
         runner.halt();
     }
 
@@ -1808,7 +1951,7 @@ mod tests {
             "always-fails",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_terminal_failure(mapper, 3);
+        ).with_terminal_failure(mapper).with_max_attempts(3);
 
         // Worker retries internally; after 3 attempts the mapper fires,
         // the synthesized fact appends, and the floor advances.
@@ -1872,7 +2015,7 @@ mod tests {
             "drop-on-park",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
-        ).with_terminal_failure(mapper, 2);
+        ).with_terminal_failure(mapper).with_max_attempts(2);
 
         runner.quiesce().await.unwrap();
         assert!(store.get("drop-on-park").await.unwrap().is_some(),
@@ -1886,32 +2029,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_failure_mapper_a_failing_trigger_retries_indefinitely() {
+    async fn unclassified_failure_without_mapper_parks_with_builtin_fact() {
+        // The mandatory terminal path (Primitive 5): no mapper means
+        // the BUILT-IN causal:reaction_failed fact — appended to the
+        // TRIGGER's own subject history so a completion fold over that
+        // subject sees the failure — not retry-forever. (There is no
+        // infinite-retry mode; transient-class backoff is the
+        // sanctioned wait-out-the-outage behavior.)
         let store = Arc::new(MemoryStore::new());
         let payload = OrderPlaced {
             order_id:    Uuid::new_v4(),
             occurred_at: Utc::now(),
         };
-        let _ = append_trigger(&store, &payload);
+        let trigger_id = append_trigger(&store, &payload);
 
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let runner = ReactorRunner::new(
             AlwaysFails(calls.clone()),
-            "no-terminal_failure",
+            "no-mapper-parks",
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         );
 
-        runner.step(10).await.unwrap();
-        // Worker-local retry keeps attempting (with backoff) — no cap.
-        wait_until(5, "at least 3 retry attempts", || {
-            calls.load(Ordering::SeqCst) >= 3
-        }).await;
-        runner.step(10).await.unwrap();
-        // Floor never passes the failing trigger.
-        let cursor = store.get("no-terminal_failure").await.unwrap();
-        assert!(cursor.is_none() || cursor == Some(LogCursor::ZERO),
-                "floor pinned below the failing trigger");
+        runner.quiesce().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst),
+                   crate::engine::DEFAULT_MAX_ATTEMPTS as usize,
+                   "domain policy for unclassified errors: bounded attempts");
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10)
+            .await.unwrap();
+        let parked = all.iter()
+            .find(|e| e.event_type == REACTION_FAILED_KIND)
+            .expect("built-in terminal fact in the log");
+        assert_eq!(parked.category, "order_placed",
+                   "built-in fact adopts the TRIGGER's subject placement");
+        assert_eq!(parked.subject_id, payload.order_id,
+                   "built-in fact adopts the TRIGGER's subject_id");
+        assert_eq!(parked.causation_id, Some(trigger_id));
+        assert_eq!(parked.payload["class"], "unclassified",
+                   "never-classified errors are labeled honestly, not as 'domain'");
+        assert_eq!(parked.payload["consumer"], "no-mapper-parks");
+        assert!(store.get("no-mapper-parks").await.unwrap().is_some(),
+                "floor advanced past the parked trigger");
         runner.halt();
     }
 
@@ -2083,6 +2242,205 @@ mod tests {
                    "one workflow's triggers must never overlap under PerWorkflow");
         assert_eq!(*order.lock(), subjects,
                    "one workflow's triggers process in log order across subjects");
+        runner.halt();
+    }
+
+    // ── BLOCKING-2: the retry taxonomy ──
+
+    /// Fails with the given classification until `until` calls, then
+    /// succeeds (emits one ShippedNotification).
+    struct FailsClassified {
+        class: crate::failure::ErrorClass,
+        until: usize,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Reactor for FailsClassified {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "fails-classified";
+        async fn react(&self, t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= self.until {
+                let e = anyhow!("classified failure on call {n}");
+                return Err(match self.class {
+                    crate::failure::ErrorClass::Transient => crate::failure::transient(e),
+                    crate::failure::ErrorClass::Poison => crate::failure::poison(e),
+                    crate::failure::ErrorClass::Domain => crate::failure::domain(e),
+                });
+            }
+            let mut out = Events::new();
+            out.push(ShippedNotification { order_id: t.order_id });
+            Ok(out)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_retries_past_the_domain_attempt_budget() {
+        // A ten-minute outage must NOT mass-park triggers: transient-
+        // classified failures ignore max_attempts and wait it out under
+        // the liveness ceiling. Here: 10 failures >> budget of 3, then
+        // recovery — the output lands, the mapper never fires.
+        let store = Arc::new(MemoryStore::new());
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+
+        let mapper_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mapper_calls_c = mapper_calls.clone();
+        let mapper: TerminalFailureMapper = std::sync::Arc::new(move |_info| {
+            mapper_calls_c.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = ReactorRunner::new(
+            FailsClassified {
+                class: crate::failure::ErrorClass::Transient,
+                until: 10,
+                calls: calls.clone(),
+            },
+            "r.transient",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_terminal_failure(mapper)
+        .with_max_attempts(3);
+
+        runner.quiesce().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 11, "10 failures + the success");
+        assert_eq!(mapper_calls.load(Ordering::SeqCst), 0,
+                   "transient never consults the domain attempt budget");
+        let outs = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap()
+            .iter()
+            .filter(|e| e.event_type == "shipped_notification")
+            .count();
+        assert_eq!(outs, 1, "the trigger recovered and produced its output");
+        runner.halt();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_exhausts_at_the_liveness_ceiling() {
+        // The ceiling exists because misclassification is inevitable —
+        // an unbounded-transient partition is a silent permanent wedge.
+        // Under virtual time (start_paused), six hours of capped
+        // backoff elapse in milliseconds of real time: the machinery is
+        // testable precisely because the ceiling is liveness time, not
+        // chrono.
+        let store = Arc::new(MemoryStore::new());
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+
+        let seen_class = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let seen_class_c = seen_class.clone();
+        let mapper: TerminalFailureMapper = std::sync::Arc::new(move |info: TerminalFailure| {
+            *seen_class_c.lock() = Some(info.class);
+            None
+        });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = ReactorRunner::new(
+            FailsClassified {
+                class: crate::failure::ErrorClass::Transient,
+                until: usize::MAX, // never recovers
+                calls: calls.clone(),
+            },
+            "r.transient.ceiling",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_terminal_failure(mapper);
+
+        // Drive with virtual-MINUTE polls: the worker's 5s-capped
+        // backoff timers auto-advance between them. (quiesce()'s 2ms
+        // poll would force virtual time forward in 2ms hops — six
+        // hours of those is millions of iterations.)
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while seen_class.lock().is_none() {
+            runner.step(64).await.unwrap();
+            assert!(std::time::Instant::now() < deadline,
+                    "ceiling never fired (real-time guard)");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        runner.quiesce().await.unwrap(); // reap the ack, persist the floor
+        assert_eq!(
+            *seen_class.lock(),
+            Some(crate::failure::FailureClass::TransientExhausted),
+            "parked as transient_exhausted — mass-replayable as a class",
+        );
+        // 6h ceiling / 5s backoff cap ⇒ thousands of attempts, not 3.
+        assert!(calls.load(Ordering::SeqCst) > 1000,
+                "the ceiling is time, not attempts (got {} attempts)",
+                calls.load(Ordering::SeqCst));
+        assert!(store.get("r.transient.ceiling").await.unwrap().is_some(),
+                "floor advanced past the exhausted trigger");
+        runner.halt();
+    }
+
+    #[tokio::test]
+    async fn mapper_receives_class_and_the_triggers_subject_identity() {
+        // BLOCKING-2's mapper contract: the mapper must be able to
+        // stamp its fact with the failing trigger's subject identity
+        // (so completion folds can fold the failure) and see the
+        // declared class.
+        let store = Arc::new(MemoryStore::new());
+        let payload = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        append_trigger(&store, &payload);
+
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let seen_c = seen.clone();
+        let mapper: TerminalFailureMapper = std::sync::Arc::new(move |info: TerminalFailure| {
+            *seen_c.lock() = Some((info.subject.clone(), info.subject_id, info.class));
+            None
+        });
+
+        let runner = ReactorRunner::new(
+            FailsClassified {
+                class: crate::failure::ErrorClass::Domain,
+                until: usize::MAX,
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            "r.domain",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_terminal_failure(mapper)
+        .with_max_attempts(2);
+
+        runner.quiesce().await.unwrap();
+        let (subject, subject_id, class) = seen.lock().clone().expect("mapper fired");
+        assert_eq!(subject, "order_placed", "the trigger's subject placement");
+        assert_eq!(subject_id, payload.order_id, "the trigger's subject_id");
+        assert_eq!(class, crate::failure::FailureClass::Domain,
+                   "a declared-domain park is labeled domain (not unclassified)");
+        runner.halt();
+    }
+
+    #[tokio::test]
+    async fn poison_classified_react_error_parks_on_first_attempt() {
+        // A reactor can declare its OWN error deterministic — parks
+        // immediately, no retry, even without a mapper.
+        let store = Arc::new(MemoryStore::new());
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = ReactorRunner::new(
+            FailsClassified {
+                class: crate::failure::ErrorClass::Poison,
+                until: usize::MAX,
+                calls: calls.clone(),
+            },
+            "r.poison.declared",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+
+        runner.quiesce().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1,
+                   "poison parks on the first attempt — retrying reproduces it");
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 10)
+            .await.unwrap();
+        let parked = all.iter()
+            .find(|e| e.event_type == REACTION_FAILED_KIND)
+            .expect("built-in terminal fact");
+        assert_eq!(parked.payload["class"], "poison");
         runner.halt();
     }
 }

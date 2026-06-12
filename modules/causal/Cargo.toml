@@ -28,5 +28,5 @@ causal_core_macros = { version = "0.8.0", path = "../causal_core_macros", option
 
 [dev-dependencies]
 fastrand.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 trybuild.workspace = true

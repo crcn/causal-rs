@@ -116,6 +116,16 @@ pub trait Reactor: Send + Sync {
     /// reactors that emit across multiple Event enums (e.g. system +
     /// discovery + scheduling).
     ///
+    /// # Classify your errors
+    ///
+    /// Retry policy follows the error's declared class (see
+    /// [`crate::failure`]): `.map_err(causal::transient)` for infra
+    /// blips (waited out under a liveness-time ceiling),
+    /// `causal::poison` for deterministic failures (parks immediately),
+    /// `causal::domain` for meaningful operation failures (bounded
+    /// attempts). Unclassified errors get domain policy and park
+    /// labeled `unclassified`.
+    ///
     /// # Cross-category outputs are the norm
     ///
     /// Output facts do **not** need to share the trigger's category.

@@ -98,6 +98,7 @@ pub mod engine;
 pub mod event_log;
 pub mod event_type;
 pub mod event;
+pub mod failure;
 pub mod multi_projector;
 pub mod projection;
 pub mod projection_runner;
@@ -140,6 +141,7 @@ pub use aggregator::Aggregator;
 pub use projector::Projector;
 pub use multi_projector::MultiProjector;
 pub use reactor::{Events, Ordering, Reactor};
+pub use failure::{domain, poison, transient, ErrorClass, FailureClass};
 
 // Engine + emit
 pub use engine::{
