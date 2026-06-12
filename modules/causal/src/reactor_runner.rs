@@ -110,11 +110,11 @@ pub struct ReactorRunner<R: Reactor> {
     /// reactor-emitted events (not just caller-emitted ones). Separate
     /// from the per-runner `aggregators` clone above.
     engine_aggregators: Option<Arc<AggregatorRegistry>>,
-    /// Shared per-correlation high-water tracker for scoped `Engine::settle`.
+    /// Shared per-workflow high-water tracker for scoped `Engine::settle`.
     /// After appending an output, the runner records the output's position
-    /// under the trigger's `correlation_id` so `settle` knows the run's chain
+    /// under the trigger's `workflow_id` so `settle` knows the run's chain
     /// has advanced. `None` outside an engine (e.g. unit tests).
-    settle_tracker: Option<crate::engine::CorrHighWater>,
+    settle_tracker: Option<crate::engine::WorkflowHighWater>,
     /// Durable snapshot store for aggregate restore-before-fold (per-consumer
     /// registry) and save-after-output-fold (shared engine registry).
     /// `None` = no durable restore.
@@ -204,9 +204,9 @@ where
         self
     }
 
-    /// Attach the shared per-correlation high-water tracker so appended
+    /// Attach the shared per-workflow high-water tracker so appended
     /// outputs advance their run's `settle` mark.
-    pub(crate) fn with_settle_tracker(mut self, tracker: crate::engine::CorrHighWater) -> Self {
+    pub(crate) fn with_settle_tracker(mut self, tracker: crate::engine::WorkflowHighWater) -> Self {
         self.settle_tracker = Some(tracker);
         self
     }
@@ -262,7 +262,7 @@ where
             obs.reactor_terminal_failure(
                 event.event_id,
                 &self.consumer_id,
-                event.correlation_id,
+                event.workflow_id,
                 attempts,
                 &error,
                 completed_at,
@@ -274,7 +274,7 @@ where
             trigger_event_type: event.event_type.clone(),
             error,
             attempts,
-            correlation_id:    event.correlation_id,
+            workflow_id:    event.workflow_id,
         };
         // terminal-failure-synthesized output (if any) is appended directly to its own
         // stream. `output_index = u32::MAX` keeps its deterministic id
@@ -289,7 +289,7 @@ where
             let out_event = EventData {
                 event_id: derive_output_event_id(&self.consumer_id, event.event_id, u32::MAX),
                 causation_id: Some(event.event_id),
-                correlation_id: event.correlation_id,
+                workflow_id: event.workflow_id,
                 event_type: event_type.clone(),
                 payload: payload.clone(),
                 created_at: chrono::Utc::now(),
@@ -304,7 +304,7 @@ where
                 .append_to_stream(&cat, sid, StreamState::Any, vec![out_event])
                 .await?;
             if let Some(tracker) = &self.settle_tracker {
-                tracker.lock().unwrap().bump(event.correlation_id, write.position);
+                tracker.lock().unwrap().bump(event.workflow_id, write.position);
             }
             if let Some(reg) = &self.engine_aggregators {
                 crate::aggregator::fold_event(
@@ -370,7 +370,7 @@ where
                         reg.notify_observer(
                             &outcome.snapshots,
                             obs.as_ref(),
-                            event.correlation_id,
+                            event.workflow_id,
                             event.position,
                             event.event_id,
                         );
@@ -419,7 +419,7 @@ where
                 obs.reactor_started(
                     event.event_id,
                     &self.consumer_id,
-                    event.correlation_id,
+                    event.workflow_id,
                     attempt_seq,
                     started_at,
                 );
@@ -428,7 +428,7 @@ where
                 // return `None` and the observer hook is skipped.
                 if let Some(descr) = self.reactor.describe(&trigger) {
                     obs.reactor_description(
-                        event.correlation_id,
+                        event.workflow_id,
                         event.position,
                         event.event_id,
                         &self.consumer_id,
@@ -446,7 +446,7 @@ where
                 event_id:       event.event_id,
                 log_position:   event.position,
                 occurred_at:    trigger.occurred_at().unwrap_or(event.created_at),
-                correlation_id: event.correlation_id,
+                workflow_id: event.workflow_id,
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
                 logs:           Some(&log_sink),
@@ -469,7 +469,7 @@ where
                         obs.reactor_completed(
                             event.event_id,
                             &self.consumer_id,
-                            event.correlation_id,
+                            event.workflow_id,
                             attempt_seq,
                             started_at,
                             completed_at,
@@ -505,7 +505,7 @@ where
                         obs.reactor_failed(
                             event.event_id,
                             &self.consumer_id,
-                            event.correlation_id,
+                            event.workflow_id,
                             attempts,
                             started_at,
                             completed_at,
@@ -558,7 +558,7 @@ where
                         &self.consumer_id, event.event_id, idx as u32,
                     ),
                     causation_id: Some(event.event_id),
-                    correlation_id: event.correlation_id,
+                    workflow_id: event.workflow_id,
                     event_type: out.durable_name.clone(),
                     payload: out.payload.clone(),
                     created_at: chrono::Utc::now(),
@@ -576,10 +576,10 @@ where
                     )
                     .await?;
                 // Advance this run's scoped-settle high-water: the output
-                // inherits the trigger's correlation_id, so it belongs to the
+                // inherits the trigger's workflow_id, so it belongs to the
                 // same chain.
                 if let Some(tracker) = &self.settle_tracker {
-                    tracker.lock().unwrap().bump(event.correlation_id, write.position);
+                    tracker.lock().unwrap().bump(event.workflow_id, write.position);
                 }
                 // Fold the output into the shared engine registry. The
                 // fold is idempotent on stream coordinates, so a
@@ -711,7 +711,7 @@ mod tests {
         let ev = EventData {
             event_id,
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      format!("{}:{}", <OrderPlaced as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
@@ -837,21 +837,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactor_output_propagates_trigger_correlation_id() {
-        // The whole point of correlation_id propagation: a fact
+    async fn reactor_output_propagates_trigger_workflow_id() {
+        // The whole point of workflow_id propagation: a fact
         // emitted in response to a trigger should carry the trigger's
-        // correlation_id so cross-system tracing chains through the
+        // workflow_id so cross-system tracing chains through the
         // reactor.
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
         let trigger_event_id = append_trigger(&store, &trigger);
 
-        // Read the persisted event to get the correlation_id the helper
+        // Read the persisted event to get the workflow_id the helper
         // generated.
         let persisted = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
-        let trigger_correlation = persisted[0].correlation_id;
+        let trigger_correlation = persisted[0].workflow_id;
 
         let runner = ReactorRunner::new(
             EmitOne,
@@ -862,7 +862,7 @@ mod tests {
         runner.step(10).await.unwrap();
 
         // The output is appended directly to the log and carries the
-        // trigger's correlation_id (cross-system tracing chains through
+        // trigger's workflow_id (cross-system tracing chains through
         // the reactor) + the trigger as its causation_id.
         let all_events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
@@ -870,8 +870,8 @@ mod tests {
         let output_event = all_events.iter()
             .find(|e| e.event_type == "shipping:shipped_notification")
             .expect("reactor output present in log");
-        assert_eq!(output_event.correlation_id, trigger_correlation,
-                   "output MUST carry trigger's correlation_id");
+        assert_eq!(output_event.workflow_id, trigger_correlation,
+                   "output MUST carry trigger's workflow_id");
         assert_eq!(output_event.causation_id, Some(trigger_event_id),
                    "output's causation_id MUST be the trigger's event_id");
     }
@@ -1008,7 +1008,7 @@ mod tests {
         let foreign = EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      "other.thing".into(),
             payload:         serde_json::json!({}),
             created_at:      Utc::now(),
@@ -1133,7 +1133,7 @@ mod tests {
         let foreign = EventData {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
-            correlation_id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
             // Same prefix bytes as "order", different category.
             event_type:     "orders:created".into(),
             payload:        serde_json::json!({ "name": "not an OrderPlaced" }),
@@ -1184,7 +1184,7 @@ mod tests {
         let poison = EventData {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
-            correlation_id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
             event_type:     "order:placed".into(),
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
@@ -1242,7 +1242,7 @@ mod tests {
         let poison = EventData {
             event_id:       Uuid::new_v4(),
             causation_id:   None,
-            correlation_id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
             event_type:     "order:placed".into(),
             payload:        serde_json::json!({ "not": "an order" }),
             created_at:     Utc::now(),
@@ -1350,14 +1350,14 @@ mod tests {
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mapper_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mapper_calls_c = mapper_calls.clone();
-        // Capture the correlation_id the mapper is handed, so we can assert the
+        // Capture the workflow_id the mapper is handed, so we can assert the
         // mapper can see the failing trigger's run (per-run terminal-failure keying).
         let seen_corr = std::sync::Arc::new(std::sync::Mutex::new(None::<Uuid>));
         let seen_corr_c = seen_corr.clone();
 
         let mapper: TerminalFailureMapper = std::sync::Arc::new(move |info: TerminalFailure| {
             mapper_calls_c.fetch_add(1, Ordering::SeqCst);
-            *seen_corr_c.lock().unwrap() = Some(info.correlation_id);
+            *seen_corr_c.lock().unwrap() = Some(info.workflow_id);
             Some(Box::new(HandlerFailed {
                 consumer: info.consumer,
                 attempts:   info.attempts,
@@ -1403,7 +1403,7 @@ mod tests {
             "terminal-failure output uses u32::MAX for its deterministic id",
         );
 
-        // The terminal-failure fact inherits the trigger's correlation_id — without
+        // The terminal-failure fact inherits the trigger's workflow_id — without
         // this, a failing reactor's downstream "HandlerFailed" would be
         // untraceable back to the trigger (the causal-chain debugging
         // story rootsignal depends on).
@@ -1412,16 +1412,16 @@ mod tests {
             .find(|e| e.event_id == trigger_id)
             .expect("trigger in log");
         assert_eq!(
-            terminal_failure.correlation_id, trigger.correlation_id,
-            "terminal-failure-synthesized fact MUST inherit trigger correlation_id",
+            terminal_failure.workflow_id, trigger.workflow_id,
+            "terminal-failure-synthesized fact MUST inherit trigger workflow_id",
         );
 
-        // TerminalFailure exposes that same correlation_id to the mapper, so a mapper
+        // TerminalFailure exposes that same workflow_id to the mapper, so a mapper
         // can key its terminal-failure event per-run (rootsignal's use case).
         let seen = seen_corr.lock().unwrap().expect("mapper ran");
         assert_eq!(
-            seen, trigger.correlation_id,
-            "TerminalFailure.correlation_id MUST be the failing trigger's run",
+            seen, trigger.workflow_id,
+            "TerminalFailure.workflow_id MUST be the failing trigger's run",
         );
 
         // Cursor is past the failing trigger — the runner is done with

@@ -69,13 +69,13 @@ async fn connect_local() -> PgPool {
         .expect("connect local postgres")
 }
 
-/// Each test isolates its rows by using a unique correlation_id and
+/// Each test isolates its rows by using a unique workflow_id and
 /// filtering on it. Avoids TRUNCATE (which would race other tests).
-fn make_event(correlation_id: Uuid, event_type: &str) -> EventData {
+fn make_event(workflow_id: Uuid, event_type: &str) -> EventData {
     EventData {
         event_id: Uuid::new_v4(),
         causation_id: None,
-        correlation_id,
+        workflow_id,
         event_type: event_type.to_string(),
         payload: serde_json::json!({}),
         created_at: Utc::now(),
@@ -95,8 +95,8 @@ async fn append_is_idempotent_on_event_id_c1() -> Result<()> {
 
     // Two appends with the same event_id should collapse to one row,
     // and both calls should return the same position.
-    let correlation = Uuid::new_v4();
-    let mut event = make_event(correlation, "test:c1");
+    let workflow = Uuid::new_v4();
+    let mut event = make_event(workflow, "test:c1");
     let event_id = event.event_id;
 
     let first = causal::append_event(&backend, event.clone()).await?;
@@ -125,7 +125,7 @@ async fn append_is_idempotent_on_event_id_c1() -> Result<()> {
 
     // Cleanup.
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())
@@ -137,7 +137,7 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
     let pool = connect_local().await;
     let backend = PgEventLogBackend::new(pool.clone());
 
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
     let stream_id = Uuid::new_v4();
 
     // Initial append at NoStream → lands at revision 0.
@@ -146,7 +146,7 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
             "order",
             stream_id,
             StreamState::NoStream,
-            vec![make_event(correlation, "test:order_placed")],
+            vec![make_event(workflow, "test:order_placed")],
         )
         .await?;
     assert_eq!(r1.revision, StreamRevision::ZERO);
@@ -157,7 +157,7 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
             "order",
             stream_id,
             StreamState::NoStream,
-            vec![make_event(correlation, "test:order_updated")],
+            vec![make_event(workflow, "test:order_updated")],
         )
         .await;
     assert!(stale.is_err(), "stale expected_version must error");
@@ -175,13 +175,13 @@ async fn append_to_stream_enforces_occ_c6() -> Result<()> {
             "order",
             stream_id,
             StreamState::StreamRevision(0),
-            vec![make_event(correlation, "test:order_updated")],
+            vec![make_event(workflow, "test:order_updated")],
         )
         .await?;
     assert_eq!(r2.revision, StreamRevision::from_raw(1));
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())
@@ -193,10 +193,10 @@ async fn read_all_returns_events_in_position_order() -> Result<()> {
     let pool = connect_local().await;
     let backend = PgEventLogBackend::new(pool.clone());
 
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
     let mut positions = Vec::new();
     for i in 0..5 {
-        let r = causal::append_event(&backend, make_event(correlation, &format!("test:n{}", i)))
+        let r = causal::append_event(&backend, make_event(workflow, &format!("test:n{}", i)))
             .await?;
         positions.push(r.position);
     }
@@ -207,7 +207,7 @@ async fn read_all_returns_events_in_position_order() -> Result<()> {
 
     let our_events: Vec<_> = loaded
         .iter()
-        .filter(|e| e.correlation_id == correlation)
+        .filter(|e| e.workflow_id == workflow)
         .collect();
     assert_eq!(our_events.len(), 5);
 
@@ -221,7 +221,7 @@ async fn read_all_returns_events_in_position_order() -> Result<()> {
     }
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())
@@ -253,8 +253,8 @@ async fn append_queues_behind_the_advisory_lock() -> Result<()> {
         .await?;
 
     // A concurrent append must now block on the same lock.
-    let correlation = Uuid::new_v4();
-    let event = make_event(correlation, "test:lock_queue");
+    let workflow = Uuid::new_v4();
+    let event = make_event(workflow, "test:lock_queue");
     let b2 = Arc::clone(&backend);
     let pending = tokio::spawn(async move { causal::append_event(&*b2, event).await });
 
@@ -270,7 +270,7 @@ async fn append_queues_behind_the_advisory_lock() -> Result<()> {
     assert!(result.position > LogCursor::ZERO, "queued append landed after release");
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())
@@ -286,7 +286,7 @@ async fn concurrent_appends_serialize_and_both_land() -> Result<()> {
     let pool = connect_local().await;
     let backend = Arc::new(PgEventLogBackend::new(pool.clone()));
 
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
     let before = backend.latest_position().await?;
 
     let spawn_append = |stream_id: Uuid, event: EventData| {
@@ -296,8 +296,8 @@ async fn concurrent_appends_serialize_and_both_land() -> Result<()> {
                 .await
         })
     };
-    let e1 = make_event(correlation, "test:racer_a");
-    let e2 = make_event(correlation, "test:racer_b");
+    let e1 = make_event(workflow, "test:racer_a");
+    let e2 = make_event(workflow, "test:racer_b");
     let (id1, id2) = (e1.event_id, e2.event_id);
     let h1 = spawn_append(Uuid::new_v4(), e1);
     let h2 = spawn_append(Uuid::new_v4(), e2);
@@ -311,7 +311,7 @@ async fn concurrent_appends_serialize_and_both_land() -> Result<()> {
     let visible = backend.read_all(before, 10_000).await?;
     let ours: Vec<_> = visible
         .iter()
-        .filter(|e| e.correlation_id == correlation)
+        .filter(|e| e.workflow_id == workflow)
         .collect();
     assert_eq!(ours.len(), 2, "both concurrent appends must be tailable");
     assert!(
@@ -325,7 +325,7 @@ async fn concurrent_appends_serialize_and_both_land() -> Result<()> {
     );
 
     sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())
@@ -343,18 +343,18 @@ async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
     let pool = connect_local().await;
     let backend = Arc::new(PgEventLogBackend::new(pool.clone()));
 
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
 
     // Our events visible at or below position `p`, by raw SQL (scoped to
-    // this test's correlation so other writers on a shared DB can't
+    // this test's workflow so other writers on a shared DB can't
     // perturb the assertion).
-    async fn ours_at_or_below(pool: &PgPool, correlation: Uuid, p: i64) -> Result<Vec<Uuid>> {
+    async fn ours_at_or_below(pool: &PgPool, workflow: Uuid, p: i64) -> Result<Vec<Uuid>> {
         Ok(sqlx::query_scalar(
             "SELECT event_id FROM causal_log
               WHERE correlation_id = $1 AND position <= $2
               ORDER BY position",
         )
-        .bind(correlation)
+        .bind(workflow)
         .bind(p)
         .fetch_all(pool)
         .await?)
@@ -366,7 +366,7 @@ async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
             let b = Arc::clone(&backend);
             let stream_id = Uuid::new_v4();
             let events: Vec<EventData> =
-                (0..10).map(|_| make_event(correlation, "test:hwm")).collect();
+                (0..10).map(|_| make_event(workflow, "test:hwm")).collect();
             tokio::spawn(async move {
                 let mut expected = StreamState::NoStream;
                 for event in events {
@@ -384,7 +384,7 @@ async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
     let mut samples: Vec<(i64, Vec<Uuid>)> = Vec::new();
     while !handles.iter().all(|h| h.is_finished()) {
         let head = backend.latest_position().await?.raw() as i64;
-        let seen = ours_at_or_below(&pool, correlation, head).await?;
+        let seen = ours_at_or_below(&pool, workflow, head).await?;
         samples.push((head, seen));
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -395,7 +395,7 @@ async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
     // After everything committed, every snapshot must still hold: no
     // event materialized at or below a previously observed head.
     for (head, seen_then) in &samples {
-        let seen_now = ours_at_or_below(&pool, correlation, *head).await?;
+        let seen_now = ours_at_or_below(&pool, workflow, *head).await?;
         assert_eq!(
             &seen_now, seen_then,
             "events appeared at or below an observed latest_position ({head}) \
@@ -403,8 +403,8 @@ async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
         );
     }
 
-    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+    sqlx::query("DELETE FROM causal_log WHERE workflow_id = $1")
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())
@@ -416,7 +416,7 @@ async fn read_stream_partitions_by_aggregate() -> Result<()> {
     let pool = connect_local().await;
     let backend = PgEventLogBackend::new(pool.clone());
 
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
     let agg_a = Uuid::new_v4();
     let agg_b = Uuid::new_v4();
 
@@ -430,7 +430,7 @@ async fn read_stream_partitions_by_aggregate() -> Result<()> {
         (agg_a, Some(1u64)),
         (agg_b, Some(0u64)),
     ] {
-        let event = make_event(correlation, "test:stream_event");
+        let event = make_event(workflow, "test:stream_event");
         let expected = match prev {
             None => StreamState::NoStream,
             Some(r) => StreamState::StreamRevision(r),
@@ -455,8 +455,8 @@ async fn read_stream_partitions_by_aggregate() -> Result<()> {
         assert_eq!(e.revision, StreamRevision::from_raw(i as u64));
     }
 
-    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+    sqlx::query("DELETE FROM causal_log WHERE workflow_id = $1")
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())
@@ -468,8 +468,8 @@ async fn latest_position_reports_max() -> Result<()> {
     let pool = connect_local().await;
     let backend = PgEventLogBackend::new(pool.clone());
 
-    let correlation = Uuid::new_v4();
-    let r = causal::append_event(&backend, make_event(correlation, "test:latest"))
+    let workflow = Uuid::new_v4();
+    let r = causal::append_event(&backend, make_event(workflow, "test:latest"))
         .await?;
 
     let latest = backend.latest_position().await?;
@@ -478,8 +478,8 @@ async fn latest_position_reports_max() -> Result<()> {
         "latest_position must be >= the position we just wrote (other concurrent writers may push it higher)"
     );
 
-    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
-        .bind(correlation)
+    sqlx::query("DELETE FROM causal_log WHERE workflow_id = $1")
+        .bind(workflow)
         .execute(&pool)
         .await?;
     Ok(())

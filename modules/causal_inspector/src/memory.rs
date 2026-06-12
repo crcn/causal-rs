@@ -25,7 +25,7 @@ fn to_stored(e: &causal::types::RecordedEvent) -> StoredEvent {
         payload: e.payload.clone(),
         id: Some(e.event_id),
         causation_id: e.causation_id,
-        correlation_id: Some(e.correlation_id),
+        workflow_id: Some(e.workflow_id),
         reactor_id: e
             .metadata
             .get("reactor_id")
@@ -64,9 +64,9 @@ impl InspectorReadModel for MemoryStore {
                         return false;
                     }
                 }
-                // Correlation ID filter
-                if let Some(ref cid) = query.correlation_id {
-                    if e.correlation_id.to_string() != *cid {
+                // Workflow ID filter
+                if let Some(ref cid) = query.workflow_id {
+                    if e.workflow_id.to_string() != *cid {
                         return false;
                     }
                 }
@@ -83,7 +83,7 @@ impl InspectorReadModel for MemoryStore {
                     let payload_str = serde_json::to_string(&e.payload).unwrap_or_default();
                     let matches = e.event_type.to_lowercase().contains(&search_lower)
                         || payload_str.to_lowercase().contains(&search_lower)
-                        || e.correlation_id
+                        || e.workflow_id
                             .to_string()
                             .to_lowercase()
                             .contains(&search_lower);
@@ -111,19 +111,19 @@ impl InspectorReadModel for MemoryStore {
     async fn causal_tree(&self, seq: i64) -> Result<(Vec<StoredEvent>, i64)> {
         let log = self.global_log();
 
-        // Find the target event's correlation_id
-        let correlation_id = log
+        // Find the target event's workflow_id
+        let workflow_id = log
             .iter()
             .find(|e| e.position.raw() as i64 == seq)
-            .map(|e| e.correlation_id);
+            .map(|e| e.workflow_id);
 
-        let Some(cid) = correlation_id else {
+        let Some(cid) = workflow_id else {
             return Ok((vec![], seq));
         };
 
         let events: Vec<StoredEvent> = log
             .iter()
-            .filter(|e| e.correlation_id == cid)
+            .filter(|e| e.workflow_id == cid)
             .map(to_stored)
             .collect();
 
@@ -136,14 +136,14 @@ impl InspectorReadModel for MemoryStore {
         Ok((events, root_seq))
     }
 
-    async fn causal_flow(&self, correlation_id: &str) -> Result<Vec<StoredEvent>> {
-        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+    async fn causal_flow(&self, workflow_id: &str) -> Result<Vec<StoredEvent>> {
+        let Ok(cid) = Uuid::parse_str(workflow_id) else {
             return Ok(vec![]);
         };
         let log = self.global_log();
         Ok(log
             .iter()
-            .filter(|e| e.correlation_id == cid)
+            .filter(|e| e.workflow_id == cid)
             .map(to_stored)
             .collect())
     }
@@ -179,18 +179,18 @@ impl InspectorReadModel for MemoryStore {
             .collect())
     }
 
-    async fn reactor_logs_by_correlation(
+    async fn reactor_logs_by_workflow(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorLogEntry>> {
-        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+        let Ok(cid) = Uuid::parse_str(workflow_id) else {
             return Ok(vec![]);
         };
-        // Build set of event IDs in this correlation
+        // Build set of event IDs in this workflow
         let event_ids: std::collections::HashSet<Uuid> = {
             let log = self.global_log();
             log.iter()
-                .filter(|e| e.correlation_id == cid)
+                .filter(|e| e.workflow_id == cid)
                 .map(|e| e.event_id)
                 .collect()
         };
@@ -209,12 +209,12 @@ impl InspectorReadModel for MemoryStore {
             .collect())
     }
 
-    async fn reactor_outcomes(&self, correlation_id: &str) -> Result<Vec<ReactorOutcomeEntry>> {
-        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+    async fn reactor_outcomes(&self, workflow_id: &str) -> Result<Vec<ReactorOutcomeEntry>> {
+        let Ok(cid) = Uuid::parse_str(workflow_id) else {
             return Ok(vec![]);
         };
 
-        // Group executions by reactor_id for this correlation
+        // Group executions by reactor_id for this workflow
         let mut by_reactor: std::collections::HashMap<
             String,
             (String, Option<String>, i32, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Vec<String>),
@@ -269,9 +269,9 @@ impl InspectorReadModel for MemoryStore {
 
     async fn reactor_attempt_history(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorAttemptEntry>> {
-        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+        let Ok(cid) = Uuid::parse_str(workflow_id) else {
             return Ok(vec![]);
         };
         let history = self.reactor_attempt_history().lock();
@@ -282,7 +282,7 @@ impl InspectorReadModel for MemoryStore {
                 ReactorAttemptEntry {
                     event_id: *event_id,
                     reactor_id: reactor_id.clone(),
-                    correlation_id: corr_id.to_string(),
+                    workflow_id: corr_id.to_string(),
                     attempt: *attempt,
                     status: status.clone(),
                     error: error.clone(),
@@ -297,9 +297,9 @@ impl InspectorReadModel for MemoryStore {
 
     async fn reactor_descriptions(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorDescriptionEntry>> {
-        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+        let Ok(cid) = Uuid::parse_str(workflow_id) else {
             return Ok(vec![]);
         };
 
@@ -327,9 +327,9 @@ impl InspectorReadModel for MemoryStore {
 
     async fn reactor_description_snapshots(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorDescriptionSnapshotEntry>> {
-        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+        let Ok(cid) = Uuid::parse_str(workflow_id) else {
             return Ok(vec![]);
         };
 
@@ -353,9 +353,9 @@ impl InspectorReadModel for MemoryStore {
 
     async fn aggregate_state_timeline(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<AggregateStateSnapshotEntry>> {
-        let Ok(cid) = Uuid::parse_str(correlation_id) else {
+        let Ok(cid) = Uuid::parse_str(workflow_id) else {
             return Ok(vec![]);
         };
 
@@ -363,7 +363,7 @@ impl InspectorReadModel for MemoryStore {
         let event_types: std::collections::HashMap<Uuid, String> = {
             let log = self.global_log();
             log.iter()
-                .filter(|e| e.correlation_id == cid)
+                .filter(|e| e.workflow_id == cid)
                 .map(|e| (e.event_id, e.event_type.clone()))
                 .collect()
         };
@@ -390,7 +390,7 @@ impl InspectorReadModel for MemoryStore {
         Ok(result)
     }
 
-    async fn list_correlations(
+    async fn list_workflows(
         &self,
         search: Option<&str>,
         limit: usize,
@@ -398,18 +398,18 @@ impl InspectorReadModel for MemoryStore {
     ) -> Result<Vec<CorrelationSummaryEntry>> {
         let log = self.global_log();
 
-        // Group events by correlation_id, skipping nil UUIDs
+        // Group events by workflow_id, skipping nil UUIDs
         let mut by_corr: std::collections::HashMap<
             Uuid,
             (i64, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, String),
         > = std::collections::HashMap::new();
 
         for e in log.iter() {
-            if e.correlation_id.is_nil() {
+            if e.workflow_id.is_nil() {
                 continue;
             }
             let entry = by_corr
-                .entry(e.correlation_id)
+                .entry(e.workflow_id)
                 .or_insert_with(|| (0, e.created_at, e.created_at, String::new()));
             entry.0 += 1;
             if e.created_at < entry.1 {
@@ -425,7 +425,7 @@ impl InspectorReadModel for MemoryStore {
         }
 
         // Check for errors via reactor_executions
-        let error_correlations: std::collections::HashSet<Uuid> = self
+        let error_workflows: std::collections::HashSet<Uuid> = self
             .reactor_executions()
             .iter()
             .filter(|entry| {
@@ -452,12 +452,12 @@ impl InspectorReadModel for MemoryStore {
             })
             .map(|(cid, (count, first_ts, last_ts, root_event_type))| {
                 CorrelationSummaryEntry {
-                    correlation_id: cid.to_string(),
+                    workflow_id: cid.to_string(),
                     event_count: count,
                     first_ts,
                     last_ts,
                     root_event_type,
-                    has_errors: error_correlations.contains(&cid),
+                    has_errors: error_workflows.contains(&cid),
                 }
             })
             .collect();
@@ -571,7 +571,7 @@ impl InspectorReadModel for MemoryStore {
                     event_id: *event_id,
                     event_type: event_type.clone(),
                     ts: *ts,
-                    correlation_id: corr_id.to_string(),
+                    workflow_id: corr_id.to_string(),
                     aggregate_key: key.clone(),
                     state: state.clone(),
                 })

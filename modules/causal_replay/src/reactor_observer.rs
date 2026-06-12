@@ -29,14 +29,14 @@ mod pg {
         Started {
             event_id: Uuid,
             reactor_id: String,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             attempt: i32,
             started_at: DateTime<Utc>,
         },
         Finished {
             event_id: Uuid,
             reactor_id: String,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             attempt: i32,
             status: &'static str,
             error: Option<String>,
@@ -47,7 +47,7 @@ mod pg {
         Dlq {
             event_id: Uuid,
             reactor_id: String,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             attempts: i32,
             error: String,
             at: DateTime<Utc>,
@@ -55,13 +55,13 @@ mod pg {
         Aggregate {
             event_id: Uuid,
             aggregate_key: String,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             state: Value,
         },
         Description {
             event_id: Uuid,
             reactor_id: String,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             description: Value,
         },
     }
@@ -99,14 +99,14 @@ mod pg {
             &self,
             event_id: Uuid,
             reactor_id: &str,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             attempt: u32,
             started_at: DateTime<Utc>,
         ) {
             self.send(Rec::Started {
                 event_id,
                 reactor_id: reactor_id.to_string(),
-                correlation_id,
+                workflow_id,
                 attempt: attempt as i32,
                 started_at,
             });
@@ -116,7 +116,7 @@ mod pg {
             &self,
             event_id: Uuid,
             reactor_id: &str,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             attempt: u32,
             started_at: DateTime<Utc>,
             completed_at: DateTime<Utc>,
@@ -125,7 +125,7 @@ mod pg {
             self.send(Rec::Finished {
                 event_id,
                 reactor_id: reactor_id.to_string(),
-                correlation_id,
+                workflow_id,
                 attempt: attempt as i32,
                 status: "completed",
                 error: None,
@@ -139,7 +139,7 @@ mod pg {
             &self,
             event_id: Uuid,
             reactor_id: &str,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             attempt: u32,
             started_at: DateTime<Utc>,
             completed_at: DateTime<Utc>,
@@ -149,7 +149,7 @@ mod pg {
             self.send(Rec::Finished {
                 event_id,
                 reactor_id: reactor_id.to_string(),
-                correlation_id,
+                workflow_id,
                 attempt: attempt as i32,
                 status: "failed",
                 error: Some(error.to_string()),
@@ -163,7 +163,7 @@ mod pg {
             &self,
             event_id: Uuid,
             reactor_id: &str,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             attempts: u32,
             error: &str,
             at: DateTime<Utc>,
@@ -171,7 +171,7 @@ mod pg {
             self.send(Rec::Dlq {
                 event_id,
                 reactor_id: reactor_id.to_string(),
-                correlation_id,
+                workflow_id,
                 attempts: attempts as i32,
                 error: error.to_string(),
                 at,
@@ -180,7 +180,7 @@ mod pg {
 
         fn aggregate_folded(
             &self,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             _position: LogCursor,
             event_id: Uuid,
             aggregate_key: &str,
@@ -189,14 +189,14 @@ mod pg {
             self.send(Rec::Aggregate {
                 event_id,
                 aggregate_key: aggregate_key.to_string(),
-                correlation_id,
+                workflow_id,
                 state,
             });
         }
 
         fn reactor_description(
             &self,
-            correlation_id: Uuid,
+            workflow_id: Uuid,
             _position: LogCursor,
             event_id: Uuid,
             reactor_id: &str,
@@ -205,7 +205,7 @@ mod pg {
             self.send(Rec::Description {
                 event_id,
                 reactor_id: reactor_id.to_string(),
-                correlation_id,
+                workflow_id,
                 description,
             });
         }
@@ -231,18 +231,18 @@ mod pg {
         let mut tx = pool.begin().await?;
         for rec in batch {
             match rec {
-                Rec::Started { event_id, reactor_id, correlation_id, attempt, started_at } => {
+                Rec::Started { event_id, reactor_id, workflow_id, attempt, started_at } => {
                     sqlx::query(
                         "INSERT INTO causal_reactor_executions
                             (event_id, reactor_id, attempt, correlation_id, status, started_at)
                          VALUES ($1, $2, $3, $4, 'running', $5)
                          ON CONFLICT (event_id, reactor_id, attempt) DO NOTHING",
                     )
-                    .bind(event_id).bind(reactor_id).bind(attempt).bind(correlation_id).bind(started_at)
+                    .bind(event_id).bind(reactor_id).bind(attempt).bind(workflow_id).bind(started_at)
                     .execute(&mut *tx).await?;
                 }
                 Rec::Finished {
-                    event_id, reactor_id, correlation_id, attempt, status, error, started_at, completed_at, logs,
+                    event_id, reactor_id, workflow_id, attempt, status, error, started_at, completed_at, logs,
                 } => {
                     sqlx::query(
                         "INSERT INTO causal_reactor_executions
@@ -253,7 +253,7 @@ mod pg {
                                error = EXCLUDED.error,
                                completed_at = EXCLUDED.completed_at",
                     )
-                    .bind(event_id).bind(reactor_id).bind(attempt).bind(correlation_id)
+                    .bind(event_id).bind(reactor_id).bind(attempt).bind(workflow_id)
                     .bind(status).bind(error).bind(started_at).bind(completed_at)
                     .execute(&mut *tx).await?;
 
@@ -264,12 +264,12 @@ mod pg {
                              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                              ON CONFLICT (event_id, reactor_id, attempt, ord) DO NOTHING",
                         )
-                        .bind(event_id).bind(reactor_id).bind(attempt).bind(ord as i32).bind(correlation_id)
+                        .bind(event_id).bind(reactor_id).bind(attempt).bind(ord as i32).bind(workflow_id)
                         .bind(level_str(&log.level)).bind(&log.message).bind(&log.data).bind(log.timestamp)
                         .execute(&mut *tx).await?;
                     }
                 }
-                Rec::Dlq { event_id, reactor_id, correlation_id, attempts, error, at } => {
+                Rec::Dlq { event_id, reactor_id, workflow_id, attempts, error, at } => {
                     sqlx::query(
                         "INSERT INTO causal_reactor_executions
                             (event_id, reactor_id, attempt, correlation_id, status, error, started_at, completed_at)
@@ -279,27 +279,27 @@ mod pg {
                                error = EXCLUDED.error,
                                completed_at = EXCLUDED.completed_at",
                     )
-                    .bind(event_id).bind(reactor_id).bind(attempts).bind(correlation_id).bind(error).bind(at)
+                    .bind(event_id).bind(reactor_id).bind(attempts).bind(workflow_id).bind(error).bind(at)
                     .execute(&mut *tx).await?;
                 }
-                Rec::Aggregate { event_id, aggregate_key, correlation_id, state } => {
+                Rec::Aggregate { event_id, aggregate_key, workflow_id, state } => {
                     sqlx::query(
                         "INSERT INTO causal_aggregate_snapshots
                             (event_id, aggregate_key, correlation_id, state)
                          VALUES ($1, $2, $3, $4)
                          ON CONFLICT (event_id, aggregate_key) DO NOTHING",
                     )
-                    .bind(event_id).bind(aggregate_key).bind(correlation_id).bind(state)
+                    .bind(event_id).bind(aggregate_key).bind(workflow_id).bind(state)
                     .execute(&mut *tx).await?;
                 }
-                Rec::Description { event_id, reactor_id, correlation_id, description } => {
+                Rec::Description { event_id, reactor_id, workflow_id, description } => {
                     sqlx::query(
                         "INSERT INTO causal_reactor_descriptions
                             (event_id, reactor_id, correlation_id, description)
                          VALUES ($1, $2, $3, $4)
                          ON CONFLICT (event_id, reactor_id) DO NOTHING",
                     )
-                    .bind(event_id).bind(reactor_id).bind(correlation_id).bind(description)
+                    .bind(event_id).bind(reactor_id).bind(workflow_id).bind(description)
                     .execute(&mut *tx).await?;
                 }
             }

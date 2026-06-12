@@ -140,23 +140,23 @@ where
 /// downstream `settle(result)` waits for any pre-existing pending
 /// work to drain.
 ///
-/// `correlation_id` is the chain id stamped on every fact in the
+/// `workflow_id` is the chain id stamped on every fact in the
 /// batch. Clients use it to poll workflow-status projections;
 /// tests use it to scope reads (`engine.state_of::<A>(corr_id).await.unwrap()`)
 /// and waits (`engine.settled()`) to a single chain. Auto-generated
-/// per emit unless the caller set it via `EmitBuilder::correlation_id`.
+/// per emit unless the caller set it via `EmitBuilder::workflow_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmitResult {
     pub position:       LogCursor,
-    pub correlation_id: Uuid,
+    pub workflow_id: Uuid,
 }
 
-/// In-process per-correlation high-water mark for scoped [`Engine::settle`].
+/// In-process per-workflow high-water mark for scoped [`Engine::settle`].
 ///
-/// Tracks, per `correlation_id`, the highest `$all` position of any event in
+/// Tracks, per `workflow_id`, the highest `$all` position of any event in
 /// that run's causal chain — seeded floor-wise by the emit position and bumped
 /// by each reactor runner as it appends an output (outputs inherit the
-/// trigger's `correlation_id`, so the whole chain shares one key). `settle`
+/// trigger's `workflow_id`, so the whole chain shares one key). `settle`
 /// reads it to wait only for *its* run to drain, not for global log quiescence.
 ///
 /// Bounded: an entry is created lazily (first output for a run) and removed when
@@ -169,7 +169,7 @@ pub(crate) struct SettleTracker {
     hw:  std::collections::HashMap<Uuid, LogCursor>,
 }
 
-/// Cap on tracked in-flight correlations. Generous — never approached when
+/// Cap on tracked in-flight workflows. Generous — never approached when
 /// `.settled()` is used (entries are removed on return); only fire-and-forget
 /// emits accumulate, and this bounds them.
 const SETTLE_TRACKER_CAP: usize = 65_536;
@@ -179,9 +179,9 @@ impl SettleTracker {
         Self { hw: std::collections::HashMap::new() }
     }
 
-    /// Record a chain event's position for `corr`, keeping the max.
-    pub(crate) fn bump(&mut self, corr: Uuid, pos: LogCursor) {
-        if let Some(cur) = self.hw.get_mut(&corr) {
+    /// Record a chain event's position for `wf`, keeping the max.
+    pub(crate) fn bump(&mut self, wf: Uuid, pos: LogCursor) {
+        if let Some(cur) = self.hw.get_mut(&wf) {
             if pos > *cur {
                 *cur = pos;
             }
@@ -196,21 +196,21 @@ impl SettleTracker {
                 self.hw.remove(&victim);
             }
         }
-        self.hw.insert(corr, pos);
+        self.hw.insert(wf, pos);
     }
 
-    fn get(&self, corr: &Uuid) -> Option<LogCursor> {
-        self.hw.get(corr).copied()
+    fn get(&self, wf: &Uuid) -> Option<LogCursor> {
+        self.hw.get(wf).copied()
     }
 
-    fn forget(&mut self, corr: &Uuid) {
-        self.hw.remove(corr);
+    fn forget(&mut self, wf: &Uuid) {
+        self.hw.remove(wf);
     }
 }
 
-/// Shared handle to the per-correlation high-water tracker, threaded from the
+/// Shared handle to the per-workflow high-water tracker, threaded from the
 /// engine into each reactor runner.
-pub(crate) type CorrHighWater = Arc<std::sync::Mutex<SettleTracker>>;
+pub(crate) type WorkflowHighWater = Arc<std::sync::Mutex<SettleTracker>>;
 
 /// Metadata about a reactor that has exhausted its retry budget,
 /// passed to the [`EngineBuilder::on_terminal_failure`] mapper. The mapper
@@ -233,11 +233,11 @@ pub struct TerminalFailure {
     /// Number of attempts that ran before declaring terminal
     /// failure (equal to `max_attempts`).
     pub attempts:          u32,
-    /// `correlation_id` of the failing trigger — its run / causal chain.
+    /// `workflow_id` of the failing trigger — its run / causal chain.
     /// The terminal-failure-synthesized event already inherits this; exposing it lets the
     /// mapper key its terminal-failure event per-run (e.g. stream-by-`run_id`)
     /// so a dead-letter can still unblock that run's downstream gates.
-    pub correlation_id:    Uuid,
+    pub workflow_id:    Uuid,
 }
 
 /// Type-erased view of a [`Event`] for the emit builder.
@@ -300,18 +300,18 @@ impl<F: Event> From<Vec<F>> for EmitInput {
 pub struct EmitBuilder<'a> {
     engine:         &'a Engine,
     input:          EmitInput,
-    correlation_id: Option<Uuid>,
+    workflow_id: Option<Uuid>,
     causation_id:      Option<Uuid>,
     metadata:       Metadata,
 }
 
 impl<'a> EmitBuilder<'a> {
-    /// Stamp `correlation_id` on every fact in the batch. Defaults to
+    /// Stamp `workflow_id` on every fact in the batch. Defaults to
     /// a fresh UUID per emit; command handlers should propagate the
-    /// trigger's `correlation_id` here so causal-chain tracing works
+    /// trigger's `workflow_id` here so causal-chain tracing works
     /// across the system.
-    pub fn correlation_id(mut self, id: Uuid) -> Self {
-        self.correlation_id = Some(id);
+    pub fn workflow_id(mut self, id: Uuid) -> Self {
+        self.workflow_id = Some(id);
         self
     }
 
@@ -343,7 +343,7 @@ impl<'a> EmitBuilder<'a> {
     /// Use for tests, sync command handlers, or any case where the
     /// caller needs the side effects to be visible before continuing.
     /// For HTTP handlers that just need to confirm durability and
-    /// return a correlation_id to the client, use the bare
+    /// return a workflow_id to the client, use the bare
     /// `.await` instead — it's faster and avoids holding connections
     /// open during long chains.
     ///
@@ -445,10 +445,10 @@ pub struct EngineBuilder {
     /// registered *after* this is set (same ordering rule as `observer`),
     /// surfaced to reactor bodies via `ctx.effect_store()`.
     effect_store:        Option<Arc<dyn crate::effect_store::EffectStore>>,
-    /// Per-correlation high-water tracker for scoped `settle`. Created eagerly
+    /// Per-workflow high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
-    corr_hw:               CorrHighWater,
+    workflow_hw:               WorkflowHighWater,
     /// Durable aggregate snapshot store. When set, folded aggregate state
     /// survives restart via read-through restore (`Engine::state_of`,
     /// consumer restore-before-fold) and is periodically snapshotted. When
@@ -488,7 +488,7 @@ impl EngineBuilder {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             observer: None,
             effect_store: None,
-            corr_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
+            workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
             reactor_seeds: Vec::new(),
@@ -744,7 +744,7 @@ impl EngineBuilder {
         let max_attempts = self.max_attempts;
         let observer = self.observer.clone();
         let effect_store = self.effect_store.clone();
-        let corr_hw = self.corr_hw.clone();
+        let workflow_hw = self.workflow_hw.clone();
         let snapshot_store = self.snapshot_store.clone();
         let snapshot_every = self.snapshot_every;
         self.consumers.push(Box::new(move |aggs, engine_aggs, occ| {
@@ -756,7 +756,7 @@ impl EngineBuilder {
             if let Some(obs) = observer { runner = runner.with_observer(obs); }
             if let Some(rc) = effect_store { runner = runner.with_effect_store(rc); }
             runner = runner.with_engine_aggregators(engine_aggs);
-            runner = runner.with_settle_tracker(corr_hw);
+            runner = runner.with_settle_tracker(workflow_hw);
             runner = runner.with_snapshot_persistence(snapshot_store, snapshot_every);
             runner = runner.with_occ_categories(occ);
             Arc::new(runner) as Arc<dyn Supervisable>
@@ -915,7 +915,7 @@ impl EngineBuilder {
             consumer_ids,
             self.observer,
             self.occ_categories,
-            self.corr_hw,
+            self.workflow_hw,
             self.snapshot_store,
             self.snapshot_every,
         ))
@@ -949,9 +949,9 @@ pub struct Engine {
     /// `EngineBuilder::with_aggregate`. `emit` rejects facts in these
     /// categories; they must use the OCC command path `Engine::append`.
     occ_categories:        std::collections::HashSet<String>,
-    /// Per-correlation high-water tracker (shared with reactor runners) that
+    /// Per-workflow high-water tracker (shared with reactor runners) that
     /// scopes [`Engine::settle`] to a single run's causal chain.
-    corr_hw:               CorrHighWater,
+    workflow_hw:               WorkflowHighWater,
     /// Durable aggregate snapshot store (shared with runners). `None` = no
     /// durable restore (in-memory fold only).
     snapshot_store:        Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
@@ -970,7 +970,7 @@ impl Engine {
         consumer_ids: Vec<String>,
         observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
         occ_categories: std::collections::HashSet<String>,
-        corr_hw: CorrHighWater,
+        workflow_hw: WorkflowHighWater,
         snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
         snapshot_every: u64,
     ) -> Self {
@@ -993,7 +993,7 @@ impl Engine {
             default_metadata,
             aggregators, consumer_ids, observer,
             occ_categories,
-            corr_hw,
+            workflow_hw,
             snapshot_store,
             snapshot_every,
         }
@@ -1002,7 +1002,7 @@ impl Engine {
     /// Emit one or more Facts to the log.
     ///
     /// Returns an [`EmitBuilder`] — chain `.metadata()`,
-    /// `.correlation_id()`, `.causation_id()` and finally `.await` to run
+    /// `.workflow_id()`, `.causation_id()` and finally `.await` to run
     /// the write. `.await` returns once facts are durably in the log;
     /// the reactor chain runs asynchronously after that. Use
     /// `.settled().await` to also wait for the chain to drain.
@@ -1010,9 +1010,9 @@ impl Engine {
     /// ```ignore
     /// // simplest — durable append, returns immediately
     /// engine.emit(fact).await?;
-    /// // command-handler envelope — propagate trigger correlation
+    /// // command-handler envelope — propagate trigger workflow
     /// engine.emit(out)
-    ///     .correlation_id(trigger_corr)
+    ///     .workflow_id(trigger_corr)
     ///     .causation_id(trigger_event_id)
     ///     .await?;
     /// // batch
@@ -1036,7 +1036,7 @@ impl Engine {
         EmitBuilder {
             engine: self,
             input: input.into(),
-            correlation_id: None,
+            workflow_id: None,
             causation_id: None,
             metadata: Metadata::new(),
         }
@@ -1138,12 +1138,12 @@ impl Engine {
             let facts = decide(&agg)?;
             if facts.is_empty() {
                 let position = self.log.latest_position().await?;
-                return Ok(EmitResult { position, correlation_id: Uuid::new_v4() });
+                return Ok(EmitResult { position, workflow_id: Uuid::new_v4() });
             }
 
             // Build the whole decision, then append it as one atomic
             // batch under OCC — the events land contiguously or not at all.
-            let correlation = Uuid::new_v4();
+            let workflow = Uuid::new_v4();
             let mut events_data = Vec::with_capacity(facts.len());
             // (event_type, payload, event_id) for the post-append fold.
             let mut folds = Vec::with_capacity(facts.len());
@@ -1162,7 +1162,7 @@ impl Engine {
                 let event = EventData {
                     event_id:        Uuid::new_v4(),
                     causation_id:    None,
-                    correlation_id:  correlation,
+                    workflow_id:  workflow,
                     event_type:      event_type.clone(),
                     payload:         payload.clone(),
                     created_at:      fact.occurred_at().unwrap_or_else(Utc::now),
@@ -1207,7 +1207,7 @@ impl Engine {
                             if outcome.applied {
                                 if let Some(obs) = self.observer.as_ref() {
                                     reg.notify_observer(
-                                        &outcome.snapshots, obs.as_ref(), correlation,
+                                        &outcome.snapshots, obs.as_ref(), workflow,
                                         result.position, *event_id,
                                     );
                                 }
@@ -1216,7 +1216,7 @@ impl Engine {
                     }
                     return Ok(EmitResult {
                         position: result.position,
-                        correlation_id: correlation,
+                        workflow_id: workflow,
                     });
                 }
                 Err(e) => {
@@ -1256,11 +1256,11 @@ impl Engine {
         // than returning trivially against `LogCursor::ZERO`).
         if b.input.facts.is_empty() {
             let position = self.log.latest_position().await?;
-            let correlation_id = b.correlation_id.unwrap_or_else(Uuid::new_v4);
-            return Ok(EmitResult { position, correlation_id });
+            let workflow_id = b.workflow_id.unwrap_or_else(Uuid::new_v4);
+            return Ok(EmitResult { position, workflow_id });
         }
 
-        let correlation = b.correlation_id.unwrap_or_else(Uuid::new_v4);
+        let workflow = b.workflow_id.unwrap_or_else(Uuid::new_v4);
         let mut last_position = LogCursor::ZERO;
 
         // Merge engine defaults under per-emit metadata. Per-emit
@@ -1308,7 +1308,7 @@ impl Engine {
             let event = EventData {
                 event_id:        Uuid::new_v4(),
                 causation_id:    b.causation_id,
-                correlation_id:  correlation,
+                workflow_id:  workflow,
                 event_type,
                 payload,
                 created_at:      occurred_at,
@@ -1406,7 +1406,7 @@ impl Engine {
                             reg.notify_observer(
                                 &outcome.snapshots,
                                 obs.as_ref(),
-                                correlation,
+                                workflow,
                                 fact_write.position,
                                 event_id,
                             );
@@ -1427,7 +1427,7 @@ impl Engine {
         }
         Ok(EmitResult {
             position: last_position,
-            correlation_id: correlation,
+            workflow_id: workflow,
         })
     }
 
@@ -1488,15 +1488,15 @@ impl Engine {
         Ok(Some((*curr).clone()))
     }
 
-    /// Wait until the causal chain of `result.correlation_id` has fully
+    /// Wait until the causal chain of `result.workflow_id` has fully
     /// quiesced — every consumer caught up to the run's furthest event, every
     /// reactor output in that chain appended, no pending work remaining for
     /// *this run*. Other runs' concurrent traffic does not delay it.
     ///
-    /// Algorithm (per-correlation high-water):
+    /// Algorithm (per-workflow high-water):
     ///
     ///   1. `hw` = the furthest `$all` position of any event in this run's
-    ///      chain (reactor outputs inherit the trigger's `correlation_id`),
+    ///      chain (reactor outputs inherit the trigger's `workflow_id`),
     ///      floored at `result.position` so we always wait for the trigger to
     ///      be observed.
     ///   2. Wait for every consumer cursor to reach `hw`.
@@ -1524,22 +1524,22 @@ impl Engine {
     /// Reactors run asynchronously in supervisor tasks; bounded latency depends
     /// on consumer batch size + supervisor poll interval.
     pub async fn settle(&self, result: EmitResult) -> Result<()> {
-        let corr = result.correlation_id;
+        let wf = result.workflow_id;
         loop {
             // High-water = the furthest position any event in THIS run's chain
             // has reached. Floor it at the emit position so we always wait for
             // consumers to at least observe the trigger, even before any
             // reactor output has landed (or if the entry was never tracked).
             let hw = self
-                .corr_hw
+                .workflow_hw
                 .lock()
                 .unwrap()
-                .get(&corr)
+                .get(&wf)
                 .unwrap_or(result.position);
 
             // Wait for every consumer to catch up to hw. Because a consumer's
             // cursor advances only after its output is appended (and outputs
-            // inherit this correlation_id), "all consumers past hw" plus "no
+            // inherit this workflow_id), "all consumers past hw" plus "no
             // new chain event appeared" means this run has drained — regardless
             // of how busy other runs keep the global log head.
             for id in &self.consumer_ids {
@@ -1548,9 +1548,9 @@ impl Engine {
 
             // Fall back to the prior hw (not the floor) if the entry was evicted
             // mid-settle, so eviction can't spuriously regress the comparison.
-            let hw2 = self.corr_hw.lock().unwrap().get(&corr).unwrap_or(hw);
+            let hw2 = self.workflow_hw.lock().unwrap().get(&wf).unwrap_or(hw);
             if hw2 == hw {
-                self.corr_hw.lock().unwrap().forget(&corr);
+                self.workflow_hw.lock().unwrap().forget(&wf);
                 return Ok(());
             }
         }
@@ -3153,7 +3153,7 @@ mod tests {
     // ── 0.3.1 fixes — caller-supplied envelope fields ──
 
     #[tokio::test]
-    async fn emit_with_correlation_id_stamps_envelope() {
+    async fn emit_with_workflow_id_stamps_envelope() {
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -3167,15 +3167,15 @@ mod tests {
             user_id:     Uuid::new_v4(),
             occurred_at: Utc::now(),
         })
-        .correlation_id(cmd_correlation)
+        .workflow_id(cmd_correlation)
         .await.unwrap();
 
         let events = EventLogBackend::read_all(
             store.as_ref(), LogCursor::ZERO, 10,
         ).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].correlation_id, cmd_correlation,
-                   "persisted correlation_id MUST match caller-supplied id");
+        assert_eq!(events[0].workflow_id, cmd_correlation,
+                   "persisted workflow_id MUST match caller-supplied id");
 
         engine.shutdown().await.unwrap();
     }
@@ -3217,7 +3217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_batch_propagates_correlation_id_to_every_fact() {
+    async fn emit_batch_propagates_workflow_id_to_every_fact() {
         let store = store();
         let engine = EngineBuilder::new(
             store.clone() as Arc<dyn EventLogBackend>,
@@ -3234,7 +3234,7 @@ mod tests {
             CounterFact::Inc { by: 1, occurred_at: Utc::now(), counter_id: id },
             CounterFact::Inc { by: 2, occurred_at: Utc::now(), counter_id: id },
         ])
-        .correlation_id(cmd_correlation)
+        .workflow_id(cmd_correlation)
         .await.unwrap();
 
         let events = EventLogBackend::read_stream(
@@ -3242,8 +3242,8 @@ mod tests {
         ).await.unwrap();
         assert_eq!(events.len(), 2);
         for ev in &events {
-            assert_eq!(ev.correlation_id, cmd_correlation,
-                       "every fact in the batch carries the caller's correlation_id");
+            assert_eq!(ev.workflow_id, cmd_correlation,
+                       "every fact in the batch carries the caller's workflow_id");
         }
 
         engine.shutdown().await.unwrap();
@@ -3652,19 +3652,19 @@ mod tests {
                 loop {
                     let _ = engine
                         .emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
-                        .correlation_id(corr_b)
+                        .workflow_id(corr_b)
                         .await;
                     tokio::time::sleep(Duration::from_millis(3)).await;
                 }
             })
         };
 
-        // Run A: emit once on its own correlation, then settle. With the old
+        // Run A: emit once on its own workflow, then settle. With the old
         // global-head settle this would hang against run B's flood.
         let corr_a = Uuid::new_v4();
         let result = engine
             .emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
-            .correlation_id(corr_a)
+            .workflow_id(corr_a)
             .await
             .unwrap();
 
@@ -3749,7 +3749,7 @@ mod tests {
 
         assert_eq!(seen.lock().len(), 1,
                    ".settled() waited for the projector to observe");
-        assert_ne!(result.correlation_id, Uuid::nil(),
+        assert_ne!(result.workflow_id, Uuid::nil(),
                    "settled still surfaces the EmitResult");
 
         engine.shutdown().await.unwrap();
@@ -3914,8 +3914,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_result_carries_correlation_id() {
-        // EmitResult.correlation_id must surface the chain id that was
+    async fn emit_result_carries_workflow_id() {
+        // EmitResult.workflow_id must surface the chain id that was
         // stamped on the emitted fact(s). Clients use it to poll
         // workflow projections; tests use it to scope `settle_to`
         // and `snapshot::<A>(stream_id)` to one run.
@@ -3926,33 +3926,33 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build().await.unwrap();
 
-        // Auto-generated correlation when not provided.
+        // Auto-generated workflow when not provided.
         let r1 = engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
             occurred_at: Utc::now(),
         }).await.unwrap();
-        assert_ne!(r1.correlation_id, Uuid::nil(),
-                   "emit auto-generates correlation_id when not set");
+        assert_ne!(r1.workflow_id, Uuid::nil(),
+                   "emit auto-generates workflow_id when not set");
 
-        // Two emits without explicit correlation must produce
-        // distinct correlations (each is a fresh chain).
+        // Two emits without explicit workflow must produce
+        // distinct workflows (each is a fresh chain).
         let r2 = engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
             occurred_at: Utc::now(),
         }).await.unwrap();
-        assert_ne!(r1.correlation_id, r2.correlation_id,
-                   "distinct emits get distinct correlation_ids");
+        assert_ne!(r1.workflow_id, r2.workflow_id,
+                   "distinct emits get distinct workflow_ids");
 
-        // Explicit correlation: result echoes what the caller set.
-        let corr = Uuid::new_v4();
+        // Explicit workflow: result echoes what the caller set.
+        let wf = Uuid::new_v4();
         let r3 = engine.emit(UserCreated {
             user_id:     Uuid::new_v4(),
             occurred_at: Utc::now(),
         })
-        .correlation_id(corr)
+        .workflow_id(wf)
         .await.unwrap();
-        assert_eq!(r3.correlation_id, corr,
-                   "EmitResult.correlation_id echoes the explicit value");
+        assert_eq!(r3.workflow_id, wf,
+                   "EmitResult.workflow_id echoes the explicit value");
 
         engine.shutdown().await.unwrap();
     }
@@ -3968,9 +3968,9 @@ mod tests {
 
         let result = engine.emit(Vec::<UserCreated>::new()).await.unwrap();
         assert_eq!(result.position, LogCursor::ZERO);
-        // Empty emit still produces a fresh correlation_id (no facts
+        // Empty emit still produces a fresh workflow_id (no facts
         // got stamped with it; the value is informational).
-        assert_ne!(result.correlation_id, Uuid::nil());
+        assert_ne!(result.workflow_id, Uuid::nil());
 
         // No events written.
         let events = EventLogBackend::read_all(
@@ -4174,7 +4174,7 @@ mod tests {
         let result = crate::append_event(store, EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      "ticker:tick".into(),
             payload:         serde_json::to_value(&tick).unwrap(),
             created_at:      tick.occurred_at,
@@ -4504,7 +4504,7 @@ mod tests {
         crate::append_event(store.as_ref(), EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      "ticker:tick".into(),
             payload,
             created_at:      tick.occurred_at,

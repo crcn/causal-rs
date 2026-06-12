@@ -73,7 +73,7 @@ export const createScrubberEngine: EngineCreator<
       }
 
       // Flow changed → stop playback
-      if (curr.flowCorrelationId !== prev.flowCorrelationId) {
+      if (curr.flowWorkflowId !== prev.flowWorkflowId) {
         stop();
       }
     },

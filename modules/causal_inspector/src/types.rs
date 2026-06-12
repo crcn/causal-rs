@@ -16,8 +16,8 @@ pub struct InspectorEvent {
     pub id: Option<String>,
     /// Parent event UUID (causal link).
     pub causation_id: Option<String>,
-    /// Correlation ID linking the full causal chain.
-    pub correlation_id: Option<String>,
+    /// Workflow ID linking the full causal chain.
+    pub workflow_id: Option<String>,
     pub reactor_id: Option<String>,
     /// Aggregate type (e.g. "Order"), if this event matched an aggregator.
     pub aggregate_type: Option<String>,
@@ -88,7 +88,7 @@ pub struct ReactorDescriptionSnapshot {
     pub blocks: serde_json::Value,
 }
 
-/// A single aggregate's state at a point in the correlation timeline.
+/// A single aggregate's state at a point in the workflow timeline.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct AggregateStateEntry {
@@ -98,7 +98,7 @@ pub struct AggregateStateEntry {
     pub state: serde_json::Value,
 }
 
-/// Aggregate state snapshot at a specific event in a correlation.
+/// Aggregate state snapshot at a specific event in a workflow.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct AggregateTimelineEntry {
@@ -118,7 +118,7 @@ pub struct ReactorDependency {
     pub output_event_types: Vec<String>,
 }
 
-/// An aggregate lifecycle entry — state snapshot across all correlations.
+/// An aggregate lifecycle entry — state snapshot across all workflows.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct AggregateLifecycleEntry {
@@ -126,16 +126,16 @@ pub struct AggregateLifecycleEntry {
     pub event_id: String,
     pub event_type: String,
     pub ts: DateTime<Utc>,
-    pub correlation_id: String,
+    pub workflow_id: String,
     pub aggregate_key: String,
     pub state: serde_json::Value,
 }
 
-/// Summary of a correlation chain for the explorer pane.
+/// Summary of a workflow chain for the explorer pane.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct CorrelationSummary {
-    pub correlation_id: String,
+    pub workflow_id: String,
     pub event_count: i64,
     pub first_ts: DateTime<Utc>,
     pub last_ts: DateTime<Utc>,
@@ -143,11 +143,11 @@ pub struct CorrelationSummary {
     pub has_errors: bool,
 }
 
-/// Paginated correlation summary response.
+/// Paginated workflow summary response.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
 pub struct CorrelationSummaryPage {
-    pub correlations: Vec<CorrelationSummary>,
+    pub workflows: Vec<CorrelationSummary>,
     pub next_cursor: Option<String>,
 }
 
@@ -169,7 +169,7 @@ pub struct ReactorOutcome {
 pub struct ReactorAttempt {
     pub event_id: String,
     pub reactor_id: String,
-    pub correlation_id: String,
+    pub workflow_id: String,
     pub attempt: i32,
     pub status: String,
     pub error: Option<String>,

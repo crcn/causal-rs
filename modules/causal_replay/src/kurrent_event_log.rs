@@ -33,12 +33,12 @@
 //!   are recovered on read by parsing the stream name (the trailing 36
 //!   chars are the canonical UUID) — no metadata round-trip needed.
 //! - **Q3 metadata.** Mapped to Kurrent's `custom_metadata` slot.
-//!   System keys (`$correlationId`, `$causationId`) use Kurrent's
-//!   `$`-prefix convention. The `$by_correlation_id` system projection
-//!   reads `$correlationId` (when configured + projections are running)
+//!   System keys (`$workflowId`, `$causationId`) use Kurrent's
+//!   `$`-prefix convention. The `$by_workflow_id` system projection
+//!   reads `$workflowId` (when configured + projections are running)
 //!   and uses `$causationId` to build the causation tree. There is NO
 //!   `$by_causation_id` system projection — the five built-ins are
-//!   `$by_category`, `$by_event_type`, `$by_correlation_id`,
+//!   `$by_category`, `$by_event_type`, `$by_workflow_id`,
 //!   `$stream_by_category`, `$streams`. The one causal-specific key
 //!   (`_persistent`) keeps the `_` prefix to mark "framework-internal";
 //!   it's stamped on write and stripped on read.
@@ -476,15 +476,15 @@ mod kurrent {
     fn build_metadata(event: &EventData) -> Map<String, Value> {
         let mut m = event.metadata.clone();
         // KurrentDB convention: system metadata keys are `$`-prefixed
-        // camelCase. The `$by_correlation_id` system projection reads
-        // `$correlationId` (once configured + projections running) and
+        // camelCase. The `$by_workflow_id` system projection reads
+        // `$workflowId` (once configured + projections running) and
         // uses `$causationId` to build the causation tree. There is no
         // `$by_causation_id` projection. Using these exact names is the
         // difference between the native projection working and silently
         // returning nothing.
         m.insert(
             "$correlationId".to_string(),
-            Value::String(event.correlation_id.to_string()),
+            Value::String(event.workflow_id.to_string()),
         );
         if let Some(causation) = event.causation_id {
             m.insert(
@@ -512,7 +512,7 @@ mod kurrent {
             _ => Map::new(),
         };
 
-        let correlation_id = metadata
+        let workflow_id = metadata
             .remove("$correlationId")
             .and_then(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
             .ok_or_else(|| anyhow!("Kurrent event missing $correlationId"))?;
@@ -549,7 +549,7 @@ mod kurrent {
             position: LogCursor::from_raw(rec.position.commit),
             event_id: rec.id,
             causation_id,
-            correlation_id,
+            workflow_id,
             event_type: rec.event_type.clone(),
             payload,
             category,
@@ -590,7 +590,7 @@ mod kurrent {
     struct WindowContent {
         event_type:     String,
         payload:        Value,
-        correlation_id: Option<Uuid>,
+        workflow_id: Option<Uuid>,
         causation_id:   Option<Uuid>,
     }
 
@@ -602,7 +602,7 @@ mod kurrent {
             } else {
                 serde_json::from_slice(&rec.custom_metadata).ok()?
             };
-            let correlation_id = metadata
+            let workflow_id = metadata
                 .get("$correlationId")
                 .and_then(|v| v.as_str())
                 .and_then(|s| Uuid::parse_str(s).ok());
@@ -613,7 +613,7 @@ mod kurrent {
             Some(WindowContent {
                 event_type: rec.event_type.clone(),
                 payload,
-                correlation_id,
+                workflow_id,
                 causation_id,
             })
         })();
@@ -629,7 +629,7 @@ mod kurrent {
 
     /// A dedup-hit must be a **byte-identical** redelivery (see the
     /// `EventLogBackend` idempotency contract): a persisted row whose
-    /// `payload` / `event_type` / `correlation_id` / `causation_id`
+    /// `payload` / `event_type` / `workflow_id` / `causation_id`
     /// differs from the redelivered batch means the producer re-decided
     /// differently on redelivery — error loudly instead of silently
     /// keeping the old row. `created_at` and `metadata` are exempt
@@ -647,14 +647,14 @@ mod kurrent {
             let identical = row.content.as_ref().is_some_and(|c| {
                 c.payload == e.payload
                     && c.event_type == e.event_type
-                    && c.correlation_id == Some(e.correlation_id)
+                    && c.workflow_id == Some(e.workflow_id)
                     && c.causation_id == e.causation_id
             });
             if !identical {
                 anyhow::bail!(
                     "append_to_stream: divergent redelivery for event_id {} — \
                      the persisted row differs from this batch's event \
-                     (payload/event_type/correlation/causation). A dedup-hit \
+                     (payload/event_type/workflow/causation). A dedup-hit \
                      must be byte-identical; a differing re-emission means the \
                      producer is nondeterministic under redelivery (wall \
                      clock, rand, or an external call not under ctx.remember). \
@@ -748,7 +748,7 @@ mod kurrent {
             EventData {
                 event_id:        Uuid::new_v4(),
                 causation_id:       None,
-                correlation_id:  Uuid::new_v4(),
+                workflow_id:  Uuid::new_v4(),
                 event_type:      event_type.to_string(),
                 payload:         serde_json::json!({}),
                 created_at:      Utc::now(),
@@ -778,7 +778,7 @@ mod kurrent {
                 content: Some(WindowContent {
                     event_type:     e.event_type.clone(),
                     payload:        e.payload.clone(),
-                    correlation_id: Some(e.correlation_id),
+                    workflow_id: Some(e.workflow_id),
                     causation_id:   e.causation_id,
                 }),
             }
@@ -808,7 +808,7 @@ mod kurrent {
         fn divergent_correlation_fails_divergence_check() {
             let e = mk_event("conformance:c1b", None, None);
             let mut row = window_row_for(&e);
-            row.content.as_mut().unwrap().correlation_id = Some(Uuid::new_v4());
+            row.content.as_mut().unwrap().workflow_id = Some(Uuid::new_v4());
             assert!(ensure_redelivery_identical(&[e], &[row]).is_err());
         }
 
@@ -838,17 +838,17 @@ mod kurrent {
         #[test]
         fn build_metadata_stamps_reserved_keys() {
             let parent = Uuid::new_v4();
-            let correlation = Uuid::new_v4();
+            let workflow = Uuid::new_v4();
             let mut e = mk_event("lifecycle:run", Some("lifecycle"), Some(Uuid::new_v4()));
             e.causation_id = Some(parent);
-            e.correlation_id = correlation;
+            e.workflow_id = workflow;
             e.metadata.insert("_run_id".into(), Value::String("r-1".into()));
 
             let m = build_metadata(&e);
             assert_eq!(
                 m.get("$correlationId").and_then(Value::as_str),
-                Some(correlation.to_string().as_str()),
-                "Kurrent convention: $correlationId, not _correlation_id"
+                Some(workflow.to_string().as_str()),
+                "Kurrent convention: $correlationId, not _workflow_id"
             );
             assert_eq!(
                 m.get("$causationId").and_then(Value::as_str),

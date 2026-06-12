@@ -28,7 +28,7 @@ import { CausalFlowPane } from "./panes/CausalFlowPane";
 import { LogsPane } from "./panes/LogsPane";
 import { AggregateTimelinePane } from "./panes/AggregateTimelinePane";
 import { WaterfallPane } from "./panes/WaterfallPane";
-import { CorrelationExplorerPane } from "./panes/CorrelationExplorerPane";
+import { WorkflowExplorerPane } from "./panes/WorkflowExplorerPane";
 import { GlobalScrubber } from "./components/GlobalScrubber";
 
 import "./CausalInspector.css";
@@ -196,9 +196,9 @@ const PANE_REGISTRY = [
     render: () => <WaterfallPane />,
   },
   {
-    name: "Correlations",
-    component: "correlations",
-    render: () => <CorrelationExplorerPane />,
+    name: "Workflows",
+    component: "workflows",
+    render: () => <WorkflowExplorerPane />,
   },
 ] as const;
 
@@ -223,8 +223,8 @@ function InspectorLayout() {
   const paneLayout = useSelector<InspectorState, PaneLayout | null>(
     (s) => s.paneLayout,
   );
-  const flowCorrelationId = useSelector<InspectorState, string | null>(
-    (s) => s.flowCorrelationId,
+  const flowWorkflowId = useSelector<InspectorState, string | null>(
+    (s) => s.flowWorkflowId,
   );
   const selectedSeq = useSelector<InspectorState, number | null>(
     (s) => s.selectedSeq,
@@ -268,8 +268,8 @@ function InspectorLayout() {
   }, [selectedSeq, addTab]);
 
   useEffect(() => {
-    if (flowCorrelationId) addTab("causal-flow", "Flow");
-  }, [flowCorrelationId, addTab]);
+    if (flowWorkflowId) addTab("causal-flow", "Flow");
+  }, [flowWorkflowId, addTab]);
 
   const factory = useCallback((node: TabNode) => {
     const component = node.getComponent();

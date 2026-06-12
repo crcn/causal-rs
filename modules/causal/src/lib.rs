@@ -7,7 +7,7 @@
 //!
 //! The vocabulary mirrors KurrentDB's where the concepts overlap:
 //! [`EventData`](types::EventData) / [`RecordedEvent`], `causation_id` /
-//! `correlation_id`, [`StreamRevision`] (0-indexed), [`StreamState`] for
+//! `workflow_id`, [`StreamRevision`] (0-indexed), [`StreamState`] for
 //! optimistic concurrency, `{category}-{stream_id}` stream names.
 //!
 //! ## Guarantees
@@ -17,7 +17,7 @@
 //! - **Replay determinism** — no wall-clock inside consumer bodies;
 //!   aggregate state is a pure fold of the log.
 //! - **Quiescence** — `emit(...).settled()` resolves when the event's
-//!   correlation chain has been observed by every consumer.
+//!   workflow chain has been observed by every consumer.
 //! - **OCC where you opt in** — the `Engine::append` decider path enforces
 //!   [`StreamState`] expectations with typed conflicts.
 //!
@@ -74,7 +74,7 @@
 //!     .build()
 //!     .await?;
 //!
-//! // Persists the event, stamps causation/correlation, and resolves once
+//! // Persists the event, stamps causation/workflow, and resolves once
 //! // ShipOnPlaced has reacted and its output has landed in the log.
 //! engine.emit(OrderPlaced { order_id: Uuid::new_v4(), total: 99.99 })
 //!     .settled()

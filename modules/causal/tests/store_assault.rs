@@ -24,7 +24,7 @@ fn ev(event_id: Uuid, payload: serde_json::Value) -> EventData {
     EventData {
         event_id,
         causation_id: None,
-        correlation_id: Uuid::new_v4(),
+        workflow_id: Uuid::new_v4(),
         event_type: "assault:thing".into(),
         payload,
         created_at: chrono::Utc::now(),

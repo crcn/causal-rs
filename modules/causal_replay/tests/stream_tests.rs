@@ -81,7 +81,7 @@ fn make_event(i: usize) -> EventData {
     EventData {
         event_id: Uuid::new_v4(),
         causation_id: None,
-        correlation_id: Uuid::new_v4(),
+        workflow_id: Uuid::new_v4(),
         event_type: format!("test:event_{i}"),
         payload: serde_json::json!({ "index": i }),
         created_at: Utc::now(),

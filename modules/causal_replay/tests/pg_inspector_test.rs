@@ -128,7 +128,7 @@ async fn pg_inspector_round_trip() -> Result<()> {
         .emit(Pinged { id, occurred_at: Utc::now() })
         .settled()
         .await?;
-    let corr = result.correlation_id.to_string();
+    let corr = result.workflow_id.to_string();
 
     // Read side. Poll for the async observer flush.
     let read = PgInspectorReadModel::new(pool.clone());
@@ -139,7 +139,7 @@ async fn pg_inspector_round_trip() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Events: Pinged + Ponged in this correlation.
+    // Events: Pinged + Ponged in this workflow.
     let flow = read.causal_flow(&corr).await?;
     assert!(flow.len() >= 2, "expected Pinged + Ponged, got {}", flow.len());
     assert!(flow.iter().any(|e| e.event_type == "insp_ping:v1"));
@@ -155,7 +155,7 @@ async fn pg_inspector_round_trip() -> Result<()> {
     assert!(pong.error.is_none(), "completed reactor must have no terminal error, got {:?}", pong.error);
     assert!(pong.attempts >= 2, "expected a retry (>=2 attempts), got {}", pong.attempts);
 
-    let logs = read.reactor_logs_by_correlation(&corr).await?;
+    let logs = read.reactor_logs_by_workflow(&corr).await?;
     assert!(logs.iter().any(|l| l.message == "pong reacting"), "expected reactor log line");
 
     // Attempt history: closed attempts only, showing both the failed attempt

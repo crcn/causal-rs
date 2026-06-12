@@ -248,7 +248,7 @@ async fn first_fold_burst_on_fresh_aggregates() {
 
 // ─────────────────────────────────────────────────────────────────────
 // Attack 3 — N emitters on different streams + M reactors fanning out
-// into yet other streams. Per-correlation settle must return, chains
+// into yet other streams. Per-workflow settle must return, chains
 // must not interfere, all three aggregates must satisfy the invariant.
 // ─────────────────────────────────────────────────────────────────────
 
@@ -366,7 +366,7 @@ async fn fanout_reactors_no_cross_chain_interference() {
                     engine.emit(Job { id }).settled().await
                 })
                 .await
-                .expect("per-correlation settle hung")
+                .expect("per-workflow settle hung")
                 .expect("emit failed");
                 results.push((id, r));
             }
@@ -388,13 +388,13 @@ async fn fanout_reactors_no_cross_chain_interference() {
         // contamination, no duplicated outputs.
         let chain: Vec<_> = log
             .iter()
-            .filter(|e| e.correlation_id == result.correlation_id)
+            .filter(|e| e.workflow_id == result.workflow_id)
             .collect();
         assert_eq!(
             chain.len(),
             3,
-            "correlation {} should own exactly trigger + 2 outputs, got {:?}",
-            result.correlation_id,
+            "workflow {} should own exactly trigger + 2 outputs, got {:?}",
+            result.workflow_id,
             chain.iter().map(|e| e.event_type.as_str()).collect::<Vec<_>>()
         );
 
@@ -657,7 +657,7 @@ async fn occ_append_8way_multi_fact_contention() {
     }
     for batch in evs.chunks(3) {
         assert_eq!(
-            batch[0].correlation_id, batch[2].correlation_id,
+            batch[0].workflow_id, batch[2].workflow_id,
             "atomic decision batches must land contiguously"
         );
     }
@@ -828,7 +828,7 @@ async fn seeding_race_reacted_set_is_clean_suffix() {
 
 // ─────────────────────────────────────────────────────────────────────
 // Attack 7 — settle() must stay scoped: a perpetual flood of unrelated
-// correlations must not delay (or hang) another run's settle.
+// workflows must not delay (or hang) another run's settle.
 // ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -880,7 +880,7 @@ async fn settle_returns_promptly_under_unrelated_flood() {
         let stop = stop.clone();
         tokio::spawn(async move {
             let mut n = 0u32;
-            // Unrelated correlations, fire-and-forget, perpetual until stop.
+            // Unrelated workflows, fire-and-forget, perpetual until stop.
             while !stop.load(Ordering::Relaxed) && n < 6000 {
                 engine
                     .emit(Work { id: Uuid::new_v4() })

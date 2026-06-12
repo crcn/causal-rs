@@ -27,16 +27,16 @@ export function FilterBar() {
         />
       </div>
 
-      {filters.correlationId && (
+      {filters.workflowId && (
         <>
           <span className="w-px h-4 bg-border" />
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400 text-[10px] font-mono">
-            {filters.correlationId.slice(0, 8)}
+            {filters.workflowId.slice(0, 8)}
             <button
               onClick={() =>
                 dispatch({
                   type: "ui/filter_changed",
-                  payload: { correlationId: null },
+                  payload: { workflowId: null },
                 })
               }
               className="hover:text-foreground transition-colors"

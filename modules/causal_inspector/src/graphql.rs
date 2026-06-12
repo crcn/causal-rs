@@ -49,7 +49,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
         search: Option<String>,
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
-        correlation_id: Option<String>,
+        workflow_id: Option<String>,
         aggregate_key: Option<String>,
     ) -> Result<InspectorEventsPage> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
@@ -61,7 +61,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             search,
             from,
             to,
-            correlation_id,
+            workflow_id,
             aggregate_key,
         };
 
@@ -93,16 +93,16 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
         Ok(InspectorCausalTree { events, root_seq })
     }
 
-    /// Fetch all events sharing a correlation_id (causal flow DAG viewer).
+    /// Fetch all events sharing a workflow_id (causal flow DAG viewer).
     async fn inspector_causal_flow(
         &self,
         ctx: &Context<'_>,
-        correlation_id: String,
+        workflow_id: String,
     ) -> Result<InspectorCausalFlow> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
 
         let stored = read_model
-            .causal_flow(&correlation_id)
+            .causal_flow(&workflow_id)
             .await
             .map_err(|e| async_graphql::Error::new(format!("Failed to load causal flow: {e}")))?;
 
@@ -140,16 +140,16 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
-    /// Fetch all reactor logs for a correlation chain.
-    async fn inspector_reactor_logs_by_correlation(
+    /// Fetch all reactor logs for a workflow chain.
+    async fn inspector_reactor_logs_by_workflow(
         &self,
         ctx: &Context<'_>,
-        correlation_id: String,
+        workflow_id: String,
     ) -> Result<Vec<ReactorLog>> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
 
         let entries = read_model
-            .reactor_logs_by_correlation(&correlation_id)
+            .reactor_logs_by_workflow(&workflow_id)
             .await
             .map_err(|e| async_graphql::Error::new(format!("Failed to load reactor logs: {e}")))?;
 
@@ -166,16 +166,16 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
-    /// Fetch reactor describe() blocks for a correlation chain.
+    /// Fetch reactor describe() blocks for a workflow chain.
     async fn inspector_reactor_descriptions(
         &self,
         ctx: &Context<'_>,
-        correlation_id: String,
+        workflow_id: String,
     ) -> Result<Vec<ReactorDescription>> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
 
         let entries = read_model
-            .reactor_descriptions(&correlation_id)
+            .reactor_descriptions(&workflow_id)
             .await
             .map_err(|e| {
                 async_graphql::Error::new(format!("Failed to load reactor descriptions: {e}"))
@@ -190,16 +190,16 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
-    /// Fetch per-event aggregate state timeline for a correlation chain.
+    /// Fetch per-event aggregate state timeline for a workflow chain.
     async fn inspector_aggregate_timeline(
         &self,
         ctx: &Context<'_>,
-        correlation_id: String,
+        workflow_id: String,
     ) -> Result<Vec<AggregateTimelineEntry>> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
 
         let entries = read_model
-            .aggregate_state_timeline(&correlation_id)
+            .aggregate_state_timeline(&workflow_id)
             .await
             .map_err(|e| {
                 async_graphql::Error::new(format!(
@@ -236,16 +236,16 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
-    /// Fetch per-event reactor description snapshots for a correlation chain.
+    /// Fetch per-event reactor description snapshots for a workflow chain.
     async fn inspector_reactor_description_snapshots(
         &self,
         ctx: &Context<'_>,
-        correlation_id: String,
+        workflow_id: String,
     ) -> Result<Vec<ReactorDescriptionSnapshot>> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
 
         let entries = read_model
-            .reactor_description_snapshots(&correlation_id)
+            .reactor_description_snapshots(&workflow_id)
             .await
             .map_err(|e| {
                 async_graphql::Error::new(format!(
@@ -264,8 +264,8 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
-    /// List all correlation chains with summary stats (paginated).
-    async fn inspector_correlations(
+    /// List all workflow chains with summary stats (paginated).
+    async fn inspector_workflows(
         &self,
         ctx: &Context<'_>,
         search: Option<String>,
@@ -282,10 +282,10 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .map_err(|e| async_graphql::Error::new(format!("Invalid cursor: {e}")))?;
 
         let entries = read_model
-            .list_correlations(search.as_deref(), lim, cursor_ts)
+            .list_workflows(search.as_deref(), lim, cursor_ts)
             .await
             .map_err(|e| {
-                async_graphql::Error::new(format!("Failed to load correlations: {e}"))
+                async_graphql::Error::new(format!("Failed to load workflows: {e}"))
             })?;
 
         let next_cursor = if entries.len() == lim {
@@ -294,10 +294,10 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             None
         };
 
-        let correlations = entries
+        let workflows = entries
             .into_iter()
             .map(|r| CorrelationSummary {
-                correlation_id: r.correlation_id,
+                workflow_id: r.workflow_id,
                 event_count: r.event_count,
                 first_ts: r.first_ts,
                 last_ts: r.last_ts,
@@ -306,7 +306,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             })
             .collect();
 
-        Ok(CorrelationSummaryPage { correlations, next_cursor })
+        Ok(CorrelationSummaryPage { workflows, next_cursor })
     }
 
     /// Derive the reactor dependency graph from the event log.
@@ -345,7 +345,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             })
     }
 
-    /// Fetch aggregate lifecycle — all state snapshots for a specific aggregate across correlations.
+    /// Fetch aggregate lifecycle — all state snapshots for a specific aggregate across workflows.
     async fn inspector_aggregate_lifecycle(
         &self,
         ctx: &Context<'_>,
@@ -369,23 +369,23 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
                 event_id: r.event_id.to_string(),
                 event_type: r.event_type,
                 ts: r.ts,
-                correlation_id: r.correlation_id,
+                workflow_id: r.workflow_id,
                 aggregate_key: r.aggregate_key,
                 state: r.state,
             })
             .collect())
     }
 
-    /// Fetch per-attempt execution history for a correlation chain.
+    /// Fetch per-attempt execution history for a workflow chain.
     async fn inspector_reactor_attempts(
         &self,
         ctx: &Context<'_>,
-        correlation_id: String,
+        workflow_id: String,
     ) -> Result<Vec<ReactorAttempt>> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
 
         let entries = read_model
-            .reactor_attempt_history(&correlation_id)
+            .reactor_attempt_history(&workflow_id)
             .await
             .map_err(|e| {
                 async_graphql::Error::new(format!("Failed to load reactor attempts: {e}"))
@@ -396,7 +396,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .map(|r| ReactorAttempt {
                 event_id: r.event_id.to_string(),
                 reactor_id: r.reactor_id,
-                correlation_id: r.correlation_id,
+                workflow_id: r.workflow_id,
                 attempt: r.attempt,
                 status: r.status,
                 error: r.error,
@@ -406,16 +406,16 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
             .collect())
     }
 
-    /// Fetch aggregated reactor execution outcomes for a correlation chain.
+    /// Fetch aggregated reactor execution outcomes for a workflow chain.
     async fn inspector_reactor_outcomes(
         &self,
         ctx: &Context<'_>,
-        correlation_id: String,
+        workflow_id: String,
     ) -> Result<Vec<ReactorOutcome>> {
         let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
 
         let entries = read_model
-            .reactor_outcomes(&correlation_id)
+            .reactor_outcomes(&workflow_id)
             .await
             .map_err(|e| {
                 async_graphql::Error::new(format!("Failed to load reactor outcomes: {e}"))

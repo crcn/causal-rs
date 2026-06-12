@@ -108,15 +108,15 @@ function RangeSlider({
 // ---------------------------------------------------------------------------
 
 function getContextLabel(
-  flowCorrelationId: string | null,
+  flowWorkflowId: string | null,
   flowSelection: FlowSelection,
 ): string {
-  if (!flowCorrelationId) return "All events";
+  if (!flowWorkflowId) return "All events";
   if (flowSelection) {
     if (flowSelection.kind === "event-type") return `${flowSelection.name} events`;
     return `Reactor ${flowSelection.reactorId}`;
   }
-  return `Flow ${flowCorrelationId.slice(0, 8)}`;
+  return `Flow ${flowWorkflowId.slice(0, 8)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,15 +128,15 @@ export function GlobalScrubber() {
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const playing = useSelector<InspectorState, boolean>((s) => s.scrubberPlaying);
   const speed = useSelector<InspectorState, number>((s) => s.scrubberSpeed);
-  const flowCorrelationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
+  const flowWorkflowId = useSelector<InspectorState, string | null>((s) => s.flowWorkflowId);
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
   const flowData = useSelector<InspectorState, InspectorState["flowData"]>((s) => s.flowData);
   const events = useSelector<InspectorState, InspectorState["events"]>((s) => s.events);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   const seqs = useMemo(
-    () => getScrubberSequence({ flowCorrelationId, flowData, flowSelection, events } as InspectorState),
-    [flowCorrelationId, flowData, flowSelection, events],
+    () => getScrubberSequence({ flowWorkflowId, flowData, flowSelection, events } as InspectorState),
+    [flowWorkflowId, flowData, flowSelection, events],
   );
 
   const endVal = scrubberEnd ?? (seqs[seqs.length - 1] ?? 0);
@@ -203,7 +203,7 @@ export function GlobalScrubber() {
   const disabled = seqs.length < 2;
   const speedLabel = speed <= 50 ? "4x" : speed <= 150 ? "2x" : speed <= 300 ? "1x" : "0.5x";
   const btnClass = `p-1.5 rounded-md transition-all duration-150 ${disabled ? "text-muted-foreground/20 cursor-default" : "text-muted-foreground/60 hover:text-foreground hover:bg-white/[0.05]"}`;
-  const contextLabel = getContextLabel(flowCorrelationId, flowSelection);
+  const contextLabel = getContextLabel(flowWorkflowId, flowSelection);
 
   return (
     <div

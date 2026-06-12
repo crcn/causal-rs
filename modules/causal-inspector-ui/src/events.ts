@@ -1,7 +1,7 @@
 import type { BaseEvent } from "./machine";
 import type {
   InspectorEvent,
-  CorrelationSummary,
+  WorkflowSummary,
   ReactorDependency,
   AggregateLifecycleEntry,
   FilterState,
@@ -35,25 +35,25 @@ type FlowLoaded = BaseEvent<"events/flow_loaded", InspectorEvent[]>;
 type LogsLoaded = BaseEvent<"events/logs_loaded", ReactorLog[]>;
 type DescriptionsLoaded = BaseEvent<
   "events/descriptions_loaded",
-  { correlationId: string; descriptions: ReactorDescription[] }
+  { workflowId: string; descriptions: ReactorDescription[] }
 >;
 type DescriptionSnapshotsLoaded = BaseEvent<
   "events/description_snapshots_loaded",
-  { correlationId: string; snapshots: ReactorDescriptionSnapshot[] }
+  { workflowId: string; snapshots: ReactorDescriptionSnapshot[] }
 >;
 type AggregateTimelineLoaded = BaseEvent<
   "events/aggregate_timeline_loaded",
-  { correlationId: string; entries: AggregateTimelineEntry[] }
+  { workflowId: string; entries: AggregateTimelineEntry[] }
 >;
 type OutcomesLoaded = BaseEvent<
   "events/outcomes_loaded",
-  { correlationId: string; outcomes: ReactorOutcome[] }
+  { workflowId: string; outcomes: ReactorOutcome[] }
 >;
 type AttemptsLoaded = BaseEvent<
   "events/attempts_loaded",
-  { correlationId: string; attempts: ReactorAttempt[] }
+  { workflowId: string; attempts: ReactorAttempt[] }
 >;
-type CorrelationsLoaded = BaseEvent<"events/correlations_loaded", { correlations: CorrelationSummary[]; hasMore: boolean; append: boolean }>;
+type WorkflowsLoaded = BaseEvent<"events/workflows_loaded", { workflows: WorkflowSummary[]; hasMore: boolean; append: boolean }>;
 type ReactorDependenciesLoaded = BaseEvent<"events/reactor_dependencies_loaded", ReactorDependency[]>;
 type AggregateKeysLoaded = BaseEvent<"events/aggregate_keys_loaded", string[]>;
 type AggregateLifecycleLoaded = BaseEvent<"events/aggregate_lifecycle_loaded", { key: string; entries: AggregateLifecycleEntry[] }>;
@@ -62,7 +62,7 @@ type AggregateLifecycleLoaded = BaseEvent<"events/aggregate_lifecycle_loaded", {
 
 type EventSelected = BaseEvent<"ui/event_selected", { seq: number }>;
 type EventDeselected = BaseEvent<"ui/event_deselected">;
-type FlowOpened = BaseEvent<"ui/flow_opened", { correlationId: string }>;
+type FlowOpened = BaseEvent<"ui/flow_opened", { workflowId: string }>;
 type FlowClosed = BaseEvent<"ui/flow_closed">;
 type FlowNodeSelected = BaseEvent<"ui/flow_node_selected", FlowSelection>;
 type FilterChanged = BaseEvent<"ui/filter_changed", Partial<FilterState>>;
@@ -72,11 +72,11 @@ type ScrubberStartChanged = BaseEvent<"ui/scrubber_start_changed", { start: numb
 type ScrubberEndChanged = BaseEvent<"ui/scrubber_end_changed", { end: number | null }>;
 type ScrubberPlayToggled = BaseEvent<"ui/scrubber_play_toggled">;
 type ScrubberSpeedChanged = BaseEvent<"ui/scrubber_speed_changed", { speed: number }>;
-type CorrelationsRequested = BaseEvent<"ui/correlations_requested", { search?: string }>;
+type WorkflowsRequested = BaseEvent<"ui/workflows_requested", { search?: string }>;
 type HandlerSelected = BaseEvent<"ui/handler_selected", { reactorId: string }>;
 type AggregateLifecycleRequested = BaseEvent<"ui/aggregate_lifecycle_requested", { aggregateKey: string }>;
-type LoadMoreCorrelationsRequested = BaseEvent<"ui/load_more_correlations_requested">;
-type LocationChanged = BaseEvent<"location/changed", { correlationId: string | null; handler: string | null }>;
+type LoadMoreWorkflowsRequested = BaseEvent<"ui/load_more_workflows_requested">;
+type LocationChanged = BaseEvent<"location/changed", { workflowId: string | null; handler: string | null }>;
 
 // ── Union ──
 
@@ -93,7 +93,7 @@ export type InspectorMachineEvent =
   | AggregateTimelineLoaded
   | OutcomesLoaded
   | AttemptsLoaded
-  | CorrelationsLoaded
+  | WorkflowsLoaded
   | EventSelected
   | EventDeselected
   | FlowOpened
@@ -106,11 +106,11 @@ export type InspectorMachineEvent =
   | ScrubberEndChanged
   | ScrubberPlayToggled
   | ScrubberSpeedChanged
-  | CorrelationsRequested
+  | WorkflowsRequested
   | ReactorDependenciesLoaded
   | AggregateKeysLoaded
   | HandlerSelected
   | LocationChanged
   | AggregateLifecycleLoaded
   | AggregateLifecycleRequested
-  | LoadMoreCorrelationsRequested;
+  | LoadMoreWorkflowsRequested;

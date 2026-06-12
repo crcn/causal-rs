@@ -2,24 +2,24 @@ import type { EngineCreator } from "../machine";
 import type { InspectorMachineEvent } from "../events";
 import type { InspectorState } from "../state";
 
-function parseUrl(): { correlationId: string | null; handler: string | null } {
+function parseUrl(): { workflowId: string | null; handler: string | null } {
   const params = new URLSearchParams(window.location.search);
   return {
-    correlationId: params.get("correlation"),
+    workflowId: params.get("workflow"),
     handler: params.get("handler"),
   };
 }
 
-function buildSearch(correlationId: string | null, handler: string | null): string {
+function buildSearch(workflowId: string | null, handler: string | null): string {
   const params = new URLSearchParams(window.location.search);
 
-  if (correlationId) params.set("correlation", correlationId);
+  if (workflowId) params.set("workflow", workflowId);
   else {
-    params.delete("correlation");
+    params.delete("workflow");
     params.delete("handler");
   }
 
-  if (handler && correlationId) params.set("handler", handler);
+  if (handler && workflowId) params.set("handler", handler);
   else params.delete("handler");
 
   const search = params.toString();
@@ -48,7 +48,7 @@ export const createUrlEngine: EngineCreator<InspectorState, InspectorMachineEven
   // Seed from current URL on init — deferred so the Machine constructor finishes first.
   queueMicrotask(() => {
     const initial = parseUrl();
-    if (initial.correlationId || initial.handler) {
+    if (initial.workflowId || initial.handler) {
       dispatch({ type: "location/changed", payload: initial });
     }
   });
@@ -57,15 +57,15 @@ export const createUrlEngine: EngineCreator<InspectorState, InspectorMachineEven
     handleEvent: (event) => {
       switch (event.type) {
         case "ui/flow_opened":
-          window.history.pushState(null, "", buildSearch(event.payload.correlationId, null));
+          window.history.pushState(null, "", buildSearch(event.payload.workflowId, null));
           break;
         case "ui/flow_closed":
           window.history.pushState(null, "", buildSearch(null, null));
           break;
         case "ui/filter_changed": {
-          const payload = event.payload as Partial<{ correlationId: string | null }>;
-          if (payload.correlationId !== undefined) {
-            window.history.pushState(null, "", buildSearch(payload.correlationId, null));
+          const payload = event.payload as Partial<{ workflowId: string | null }>;
+          if (payload.workflowId !== undefined) {
+            window.history.pushState(null, "", buildSearch(payload.workflowId, null));
           }
           break;
         }
@@ -75,7 +75,7 @@ export const createUrlEngine: EngineCreator<InspectorState, InspectorMachineEven
             null,
             "",
             buildSearch(
-              new URLSearchParams(window.location.search).get("correlation"),
+              new URLSearchParams(window.location.search).get("workflow"),
               event.payload.reactorId,
             ),
           );

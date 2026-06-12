@@ -5,7 +5,7 @@ import type {
   InspectorEventsPage,
   InspectorCausalTree,
   InspectorCausalFlow,
-  CorrelationSummaryPage,
+  WorkflowSummaryPage,
   ReactorDependency,
   AggregateLifecycleEntry,
   ReactorLog,
@@ -19,11 +19,11 @@ import {
   INSPECTOR_EVENTS,
   INSPECTOR_CAUSAL_TREE,
   INSPECTOR_CAUSAL_FLOW,
-  INSPECTOR_CORRELATIONS,
+  INSPECTOR_WORKFLOWS,
   INSPECTOR_REACTOR_DEPENDENCIES,
   INSPECTOR_AGGREGATE_KEYS,
   INSPECTOR_AGGREGATE_LIFECYCLE,
-  INSPECTOR_REACTOR_LOGS_BY_CORRELATION,
+  INSPECTOR_REACTOR_LOGS_BY_WORKFLOW,
   INSPECTOR_REACTOR_DESCRIPTIONS,
   INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS,
   INSPECTOR_AGGREGATE_TIMELINE,
@@ -50,10 +50,10 @@ export const createQueryEngine = (
 ): EngineCreator<InspectorState, InspectorMachineEvent> => {
   return (dispatch, getState) => {
     let flowPollTimer: ReturnType<typeof setInterval> | null = null;
-    let correlationPollTimer: ReturnType<typeof setInterval> | null = null;
+    let workflowPollTimer: ReturnType<typeof setInterval> | null = null;
     // Stale-response guards
     let activeCausalSeq: number | null = null;
-    let activeFlowCorrelationId: string | null = null;
+    let activeFlowWorkflowId: string | null = null;
 
     const fetchEvents = async () => {
       const state = getState();
@@ -69,7 +69,7 @@ export const createQueryEngine = (
             limit: 50,
             cursor,
             search: state.filters.search || undefined,
-            correlationId: state.filters.correlationId || undefined,
+            workflowId: state.filters.workflowId || undefined,
             aggregateKey: state.filters.aggregateKey || undefined,
           }
         );
@@ -102,13 +102,13 @@ export const createQueryEngine = (
       }
     };
 
-    const fetchFlow = async (correlationId: string) => {
-      activeFlowCorrelationId = correlationId;
+    const fetchFlow = async (workflowId: string) => {
+      activeFlowWorkflowId = workflowId;
       try {
         const data = await transport.query<{
           inspectorCausalFlow: InspectorCausalFlow;
-        }>(INSPECTOR_CAUSAL_FLOW, { correlationId });
-        if (activeFlowCorrelationId !== correlationId) return; // stale
+        }>(INSPECTOR_CAUSAL_FLOW, { workflowId });
+        if (activeFlowWorkflowId !== workflowId) return; // stale
         dispatch({
           type: "events/flow_loaded",
           payload: data.inspectorCausalFlow.events,
@@ -118,59 +118,59 @@ export const createQueryEngine = (
       }
     };
 
-    const fetchFlowMetadata = async (correlationId: string) => {
+    const fetchFlowMetadata = async (workflowId: string) => {
       try {
         const [descData, snapshotData, aggTimelineData, outcomeData, attemptData] = await Promise.all([
           transport.query<{
             inspectorReactorDescriptions: ReactorDescription[];
-          }>(INSPECTOR_REACTOR_DESCRIPTIONS, { correlationId }),
+          }>(INSPECTOR_REACTOR_DESCRIPTIONS, { workflowId }),
           transport.query<{
             inspectorReactorDescriptionSnapshots: ReactorDescriptionSnapshot[];
-          }>(INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS, { correlationId }),
+          }>(INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS, { workflowId }),
           transport.query<{
             inspectorAggregateTimeline: AggregateTimelineEntry[];
-          }>(INSPECTOR_AGGREGATE_TIMELINE, { correlationId }),
+          }>(INSPECTOR_AGGREGATE_TIMELINE, { workflowId }),
           transport.query<{
             inspectorReactorOutcomes: ReactorOutcome[];
-          }>(INSPECTOR_REACTOR_OUTCOMES, { correlationId }),
+          }>(INSPECTOR_REACTOR_OUTCOMES, { workflowId }),
           transport.query<{
             inspectorReactorAttempts: ReactorAttempt[];
-          }>(INSPECTOR_REACTOR_ATTEMPTS, { correlationId }),
+          }>(INSPECTOR_REACTOR_ATTEMPTS, { workflowId }),
         ]);
-        if (activeFlowCorrelationId !== correlationId) return; // stale
+        if (activeFlowWorkflowId !== workflowId) return; // stale
 
         dispatch({
           type: "events/descriptions_loaded",
           payload: {
-            correlationId,
+            workflowId,
             descriptions: descData.inspectorReactorDescriptions,
           },
         });
         dispatch({
           type: "events/description_snapshots_loaded",
           payload: {
-            correlationId,
+            workflowId,
             snapshots: snapshotData.inspectorReactorDescriptionSnapshots,
           },
         });
         dispatch({
           type: "events/aggregate_timeline_loaded",
           payload: {
-            correlationId,
+            workflowId,
             entries: aggTimelineData.inspectorAggregateTimeline,
           },
         });
         dispatch({
           type: "events/outcomes_loaded",
           payload: {
-            correlationId,
+            workflowId,
             outcomes: outcomeData.inspectorReactorOutcomes,
           },
         });
         dispatch({
           type: "events/attempts_loaded",
           payload: {
-            correlationId,
+            workflowId,
             attempts: attemptData.inspectorReactorAttempts,
           },
         });
@@ -179,44 +179,44 @@ export const createQueryEngine = (
       }
     };
 
-    const fetchLogs = async (correlationId: string) => {
+    const fetchLogs = async (workflowId: string) => {
       try {
         const data = await transport.query<{
-          inspectorReactorLogsByCorrelation: ReactorLog[];
-        }>(INSPECTOR_REACTOR_LOGS_BY_CORRELATION, { correlationId });
-        dispatch({ type: "events/logs_loaded", payload: data.inspectorReactorLogsByCorrelation });
+          inspectorReactorLogsByWorkflow: ReactorLog[];
+        }>(INSPECTOR_REACTOR_LOGS_BY_WORKFLOW, { workflowId });
+        dispatch({ type: "events/logs_loaded", payload: data.inspectorReactorLogsByWorkflow });
       } catch (e) {
         console.error("[causal-inspector] fetch logs failed:", e);
       }
     };
 
-    let correlationCursor: string | null = null;
+    let workflowCursor: string | null = null;
 
-    const fetchCorrelations = async (opts?: { search?: string; append?: boolean }) => {
+    const fetchWorkflows = async (opts?: { search?: string; append?: boolean }) => {
       const append = opts?.append ?? false;
-      const cursor = append ? correlationCursor : undefined;
+      const cursor = append ? workflowCursor : undefined;
 
       try {
         const data = await transport.query<{
-          inspectorCorrelations: CorrelationSummaryPage;
-        }>(INSPECTOR_CORRELATIONS, {
+          inspectorWorkflows: WorkflowSummaryPage;
+        }>(INSPECTOR_WORKFLOWS, {
           search: opts?.search || undefined,
           limit: 50,
           cursor: cursor || undefined,
         });
 
-        correlationCursor = data.inspectorCorrelations.nextCursor;
+        workflowCursor = data.inspectorWorkflows.nextCursor;
 
         dispatch({
-          type: "events/correlations_loaded",
+          type: "events/workflows_loaded",
           payload: {
-            correlations: data.inspectorCorrelations.correlations,
-            hasMore: data.inspectorCorrelations.nextCursor != null,
+            workflows: data.inspectorWorkflows.workflows,
+            hasMore: data.inspectorWorkflows.nextCursor != null,
             append,
           },
         });
       } catch (e) {
-        console.error("[causal-inspector] fetch correlations failed:", e);
+        console.error("[causal-inspector] fetch workflows failed:", e);
       }
     };
 
@@ -262,10 +262,10 @@ export const createQueryEngine = (
       }
     };
 
-    const startFlowPolling = (correlationId: string) => {
+    const startFlowPolling = (workflowId: string) => {
       stopFlowPolling();
-      fetchFlowMetadata(correlationId);
-      flowPollTimer = setInterval(() => fetchFlowMetadata(correlationId), 5000);
+      fetchFlowMetadata(workflowId);
+      flowPollTimer = setInterval(() => fetchFlowMetadata(workflowId), 5000);
     };
 
     const stopFlowPolling = () => {
@@ -275,16 +275,16 @@ export const createQueryEngine = (
       }
     };
 
-    const stopCorrelationPolling = () => {
-      if (correlationPollTimer) {
-        clearInterval(correlationPollTimer);
-        correlationPollTimer = null;
+    const stopWorkflowPolling = () => {
+      if (workflowPollTimer) {
+        clearInterval(workflowPollTimer);
+        workflowPollTimer = null;
       }
     };
 
     // Initial load
     fetchEvents();
-    fetchCorrelations();
+    fetchWorkflows();
     fetchReactorDependencies();
     fetchAggregateKeys();
 
@@ -292,13 +292,13 @@ export const createQueryEngine = (
       handleEvent: (event, curr, prev) => {
         // ── State-reactive: navigation transitions ──
 
-        if (curr.flowCorrelationId !== prev.flowCorrelationId) {
-          if (curr.flowCorrelationId) {
+        if (curr.flowWorkflowId !== prev.flowWorkflowId) {
+          if (curr.flowWorkflowId) {
             // Flow opened
-            fetchFlow(curr.flowCorrelationId);
-            startFlowPolling(curr.flowCorrelationId);
-            fetchLogs(curr.flowCorrelationId);
-            stopCorrelationPolling();
+            fetchFlow(curr.flowWorkflowId);
+            startFlowPolling(curr.flowWorkflowId);
+            fetchLogs(curr.flowWorkflowId);
+            stopWorkflowPolling();
           } else {
             // Flow closed
             stopFlowPolling();
@@ -320,15 +320,15 @@ export const createQueryEngine = (
             fetchEvents();
             break;
 
-          case "ui/load_more_correlations_requested":
-            fetchCorrelations({ append: true });
+          case "ui/load_more_workflows_requested":
+            fetchWorkflows({ append: true });
             break;
 
-          case "ui/correlations_requested":
-            correlationCursor = null;
-            fetchCorrelations({ search: event.payload.search });
-            stopCorrelationPolling();
-            correlationPollTimer = setInterval(() => fetchCorrelations({ search: event.payload.search }), 5000);
+          case "ui/workflows_requested":
+            workflowCursor = null;
+            fetchWorkflows({ search: event.payload.search });
+            stopWorkflowPolling();
+            workflowPollTimer = setInterval(() => fetchWorkflows({ search: event.payload.search }), 5000);
             break;
 
           case "ui/aggregate_lifecycle_requested":
@@ -338,7 +338,7 @@ export const createQueryEngine = (
       },
       dispose: () => {
         stopFlowPolling();
-        stopCorrelationPolling();
+        stopWorkflowPolling();
       },
     };
   };

@@ -15,7 +15,7 @@
 //!       kurrentplatform/kurrentdb:latest --insecure --run-projections=All \
 //!       --enable-atom-pub-over-http
 //!
-//! Each test scopes its assertions by a per-test correlation_id; we
+//! Each test scopes its assertions by a per-test workflow_id; we
 //! don't try to truncate Kurrent between runs (Kurrent isn't really
 //! "TRUNCATE-able" — stream deletion is logical). Tests must remain
 //! tolerant of pre-existing data in `$all`.
@@ -40,10 +40,10 @@ fn connect() -> KurrentEventLogBackend {
         .expect("Kurrent connect failed — is the server up at KURRENT_URL?")
 }
 
-/// All tests isolate by a per-test correlation_id. Avoid stepping on
+/// All tests isolate by a per-test workflow_id. Avoid stepping on
 /// streams that other tests might own.
 fn mk_event(
-    correlation: Uuid,
+    workflow: Uuid,
     event_type: &str,
     category: Option<&str>,
     stream_id: Option<Uuid>,
@@ -51,7 +51,7 @@ fn mk_event(
     EventData {
         event_id:        Uuid::new_v4(),
         causation_id:       None,
-        correlation_id:  correlation,
+        workflow_id:  workflow,
         event_type:      event_type.to_string(),
         payload:         serde_json::json!({ "v": 1 }),
         created_at:      Utc::now(),
@@ -68,9 +68,9 @@ fn mk_event(
 async fn append_and_read_stream_round_trips() -> Result<()> {
     let backend = connect();
 
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
     let agg_id = Uuid::new_v4();
-    let event = mk_event(correlation, "lifecycle:run_started",
+    let event = mk_event(workflow, "lifecycle:run_started",
                          Some("lifecycle"), Some(agg_id));
     let event_id = event.event_id;
 
@@ -83,7 +83,7 @@ async fn append_and_read_stream_round_trips() -> Result<()> {
     let stream = backend.read_stream("lifecycle", agg_id, None).await?;
     assert_eq!(stream.len(), 1, "exactly the one event we wrote");
     assert_eq!(stream[0].event_id, event_id);
-    assert_eq!(stream[0].correlation_id, correlation);
+    assert_eq!(stream[0].workflow_id, workflow);
     assert_eq!(stream[0].event_type, "lifecycle:run_started");
     assert_eq!(stream[0].payload, serde_json::json!({ "v": 1 }));
     Ok(())
@@ -99,8 +99,8 @@ async fn append_is_idempotent_for_duplicate_eventid_at_stream_head() -> Result<(
     // another append to the same stream can still duplicate — there is
     // no time window. This test pins the no-interleave behavior.
     let backend = connect();
-    let correlation = Uuid::new_v4();
-    let mut event = mk_event(correlation, "telemetry:ping", None, None);
+    let workflow = Uuid::new_v4();
+    let mut event = mk_event(workflow, "telemetry:ping", None, None);
     let event_id = event.event_id;
 
     let first = causal::append_event(&backend, event.clone()).await?;
@@ -249,9 +249,9 @@ async fn metadata_round_trips_with_reserved_keys_stripped() -> Result<()> {
     let backend = connect();
     let agg_id = Uuid::new_v4();
     let parent = Uuid::new_v4();
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
 
-    let mut event = mk_event(correlation, "lifecycle:tagged",
+    let mut event = mk_event(workflow, "lifecycle:tagged",
                              Some("lifecycle"), Some(agg_id));
     event.causation_id = Some(parent);
     event.metadata.insert(
@@ -267,7 +267,7 @@ async fn metadata_round_trips_with_reserved_keys_stripped() -> Result<()> {
     let stream = backend.read_stream("lifecycle", agg_id, None).await?;
     let loaded = stream.iter().find(|e| e.event_id == event_id)
         .expect("event in stream");
-    assert_eq!(loaded.correlation_id, correlation,
+    assert_eq!(loaded.workflow_id, workflow,
                "$correlationId was stamped and stripped back into the field");
     assert_eq!(loaded.causation_id, Some(parent),
                "$causationId was stamped and stripped back into the field");

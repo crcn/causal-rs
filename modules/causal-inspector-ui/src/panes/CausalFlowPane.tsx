@@ -615,7 +615,7 @@ export type CausalFlowPaneProps = {
 };
 
 export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlowPaneProps = {}) {
-  const flowCorrelationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
+  const flowWorkflowId = useSelector<InspectorState, string | null>((s) => s.flowWorkflowId);
   const flowData = useSelector<InspectorState, InspectorEvent[]>((s) => s.flowData);
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
   const descriptionsMap = useSelector<InspectorState, Record<string, ReactorDescription[]>>((s) => s.descriptions);
@@ -624,26 +624,26 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
-  const flowLoading = flowCorrelationId != null && flowData.length === 0;
+  const flowLoading = flowWorkflowId != null && flowData.length === 0;
 
   // Build typed maps from state
   const descriptions = useMemo(() => {
-    if (!flowCorrelationId) return undefined;
-    const raw = descriptionsMap[flowCorrelationId];
+    if (!flowWorkflowId) return undefined;
+    const raw = descriptionsMap[flowWorkflowId];
     if (!raw) return undefined;
     const map = new Map<string, Block[]>();
     for (const d of raw) map.set(d.reactorId, d.blocks);
     return map;
-  }, [descriptionsMap, flowCorrelationId]);
+  }, [descriptionsMap, flowWorkflowId]);
 
   const outcomes = useMemo(() => {
-    if (!flowCorrelationId) return undefined;
-    const raw = outcomesMap[flowCorrelationId];
+    if (!flowWorkflowId) return undefined;
+    const raw = outcomesMap[flowWorkflowId];
     if (!raw) return undefined;
     const map = new Map<string, ReactorOutcome>();
     for (const o of raw) map.set(o.reactorId, o);
     return map;
-  }, [outcomesMap, flowCorrelationId]);
+  }, [outcomesMap, flowWorkflowId]);
 
   const [hiddenReactors, setHiddenReactors] = useState<Set<string>>(
     () => defaultHiddenReactors ?? new Set()
@@ -780,7 +780,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
 
   const onNodesChange = useCallback((_changes: NodeChange[]) => {}, []);
 
-  if (!flowCorrelationId) {
+  if (!flowWorkflowId) {
     return (
       <div className="flex items-center justify-center h-full text-xs text-muted-foreground/50 tracking-wide">
         Select an event to visualize its causal flow
@@ -822,7 +822,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
         <h3 className="text-[10px] font-semibold text-muted-foreground/60 uppercase tracking-widest">
           Flow
         </h3>
-        <span className="text-[10px] font-mono text-foreground/80 truncate px-1.5 py-0.5 rounded bg-white/[0.03] border border-border">{flowCorrelationId}</span>
+        <span className="text-[10px] font-mono text-foreground/80 truncate px-1.5 py-0.5 rounded bg-white/[0.03] border border-border">{flowWorkflowId}</span>
         <span className="text-[10px] text-muted-foreground/50 tabular-nums">
           {flowData.length} events &middot; {nodes.length} nodes
         </span>

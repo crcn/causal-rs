@@ -30,7 +30,7 @@ use crate::types::{
 ///
 /// A dedup-hit MUST be a **byte-identical** redelivery: backends MUST
 /// error (not silently keep the old row) when a redelivered event's
-/// `payload`, `event_type`, `correlation_id`, or `causation_id` differs
+/// `payload`, `event_type`, `workflow_id`, or `causation_id` differs
 /// from the persisted row. A divergent re-emission means the producer is
 /// nondeterministic under redelivery (wall clock, rand, or an external
 /// call not under `ctx.remember`) — silently keeping the old row while

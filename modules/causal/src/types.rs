@@ -167,8 +167,8 @@ pub struct RecordedEvent {
     pub event_id: Uuid,
     /// Parent event that caused this event (None for root events).
     pub causation_id: Option<Uuid>,
-    /// Correlation ID linking the full causal tree.
-    pub correlation_id: Uuid,
+    /// Workflow ID linking the full causal tree.
+    pub workflow_id: Uuid,
     /// Canonical `{CATEGORY}:{name}` event_type string.
     pub event_type: String,
     /// JSON payload.
@@ -211,7 +211,7 @@ impl fmt::Debug for RecordedEvent {
             .field("position", &self.position)
             .field("event_id", &self.event_id)
             .field("causation_id", &self.causation_id)
-            .field("correlation_id", &self.correlation_id)
+            .field("workflow_id", &self.workflow_id)
             .field("event_type", &self.event_type)
             .field("payload", &self.payload)
             .field("created_at", &self.created_at)
@@ -229,7 +229,7 @@ impl fmt::Debug for RecordedEvent {
 pub struct EventData {
     pub event_id: Uuid,
     pub causation_id: Option<Uuid>,
-    pub correlation_id: Uuid,
+    pub workflow_id: Uuid,
     pub event_type: String,
     pub payload: serde_json::Value,
     /// Hint for `created_at` — backends MAY override server-side.
@@ -251,7 +251,7 @@ impl fmt::Debug for EventData {
         f.debug_struct("EventData")
             .field("event_id", &self.event_id)
             .field("causation_id", &self.causation_id)
-            .field("correlation_id", &self.correlation_id)
+            .field("workflow_id", &self.workflow_id)
             .field("event_type", &self.event_type)
             .field("payload", &self.payload)
             .field("created_at", &self.created_at)
@@ -283,7 +283,7 @@ mod persisted_event_tests {
             position:        LogCursor::ZERO,
             event_id:        Uuid::nil(),
             causation_id:       None,
-            correlation_id:  Uuid::nil(),
+            workflow_id:  Uuid::nil(),
             event_type:      event_type.into(),
             payload:         serde_json::Value::Null,
             created_at:      Utc::now(),

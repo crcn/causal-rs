@@ -26,7 +26,7 @@ pub trait ReactorObserver: Send + Sync + 'static {
         &self,
         _event_id: Uuid,
         _reactor_id: &str,
-        _correlation_id: Uuid,
+        _workflow_id: Uuid,
         _attempt: u32,
         _started_at: DateTime<Utc>,
     ) {}
@@ -37,7 +37,7 @@ pub trait ReactorObserver: Send + Sync + 'static {
         &self,
         _event_id: Uuid,
         _reactor_id: &str,
-        _correlation_id: Uuid,
+        _workflow_id: Uuid,
         _attempt: u32,
         _started_at: DateTime<Utc>,
         _completed_at: DateTime<Utc>,
@@ -50,7 +50,7 @@ pub trait ReactorObserver: Send + Sync + 'static {
         &self,
         _event_id: Uuid,
         _reactor_id: &str,
-        _correlation_id: Uuid,
+        _workflow_id: Uuid,
         _attempt: u32,
         _started_at: DateTime<Utc>,
         _completed_at: DateTime<Utc>,
@@ -65,7 +65,7 @@ pub trait ReactorObserver: Send + Sync + 'static {
         &self,
         _event_id: Uuid,
         _reactor_id: &str,
-        _correlation_id: Uuid,
+        _workflow_id: Uuid,
         _attempts: u32,
         _error: &str,
         _at: DateTime<Utc>,
@@ -75,7 +75,7 @@ pub trait ReactorObserver: Send + Sync + 'static {
     /// `state` is the JSON-serialized post-fold aggregate state.
     fn aggregate_folded(
         &self,
-        _correlation_id: Uuid,
+        _workflow_id: Uuid,
         _position: LogCursor,
         _event_id: Uuid,
         _aggregate_key: &str,
@@ -87,7 +87,7 @@ pub trait ReactorObserver: Send + Sync + 'static {
     /// declared intent for this trigger event.
     fn reactor_description(
         &self,
-        _correlation_id: Uuid,
+        _workflow_id: Uuid,
         _position: LogCursor,
         _event_id: Uuid,
         _reactor_id: &str,

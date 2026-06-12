@@ -102,7 +102,7 @@ mod pg {
 
     /// A dedup-hit must be a **byte-identical** redelivery (see the
     /// `EventLogBackend` idempotency contract): a persisted row whose
-    /// `payload` / `event_type` / `correlation_id` / `causation_id`
+    /// `payload` / `event_type` / `workflow_id` / `causation_id`
     /// differs from the redelivered batch means the producer re-decided
     /// differently on redelivery — error loudly instead of silently
     /// keeping the old row. `created_at` and `metadata` are exempt
@@ -115,7 +115,7 @@ mod pg {
         event_ids: &[Uuid],
         event_types: &[String],
         payloads: &[serde_json::Value],
-        correlation_ids: &[Uuid],
+        workflow_ids: &[Uuid],
         causation_ids: &[Option<Uuid>],
     ) -> Result<()>
     where
@@ -137,7 +137,7 @@ mod pg {
         .bind(event_ids)
         .bind(event_types)
         .bind(payloads)
-        .bind(correlation_ids)
+        .bind(workflow_ids)
         .bind(causation_ids)
         .fetch_optional(executor)
         .await?;
@@ -145,7 +145,7 @@ mod pg {
             anyhow::bail!(
                 "append_to_stream: divergent redelivery for event_id {id} — \
                  the persisted row differs from this batch's event \
-                 (payload/event_type/correlation/causation). A dedup-hit \
+                 (payload/event_type/workflow/causation). A dedup-hit \
                  must be byte-identical; a differing re-emission means the \
                  producer is nondeterministic under redelivery (wall clock, \
                  rand, or an external call not under ctx.remember). The \
@@ -174,7 +174,7 @@ mod pg {
             // of pure SQL — no per-event encoding work under the lock.
             let event_ids:       Vec<Uuid>           = events.iter().map(|e| e.event_id).collect();
             let causation_ids:   Vec<Option<Uuid>>   = events.iter().map(|e| e.causation_id).collect();
-            let correlation_ids: Vec<Uuid>           = events.iter().map(|e| e.correlation_id).collect();
+            let workflow_ids: Vec<Uuid>           = events.iter().map(|e| e.workflow_id).collect();
             let event_types:     Vec<String>         = events.iter().map(|e| e.event_type.clone()).collect();
             let payloads:        Vec<serde_json::Value> = events.iter().map(|e| e.payload.clone()).collect();
             let metadatas:       Vec<serde_json::Value> = events
@@ -262,7 +262,7 @@ mod pg {
                                     &event_ids,
                                     &event_types,
                                     &payloads,
-                                    &correlation_ids,
+                                    &workflow_ids,
                                     &causation_ids,
                                 )
                                 .await?;
@@ -342,10 +342,10 @@ mod pg {
             // so positions ascend with revisions within the batch.
             let rows = sqlx::query(
                 "INSERT INTO causal_log
-                    (event_id, causation_id, correlation_id, event_type,
+                    (event_id, causation_id, workflow_id, event_type,
                      payload, aggregate_type, aggregate_id, revision,
                      metadata, created_at, persistent)
-                 SELECT u.event_id, u.causation_id, u.correlation_id,
+                 SELECT u.event_id, u.causation_id, u.workflow_id,
                         u.event_type, u.payload, $1, $2, u.revision,
                         u.metadata, u.created_at, u.persistent
                    FROM UNNEST($3::uuid[], $4::uuid[], $5::uuid[],
@@ -353,7 +353,7 @@ mod pg {
                                $9::jsonb[], $10::timestamptz[],
                                $11::boolean[])
                         WITH ORDINALITY
-                        AS u(event_id, causation_id, correlation_id,
+                        AS u(event_id, causation_id, workflow_id,
                              event_type, payload, revision, metadata,
                              created_at, persistent, ord)
                   ORDER BY u.ord
@@ -363,7 +363,7 @@ mod pg {
             .bind(aggregate_id)
             .bind(&event_ids)
             .bind(&causation_ids)
-            .bind(&correlation_ids)
+            .bind(&workflow_ids)
             .bind(&event_types)
             .bind(&payloads)
             .bind(&revisions)
@@ -419,7 +419,7 @@ mod pg {
                             &event_ids,
                             &event_types,
                             &payloads,
-                            &correlation_ids,
+                            &workflow_ids,
                             &causation_ids,
                         )
                         .await?;
@@ -481,7 +481,7 @@ mod pg {
             limit: usize,
         ) -> Result<Vec<RecordedEvent>> {
             let rows = sqlx::query(
-                "SELECT position, event_id, causation_id, correlation_id,
+                "SELECT position, event_id, causation_id, workflow_id,
                         event_type, payload, aggregate_type, aggregate_id,
                         revision, metadata, created_at, persistent
                    FROM causal_log
@@ -509,7 +509,7 @@ mod pg {
             // so `revision > -1` matches `revision >= 0`.
             let after_val: i64 = after.map(|r| r.raw() as i64).unwrap_or(-1);
             let rows = sqlx::query(
-                "SELECT position, event_id, causation_id, correlation_id,
+                "SELECT position, event_id, causation_id, workflow_id,
                         event_type, payload, aggregate_type, aggregate_id,
                         revision, metadata, created_at, persistent
                    FROM causal_log
@@ -570,7 +570,7 @@ mod pg {
             position: LogCursor::from_raw(position as u64),
             event_id: row.try_get("event_id")?,
             causation_id: row.try_get("causation_id")?,
-            correlation_id: row.try_get("correlation_id")?,
+            workflow_id: row.try_get("correlation_id")?,
             event_type: row.try_get("event_type")?,
             payload: row.try_get("payload")?,
             category,

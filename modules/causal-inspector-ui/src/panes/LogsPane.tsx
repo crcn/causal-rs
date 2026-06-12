@@ -70,8 +70,8 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
   const [levelFilter, setLevelFilter] = useState<Set<string>>(new Set(["debug", "info", "warn", "error"]));
   const [searchText, setSearchText] = useState("");
 
-  const isCorrelationScope = logsFilter.scope === "correlation" && logsFilter.correlationId != null;
-  const hasFilter = logsFilter.reactorId != null || isCorrelationScope;
+  const isWorkflowScope = logsFilter.scope === "workflow" && logsFilter.workflowId != null;
+  const hasFilter = logsFilter.reactorId != null || isWorkflowScope;
 
   // Set of event IDs visible within scrubber range
   const visibleEventIds = useMemo(() => {
@@ -170,10 +170,10 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
         {logsFilter.reactorId ? (
           <>
             <span className="font-mono text-foreground/60">{logsFilter.reactorId}</span>
-            {isCorrelationScope && <span className="ml-1">(all reactors in correlation)</span>}
+            {isWorkflowScope && <span className="ml-1">(all reactors in workflow)</span>}
           </>
         ) : (
-          <span>All reactors in correlation</span>
+          <span>All reactors in workflow</span>
         )}
         <span className="ml-2 tabular-nums">{filteredLogs.length} logs</span>
       </div>
@@ -184,7 +184,7 @@ export function LogsPane({ onInvestigate }: LogsPaneProps = {}) {
           <div className="p-3 text-[11px] text-muted-foreground/40">No logs match filters</div>
         )}
         {filteredLogs.map((log, i) => (
-          <LogRow key={i} log={log} showReactor={isCorrelationScope} />
+          <LogRow key={i} log={log} showReactor={isWorkflowScope} />
         ))}
       </div>
     </div>

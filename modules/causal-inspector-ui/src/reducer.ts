@@ -10,25 +10,25 @@ import type { InspectorState } from "./state";
  */
 function applyNavigation(
   draft: Draft<InspectorState>,
-  correlationId: string | null,
+  workflowId: string | null,
   handler: string | null,
 ) {
-  // Correlation changed → reset flow state
-  if (correlationId !== draft.flowCorrelationId) {
-    if (correlationId) {
-      draft.flowCorrelationId = correlationId;
+  // Workflow changed → reset flow state
+  if (workflowId !== draft.flowWorkflowId) {
+    if (workflowId) {
+      draft.flowWorkflowId = workflowId;
       draft.flowData = [];
       draft.flowSelection = null;
       draft.scrubberStart = null;
       draft.scrubberEnd = null;
       draft.scrubberPlaying = false;
       draft.logsFilter = {
-        scope: "correlation",
+        scope: "workflow",
         reactorId: null,
-        correlationId,
+        workflowId,
       };
     } else {
-      draft.flowCorrelationId = null;
+      draft.flowWorkflowId = null;
       draft.flowData = [];
       draft.flowSelection = null;
       draft.scrubberStart = null;
@@ -37,7 +37,7 @@ function applyNavigation(
       draft.logsFilter = {
         scope: "reactor",
         reactorId: null,
-        correlationId: null,
+        workflowId: null,
       };
     }
   }
@@ -47,7 +47,7 @@ function applyNavigation(
     draft.logsFilter = {
       scope: "reactor",
       reactorId: handler,
-      correlationId: draft.flowCorrelationId,
+      workflowId: draft.flowWorkflowId,
     };
   }
 }
@@ -62,7 +62,7 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
     case "events/received": {
       const newEvents = event.payload;
       const filtered = newEvents.filter((e) => {
-        if (draft.filters.correlationId && e.correlationId !== draft.filters.correlationId) {
+        if (draft.filters.workflowId && e.workflowId !== draft.filters.workflowId) {
           return false;
         }
         if (draft.filters.search) {
@@ -70,7 +70,7 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
           const matches =
             e.name.toLowerCase().includes(s) ||
             e.payload.toLowerCase().includes(s) ||
-            (e.correlationId ?? "").toLowerCase().includes(s);
+            (e.workflowId ?? "").toLowerCase().includes(s);
           if (!matches) return false;
         }
         return true;
@@ -106,39 +106,39 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       draft.logs = event.payload;
       break;
     case "events/descriptions_loaded": {
-      const { correlationId, descriptions } = event.payload;
-      draft.descriptions[correlationId] = descriptions;
+      const { workflowId, descriptions } = event.payload;
+      draft.descriptions[workflowId] = descriptions;
       break;
     }
     case "events/description_snapshots_loaded": {
-      const { correlationId, snapshots } = event.payload;
-      draft.descriptionSnapshots[correlationId] = snapshots;
+      const { workflowId, snapshots } = event.payload;
+      draft.descriptionSnapshots[workflowId] = snapshots;
       break;
     }
     case "events/aggregate_timeline_loaded": {
-      const { correlationId, entries } = event.payload;
-      draft.aggregateTimeline[correlationId] = entries;
+      const { workflowId, entries } = event.payload;
+      draft.aggregateTimeline[workflowId] = entries;
       break;
     }
     case "events/outcomes_loaded": {
-      const { correlationId, outcomes } = event.payload;
-      draft.outcomes[correlationId] = outcomes;
+      const { workflowId, outcomes } = event.payload;
+      draft.outcomes[workflowId] = outcomes;
       break;
     }
     case "events/attempts_loaded": {
-      const { correlationId, attempts } = event.payload;
-      draft.attempts[correlationId] = attempts;
+      const { workflowId, attempts } = event.payload;
+      draft.attempts[workflowId] = attempts;
       break;
     }
-    case "events/correlations_loaded": {
-      const { correlations, hasMore, append } = event.payload;
+    case "events/workflows_loaded": {
+      const { workflows, hasMore, append } = event.payload;
       if (append) {
-        draft.correlations.push(...correlations);
+        draft.workflows.push(...workflows);
       } else {
-        draft.correlations = correlations;
+        draft.workflows = workflows;
       }
-      draft.correlationsHasMore = hasMore;
-      draft.correlationsLoading = false;
+      draft.workflowsHasMore = hasMore;
+      draft.workflowsLoading = false;
       break;
     }
     case "events/reactor_dependencies_loaded":
@@ -155,17 +155,17 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
     // ── Navigation (user facts + browser popstate) ──
 
     case "ui/flow_opened":
-      applyNavigation(draft, event.payload.correlationId, null);
+      applyNavigation(draft, event.payload.workflowId, null);
       break;
     case "ui/flow_closed":
       applyNavigation(draft, null, null);
       break;
     case "ui/handler_selected":
-      applyNavigation(draft, draft.flowCorrelationId, event.payload.reactorId);
+      applyNavigation(draft, draft.flowWorkflowId, event.payload.reactorId);
       break;
     case "location/changed":
-      applyNavigation(draft, event.payload.correlationId, event.payload.handler);
-      draft.filters.correlationId = event.payload.correlationId;
+      applyNavigation(draft, event.payload.workflowId, event.payload.handler);
+      draft.filters.workflowId = event.payload.workflowId;
       break;
 
     // ── UI ──
@@ -182,9 +182,9 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       // Clear reactor filter when deselecting a node
       if (event.payload == null && draft.logsFilter.reactorId != null) {
         draft.logsFilter = {
-          scope: "correlation",
+          scope: "workflow",
           reactorId: null,
-          correlationId: draft.flowCorrelationId,
+          workflowId: draft.flowWorkflowId,
         };
       }
       break;
@@ -209,11 +209,11 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
     case "ui/scrubber_speed_changed":
       draft.scrubberSpeed = event.payload.speed;
       break;
-    case "ui/correlations_requested":
-      draft.correlationsLoading = true;
+    case "ui/workflows_requested":
+      draft.workflowsLoading = true;
       break;
-    case "ui/load_more_correlations_requested":
-      draft.correlationsLoading = true;
+    case "ui/load_more_workflows_requested":
+      draft.workflowsLoading = true;
       break;
   }
 };

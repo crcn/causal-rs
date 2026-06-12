@@ -192,7 +192,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                         reg.notify_observer(
                             &outcome.snapshots,
                             obs.as_ref(),
-                            event.correlation_id,
+                            event.workflow_id,
                             event.position,
                             event.event_id,
                         );
@@ -216,7 +216,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 event_id:       event.event_id,
                 log_position:   event.position,
                 occurred_at,
-                correlation_id: event.correlation_id,
+                workflow_id: event.workflow_id,
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
                 logs:           None,
@@ -326,7 +326,7 @@ mod tests {
         let ev = EventData {
             event_id,
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      event_type.into(),
             payload:         serde_json::json!({"event_type": event_type}),
             created_at:      Utc::now(),

@@ -29,8 +29,8 @@ pub struct StoredEvent {
     pub id: Option<Uuid>,
     /// Parent event ID (causal link).
     pub causation_id: Option<Uuid>,
-    /// Correlation ID linking the full causal chain.
-    pub correlation_id: Option<Uuid>,
+    /// Workflow ID linking the full causal chain.
+    pub workflow_id: Option<Uuid>,
     /// Reactor that produced this event.
     pub reactor_id: Option<String>,
     /// Aggregate type (e.g. "Order"), if this event matched an aggregator.
@@ -55,7 +55,7 @@ impl StoredEvent {
             name,
             id: self.id.map(|u| u.to_string()),
             causation_id: self.causation_id.map(|u| u.to_string()),
-            correlation_id: self.correlation_id.map(|u| u.to_string()),
+            workflow_id: self.workflow_id.map(|u| u.to_string()),
             reactor_id: self.reactor_id.clone(),
             aggregate_type: self.aggregate_type.clone(),
             aggregate_id: self.aggregate_id.map(|u| u.to_string()),
@@ -81,14 +81,14 @@ pub struct EventQuery {
     pub limit: usize,
     /// Cursor for pagination (seq of last seen event).
     pub cursor: Option<i64>,
-    /// Full-text search across payload, event_type, correlation_id.
+    /// Full-text search across payload, event_type, workflow_id.
     pub search: Option<String>,
     /// Only events after this time.
     pub from: Option<DateTime<Utc>>,
     /// Only events before this time.
     pub to: Option<DateTime<Utc>>,
-    /// Filter to a specific correlation chain.
-    pub correlation_id: Option<String>,
+    /// Filter to a specific workflow chain.
+    pub workflow_id: Option<String>,
     /// Filter to a specific aggregate stream (e.g. "Order:00000000-…").
     pub aggregate_key: Option<String>,
 }
@@ -121,7 +121,7 @@ pub struct ReactorOutcomeEntry {
 pub struct ReactorAttemptEntry {
     pub event_id: Uuid,
     pub reactor_id: String,
-    pub correlation_id: String,
+    pub workflow_id: String,
     pub attempt: i32,
     pub status: String,
     pub error: Option<String>,
@@ -165,22 +165,22 @@ pub struct ReactorDependencyEntry {
     pub output_event_types: Vec<String>,
 }
 
-/// An aggregate lifecycle entry — state snapshot across all correlations.
+/// An aggregate lifecycle entry — state snapshot across all workflows.
 #[derive(Debug, Clone)]
 pub struct AggregateLifecycleEntry {
     pub seq: i64,
     pub event_id: Uuid,
     pub event_type: String,
     pub ts: DateTime<Utc>,
-    pub correlation_id: String,
+    pub workflow_id: String,
     pub aggregate_key: String,
     pub state: serde_json::Value,
 }
 
-/// Summary of a correlation chain for the explorer pane.
+/// Summary of a workflow chain for the explorer pane.
 #[derive(Debug, Clone)]
 pub struct CorrelationSummaryEntry {
-    pub correlation_id: String,
+    pub workflow_id: String,
     pub event_count: i64,
     pub first_ts: DateTime<Utc>,
     pub last_ts: DateTime<Utc>,
@@ -207,14 +207,14 @@ pub trait InspectorReadModel: Send + Sync {
     /// Single event by sequence number.
     async fn get_event(&self, seq: i64) -> Result<Option<StoredEvent>>;
 
-    /// All events sharing the same correlation_id as the given event.
+    /// All events sharing the same workflow_id as the given event.
     ///
     /// Returns `(events, root_seq)` where `root_seq` is the seq of the
     /// root event (the one with no parent).
     async fn causal_tree(&self, seq: i64) -> Result<(Vec<StoredEvent>, i64)>;
 
-    /// All events sharing a correlation_id, ordered by seq ascending.
-    async fn causal_flow(&self, correlation_id: &str) -> Result<Vec<StoredEvent>>;
+    /// All events sharing a workflow_id, ordered by seq ascending.
+    async fn causal_flow(&self, workflow_id: &str) -> Result<Vec<StoredEvent>>;
 
     /// Events starting from a given seq (for subscription catch-up).
     async fn events_from_seq(&self, start_seq: i64, limit: usize) -> Result<Vec<StoredEvent>>;
@@ -228,53 +228,53 @@ pub trait InspectorReadModel: Send + Sync {
         reactor_id: &str,
     ) -> Result<Vec<ReactorLogEntry>>;
 
-    /// All reactor logs for a correlation chain.
-    async fn reactor_logs_by_correlation(
+    /// All reactor logs for a workflow chain.
+    async fn reactor_logs_by_workflow(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorLogEntry>>;
 
-    /// Aggregated reactor execution outcomes for a correlation chain.
-    async fn reactor_outcomes(&self, correlation_id: &str) -> Result<Vec<ReactorOutcomeEntry>>;
+    /// Aggregated reactor execution outcomes for a workflow chain.
+    async fn reactor_outcomes(&self, workflow_id: &str) -> Result<Vec<ReactorOutcomeEntry>>;
 
-    /// Per-attempt execution history for a correlation chain.
+    /// Per-attempt execution history for a workflow chain.
     ///
     /// Returns individual attempt records ordered by started_at ascending.
     async fn reactor_attempt_history(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorAttemptEntry>>;
 
-    /// Reactor description blocks for a correlation chain.
+    /// Reactor description blocks for a workflow chain.
     async fn reactor_descriptions(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorDescriptionEntry>>;
 
-    /// Per-event description snapshots for a correlation chain.
+    /// Per-event description snapshots for a workflow chain.
     ///
     /// Returns snapshots ordered by seq ascending, showing the state of
-    /// each reactor's description at each event in the correlation.
+    /// each reactor's description at each event in the workflow.
     async fn reactor_description_snapshots(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<ReactorDescriptionSnapshotEntry>>;
 
-    /// Per-event aggregate state snapshots for a correlation chain.
+    /// Per-event aggregate state snapshots for a workflow chain.
     ///
     /// Returns snapshots ordered by seq ascending, showing aggregate state
     /// after each event was applied.
     async fn aggregate_state_timeline(
         &self,
-        correlation_id: &str,
+        workflow_id: &str,
     ) -> Result<Vec<AggregateStateSnapshotEntry>>;
 
-    /// List all correlation chains with summary stats.
+    /// List all workflow chains with summary stats.
     ///
-    /// Optionally filter by search string (matches correlation_id or root event type).
-    /// Returns most recent correlations first, limited by `limit`.
+    /// Optionally filter by search string (matches workflow_id or root event type).
+    /// Returns most recent workflows first, limited by `limit`.
     /// Pass `cursor` (last_ts of previous page's last item) for pagination.
-    async fn list_correlations(
+    async fn list_workflows(
         &self,
         search: Option<&str>,
         limit: usize,
@@ -287,7 +287,7 @@ pub trait InspectorReadModel: Send + Sync {
     /// and the event types it produced (outputs).
     async fn reactor_dependencies(&self) -> Result<Vec<ReactorDependencyEntry>>;
 
-    /// All state snapshots for a specific aggregate across all correlations.
+    /// All state snapshots for a specific aggregate across all workflows.
     ///
     /// Returns entries ordered by seq ascending.
     async fn aggregate_lifecycle(

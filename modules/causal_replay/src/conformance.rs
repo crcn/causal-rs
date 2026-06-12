@@ -32,10 +32,10 @@
 //!
 //! ## Isolation
 //!
-//! Each scenario uses fresh UUIDs for `event_id`, `correlation_id`,
+//! Each scenario uses fresh UUIDs for `event_id`, `workflow_id`,
 //! `aggregate_id`. Two tests running in parallel against the same
 //! durable backend won't collide on writes; reads are scoped by
-//! correlation_id or aggregate_id rather than by clearing tables.
+//! workflow_id or aggregate_id rather than by clearing tables.
 //!
 //! This means scenarios can run against a shared backend without
 //! teardown. No `TRUNCATE`, no stream deletion.
@@ -50,7 +50,7 @@ use causal::EventLogBackend;
 /// Build a stock `EventData` for tests. Caller can mutate before
 /// appending if they need a non-default shape.
 pub fn fresh_event(
-    correlation: Uuid,
+    workflow: Uuid,
     event_type: &str,
     category: Option<&str>,
     stream_id: Option<Uuid>,
@@ -58,7 +58,7 @@ pub fn fresh_event(
     EventData {
         event_id:        Uuid::new_v4(),
         causation_id:       None,
-        correlation_id:  correlation,
+        workflow_id:  workflow,
         event_type:      event_type.to_string(),
         payload:         serde_json::json!({}),
         created_at:      Utc::now(),
@@ -80,8 +80,8 @@ pub fn fresh_event(
 /// duplicate log entry. (`created_at` may differ — it's a documented
 /// hint that redeliveries re-stamp.)
 pub async fn append_is_idempotent_on_event_id<B: EventLogBackend>(b: &B) -> Result<()> {
-    let correlation = Uuid::new_v4();
-    let mut event = fresh_event(correlation, "conformance:c1", None, None);
+    let workflow = Uuid::new_v4();
+    let mut event = fresh_event(workflow, "conformance:c1", None, None);
     let event_id = event.event_id;
 
     let first = causal::append_event(b, event.clone()).await?;
@@ -104,14 +104,14 @@ pub async fn append_is_idempotent_on_event_id<B: EventLogBackend>(b: &B) -> Resu
 }
 
 /// C1b: a dedup-hit must be byte-identical. A redelivery whose
-/// `payload` (or `event_type` / `correlation_id` / `causation_id`)
+/// `payload` (or `event_type` / `workflow_id` / `causation_id`)
 /// differs from the persisted row is an upstream determinism violation
 /// — the producer re-decided differently on redelivery. The backend
 /// MUST error loudly (never silently keep the old row while reporting
 /// success) and MUST leave the original row untouched.
 pub async fn divergent_redelivery_is_rejected<B: EventLogBackend>(b: &B) -> Result<()> {
-    let correlation = Uuid::new_v4();
-    let mut event = fresh_event(correlation, "conformance:c1b", None, None);
+    let workflow = Uuid::new_v4();
+    let mut event = fresh_event(workflow, "conformance:c1b", None, None);
     let event_id = event.event_id;
     event.payload = serde_json::json!({"decision": "ship"});
 
@@ -810,23 +810,23 @@ pub async fn read_stream_returns_empty_for_missing_stream<B: EventLogBackend>(
 pub async fn read_all_returns_events_strictly_after_cursor<B: EventLogBackend>(
     b: &B,
 ) -> Result<()> {
-    let correlation = Uuid::new_v4();
-    let e1 = fresh_event(correlation, "conformance:c1", None, None);
+    let workflow = Uuid::new_v4();
+    let e1 = fresh_event(workflow, "conformance:c1", None, None);
     let e1_id = e1.event_id;
     let r1 = causal::append_event(b, e1).await?;
 
-    let e2 = fresh_event(correlation, "conformance:c2", None, None);
+    let e2 = fresh_event(workflow, "conformance:c2", None, None);
     let e2_id = e2.event_id;
     causal::append_event(b, e2).await?;
 
     // Reading $all after r1.position must NOT include e1, but MUST
-    // include e2. (Filtering by correlation so we don't pick up
+    // include e2. (Filtering by workflow so we don't pick up
     // unrelated events from a shared backend.)
     let after = b.read_all(r1.position, 1000).await?;
     let mut seen_e1 = false;
     let mut seen_e2 = false;
     for ev in &after {
-        if ev.correlation_id != correlation {
+        if ev.workflow_id != workflow {
             continue;
         }
         if ev.event_id == e1_id {
@@ -884,7 +884,7 @@ pub async fn concurrent_appends_are_tailable_without_loss<B: EventLogBackend>(
     const APPENDERS: usize = 8;
     const EVENTS_PER_APPENDER: usize = 25;
 
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
     let aggregate_type = "conformance";
 
     // Pre-build every batch (one distinct stream per appender) so the
@@ -896,7 +896,7 @@ pub async fn concurrent_appends_are_tailable_without_loss<B: EventLogBackend>(
             (0..EVENTS_PER_APPENDER)
                 .map(|_| {
                     fresh_event(
-                        correlation,
+                        workflow,
                         "conformance:stress",
                         Some(aggregate_type),
                         Some(*stream_id),
@@ -975,7 +975,7 @@ pub async fn concurrent_appends_are_tailable_without_loss<B: EventLogBackend>(
                     ev.position, last_position,
                 );
                 last_position = ev.position;
-                if ev.correlation_id == correlation {
+                if ev.workflow_id == workflow {
                     seen.push(ev.event_id);
                 }
             }
@@ -1027,12 +1027,12 @@ pub async fn concurrent_any_appends_all_succeed<B: EventLogBackend>(
     const N: usize = 8;
     let aggregate_type = "conformance";
     let stream_id = Uuid::new_v4();
-    let correlation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
 
     let events: Vec<EventData> = (0..N)
         .map(|_| {
             fresh_event(
-                correlation,
+                workflow,
                 "conformance:any",
                 Some(aggregate_type),
                 Some(stream_id),

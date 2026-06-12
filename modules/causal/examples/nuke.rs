@@ -254,7 +254,7 @@ async fn chase_scenario(n: u64) -> Result<()> {
     // Fire-and-forget flood with the Echo reactor registered: the
     // serial consumer loop must chase a log that's growing under it,
     // and the SettleTracker accumulates one entry per un-settled
-    // correlation (crossing its 65,536 CAP well before n = 100k —
+    // workflow (crossing its 65,536 CAP well before n = 100k —
     // eviction must stay bounded, the chase must still finish).
     let store = Arc::new(MemoryStore::new());
     let counter = CountPings::default();

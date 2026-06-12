@@ -127,7 +127,7 @@ mod pg {
         )
         .bind(e.event_id)
         .bind(e.causation_id)
-        .bind(e.correlation_id)
+        .bind(e.workflow_id)
         .bind(&e.event_type)
         .bind(&e.payload)
         .bind(aggregate_type)

@@ -153,7 +153,7 @@ where
                         reg.notify_observer(
                             &outcome.snapshots,
                             obs.as_ref(),
-                            event.correlation_id,
+                            event.workflow_id,
                             event.position,
                             event.event_id,
                         );
@@ -174,7 +174,7 @@ where
                 event_id:       event.event_id,
                 log_position:   event.position,
                 occurred_at:    fact.occurred_at().unwrap_or(event.created_at),
-                correlation_id: event.correlation_id,
+                workflow_id: event.workflow_id,
                 metadata:       &event.metadata,
                 aggregators:    self.aggregators.as_ref(),
                 logs:           None,
@@ -333,7 +333,7 @@ mod tests {
         EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(payload).unwrap(),
             created_at:      Utc::now(),
@@ -360,11 +360,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projector_ctx_carries_persisted_event_correlation_id() {
+    async fn projector_ctx_carries_persisted_event_workflow_id() {
         // The Projector's ctx is built from the persisted event,
         // not regenerated. Tracing through a fold: emit a fact with
-        // explicit correlation_id, run the projector, assert the
-        // ctx correlation_id matches.
+        // explicit workflow_id, run the projector, assert the
+        // ctx workflow_id matches.
 
         #[derive(Default, Clone)]
         struct CorrelationCapture {
@@ -373,11 +373,11 @@ mod tests {
         #[async_trait]
         impl Projector for CorrelationCapture {
             type Event = Recorded;
-            const NAME: &'static str = "correlation-capture";
+            const NAME: &'static str = "workflow-capture";
             async fn project(
                 &self, _fact: &Recorded, ctx: Ctx<'_>,
             ) -> Result<()> {
-                self.seen.lock().push((ctx.event_id, ctx.correlation_id));
+                self.seen.lock().push((ctx.event_id, ctx.workflow_id));
                 Ok(())
             }
         }
@@ -385,7 +385,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let cmd_correlation = Uuid::new_v4();
 
-        // Append a fact with explicit correlation_id (the kind of thing
+        // Append a fact with explicit workflow_id (the kind of thing
         // a command handler would produce when responding to an HTTP
         // request).
         let payload = Recorded { id: Uuid::new_v4(), occurred_at: Utc::now() };
@@ -393,7 +393,7 @@ mod tests {
         let ev = EventData {
             event_id,
             causation_id:       None,
-            correlation_id:  cmd_correlation,
+            workflow_id:  cmd_correlation,
             event_type:      format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload:         serde_json::to_value(&payload).unwrap(),
             created_at:      Utc::now(),
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].0, event_id, "ctx.event_id matches persisted");
         assert_eq!(observed[0].1, cmd_correlation,
-                   "ctx.correlation_id matches the upstream command's id, \
+                   "ctx.workflow_id matches the upstream command's id, \
                     not regenerated");
     }
 
@@ -580,7 +580,7 @@ mod tests {
         let foreign = EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      "other.thing".into(),
             payload:         serde_json::json!({}),
             created_at:      Utc::now(),
@@ -650,7 +650,7 @@ mod tests {
         crate::append_event(store.as_ref(), crate::types::EventData {
             event_id:        Uuid::new_v4(),
             causation_id:       None,
-            correlation_id:  Uuid::new_v4(),
+            workflow_id:  Uuid::new_v4(),
             event_type:      format!("{}:{}", <NoTimeFact as Event>::CATEGORY, fact.event_type()),
             payload:         serde_json::to_value(&fact).unwrap(),
             created_at:      pinned,

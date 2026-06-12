@@ -138,12 +138,12 @@ const PADDING_X = 12;
 export type WaterfallPaneProps = Record<string, never>;
 
 export function WaterfallPane() {
-  const correlationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
+  const workflowId = useSelector<InspectorState, string | null>((s) => s.flowWorkflowId);
   const outcomes = useSelector<InspectorState, ReactorOutcome[]>((s) =>
-    correlationId ? s.outcomes[correlationId] ?? [] : [],
+    workflowId ? s.outcomes[workflowId] ?? [] : [],
   );
   const attempts = useSelector<InspectorState, ReactorAttempt[]>((s) =>
-    correlationId ? s.attempts[correlationId] ?? [] : [],
+    workflowId ? s.attempts[workflowId] ?? [] : [],
   );
   const flowData = useSelector<InspectorState, InspectorEvent[]>((s) => s.flowData);
   const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
@@ -190,7 +190,7 @@ export function WaterfallPane() {
     return new Date(event.ts).getTime();
   }, [scrubberEnd, flowData]);
 
-  if (!correlationId) {
+  if (!workflowId) {
     return (
       <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
         Open a flow to see the reactor waterfall
@@ -201,7 +201,7 @@ export function WaterfallPane() {
   if (bars.length === 0) {
     return (
       <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
-        No reactor execution data for this correlation
+        No reactor execution data for this workflow
       </div>
     );
   }

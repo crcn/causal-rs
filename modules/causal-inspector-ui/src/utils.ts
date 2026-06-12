@@ -12,7 +12,7 @@ export function inScrubberRange(seq: number, start: number | null, end: number |
 export function getScrubberSequence(state: InspectorState): number[] {
   let events: InspectorEvent[];
 
-  if (state.flowCorrelationId) {
+  if (state.flowWorkflowId) {
     events = state.flowData;
     const sel = state.flowSelection;
     if (sel) {

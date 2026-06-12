@@ -1,6 +1,6 @@
 import type {
   InspectorEvent,
-  CorrelationSummary,
+  WorkflowSummary,
   ReactorDependency,
   AggregateLifecycleEntry,
   FilterState,
@@ -24,8 +24,8 @@ export type InspectorState = {
   // Selection
   selectedSeq: number | null;
 
-  // Flow (causal DAG) — keyed by correlation_id
-  flowCorrelationId: string | null;
+  // Flow (causal DAG) — keyed by workflow_id
+  flowWorkflowId: string | null;
   flowData: InspectorEvent[];
   flowSelection: FlowSelection;
 
@@ -45,17 +45,17 @@ export type InspectorState = {
   logs: ReactorLog[];
   logsFilter: LogsFilter;
 
-  // Reactor metadata (keyed by correlationId)
+  // Reactor metadata (keyed by workflowId)
   descriptions: Record<string, ReactorDescription[]>;
   descriptionSnapshots: Record<string, ReactorDescriptionSnapshot[]>;
   aggregateTimeline: Record<string, AggregateTimelineEntry[]>;
   outcomes: Record<string, ReactorOutcome[]>;
   attempts: Record<string, ReactorAttempt[]>;
 
-  // Correlations
-  correlations: CorrelationSummary[];
-  correlationsLoading: boolean;
-  correlationsHasMore: boolean;
+  // Workflows
+  workflows: WorkflowSummary[];
+  workflowsLoading: boolean;
+  workflowsHasMore: boolean;
 
   // Reactor dependency map
   reactorDependencies: ReactorDependency[];
@@ -79,7 +79,7 @@ export const initialState: InspectorState = {
 
   selectedSeq: null,
 
-  flowCorrelationId: null,
+  flowWorkflowId: null,
   flowData: [],
   flowSelection: null,
 
@@ -92,7 +92,7 @@ export const initialState: InspectorState = {
 
   filters: {
     search: "",
-    correlationId: null,
+    workflowId: null,
     aggregateKey: null,
   },
 
@@ -100,7 +100,7 @@ export const initialState: InspectorState = {
   logsFilter: {
     scope: "reactor",
     reactorId: null,
-    correlationId: null,
+    workflowId: null,
   },
 
   descriptions: {},
@@ -109,9 +109,9 @@ export const initialState: InspectorState = {
   outcomes: {},
   attempts: {},
 
-  correlations: [],
-  correlationsLoading: false,
-  correlationsHasMore: true,
+  workflows: [],
+  workflowsLoading: false,
+  workflowsHasMore: true,
 
   reactorDependencies: [],
 

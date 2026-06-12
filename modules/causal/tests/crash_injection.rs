@@ -165,7 +165,7 @@ async fn append_n(store: &MemoryStore, n: usize) {
         let ev = EventData {
             event_id: Uuid::new_v4(),
             causation_id: None,
-            correlation_id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
             event_type: format!("{}:{}", <Recorded as Event>::CATEGORY, payload.event_type()),
             payload: serde_json::to_value(&payload).unwrap(),
             created_at: Utc::now(),
@@ -293,7 +293,7 @@ async fn append_trigger(store: &MemoryStore) -> Uuid {
     let ev = EventData {
         event_id,
         causation_id: None,
-        correlation_id: Uuid::new_v4(),
+        workflow_id: Uuid::new_v4(),
         event_type: format!("{}:{}", <Trigger as Event>::CATEGORY, payload.event_type()),
         payload: serde_json::to_value(&payload).unwrap(),
         created_at: Utc::now(),

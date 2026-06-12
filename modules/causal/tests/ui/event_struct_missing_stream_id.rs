@@ -7,7 +7,7 @@ use uuid::Uuid;
 #[causal::event]
 #[derive(Clone, Serialize, Deserialize)]
 struct EnrichmentReady {
-    correlation_id: Uuid,
+    workflow_id: Uuid,
 }
 
 fn main() {}

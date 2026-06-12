@@ -13,13 +13,13 @@ function EventRow({
   event,
   isSelected,
   onClick,
-  onFilterCorrelation,
+  onFilterWorkflow,
   onInvestigate,
 }: {
   event: InspectorEvent;
   isSelected: boolean;
   onClick: () => void;
-  onFilterCorrelation: (correlationId: string) => void;
+  onFilterWorkflow: (workflowId: string) => void;
   onInvestigate?: () => void;
 }) {
   const [payloadOpen, setPayloadOpen] = useState(false);
@@ -40,13 +40,13 @@ function EventRow({
           <span className="text-[10px] text-muted-foreground/70 shrink-0 w-32 tabular-nums">
             {formatTs(event.ts)}
           </span>
-          {event.correlationId && (
+          {event.workflowId && (
             <button
-              onClick={(e) => { e.stopPropagation(); onFilterCorrelation(event.correlationId!); }}
+              onClick={(e) => { e.stopPropagation(); onFilterWorkflow(event.workflowId!); }}
               className="px-1.5 py-0.5 rounded-full text-[9px] font-mono bg-purple-500/8 text-purple-400/80 hover:bg-purple-500/15 hover:text-purple-400 shrink-0 transition-all border border-purple-500/10"
-              title={`Filter by correlation ${event.correlationId}`}
+              title={`Filter by workflow ${event.workflowId}`}
             >
-              {event.correlationId.slice(0, 8)}
+              {event.workflowId.slice(0, 8)}
             </button>
           )}
           <span
@@ -121,14 +121,14 @@ export type TimelinePaneProps = {
 export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
   const events = useSelector<InspectorState, InspectorEvent[]>((s) => {
     let result = s.events;
-    const cid = s.filters.correlationId;
-    if (cid) result = result.filter((e) => e.correlationId === cid);
+    const cid = s.filters.workflowId;
+    if (cid) result = result.filter((e) => e.workflowId === cid);
     const search = s.filters.search?.toLowerCase();
     if (search) {
       result = result.filter((e) =>
         e.name.toLowerCase().includes(search) ||
         e.payload.toLowerCase().includes(search) ||
-        (e.correlationId ?? "").toLowerCase().includes(search)
+        (e.workflowId ?? "").toLowerCase().includes(search)
       );
     }
     return result;
@@ -148,16 +148,16 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
   const handleSelect = useCallback(
     (event: InspectorEvent) => {
       dispatch({ type: "ui/event_selected", payload: { seq: event.seq } });
-      if (event.correlationId) {
-        dispatch({ type: "ui/flow_opened", payload: { correlationId: event.correlationId } });
+      if (event.workflowId) {
+        dispatch({ type: "ui/flow_opened", payload: { workflowId: event.workflowId } });
       }
     },
     [dispatch]
   );
 
-  const handleFilterCorrelation = useCallback(
-    (correlationId: string) => {
-      dispatch({ type: "ui/filter_changed", payload: { correlationId } });
+  const handleFilterWorkflow = useCallback(
+    (workflowId: string) => {
+      dispatch({ type: "ui/filter_changed", payload: { workflowId } });
     },
     [dispatch]
   );
@@ -191,7 +191,7 @@ export function TimelinePane({ onInvestigate }: TimelinePaneProps = {}) {
               event={event}
               isSelected={event.seq === selectedSeq}
               onClick={() => handleSelect(event)}
-              onFilterCorrelation={handleFilterCorrelation}
+              onFilterWorkflow={handleFilterWorkflow}
               onInvestigate={onInvestigate ? () => onInvestigate(event) : undefined}
             />
           ))}

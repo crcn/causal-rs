@@ -260,9 +260,9 @@ function AggregateCard({
 export type AggregateTimelinePaneProps = Record<string, never>;
 
 export function AggregateTimelinePane() {
-  const correlationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
+  const workflowId = useSelector<InspectorState, string | null>((s) => s.flowWorkflowId);
   const entries = useSelector<InspectorState, AggregateTimelineEntry[]>((s) =>
-    correlationId ? s.aggregateTimeline[correlationId] ?? [] : [],
+    workflowId ? s.aggregateTimeline[workflowId] ?? [] : [],
   );
   const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
@@ -312,7 +312,7 @@ export function AggregateTimelinePane() {
     [dispatch],
   );
 
-  if (!correlationId) {
+  if (!workflowId) {
     return (
       <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
         Open a flow to see the aggregate state timeline
@@ -323,7 +323,7 @@ export function AggregateTimelinePane() {
   if (entries.length === 0) {
     return (
       <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#50506a", fontSize: 12, letterSpacing: "0.03em" }}>
-        No aggregate state snapshots for this correlation
+        No aggregate state snapshots for this workflow
       </div>
     );
   }

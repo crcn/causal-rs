@@ -6,7 +6,7 @@ export type InspectorEvent = {
   name: string;
   id: string | null;
   parentId: string | null;
-  correlationId: string | null;
+  workflowId: string | null;
   reactorId: string | null;
   aggregateType: string | null;
   aggregateId: string | null;
@@ -65,7 +65,7 @@ export type ReactorOutcome = {
 export type ReactorAttempt = {
   eventId: string;
   reactorId: string;
-  correlationId: string;
+  workflowId: string;
   attempt: number;
   status: string;
   error: string | null;
@@ -103,13 +103,13 @@ export type AggregateLifecycleEntry = {
   eventId: string;
   eventType: string;
   ts: string;
-  correlationId: string;
+  workflowId: string;
   aggregateKey: string;
   state: unknown;
 };
 
-export type CorrelationSummary = {
-  correlationId: string;
+export type WorkflowSummary = {
+  workflowId: string;
   eventCount: number;
   firstTs: string;
   lastTs: string;
@@ -117,21 +117,21 @@ export type CorrelationSummary = {
   hasErrors: boolean;
 };
 
-export type CorrelationSummaryPage = {
-  correlations: CorrelationSummary[];
+export type WorkflowSummaryPage = {
+  workflows: WorkflowSummary[];
   nextCursor: string | null;
 };
 
 export type FilterState = {
   search: string;
-  correlationId: string | null;
+  workflowId: string | null;
   aggregateKey: string | null;
 };
 
 export type LogsFilter = {
-  scope: "reactor" | "correlation";
+  scope: "reactor" | "workflow";
   reactorId: string | null;
-  correlationId: string | null;
+  workflowId: string | null;
 };
 
 export type FlowSelection =

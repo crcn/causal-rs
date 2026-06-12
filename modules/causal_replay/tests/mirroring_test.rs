@@ -14,11 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-fn make_event(correlation: Uuid, event_type: &str) -> EventData {
+fn make_event(workflow: Uuid, event_type: &str) -> EventData {
     EventData {
         event_id: Uuid::new_v4(),
         causation_id: None,
-        correlation_id: correlation,
+        workflow_id: workflow,
         event_type: event_type.to_string(),
         payload: serde_json::json!({}),
         created_at: Utc::now(),
@@ -36,8 +36,8 @@ async fn append_writes_to_both_children() -> Result<()> {
     let v03: Arc<dyn EventLogBackend> = Arc::new(MemoryStore::new());
     let mirror = MirroringEventLogBackend::new(legacy.clone(), v03.clone());
 
-    let correlation = Uuid::new_v4();
-    let event = make_event(correlation, "test:dual");
+    let workflow = Uuid::new_v4();
+    let event = make_event(workflow, "test:dual");
     let event_id = event.event_id;
 
     causal::append_event(&mirror, event).await?;

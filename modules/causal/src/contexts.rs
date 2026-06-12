@@ -43,7 +43,7 @@ pub struct Ctx<'a> {
     pub event_id:       Uuid,
     pub log_position:   LogCursor,
     pub occurred_at:    DateTime<Utc>,
-    pub correlation_id: Uuid,
+    pub workflow_id: Uuid,
     pub metadata:       &'a Metadata,
     /// Optional read-side access to in-process aggregator state folded
     /// from events. `None` if the runner wasn't configured with an
@@ -70,7 +70,7 @@ impl<'a> std::fmt::Debug for Ctx<'a> {
             .field("event_id", &self.event_id)
             .field("log_position", &self.log_position)
             .field("occurred_at", &self.occurred_at)
-            .field("correlation_id", &self.correlation_id)
+            .field("workflow_id", &self.workflow_id)
             .field("metadata", &self.metadata)
             .field("has_aggregators", &self.aggregators.is_some())
             .field("has_effect_store", &self.effect_store.is_some())
@@ -207,7 +207,7 @@ mod tests {
             event_id:       Uuid::nil(),
             log_position:   LogCursor::ZERO,
             occurred_at:    occurred,
-            correlation_id: Uuid::nil(),
+            workflow_id: Uuid::nil(),
             metadata:       &meta,
             aggregators:    None,
             logs:           None,
@@ -226,7 +226,7 @@ mod tests {
             event_id:       Uuid::nil(),
             log_position:   LogCursor::ZERO,
             occurred_at:    Utc::now(),
-            correlation_id: Uuid::nil(),
+            workflow_id: Uuid::nil(),
             metadata:       &meta,
             aggregators:    None,
             logs:           None,

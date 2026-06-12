@@ -817,7 +817,7 @@ impl AggregatorRegistry {
         &self,
         snapshots: &TransitionSnapshots,
         observer: &dyn crate::reactor_observer::ReactorObserver,
-        correlation_id: Uuid,
+        workflow_id: Uuid,
         position: LogCursor,
         event_id: Uuid,
     ) {
@@ -830,7 +830,7 @@ impl AggregatorRegistry {
             };
             match agg.serialize_state(next.as_ref()) {
                 Ok(state_json) => observer.aggregate_folded(
-                    correlation_id,
+                    workflow_id,
                     position,
                     event_id,
                     key,
@@ -1180,7 +1180,7 @@ mod tests {
             let ev = EventData {
                 event_id: Uuid::new_v4(),
                 causation_id: None,
-                correlation_id: Uuid::new_v4(),
+                workflow_id: Uuid::new_v4(),
                 event_type: format!("ping:{}", payload.event_type()),
                 payload: serde_json::to_value(&payload).unwrap(),
                 created_at: Utc::now(),

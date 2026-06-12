@@ -14,7 +14,7 @@ const DEFAULT_CAPACITY: usize = 500_000;
 pub struct EventCache {
     events: VecDeque<Arc<InspectorEvent>>,
     by_seq: HashMap<i64, Arc<InspectorEvent>>,
-    by_correlation: HashMap<Uuid, Vec<i64>>,
+    by_workflow: HashMap<Uuid, Vec<i64>>,
     by_handler: HashMap<String, Vec<i64>>,
     /// Index by composite aggregate key ("Type:id") for stream filtering.
     by_stream: HashMap<String, Vec<i64>>,
@@ -26,7 +26,7 @@ impl EventCache {
         Self {
             events: VecDeque::with_capacity(capacity.min(DEFAULT_CAPACITY)),
             by_seq: HashMap::new(),
-            by_correlation: HashMap::new(),
+            by_workflow: HashMap::new(),
             by_handler: HashMap::new(),
             by_stream: HashMap::new(),
             capacity,
@@ -46,8 +46,8 @@ impl EventCache {
 
         self.by_seq.insert(seq, Arc::clone(&event));
 
-        if let Some(cid) = event.correlation_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
-            self.by_correlation.entry(cid).or_default().push(seq);
+        if let Some(cid) = event.workflow_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
+            self.by_workflow.entry(cid).or_default().push(seq);
         }
 
         if let Some(ref reactor_id) = event.reactor_id {
@@ -69,13 +69,13 @@ impl EventCache {
         let seq = evicted.seq;
         self.by_seq.remove(&seq);
 
-        if let Some(cid) = evicted.correlation_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
-            if let Some(bucket) = self.by_correlation.get_mut(&cid) {
+        if let Some(cid) = evicted.workflow_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
+            if let Some(bucket) = self.by_workflow.get_mut(&cid) {
                 if let Ok(pos) = bucket.binary_search(&seq) {
                     bucket.remove(pos);
                 }
                 if bucket.is_empty() {
-                    self.by_correlation.remove(&cid);
+                    self.by_workflow.remove(&cid);
                 }
             }
         }
@@ -115,15 +115,15 @@ impl EventCache {
         cursor: Option<i64>,
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
-        correlation_id: Option<&str>,
+        workflow_id: Option<&str>,
         aggregate_key: Option<&str>,
         limit: usize,
     ) -> (Vec<Arc<InspectorEvent>>, Option<i64>) {
         let term_lower = term.map(|t| t.to_lowercase());
 
-        let correlation_seqs: Option<&Vec<i64>> = correlation_id
+        let correlation_seqs: Option<&Vec<i64>> = workflow_id
             .and_then(|cid| Uuid::parse_str(cid).ok())
-            .and_then(|uuid| self.by_correlation.get(&uuid));
+            .and_then(|uuid| self.by_workflow.get(&uuid));
 
         let stream_seqs: Option<&Vec<i64>> = aggregate_key
             .and_then(|key| self.by_stream.get(key));
@@ -159,7 +159,7 @@ impl EventCache {
             if let Some(ref needle) = term_lower {
                 let matches = event.payload.to_lowercase().contains(needle)
                     || event.event_type.to_lowercase().contains(needle)
-                    || event.correlation_id.as_deref().map(|s| s.to_lowercase().contains(needle)).unwrap_or(false);
+                    || event.workflow_id.as_deref().map(|s| s.to_lowercase().contains(needle)).unwrap_or(false);
 
                 if !matches {
                     continue;
@@ -181,13 +181,13 @@ impl EventCache {
         (results, next_cursor)
     }
 
-    /// Get all events sharing the same correlation_id as the given event.
+    /// Get all events sharing the same workflow_id as the given event.
     pub fn causal_tree(&self, seq: i64) -> Option<(Vec<Arc<InspectorEvent>>, i64)> {
         let event = self.by_seq.get(&seq)?;
-        let cid_str = event.correlation_id.as_deref()?;
+        let cid_str = event.workflow_id.as_deref()?;
         let cid = Uuid::parse_str(cid_str).ok()?;
 
-        let seqs = self.by_correlation.get(&cid)?;
+        let seqs = self.by_workflow.get(&cid)?;
         let mut events: Vec<Arc<InspectorEvent>> = seqs
             .iter()
             .filter_map(|s| self.by_seq.get(s).cloned())
@@ -203,10 +203,10 @@ impl EventCache {
         Some((events, root_seq))
     }
 
-    /// Get all events for a correlation_id, ordered by seq ascending.
-    pub fn causal_flow(&self, correlation_id: &str) -> Option<Vec<Arc<InspectorEvent>>> {
-        let cid = Uuid::parse_str(correlation_id).ok()?;
-        let seqs = self.by_correlation.get(&cid)?;
+    /// Get all events for a workflow_id, ordered by seq ascending.
+    pub fn causal_flow(&self, workflow_id: &str) -> Option<Vec<Arc<InspectorEvent>>> {
+        let cid = Uuid::parse_str(workflow_id).ok()?;
+        let seqs = self.by_workflow.get(&cid)?;
         let mut events: Vec<Arc<InspectorEvent>> = seqs
             .iter()
             .filter_map(|s| self.by_seq.get(s).cloned())
@@ -237,7 +237,7 @@ mod tests {
         seq: i64,
         event_type: &str,
         payload: &str,
-        correlation_id: Option<&str>,
+        workflow_id: Option<&str>,
         reactor_id: Option<&str>,
         causation_id: Option<&str>,
     ) -> InspectorEvent {
@@ -248,7 +248,7 @@ mod tests {
             name: "test_event".to_string(),
             id: Some(Uuid::new_v4().to_string()),
             causation_id: causation_id.map(String::from),
-            correlation_id: correlation_id.map(String::from),
+            workflow_id: workflow_id.map(String::from),
             reactor_id: reactor_id.map(String::from),
             aggregate_type: None,
             aggregate_id: None,
@@ -269,7 +269,7 @@ mod tests {
         assert!(cache.by_seq.contains_key(&1));
         assert_eq!(cache.by_handler.get("reactor-a").unwrap(), &vec![1i64]);
         let cid_uuid = Uuid::parse_str(&cid).unwrap();
-        assert_eq!(cache.by_correlation.get(&cid_uuid).unwrap(), &vec![1i64]);
+        assert_eq!(cache.by_workflow.get(&cid_uuid).unwrap(), &vec![1i64]);
     }
 
     #[test]

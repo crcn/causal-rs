@@ -7,7 +7,7 @@ const EVENT_FIELDS = `
   name
   id
   parentId: causationId
-  correlationId
+  workflowId
   reactorId
   aggregateType
   aggregateId
@@ -29,14 +29,14 @@ export const INSPECTOR_EVENTS = `
     $limit: Int!
     $cursor: Int
     $search: String
-    $correlationId: String
+    $workflowId: String
     $aggregateKey: String
   ) {
     inspectorEvents(
       limit: $limit
       cursor: $cursor
       search: $search
-      correlationId: $correlationId
+      workflowId: $workflowId
       aggregateKey: $aggregateKey
     ) {
       events {
@@ -59,8 +59,8 @@ export const INSPECTOR_CAUSAL_TREE = `
 `;
 
 export const INSPECTOR_CAUSAL_FLOW = `
-  query InspectorCausalFlow($correlationId: String!) {
-    inspectorCausalFlow(correlationId: $correlationId) {
+  query InspectorCausalFlow($workflowId: String!) {
+    inspectorCausalFlow(workflowId: $workflowId) {
       events {
         ${EVENT_FIELDS}
       }
@@ -81,9 +81,9 @@ export const INSPECTOR_REACTOR_LOGS = `
   }
 `;
 
-export const INSPECTOR_REACTOR_LOGS_BY_CORRELATION = `
-  query InspectorReactorLogsByCorrelation($correlationId: String!) {
-    inspectorReactorLogsByCorrelation(correlationId: $correlationId) {
+export const INSPECTOR_REACTOR_LOGS_BY_WORKFLOW = `
+  query InspectorReactorLogsByWorkflow($workflowId: String!) {
+    inspectorReactorLogsByWorkflow(workflowId: $workflowId) {
       eventId
       reactorId
       level
@@ -95,8 +95,8 @@ export const INSPECTOR_REACTOR_LOGS_BY_CORRELATION = `
 `;
 
 export const INSPECTOR_REACTOR_DESCRIPTIONS = `
-  query InspectorReactorDescriptions($correlationId: String!) {
-    inspectorReactorDescriptions(correlationId: $correlationId) {
+  query InspectorReactorDescriptions($workflowId: String!) {
+    inspectorReactorDescriptions(workflowId: $workflowId) {
       reactorId
       blocks
     }
@@ -104,8 +104,8 @@ export const INSPECTOR_REACTOR_DESCRIPTIONS = `
 `;
 
 export const INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS = `
-  query InspectorReactorDescriptionSnapshots($correlationId: String!) {
-    inspectorReactorDescriptionSnapshots(correlationId: $correlationId) {
+  query InspectorReactorDescriptionSnapshots($workflowId: String!) {
+    inspectorReactorDescriptionSnapshots(workflowId: $workflowId) {
       seq
       eventId
       reactorId
@@ -115,8 +115,8 @@ export const INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS = `
 `;
 
 export const INSPECTOR_AGGREGATE_TIMELINE = `
-  query InspectorAggregateTimeline($correlationId: String!) {
-    inspectorAggregateTimeline(correlationId: $correlationId) {
+  query InspectorAggregateTimeline($workflowId: String!) {
+    inspectorAggregateTimeline(workflowId: $workflowId) {
       seq
       eventId
       eventType
@@ -151,18 +151,18 @@ export const INSPECTOR_AGGREGATE_LIFECYCLE = `
       eventId
       eventType
       ts
-      correlationId
+      workflowId
       aggregateKey
       state
     }
   }
 `;
 
-export const INSPECTOR_CORRELATIONS = `
-  query InspectorCorrelations($search: String, $limit: Int, $cursor: String) {
-    inspectorCorrelations(search: $search, limit: $limit, cursor: $cursor) {
-      correlations {
-        correlationId
+export const INSPECTOR_WORKFLOWS = `
+  query InspectorWorkflows($search: String, $limit: Int, $cursor: String) {
+    inspectorWorkflows(search: $search, limit: $limit, cursor: $cursor) {
+      workflows {
+        workflowId
         eventCount
         firstTs
         lastTs
@@ -175,8 +175,8 @@ export const INSPECTOR_CORRELATIONS = `
 `;
 
 export const INSPECTOR_REACTOR_OUTCOMES = `
-  query InspectorReactorOutcomes($correlationId: String!) {
-    inspectorReactorOutcomes(correlationId: $correlationId) {
+  query InspectorReactorOutcomes($workflowId: String!) {
+    inspectorReactorOutcomes(workflowId: $workflowId) {
       reactorId
       status
       error
@@ -189,11 +189,11 @@ export const INSPECTOR_REACTOR_OUTCOMES = `
 `;
 
 export const INSPECTOR_REACTOR_ATTEMPTS = `
-  query InspectorReactorAttempts($correlationId: String!) {
-    inspectorReactorAttempts(correlationId: $correlationId) {
+  query InspectorReactorAttempts($workflowId: String!) {
+    inspectorReactorAttempts(workflowId: $workflowId) {
       eventId
       reactorId
-      correlationId
+      workflowId
       attempt
       status
       error

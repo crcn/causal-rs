@@ -88,11 +88,11 @@ pub struct MemoryStore {
     // Populated by `impl ReactorObserver for MemoryStore`. Read by
     // `causal_inspector` to render UI panes.
     //
-    /// Reactor execution timing: `(event_id, reactor_id)` → `(corr,
+    /// Reactor execution timing: `(event_id, reactor_id)` → `(wf,
     /// started_at, completed_at, status, error, attempts)`.
     reactor_executions:
         Arc<DashMap<(Uuid, String), (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, String, Option<String>, i32)>>,
-    /// Per-attempt history: `(event_id, reactor_id, corr, attempt#,
+    /// Per-attempt history: `(event_id, reactor_id, wf, attempt#,
     /// status, error, started_at, completed_at)`.
     reactor_attempt_history:
         Arc<Mutex<Vec<(Uuid, String, Uuid, i32, String, Option<String>, DateTime<Utc>, DateTime<Utc>)>>>,
@@ -100,11 +100,11 @@ pub struct MemoryStore {
     /// `(event_id, reactor_id, LogEntry)`.
     reactor_log_entries: Arc<Mutex<Vec<(Uuid, String, LogEntry)>>>,
     /// Aggregate state after each fold:
-    /// `(corr, position, event_id, aggregate_key, state_json)`.
+    /// `(wf, position, event_id, aggregate_key, state_json)`.
     aggregate_state_snapshots:
         Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
     /// Reactor describe-DSL output per event:
-    /// `(corr, position, event_id, reactor_id, description_json)`.
+    /// `(wf, position, event_id, reactor_id, description_json)`.
     reactor_description_snapshots:
         Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
 }
@@ -184,13 +184,13 @@ impl ReactorObserver for MemoryStore {
         &self,
         event_id: Uuid,
         reactor_id: &str,
-        correlation_id: Uuid,
+        workflow_id: Uuid,
         attempt: u32,
         started_at: DateTime<Utc>,
     ) {
         self.reactor_executions.insert(
             (event_id, reactor_id.to_string()),
-            (correlation_id, started_at, None, "running".to_string(), None, attempt as i32),
+            (workflow_id, started_at, None, "running".to_string(), None, attempt as i32),
         );
     }
 
@@ -198,7 +198,7 @@ impl ReactorObserver for MemoryStore {
         &self,
         event_id: Uuid,
         reactor_id: &str,
-        correlation_id: Uuid,
+        workflow_id: Uuid,
         attempt: u32,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
@@ -216,7 +216,7 @@ impl ReactorObserver for MemoryStore {
         self.reactor_attempt_history.lock().push((
             event_id,
             reactor_id.to_string(),
-            correlation_id,
+            workflow_id,
             attempt as i32,
             "completed".to_string(),
             None,
@@ -236,7 +236,7 @@ impl ReactorObserver for MemoryStore {
         &self,
         event_id: Uuid,
         reactor_id: &str,
-        correlation_id: Uuid,
+        workflow_id: Uuid,
         attempt: u32,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
@@ -254,7 +254,7 @@ impl ReactorObserver for MemoryStore {
         self.reactor_attempt_history.lock().push((
             event_id,
             reactor_id.to_string(),
-            correlation_id,
+            workflow_id,
             attempt as i32,
             "retry".to_string(),
             Some(error.to_string()),
@@ -273,7 +273,7 @@ impl ReactorObserver for MemoryStore {
         &self,
         event_id: Uuid,
         reactor_id: &str,
-        _correlation_id: Uuid,
+        _workflow_id: Uuid,
         attempts: u32,
         error: &str,
         at: DateTime<Utc>,
@@ -290,14 +290,14 @@ impl ReactorObserver for MemoryStore {
 
     fn aggregate_folded(
         &self,
-        correlation_id: Uuid,
+        workflow_id: Uuid,
         position: LogCursor,
         event_id: Uuid,
         aggregate_key: &str,
         state: serde_json::Value,
     ) {
         self.aggregate_state_snapshots.lock().push((
-            correlation_id,
+            workflow_id,
             position.raw(),
             event_id,
             aggregate_key.to_string(),
@@ -307,14 +307,14 @@ impl ReactorObserver for MemoryStore {
 
     fn reactor_description(
         &self,
-        correlation_id: Uuid,
+        workflow_id: Uuid,
         position: LogCursor,
         event_id: Uuid,
         reactor_id: &str,
         description: serde_json::Value,
     ) {
         self.reactor_description_snapshots.lock().push((
-            correlation_id,
+            workflow_id,
             position.raw(),
             event_id,
             reactor_id.to_string(),
@@ -429,13 +429,13 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                 let row = &log[at];
                 if row.payload != e.payload
                     || row.event_type != e.event_type
-                    || row.correlation_id != e.correlation_id
+                    || row.workflow_id != e.workflow_id
                     || row.causation_id != e.causation_id
                 {
                     anyhow::bail!(
                         "append_to_stream: divergent redelivery for event_id {} — \
                          the persisted row differs from this batch's event \
-                         (payload/event_type/correlation/causation). A dedup-hit \
+                         (payload/event_type/workflow/causation). A dedup-hit \
                          must be byte-identical; a differing re-emission means the \
                          producer is nondeterministic under redelivery (wall \
                          clock, rand, or an external call not under \
@@ -505,7 +505,7 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                 position,
                 event_id: event.event_id,
                 causation_id: event.causation_id,
-                correlation_id: event.correlation_id,
+                workflow_id: event.workflow_id,
                 event_type: event.event_type,
                 payload: event.payload,
                 created_at: event.created_at,
@@ -603,7 +603,7 @@ mod append_tests {
         EventData {
             event_id,
             causation_id: None,
-            correlation_id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
             event_type: "test:thing".into(),
             payload: serde_json::json!({}),
             created_at: chrono::Utc::now(),

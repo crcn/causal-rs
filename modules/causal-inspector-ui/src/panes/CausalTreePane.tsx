@@ -202,8 +202,8 @@ function TreeNode({
         ref={isSelected ? nodeRef : undefined}
         onClick={() => {
           dispatch({ type: "ui/event_selected", payload: { seq: event.seq } });
-          if (event.correlationId) {
-            dispatch({ type: "ui/flow_opened", payload: { correlationId: event.correlationId } });
+          if (event.workflowId) {
+            dispatch({ type: "ui/flow_opened", payload: { workflowId: event.workflowId } });
           }
         }}
         className={`group/tree w-full text-left px-2 py-1.5 rounded-md transition-all duration-150 cursor-pointer hover:bg-white/[0.03] ${
@@ -323,7 +323,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
   const causalTree = useSelector<InspectorState, InspectorState["causalTree"]>((s) => s.causalTree);
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
-  const flowCorrelationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
+  const flowWorkflowId = useSelector<InspectorState, string | null>((s) => s.flowWorkflowId);
   const scrubberStart = useSelector<InspectorState, number | null>((s) => s.scrubberStart);
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
   const outcomesMap = useSelector<InspectorState, Record<string, ReactorOutcome[]>>((s) => s.outcomes);
@@ -331,13 +331,13 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
 
   // Build reactor outcome lookup for current flow
   const outcomesByReactor = useMemo(() => {
-    if (!flowCorrelationId) return new Map<string, ReactorOutcome>();
-    const raw = outcomesMap[flowCorrelationId];
+    if (!flowWorkflowId) return new Map<string, ReactorOutcome>();
+    const raw = outcomesMap[flowWorkflowId];
     if (!raw) return new Map<string, ReactorOutcome>();
     const map = new Map<string, ReactorOutcome>();
     for (const o of raw) map.set(o.reactorId, o);
     return map;
-  }, [outcomesMap, flowCorrelationId]);
+  }, [outcomesMap, flowWorkflowId]);
 
   const treeEvents = useMemo(() => {
     const all = causalTree?.events ?? null;
@@ -348,12 +348,12 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
 
   const onClickReactor = useCallback(
     (reactorId: string, _parentEventId: string) => {
-      if (flowCorrelationId) {
+      if (flowWorkflowId) {
         dispatch({ type: "ui/flow_node_selected", payload: { kind: "reactor", reactorId } });
       }
       dispatch({ type: "ui/handler_selected", payload: { reactorId } });
     },
-    [flowCorrelationId, dispatch]
+    [flowWorkflowId, dispatch]
   );
 
   const { roots, childrenMap, totalCount, filteredCount } = useMemo(() => {
@@ -362,7 +362,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
 
     const total = treeEvents.length;
 
-    const events = (flowCorrelationId && flowSelection)
+    const events = (flowWorkflowId && flowSelection)
       ? treeEvents.filter(e => matchesFlowSelection(e, flowSelection))
       : treeEvents;
 
@@ -383,7 +383,7 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
     rootList.sort((a, b) => a.seq - b.seq);
     const filtered = rootList.length + [...cMap.values()].reduce((s, a) => s + a.length, 0);
     return { roots: rootList, childrenMap: cMap, totalCount: total, filteredCount: filtered };
-  }, [treeEvents, flowCorrelationId, flowSelection]);
+  }, [treeEvents, flowWorkflowId, flowSelection]);
 
   if (treeLoading) {
     return (

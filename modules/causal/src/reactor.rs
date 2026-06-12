@@ -312,7 +312,7 @@ mod tests {
             event_id:       Uuid::nil(),
             log_position:   LogCursor::ZERO,
             occurred_at:    trigger.occurred_at,
-            correlation_id: Uuid::nil(),
+            workflow_id: Uuid::nil(),
             metadata:       &meta,
             aggregators:    None,
             logs:           None,

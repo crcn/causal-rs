@@ -29,7 +29,7 @@ export type {
   InspectorEventsPage,
   InspectorCausalTree,
   InspectorCausalFlow,
-  CorrelationSummary,
+  WorkflowSummary,
   ReactorDependency,
   AggregateLifecycleEntry,
   Block,
@@ -66,9 +66,9 @@ export {
   INSPECTOR_EVENTS,
   INSPECTOR_CAUSAL_TREE,
   INSPECTOR_CAUSAL_FLOW,
-  INSPECTOR_CORRELATIONS,
+  INSPECTOR_WORKFLOWS,
   INSPECTOR_REACTOR_LOGS,
-  INSPECTOR_REACTOR_LOGS_BY_CORRELATION,
+  INSPECTOR_REACTOR_LOGS_BY_WORKFLOW,
   INSPECTOR_REACTOR_DESCRIPTIONS,
   INSPECTOR_REACTOR_DESCRIPTION_SNAPSHOTS,
   INSPECTOR_AGGREGATE_TIMELINE,
@@ -111,5 +111,5 @@ export { CausalFlowPane } from "./panes/CausalFlowPane";
 export type { CausalFlowPaneProps } from "./panes/CausalFlowPane";
 export { AggregateTimelinePane } from "./panes/AggregateTimelinePane";
 export { WaterfallPane } from "./panes/WaterfallPane";
-export { CorrelationExplorerPane } from "./panes/CorrelationExplorerPane";
+export { WorkflowExplorerPane } from "./panes/WorkflowExplorerPane";
 
