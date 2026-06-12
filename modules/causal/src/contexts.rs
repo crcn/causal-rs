@@ -19,8 +19,7 @@ use crate::aggregate::Aggregate;
 use crate::aggregator::AggregatorRegistry;
 use crate::types::{LogCursor, LogEntry, LogLevel};
 
-/// Aggregate state snapshot pair returned by [`Ctx::aggregate`] and
-/// [`Ctx::aggregate_of`]. `prev` is the state before the current
+/// Aggregate state snapshot pair returned by [`Ctx::state_of`]. `prev` is the state before the current
 /// event was folded; `curr` is the state after. Both are `Arc<A>`
 /// so reads are zero-clone.
 pub struct AggregateState<A> {
@@ -111,43 +110,27 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Read singleton aggregate state — `(prev, curr)` snapshots
+    /// Read a subject's folded state — `(prev, curr)` snapshots
     /// captured by the runner around folding the current event.
     /// `curr` reflects state INCLUDING the current event because the
     /// runner folds before invoking the consumer body.
     ///
-    /// Used for incrementally-built read-only state shared across
-    /// reactors / projectors (saga-style PipelineState pattern).
+    /// The no-arg singleton read (`ctx.aggregate()`) was deleted in the
+    /// 0.10 step-1 rename: a magic nil-keyed global was a lying default
+    /// (keying invisible at the call site). State keyed to "the whole
+    /// system" is still expressible — explicitly, with `Uuid::nil()`.
     ///
     /// # Panics
     /// Panics if no aggregators were registered with the engine via
-    /// `EngineBuilder::with_aggregators(...)`. Calling `aggregate()`
+    /// `EngineBuilder::with_aggregators(...)`. Calling `state_of()`
     /// in a body that has no aggregator wiring is a configuration bug
     /// — the panic surfaces it loudly at the offending call site.
-    pub fn aggregate<A>(&self) -> AggregateState<A>
+    pub fn state_of<A>(&self, id: Uuid) -> AggregateState<A>
     where
         A: Aggregate,
     {
         let reg = self.aggregators.expect(
-            "ctx.aggregate::<A>() called but no aggregators were registered \
-             with EngineBuilder::with_aggregators(...)",
-        );
-        let (prev, curr) = reg.get_singleton_arc::<A>();
-        AggregateState { prev, curr }
-    }
-
-    /// Read aggregate state for a specific aggregate id (non-singleton
-    /// aggregates). Same semantics as [`Self::aggregate`] but takes an
-    /// id parameter.
-    ///
-    /// # Panics
-    /// Panics if no aggregators were registered. See [`Self::aggregate`].
-    pub fn aggregate_of<A>(&self, id: Uuid) -> AggregateState<A>
-    where
-        A: Aggregate,
-    {
-        let reg = self.aggregators.expect(
-            "ctx.aggregate_of::<A>(id) called but no aggregators were registered \
+            "ctx.state_of::<A>(id) called but no aggregators were registered \
              with EngineBuilder::with_aggregators(...)",
         );
         let (prev, curr) = reg.get_transition_arc::<A>(id);

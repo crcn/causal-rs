@@ -106,7 +106,7 @@ pub struct ReactorRunner<R: Reactor> {
     /// external call under the reaction key — safe under retry/redelivery.
     effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
     /// Engine-level aggregator registry. Reactor outputs are folded into
-    /// it after they're appended, so `engine.snapshot::<A>(id)` reflects
+    /// it after they're appended, so `engine.state_of::<A>(id).await.unwrap()` reflects
     /// reactor-emitted events (not just caller-emitted ones). Separate
     /// from the per-runner `aggregators` clone above.
     engine_aggregators: Option<Arc<AggregatorRegistry>>,
@@ -195,7 +195,7 @@ where
     }
 
     /// Attach the engine-level aggregator registry so reactor outputs
-    /// fold into it after append (keeps `engine.snapshot` current).
+    /// fold into it after append (keeps `engine.state_of` current).
     pub fn with_engine_aggregators(
         mut self,
         engine_aggregators: Option<Arc<AggregatorRegistry>>,

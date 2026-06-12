@@ -142,7 +142,7 @@ where
 ///
 /// `correlation_id` is the chain id stamped on every fact in the
 /// batch. Clients use it to poll workflow-status projections;
-/// tests use it to scope reads (`engine.snapshot::<A>(corr_id)`)
+/// tests use it to scope reads (`engine.state_of::<A>(corr_id).await.unwrap()`)
 /// and waits (`engine.settled()`) to a single chain. Auto-generated
 /// per emit unless the caller set it via `EmitBuilder::correlation_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,7 +450,7 @@ pub struct EngineBuilder {
     /// and the built engine.
     corr_hw:               CorrHighWater,
     /// Durable aggregate snapshot store. When set, folded aggregate state
-    /// survives restart via read-through restore (`Engine::load_aggregate`,
+    /// survives restart via read-through restore (`Engine::state_of`,
     /// consumer restore-before-fold) and is periodically snapshotted. When
     /// `None`, behavior is unchanged (in-memory fold only).
     snapshot_store:        Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
@@ -583,7 +583,7 @@ impl EngineBuilder {
     /// that declares an
     /// [`Aggregate::STREAM_CATEGORY`](crate::aggregate::Aggregate::STREAM_CATEGORY)
     /// is restored read-through (snapshot + stream-tail replay) by
-    /// [`Engine::load_aggregate`] and by consumer runners before they fold, and
+    /// [`Engine::state_of`] and by consumer runners before they fold, and
     /// is snapshotted every [`with_snapshot_every`](Self::with_snapshot_every)
     /// events. Without it, behavior is unchanged. Idempotent restore — safe on
     /// any/all nodes.
@@ -629,7 +629,7 @@ impl EngineBuilder {
     }
 
     /// Register [`crate::Aggregator`] definitions so consumers can read
-    /// folded aggregate state via `ctx.aggregate::<A>(id)`. Aggregator
+    /// folded aggregate state via `ctx.state_of::<A>(id)`. Aggregator
     /// state is **per-engine, in-memory** — it does NOT persist across
     /// `Engine` instances. For saga-pattern read state shared across
     /// reactors within one workflow run, this is the right tool.
@@ -933,9 +933,9 @@ pub struct Engine {
     handles:               Vec<JoinHandle<()>>,
     default_metadata:      Metadata,
     /// Engine-level aggregator registry for out-of-band read access
-    /// via `engine.snapshot::<A>(stream_id)`. Folded on every
+    /// via `engine.state_of::<A>(stream_id).await.unwrap()`. Folded on every
     /// successful `emit()`. Each consumer holds its OWN registry
-    /// clone for in-body `ctx.aggregate` reads — the engine-level
+    /// clone for in-body `ctx.state_of` reads — the engine-level
     /// registry exists for the test ergonomic of reading aggregate
     /// state without going through a consumer.
     aggregators:           Option<Arc<AggregatorRegistry>>,
@@ -1181,7 +1181,7 @@ impl Engine {
             match self.log.append_to_stream(F::STREAM_CATEGORY, id, expected, events_data).await {
                 Ok(result) => {
                     // Fold each fact into the engine registry so
-                    // `engine.snapshot::<A>(id)` reflects the write. The
+                    // `engine.state_of::<A>(id).await.unwrap()` reflects the write. The
                     // batch committed atomically at one position;
                     // `result.revision` is the LAST fact's revision, so
                     // fact i sits at `result.revision - (n - 1 - i)`.
@@ -1382,9 +1382,9 @@ impl Engine {
                 };
 
                 // Mirror into the engine-level registry so out-of-band
-                // `engine.snapshot::<A>(stream_id)` reads stay fresh.
+                // `engine.state_of::<A>(stream_id).await.unwrap()` reads stay fresh.
                 // Consumers maintain their OWN registry clones for
-                // in-body `ctx.aggregate` reads — independent state.
+                // in-body `ctx.state_of` reads — independent state.
                 // Idempotent on stream coordinates; gap repair orders
                 // racing concurrent emits to the same aggregate stream.
                 if let Some(reg) = &self.aggregators {
@@ -1431,54 +1431,11 @@ impl Engine {
         })
     }
 
-    /// Inspect the current folded state of aggregate `A` for the
-    /// given `stream_id`. Returns `None` if no facts have ever been
-    /// folded for this `stream_id`.
-    ///
-    /// # Panics
-    /// If no aggregator was ever registered for `A` (or no aggregators
-    /// at all): an unregistered type would otherwise read as "no state
-    /// yet" forever, hiding a configuration bug.
-    ///
-    /// ## Not for decisions
-    ///
-    /// **Do not** use this to read aggregate state and then `emit`
-    /// based on what you saw — the value is stale by the time you
-    /// hold it (other emits, reactor chains, or restarts may have
-    /// moved past it), and decisions made outside the causal chain
-    /// are not recorded with provenance. Make decisions **inside**
-    /// reactors via `ctx.aggregate::<A>(id)`; expose query results
-    /// to clients via projections (Postgres tables, etc.) keyed on
-    /// `correlation_id` or the entity id.
-    ///
-    /// `snapshot` exists for tests, debugging, and operational
-    /// inspection — assertions, status dashboards, ad-hoc CLI
-    /// dumps. Treat it as a peek into in-memory state, nothing more.
-    pub fn snapshot<A>(&self, stream_id: Uuid) -> Option<A>
-    where
-        A: crate::aggregate::Aggregate + Clone,
-    {
-        let reg = self.aggregators.as_ref().unwrap_or_else(|| {
-            panic!(
-                "engine.snapshot::<{}>() called but no aggregators were \
-                 registered with EngineBuilder::with_aggregators(...)",
-                std::any::type_name::<A>(),
-            )
-        });
-        // get_transition_arc panics if `A` was never registered —
-        // distinguishing "registered, no events yet" (None below) from
-        // a configuration bug (loud).
-        let (_, curr) = reg.get_transition_arc::<A>(stream_id);
-        let key = format!("{}:{}", <A as crate::aggregate::Aggregate>::NAME, stream_id);
-        if !reg.has_state(&key) {
-            return None;
-        }
-        Some((*curr).clone())
-    }
-
-    /// Read an aggregate's current state, **restoring it from durable storage
-    /// if it isn't already in memory** — the async, restart-surviving
-    /// counterpart to the sync [`snapshot`](Self::snapshot) peek.
+    /// Read a subject's current state, **restoring it from durable
+    /// storage if it isn't already in memory**. This is the only
+    /// out-of-band read: the sync racy peek (`engine.state_of`) was
+    /// deleted in the 0.10 step-1 rename — every use it had is this,
+    /// minus the race.
     ///
     /// If the aggregate isn't cached, this loads its snapshot (if a
     /// [`with_snapshot_store`](EngineBuilder::with_snapshot_store) is wired),
@@ -1490,20 +1447,21 @@ impl Engine {
     /// Returns `None` when the aggregate has no events and no snapshot (or when
     /// `A::STREAM_CATEGORY` is unset, i.e. restore is disabled).
     ///
-    /// Like `snapshot`, this is for ops/tests/read paths outside a consumer —
-    /// in a reactor/projector body, read via `ctx.aggregate::<A>(id)` (the
+    /// For ops/tests/read paths outside a consumer — in a
+    /// reactor/projector body, read via `ctx.state_of::<A>(id)` (the
     /// runner restores before folding).
     ///
     /// # Panics
-    /// Like [`snapshot`](Self::snapshot): if no aggregator was ever
-    /// registered for `A` (or no aggregators at all).
-    pub async fn load_aggregate<A>(&self, id: Uuid) -> Result<Option<A>>
+    /// If no aggregator was ever registered for `A` (or no aggregators
+    /// at all): an unregistered type would otherwise read as "no state
+    /// yet" forever, hiding a configuration bug.
+    pub async fn state_of<A>(&self, id: Uuid) -> Result<Option<A>>
     where
         A: crate::aggregate::Aggregate + Clone + serde::de::DeserializeOwned,
     {
         let Some(reg) = self.aggregators.as_ref() else {
             panic!(
-                "engine.load_aggregate::<{}>() called but no aggregators were \
+                "engine.state_of::<{}>() called but no aggregators were \
                  registered with EngineBuilder::with_aggregators(...)",
                 std::any::type_name::<A>(),
             )
@@ -1633,7 +1591,7 @@ async fn supervise_one(
         if shutdown.try_recv().is_ok() { break; }
 
         // Catch panics from the consumer body so a misconfiguration
-        // (e.g., ctx.aggregate without aggregators registered) or a
+        // (e.g., ctx.state_of without aggregators registered) or a
         // downstream-library panic doesn't kill the spawned tokio task
         // silently — which would leave the consumer permanently dead
         // while the engine keeps running. Panics become an ERROR-level
@@ -1666,7 +1624,7 @@ async fn supervise_one(
                     consumer = consumer.consumer_id(),
                     panic = %panic_payload_message(&panic_payload),
                     "supervisor step PANICKED — consumer will retry. \
-                     Common cause: ctx.aggregate called without aggregators \
+                     Common cause: ctx.state_of called without aggregators \
                      registered via EngineBuilder::with_aggregators"
                 );
                 tokio::select! {
@@ -1992,7 +1950,7 @@ mod tests {
 
     /// Regression test for the reactor-append → engine-aggregator fold path.
     ///
-    /// Before this path existed, `engine.snapshot::<A>(stream_id)`
+    /// Before this path existed, `engine.state_of::<A>(stream_id).await.unwrap()`
     /// reflected only caller-emitted facts; reactor-emitted facts
     /// updated each consumer's private registry clone but were
     /// invisible to out-of-band readers. That made the saga-style
@@ -2003,7 +1961,7 @@ mod tests {
     /// The fix folds every reactor output into the engine aggregator
     /// registry right after it's appended to the log. This test pins
     /// that contract: emit a UserCreated, the reactor emits a
-    /// WelcomeQueued, settle, then `engine.snapshot::<ChainCount>` on
+    /// WelcomeQueued, settle, then `engine.state_of::<ChainCount>` on
     /// the user_id stream reflects BOTH (one UserCreated, one
     /// WelcomeQueued — total = 2).
     ///
@@ -2045,7 +2003,7 @@ mod tests {
         }).settled().await.unwrap();
 
         let state: ChainCount = engine
-            .snapshot::<ChainCount>(user_id)
+            .state_of::<ChainCount>(user_id).await.unwrap()
             .expect("snapshot must exist after settled emit");
         assert_eq!(state.applied, 2,
             "engine.snapshot must reflect BOTH caller-emitted UserCreated \
@@ -2233,18 +2191,18 @@ mod tests {
         engine.emit(OrgUserCreated { user_id: user_3, org_id: org_b, occurred_at: Utc::now() }).settled().await.unwrap();
 
         // UserCount: each user_id folds independently → 1, 1, 1.
-        assert_eq!(engine.snapshot::<UserCount>(user_1).unwrap().n, 1);
-        assert_eq!(engine.snapshot::<UserCount>(user_2).unwrap().n, 1);
-        assert_eq!(engine.snapshot::<UserCount>(user_3).unwrap().n, 1);
+        assert_eq!(engine.state_of::<UserCount>(user_1).await.unwrap().unwrap().n, 1);
+        assert_eq!(engine.state_of::<UserCount>(user_2).await.unwrap().unwrap().n, 1);
+        assert_eq!(engine.state_of::<UserCount>(user_3).await.unwrap().unwrap().n, 1);
 
         // OrgCount: keyed by org_id → 2 for org_a, 1 for org_b.
-        assert_eq!(engine.snapshot::<OrgCount>(org_a).unwrap().n, 2,
+        assert_eq!(engine.state_of::<OrgCount>(org_a).await.unwrap().unwrap().n, 2,
             "id_fn must extract org_id, not user_id (Event::stream_id)");
-        assert_eq!(engine.snapshot::<OrgCount>(org_b).unwrap().n, 1);
+        assert_eq!(engine.state_of::<OrgCount>(org_b).await.unwrap().unwrap().n, 1);
 
         // Cross-check: org_a snapshot at user_1's key must be None
         // (the OrgCount aggregator never folded there).
-        assert!(engine.snapshot::<OrgCount>(user_1).is_none(),
+        assert!(engine.state_of::<OrgCount>(user_1).await.unwrap().is_none(),
             "OrgCount keyed by org_id must not appear under user_id key");
 
         engine.shutdown().await.unwrap();
@@ -2298,12 +2256,12 @@ mod tests {
         engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: None, occurred_at: Utc::now() }).settled().await.unwrap();
         engine.emit(MaybeRunEvent { stream_id: Uuid::new_v4(), run_id: Some(run), occurred_at: Utc::now() }).settled().await.unwrap();
 
-        assert_eq!(engine.snapshot::<RunCounter>(run).unwrap().n, 2,
+        assert_eq!(engine.state_of::<RunCounter>(run).await.unwrap().unwrap().n, 2,
             "only the two facts with run_id Some should fold");
 
         // The None-run fact must not have created an entry at
         // Uuid::nil — verify nothing leaked there.
-        assert!(engine.snapshot::<RunCounter>(Uuid::nil()).is_none(),
+        assert!(engine.state_of::<RunCounter>(Uuid::nil()).await.unwrap().is_none(),
             "id_fn returning None must skip the fold entirely, not fold at nil");
 
         engine.shutdown().await.unwrap();
@@ -2375,9 +2333,9 @@ mod tests {
         engine.emit(TaggedEvent { event_id: Uuid::new_v4(), tag_id: tag_a, occurred_at: Utc::now() }).settled().await.unwrap();
         engine.emit(TaggedEvent { event_id: Uuid::new_v4(), tag_id: tag_b, occurred_at: Utc::now() }).settled().await.unwrap();
 
-        assert_eq!(engine.snapshot::<TagBucket>(tag_a).unwrap().count, 2,
+        assert_eq!(engine.state_of::<TagBucket>(tag_a).await.unwrap().unwrap().count, 2,
             "#[aggregator(id_fn = \"tag\")] must key by tag_id, not event_id");
-        assert_eq!(engine.snapshot::<TagBucket>(tag_b).unwrap().count, 1);
+        assert_eq!(engine.state_of::<TagBucket>(tag_b).await.unwrap().unwrap().count, 1);
 
         engine.shutdown().await.unwrap();
     }
@@ -3460,7 +3418,7 @@ mod tests {
     #[tokio::test]
     async fn engine_snapshot_reads_state_folded_on_emit() {
         // Inspection path: emit Ticks for one stream_id, then read
-        // TickCounter via engine.snapshot::<A>(id) without going
+        // TickCounter via engine.state_of::<A>(id).await.unwrap() without going
         // through a consumer.
         let store = store();
         let engine = EngineBuilder::new(
@@ -3477,7 +3435,7 @@ mod tests {
             engine.emit(Tick { seq: i, occurred_at: Utc::now() }).await.unwrap();
         }
 
-        let counter = engine.snapshot::<TickCounter>(Uuid::nil())
+        let counter = engine.state_of::<TickCounter>(Uuid::nil()).await.unwrap()
             .expect("snapshot Some after 5 ticks folded");
         assert_eq!(counter.count, 5,
                    "engine-level registry folded all 5 emitted Ticks");
@@ -3498,7 +3456,7 @@ mod tests {
             store.clone() as Arc<dyn CheckpointStore>,
             store.clone() as Arc<dyn ReactorCheckpoint>,
         ).build().await.unwrap();
-        let _ = engine.snapshot::<TickCounter>(Uuid::nil());
+        let _ = engine.state_of::<TickCounter>(Uuid::nil()).await.unwrap();
     }
 
     #[tokio::test]
@@ -3922,7 +3880,7 @@ mod tests {
         .build().await.unwrap();
 
         let id = Uuid::new_v4();
-        assert!(engine.snapshot::<UserAgg>(id).is_none(),
+        assert!(engine.state_of::<UserAgg>(id).await.unwrap().is_none(),
                 "snapshot returns None when the aggregate has no facts yet");
         engine.shutdown().await.unwrap();
     }
@@ -3943,13 +3901,13 @@ mod tests {
             by: 7, occurred_at: Utc::now(), counter_id: id,
         }).await.unwrap();
 
-        let state = engine.snapshot::<Counter>(id)
+        let state = engine.state_of::<Counter>(id).await.unwrap()
             .expect("snapshot Some after emit folded a fact for this id");
         assert_eq!(state.value, 7);
 
         // Independent ids stay None.
         let other = Uuid::new_v4();
-        assert!(engine.snapshot::<Counter>(other).is_none(),
+        assert!(engine.state_of::<Counter>(other).await.unwrap().is_none(),
                 "snapshot is keyed — other ids unaffected");
 
         engine.shutdown().await.unwrap();
@@ -4121,7 +4079,7 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                let s = ctx.aggregate::<TickCounter>().curr;
+                let s = ctx.state_of::<TickCounter>(Uuid::nil()).curr;
                 self.snaps.lock().push(s.count);
                 Ok(())
             }
@@ -4174,7 +4132,7 @@ mod tests {
             async fn react(
                 &self, _t: &Tick, ctx: Ctx<'_>,
             ) -> Result<crate::reactor::Events> {
-                let s = ctx.aggregate::<TickCounter>();
+                let s = ctx.state_of::<TickCounter>(Uuid::nil());
                 self.transitions.lock().push((s.prev.count, s.curr.count));
                 Ok(crate::reactor::Events::new())
             }
@@ -4299,7 +4257,7 @@ mod tests {
     /// This matters because the "obvious" alternative — apply ALL
     /// facts, then project ALL — would silently break transition
     /// guards that depend on per-event `prev`/`curr` deltas
-    /// (`ctx.aggregate::<A>().prev` vs `.curr`). Today's projection
+    /// (`ctx.state_of::<A>(Uuid::nil()).prev` vs `.curr`). Today's projection
     /// runner does the right thing; this test makes the contract
     /// load-bearing so a future refactor can't silently flip to
     /// apply-all-then-project-all.
@@ -4323,7 +4281,7 @@ mod tests {
                 _f: &Tick,
                 ctx: Ctx<'_>,
             ) -> Result<()> {
-                let s = ctx.aggregate::<TickCounter>();
+                let s = ctx.state_of::<TickCounter>(Uuid::nil());
                 self.transitions.lock().push((s.prev.count, s.curr.count));
                 Ok(())
             }
@@ -4377,7 +4335,7 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                self.snaps.lock().push(ctx.aggregate::<TickCounter>().curr.count);
+                self.snaps.lock().push(ctx.state_of::<TickCounter>(Uuid::nil()).curr.count);
                 Ok(())
             }
         }
@@ -4428,7 +4386,7 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                *self.snap.lock() = Some(ctx.aggregate::<TickCounter>().curr.count);
+                *self.snap.lock() = Some(ctx.state_of::<TickCounter>(Uuid::nil()).curr.count);
                 Ok(())
             }
         }
@@ -4457,7 +4415,7 @@ mod tests {
     ///
     /// Setup: 2 historical Tick events in the log, checkpoint past
     /// them; one fresh Tick arrives. A consumer that reads
-    /// `ctx.aggregate::<TickCounter>().prev.count` vs `.curr.count`
+    /// `ctx.state_of::<TickCounter>(Uuid::nil()).prev.count` vs `.curr.count`
     /// must see `(2, 3)` — the historical state from hydration vs
     /// the post-fold state for the new event. If hydration only
     /// folds into `curr` and leaves `prev` at default, transition
@@ -4487,7 +4445,7 @@ mod tests {
                 _f: &Tick,
                 ctx: Ctx<'_>,
             ) -> Result<()> {
-                let s = ctx.aggregate::<TickCounter>();
+                let s = ctx.state_of::<TickCounter>(Uuid::nil());
                 *self.prev_curr.lock() = Some((s.prev.count, s.curr.count));
                 Ok(())
             }
@@ -4534,7 +4492,7 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                let _ = ctx.aggregate::<TickCounter>().curr;
+                let _ = ctx.state_of::<TickCounter>(Uuid::nil()).curr;
                 Ok(())
             }
         }
@@ -4658,8 +4616,8 @@ mod tests {
             async fn project(
                 &self, _f: &Tick, ctx: Ctx<'_>,
             ) -> Result<()> {
-                self.a.lock().push(ctx.aggregate::<TickCounter>().curr.count);
-                self.b.lock().push(ctx.aggregate::<OtherCounter>().curr.count);
+                self.a.lock().push(ctx.state_of::<TickCounter>(Uuid::nil()).curr.count);
+                self.b.lock().push(ctx.state_of::<OtherCounter>(Uuid::nil()).curr.count);
                 Ok(())
             }
         }

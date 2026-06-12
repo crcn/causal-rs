@@ -94,7 +94,7 @@ async fn restart_restores_full_aggregate_state() -> Result<()> {
         engine.emit(Deposited { account: acct, amount: 50 }).await?;
         engine.emit(Withdrawn { account: acct, amount: 30 }).await?;
         assert_eq!(
-            engine.snapshot::<Balance>(acct),
+            engine.state_of::<Balance>(acct).await.unwrap(),
             Some(Balance { value: 120 }),
             "engine #1 in-memory fold"
         );
@@ -103,7 +103,7 @@ async fn restart_restores_full_aggregate_state() -> Result<()> {
 
     // Engine #2 — fresh registry, SAME MemoryStore.
     let engine2 = build(&mem, Some(mem.clone()), 100).await;
-    let restored = engine2.load_aggregate::<Balance>(acct).await?;
+    let restored = engine2.state_of::<Balance>(acct).await?;
     assert_eq!(
         restored,
         Some(Balance { value: 120 }),
@@ -132,7 +132,7 @@ async fn snapshot_accelerates_without_changing_result() -> Result<()> {
 
     // Engine #2 restores via snapshot + tail.
     let engine2 = build(&mem, Some(mem.clone()), 3).await;
-    let restored = engine2.load_aggregate::<Balance>(acct).await?;
+    let restored = engine2.state_of::<Balance>(acct).await?;
     assert_eq!(
         restored,
         Some(Balance { value: expected }),
@@ -169,7 +169,7 @@ async fn corrupt_snapshot_self_heals() -> Result<()> {
     .await?;
 
     let engine2 = build(&mem, Some(mem.clone()), 100).await;
-    let restored = engine2.load_aggregate::<Balance>(acct).await?;
+    let restored = engine2.state_of::<Balance>(acct).await?;
     assert_eq!(
         restored,
         Some(Balance { value: 60 }),
@@ -218,19 +218,19 @@ async fn without_snapshot_store_behavior_unchanged() -> Result<()> {
         let engine = build(&mem, None, 0).await; // no snapshot store
         engine.emit(Deposited { account: acct, amount: 100 }).await?;
         assert_eq!(
-            engine.snapshot::<Balance>(acct),
+            engine.state_of::<Balance>(acct).await.unwrap(),
             Some(Balance { value: 100 }),
             "in-memory fold still works with no store"
         );
         engine.shutdown().await?;
     }
 
-    // Fresh engine, no store → load_aggregate does NOT restore.
+    // Fresh engine, no store → state_of does NOT restore.
     let engine2 = build(&mem, None, 0).await;
     assert_eq!(
-        engine2.load_aggregate::<Balance>(acct).await?,
+        engine2.state_of::<Balance>(acct).await?,
         None,
-        "without a snapshot store, load_aggregate does not restore (unchanged)"
+        "without a snapshot store, state_of does not restore (unchanged)"
     );
     let snap = SnapshotStore::load_snapshot(mem.as_ref(), "Balance", acct).await?;
     assert!(snap.is_none(), "no snapshot store → no snapshots ever saved");

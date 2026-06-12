@@ -80,7 +80,7 @@ where
 
     /// Attach a per-runner [`AggregatorRegistry`] copy. The runner folds
     /// every event into this registry before invoking the consumer body
-    /// so `ctx.aggregate::<A>()` reads state INCLUDING the current event.
+    /// so `ctx.state_of::<A>(Uuid::nil())` reads state INCLUDING the current event.
     pub fn with_aggregators(mut self, aggregators: Arc<AggregatorRegistry>) -> Self {
         self.aggregators = Some(aggregators);
         self

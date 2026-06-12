@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // 6. Read the folded state back.
-    let order = engine.snapshot::<Order>(order_id).expect("order exists");
+    let order = engine.state_of::<Order>(order_id).await.unwrap().expect("order exists");
     assert_eq!(order.total, 99.99);
     assert!(order.shipped, "set by the reactor's downstream event");
 

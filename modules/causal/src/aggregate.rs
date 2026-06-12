@@ -65,7 +65,7 @@ pub trait Aggregate: Default + Send + Sync + 'static {
     /// Defaults to `""` — restore is **disabled** for the aggregate and
     /// behavior is unchanged (in-memory fold only, lost on restart).
     /// Set it (and wire `EngineBuilder::with_snapshot_store`) to make
-    /// folded state survive a restart via `Engine::load_aggregate`:
+    /// folded state survive a restart via `Engine::state_of`:
     /// load snapshot (if any) + replay the stream tail + fold.
     const STREAM_CATEGORY: &'static str = "";
 }

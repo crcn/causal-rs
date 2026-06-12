@@ -2,7 +2,7 @@
 //! (idempotent folds + gap repair) and reactor cursor seeding.
 //!
 //! Master invariant (checked after every attack): for every aggregate,
-//! `engine.snapshot::<A>(id)` == an independent from-scratch fold of the
+//! `engine.state_of::<A>(id).await.unwrap()` == an independent from-scratch fold of the
 //! aggregate's own stream read directly from the log.
 //!
 //! Run: `cargo test -p causal --test antifragile_concurrency -- --test-threads=8`
@@ -67,11 +67,11 @@ where
 /// THE invariant: engine snapshot == from-scratch fold of the log.
 async fn assert_invariant<A, F>(engine: &Engine, store: &MemoryStore, id: Uuid, ctx: &str)
 where
-    A: Aggregate + Apply<F> + Clone + PartialEq + std::fmt::Debug,
+    A: Aggregate + Apply<F> + Clone + PartialEq + std::fmt::Debug + serde::de::DeserializeOwned,
     F: Event,
 {
     let (expected, n) = replay_one::<A, F>(store, id).await;
-    match engine.snapshot::<A>(id) {
+    match engine.state_of::<A>(id).await.unwrap() {
         None if n == 0 => {}
         None => panic!(
             "[{ctx}] INVARIANT BROKEN: log has {n} folding events for {id} \
@@ -94,11 +94,11 @@ async fn assert_invariant_if_present<A, F>(
     ctx: &str,
 ) -> bool
 where
-    A: Aggregate + Apply<F> + Clone + PartialEq + std::fmt::Debug,
+    A: Aggregate + Apply<F> + Clone + PartialEq + std::fmt::Debug + serde::de::DeserializeOwned,
     F: Event,
 {
     let (expected, _) = replay_one::<A, F>(store, id).await;
-    match engine.snapshot::<A>(id) {
+    match engine.state_of::<A>(id).await.unwrap() {
         None => false,
         Some(got) => {
             assert_eq!(
@@ -180,7 +180,7 @@ async fn same_stream_emit_storm_no_fold_lost() {
     }
 
     // No fold lost, no double-count.
-    let snap = engine.snapshot::<HitTotal>(id).expect("state present");
+    let snap = engine.state_of::<HitTotal>(id).await.unwrap().expect("state present");
     assert_eq!(snap.n, TASKS * PER, "every concurrent emit folded exactly once");
     let expected_sum: i64 = (0..(TASKS * PER) as i64).sum();
     assert_eq!(snap.sum, expected_sum, "fold content intact, not just count");
@@ -237,7 +237,7 @@ async fn first_fold_burst_on_fresh_aggregates() {
     }
 
     for &id in &ids {
-        let snap = engine.snapshot::<HitTotal>(id).expect("state present");
+        let snap = engine.state_of::<HitTotal>(id).await.unwrap().expect("state present");
         assert_eq!(
             snap.n, BURST as u64,
             "fresh-aggregate burst lost a fold for {id} (vacant-entry restore race)"
@@ -668,7 +668,7 @@ async fn occ_append_8way_multi_fact_contention() {
     assert_eq!(loaded.sum as u64, total_events * 2); // avg by = 2
     assert_eq!(rev.raw(), total_events - 1);
 
-    let snap = engine.snapshot::<OccTotal>(id).expect("registry state present");
+    let snap = engine.state_of::<OccTotal>(id).await.unwrap().expect("registry state present");
     assert_eq!(snap, loaded, "no skipped folds: registry == log fold");
     assert_invariant::<OccTotal, OccFact>(&engine, &store, id, "occ 8-way").await;
 }
@@ -1008,7 +1008,7 @@ async fn gap_repair_converges_through_foreign_events_in_stream() {
         h.await.unwrap();
     }
 
-    let snap = engine.snapshot::<AcctBalance>(acct).expect("state present");
+    let snap = engine.state_of::<AcctBalance>(acct).await.unwrap().expect("state present");
     assert_eq!(snap.n, TASKS * PAIRS, "every Dep folded exactly once");
     assert_invariant::<AcctBalance, Dep>(&engine, &store, acct, "foreign-interleaved stream").await;
 
@@ -1086,7 +1086,7 @@ async fn snapshot_every_one_storm_then_durable_restore() {
             .await
             .unwrap();
         let restored = engine2
-            .load_aggregate::<HitTotal>(id)
+            .state_of::<HitTotal>(id)
             .await
             .unwrap()
             .expect("restorable aggregate");
@@ -1105,7 +1105,7 @@ async fn snapshot_every_one_storm_then_durable_restore() {
 //
 // Shape: a stream with history (30 events), a fresh engine whose
 // registry is vacant for it, and a handful of CONCURRENT emits.
-// No load_aggregate, no snapshot store, no reactors required.
+// No state_of, no snapshot store, no reactors required.
 //
 // The bug (aggregator.rs): each concurrent emit's `fold_event`
 // (unbounded) saw a vacant entry at revision > 0 → `FoldGap` →
@@ -1171,7 +1171,7 @@ async fn vacant_registry_restore_race_loses_folds() {
             h.await.unwrap();
         }
 
-        let snap = engine.snapshot::<HitTotal>(id).expect("state present");
+        let snap = engine.state_of::<HitTotal>(id).await.unwrap().expect("state present");
         assert_eq!(
             snap.n,
             HISTORY + CONCURRENT,

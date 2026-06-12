@@ -132,7 +132,7 @@ impl AggregatorIdValue for Option<Uuid> {
 impl Aggregator {
     /// Construct an Aggregator that folds facts of type `F` into
     /// aggregate state `A`. Consumers read the folded state via
-    /// `ctx.aggregate::<A>(stream_id)` inside their reactor / projector
+    /// `ctx.state_of::<A>(stream_id)` inside their reactor / projector
     /// body.
     ///
     /// Stream id comes from `Event::stream_id`; aggregate type string
@@ -882,7 +882,7 @@ impl Default for AggregatorRegistry {
 
 // ── Durable restore / snapshot save (read-through on the aggregate's stream) ──
 //
-// Free functions so both `Engine` (for `load_aggregate`) and the consumer
+// Free functions so both `Engine` (for `state_of`) and the consumer
 // runners (restore-before-fold / save-after-fold) share one implementation.
 
 /// Fold one event into `reg`, repairing revision gaps by read-through

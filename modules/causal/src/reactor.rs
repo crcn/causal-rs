@@ -42,7 +42,7 @@ use crate::event::Event;
 ///
 /// The framework does **not** provide write-side concurrency control
 /// (no CAS / OCC on the user-facing emit path). When two reactors
-/// running in parallel both read `ctx.aggregate::<A>(id)` at version
+/// running in parallel both read `ctx.state_of::<A>(id)` at version
 /// V and each emit a fact for that same stream, both facts append —
 /// the second decision was made on stale state. Example:
 ///
