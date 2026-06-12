@@ -1,27 +1,19 @@
-// Genuinely streamless facts (telemetry, ops counters) opt in to the
-// shared `{category}-nil` stream EXPLICITLY — the cost (no per-stream
-// aggregate can fold them) is visible at the definition site.
+// Reference-carrying subject-less facts opt in EXPLICITLY — the ids
+// present are references, not subjects, and the declaration says so.
 use causal::Event;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[causal::event(prefix = "telemetry", no_subject)]
+#[causal::event(prefix = "cache", no_subject)]
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum TelemetryEvent {
-    TickRecorded { n: u64 },
-}
-
-#[causal::event(no_subject)]
-#[derive(Clone, Serialize, Deserialize)]
-struct HeartbeatSeen {
-    n: u64,
+struct CachePurged {
+    requested_by: Uuid,   // a reference — without no_subject this is a
+    n_evicted: u64,       // teaching error naming `requested_by`
 }
 
 fn main() {
     assert_eq!(
-        TelemetryEvent::TickRecorded { n: 1 }.subject_id(),
+        CachePurged { requested_by: Uuid::new_v4(), n_evicted: 3 }.subject_id(),
         Uuid::nil(),
     );
-    assert_eq!(HeartbeatSeen { n: 1 }.subject_id(), Uuid::nil());
 }

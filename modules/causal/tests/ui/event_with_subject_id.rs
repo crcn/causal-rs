@@ -1,4 +1,4 @@
-// The normal shape: the event names the Uuid field it streams by.
+// The normal shape: the fact names the Uuid field it is about.
 use causal::Event;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,23 +10,21 @@ struct Deposited {
     occurred_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[causal::event(prefix = "curiosity", subject_id = "signal_id")]
+// Two fact families sharing ONE subject history — the anti-god-enum
+// valve. Both land in `ledger-{account}`; each keeps its own type.
+#[causal::event(prefix = "withdraw", subject_id = "account", subject = "ledger")]
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum CuriosityEvent {
-    SignalInvestigated {
-        signal_id: Uuid,
-        occurred_at: chrono::DateTime<chrono::Utc>,
-    },
+struct Withdrawn {
+    account: Uuid,
+    occurred_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn main() {
     let id = Uuid::new_v4();
     let d = Deposited { account: id, occurred_at: chrono::Utc::now() };
     assert_eq!(d.subject_id(), id);
-    let c = CuriosityEvent::SignalInvestigated {
-        signal_id: id,
-        occurred_at: chrono::Utc::now(),
-    };
-    assert_eq!(c.subject_id(), id);
+    assert_eq!(<Deposited as Event>::SUBJECT, "deposit"); // defaults to CATEGORY
+    let w = Withdrawn { account: id, occurred_at: chrono::Utc::now() };
+    assert_eq!(w.subject_id(), id);
+    assert_eq!(<Withdrawn as Event>::SUBJECT, "ledger");  // co-located
 }

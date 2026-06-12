@@ -1,0 +1,19 @@
+error: #[event]: the enum fact form was retracted (no-lying-defaults §1). One fact = one struct. A family enum's trigger deserializes by serde tag, so ADDING A VARIANT poisons every deployed consumer of the family (unknown variant → deserialization failure → terminal failure) — vocabulary growth as a breaking change. Split each variant into its own struct fact; to share one subject history, put `subject = "<kind>"` on each.
+  --> tests/ui/event_enum_retracted.rs:12:6
+   |
+12 | enum JobEvent {
+   |      ^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+ --> tests/ui/event_enum_retracted.rs:6:13
+  |
+6 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `uuid::Uuid`
+ --> tests/ui/event_enum_retracted.rs:7:5
+  |
+7 | use uuid::Uuid;
+  |     ^^^^^^^^^^
