@@ -6,6 +6,42 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### 0.10 step 6 — consumers are functions (2026-06-12)
+
+Primitive 7: the `#[reactor]` macro deleted in the 2026-06-10 audit,
+revived with the lessons applied — the macro removes trait ceremony
+ONLY; it is forbidden from deciding anything load-bearing.
+
+- **`#[causal::reactors(deps = JobDeps)]`** on a module: each
+  `#[reactor(name = "job.enrich", ordering = per_workflow,
+  max_in_flight = 4)]` async fn becomes the hand-written struct +
+  `Reactor` impl, verbatim — trigger type read from the fn signature,
+  attribute knobs copied into the consts, deps captured in the
+  generated struct (shared `Arc`), the fn body called untouched. The
+  module gains `reactors(deps) -> Vec<Box<dyn ReactorRegistration>>`
+  for `EngineBuilder::with_reactors`. Bare fns in the module are left
+  alone (helpers are legitimate).
+- **`#[causal::projectors(deps = ..)]`**: `#[projector(name = ..)]`
+  with a typed `&E` param → `Projector`; with
+  `kinds = ["..", ".."]` and `&RecordedEvent` → `MultiProjector`. The
+  module gains `projectors()` / `multi_projectors()` (the non-empty
+  ones). A `&RecordedEvent` fn WITHOUT `kinds` is a teaching error —
+  each kinds entry is a settle-latency coupling, written out, never
+  inferred.
+- **Inference only where wrongness is loud**: the trigger/event type
+  comes from the signature (a wrong type changes which events arrive,
+  visibly). `name` is REQUIRED — it names a durable cursor; a
+  fn-name-derived default would turn a rename refactor into an
+  orphaned cursor (teaching compile error says so).
+- **`Reactor::MAX_IN_FLIGHT`** (new const, default unbounded): caps
+  concurrently *executing* reactions per consumer — the knob that
+  protects a bounded external resource from partition fan-out.
+  Enforced with a semaphore around the executing attempt only; a
+  worker waiting out a retry backoff holds no slot. Rides the
+  `#[reactor]` attribute alongside `ordering` so concurrency lives in
+  the same diff as the body it governs.
+- `causal::async_trait` re-exported for the generated impls.
+
 ### 0.10 step 5 — workflow roots declared on the fact (2026-06-12, breaking)
 
 Which workflow a fact belongs to is part of what the fact IS, declared

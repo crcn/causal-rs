@@ -866,3 +866,486 @@ fn expand_event_struct(
         #fact_impl
     })
 }
+
+// ── #[reactors] / #[projectors] module macros (0.10 Primitive 7) ─────
+//
+// Revival of the macro deleted in the 2026-06-10 audit, with the
+// lessons applied: the macro removes trait ceremony ONLY — it is
+// forbidden from deciding anything load-bearing. Inference is allowed
+// only where wrong inference fails loudly (the trigger type from the
+// fn signature — a wrong type changes which events arrive, visibly);
+// everything whose wrongness is silent stays explicit (`name` names a
+// durable cursor; `kinds` entries are settle-latency couplings;
+// `ordering` / `max_in_flight` are execution semantics that belong in
+// the same diff as the body they govern).
+
+/// What one `#[reactor]`/`#[projector]` fn parsed into.
+struct ConsumerFn {
+    fn_ident: Ident,
+    struct_ident: Ident,
+    /// The event/trigger parameter's type (`&T` → `T`).
+    event_ty: Type,
+    name: String,
+    ordering: Option<Ident>,
+    max_in_flight: Option<u64>,
+    kinds: Option<Vec<String>>,
+}
+
+fn lit_str_of(value: &Expr) -> Option<String> {
+    if let Expr::Lit(el) = value {
+        if let Lit::Str(s) = &el.lit {
+            return Some(s.value());
+        }
+    }
+    None
+}
+
+/// Parse the module attr: optional `deps = SomeType`.
+fn parse_module_deps(attr: TokenStream2, module: &ItemMod) -> syn::Result<Option<Type>> {
+    if attr.is_empty() {
+        return Ok(None);
+    }
+    let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+    let metas = parser
+        .parse2(attr)
+        .map_err(|e| syn::Error::new_spanned(module, format!("bad module args: {e}")))?;
+    for meta in &metas {
+        if let Meta::NameValue(MetaNameValue { path, value, .. }) = meta {
+            if path.is_ident("deps") {
+                if let Expr::Path(p) = value {
+                    return Ok(Some(Type::Path(syn::TypePath {
+                        qself: None,
+                        path: p.path.clone(),
+                    })));
+                }
+                return Err(syn::Error::new_spanned(
+                    value,
+                    "deps takes a type, e.g. `deps = JobDeps`",
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Parse one consumer fn: validate the attr + signature, extract the
+/// event type. `attr_name` is "reactor" or "projector"; `has_deps`
+/// decides the expected arity.
+fn parse_consumer_fn(
+    attr_name: &str,
+    metas: &Punctuated<Meta, Token![,]>,
+    item_fn: &ItemFn,
+    has_deps: bool,
+) -> syn::Result<ConsumerFn> {
+    let fn_ident = item_fn.sig.ident.clone();
+    let mut name = None;
+    let mut ordering = None;
+    let mut max_in_flight = None;
+    let mut kinds: Option<Vec<String>> = None;
+
+    for meta in metas {
+        match meta {
+            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("name") => {
+                name = lit_str_of(value);
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("ordering") && attr_name == "reactor" =>
+            {
+                if let Expr::Path(p) = value {
+                    if let Some(id) = p.path.get_ident() {
+                        let canon = match id.to_string().as_str() {
+                            "per_subject" => "PerSubject",
+                            "per_workflow" => "PerWorkflow",
+                            "none" => "None",
+                            other => {
+                                return Err(syn::Error::new_spanned(
+                                    value,
+                                    format!(
+                                        "unknown ordering `{other}` — one of \
+                                         per_subject | per_workflow | none",
+                                    ),
+                                ));
+                            }
+                        };
+                        ordering = Some(format_ident!("{canon}"));
+                    }
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("max_in_flight") && attr_name == "reactor" =>
+            {
+                if let Expr::Lit(el) = value {
+                    if let Lit::Int(i) = &el.lit {
+                        max_in_flight = Some(i.base10_parse::<u64>()?);
+                    }
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("kinds") && attr_name == "projector" =>
+            {
+                if let Expr::Array(arr) = value {
+                    let mut out = Vec::new();
+                    for el in &arr.elems {
+                        match lit_str_of(el) {
+                            Some(s) => out.push(s),
+                            None => {
+                                return Err(syn::Error::new_spanned(
+                                    el,
+                                    "kinds entries are string literals, e.g. \
+                                     `kinds = [\"job_opened\", \"job_billed\"]`",
+                                ));
+                            }
+                        }
+                    }
+                    kinds = Some(out);
+                }
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    format!("unknown #[{attr_name}] argument"),
+                ));
+            }
+        }
+    }
+
+    // `name` is REQUIRED: it names a DURABLE CURSOR. A fn-name-derived
+    // default would turn a rename refactor into an orphaned cursor
+    // (reactors reseed at latest — backlog silently skipped; projectors
+    // reseed at zero — full re-projection into live read models).
+    let Some(name) = name else {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.ident,
+            format!(
+                "#[{attr_name}] needs a `name` — it names this consumer's \
+                 DURABLE CURSOR (checkpoint rows, failure records, the \
+                 inspector). Deriving it from the fn name would turn a rename \
+                 refactor into an orphaned cursor. e.g. \
+                 `#[{attr_name}(name = \"job.enrich\")]`",
+            ),
+        ));
+    };
+
+    // Signature: (deps: &Deps,)? event: &E, ctx: Ctx<'_>
+    let expected = if has_deps { 3 } else { 2 };
+    let params: Vec<&FnArg> = item_fn.sig.inputs.iter().collect();
+    if params.len() != expected {
+        let shape = if has_deps {
+            "(deps: &Deps, event: &E, ctx: Ctx<'_>)"
+        } else {
+            "(event: &E, ctx: Ctx<'_>)"
+        };
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig,
+            format!(
+                "#[{attr_name}] fn takes {shape} — this module {} `deps`",
+                if has_deps { "declares" } else { "declares no" },
+            ),
+        ));
+    }
+    let event_param = params[if has_deps { 1 } else { 0 }];
+    let FnArg::Typed(pt) = event_param else {
+        return Err(syn::Error::new_spanned(event_param, "expected a typed parameter"));
+    };
+    let Type::Reference(r) = &*pt.ty else {
+        return Err(syn::Error::new_spanned(
+            &pt.ty,
+            "the event parameter is taken by reference: `event: &E`",
+        ));
+    };
+    let event_ty = (*r.elem).clone();
+
+    // The attribute decides typed-vs-raw; the signature must agree.
+    let is_recorded = matches!(
+        &event_ty,
+        Type::Path(tp) if tp.path.segments.last()
+            .map(|s| s.ident == "RecordedEvent").unwrap_or(false)
+    );
+    if attr_name == "projector" {
+        if kinds.is_some() && !is_recorded {
+            return Err(syn::Error::new_spanned(
+                &pt.ty,
+                "#[projector(kinds = [...])] is the cross-kind shape — its fn \
+                 takes the raw `event: &RecordedEvent` and routes by \
+                 `event.event_type`. For a single typed event, drop `kinds`.",
+            ));
+        }
+        if kinds.is_none() && is_recorded {
+            return Err(syn::Error::new_spanned(
+                &pt.ty,
+                "a `&RecordedEvent` projector must declare \
+                 `kinds = [\"...\"]` — each entry is a settle-latency \
+                 coupling (settle waits on projector cursors), so the \
+                 subscription is written out, never inferred.",
+            ));
+        }
+    }
+
+    Ok(ConsumerFn {
+        struct_ident: format_ident!("__causal_{}_{}", attr_name, fn_ident),
+        fn_ident,
+        event_ty,
+        name,
+        ordering,
+        max_in_flight,
+        kinds,
+    })
+}
+
+/// Shared driver for `#[reactors]` / `#[projectors]` on a module.
+fn expand_consumers_module(
+    attr: TokenStream2,
+    mut module: ItemMod,
+    attr_name: &str,
+) -> syn::Result<TokenStream2> {
+    let deps_ty = parse_module_deps(attr, &module)?;
+    let Some((_, items)) = &mut module.content else {
+        return Err(syn::Error::new_spanned(
+            module,
+            format!("#[{attr_name}s] requires an inline module"),
+        ));
+    };
+
+    let mut parsed: Vec<ConsumerFn> = Vec::new();
+    for item in items.iter_mut() {
+        let Item::Fn(item_fn) = item else { continue };
+        // Take the matching attr off the fn (it's ours, not rustc's).
+        let Some(pos) = item_fn.attrs.iter().position(|a| a.path().is_ident(attr_name))
+        else {
+            continue; // bare fn — a helper, left untouched
+        };
+        let attr = item_fn.attrs.remove(pos);
+        let metas = match &attr.meta {
+            Meta::List(l) => {
+                let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+                parser.parse2(l.tokens.clone())?
+            }
+            _ => Punctuated::new(),
+        };
+        parsed.push(parse_consumer_fn(attr_name, &metas, item_fn, deps_ty.is_some())?);
+    }
+
+    if parsed.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &module.ident,
+            format!(
+                "#[{attr_name}s] module has no #[{attr_name}(name = \"...\")] \
+                 functions",
+            ),
+        ));
+    }
+
+    // Generated struct + trait impl per fn, INSIDE the module so the
+    // fn's own type paths resolve unchanged.
+    let mut generated: Vec<Item> = Vec::new();
+    for c in &parsed {
+        let ConsumerFn { fn_ident, struct_ident, event_ty, name, ordering, max_in_flight, kinds } = c;
+        let struct_def: Item = match &deps_ty {
+            Some(d) => parse_quote! {
+                #[allow(non_camel_case_types)]
+                pub struct #struct_ident { deps: ::std::sync::Arc<#d> }
+            },
+            None => parse_quote! {
+                #[allow(non_camel_case_types)]
+                pub struct #struct_ident;
+            },
+        };
+        generated.push(struct_def);
+        // The body of the generated trait method: call the user's fn.
+        let call = |evt: TokenStream2| -> TokenStream2 {
+            match &deps_ty {
+                Some(_) => quote! { #fn_ident(&self.deps, #evt, __ctx).await },
+                None => quote! { #fn_ident(#evt, __ctx).await },
+            }
+        };
+
+        let react_call = call(quote! { __trigger });
+        let project_call = call(quote! { __event });
+        let imp: Item = if attr_name == "reactor" {
+            let ordering_const = ordering.as_ref().map(|o| {
+                quote! { const ORDERING: ::causal::Ordering = ::causal::Ordering::#o; }
+            });
+            let mif_const = max_in_flight.map(|n| {
+                let n = n as usize;
+                quote! { const MAX_IN_FLIGHT: usize = #n; }
+            });
+            parse_quote! {
+                #[::causal::async_trait]
+                impl ::causal::Reactor for #struct_ident {
+                    type Trigger = #event_ty;
+                    const NAME: &'static str = #name;
+                    #ordering_const
+                    #mif_const
+                    async fn react(
+                        &self,
+                        __trigger: &#event_ty,
+                        __ctx: ::causal::Ctx<'_>,
+                    ) -> ::anyhow::Result<::causal::Events> {
+                        #react_call
+                    }
+                }
+            }
+        } else if let Some(kind_list) = kinds {
+            parse_quote! {
+                #[::causal::async_trait]
+                impl ::causal::MultiProjector for #struct_ident {
+                    const NAME: &'static str = #name;
+                    const KINDS: &'static [&'static str] = &[#(#kind_list),*];
+                    async fn project(
+                        &self,
+                        __event: &::causal::RecordedEvent,
+                        __ctx: ::causal::Ctx<'_>,
+                    ) -> ::anyhow::Result<()> {
+                        #project_call
+                    }
+                }
+            }
+        } else {
+            parse_quote! {
+                #[::causal::async_trait]
+                impl ::causal::Projector for #struct_ident {
+                    type Event = #event_ty;
+                    const NAME: &'static str = #name;
+                    async fn project(
+                        &self,
+                        __event: &#event_ty,
+                        __ctx: ::causal::Ctx<'_>,
+                    ) -> ::anyhow::Result<()> {
+                        #project_call
+                    }
+                }
+            }
+        };
+        generated.push(imp);
+    }
+
+    // Registration fn(s). A reactors module gets `reactors()`; a
+    // projectors module gets `projectors()` and/or `multi_projectors()`
+    // (only the non-empty ones).
+    let mk_registration = |fn_name: &str,
+                           trait_path: TokenStream2,
+                           members: &[&ConsumerFn]|
+     -> Item {
+        let fn_ident = format_ident!("{fn_name}");
+        let boxes = members.iter().map(|c| {
+            let s = &c.struct_ident;
+            match &deps_ty {
+                Some(_) => quote! {
+                    ::std::boxed::Box::new(#s { deps: __deps.clone() })
+                        as ::std::boxed::Box<dyn #trait_path>
+                },
+                None => quote! {
+                    ::std::boxed::Box::new(#s) as ::std::boxed::Box<dyn #trait_path>
+                },
+            }
+        });
+        match &deps_ty {
+            Some(d) => parse_quote! {
+                pub fn #fn_ident(deps: #d)
+                    -> ::std::vec::Vec<::std::boxed::Box<dyn #trait_path>>
+                {
+                    let __deps = ::std::sync::Arc::new(deps);
+                    ::std::vec![#(#boxes),*]
+                }
+            },
+            None => parse_quote! {
+                pub fn #fn_ident()
+                    -> ::std::vec::Vec<::std::boxed::Box<dyn #trait_path>>
+                {
+                    ::std::vec![#(#boxes),*]
+                }
+            },
+        }
+    };
+
+    if attr_name == "reactor" {
+        let all: Vec<&ConsumerFn> = parsed.iter().collect();
+        generated.push(mk_registration(
+            "reactors",
+            quote! { ::causal::ReactorRegistration },
+            &all,
+        ));
+    } else {
+        let singles: Vec<&ConsumerFn> =
+            parsed.iter().filter(|c| c.kinds.is_none()).collect();
+        let multis: Vec<&ConsumerFn> =
+            parsed.iter().filter(|c| c.kinds.is_some()).collect();
+        if !singles.is_empty() {
+            generated.push(mk_registration(
+                "projectors",
+                quote! { ::causal::ProjectorRegistration },
+                &singles,
+            ));
+        }
+        if !multis.is_empty() {
+            generated.push(mk_registration(
+                "multi_projectors",
+                quote! { ::causal::MultiProjectorRegistration },
+                &multis,
+            ));
+        }
+    }
+
+    items.extend(generated);
+    Ok(quote! { #module })
+}
+
+/// Turns a module of plain async functions into registered [`Reactor`]s
+/// — the fn body is the Primitive-2 body, untouched; the macro removes
+/// trait ceremony only.
+///
+/// ```ignore
+/// #[causal::reactors(deps = JobDeps)]
+/// mod job_reactors {
+///     pub struct JobDeps { pub whisper: Arc<WhisperClient> }
+///
+///     #[reactor(name = "job.enrich", max_in_flight = 4)]
+///     async fn enrich(deps: &JobDeps, t: &JobOpened, ctx: Ctx<'_>) -> Result<Events> {
+///         …
+///     }
+/// }
+/// // EngineBuilder: .with_reactors(job_reactors::reactors(JobDeps { … }))
+/// ```
+///
+/// Inference is allowed only where wrong inference fails loudly: the
+/// trigger type comes from the fn signature (a wrong type changes which
+/// events arrive — visibly). `name` is REQUIRED (it names a durable
+/// cursor; a derived default turns a rename into an orphaned cursor),
+/// and every execution-semantics knob is explicit: `ordering =
+/// per_subject | per_workflow | none` (BLOCKING-4's declaration rides
+/// here), `max_in_flight = N`.
+#[proc_macro_attribute]
+pub fn reactors(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let module = parse_macro_input!(item as ItemMod);
+    match expand_consumers_module(attr.into(), module, "reactor") {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Turns a module of plain async functions into registered
+/// [`Projector`]s / [`MultiProjector`]s — same contract as
+/// [`macro@reactors`].
+///
+/// ```ignore
+/// #[causal::projectors(deps = ReadModels)]
+/// mod job_projectors {
+///     #[projector(name = "job.read_model")]
+///     async fn job_row(deps: &ReadModels, e: &JobOpened, ctx: Ctx<'_>) -> Result<()> { … }
+///
+///     // Cross-kind: `kinds` is explicit — each entry couples every
+///     // workflow emitting that kind to this projector's write latency.
+///     #[projector(name = "ops.audit", kinds = ["wf_job_opened", "wf_job_enriched"])]
+///     async fn audit(deps: &ReadModels, e: &RecordedEvent, ctx: Ctx<'_>) -> Result<()> { … }
+/// }
+/// // .with_projectors(job_projectors::projectors(deps))
+/// // .with_multi_projectors(job_projectors::multi_projectors(deps))
+/// ```
+#[proc_macro_attribute]
+pub fn projectors(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let module = parse_macro_input!(item as ItemMod);
+    match expand_consumers_module(attr.into(), module, "projector") {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}

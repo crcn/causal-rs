@@ -179,6 +179,10 @@ pub use snapshot_store::SnapshotStore;
 // Default backend
 pub use memory_store::MemoryStore;
 
+// Re-exported for macro-generated consumer impls (#[causal::reactors]
+// / #[causal::projectors] emit `#[::causal::async_trait]` impls).
+pub use async_trait::async_trait;
+
 
 /// Universal return macro for [`Reactor::react`]. Builds an
 /// [`Events`] collection from one or more output facts.
@@ -210,5 +214,5 @@ macro_rules! events {
 }
 
 #[cfg(feature = "macros")]
-pub use causal_core_macros::{aggregators, event};
+pub use causal_core_macros::{aggregators, event, projectors, reactors};
 

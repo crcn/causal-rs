@@ -1,0 +1,25 @@
+error: #[reactor] needs a `name` — it names this consumer's DURABLE CURSOR (checkpoint rows, failure records, the inspector). Deriving it from the fn name would turn a rename refactor into an orphaned cursor. e.g. `#[reactor(name = "job.enrich")]`
+  --> tests/ui/reactor_fn_missing_name.rs:19:14
+   |
+19 |     async fn enrich(t: &JobOpened, _ctx: Ctx<'_>) -> Result<Events> {
+   |              ^^^^^^
+
+warning: unused import: `anyhow::Result`
+ --> tests/ui/reactor_fn_missing_name.rs:4:5
+  |
+4 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `causal::contexts::Ctx`
+ --> tests/ui/reactor_fn_missing_name.rs:5:5
+  |
+5 | use causal::contexts::Ctx;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `causal::reactor::Events`
+ --> tests/ui/reactor_fn_missing_name.rs:6:5
+  |
+6 | use causal::reactor::Events;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^

@@ -316,6 +316,11 @@ struct Core<R: Reactor> {
     /// it (those are tokio time).
     clock: Arc<dyn Clock>,
 
+    /// `Reactor::MAX_IN_FLIGHT` enforcement: workers acquire a permit
+    /// around each executing attempt (not around backoff waits — a
+    /// sleeping retry holds no external resource). `None` = unbounded.
+    in_flight: Option<Arc<tokio::sync::Semaphore>>,
+
     dispatch: parking_lot::Mutex<DispatchState>,
     completions_tx: mpsc::UnboundedSender<Completion>,
     completions_rx: parking_lot::Mutex<mpsc::UnboundedReceiver<Completion>>,
@@ -352,6 +357,13 @@ where
                 snapshot_every: 0,
                 occ_categories: Arc::new(std::collections::HashSet::new()),
                 clock: Arc::new(crate::clock::SystemClock),
+                in_flight: (R::MAX_IN_FLIGHT != usize::MAX).then(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        // Semaphore's permit ceiling is below usize::MAX;
+                        // any practical cap fits.
+                        R::MAX_IN_FLIGHT.min(tokio::sync::Semaphore::MAX_PERMITS),
+                    ))
+                }),
                 dispatch: parking_lot::Mutex::new(DispatchState {
                     started: false,
                     ingest_pos: LogCursor::ZERO,
@@ -714,7 +726,22 @@ where
                 return None;
             }
             let labels = LabelSet::default();
+            // MAX_IN_FLIGHT permit spans the executing attempt only —
+            // released before any backoff sleep.
+            let permit = match self.in_flight.as_ref() {
+                Some(sem) => {
+                    tokio::select! {
+                        _ = self.stop_notify.notified() => return None,
+                        p = sem.clone().acquire_owned() => match p {
+                            Ok(p) => Some(p),
+                            Err(_) => return None, // semaphore closed = halt
+                        },
+                    }
+                }
+                None => None,
+            };
             let attempted = self.attempt_trigger(event, fold_cache, &labels).await;
+            drop(permit);
             used_effects.extend(
                 labels
                     .into_inner()

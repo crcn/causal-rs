@@ -1,0 +1,25 @@
+error: a `&RecordedEvent` projector must declare `kinds = ["..."]` — each entry is a settle-latency coupling (settle waits on projector cursors), so the subscription is written out, never inferred.
+  --> tests/ui/projector_recorded_event_needs_kinds.rs:13:23
+   |
+13 |     async fn audit(e: &RecordedEvent, _ctx: Ctx<'_>) -> Result<()> {
+   |                       ^^^^^^^^^^^^^^
+
+warning: unused import: `anyhow::Result`
+ --> tests/ui/projector_recorded_event_needs_kinds.rs:4:5
+  |
+4 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `causal::contexts::Ctx`
+ --> tests/ui/projector_recorded_event_needs_kinds.rs:5:5
+  |
+5 | use causal::contexts::Ctx;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `causal::types::RecordedEvent`
+ --> tests/ui/projector_recorded_event_needs_kinds.rs:6:5
+  |
+6 | use causal::types::RecordedEvent;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

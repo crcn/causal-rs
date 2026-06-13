@@ -110,6 +110,20 @@ pub trait Reactor: Send + Sync {
     /// — see [`Ordering`]. Defaults to [`Ordering::PerSubject`].
     const ORDERING: Ordering = Ordering::PerSubject;
 
+    /// Cap on concurrently executing reactions for this consumer —
+    /// the knob that protects a bounded external resource (an API's
+    /// concurrency limit, a GPU pool) from unbounded partition
+    /// fan-out. Default: unbounded (the partition key is the only
+    /// concurrency limit).
+    ///
+    /// The cap bounds *executing attempts*, not partitions: a worker
+    /// waiting out a retry backoff holds no slot (the external
+    /// resource isn't in use), so a wedged partition under a cap of 1
+    /// delays other partitions only while its attempt actually runs.
+    /// Like `ORDERING`, concurrency belongs in the same diff as the
+    /// body it governs.
+    const MAX_IN_FLIGHT: usize = usize::MAX;
+
     /// Decide on output facts in response to a trigger. Pure — no I/O
     /// to external systems beyond what's exposed via the trigger and
     /// `ctx`. Output type is heterogeneous (`Events`) to accommodate
