@@ -146,13 +146,14 @@ async fn engine_appends_to_kurrent_with_pg_checkpoint() -> Result<()> {
     };
     engine.emit(fact).await?;
 
-    // Verify the fact landed in Kurrent.
+    // Verify the fact landed in Kurrent — flat naming: placement is
+    // the fact's NAME ("placed"), so the stream is `placed-{order_id}`.
     let stream = kurrent_arc
-        .read_stream("order", order_id, None)
+        .read_stream("placed", order_id, None)
         .await?;
     assert_eq!(stream.len(), 1, "exactly the one fact we emitted");
-    assert_eq!(stream[0].event_type, "order");
-    assert_eq!(stream[0].category, "order");
+    assert_eq!(stream[0].event_type, "placed");
+    assert_eq!(stream[0].category, "placed");
     assert_eq!(stream[0].subject_id, order_id);
 
     engine.shutdown().await?;

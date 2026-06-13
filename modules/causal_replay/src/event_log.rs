@@ -341,11 +341,14 @@ mod pg {
             // ORDINALITY + ORDER BY pins insert order to batch order,
             // so positions ascend with revisions within the batch.
             let rows = sqlx::query(
+                // Storage keeps its native column name: the domain's
+                // `workflow_id` lands in `correlation_id` (0.10 step 1's
+                // boundary rule — vocabulary stops at EventLogBackend).
                 "INSERT INTO causal_log
-                    (event_id, causation_id, workflow_id, event_type,
+                    (event_id, causation_id, correlation_id, event_type,
                      payload, aggregate_type, aggregate_id, revision,
                      metadata, created_at, persistent)
-                 SELECT u.event_id, u.causation_id, u.workflow_id,
+                 SELECT u.event_id, u.causation_id, u.correlation_id,
                         u.event_type, u.payload, $1, $2, u.revision,
                         u.metadata, u.created_at, u.persistent
                    FROM UNNEST($3::uuid[], $4::uuid[], $5::uuid[],
@@ -353,7 +356,7 @@ mod pg {
                                $9::jsonb[], $10::timestamptz[],
                                $11::boolean[])
                         WITH ORDINALITY
-                        AS u(event_id, causation_id, workflow_id,
+                        AS u(event_id, causation_id, correlation_id,
                              event_type, payload, revision, metadata,
                              created_at, persistent, ord)
                   ORDER BY u.ord
@@ -481,7 +484,7 @@ mod pg {
             limit: usize,
         ) -> Result<Vec<RecordedEvent>> {
             let rows = sqlx::query(
-                "SELECT position, event_id, causation_id, workflow_id,
+                "SELECT position, event_id, causation_id, correlation_id,
                         event_type, payload, aggregate_type, aggregate_id,
                         revision, metadata, created_at, persistent
                    FROM causal_log
@@ -509,7 +512,7 @@ mod pg {
             // so `revision > -1` matches `revision >= 0`.
             let after_val: i64 = after.map(|r| r.raw() as i64).unwrap_or(-1);
             let rows = sqlx::query(
-                "SELECT position, event_id, causation_id, workflow_id,
+                "SELECT position, event_id, causation_id, correlation_id,
                         event_type, payload, aggregate_type, aggregate_id,
                         revision, metadata, created_at, persistent
                    FROM causal_log

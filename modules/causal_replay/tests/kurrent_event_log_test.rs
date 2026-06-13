@@ -104,12 +104,18 @@ async fn append_is_idempotent_for_duplicate_eventid_at_stream_head() -> Result<(
     let event_id = event.event_id;
 
     let first = causal::append_event(&backend, event.clone()).await?;
-    // Same event_id, different payload — Kurrent collapses the write.
-    event.payload = serde_json::json!({"this_should_not": "overwrite"});
-    let second = causal::append_event(&backend, event).await?;
-
+    // Byte-identical redelivery: collapses to the original write.
+    let second = causal::append_event(&backend, event.clone()).await?;
     assert_eq!(first.position, second.position,
                "duplicate event_id at stream head returns same position");
+
+    // DIVERGENT redelivery: rejected loudly (C1b — the 0.8 silent
+    // keep-the-old-row contract was replaced in the 0.10 audit).
+    event.payload = serde_json::json!({"this_should_not": "overwrite"});
+    let err = causal::append_event(&backend, event)
+        .await
+        .expect_err("divergent redelivery must be rejected");
+    assert!(format!("{err:#}").contains("divergent redelivery"), "{err:#}");
 
     // The first payload is the one that landed.
     let stream = backend.read_stream("telemetry", Uuid::nil(), None).await;
@@ -347,7 +353,7 @@ impl causal::Reactor for DoFetch {
     const NAME: &'static str = "do_fetch_reactor";
     async fn react(&self, t: &FetchRequested, ctx: causal::Ctx<'_>) -> Result<causal::Events> {
         let mut out = causal::Events::new();
-        out.push(Fetched { id: t.id, occurred_at: ctx.now() });
+        out.push(Fetched { id: t.id, occurred_at: ctx.time() });
         Ok(out)
     }
 }
@@ -375,12 +381,13 @@ async fn reactor_output_lands_in_its_own_stream_not_global() {
         .await
         .unwrap();
 
-    // The Fetched output must be in ITS OWN stream `fetched-{id}`, routed
-    // by the output Event's own (category, subject_id) — not `_global`.
-    let out = kurrent.read_stream("fetched", id, None).await.unwrap();
-    assert_eq!(out.len(), 1, "exactly one Fetched in fetched-{id}");
+    // The Fetched output must be in ITS OWN stream `done-{id}` (flat
+    // naming: placement = the fact's NAME unless SUBJECT overrides),
+    // routed by the output Event's own declarations — not `_global`.
+    let out = kurrent.read_stream("done", id, None).await.unwrap();
+    assert_eq!(out.len(), 1, "exactly one Fetched in done-{id}");
     assert_eq!(out[0].event_type, "done");
-    assert_eq!(out[0].category, "fetched");
+    assert_eq!(out[0].category, "done");
     assert_eq!(out[0].subject_id, id);
     assert!(out[0].causation_id.is_some(), "output carries the trigger as causation");
 

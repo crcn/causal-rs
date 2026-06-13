@@ -106,3 +106,35 @@ async fn concurrent_appends_are_tailable_without_loss() -> Result<()> {
 async fn concurrent_any_appends_all_succeed() -> Result<()> {
     conformance::concurrent_any_appends_all_succeed(&b()).await
 }
+
+// ── Checkpoint / reactor-cursor conformance (release gate) ──────────
+
+#[tokio::test]
+async fn checkpoint_unknown_consumer_is_none() -> Result<()> {
+    conformance::checkpoint_unknown_consumer_is_none(&b()).await
+}
+
+#[tokio::test]
+async fn checkpoint_set_then_get_round_trips() -> Result<()> {
+    conformance::checkpoint_set_then_get_round_trips(&b()).await
+}
+
+#[tokio::test]
+async fn checkpoint_consumers_are_isolated() -> Result<()> {
+    conformance::checkpoint_consumers_are_isolated(&b()).await
+}
+
+#[tokio::test]
+async fn reactor_attempts_count_monotonically() -> Result<()> {
+    conformance::reactor_attempts_count_monotonically(&b()).await
+}
+
+#[tokio::test]
+async fn reactor_attempts_are_isolated() -> Result<()> {
+    conformance::reactor_attempts_are_isolated(&b()).await
+}
+
+#[tokio::test]
+async fn reactor_attempts_clear_resets() -> Result<()> {
+    conformance::reactor_attempts_clear_resets(&b()).await
+}

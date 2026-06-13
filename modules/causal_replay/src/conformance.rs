@@ -44,6 +44,7 @@ use anyhow::Result;
 use chrono::Utc;
 use uuid::Uuid;
 
+use causal::checkpoint_store::{CheckpointStore, ReactorCheckpoint};
 use causal::types::{EventData, LogCursor, StreamRevision, StreamState};
 use causal::EventLogBackend;
 
@@ -1143,6 +1144,89 @@ async fn find_event_in_log<B: EventLogBackend>(
 /// test file lists scenarios as `#[tokio::test]` fns by name) but
 /// kept for future plumbing — e.g., a single `run_all_against(b)`
 /// helper for ad-hoc smoke tests.
+// ─────────────────────────────────────────────────────────────────────
+// Checkpoint / reactor-cursor conformance (release gate)
+// ─────────────────────────────────────────────────────────────────────
+//
+// The partitioned runner's ack-floor checkpoint and the BLOCKING-2
+// retry budget both live on these traits — a backend that drifts here
+// silently re-runs or skips work. The contract is WITHIN one store
+// instance: cross-restart attempt persistence is deliberately NOT
+// required (PgReactorCheckpoint documents in-memory counters; a
+// restart re-earns the budget, which is loud-and-bounded).
+
+/// K1: an unknown consumer has no cursor — the engine seeds it.
+pub async fn checkpoint_unknown_consumer_is_none<C: CheckpointStore>(c: &C) -> Result<()> {
+    assert_eq!(c.get("conf.k1.never-seen").await?, None);
+    Ok(())
+}
+
+/// K2: set→get round-trips, and a later set overwrites (the ack-floor
+/// only ever moves forward, but the STORE contract is last-write-wins —
+/// the runner owns monotonicity).
+pub async fn checkpoint_set_then_get_round_trips<C: CheckpointStore>(c: &C) -> Result<()> {
+    let id = format!("conf.k2.{}", Uuid::new_v4());
+    c.set(&id, LogCursor::from_raw(7)).await?;
+    assert_eq!(c.get(&id).await?, Some(LogCursor::from_raw(7)));
+    c.set(&id, LogCursor::from_raw(42)).await?;
+    assert_eq!(c.get(&id).await?, Some(LogCursor::from_raw(42)), "last write wins");
+    Ok(())
+}
+
+/// K3: consumers are isolated — one consumer's floor never bleeds into
+/// another's.
+pub async fn checkpoint_consumers_are_isolated<C: CheckpointStore>(c: &C) -> Result<()> {
+    let a = format!("conf.k3a.{}", Uuid::new_v4());
+    let b = format!("conf.k3b.{}", Uuid::new_v4());
+    c.set(&a, LogCursor::from_raw(10)).await?;
+    c.set(&b, LogCursor::from_raw(20)).await?;
+    assert_eq!(c.get(&a).await?, Some(LogCursor::from_raw(10)));
+    assert_eq!(c.get(&b).await?, Some(LogCursor::from_raw(20)));
+    Ok(())
+}
+
+/// K4: attempt counters are a 1,2,3… sequence per (consumer, trigger) —
+/// the BLOCKING-2 domain budget counts on exactly this.
+pub async fn reactor_attempts_count_monotonically<C: ReactorCheckpoint>(c: &C) -> Result<()> {
+    let consumer = format!("conf.k4.{}", Uuid::new_v4());
+    let trigger = Uuid::new_v4();
+    assert_eq!(c.record_reactor_attempt(&consumer, trigger).await?, 1);
+    assert_eq!(c.record_reactor_attempt(&consumer, trigger).await?, 2);
+    assert_eq!(c.record_reactor_attempt(&consumer, trigger).await?, 3);
+    Ok(())
+}
+
+/// K5: attempt counters are isolated per consumer AND per trigger —
+/// one trigger's failures must not spend another's budget.
+pub async fn reactor_attempts_are_isolated<C: ReactorCheckpoint>(c: &C) -> Result<()> {
+    let consumer_a = format!("conf.k5a.{}", Uuid::new_v4());
+    let consumer_b = format!("conf.k5b.{}", Uuid::new_v4());
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    assert_eq!(c.record_reactor_attempt(&consumer_a, t1).await?, 1);
+    assert_eq!(c.record_reactor_attempt(&consumer_a, t1).await?, 2);
+    assert_eq!(c.record_reactor_attempt(&consumer_a, t2).await?, 1,
+               "a different trigger starts its own count");
+    assert_eq!(c.record_reactor_attempt(&consumer_b, t1).await?, 1,
+               "a different consumer starts its own count");
+    Ok(())
+}
+
+/// K6: clear resets the budget (a SUCCESS clears so a future failure
+/// starts fresh); clearing an unknown pair is a no-op, not an error
+/// (the park path clears unconditionally).
+pub async fn reactor_attempts_clear_resets<C: ReactorCheckpoint>(c: &C) -> Result<()> {
+    let consumer = format!("conf.k6.{}", Uuid::new_v4());
+    let trigger = Uuid::new_v4();
+    c.record_reactor_attempt(&consumer, trigger).await?;
+    c.record_reactor_attempt(&consumer, trigger).await?;
+    c.clear_reactor_attempts(&consumer, trigger).await?;
+    assert_eq!(c.record_reactor_attempt(&consumer, trigger).await?, 1,
+               "cleared budget starts fresh");
+    c.clear_reactor_attempts(&consumer, Uuid::new_v4()).await?; // unknown: fine
+    Ok(())
+}
+
 pub fn scenario_names() -> &'static [&'static str] {
     &[
         "append_is_idempotent_on_event_id",
@@ -1164,5 +1248,11 @@ pub fn scenario_names() -> &'static [&'static str] {
         "latest_position_reflects_committed_writes",
         "concurrent_appends_are_tailable_without_loss",
         "concurrent_any_appends_all_succeed",
+        "checkpoint_unknown_consumer_is_none",
+        "checkpoint_set_then_get_round_trips",
+        "checkpoint_consumers_are_isolated",
+        "reactor_attempts_count_monotonically",
+        "reactor_attempts_are_isolated",
+        "reactor_attempts_clear_resets",
     ]
 }

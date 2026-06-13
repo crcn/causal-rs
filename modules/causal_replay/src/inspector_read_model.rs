@@ -34,7 +34,7 @@ mod pg {
         }
     }
 
-    const EVENT_COLS: &str = "position, event_id, causation_id, workflow_id, event_type, \
+    const EVENT_COLS: &str = "position, event_id, causation_id, correlation_id, event_type, \
         payload, aggregate_type, aggregate_id, revision, metadata, created_at";
 
     /// Safety bound on workflow-scoped reads. A workflow is normally a
@@ -89,11 +89,11 @@ mod pg {
                   WHERE ($1::bigint IS NULL OR position < $1)
                     AND ($2::timestamptz IS NULL OR created_at >= $2)
                     AND ($3::timestamptz IS NULL OR created_at <= $3)
-                    AND ($4::uuid IS NULL OR workflow_id = $4)
+                    AND ($4::uuid IS NULL OR correlation_id = $4)
                     AND ($5::text IS NULL OR (aggregate_type || ':' || aggregate_id::text) = $5)
                     AND ($6::text IS NULL OR event_type ILIKE '%'||$6||'%'
                          OR payload::text ILIKE '%'||$6||'%'
-                         OR workflow_id::text ILIKE '%'||$6||'%')
+                         OR correlation_id::text ILIKE '%'||$6||'%')
                   ORDER BY position DESC
                   LIMIT $7"
             );
@@ -119,7 +119,7 @@ mod pg {
         async fn causal_tree(&self, seq: i64) -> Result<(Vec<StoredEvent>, i64)> {
             let sql = format!(
                 "SELECT {EVENT_COLS} FROM causal_log
-                  WHERE workflow_id = (SELECT workflow_id FROM causal_log WHERE position = $1)
+                  WHERE correlation_id = (SELECT correlation_id FROM causal_log WHERE position = $1)
                   ORDER BY position ASC
                   LIMIT {MAX_CORRELATION_ROWS}"
             );
@@ -136,7 +136,7 @@ mod pg {
         async fn causal_flow(&self, workflow_id: &str) -> Result<Vec<StoredEvent>> {
             let Some(cid) = parse_corr(workflow_id) else { return Ok(vec![]) };
             let sql = format!(
-                "SELECT {EVENT_COLS} FROM causal_log WHERE workflow_id = $1
+                "SELECT {EVENT_COLS} FROM causal_log WHERE correlation_id = $1
                   ORDER BY position ASC LIMIT {MAX_CORRELATION_ROWS}"
             );
             let rows = sqlx::query(&sql).bind(cid).fetch_all(&self.pool).await?;
@@ -192,7 +192,7 @@ mod pg {
             let sql = format!(
                 "SELECT event_id, reactor_id, level, message, data, logged_at
                    FROM causal_reactor_logs
-                  WHERE workflow_id = $1
+                  WHERE correlation_id = $1
                   ORDER BY logged_at ASC
                   LIMIT {MAX_CORRELATION_ROWS}"
             );
@@ -230,7 +230,7 @@ mod pg {
                         MAX(completed_at) AS completed_at,
                         array_agg(DISTINCT event_id::text) AS event_ids
                    FROM causal_reactor_executions
-                  WHERE workflow_id = $1
+                  WHERE correlation_id = $1
                   GROUP BY reactor_id",
             )
             .bind(cid)
@@ -263,10 +263,10 @@ mod pg {
             // completed_at and would render as a zero-duration attempt
             // (mirrors MemoryStore, which records history only on close).
             let sql = format!(
-                "SELECT event_id, reactor_id, workflow_id, attempt, status, error,
+                "SELECT event_id, reactor_id, correlation_id, attempt, status, error,
                         started_at, completed_at
                    FROM causal_reactor_executions
-                  WHERE workflow_id = $1 AND completed_at IS NOT NULL
+                  WHERE correlation_id = $1 AND completed_at IS NOT NULL
                   ORDER BY started_at ASC
                   LIMIT {MAX_CORRELATION_ROWS}"
             );
@@ -275,7 +275,7 @@ mod pg {
                 .map(|r| {
                     let completed: Option<DateTime<Utc>> = r.try_get("completed_at")?;
                     let started: DateTime<Utc> = r.try_get("started_at")?;
-                    let corr: Uuid = r.try_get("workflow_id")?;
+                    let corr: Uuid = r.try_get("correlation_id")?;
                     Ok(ReactorAttemptEntry {
                         event_id: r.try_get("event_id")?,
                         reactor_id: r.try_get("reactor_id")?,
@@ -300,7 +300,7 @@ mod pg {
                 "SELECT DISTINCT ON (d.reactor_id) d.reactor_id, d.description
                    FROM causal_reactor_descriptions d
                    JOIN causal_log l ON l.event_id = d.event_id
-                  WHERE d.workflow_id = $1
+                  WHERE d.correlation_id = $1
                   ORDER BY d.reactor_id, l.position DESC",
             )
             .bind(cid)
@@ -325,7 +325,7 @@ mod pg {
                 "SELECT l.position AS seq, d.event_id, d.reactor_id, d.description
                    FROM causal_reactor_descriptions d
                    JOIN causal_log l ON l.event_id = d.event_id
-                  WHERE d.workflow_id = $1
+                  WHERE d.correlation_id = $1
                   ORDER BY l.position ASC
                   LIMIT {MAX_CORRELATION_ROWS}"
             );
@@ -351,7 +351,7 @@ mod pg {
                 "SELECT l.position AS seq, s.event_id, l.event_type, s.aggregate_key, s.state
                    FROM causal_aggregate_snapshots s
                    JOIN causal_log l ON l.event_id = s.event_id
-                  WHERE s.workflow_id = $1
+                  WHERE s.correlation_id = $1
                   ORDER BY l.position ASC
                   LIMIT {MAX_CORRELATION_ROWS}"
             );
@@ -377,23 +377,23 @@ mod pg {
         ) -> Result<Vec<CorrelationSummaryEntry>> {
             let rows = sqlx::query(
                 "WITH summary AS (
-                    SELECT workflow_id,
+                    SELECT correlation_id,
                            COUNT(*) AS event_count,
                            MIN(created_at) AS first_ts,
                            MAX(created_at) AS last_ts,
                            (array_agg(event_type ORDER BY position) FILTER (WHERE causation_id IS NULL))[1] AS root_event_type
                       FROM causal_log
-                     WHERE workflow_id <> '00000000-0000-0000-0000-000000000000'
-                     GROUP BY workflow_id
+                     WHERE correlation_id <> '00000000-0000-0000-0000-000000000000'
+                     GROUP BY correlation_id
                  )
-                 SELECT s.workflow_id, s.event_count, s.first_ts, s.last_ts,
+                 SELECT s.correlation_id, s.event_count, s.first_ts, s.last_ts,
                         COALESCE(s.root_event_type, '') AS root_event_type,
                         EXISTS (SELECT 1 FROM causal_reactor_executions x
-                                 WHERE x.workflow_id = s.workflow_id
+                                 WHERE x.correlation_id = s.correlation_id
                                    AND x.status IN ('failed','dead_letter')) AS has_errors
                    FROM summary s
                   WHERE ($1::text IS NULL
-                         OR s.workflow_id::text ILIKE '%'||$1||'%'
+                         OR s.correlation_id::text ILIKE '%'||$1||'%'
                          OR COALESCE(s.root_event_type,'') ILIKE '%'||$1||'%')
                     AND ($2::timestamptz IS NULL OR s.last_ts < $2)
                   ORDER BY s.last_ts DESC
@@ -406,7 +406,7 @@ mod pg {
             .await?;
             rows.iter()
                 .map(|r| {
-                    let corr: Uuid = r.try_get("workflow_id")?;
+                    let corr: Uuid = r.try_get("correlation_id")?;
                     Ok(CorrelationSummaryEntry {
                         workflow_id: corr.to_string(),
                         event_count: r.try_get("event_count")?,
@@ -470,7 +470,7 @@ mod pg {
         ) -> Result<Vec<AggregateLifecycleEntry>> {
             let rows = sqlx::query(
                 "SELECT l.position AS seq, s.event_id, l.event_type, l.created_at AS ts,
-                        s.workflow_id, s.aggregate_key, s.state
+                        s.correlation_id, s.aggregate_key, s.state
                    FROM causal_aggregate_snapshots s
                    JOIN causal_log l ON l.event_id = s.event_id
                   WHERE s.aggregate_key = $1
@@ -483,7 +483,7 @@ mod pg {
             .await?;
             rows.iter()
                 .map(|r| {
-                    let corr: Uuid = r.try_get("workflow_id")?;
+                    let corr: Uuid = r.try_get("correlation_id")?;
                     Ok(AggregateLifecycleEntry {
                         seq: r.try_get("seq")?,
                         event_id: r.try_get("event_id")?,

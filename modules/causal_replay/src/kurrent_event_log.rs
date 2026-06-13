@@ -526,7 +526,7 @@ mod kurrent {
         // category + subject_id are recovered from the Kurrent stream name
         // `{category}-{subject_id}` (subject_id is a canonical 36-char UUID
         // at the end). No `_aggregateType` metadata needed.
-        let stream_name = rec.subject_id();
+        let stream_name = rec.stream_id(); // kurrentdb crate API — its vocabulary, not ours
         let subject_id = stream_name
             .get(stream_name.len().saturating_sub(36)..)
             .and_then(|s| Uuid::parse_str(s).ok())

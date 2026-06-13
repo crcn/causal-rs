@@ -93,7 +93,7 @@ struct ShipOnPlaced;
 #[async_trait::async_trait]
 impl Reactor for ShipOnPlaced {
     type Trigger = OrderPlaced;
-    const GROUP_NAME: &'static str = "ship_on_placed";
+    const NAME: &'static str = "ship_on_placed";
     async fn react(&self, t: &OrderPlaced, _ctx: Ctx<'_>) -> anyhow::Result<Events> {
         Ok(causal::events![ShipmentRequested { order_id: t.order_id }])
     }
@@ -126,18 +126,20 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // 6. Read the folded state back.
-    let order = engine.snapshot::<Order>(order_id).expect("order exists");
+    let order = engine.state_of::<Order>(order_id).await?.expect("order exists");
     assert_eq!(order.total, 99.99);
     assert!(order.shipped, "set by the reactor's downstream event");
     Ok(())
 }
 ```
 
-Inside a reactor or projector body you read live aggregate state with
-`ctx.aggregate_of::<Order>(id).curr` — so a decision can depend on the
-fold so far. The `#[event]`, `#[aggregator]`, and `#[aggregators]`
-macros (feature `macros`, on by default) generate the boilerplate
-above from an enum; the walkthrough hand-rolls it to show the full
+Inside a reactor or projector body you read aggregate state with
+`ctx.state_of::<Order>(id).await?.curr` — in a reactor this is a
+position-bounded fold of the subject's history at your trigger, so the
+answer is deterministic under any concurrency. The `#[event]`,
+`#[aggregators]`, `#[reactors]`, and `#[projectors]` macros (feature
+`macros`, on by default) generate the boilerplate above from struct +
+fn declarations; the walkthrough hand-rolls it to show the full
 surface.
 
 ## Runnable examples
@@ -249,7 +251,7 @@ let engine = EngineBuilder::new(
 | `StreamState` for OCC | `causal::types::StreamState` (same variants) |
 | ExpectedRevision | `StreamState::StreamRevision(u64)` |
 | Persistent subscription | `Reactor` (extends with atomic emit on top) |
-| Group name | `Reactor::GROUP_NAME` / `Projector::GROUP_NAME` |
+| Group name | `Reactor::NAME` / `Projector::NAME` (one consumer per name — no competing instances) |
 | `correlation_id` | `correlation_id` |
 | `causation_id` | `causation_id` |
 | `$correlationId` metadata | stamped automatically — feeds the `$by_correlation_id` projection (enable + configure `correlationIdProperty`) |

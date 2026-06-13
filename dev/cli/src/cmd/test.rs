@@ -71,6 +71,7 @@ fn pg(ctx: &AppContext) -> Result<()> {
             "test", "-p", "causal_replay", "--features", "postgres",
             "--test", "pg_event_log_test",
             "--test", "pg_event_log_conformance_test",
+            "--test", "pg_checkpoint_conformance_test",
             "--test", "pg_snapshot_store_test",
             "--", "--ignored",
         ],

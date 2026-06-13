@@ -101,16 +101,23 @@ async fn append_is_idempotent_on_event_id_c1() -> Result<()> {
 
     let first = causal::append_event(&backend, event.clone()).await?;
 
-    // Same event_id, different payload — second call should be a no-op.
-    event.payload = serde_json::json!({"this_should_not": "overwrite"});
-    let second = causal::append_event(&backend, event).await?;
-
+    // Byte-identical redelivery: dedups to the original write.
+    let second = causal::append_event(&backend, event.clone()).await?;
     assert_eq!(
         first.position, second.position,
         "duplicate event_id must return the same position"
     );
 
-    // Verify the original payload was preserved (no-op update).
+    // DIVERGENT redelivery: rejected loudly (C1b — the 0.8 silent
+    // keep-the-old-row contract was replaced in the 0.10 audit; a
+    // differing re-emission means a nondeterministic producer).
+    event.payload = serde_json::json!({"this_should_not": "overwrite"});
+    let err = causal::append_event(&backend, event)
+        .await
+        .expect_err("divergent redelivery must be rejected");
+    assert!(format!("{err:#}").contains("divergent redelivery"), "{err:#}");
+
+    // The original payload is untouched either way.
     let payload: serde_json::Value = sqlx::query_scalar(
         "SELECT payload FROM causal_log WHERE event_id = $1",
     )
@@ -120,7 +127,7 @@ async fn append_is_idempotent_on_event_id_c1() -> Result<()> {
     assert_eq!(
         payload,
         serde_json::json!({}),
-        "original payload must be preserved on duplicate-event_id append"
+        "original payload preserved; the divergent batch wrote nothing"
     );
 
     // Cleanup.
@@ -403,7 +410,7 @@ async fn latest_position_is_frozen_under_concurrent_appends() -> Result<()> {
         );
     }
 
-    sqlx::query("DELETE FROM causal_log WHERE workflow_id = $1")
+    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
         .bind(workflow)
         .execute(&pool)
         .await?;
@@ -455,7 +462,7 @@ async fn read_stream_partitions_by_aggregate() -> Result<()> {
         assert_eq!(e.revision, StreamRevision::from_raw(i as u64));
     }
 
-    sqlx::query("DELETE FROM causal_log WHERE workflow_id = $1")
+    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
         .bind(workflow)
         .execute(&pool)
         .await?;
@@ -478,7 +485,7 @@ async fn latest_position_reports_max() -> Result<()> {
         "latest_position must be >= the position we just wrote (other concurrent writers may push it higher)"
     );
 
-    sqlx::query("DELETE FROM causal_log WHERE workflow_id = $1")
+    sqlx::query("DELETE FROM causal_log WHERE correlation_id = $1")
         .bind(workflow)
         .execute(&pool)
         .await?;
