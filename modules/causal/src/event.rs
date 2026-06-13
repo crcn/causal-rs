@@ -29,7 +29,10 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// `event_type` and matched by consumers by EQUALITY. A wire
     /// format: pick it once, treat it like `Aggregate::NAME`.
     /// Renaming it orphans historical events from new consumers —
-    /// that's what the `vocab_check!` CI gate exists to catch.
+    /// guard renames in CI by round-tripping a fixture corpus of
+    /// historically appended payloads through your current
+    /// deserializers (a planned `vocab_check!` gate may ship this as
+    /// framework machinery; today the corpus and check are yours).
     const NAME: &'static str;
 
     /// The subject KIND whose history this fact joins — the storage
