@@ -56,7 +56,7 @@ ArticleSubmitted
 - **Convergence gates** — enrichment fires only when all three analyses are
   done; publish only when summary + categories are done. A singleton
   `PipelineState` aggregate tracks completion; each gate reads it via
-  `ctx.aggregate::<PipelineState>()` and emits only when ready (the convergent
+  `ctx.state_of::<PipelineState>(article_id)` and emits only when ready (the convergent
   event's deterministic id makes a duplicate a no-op).
 - **Retry / recovery** — plagiarism returns a transient `503` on the first
   attempt for some articles, then succeeds on retry — visible in the inspector's

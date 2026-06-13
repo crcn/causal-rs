@@ -14,7 +14,7 @@ Runnable causal-rs examples backed by KurrentDB.
 
 Every example follows the same three steps:
 
-1. **Define `Event`s.** Typed structs implementing `causal::Event` — one `CATEGORY` per logical stream, `stream_id` for routing.
+1. **Define `Event`s.** Typed structs implementing `causal::Event` — a flat `NAME` (the wire event_type, matched exactly) and `subject_id` for which thing the fact is about.
 2. **Define a `Reactor`.** A struct implementing `causal::Reactor` with `type Trigger = …` and `async fn react(…) -> Result<Events>`.
 3. **Build the engine.** `EngineBuilder::new(log, checkpoint, reactor_checkpoint)` casts three backend trait objects, `.with_reactor(R)` registers each consumer, `.build().await?` (async + fallible — it seeds reactor cursors) returns the live engine. `engine.emit(...).settled().await?` runs the full causal chain to quiescence.
 

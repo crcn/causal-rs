@@ -30,9 +30,9 @@ struct SummarizeRequested {
 }
 
 impl Event for SummarizeRequested {
-    const CATEGORY: &'static str = "summary_request";
-    fn event_type(&self) -> &str { "requested" }
-    fn stream_id(&self) -> Uuid { self.task_id }
+    // The fact's kind — flat, exact, matched by equality (0.10).
+    const NAME: &'static str = "summarize_requested";
+    fn subject_id(&self) -> Uuid { self.task_id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -45,9 +45,10 @@ struct Summarized {
 }
 
 impl Event for Summarized {
-    const CATEGORY: &'static str = "summary_result";
-    fn event_type(&self) -> &str { "summarized" }
-    fn stream_id(&self) -> Uuid { self.task_id }
+    const NAME: &'static str = "summarized";
+    // Co-locate both outcomes in one subject history per task.
+    const SUBJECT: &'static str = "summary_result";
+    fn subject_id(&self) -> Uuid { self.task_id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -59,9 +60,9 @@ struct SummaryFailed {
 }
 
 impl Event for SummaryFailed {
-    const CATEGORY: &'static str = "summary_result";
-    fn event_type(&self) -> &str { "failed" }
-    fn stream_id(&self) -> Uuid { self.task_id }
+    const NAME: &'static str = "summary_failed";
+    const SUBJECT: &'static str = "summary_result";
+    fn subject_id(&self) -> Uuid { self.task_id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -123,12 +124,21 @@ struct SummarizeReactor {
     api_key:     String,
 }
 
+/// The memoized outcome of one LLM call — `ctx.effect` stores it, so a
+/// crash-redelivery replays the SAME summary instead of paying for (and
+/// emitting) a different one.
+#[derive(Serialize, Deserialize)]
+enum SummaryOutcome {
+    Done { summary: String, tokens_used: u32 },
+    Failed { reason: String },
+}
+
 #[async_trait]
 impl Reactor for SummarizeReactor {
     type Trigger = SummarizeRequested;
-    const GROUP_NAME: &'static str = "summarize";
+    const NAME: &'static str = "summarize";
 
-    async fn react(&self, trigger: &SummarizeRequested, _ctx: Ctx<'_>) -> Result<Events> {
+    async fn react(&self, trigger: &SummarizeRequested, ctx: Ctx<'_>) -> Result<Events> {
         let request = AnthropicRequest {
             model:      "claude-sonnet-4-20250514".to_string(),
             max_tokens: 1024,
@@ -138,31 +148,48 @@ impl Reactor for SummarizeReactor {
             }],
         };
 
-        let occurred_at = Utc::now();
-        match call_anthropic(&self.http_client, &self.api_key, request).await {
-            Ok(response) => {
-                let summary = response
-                    .content
-                    .first()
-                    .and_then(|c| c.text.clone())
-                    .unwrap_or_default();
-                let tokens_used = response.usage.input_tokens + response.usage.output_tokens;
+        // The LLM call goes through the deterministic door: memoized
+        // under (consumer, trigger, label), it runs once per reaction
+        // no matter how many times the trigger redelivers.
+        let client = self.http_client.clone();
+        let api_key = self.api_key.clone();
+        let outcome: SummaryOutcome = ctx
+            .effect("summarize", || async move {
+                Ok(match call_anthropic(&client, &api_key, request).await {
+                    Ok(response) => {
+                        let summary = response
+                            .content
+                            .first()
+                            .and_then(|c| c.text.clone())
+                            .unwrap_or_default();
+                        let tokens_used =
+                            response.usage.input_tokens + response.usage.output_tokens;
+                        SummaryOutcome::Done { summary, tokens_used }
+                    }
+                    Err(e) => SummaryOutcome::Failed { reason: e.to_string() },
+                })
+            })
+            .await?;
+
+        // Timestamps come from the trigger (`ctx.time()`), never the
+        // wall clock — replay reproduces the payload byte-identically.
+        match outcome {
+            SummaryOutcome::Done { summary, tokens_used } => {
                 println!("summary ({} tokens): {}", tokens_used, summary);
-                Ok(Events::new().add(Summarized {
+                Ok(causal::events![Summarized {
                     task_id: trigger.task_id,
                     summary,
                     tokens_used,
-                    occurred_at,
-                }))
+                    occurred_at: ctx.time(),
+                }])
             }
-            Err(e) => {
-                let reason = e.to_string();
+            SummaryOutcome::Failed { reason } => {
                 eprintln!("summary failed: {reason}");
-                Ok(Events::new().add(SummaryFailed {
+                Ok(causal::events![SummaryFailed {
                     task_id: trigger.task_id,
                     reason,
-                    occurred_at,
-                }))
+                    occurred_at: ctx.time(),
+                }])
             }
         }
     }
@@ -203,8 +230,10 @@ async fn main() -> Result<()> {
         mem.clone() as Arc<dyn CheckpointStore>,
         mem as Arc<dyn ReactorCheckpoint>,
     )
+    .with_effect_store(Arc::new(causal::InMemoryEffectStore::new()))
     .with_reactor(SummarizeReactor { http_client, api_key })
-    .build();
+    .build()
+    .await?;
 
     let text = "Rust is a multi-paradigm, general-purpose programming language that emphasizes \
                 performance, type safety, and concurrency.";

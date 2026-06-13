@@ -60,22 +60,20 @@ use sqlx::postgres::PgPoolOptions;
 
 // ── Events ──────────────────────────────────────────────────────────
 //
-// Each event type is its own category (keyed by `article_id`). Distinct
-// categories let a single multi-event aggregate (`PipelineState`) fold all of
-// them — the aggregator registry keys on `(Aggregate::NAME, Event CATEGORY)`,
-// so one aggregator per category.
+// Each fact declares its kind (flat, exact — the wire event_type) and
+// which article it is about. A single multi-event aggregate
+// (`PipelineState`, keyed by article_id) folds all of them.
 
 macro_rules! pipeline_event {
-    ($name:ident, $category:literal, { $($field:ident : $ty:ty),* $(,)? }) => {
+    ($name:ident, $kind:literal, { $($field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct $name {
             article_id: Uuid,
             $($field: $ty),*
         }
         impl Event for $name {
-            const CATEGORY: &'static str = $category;
-            fn event_type(&self) -> &str { "v1" }
-            fn stream_id(&self) -> Uuid { self.article_id }
+            const NAME: &'static str = $kind;
+            fn subject_id(&self) -> Uuid { self.article_id }
         }
     };
 }
@@ -90,11 +88,12 @@ pipeline_event!(CategoriesTagged, "categories_tagged", { categories: Vec<String>
 pipeline_event!(ArticlePublished, "article_published", { slug: String });
 pipeline_event!(SubscribersNotified, "subscribers_notified", { count: u32 });
 
-// ── Singleton aggregate: pipeline phase tracking ────────────────────
+// ── Per-article aggregate: pipeline phase tracking ──────────────────
 //
-// One article is in flight at a time (the generator waits for `.settled()`),
-// so a global singleton keyed at `Uuid::nil()` is enough to track which
-// analyses / publishing steps have completed for the current article.
+// Keyed by article_id — each article folds its own phase state from its
+// own subject histories. (The pre-0.10 version used a nil-keyed global
+// singleton; that fan-in shape is exactly the lying default 0.10
+// removed, and it would have raced once articles overlapped.)
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PipelineState {
@@ -139,21 +138,21 @@ impl Apply<CategoriesTagged> for PipelineState {
     }
 }
 
-fn analyses_complete(ctx: &Ctx<'_>) -> bool {
-    let a = ctx.aggregate::<PipelineState>();
+// In a reactor, `ctx.state_of` is a fold of the article's histories
+// BOUNDED AT THE TRIGGER — deterministic under any concurrency. The
+// convergence gates below lean on exactly that: only the reactor whose
+// trigger IS the last-arriving analysis sees all-complete, so exactly
+// one emits (and the deterministic output id makes a redelivered
+// duplicate a no-op anyway).
+async fn analyses_complete(ctx: &Ctx<'_>, article_id: Uuid) -> Result<bool> {
+    let a = ctx.state_of::<PipelineState>(article_id).await?;
     let done = &a.curr.completed_analyses;
-    done.contains("metadata") && done.contains("sentiment") && done.contains("plagiarism")
+    Ok(done.contains("metadata") && done.contains("sentiment") && done.contains("plagiarism"))
 }
-fn publishing_complete(ctx: &Ctx<'_>) -> bool {
-    let p = ctx.aggregate::<PipelineState>();
+async fn publishing_complete(ctx: &Ctx<'_>, article_id: Uuid) -> Result<bool> {
+    let p = ctx.state_of::<PipelineState>(article_id).await?;
     let done = &p.curr.completed_publishing;
-    done.contains("summary") && done.contains("categories")
-}
-
-/// Singleton id-fn: every event folds into one `PipelineState` at `Uuid::nil()`.
-/// A generic fn (not a closure) so it can be reused across event types.
-fn nil_id<F>(_: &F) -> Option<Uuid> {
-    Some(Uuid::nil())
+    Ok(done.contains("summary") && done.contains("categories"))
 }
 
 // ── Reactors ────────────────────────────────────────────────────────
@@ -164,7 +163,7 @@ struct ExtractMetadata;
 #[async_trait]
 impl Reactor for ExtractMetadata {
     type Trigger = ArticleSubmitted;
-    const GROUP_NAME: &'static str = "extract_metadata";
+    const NAME: &'static str = "extract_metadata";
     async fn react(&self, t: &ArticleSubmitted, ctx: Ctx<'_>) -> Result<Events> {
         ctx.log(LogLevel::Info, "Extracting metadata");
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -187,7 +186,7 @@ struct AnalyzeSentiment;
 #[async_trait]
 impl Reactor for AnalyzeSentiment {
     type Trigger = ArticleSubmitted;
-    const GROUP_NAME: &'static str = "analyze_sentiment";
+    const NAME: &'static str = "analyze_sentiment";
     async fn react(&self, t: &ArticleSubmitted, ctx: Ctx<'_>) -> Result<Events> {
         ctx.log(LogLevel::Info, "Analyzing sentiment");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -209,7 +208,7 @@ struct CheckPlagiarism {
 #[async_trait]
 impl Reactor for CheckPlagiarism {
     type Trigger = ArticleSubmitted;
-    const GROUP_NAME: &'static str = "check_plagiarism";
+    const NAME: &'static str = "check_plagiarism";
     async fn react(&self, t: &ArticleSubmitted, ctx: Ctx<'_>) -> Result<Events> {
         ctx.log(LogLevel::Info, "Checking plagiarism");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -219,12 +218,15 @@ impl Reactor for CheckPlagiarism {
             let first_time = self.failed_once.lock().unwrap().insert(t.article_id);
             if first_time {
                 ctx.log(LogLevel::Warn, "[simulated] plagiarism API 503 — retrying");
-                // Deliberate first-attempt failure to demonstrate the inspector's
-                // retry / outcome panes; the next attempt succeeds.
-                anyhow::bail!(
+                // Deliberate first-attempt failure to demonstrate the
+                // inspector's retry / outcome panes; the next attempt
+                // succeeds. A 503 is TRANSIENT — declared, so the
+                // runner waits it out instead of spending the bounded
+                // domain budget (0.10 retry taxonomy).
+                return Err(causal::transient(anyhow::anyhow!(
                     "[simulated] plagiarism 503 for article {} (demo retry — succeeds next attempt)",
                     &t.article_id.to_string()[..8]
-                );
+                )));
             }
         }
 
@@ -246,12 +248,12 @@ impl Reactor for CheckPlagiarism {
 // analysis event type; only the last-arriving one sees all-complete and emits.
 // `ArticleEnriched`'s deterministic id makes a duplicate a no-op (dedup on append).
 
-fn enrich(t_article_id: Uuid, ctx: &Ctx<'_>) -> Events {
-    if analyses_complete(ctx) {
+async fn enrich(t_article_id: Uuid, ctx: &Ctx<'_>) -> Result<Events> {
+    if analyses_complete(ctx, t_article_id).await? {
         ctx.log(LogLevel::Info, "All analyses complete — enriching article");
-        Events::new().add(ArticleEnriched { article_id: t_article_id })
+        Ok(Events::new().add(ArticleEnriched { article_id: t_article_id }))
     } else {
-        Events::new()
+        Ok(Events::new())
     }
 }
 
@@ -259,27 +261,27 @@ struct EnrichOnMetadata;
 #[async_trait]
 impl Reactor for EnrichOnMetadata {
     type Trigger = MetadataExtracted;
-    const GROUP_NAME: &'static str = "enrich_article:on_metadata";
+    const NAME: &'static str = "enrich_article:on_metadata";
     async fn react(&self, t: &MetadataExtracted, ctx: Ctx<'_>) -> Result<Events> {
-        Ok(enrich(t.article_id, &ctx))
+        enrich(t.article_id, &ctx).await
     }
 }
 struct EnrichOnSentiment;
 #[async_trait]
 impl Reactor for EnrichOnSentiment {
     type Trigger = SentimentAnalyzed;
-    const GROUP_NAME: &'static str = "enrich_article:on_sentiment";
+    const NAME: &'static str = "enrich_article:on_sentiment";
     async fn react(&self, t: &SentimentAnalyzed, ctx: Ctx<'_>) -> Result<Events> {
-        Ok(enrich(t.article_id, &ctx))
+        enrich(t.article_id, &ctx).await
     }
 }
 struct EnrichOnPlagiarism;
 #[async_trait]
 impl Reactor for EnrichOnPlagiarism {
     type Trigger = PlagiarismChecked;
-    const GROUP_NAME: &'static str = "enrich_article:on_plagiarism";
+    const NAME: &'static str = "enrich_article:on_plagiarism";
     async fn react(&self, t: &PlagiarismChecked, ctx: Ctx<'_>) -> Result<Events> {
-        Ok(enrich(t.article_id, &ctx))
+        enrich(t.article_id, &ctx).await
     }
 }
 
@@ -289,7 +291,7 @@ struct GenerateSummary;
 #[async_trait]
 impl Reactor for GenerateSummary {
     type Trigger = ArticleEnriched;
-    const GROUP_NAME: &'static str = "generate_summary";
+    const NAME: &'static str = "generate_summary";
     async fn react(&self, t: &ArticleEnriched, ctx: Ctx<'_>) -> Result<Events> {
         ctx.log(LogLevel::Info, "Generating summary");
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -306,7 +308,7 @@ struct TagCategories;
 #[async_trait]
 impl Reactor for TagCategories {
     type Trigger = ArticleEnriched;
-    const GROUP_NAME: &'static str = "tag_categories";
+    const NAME: &'static str = "tag_categories";
     async fn react(&self, t: &ArticleEnriched, ctx: Ctx<'_>) -> Result<Events> {
         ctx.log(LogLevel::Info, "Tagging categories");
         tokio::time::sleep(Duration::from_millis(90)).await;
@@ -319,13 +321,13 @@ impl Reactor for TagCategories {
 
 // Convergence gate: publish once summary + categories are both done.
 
-fn publish(article_id: Uuid, ctx: &Ctx<'_>) -> Events {
-    if publishing_complete(ctx) {
+async fn publish(article_id: Uuid, ctx: &Ctx<'_>) -> Result<Events> {
+    if publishing_complete(ctx, article_id).await? {
         let slug = format!("article-{}", &article_id.to_string()[..8]);
         ctx.log_with_data(LogLevel::Info, "Publishing article", Some(json!({ "slug": slug })));
-        Events::new().add(ArticlePublished { article_id, slug })
+        Ok(Events::new().add(ArticlePublished { article_id, slug }))
     } else {
-        Events::new()
+        Ok(Events::new())
     }
 }
 
@@ -333,18 +335,18 @@ struct PublishOnSummary;
 #[async_trait]
 impl Reactor for PublishOnSummary {
     type Trigger = SummaryGenerated;
-    const GROUP_NAME: &'static str = "publish_article:on_summary";
+    const NAME: &'static str = "publish_article:on_summary";
     async fn react(&self, t: &SummaryGenerated, ctx: Ctx<'_>) -> Result<Events> {
-        Ok(publish(t.article_id, &ctx))
+        publish(t.article_id, &ctx).await
     }
 }
 struct PublishOnCategories;
 #[async_trait]
 impl Reactor for PublishOnCategories {
     type Trigger = CategoriesTagged;
-    const GROUP_NAME: &'static str = "publish_article:on_categories";
+    const NAME: &'static str = "publish_article:on_categories";
     async fn react(&self, t: &CategoriesTagged, ctx: Ctx<'_>) -> Result<Events> {
-        Ok(publish(t.article_id, &ctx))
+        publish(t.article_id, &ctx).await
     }
 }
 
@@ -354,7 +356,7 @@ struct NotifySubscribers;
 #[async_trait]
 impl Reactor for NotifySubscribers {
     type Trigger = ArticlePublished;
-    const GROUP_NAME: &'static str = "notify_subscribers";
+    const NAME: &'static str = "notify_subscribers";
     async fn react(&self, t: &ArticlePublished, ctx: Ctx<'_>) -> Result<Events> {
         ctx.log(LogLevel::Info, "Notifying subscribers");
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -367,9 +369,9 @@ impl Reactor for NotifySubscribers {
 #[derive(Clone)]
 struct DemoEventDisplay;
 
-/// The category portion of `{category}:{event_type}` — our event name.
+/// Event kinds are flat since 0.10 — the wire `event_type` IS the name.
 fn slug(event_type: &str) -> &str {
-    event_type.split(':').next().unwrap_or(event_type)
+    event_type
 }
 
 impl EventDisplay for DemoEventDisplay {
@@ -496,7 +498,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Build the engine: singleton phase-tracking aggregate + the reactor pipeline.
+    // Build the engine: per-article phase-tracking aggregate + the reactor pipeline.
     let engine = EngineBuilder::new(
         log.clone(),
         checkpoint.clone() as Arc<dyn CheckpointStore>,
@@ -504,12 +506,12 @@ async fn main() -> Result<()> {
     )
     .with_observer(observer)
     .with_aggregators(vec![
-        Aggregator::for_type_with_id_fn::<PipelineState, MetadataExtracted, _>(nil_id),
-        Aggregator::for_type_with_id_fn::<PipelineState, SentimentAnalyzed, _>(nil_id),
-        Aggregator::for_type_with_id_fn::<PipelineState, PlagiarismChecked, _>(nil_id),
-        Aggregator::for_type_with_id_fn::<PipelineState, ArticleEnriched, _>(nil_id),
-        Aggregator::for_type_with_id_fn::<PipelineState, SummaryGenerated, _>(nil_id),
-        Aggregator::for_type_with_id_fn::<PipelineState, CategoriesTagged, _>(nil_id),
+        Aggregator::for_type::<PipelineState, MetadataExtracted>(),
+        Aggregator::for_type::<PipelineState, SentimentAnalyzed>(),
+        Aggregator::for_type::<PipelineState, PlagiarismChecked>(),
+        Aggregator::for_type::<PipelineState, ArticleEnriched>(),
+        Aggregator::for_type::<PipelineState, SummaryGenerated>(),
+        Aggregator::for_type::<PipelineState, CategoriesTagged>(),
     ])
     .with_reactor(ExtractMetadata)
     .with_reactor(AnalyzeSentiment)
@@ -522,7 +524,8 @@ async fn main() -> Result<()> {
     .with_reactor(PublishOnSummary)
     .with_reactor(PublishOnCategories)
     .with_reactor(NotifySubscribers)
-    .build();
+    .build()
+    .await?;
 
     // Inspector router (GraphQL + WS) + the bundled UI under /causal.
     let inspector = router(
