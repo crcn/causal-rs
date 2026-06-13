@@ -6,6 +6,19 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-12
+
+The "No Lying Defaults" release: every framework default that could
+silently corrupt state was found in the rootsignal archaeology and
+removed. Built in seven sequenced steps (see
+`docs/plans/2026-06-12-design-0.10-no-lying-defaults.md`); each step's
+detail is below. Headline changes: stream identity and workflow roots
+are declared on the fact; reactors run concurrently across declared
+partitions with an honest per-workflow `settle`; failure follows a
+retry taxonomy with a mandatory terminal path; `react()` sees only a
+deterministic `Ctx`. Breaking throughout — there is no 0.9 release; 0.8
+consumers migrate via the notes in each step.
+
 ### 0.10 step 6 — consumers are functions (2026-06-12)
 
 Primitive 7: the `#[reactor]` macro deleted in the 2026-06-10 audit,
