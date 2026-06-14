@@ -232,6 +232,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 },
                 logs:           None,
                 effect_store: None,
+                cancelled_workflows: None,
             };
             match self.projector.project(&event, ctx).await {
                 Ok(()) => {

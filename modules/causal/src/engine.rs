@@ -231,6 +231,23 @@ impl SettleTracker {
 /// engine into each reactor runner.
 pub(crate) type WorkflowHighWater = Arc<std::sync::Mutex<SettleTracker>>;
 
+/// Shared cancel fence: workflow_ids for which new triggers must be
+/// acked without dispatch. Set by [`Engine::cancel_workflow`]; checked
+/// by every [`ReactorRunner`](crate::reactor_runner::ReactorRunner) at
+/// dispatch time and inside reactor bodies via
+/// [`Ctx::is_workflow_cancelled`](crate::contexts::Ctx::is_workflow_cancelled).
+pub(crate) type CancelledWorkflows =
+    Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>;
+
+/// `event_type` of the durable cancel marker appended to the control
+/// stream by [`Engine::cancel_workflow`]. Recognised inline by every
+/// reactor runner's ingestion loop to rebuild the fence on catch-up.
+pub(crate) const WORKFLOW_CANCELLED_KIND: &str = "causal:workflow_cancelled";
+
+/// Subject and subject_id of the global control stream where cancel
+/// markers are persisted (one stream, nil id, infinite retention needed).
+pub(crate) const CONTROL_STREAM_SUBJECT: &str = "causal:control";
+
 /// Metadata about a reactor that has exhausted its retry budget,
 /// passed to the [`EngineBuilder::on_terminal_failure`] mapper. The mapper
 /// decides whether to synthesize a terminal-failure Event and append
@@ -456,6 +473,7 @@ pub(crate) struct ConsumerWiring {
     pub snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
     pub snapshot_every: u64,
     pub clock: Arc<dyn crate::clock::Clock>,
+    pub cancelled_workflows: CancelledWorkflows,
 }
 
 /// Constructs an `Arc<dyn Supervisable>` runner at `build()` time,
@@ -517,6 +535,12 @@ pub struct EngineBuilder {
     /// it; defaults to the system clock. Liveness decisions never use
     /// it (Primitive 6's two-clock rule).
     clock:                 Arc<dyn crate::clock::Clock>,
+    /// Shared cancel fence (see [`Engine::cancel_workflow`]).
+    cancelled_workflows:   CancelledWorkflows,
+    /// `true` when the caller explicitly called [`with_effect_store`](Self::with_effect_store).
+    /// Used to emit a production durability warning at build time when
+    /// reactors are registered but only the in-memory default is wired.
+    explicit_effect_store: bool,
 }
 
 impl EngineBuilder {
@@ -542,12 +566,16 @@ impl EngineBuilder {
             failure_mapper: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             observer: None,
-            effect_store: None,
+            effect_store: Some(Arc::new(crate::effect_store::InMemoryEffectStore::new())),
+            explicit_effect_store: false,
             workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
             reactor_seeds: Vec::new(),
             clock: Arc::new(crate::clock::SystemClock),
+            cancelled_workflows: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -563,20 +591,19 @@ impl EngineBuilder {
         self
     }
 
-    /// Register a [`EffectStore`](crate::effect_store::EffectStore)
-    /// surfaced to reactor bodies via `ctx.effect_store()`. Lets a
-    /// side-effecting reactor memoize its external call under its
-    /// [`EffectKey`](crate::effect_store::EffectKey) so retry /
-    /// redelivery runs the call effectively once.
+    /// Override the default [`InMemoryEffectStore`](crate::effect_store::InMemoryEffectStore)
+    /// with a durable backend. The in-memory default handles retries within a
+    /// single process lifetime; cross-restart durability (surviving redeploys,
+    /// crashes) requires a persistent store such as a Postgres-backed impl.
     ///
-    /// Ordering: like [`with_observer`](Self::with_observer), this is
-    /// plumbed into reactors registered *after* this call. Set it before
-    /// `with_reactor(...)`.
+    /// Call this in production. Tests that don't call it get the in-memory
+    /// default, which is correct for single-process test runs.
     pub fn with_effect_store(
         mut self,
         cache: Arc<dyn crate::effect_store::EffectStore>,
     ) -> Self {
         self.effect_store = Some(cache);
+        self.explicit_effect_store = true;
         self
     }
 
@@ -814,6 +841,7 @@ impl EngineBuilder {
             runner = runner.with_settle_tracker(w.workflow_hw);
             runner = runner.with_snapshot_persistence(w.snapshot_store, w.snapshot_every);
             runner = runner.with_occ_categories(w.occ);
+            runner = runner.with_cancelled_workflows(w.cancelled_workflows);
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -910,6 +938,17 @@ impl EngineBuilder {
     /// `LogCursor::ZERO` and want full history. The defaults differ on
     /// purpose — side effects must not replay; read models must.
     pub async fn build(self) -> Result<Engine> {
+        // Warn when reactors are wired but no durable EffectStore was configured.
+        // InMemoryEffectStore survives retries within one process lifetime but is
+        // lost on restart — the next redelivery re-runs every ctx.effect() call.
+        if !self.reactor_seeds.is_empty() && !self.explicit_effect_store {
+            tracing::warn!(
+                "EffectStore not configured — using InMemoryEffectStore. \
+                 Side effects will re-execute across process restarts. \
+                 Call with_effect_store() with a durable backend before deploying to production.",
+            );
+        }
+
         // Reject categories that can't participate in the
         // `{category}:{name}` format before anything runs — a colon in a
         // category silently desyncs reactor matching from aggregate
@@ -938,6 +977,28 @@ impl EngineBuilder {
             };
             if let Some(pos) = seed {
                 self.reactor_checkpoint.set(group, pos).await?;
+            }
+        }
+
+        // Rebuild cancel fence from the control stream so it survives restart.
+        // Errors (stream absent, storage blip) are benign — fence starts empty.
+        {
+            let mut fence = self.cancelled_workflows.lock().unwrap();
+            if let Ok(markers) = self.log.read_stream(
+                CONTROL_STREAM_SUBJECT,
+                Uuid::from_bytes([0; 16]),
+                None,
+            ).await {
+                for event in markers {
+                    if event.event_type == WORKFLOW_CANCELLED_KIND {
+                        if let Some(target) = event.payload.get("target")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<Uuid>().ok())
+                        {
+                            fence.insert(target);
+                        }
+                    }
+                }
             }
         }
 
@@ -974,6 +1035,7 @@ impl EngineBuilder {
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_every: self.snapshot_every,
                     clock: self.clock.clone(),
+                    cancelled_workflows: self.cancelled_workflows.clone(),
                 })
             })
             .collect();
@@ -989,6 +1051,7 @@ impl EngineBuilder {
             self.snapshot_store,
             self.snapshot_every,
             self.clock,
+            self.cancelled_workflows,
         ))
     }
 }
@@ -1030,6 +1093,9 @@ pub struct Engine {
     snapshot_every:        u64,
     /// Calendar clock for emit-path stamping (see `EngineBuilder::with_clock`).
     clock:                 Arc<dyn crate::clock::Clock>,
+    /// Cancel fence shared with every reactor runner (see
+    /// [`Engine::cancel_workflow`]).
+    cancelled_workflows:   CancelledWorkflows,
 }
 
 impl Engine {
@@ -1046,6 +1112,7 @@ impl Engine {
         snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
         snapshot_every: u64,
         clock: Arc<dyn crate::clock::Clock>,
+        cancelled_workflows: CancelledWorkflows,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len());
@@ -1071,6 +1138,7 @@ impl Engine {
             snapshot_store,
             snapshot_every,
             clock,
+            cancelled_workflows,
         }
     }
 
@@ -1115,6 +1183,52 @@ impl Engine {
             causation_id: None,
             metadata: Metadata::new(),
         }
+    }
+
+    /// Cancel a workflow: prevent any queued trigger for `workflow_id`
+    /// from reaching a reactor body, and let
+    /// [`Ctx::is_workflow_cancelled`] return `true` for in-flight
+    /// triggers that were dispatched before this call.
+    ///
+    /// # What this does
+    ///
+    /// 1. Appends a `causal:workflow_cancelled` marker to the
+    ///    `causal:control` stream — durable across restarts (the runner's
+    ///    ingestion loop re-processes it and the builder reads the stream
+    ///    on startup).
+    /// 2. Immediately sets the in-memory cancel fence shared with every
+    ///    reactor runner (does NOT wait for the ingestion loop to catch up).
+    ///
+    /// Triggers already past the dispatch gate (worker sleeping in
+    /// backoff, or executing `react()`) are NOT aborted — the reactor
+    /// body should call `ctx.is_workflow_cancelled()` and return early.
+    /// See the cancellation docs for the full taxonomy of guarantees.
+    ///
+    /// Idempotent: cancelling an already-cancelled or already-drained
+    /// workflow is a no-op at the runner level.
+    pub async fn cancel_workflow(&self, workflow_id: Uuid) -> Result<()> {
+        use crate::types::StreamState;
+        // Durable marker — must succeed before we set the in-memory
+        // fence, so a write failure never leaves a ghost fence.
+        let nil = Uuid::from_bytes([0; 16]);
+        let event = crate::types::EventData {
+            event_id:     Uuid::new_v4(),
+            causation_id: None,
+            workflow_id:  nil,
+            event_type:   WORKFLOW_CANCELLED_KIND.to_string(),
+            payload:      serde_json::json!({ "target": workflow_id }),
+            created_at:   self.clock.now(),
+            category:     Some(CONTROL_STREAM_SUBJECT.to_string()),
+            subject_id:   Some(nil),
+            metadata:     crate::contexts::Metadata::new(),
+            ephemeral:    None,
+            persistent:   true,
+        };
+        self.log
+            .append_to_stream(CONTROL_STREAM_SUBJECT, nil, StreamState::Any, vec![event])
+            .await?;
+        self.cancelled_workflows.lock().unwrap().insert(workflow_id);
+        Ok(())
     }
 
     /// Hydrate an aggregate by folding its full stream from the log.
@@ -3143,6 +3257,66 @@ mod tests {
             1,
             "external call ran once despite the retry — EffectStore deduped it",
         );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn effect_runs_without_explicit_store_configuration() {
+        // Gap 1: ctx.effect() must work when no with_effect_store() is called.
+        // Before the fix this panics; after it uses the InMemory default.
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Go { id: Uuid, occurred_at: DateTime<Utc> }
+        impl Event for Go {
+            const NAME: &'static str = "effect_default_go";
+            fn subject_id(&self) -> Uuid { self.id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Done { id: Uuid, value: i64, occurred_at: DateTime<Utc> }
+        impl Event for Done {
+            const NAME: &'static str = "effect_default_done";
+            fn subject_id(&self) -> Uuid { self.id }
+            fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+        }
+
+        struct EffectReactor { calls: Arc<AtomicU32> }
+        #[async_trait::async_trait]
+        impl Reactor for EffectReactor {
+            type Trigger = Go;
+            const NAME: &'static str = "effect_default_reactor";
+            async fn react(&self, trigger: &Go, ctx: Ctx<'_>) -> anyhow::Result<Events> {
+                let calls = self.calls.clone();
+                let value: i64 = ctx.effect("work", || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(7)
+                }).await?;
+                let mut out = Events::new();
+                out.push(Done { id: trigger.id, value, occurred_at: ctx.time() });
+                Ok(out)
+            }
+        }
+
+        let store = store();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        // Intentionally no .with_effect_store() — the default must cover this.
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_reactor(EffectReactor { calls: calls.clone() })
+        .build().await.unwrap();
+
+        engine
+            .emit(Go { id: Uuid::new_v4(), occurred_at: Utc::now() })
+            .settled()
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "effect ran exactly once");
         engine.shutdown().await.unwrap();
     }
 

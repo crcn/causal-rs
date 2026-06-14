@@ -361,6 +361,7 @@ mod tests {
             state:    crate::contexts::StateSource::None,
             logs:           None,
             effect_store: None,
+            cancelled_workflows: None,
         };
 
         let events = r.react(&trigger, ctx).await.unwrap();

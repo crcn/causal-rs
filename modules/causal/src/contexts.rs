@@ -69,7 +69,11 @@ const NS_DERIVED_ID: Uuid = Uuid::from_bytes([
 /// duplicate detection. The runner owns one per attempt; duplicate
 /// labels silently yielding the same id/result would be a silent-
 /// correctness bug, so reuse is a runtime error (domain class).
-pub(crate) type LabelSet = Mutex<std::collections::HashSet<(&'static str, String)>>;
+///
+/// Ordered Vec (not HashSet): insertion order is preserved so the
+/// reactor runner can compare effect label sequences across retry
+/// attempts to detect control-flow divergence.
+pub(crate) type LabelSet = Mutex<Vec<(&'static str, String)>>;
 
 /// Where `ctx.state_of` reads aggregate state from.
 ///
@@ -147,6 +151,10 @@ pub struct Ctx<'a> {
     /// the engine was built with `EngineBuilder::with_effect_store`.
     pub(crate) effect_store:
         Option<&'a Arc<dyn crate::effect_store::EffectStore>>,
+    /// Shared cancel fence from the engine. `Some` inside reactor bodies;
+    /// `None` in projector bodies and hand-constructed Ctx values.
+    pub(crate) cancelled_workflows:
+        Option<&'a crate::engine::CancelledWorkflows>,
 }
 
 impl<'a> std::fmt::Debug for Ctx<'a> {
@@ -171,6 +179,30 @@ impl<'a> std::fmt::Debug for Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
+    /// True if the engine's cancel fence contains this trigger's
+    /// `workflow_id` — i.e., `Engine::cancel_workflow` was called for
+    /// this workflow before or after the trigger was dispatched.
+    ///
+    /// **O(1)** — hashset lookup against the shared fence. **Replayable**
+    /// — the fence is rebuilt from the durable `causal:control` stream
+    /// during engine startup, so replay produces the same answer as the
+    /// original run for any trigger dispatched after the cancel marker.
+    ///
+    /// Typical use: early-exit at the top of a reactor body so already-
+    /// dispatched triggers do no real work after the workflow is cancelled.
+    ///
+    /// ```ignore
+    /// async fn react(&self, evt: &MyEvent, ctx: Ctx<'_>) -> Result<Events> {
+    ///     if ctx.is_workflow_cancelled() { return Ok(Events::new()); }
+    ///     // ...
+    /// }
+    /// ```
+    pub fn is_workflow_cancelled(&self) -> bool {
+        self.cancelled_workflows
+            .map(|f| f.lock().unwrap().contains(&self.workflow_id))
+            .unwrap_or(false)
+    }
+
     /// The TRIGGER's recorded time — the fact's logical `occurred_at`.
     /// Consumers that need a timestamp use this, never wall-clock, so
     /// replay reproduces state byte-identically. (Append-time
@@ -204,13 +236,15 @@ impl<'a> Ctx<'a> {
 
     fn claim_label(&self, kind: &'static str, label: &str) -> Result<()> {
         if let Some(labels) = self.labels {
-            if !labels.lock().insert((kind, label.to_string())) {
+            let mut lock = labels.lock();
+            if lock.iter().any(|(k, l)| *k == kind && l == label) {
                 return Err(crate::failure::domain(anyhow::anyhow!(
                     "duplicate ctx.{kind}(\"{label}\") in one reaction — each \
                      call would silently yield the same result; give each \
                      identity/effect its own label",
                 )));
             }
+            lock.push((kind, label.to_string()));
         }
         Ok(())
     }
@@ -335,24 +369,75 @@ impl<'a> Ctx<'a> {
     /// redelivery deterministic); parked terminal failures keep theirs
     /// for failure replay.
     ///
-    /// Errors if no cache was configured
-    /// (`EngineBuilder::with_effect_store`).
+    /// The default store is [`InMemoryEffectStore`](crate::effect_store::InMemoryEffectStore),
+    /// which handles retries within a single process lifetime. For cross-restart
+    /// durability, override via [`EngineBuilder::with_effect_store`].
     pub async fn effect<F, Fut, T>(&self, label: &str, compute: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let cache = self.effect_store.ok_or_else(|| {
-            anyhow::anyhow!(
-                "ctx.effect called but no EffectStore was configured \
-                 (EngineBuilder::with_effect_store)"
-            )
-        })?;
+        let cache = self.effect_store
+            .expect("effect_store is always Some — EngineBuilder defaults to InMemoryEffectStore");
         self.claim_label("effect", label)?;
         let key =
             crate::effect_store::EffectKey::new(self.consumer, self.event_id, label);
         crate::effect_store::remember(&**cache, &key, compute).await
+    }
+
+    /// Run N side-effecting computations **concurrently**, each
+    /// memoized under its own label. All labels are claimed before any
+    /// I/O starts — a duplicate label errors immediately. Results are
+    /// returned in **input order** regardless of completion order,
+    /// making this deterministic across retries.
+    ///
+    /// ```ignore
+    /// // Use Box::pin to erase the concrete Future type.
+    /// let results = ctx.effect_all(vec![
+    ///     ("fetch_html", Box::new(|| Box::pin(async { scrape_html(&url).await }))),
+    ///     ("fetch_meta", Box::new(|| Box::pin(async { scrape_meta(&url).await }))),
+    /// ]).await?;
+    /// let (html, meta) = (&results[0], &results[1]);
+    /// ```
+    ///
+    /// All effects must share the same return type `T`. For
+    /// heterogeneous return types, or when N is known at compile time,
+    /// use `tokio::join!` with separate [`Ctx::effect`] calls instead —
+    /// those are equally memoized and often more readable.
+    pub async fn effect_all<T>(
+        &self,
+        effects: Vec<(
+            &str,
+            Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>>>>>,
+        )>,
+    ) -> Result<Vec<T>>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let cache = self.effect_store
+            .expect("effect_store is always Some — EngineBuilder defaults to InMemoryEffectStore");
+        // Claim all labels atomically upfront — fail fast before I/O.
+        for (label, _) in &effects {
+            self.claim_label("effect", label)?;
+        }
+        // Each future owns its own Arc clone and EffectKey so no
+        // lifetime constraint links them back to this stack frame.
+        let futs: Vec<_> = effects.into_iter()
+            .map(|(label, compute)| {
+                let store = Arc::clone(cache);
+                let key = crate::effect_store::EffectKey::new(
+                    self.consumer, self.event_id, label,
+                );
+                async move {
+                    crate::effect_store::remember(
+                        store.as_ref(), &key, move || compute(),
+                    ).await
+                }
+            })
+            .collect();
+        // try_join_all preserves input order.
+        futures::future::try_join_all(futs).await
     }
 }
 
@@ -380,6 +465,7 @@ mod tests {
             state:    StateSource::None,
             logs:           None,
             effect_store: None,
+            cancelled_workflows: None,
         }
     }
 
@@ -443,6 +529,102 @@ mod tests {
         );
         assert!(format!("{err:#}").contains("duplicate"), "the error teaches");
         // Same label under a DIFFERENT kind (effect) is not a duplicate.
-        assert!(labels.lock().insert(("effect", "group".into())));
+        assert!(
+            !labels.lock().iter().any(|(k, l)| *k == "effect" && l == "group"),
+            "effect:group should not yet be claimed",
+        );
+        labels.lock().push(("effect", "group".into()));
+    }
+
+    #[tokio::test]
+    async fn effect_all_runs_concurrently_and_returns_in_order() {
+        use crate::effect_store::InMemoryEffectStore;
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        let store: Arc<dyn crate::effect_store::EffectStore> =
+            Arc::new(InMemoryEffectStore::new());
+        let meta = fixed_meta();
+        let labels = LabelSet::default();
+        let ctx = Ctx {
+            event_id:            Uuid::new_v4(),
+            log_position:        LogCursor::ZERO,
+            occurred_at:         Utc::now(),
+            workflow_id:         Uuid::nil(),
+            metadata:            &meta,
+            consumer:            "test.consumer",
+            labels:              Some(&labels),
+            state:               StateSource::None,
+            logs:                None,
+            effect_store:        Some(&store),
+            cancelled_workflows: None,
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+        let results: Vec<String> = ctx.effect_all(vec![
+            ("first",  Box::new(move || Box::pin(async move {
+                c1.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, anyhow::Error>("hello".into())
+            }))),
+            ("second", Box::new(move || Box::pin(async move {
+                c2.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, anyhow::Error>("world".into())
+            }))),
+        ]).await.unwrap();
+
+        assert_eq!(results[0], "hello");
+        assert_eq!(results[1], "world");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "both effects ran");
+        assert!(
+            labels.lock().iter().any(|(k, l)| *k == "effect" && l == "first"),
+            "first label claimed",
+        );
+        assert!(
+            labels.lock().iter().any(|(k, l)| *k == "effect" && l == "second"),
+            "second label claimed",
+        );
+    }
+
+    #[tokio::test]
+    async fn effect_all_duplicate_label_errors_before_any_io() {
+        use crate::effect_store::InMemoryEffectStore;
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        let store: Arc<dyn crate::effect_store::EffectStore> =
+            Arc::new(InMemoryEffectStore::new());
+        let meta = fixed_meta();
+        let labels = LabelSet::default();
+        let ctx = Ctx {
+            event_id:            Uuid::new_v4(),
+            log_position:        LogCursor::ZERO,
+            occurred_at:         Utc::now(),
+            workflow_id:         Uuid::nil(),
+            metadata:            &meta,
+            consumer:            "test.consumer",
+            labels:              Some(&labels),
+            state:               StateSource::None,
+            logs:                None,
+            effect_store:        Some(&store),
+            cancelled_workflows: None,
+        };
+
+        // Pre-claim "fetch" so effect_all sees a duplicate.
+        ctx.effect("fetch", || async { Ok::<String, anyhow::Error>("cached".into()) }).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let err = ctx.effect_all(vec![
+            ("fetch",  Box::new(move || Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, anyhow::Error>("should not run".into())
+            }))),
+            ("other",  Box::new(|| Box::pin(async {
+                Ok::<String, anyhow::Error>("fine".into())
+            }))),
+        ]).await.unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "compute never ran — error before I/O");
+        assert!(format!("{err:#}").contains("duplicate"), "error message is instructive");
     }
 }

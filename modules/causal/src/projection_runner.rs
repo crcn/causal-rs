@@ -190,6 +190,7 @@ where
                 },
                 logs:           None,
                 effect_store: None,
+                cancelled_workflows: None,
             };
 
             match self.projector.project(&fact, ctx).await {

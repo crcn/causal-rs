@@ -327,6 +327,11 @@ struct Core<R: Reactor> {
     /// Halt flag: workers stop taking new triggers / retry attempts.
     stopped: AtomicBool,
     stop_notify: tokio::sync::Notify,
+    /// Shared cancel fence. Triggers whose `workflow_id` is present are
+    /// acked at the dispatch gate without reaching the reactor body;
+    /// workers also check it on each loop boundary for already-queued
+    /// triggers. Cancel markers in the log are ingested inline.
+    cancelled_workflows: Option<crate::engine::CancelledWorkflows>,
 }
 
 impl<R: Reactor + 'static> ReactorRunner<R>
@@ -378,6 +383,7 @@ where
                 completions_rx: parking_lot::Mutex::new(completions_rx),
                 stopped: AtomicBool::new(false),
                 stop_notify: tokio::sync::Notify::new(),
+                cancelled_workflows: None,
             }),
         }
     }
@@ -477,6 +483,16 @@ where
         self
     }
 
+    /// Wire the engine's shared cancel fence so this runner skips
+    /// triggers belonging to cancelled workflows.
+    pub(crate) fn with_cancelled_workflows(
+        mut self,
+        cancelled_workflows: crate::engine::CancelledWorkflows,
+    ) -> Self {
+        self.core_mut().cancelled_workflows = Some(cancelled_workflows);
+        self
+    }
+
     pub fn consumer_id(&self) -> &str { &self.core.consumer_id }
 
     /// Stop taking new work: workers exit at their next loop boundary
@@ -510,22 +526,42 @@ where
                     if d.pending.len() >= MAX_PENDING {
                         break; // window full — do not scan past this trigger
                     }
-                    d.pending.insert(
-                        event.position,
-                        PendingTrigger {
-                            event_id: event.event_id,
-                            acked: false,
-                            parked: false,
-                            effect_labels: Vec::new(),
-                        },
-                    );
-                    *d.wf_pending.entry(event.workflow_id).or_insert(0) += 1;
-                    d.ingest_pos = event.position;
-                    let key = partition_key_for(R::ORDERING, &event);
-                    Core::enqueue(&self.core, &mut d, key, event);
+                    let fenced = self.core.cancelled_workflows.as_ref()
+                        .map(|f| f.lock().unwrap().contains(&event.workflow_id))
+                        .unwrap_or(false);
+                    if fenced {
+                        // Dispatch-gate: ack at the gate without entering
+                        // pending or wf_pending — the floor catches up naturally.
+                        d.ingest_pos = event.position;
+                    } else {
+                        d.pending.insert(
+                            event.position,
+                            PendingTrigger {
+                                event_id: event.event_id,
+                                acked: false,
+                                parked: false,
+                                effect_labels: Vec::new(),
+                            },
+                        );
+                        *d.wf_pending.entry(event.workflow_id).or_insert(0) += 1;
+                        d.ingest_pos = event.position;
+                        let key = partition_key_for(R::ORDERING, &event);
+                        Core::enqueue(&self.core, &mut d, key, event);
+                    }
                 } else {
-                    // Non-matching: scan past. (No scan-folds — reactor
-                    // state reads are fold-on-read from the log.)
+                    // Non-matching: scan past. Recognise cancel markers
+                    // inline so the fence is current for subsequent triggers
+                    // in the same batch.
+                    if event.event_type == crate::engine::WORKFLOW_CANCELLED_KIND {
+                        if let Some(fence) = &self.core.cancelled_workflows {
+                            if let Some(target) = event.payload.get("target")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<Uuid>().ok())
+                            {
+                                fence.lock().unwrap().insert(target);
+                            }
+                        }
+                    }
                     d.ingest_pos = event.position;
                 }
                 ingested += 1;
@@ -673,6 +709,19 @@ where
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             };
+            // Worker-level fence: ack immediately for already-queued
+            // triggers whose workflow was cancelled after dispatch.
+            if let Some(fence) = &core.cancelled_workflows {
+                if fence.lock().unwrap().contains(&event.workflow_id) {
+                    let _ = core.completions_tx.send(Completion {
+                        position: event.position,
+                        workflow: event.workflow_id,
+                        parked: false,
+                        effect_labels: vec![],
+                    });
+                    continue;
+                }
+            }
             match core.process_trigger(&event, &fold_cache).await {
                 Some(done) => {
                     let _ = core.completions_tx.send(Completion {
@@ -721,6 +770,10 @@ where
         // a later attempt's path never touches).
         let mut used_effects: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Effect label set from the first attempt — divergence backstop.
+        // Compared as a SET (not sequence) so concurrent effects via
+        // try_join_all don't produce false positives from poll-order variance.
+        let mut first_attempt_effects: Option<std::collections::HashSet<String>> = None;
         loop {
             if self.stopped() {
                 return None;
@@ -742,13 +795,37 @@ where
             };
             let attempted = self.attempt_trigger(event, fold_cache, &labels).await;
             drop(permit);
-            used_effects.extend(
-                labels
-                    .into_inner()
-                    .into_iter()
-                    .filter(|(kind, _)| *kind == "effect")
-                    .map(|(_, label)| label),
-            );
+            let this_effects: Vec<String> = labels
+                .into_inner()
+                .into_iter()
+                .filter(|(kind, _)| *kind == "effect")
+                .map(|(_, label)| label)
+                .collect();
+
+            match &first_attempt_effects {
+                None => {
+                    first_attempt_effects =
+                        Some(this_effects.iter().cloned().collect());
+                }
+                Some(first) => {
+                    let this_set: std::collections::HashSet<&str> =
+                        this_effects.iter().map(String::as_str).collect();
+                    let first_set: std::collections::HashSet<&str> =
+                        first.iter().map(String::as_str).collect();
+                    if first_set != this_set {
+                        tracing::error!(
+                            consumer = self.consumer_id,
+                            event_id = %event.event_id,
+                            first    = ?first,
+                            retry    = ?this_effects,
+                            "reactor effect labels diverged across retries — \
+                             nondeterminism inside react() is likely",
+                        );
+                    }
+                }
+            }
+
+            used_effects.extend(this_effects);
             let failure = match attempted {
                 Ok(AttemptOutcome::Done) => {
                     return Some(TriggerDone {
@@ -913,6 +990,7 @@ where
             state,
             logs:           Some(&log_sink),
             effect_store: self.effect_store.as_ref(),
+            cancelled_workflows: self.cancelled_workflows.as_ref(),
         };
 
         // ── Decision. A panic is caught and treated as an attempt
@@ -2544,6 +2622,88 @@ mod tests {
         assert_eq!(subject_id, payload.order_id, "the trigger's subject_id");
         assert_eq!(class, crate::failure::FailureClass::Domain,
                    "a declared-domain park is labeled domain (not unclassified)");
+        runner.halt();
+    }
+
+    #[tokio::test]
+    async fn fenced_workflow_is_acked_at_dispatch_gate_without_calling_reactor() {
+        // Engine::cancel_workflow sets a fence; any trigger whose
+        // workflow_id is in the fence must be skipped at the dispatch
+        // gate — the reactor body must not be called and the floor must
+        // still advance (the trigger is not pending work).
+        let store = Arc::new(MemoryStore::new());
+        let wf_cancelled = Uuid::new_v4();
+        let wf_live      = Uuid::new_v4();
+
+        let append_for_wf = |store: Arc<MemoryStore>, wf: Uuid, order_id: Uuid| {
+            let ev = EventData {
+                event_id:    Uuid::new_v4(),
+                causation_id: None,
+                workflow_id: wf,
+                event_type:  <OrderPlaced as Event>::NAME.to_string(),
+                payload:     serde_json::to_value(OrderPlaced {
+                    order_id, occurred_at: Utc::now(),
+                }).unwrap(),
+                created_at:  Utc::now(),
+                category:    Some(<OrderPlaced as Event>::NAME.to_string()),
+                subject_id:  Some(order_id),
+                metadata:    serde_json::Map::new(),
+                ephemeral:   None,
+                persistent:  true,
+            };
+            futures::executor::block_on(crate::append_event(store.as_ref(), ev)).unwrap();
+        };
+
+        // One cancelled-workflow trigger, one live trigger.
+        append_for_wf(store.clone(), wf_cancelled, Uuid::new_v4());
+        append_for_wf(store.clone(), wf_live,      Uuid::new_v4());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+
+        struct CountingReactor(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Reactor for CountingReactor {
+            type Trigger = OrderPlaced;
+            const NAME: &'static str = "counting-reactor";
+            async fn react(&self, t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut out = Events::new();
+                out.push(ShippedNotification { order_id: t.order_id });
+                Ok(out)
+            }
+        }
+
+        let fence: crate::engine::CancelledWorkflows =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        fence.lock().unwrap().insert(wf_cancelled);
+
+        let runner = ReactorRunner::new(
+            CountingReactor(calls_c),
+            "r.fence-gate",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_cancelled_workflows(fence);
+
+        runner.quiesce().await.unwrap();
+
+        // Reactor called exactly once — for the live workflow only.
+        assert_eq!(calls.load(Ordering::SeqCst), 1,
+                   "reactor must not be called for a fenced workflow");
+
+        // One output: the live workflow's trigger produced it.
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.event_type == "shipped_notification").count(),
+            1,
+            "only the live workflow produced output",
+        );
+
+        // Floor advanced past both triggers.
+        assert!(store.get("r.fence-gate").await.unwrap().is_some(),
+                "ack-floor advanced past the fenced trigger");
         runner.halt();
     }
 

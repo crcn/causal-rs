@@ -137,6 +137,7 @@ mod tests {
                 state:    crate::contexts::StateSource::None,
                 logs:           None,
                 effect_store: None,
+                cancelled_workflows: None,
             },
         ).await.unwrap();
 
@@ -167,8 +168,9 @@ mod tests {
                     consumer: "",
                     labels:   None,
                     state:    crate::contexts::StateSource::None,
-                logs:           None,
-                effect_store: None,
+                    logs:           None,
+                    effect_store: None,
+                    cancelled_workflows: None,
                 },
             ).await.unwrap();
         }
