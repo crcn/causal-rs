@@ -10,6 +10,7 @@ description = "A deterministic, event-driven coordination layer where machines d
 [features]
 default = ["macros"]
 macros = ["dep:causal_core_macros"]
+testing = []
 
 [dependencies]
 anyhow.workspace = true

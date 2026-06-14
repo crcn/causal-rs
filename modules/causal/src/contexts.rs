@@ -546,26 +546,10 @@ mod tests {
 
     #[tokio::test]
     async fn effect_all_runs_concurrently_and_returns_in_order() {
-        use crate::effect_store::InMemoryEffectStore;
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
-        let store: Arc<dyn crate::effect_store::EffectStore> =
-            Arc::new(InMemoryEffectStore::new());
-        let meta = fixed_meta();
-        let labels = LabelSet::default();
-        let ctx = Ctx {
-            event_id:            Uuid::new_v4(),
-            log_position:        LogCursor::ZERO,
-            occurred_at:         Utc::now(),
-            workflow_id:         Uuid::nil(),
-            metadata:            &meta,
-            consumer:            "test.consumer",
-            labels:              Some(&labels),
-            state:               StateSource::None,
-            logs:                None,
-            effect_store:        Some(&store),
-            cancelled_workflows: None,
-        };
+        let owner = crate::testing::TestCtx::new().with_effects();
+        let ctx = owner.ctx();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let c1 = calls.clone();
@@ -585,37 +569,21 @@ mod tests {
         assert_eq!(results[1], "world");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "both effects ran");
         assert!(
-            labels.lock().iter().any(|(k, l)| *k == "effect" && l == "first"),
+            owner.labels.lock().iter().any(|(k, l)| *k == "effect" && l == "first"),
             "first label claimed",
         );
         assert!(
-            labels.lock().iter().any(|(k, l)| *k == "effect" && l == "second"),
+            owner.labels.lock().iter().any(|(k, l)| *k == "effect" && l == "second"),
             "second label claimed",
         );
     }
 
     #[tokio::test]
     async fn effect_all_duplicate_label_errors_before_any_io() {
-        use crate::effect_store::InMemoryEffectStore;
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
-        let store: Arc<dyn crate::effect_store::EffectStore> =
-            Arc::new(InMemoryEffectStore::new());
-        let meta = fixed_meta();
-        let labels = LabelSet::default();
-        let ctx = Ctx {
-            event_id:            Uuid::new_v4(),
-            log_position:        LogCursor::ZERO,
-            occurred_at:         Utc::now(),
-            workflow_id:         Uuid::nil(),
-            metadata:            &meta,
-            consumer:            "test.consumer",
-            labels:              Some(&labels),
-            state:               StateSource::None,
-            logs:                None,
-            effect_store:        Some(&store),
-            cancelled_workflows: None,
-        };
+        let owner = crate::testing::TestCtx::new().with_effects();
+        let ctx = owner.ctx();
 
         // Pre-claim "fetch" so effect_all sees a duplicate.
         ctx.effect("fetch", || async { Ok::<String, anyhow::Error>("cached".into()) }).await.unwrap();

@@ -113,6 +113,9 @@ pub mod types;
 
 pub mod memory_store;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 // ── public surface ──────────────────────────────────────────────
 //
 // What's in the prelude vs. behind a module path follows one rule:
