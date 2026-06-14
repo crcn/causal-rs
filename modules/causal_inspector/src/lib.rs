@@ -5,6 +5,9 @@ pub mod read_model;
 #[cfg(feature = "memory")]
 pub mod memory;
 
+#[cfg(feature = "memory")]
+pub use memory::MemoryInspectorReadModel;
+
 #[cfg(feature = "cache")]
 pub mod cache;
 
@@ -23,7 +26,8 @@ pub use axum_router::router;
 pub use types::*;
 pub use display::{EventDisplay, DefaultEventDisplay};
 pub use read_model::{
-    InspectorReadModel, EventQuery, StoredEvent,
-    ReactorLogEntry, ReactorOutcomeEntry, ReactorDescriptionEntry,
-    ReactorDescriptionSnapshotEntry, AggregateStateSnapshotEntry,
+    AggregateKeyEntry, AggregateKeysPage, AggregateStateSnapshotEntry, EffectRecord, EventQuery,
+    InspectorReadModel, ReactorDescriptionEntry, ReactorDescriptionSnapshotEntry, ReactorLogEntry,
+    ReactorOutcomeEntry, StoredEvent, SubjectChainEventRaw, SubjectChainMode, SubjectChainPage,
+    SubjectChainSourceMode,
 };

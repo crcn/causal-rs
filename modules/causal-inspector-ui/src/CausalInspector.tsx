@@ -20,10 +20,11 @@ import type { InspectorTransport, StorageTransport } from "./engines";
 import { useSelector, useDispatch } from "./machine";
 import type { InspectorState } from "./state";
 import type { InspectorMachineEvent } from "./events";
-import type { PaneLayout } from "./types";
+import type { PaneLayout, SubjectChainMode } from "./types";
 
 import { TimelinePane } from "./panes/TimelinePane";
 import { CausalTreePane } from "./panes/CausalTreePane";
+import { SubjectChainPane } from "./panes/SubjectChainPane";
 import { CausalFlowPane } from "./panes/CausalFlowPane";
 import { LogsPane } from "./panes/LogsPane";
 import { AggregateTimelinePane } from "./panes/AggregateTimelinePane";
@@ -45,6 +46,12 @@ export type CausalInspectorProps = {
   };
   /** CSS class for the container */
   className?: string;
+  /** Pre-navigate to a specific entity's subject chain on mount */
+  initialSubject?: {
+    aggregateType: string;
+    aggregateId: string;
+    mode?: SubjectChainMode;
+  };
 };
 
 // ── Transport ─────────────────────────────────────────────────
@@ -200,6 +207,11 @@ const PANE_REGISTRY = [
     component: "workflows",
     render: () => <WorkflowExplorerPane />,
   },
+  {
+    name: "Subject Chain",
+    component: "subject-chain",
+    render: () => <SubjectChainPane />,
+  },
 ] as const;
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -228,6 +240,9 @@ function InspectorLayout() {
   );
   const selectedSeq = useSelector<InspectorState, number | null>(
     (s) => s.selectedSeq,
+  );
+  const subjectType = useSelector<InspectorState, string | null>(
+    (s) => s.subjectType,
   );
   const dispatch = useDispatch<InspectorMachineEvent>();
 
@@ -270,6 +285,10 @@ function InspectorLayout() {
   useEffect(() => {
     if (flowWorkflowId) addTab("causal-flow", "Flow");
   }, [flowWorkflowId, addTab]);
+
+  useEffect(() => {
+    if (subjectType) addTab("subject-chain", "Subject Chain");
+  }, [subjectType, addTab]);
 
   const factory = useCallback((node: TabNode) => {
     const component = node.getComponent();
@@ -381,6 +400,7 @@ export function CausalInspector({
   endpoint,
   fetchOptions,
   className,
+  initialSubject,
 }: CausalInspectorProps) {
   const transport = useMemo(
     () => createTransport(endpoint, fetchOptions),
@@ -393,11 +413,23 @@ export function CausalInspector({
     [transport],
   );
 
+  const initialState = useMemo(() => {
+    const base = savedLayout ? { paneLayout: savedLayout } : undefined;
+    if (!initialSubject) return base;
+    return {
+      ...base,
+      subjectType: initialSubject.aggregateType,
+      subjectId: initialSubject.aggregateId,
+      subjectMode: initialSubject.mode ?? ("both" as const),
+      subjectChainLoading: true,
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div className={`causal-inspector${className ? ` ${className}` : ""}`}>
       <CausalInspectorProvider
         createEngine={createEngine}
-        initialState={savedLayout ? { paneLayout: savedLayout } : undefined}
+        initialState={initialState}
       >
         <InspectorLayout />
       </CausalInspectorProvider>

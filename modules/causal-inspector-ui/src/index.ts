@@ -44,6 +44,12 @@ export type {
   LogsFilter,
   FlowSelection,
   PaneLayout,
+  SubjectChainSourceMode,
+  SubjectChainMode,
+  SubjectChainEvent,
+  InspectorEffect,
+  AggregateKeyEntry,
+  AggregateKeysPage,
 } from "./types";
 
 // ── Engines ──
@@ -77,6 +83,10 @@ export {
   INSPECTOR_REACTOR_DEPENDENCIES,
   INSPECTOR_AGGREGATE_KEYS,
   INSPECTOR_AGGREGATE_LIFECYCLE,
+  INSPECTOR_SUBJECT_CHAIN,
+  INSPECTOR_EFFECTS_FOR_EVENT,
+  INSPECTOR_AGGREGATE_TYPES,
+  INSPECTOR_AGGREGATE_KEYS_BY_TYPE,
 } from "./queries";
 
 // ── Theme ──
@@ -100,6 +110,7 @@ export { FilterBar } from "./components/FilterBar";
 export { CopyablePayload } from "./components/CopyablePayload";
 export { JsonSyntax } from "./components/JsonSyntax";
 export { GlobalScrubber } from "./components/GlobalScrubber";
+export { EffectList } from "./components/EffectList";
 // ── Panes ──
 export { TimelinePane } from "./panes/TimelinePane";
 export type { TimelinePaneProps } from "./panes/TimelinePane";
@@ -112,4 +123,5 @@ export type { CausalFlowPaneProps } from "./panes/CausalFlowPane";
 export { AggregateTimelinePane } from "./panes/AggregateTimelinePane";
 export { WaterfallPane } from "./panes/WaterfallPane";
 export { WorkflowExplorerPane } from "./panes/WorkflowExplorerPane";
+export { SubjectChainPane } from "./panes/SubjectChainPane";
 

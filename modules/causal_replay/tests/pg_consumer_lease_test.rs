@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::Connection as _;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -192,6 +193,86 @@ async fn second_engine_blocks_until_first_halts() -> Result<()> {
         .await
         .expect("B must unblock after A halts")
         .expect("channel ok");
+
+    Ok(())
+}
+
+/// Postgres advisory locks release when the connection that holds them
+/// is dropped — the OS-level socket close triggers automatic cleanup.
+///
+/// This is the crash-safety property `PgConsumerLeasor` relies on:
+/// when a server process dies unexpectedly, its advisory lock is released
+/// immediately, and a new server can acquire it without manual intervention.
+///
+/// We replicate the lock derivation from `PgConsumerLeasor` directly
+/// so this test exercises the exact lock namespace used in production.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local DATABASE_URL"]
+async fn advisory_lock_releases_on_connection_drop() -> Result<()> {
+    // Replicate the lock derivation from consumer_lease.rs.
+    fn fnv1a_32(s: &str) -> i32 {
+        let mut hash: u32 = 2_166_136_261;
+        for byte in s.bytes() {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        hash as i32
+    }
+    const ADVISORY_CLASS: i32 = 0xCA05_u32 as i32;
+
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+    assert!(
+        url.contains("localhost") || url.contains("127.0.0.1"),
+        "Refusing to run integration tests against non-local Postgres: {url}"
+    );
+    let consumer = format!("crash-lock-test.{}", Uuid::new_v4());
+    let key = fnv1a_32(&consumer);
+
+    // Connection A acquires the lock — simulates a running server.
+    let mut conn_a = sqlx::PgConnection::connect(&url).await?;
+    sqlx::query("SELECT pg_advisory_lock($1, $2)")
+        .bind(ADVISORY_CLASS)
+        .bind(key)
+        .execute(&mut conn_a)
+        .await?;
+
+    // Connection B cannot acquire while A holds it.
+    let mut conn_b = sqlx::PgConnection::connect(&url).await?;
+    let (held,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1, $2)")
+        .bind(ADVISORY_CLASS)
+        .bind(key)
+        .fetch_one(&mut conn_b)
+        .await?;
+    assert!(!held, "lock must be held by connection A before drop");
+
+    // Drop connection A — simulates a server crash.
+    // The OS closes the socket; Postgres detects the lost session and
+    // releases all its advisory locks automatically.
+    drop(conn_a);
+
+    // Connection B can now acquire within a short window.
+    let acquired = timeout(Duration::from_secs(5), async {
+        loop {
+            let (ok,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1, $2)")
+                .bind(ADVISORY_CLASS)
+                .bind(key)
+                .fetch_one(&mut conn_b)
+                .await?;
+            if ok {
+                return Ok::<bool, anyhow::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert!(acquired, "advisory lock must be acquirable after connection A drops");
+
+    // Release conn_b's lock.
+    sqlx::query("SELECT pg_advisory_unlock($1, $2)")
+        .bind(ADVISORY_CLASS)
+        .bind(key)
+        .execute(&mut conn_b)
+        .await?;
 
     Ok(())
 }

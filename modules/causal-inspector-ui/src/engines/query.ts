@@ -14,6 +14,9 @@ import type {
   AggregateTimelineEntry,
   ReactorOutcome,
   ReactorAttempt,
+  SubjectChainMode,
+  SubjectChainEvent,
+  InspectorEffect,
 } from "../types";
 import {
   INSPECTOR_EVENTS,
@@ -29,6 +32,8 @@ import {
   INSPECTOR_AGGREGATE_TIMELINE,
   INSPECTOR_REACTOR_OUTCOMES,
   INSPECTOR_REACTOR_ATTEMPTS,
+  INSPECTOR_SUBJECT_CHAIN,
+  INSPECTOR_EFFECTS_FOR_EVENT,
 } from "../queries";
 
 export type QueryTransport = {
@@ -54,6 +59,7 @@ export const createQueryEngine = (
     // Stale-response guards
     let activeCausalSeq: number | null = null;
     let activeFlowWorkflowId: string | null = null;
+    let activeSubjectKey: string | null = null;
 
     const fetchEvents = async () => {
       const state = getState();
@@ -262,6 +268,61 @@ export const createQueryEngine = (
       }
     };
 
+    const fetchSubjectChain = async (
+      aggregateType: string,
+      aggregateId: string,
+      mode: SubjectChainMode,
+      cursor: number | null,
+    ) => {
+      const key = `${aggregateType}:${aggregateId}:${mode}`;
+      activeSubjectKey = key;
+      try {
+        const data = await transport.query<{
+          inspectorSubjectChain: {
+            events: SubjectChainEvent[];
+            nextCursor: number | null;
+            depthCapReached: boolean;
+          };
+        }>(INSPECTOR_SUBJECT_CHAIN, {
+          aggregateType,
+          aggregateId,
+          mode: mode.toUpperCase(),
+          limit: 50,
+          cursor: cursor ?? undefined,
+        });
+        if (activeSubjectKey !== key) return; // navigated away
+        const page = data.inspectorSubjectChain;
+        dispatch({
+          type: "events/subject_chain_loaded",
+          payload: {
+            events: page.events,
+            hasMore: page.nextCursor != null,
+            cursor: page.nextCursor,
+            depthCapped: page.depthCapReached,
+            append: cursor != null,
+          },
+        });
+      } catch (e) {
+        console.error("[causal-inspector] fetch subject chain failed:", e);
+      }
+    };
+
+    const fetchEventEffects = async (eventId: string) => {
+      const state = getState();
+      if (eventId in state.expandedEffects) return; // already loaded
+      try {
+        const data = await transport.query<{
+          inspectorEffectsForEvent: InspectorEffect[];
+        }>(INSPECTOR_EFFECTS_FOR_EVENT, { eventId });
+        dispatch({
+          type: "events/event_effects_loaded",
+          payload: { eventId, effects: data.inspectorEffectsForEvent },
+        });
+      } catch (e) {
+        console.error("[causal-inspector] fetch event effects failed:", e);
+      }
+    };
+
     const startFlowPolling = (workflowId: string) => {
       stopFlowPolling();
       fetchFlowMetadata(workflowId);
@@ -291,6 +352,13 @@ export const createQueryEngine = (
     return {
       handleEvent: (event, curr, prev) => {
         // ── State-reactive: navigation transitions ──
+
+        // Subject changed → fetch first page
+        if (curr.subjectType !== prev.subjectType || curr.subjectId !== prev.subjectId) {
+          if (curr.subjectType && curr.subjectId) {
+            fetchSubjectChain(curr.subjectType, curr.subjectId, curr.subjectMode, null);
+          }
+        }
 
         if (curr.flowWorkflowId !== prev.flowWorkflowId) {
           if (curr.flowWorkflowId) {
@@ -333,6 +401,37 @@ export const createQueryEngine = (
 
           case "ui/aggregate_lifecycle_requested":
             fetchAggregateLifecycle(event.payload.aggregateKey);
+            break;
+
+          case "ui/subject_selected": {
+            const { aggregateType, aggregateId, mode = "both" } = event.payload;
+            fetchSubjectChain(aggregateType, aggregateId, mode, null);
+            break;
+          }
+
+          case "ui/subject_mode_changed": {
+            const state = getState();
+            if (state.subjectType && state.subjectId) {
+              fetchSubjectChain(state.subjectType, state.subjectId, event.payload.mode, null);
+            }
+            break;
+          }
+
+          case "ui/subject_chain_load_more": {
+            const state = getState();
+            if (state.subjectType && state.subjectId) {
+              fetchSubjectChain(
+                state.subjectType,
+                state.subjectId,
+                state.subjectMode,
+                state.subjectChainCursor,
+              );
+            }
+            break;
+          }
+
+          case "ui/event_effects_requested":
+            fetchEventEffects(event.payload.eventId);
             break;
         }
       },

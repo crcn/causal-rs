@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 
+use crate::read_model::SubjectChainSourceMode;
+
 /// Processed event ready for the inspector.
 /// Use `EventDisplay` to control `name` and `summary`.
 #[derive(Clone, Debug)]
@@ -175,4 +177,63 @@ pub struct ReactorAttempt {
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+}
+
+// ── Entity-scoped inspection types ───────────────────────────────────────────
+
+/// One `ctx.effect()` result for the effects inspector panel.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct InspectorEffect {
+    pub consumer:   String,
+    pub label:      String,
+    pub value:      serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A single event in a subject chain response, enriched with display names.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct InspectorSubjectChainEvent {
+    pub seq:             i64,
+    pub ts:              DateTime<Utc>,
+    #[cfg_attr(feature = "graphql", graphql(name = "type"))]
+    pub event_type:      String,
+    pub name:            String,
+    pub id:              Option<String>,
+    pub causation_id:    Option<String>,
+    pub workflow_id:     Option<String>,
+    pub reactor_id:      Option<String>,
+    pub aggregate_type:  Option<String>,
+    pub aggregate_id:    Option<String>,
+    pub stream_revision: Option<i64>,
+    pub summary:         Option<String>,
+    pub payload:         String,
+    /// Whether this event came from the entity's own stream or from a descendant chain.
+    pub source_mode:     SubjectChainSourceMode,
+}
+
+/// Paginated subject chain response.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct InspectorSubjectChainPage {
+    pub events:            Vec<InspectorSubjectChainEvent>,
+    pub next_cursor:       Option<i64>,
+    pub depth_cap_reached: bool,
+}
+
+/// One entity in the aggregate keys listing.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct InspectorAggregateKeyEntry {
+    pub aggregate_id:  String,
+    pub display_label: Option<String>,
+}
+
+/// Paginated entity listing response.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::SimpleObject))]
+pub struct InspectorAggregateKeysPage {
+    pub entries:     Vec<InspectorAggregateKeyEntry>,
+    pub next_cursor: Option<String>,
 }

@@ -2,11 +2,12 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useSelector, useDispatch } from "../machine";
 import type { InspectorState } from "../state";
 import type { InspectorMachineEvent } from "../events";
-import type { InspectorEvent, FlowSelection, ReactorOutcome } from "../types";
+import type { InspectorEvent, FlowSelection, ReactorOutcome, InspectorEffect } from "../types";
 import { CopyablePayload } from "../components/CopyablePayload";
+import { EffectList } from "../components/EffectList";
 import { eventTextColor } from "../theme";
 import { formatTs, compactPayload, copyToClipboard, inScrubberRange } from "../utils";
-import { Copy, Check, Search, X, ChevronRight, ChevronDown, AlertTriangle } from "lucide-react";
+import { Copy, Check, Search, X, ChevronRight, ChevronDown, AlertTriangle, Zap } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Tree JSON export
@@ -162,9 +163,12 @@ function TreeNode({
 }) {
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
+  const expandedEffects = useSelector<InspectorState, Record<string, InspectorEffect[]>>((s) => s.expandedEffects);
+  const loadingEffectsIds = useSelector<InspectorState, string[]>((s) => s.loadingEffects);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
   const [payloadOpen, setPayloadOpen] = useState(false);
+  const [effectsOpen, setEffectsOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [copied, setCopied] = useState(false);
   const isSelected = event.seq === selectedSeq;
@@ -229,9 +233,43 @@ function TreeNode({
               ({children.length})
             </span>
           )}
+          {event.aggregateType && event.aggregateId && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                dispatch({ type: "ui/subject_selected", payload: { aggregateType: event.aggregateType!, aggregateId: event.aggregateId!, mode: "both" } });
+              }}
+              className="px-1.5 py-0.5 rounded-full text-[9px] font-mono bg-teal-500/8 text-teal-400/80 hover:bg-teal-500/15 hover:text-teal-400 shrink-0 transition-all border border-teal-500/10"
+              title={`View subject ${event.aggregateType}:${event.aggregateId}`}
+            >
+              {event.aggregateType}:{event.aggregateId.slice(0, 8)}
+            </button>
+          )}
           <span className="text-[10px] text-muted-foreground shrink-0">
             {formatTs(event.ts)}
           </span>
+          {event.id && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!effectsOpen && expandedEffects[event.id!] === undefined) {
+                  dispatch({ type: "ui/event_effects_requested", payload: { eventId: event.id! } });
+                }
+                setEffectsOpen((v) => !v);
+              }}
+              className={`opacity-0 group-hover/tree:opacity-100 transition-all duration-150 flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] ${
+                effectsOpen
+                  ? "opacity-100 bg-indigo-500/10 text-indigo-400/70 border border-indigo-500/20"
+                  : "hover:bg-white/[0.05] text-muted-foreground/50 border border-transparent"
+              }`}
+              title="Show effects"
+            >
+              <Zap size={9} />
+              {expandedEffects[event.id] !== undefined && expandedEffects[event.id].length > 0 && (
+                <span>{expandedEffects[event.id].length}</span>
+              )}
+            </button>
+          )}
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -265,6 +303,15 @@ function TreeNode({
         </button>
         {payloadOpen && (
           <CopyablePayload payload={event.payload} className="mt-1 ml-3 max-h-48" />
+        )}
+        {effectsOpen && (
+          <div className="mt-1 ml-3">
+            {loadingEffectsIds.includes(event.id ?? "") ? (
+              <div className="text-[9px] text-muted-foreground/40 italic py-1">Loading…</div>
+            ) : (
+              <EffectList effects={event.id ? (expandedEffects[event.id] ?? []) : []} />
+            )}
+          </div>
         )}
       </div>
 

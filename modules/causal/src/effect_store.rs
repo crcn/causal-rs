@@ -139,6 +139,20 @@ impl InMemoryEffectStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Scan all entries whose trigger matches `trigger_event_id`.
+    ///
+    /// Not on the `EffectStore` trait — this is a memory-layer-only
+    /// operation used by `MemoryInspectorReadModel::effects_for_event`.
+    pub fn scan_by_trigger(&self, trigger_event_id: Uuid) -> Vec<(EffectKey, serde_json::Value)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.trigger_event_id == trigger_event_id)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 #[async_trait]

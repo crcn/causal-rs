@@ -13,6 +13,9 @@ import type {
   ReactorAttempt,
   LogsFilter,
   PaneLayout,
+  SubjectChainEvent,
+  SubjectChainMode,
+  InspectorEffect,
 } from "./types";
 
 export type InspectorState = {
@@ -70,6 +73,18 @@ export type InspectorState = {
 
   // Pane layout (opaque JSON — interpreted by the host app)
   paneLayout: PaneLayout | null;
+
+  // Entity-scoped inspection
+  subjectType: string | null;
+  subjectId: string | null;
+  subjectMode: SubjectChainMode;
+  subjectChain: SubjectChainEvent[];
+  subjectChainLoading: boolean;
+  subjectChainHasMore: boolean;
+  subjectChainCursor: number | null;
+  subjectDepthCapped: boolean;
+  expandedEffects: Record<string, InspectorEffect[]>;
+  loadingEffects: string[];
 };
 
 export const initialState: InspectorState = {
@@ -122,4 +137,15 @@ export const initialState: InspectorState = {
   subscription: "disconnected",
 
   paneLayout: null,
+
+  subjectType: null,
+  subjectId: null,
+  subjectMode: "both",
+  subjectChain: [],
+  subjectChainLoading: false,
+  subjectChainHasMore: false,
+  subjectChainCursor: null,
+  subjectDepthCapped: false,
+  expandedEffects: {},
+  loadingEffects: [],
 };

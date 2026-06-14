@@ -11,7 +11,9 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 
 use crate::display::EventDisplay;
-use crate::read_model::{InspectorReadModel, EventQuery, StoredEvent};
+use crate::read_model::{
+    EventQuery, InspectorReadModel, StoredEvent, SubjectChainEventRaw, SubjectChainMode,
+};
 use crate::types::*;
 
 /// Generic inspector query resolvers for causal event tables.
@@ -36,6 +38,26 @@ impl<D: EventDisplay> CausalInspectorQuery<D> {
 
 fn stored_to_inspector(events: Vec<StoredEvent>, display: &dyn EventDisplay) -> Vec<InspectorEvent> {
     events.iter().map(|e| e.to_inspector_event(display)).collect()
+}
+
+fn chain_raw_to_gql(raw: SubjectChainEventRaw, display: &dyn EventDisplay) -> InspectorSubjectChainEvent {
+    let s = &raw.stored;
+    InspectorSubjectChainEvent {
+        seq:             s.seq,
+        ts:              s.ts,
+        event_type:      s.event_type.clone(),
+        name:            display.display_name(&s.event_type, &s.payload),
+        id:              s.id.map(|u| u.to_string()),
+        causation_id:    s.causation_id.map(|u| u.to_string()),
+        workflow_id:     s.workflow_id.map(|u| u.to_string()),
+        reactor_id:      s.reactor_id.clone(),
+        aggregate_type:  s.aggregate_type.clone(),
+        aggregate_id:    s.aggregate_id.map(|u| u.to_string()),
+        stream_revision: s.stream_revision.map(|v| v as i64),
+        summary:         display.summary(&s.event_type, &s.payload),
+        payload:         serde_json::to_string(&s.payload).unwrap_or_default(),
+        source_mode:     raw.source_mode,
+    }
 }
 
 #[Object]
@@ -433,6 +455,119 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
                 triggering_event_ids: r.triggering_event_ids,
             })
             .collect())
+    }
+
+    // ── Entity-scoped inspection ─────────────────────────────────────────────
+
+    /// All `ctx.effect()` results triggered by the given event.
+    async fn inspector_effects_for_event(
+        &self,
+        ctx: &Context<'_>,
+        event_id: String,
+    ) -> Result<Vec<InspectorEffect>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+        let uuid = uuid::Uuid::parse_str(&event_id)
+            .map_err(|e| async_graphql::Error::new(format!("Invalid event_id: {e}")))?;
+
+        let records = read_model
+            .effects_for_event(uuid)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("Failed to load effects: {e}")))?;
+
+        Ok(records
+            .into_iter()
+            .map(|r| InspectorEffect { consumer: r.consumer, label: r.label, value: r.value, created_at: r.created_at })
+            .collect())
+    }
+
+    /// Distinct aggregate types present in the event log, for entity discovery.
+    async fn inspector_aggregate_types(
+        &self,
+        ctx: &Context<'_>,
+        search: Option<String>,
+        limit: Option<i32>,
+    ) -> Result<Vec<String>> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+        let lim = (limit.unwrap_or(100) as usize).min(500);
+        read_model
+            .list_aggregate_types(search.as_deref(), lim)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("Failed to list aggregate types: {e}")))
+    }
+
+    /// Entities of a given aggregate type, with display labels derived from their first event.
+    async fn inspector_aggregate_keys_by_type(
+        &self,
+        ctx: &Context<'_>,
+        aggregate_type: String,
+        search: Option<String>,
+        limit: Option<i32>,
+        cursor: Option<String>,
+    ) -> Result<InspectorAggregateKeysPage> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+        let lim = (limit.unwrap_or(50) as usize).min(200);
+        let cursor_uuid = cursor
+            .as_deref()
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .map_err(|e| async_graphql::Error::new(format!("Invalid cursor: {e}")))?;
+
+        let page = read_model
+            .list_aggregate_keys_by_type(&aggregate_type, search.as_deref(), lim, cursor_uuid)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("Failed to list aggregate keys: {e}")))?;
+
+        let display = self.display.as_ref();
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|e| InspectorAggregateKeyEntry {
+                aggregate_id: e.aggregate_id.to_string(),
+                display_label: {
+                    let label = display.display_name(&e.event_type, &e.first_payload);
+                    if label.is_empty() { None } else { Some(label) }
+                },
+            })
+            .collect();
+
+        Ok(InspectorAggregateKeysPage {
+            entries,
+            next_cursor: page.next_cursor.map(|u| u.to_string()),
+        })
+    }
+
+    /// Events for a specific entity, scoped by mode (stream / descendants / both).
+    async fn inspector_subject_chain(
+        &self,
+        ctx: &Context<'_>,
+        aggregate_type: String,
+        aggregate_id: String,
+        mode: SubjectChainMode,
+        limit: Option<i32>,
+        cursor: Option<i64>,
+    ) -> Result<InspectorSubjectChainPage> {
+        let read_model = ctx.data::<Arc<dyn InspectorReadModel>>()?;
+        let lim = (limit.unwrap_or(50) as usize).min(200);
+        let uuid = uuid::Uuid::parse_str(&aggregate_id)
+            .map_err(|e| async_graphql::Error::new(format!("Invalid aggregate_id: {e}")))?;
+
+        let page = read_model
+            .subject_chain(&aggregate_type, uuid, mode, lim, cursor)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("Failed to load subject chain: {e}")))?;
+
+        let display = self.display.as_ref();
+        let events = page
+            .events
+            .into_iter()
+            .map(|raw| chain_raw_to_gql(raw, display))
+            .collect();
+
+        Ok(InspectorSubjectChainPage {
+            events,
+            next_cursor: page.next_cursor,
+            depth_cap_reached: page.depth_cap_reached,
+        })
     }
 }
 

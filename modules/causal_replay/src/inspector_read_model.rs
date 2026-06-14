@@ -19,9 +19,11 @@ mod pg {
     use uuid::Uuid;
 
     use causal_inspector::read_model::{
-        AggregateLifecycleEntry, AggregateStateSnapshotEntry, CorrelationSummaryEntry, EventQuery,
-        InspectorReadModel, ReactorAttemptEntry, ReactorDependencyEntry, ReactorDescriptionEntry,
+        AggregateKeyEntry, AggregateKeysPage, AggregateLifecycleEntry, AggregateStateSnapshotEntry,
+        CorrelationSummaryEntry, EffectRecord, EventQuery, InspectorReadModel,
+        ReactorAttemptEntry, ReactorDependencyEntry, ReactorDescriptionEntry,
         ReactorDescriptionSnapshotEntry, ReactorLogEntry, ReactorOutcomeEntry, StoredEvent,
+        SubjectChainEventRaw, SubjectChainMode, SubjectChainPage, SubjectChainSourceMode,
     };
 
     pub struct PgInspectorReadModel {
@@ -504,6 +506,233 @@ mod pg {
             .fetch_all(&self.pool)
             .await?;
             rows.iter().map(|r| Ok(r.try_get("aggregate_key")?)).collect()
+        }
+
+        async fn effects_for_event(&self, event_id: Uuid) -> Result<Vec<EffectRecord>> {
+            let rows = sqlx::query(
+                "SELECT consumer, label, value, created_at
+                   FROM causal_effect_store
+                  WHERE trigger_event_id = $1
+                  ORDER BY created_at",
+            )
+            .bind(event_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.iter()
+                .map(|r| {
+                    Ok(EffectRecord {
+                        consumer: r.try_get("consumer")?,
+                        label: r.try_get("label")?,
+                        value: r.try_get("value")?,
+                        created_at: r.try_get("created_at")?,
+                    })
+                })
+                .collect()
+        }
+
+        async fn list_aggregate_types(
+            &self,
+            search: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<String>> {
+            let sql = "SELECT DISTINCT aggregate_type
+                         FROM causal_log
+                        WHERE aggregate_type IS NOT NULL
+                          AND ($1::text IS NULL OR aggregate_type ILIKE '%' || $1 || '%')
+                        ORDER BY aggregate_type
+                        LIMIT $2";
+            let rows = sqlx::query(sql)
+                .bind(search)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?;
+            rows.iter().map(|r| Ok(r.try_get("aggregate_type")?)).collect()
+        }
+
+        async fn list_aggregate_keys_by_type(
+            &self,
+            aggregate_type: &str,
+            search: Option<&str>,
+            limit: usize,
+            cursor: Option<Uuid>,
+        ) -> Result<AggregateKeysPage> {
+            // DISTINCT ON gives the first event (lowest position) per entity — its payload
+            // is the creation payload the inspector uses for display labels.
+            let sql = "SELECT DISTINCT ON (aggregate_id)
+                              aggregate_id, event_type, payload
+                         FROM causal_log
+                        WHERE aggregate_type = $1
+                          AND ($2::text IS NULL OR aggregate_id::text ILIKE '%' || $2 || '%')
+                          AND ($3::uuid IS NULL OR aggregate_id > $3)
+                        ORDER BY aggregate_id, position ASC
+                        LIMIT $4";
+            let rows = sqlx::query(sql)
+                .bind(aggregate_type)
+                .bind(search)
+                .bind(cursor)
+                .bind((limit + 1) as i64)
+                .fetch_all(&self.pool)
+                .await?;
+
+            let mut entries: Vec<AggregateKeyEntry> = rows
+                .iter()
+                .map(|r| {
+                    Ok(AggregateKeyEntry {
+                        aggregate_id: r.try_get("aggregate_id")?,
+                        event_type: r.try_get("event_type")?,
+                        first_payload: r.try_get("payload")?,
+                    })
+                })
+                .collect::<Result<_>>()?;
+
+            let next_cursor = if entries.len() > limit {
+                entries.truncate(limit);
+                entries.last().map(|e| e.aggregate_id)
+            } else {
+                None
+            };
+
+            Ok(AggregateKeysPage { entries, next_cursor })
+        }
+
+        async fn subject_chain(
+            &self,
+            aggregate_type: &str,
+            aggregate_id: Uuid,
+            mode: SubjectChainMode,
+            limit: usize,
+            cursor: Option<i64>,
+        ) -> Result<SubjectChainPage> {
+            match mode {
+                SubjectChainMode::Stream => {
+                    let events = self
+                        .pg_stream_page(aggregate_type, aggregate_id, limit, cursor)
+                        .await?;
+                    let next_cursor = events.last().map(|e| e.stored.seq);
+                    Ok(SubjectChainPage { events, next_cursor, depth_cap_reached: false })
+                }
+                SubjectChainMode::Descendants => {
+                    self.pg_desc_page(aggregate_type, aggregate_id, limit, cursor).await
+                }
+                SubjectChainMode::Both => {
+                    let fetch = limit * 2;
+                    let (stream_events, mut desc_page) = tokio::try_join!(
+                        self.pg_stream_page(aggregate_type, aggregate_id, fetch, cursor),
+                        self.pg_desc_page(aggregate_type, aggregate_id, fetch, cursor),
+                    )?;
+                    // Merge by position — stream wins over descendant for same seq.
+                    let mut merged: std::collections::BTreeMap<i64, SubjectChainEventRaw> =
+                        std::collections::BTreeMap::new();
+                    for ev in desc_page.events.drain(..) {
+                        merged.insert(ev.stored.seq, ev);
+                    }
+                    for ev in stream_events {
+                        merged.insert(ev.stored.seq, ev);
+                    }
+                    let events: Vec<SubjectChainEventRaw> =
+                        merged.into_values().take(limit).collect();
+                    let next_cursor = events.last().map(|e| e.stored.seq);
+                    Ok(SubjectChainPage {
+                        events,
+                        next_cursor,
+                        depth_cap_reached: desc_page.depth_cap_reached,
+                    })
+                }
+            }
+        }
+    }
+
+    impl PgInspectorReadModel {
+        async fn pg_stream_page(
+            &self,
+            aggregate_type: &str,
+            aggregate_id: Uuid,
+            limit: usize,
+            cursor: Option<i64>,
+        ) -> Result<Vec<SubjectChainEventRaw>> {
+            let sql = format!(
+                "SELECT {EVENT_COLS} FROM causal_log
+                  WHERE aggregate_type = $1
+                    AND aggregate_id = $2
+                    AND ($3::bigint IS NULL OR position > $3)
+                  ORDER BY position ASC
+                  LIMIT $4"
+            );
+            let rows = sqlx::query(&sql)
+                .bind(aggregate_type)
+                .bind(aggregate_id)
+                .bind(cursor)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?;
+            rows.iter()
+                .map(|r| {
+                    Ok(SubjectChainEventRaw {
+                        stored: row_to_stored(r)?,
+                        source_mode: SubjectChainSourceMode::Stream,
+                    })
+                })
+                .collect()
+        }
+
+        async fn pg_desc_page(
+            &self,
+            aggregate_type: &str,
+            aggregate_id: Uuid,
+            limit: usize,
+            cursor: Option<i64>,
+        ) -> Result<SubjectChainPage> {
+            // Recursive CTE bounded at depth 10. EXISTS(...) computes depth_cap_reached
+            // across the full tree (not just the returned page) because the CTE is
+            // materialized once and both the JOIN and the EXISTS scan the same result.
+            let sql = format!(
+                "WITH RECURSIVE origins AS (
+                    SELECT event_id FROM causal_log
+                     WHERE aggregate_type = $1 AND aggregate_id = $2
+                 ),
+                 descendants(event_id, depth) AS (
+                    SELECT l.event_id, 1
+                      FROM causal_log l
+                     WHERE l.causation_id IN (SELECT event_id FROM origins)
+                    UNION ALL
+                    SELECT l.event_id, d.depth + 1
+                      FROM causal_log l
+                      JOIN descendants d ON l.causation_id = d.event_id
+                     WHERE d.depth < 10
+                 )
+                 SELECT {EVENT_COLS},
+                        (EXISTS(SELECT 1 FROM descendants WHERE depth >= 10)) AS depth_cap_reached
+                   FROM causal_log l
+                   JOIN (SELECT DISTINCT event_id FROM descendants) d ON l.event_id = d.event_id
+                  WHERE ($3::bigint IS NULL OR l.position > $3)
+                  ORDER BY l.position ASC
+                  LIMIT $4"
+            );
+            let rows = sqlx::query(&sql)
+                .bind(aggregate_type)
+                .bind(aggregate_id)
+                .bind(cursor)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?;
+
+            let depth_cap_reached = rows
+                .first()
+                .and_then(|r| r.try_get::<bool, _>("depth_cap_reached").ok())
+                .unwrap_or(false);
+
+            let events = rows
+                .iter()
+                .map(|r| {
+                    Ok(SubjectChainEventRaw {
+                        stored: row_to_stored(r)?,
+                        source_mode: SubjectChainSourceMode::Descendant,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let next_cursor = events.last().map(|e| e.stored.seq);
+            Ok(SubjectChainPage { events, next_cursor, depth_cap_reached })
         }
     }
 }

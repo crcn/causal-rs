@@ -202,3 +202,85 @@ export const INSPECTOR_REACTOR_ATTEMPTS = `
     }
   }
 `;
+
+// ── Entity-scoped inspection queries ─────────────────────────────────────
+
+const SUBJECT_CHAIN_EVENT_FIELDS = `
+  seq
+  ts
+  type
+  name
+  id
+  causationId
+  workflowId
+  reactorId
+  aggregateType
+  aggregateId
+  streamRevision
+  summary
+  payload
+  sourceMode
+`;
+
+export const INSPECTOR_SUBJECT_CHAIN = `
+  query InspectorSubjectChain(
+    $aggregateType: String!
+    $aggregateId: String!
+    $mode: SubjectChainMode!
+    $limit: Int
+    $cursor: Int
+  ) {
+    inspectorSubjectChain(
+      aggregateType: $aggregateType
+      aggregateId: $aggregateId
+      mode: $mode
+      limit: $limit
+      cursor: $cursor
+    ) {
+      events {
+        ${SUBJECT_CHAIN_EVENT_FIELDS}
+      }
+      nextCursor
+      depthCapReached
+    }
+  }
+`;
+
+export const INSPECTOR_EFFECTS_FOR_EVENT = `
+  query InspectorEffectsForEvent($eventId: String!) {
+    inspectorEffectsForEvent(eventId: $eventId) {
+      consumer
+      label
+      value
+      createdAt
+    }
+  }
+`;
+
+export const INSPECTOR_AGGREGATE_TYPES = `
+  query InspectorAggregateTypes($search: String, $limit: Int) {
+    inspectorAggregateTypes(search: $search, limit: $limit)
+  }
+`;
+
+export const INSPECTOR_AGGREGATE_KEYS_BY_TYPE = `
+  query InspectorAggregateKeysByType(
+    $aggregateType: String!
+    $search: String
+    $limit: Int
+    $cursor: String
+  ) {
+    inspectorAggregateKeysByType(
+      aggregateType: $aggregateType
+      search: $search
+      limit: $limit
+      cursor: $cursor
+    ) {
+      entries {
+        aggregateId
+        displayLabel
+      }
+      nextCursor
+    }
+  }
+`;

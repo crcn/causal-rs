@@ -3,6 +3,8 @@ import type { Reducer } from "./machine";
 import type { InspectorMachineEvent } from "./events";
 import type { InspectorState } from "./state";
 
+import type { SubjectChainMode } from "./types";
+
 /**
  * Shared navigation logic used by both user-initiated facts
  * (ui/flow_opened, ui/handler_selected) and browser-initiated
@@ -50,6 +52,27 @@ function applyNavigation(
       workflowId: draft.flowWorkflowId,
     };
   }
+}
+
+function applySubjectSelected(
+  draft: Draft<InspectorState>,
+  aggregateType: string,
+  aggregateId: string,
+  mode: SubjectChainMode,
+) {
+  draft.subjectType = aggregateType;
+  draft.subjectId = aggregateId;
+  draft.subjectMode = mode;
+  draft.subjectChain = [];
+  draft.subjectChainCursor = null;
+  draft.subjectDepthCapped = false;
+  draft.subjectChainLoading = true;
+  // Mutual exclusion: clear workflow state
+  draft.flowWorkflowId = null;
+  draft.flowData = [];
+  draft.flowSelection = null;
+  draft.causalTree = null;
+  draft.logsFilter = { scope: "reactor", reactorId: null, workflowId: null };
 }
 
 export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
@@ -164,8 +187,13 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
       applyNavigation(draft, draft.flowWorkflowId, event.payload.reactorId);
       break;
     case "location/changed":
-      applyNavigation(draft, event.payload.workflowId, event.payload.handler);
-      draft.filters.workflowId = event.payload.workflowId;
+      if (event.payload.subject) {
+        const [subjectType, subjectId] = event.payload.subject.split(/:(.+)/);
+        applySubjectSelected(draft, subjectType, subjectId, event.payload.subjectMode ?? "both");
+      } else {
+        applyNavigation(draft, event.payload.workflowId, event.payload.handler);
+        draft.filters.workflowId = event.payload.workflowId;
+      }
       break;
 
     // ── UI ──
@@ -215,5 +243,51 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
     case "ui/load_more_workflows_requested":
       draft.workflowsLoading = true;
       break;
+
+    // ── Entity-scoped inspection ──
+
+    case "ui/subject_selected":
+      applySubjectSelected(draft, event.payload.aggregateType, event.payload.aggregateId, event.payload.mode ?? "both");
+      break;
+
+    case "ui/subject_mode_changed":
+      draft.subjectMode = event.payload.mode;
+      draft.subjectChain = [];
+      draft.subjectChainCursor = null;
+      draft.subjectChainLoading = true;
+      break;
+
+    case "ui/subject_chain_load_more":
+      draft.subjectChainLoading = true;
+      break;
+
+    case "ui/event_effects_requested": {
+      const { eventId } = event.payload;
+      if (!draft.loadingEffects.includes(eventId) && !(eventId in draft.expandedEffects)) {
+        draft.loadingEffects.push(eventId);
+      }
+      break;
+    }
+
+    case "events/subject_chain_loaded": {
+      const { events, hasMore, cursor, depthCapped, append } = event.payload;
+      if (append) {
+        draft.subjectChain.push(...events);
+      } else {
+        draft.subjectChain = events;
+      }
+      draft.subjectChainHasMore = hasMore;
+      draft.subjectChainCursor = cursor;
+      draft.subjectDepthCapped = depthCapped;
+      draft.subjectChainLoading = false;
+      break;
+    }
+
+    case "events/event_effects_loaded": {
+      const { eventId, effects } = event.payload;
+      draft.expandedEffects[eventId] = effects;
+      draft.loadingEffects = draft.loadingEffects.filter(id => id !== eventId);
+      break;
+    }
   }
 };

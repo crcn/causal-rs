@@ -188,6 +188,69 @@ pub struct CorrelationSummaryEntry {
     pub has_errors: bool,
 }
 
+/// One `ctx.effect()` result associated with a triggering event.
+#[derive(Debug, Clone)]
+pub struct EffectRecord {
+    pub consumer:   String,
+    pub label:      String,
+    pub value:      serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Whether a subject-chain event came from the entity's own stream or from a
+/// downstream descendant triggered by that stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::Enum))]
+pub enum SubjectChainSourceMode {
+    Stream,
+    Descendant,
+}
+
+/// Query mode for `subject_chain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "graphql", derive(async_graphql::Enum))]
+pub enum SubjectChainMode {
+    /// Only events whose aggregate_type/aggregate_id matches the subject.
+    Stream,
+    /// Only events caused (directly or transitively) by the subject's stream events.
+    Descendants,
+    /// Both stream and descendant events merged by position, stream wins on conflict.
+    Both,
+}
+
+/// A raw event from a subject chain query, before display transformation.
+#[derive(Debug, Clone)]
+pub struct SubjectChainEventRaw {
+    pub stored:      StoredEvent,
+    pub source_mode: SubjectChainSourceMode,
+}
+
+/// Raw paginated result from `subject_chain`, before display transformation.
+#[derive(Debug, Clone)]
+pub struct SubjectChainPage {
+    pub events:            Vec<SubjectChainEventRaw>,
+    /// Position of the last returned event, for the next page cursor.
+    pub next_cursor:       Option<i64>,
+    /// True if the descendant tree was truncated at the depth cap (depth 10).
+    pub depth_cap_reached: bool,
+}
+
+/// One entity (aggregate) entry with its first-event data for label extraction.
+#[derive(Debug, Clone)]
+pub struct AggregateKeyEntry {
+    pub aggregate_id:   Uuid,
+    pub event_type:     String,
+    pub first_payload:  serde_json::Value,
+}
+
+/// Paginated entity list from `list_aggregate_keys_by_type`.
+#[derive(Debug, Clone)]
+pub struct AggregateKeysPage {
+    pub entries:     Vec<AggregateKeyEntry>,
+    /// aggregate_id of the last entry, for the next page cursor.
+    pub next_cursor: Option<Uuid>,
+}
+
 /// Store-agnostic read model for the inspector.
 ///
 /// Implement this trait for your store backend (Postgres, in-memory, etc.)
@@ -197,7 +260,7 @@ pub struct CorrelationSummaryEntry {
 ///
 /// ```ignore
 /// let store = Arc::new(MemoryStore::new());
-/// schema_builder.data(store.clone() as Arc<dyn InspectorReadModel>);
+/// schema_builder.data(Arc::new(MemoryInspectorReadModel::new(store)) as Arc<dyn InspectorReadModel>);
 /// ```
 #[async_trait]
 pub trait InspectorReadModel: Send + Sync {
@@ -298,4 +361,36 @@ pub trait InspectorReadModel: Send + Sync {
 
     /// List all known aggregate keys.
     async fn list_aggregate_keys(&self) -> Result<Vec<String>>;
+
+    // ── Entity-scoped inspection ─────────────────────────────────
+
+    /// All `ctx.effect()` results triggered by the given event.
+    async fn effects_for_event(&self, event_id: Uuid) -> Result<Vec<EffectRecord>>;
+
+    /// Distinct aggregate types present in the event log, optionally filtered.
+    async fn list_aggregate_types(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>>;
+
+    /// Entities of a given type with the first event's data for label extraction.
+    /// Cursor is the `aggregate_id` of the last seen entry.
+    async fn list_aggregate_keys_by_type(
+        &self,
+        aggregate_type: &str,
+        search: Option<&str>,
+        limit: usize,
+        cursor: Option<Uuid>,
+    ) -> Result<AggregateKeysPage>;
+
+    /// Events for an entity scoped by mode, paginated by position cursor.
+    async fn subject_chain(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
+        mode: SubjectChainMode,
+        limit: usize,
+        cursor: Option<i64>,
+    ) -> Result<SubjectChainPage>;
 }

@@ -145,3 +145,49 @@ export type FlowSelection =
  * just stores and round-trips it.
  */
 export type PaneLayout = Record<string, unknown>;
+
+// ── Entity-scoped inspection ──────────────────────────────────────────────
+
+/** Whether a subject-chain event came from the entity's own stream or a downstream descendant. */
+export type SubjectChainSourceMode = "stream" | "descendant";
+
+/** Query mode for subject_chain — which events to include. */
+export type SubjectChainMode = "stream" | "descendants" | "both";
+
+/** One event in a subject chain response, with display names applied. */
+export type SubjectChainEvent = {
+  seq: number;
+  ts: string;
+  type: string;
+  name: string;
+  id: string | null;
+  causationId: string | null;
+  workflowId: string | null;
+  reactorId: string | null;
+  aggregateType: string | null;
+  aggregateId: string | null;
+  streamRevision: number | null;
+  summary: string | null;
+  payload: string;
+  sourceMode: SubjectChainSourceMode;
+};
+
+/** One `ctx.effect()` result for the effects inspector panel. */
+export type InspectorEffect = {
+  consumer: string;
+  label: string;
+  value: unknown;
+  createdAt: string;
+};
+
+/** One entity entry from the aggregate keys listing. */
+export type AggregateKeyEntry = {
+  aggregateId: string;
+  displayLabel: string | null;
+};
+
+/** Paginated entity listing response. */
+export type AggregateKeysPage = {
+  entries: AggregateKeyEntry[];
+  nextCursor: string | null;
+};

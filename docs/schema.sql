@@ -191,3 +191,24 @@ CREATE TABLE causal_aggregate_snapshots (
 );
 CREATE INDEX idx_agg_snap_corr ON causal_aggregate_snapshots (correlation_id);
 CREATE INDEX idx_agg_snap_key  ON causal_aggregate_snapshots (aggregate_key);
+
+-- ── causal_effect_store: durable memo of reactor side effects ────────
+--
+-- Backs `PgEffectStore`. Keyed by (consumer, trigger_event_id, label);
+-- first-write-wins via INSERT ... ON CONFLICT DO NOTHING.
+-- `trigger_event_id` links to causal_log.event_id — effects are
+-- associated with the event that triggered the reactor that produced them.
+CREATE TABLE IF NOT EXISTS causal_effect_store (
+    consumer         TEXT    NOT NULL,
+    trigger_event_id UUID    NOT NULL,
+    label            TEXT    NOT NULL,
+    value            JSONB   NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (consumer, trigger_event_id, label)
+);
+
+-- Partial index for efficient causation-chain traversal in recursive CTEs.
+-- Required by the inspector's DESCENDANTS subject-chain mode.
+CREATE INDEX IF NOT EXISTS idx_causal_log_causation
+    ON causal_log (causation_id)
+    WHERE causation_id IS NOT NULL;

@@ -88,3 +88,36 @@ async fn effect_store_remember_calls_compute_once() -> Result<()> {
 async fn effect_store_remember_replays_cached_on_redelivery() -> Result<()> {
     conformance::effect_store_remember_replays_cached_on_redelivery(&backend().await).await
 }
+
+// ── Crash scenario ────────────────────────────────────────────────────
+
+/// `PgEffectStore` entries survive a process restart.
+///
+/// Simulates process A caching an effect result, then dying (in-memory
+/// struct dropped). Process B opens a new store on the same database —
+/// the entry must still be there. This is the property that makes
+/// `ctx.effect()` safe across restarts: a cached result is never lost.
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + causal_effect_store table"]
+async fn effect_store_survives_process_restart() -> Result<()> {
+    use causal::effect_store::{EffectKey, EffectStore};
+    use uuid::Uuid;
+
+    let key = EffectKey::new("crash-restart-consumer", Uuid::new_v4(), "api-call");
+    let value = serde_json::json!({"result": "cached-by-process-a"});
+
+    // "Process A" — puts a value, then dies. Dropping the store loses all
+    // in-memory state; the Postgres row persists.
+    {
+        let store_a = backend().await;
+        store_a.put(&key, value.clone()).await?;
+    }
+
+    // "Process B" — new store instance on the same database.
+    let store_b = backend().await;
+    let retrieved = store_b.get(&key).await?;
+    assert_eq!(retrieved, Some(value), "PgEffectStore entry must survive process restart");
+
+    store_b.remove(&key).await?;
+    Ok(())
+}

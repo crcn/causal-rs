@@ -13,6 +13,9 @@ import type {
   ReactorOutcome,
   ReactorAttempt,
   PaneLayout,
+  SubjectChainEvent,
+  SubjectChainMode,
+  InspectorEffect,
 } from "./types";
 
 // ── Subscription events ──
@@ -76,7 +79,16 @@ type WorkflowsRequested = BaseEvent<"ui/workflows_requested", { search?: string 
 type HandlerSelected = BaseEvent<"ui/handler_selected", { reactorId: string }>;
 type AggregateLifecycleRequested = BaseEvent<"ui/aggregate_lifecycle_requested", { aggregateKey: string }>;
 type LoadMoreWorkflowsRequested = BaseEvent<"ui/load_more_workflows_requested">;
-type LocationChanged = BaseEvent<"location/changed", { workflowId: string | null; handler: string | null }>;
+type LocationChanged = BaseEvent<"location/changed", { workflowId: string | null; handler: string | null; subject: string | null; subjectMode: SubjectChainMode | null }>;
+
+// ── Entity-scoped inspection events ──
+
+type SubjectSelected = BaseEvent<"ui/subject_selected", { aggregateType: string; aggregateId: string; mode?: SubjectChainMode }>;
+type SubjectModeChanged = BaseEvent<"ui/subject_mode_changed", { mode: SubjectChainMode }>;
+type SubjectChainLoadMore = BaseEvent<"ui/subject_chain_load_more">;
+type EventEffectsRequested = BaseEvent<"ui/event_effects_requested", { eventId: string }>;
+type SubjectChainLoaded = BaseEvent<"events/subject_chain_loaded", { events: SubjectChainEvent[]; hasMore: boolean; cursor: number | null; depthCapped: boolean; append: boolean }>;
+type EventEffectsLoaded = BaseEvent<"events/event_effects_loaded", { eventId: string; effects: InspectorEffect[] }>;
 
 // ── Union ──
 
@@ -113,4 +125,10 @@ export type InspectorMachineEvent =
   | LocationChanged
   | AggregateLifecycleLoaded
   | AggregateLifecycleRequested
-  | LoadMoreWorkflowsRequested;
+  | LoadMoreWorkflowsRequested
+  | SubjectSelected
+  | SubjectModeChanged
+  | SubjectChainLoadMore
+  | EventEffectsRequested
+  | SubjectChainLoaded
+  | EventEffectsLoaded;
