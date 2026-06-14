@@ -889,6 +889,12 @@ struct ConsumerFn {
     ordering: Option<Ident>,
     max_in_flight: Option<u64>,
     kinds: Option<Vec<String>>,
+    /// Per-reactor retry policy params. All optional; any present
+    /// causes `retry_policy()` to be generated on the impl.
+    retry_max_attempts: Option<u32>,
+    retry_initial_backoff_ms: Option<u64>,
+    retry_backoff_multiplier: Option<f64>,
+    retry_max_backoff_ms: Option<u64>,
 }
 
 fn lit_str_of(value: &Expr) -> Option<String> {
@@ -942,6 +948,10 @@ fn parse_consumer_fn(
     let mut ordering = None;
     let mut max_in_flight = None;
     let mut kinds: Option<Vec<String>> = None;
+    let mut retry_max_attempts: Option<u32> = None;
+    let mut retry_initial_backoff_ms: Option<u64> = None;
+    let mut retry_backoff_multiplier: Option<f64> = None;
+    let mut retry_max_backoff_ms: Option<u64> = None;
 
     for meta in metas {
         match meta {
@@ -998,6 +1008,42 @@ fn parse_consumer_fn(
                         }
                     }
                     kinds = Some(out);
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("max_attempts") && attr_name == "reactor" =>
+            {
+                if let Expr::Lit(el) = value {
+                    if let Lit::Int(i) = &el.lit {
+                        retry_max_attempts = Some(i.base10_parse::<u32>()?);
+                    }
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("initial_backoff_ms") && attr_name == "reactor" =>
+            {
+                if let Expr::Lit(el) = value {
+                    if let Lit::Int(i) = &el.lit {
+                        retry_initial_backoff_ms = Some(i.base10_parse::<u64>()?);
+                    }
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("backoff_multiplier") && attr_name == "reactor" =>
+            {
+                if let Expr::Lit(el) = value {
+                    if let Lit::Float(f) = &el.lit {
+                        retry_backoff_multiplier = Some(f.base10_parse::<f64>()?);
+                    }
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("max_backoff_ms") && attr_name == "reactor" =>
+            {
+                if let Expr::Lit(el) = value {
+                    if let Lit::Int(i) = &el.lit {
+                        retry_max_backoff_ms = Some(i.base10_parse::<u64>()?);
+                    }
                 }
             }
             other => {
@@ -1089,6 +1135,10 @@ fn parse_consumer_fn(
         ordering,
         max_in_flight,
         kinds,
+        retry_max_attempts,
+        retry_initial_backoff_ms,
+        retry_backoff_multiplier,
+        retry_max_backoff_ms,
     })
 }
 
@@ -1139,7 +1189,7 @@ fn expand_consumers_module(
     // fn's own type paths resolve unchanged.
     let mut generated: Vec<Item> = Vec::new();
     for c in &parsed {
-        let ConsumerFn { fn_ident, struct_ident, event_ty, name, ordering, max_in_flight, kinds } = c;
+        let ConsumerFn { fn_ident, struct_ident, event_ty, name, ordering, max_in_flight, kinds, .. } = c;
         let struct_def: Item = match &deps_ty {
             Some(d) => parse_quote! {
                 #[allow(non_camel_case_types)]
@@ -1169,6 +1219,35 @@ fn expand_consumers_module(
                 let n = n as usize;
                 quote! { const MAX_IN_FLIGHT: usize = #n; }
             });
+            // Generate retry_policy() only when at least one retry param is
+            // present. Missing params use RetryPolicy defaults so a caller can
+            // write just `max_attempts = 5` without spelling out backoff shape.
+            let retry_policy_fn = if c.retry_max_attempts.is_some()
+                || c.retry_initial_backoff_ms.is_some()
+                || c.retry_backoff_multiplier.is_some()
+                || c.retry_max_backoff_ms.is_some()
+            {
+                // Unspecified fields fall back to the historical defaults
+                // (25 ms base, ×2 multiplier, 5 s cap, 3 attempts) so a
+                // caller can write just `max_attempts = 10` without spelling
+                // out the full backoff shape.
+                let ma  = c.retry_max_attempts.unwrap_or(3u32);
+                let ibm = c.retry_initial_backoff_ms.unwrap_or(25u64);
+                let bm  = c.retry_backoff_multiplier.unwrap_or(2.0f64);
+                let mbm = c.retry_max_backoff_ms.unwrap_or(5_000u64);
+                quote! {
+                    fn retry_policy(&self) -> ::std::option::Option<::causal::RetryPolicy> {
+                        ::std::option::Option::Some(::causal::RetryPolicy {
+                            max_attempts:        #ma,
+                            initial_backoff_ms:  #ibm,
+                            backoff_multiplier:  #bm,
+                            max_backoff_ms:      #mbm,
+                        })
+                    }
+                }
+            } else {
+                quote! {}
+            };
             parse_quote! {
                 #[::causal::async_trait]
                 impl ::causal::Reactor for #struct_ident {
@@ -1176,6 +1255,7 @@ fn expand_consumers_module(
                     const NAME: &'static str = #name;
                     #ordering_const
                     #mif_const
+                    #retry_policy_fn
                     async fn react(
                         &self,
                         __trigger: &#event_ty,

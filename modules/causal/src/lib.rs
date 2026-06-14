@@ -141,7 +141,7 @@ pub use aggregator::Aggregator;
 // Consumers
 pub use projector::Projector;
 pub use multi_projector::MultiProjector;
-pub use reactor::{Events, Ordering, Reactor};
+pub use reactor::{Events, Ordering, Reactor, RetryPolicy};
 pub use failure::{domain, poison, transient, ErrorClass, FailureClass};
 
 // Engine + emit

@@ -186,6 +186,86 @@ pub trait Reactor: Send + Sync {
     fn describe(&self, _trigger: &Self::Trigger) -> Option<serde_json::Value> {
         None
     }
+
+    /// Override the engine-wide retry policy for this reactor. `None`
+    /// (the default) inherits the engine's configured policy.
+    ///
+    /// Use the named constructors for the two common shapes:
+    ///
+    /// ```ignore
+    /// fn retry_policy(&self) -> Option<RetryPolicy> {
+    ///     Some(RetryPolicy::exponential(10, 500))  // 10 attempts, 500 ms → 60 s
+    /// }
+    /// ```
+    ///
+    /// The `#[reactor]` macro generates this method from flat params:
+    /// `#[reactor(name = "...", max_attempts = 10, initial_backoff_ms = 500)]`
+    fn retry_policy(&self) -> Option<RetryPolicy> {
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// RetryPolicy
+// ─────────────────────────────────────────────────────────────────────
+
+/// Per-reactor retry budget and backoff shape for domain-class and
+/// unclassified errors. Transient errors are governed separately by
+/// [`TRANSIENT_CEILING`](crate::reactor_runner::TRANSIENT_CEILING)
+/// (liveness time, not attempts); poison parks immediately regardless.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryPolicy {
+    /// Maximum attempts before a domain / unclassified error parks.
+    pub max_attempts: u32,
+    /// Delay before the first retry, in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Multiplier applied to the delay on each successive attempt.
+    pub backoff_multiplier: f64,
+    /// Ceiling on the computed delay, in milliseconds.
+    pub max_backoff_ms: u64,
+}
+
+impl RetryPolicy {
+    /// Exponential backoff with sane defaults: multiplier = 2.0,
+    /// ceiling = 60 seconds.
+    pub fn exponential(max_attempts: u32, initial_backoff_ms: u64) -> Self {
+        Self {
+            max_attempts,
+            initial_backoff_ms,
+            backoff_multiplier: 2.0,
+            max_backoff_ms: 60_000,
+        }
+    }
+
+    /// Fixed delay — no growth between attempts.
+    pub fn fixed(max_attempts: u32, delay_ms: u64) -> Self {
+        Self {
+            max_attempts,
+            initial_backoff_ms: delay_ms,
+            backoff_multiplier: 1.0,
+            max_backoff_ms: delay_ms,
+        }
+    }
+
+    /// Engine-default policy shaped from a bare `max_attempts` count,
+    /// preserving the historical backoff constants (25 ms base, ×2, 5 s cap).
+    pub(crate) fn from_max_attempts(max_attempts: u32) -> Self {
+        Self {
+            max_attempts,
+            initial_backoff_ms: 25,
+            backoff_multiplier: 2.0,
+            max_backoff_ms: 5_000,
+        }
+    }
+
+    /// Compute the sleep duration before attempt `n` (0-indexed).
+    pub(crate) fn backoff_for(&self, attempt: u32) -> std::time::Duration {
+        let base = std::time::Duration::from_millis(self.initial_backoff_ms);
+        // cap the exponent to avoid f64 overflow on very high attempt counts
+        let exp = self.backoff_multiplier.powi(attempt.min(63) as i32);
+        base.mul_f64(exp)
+            .min(std::time::Duration::from_millis(self.max_backoff_ms))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

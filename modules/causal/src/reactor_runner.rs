@@ -72,10 +72,6 @@ use crate::types::{EventData, LogCursor, RecordedEvent, StreamState};
 /// never by how far the log head ran ahead of a slow partition.
 const MAX_PENDING: usize = 4096;
 
-/// Worker-local retry pacing: capped exponential backoff.
-const WORKER_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(25);
-const WORKER_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// The transient-class retry ceiling (BLOCKING-2): how long a
 /// transient-classified failure may back off before parking as
 /// `transient_exhausted`. Measured in **liveness time** (tokio
@@ -94,11 +90,6 @@ const TRANSIENT_CEILING: std::time::Duration = std::time::Duration::from_secs(6 
 /// characters since 0.10 step 1).
 pub const REACTION_FAILED_KIND: &str = "causal:reaction_failed";
 
-fn backoff_for(attempt: u32) -> std::time::Duration {
-    WORKER_BACKOFF_BASE
-        .saturating_mul(1u32 << attempt.min(16))
-        .min(WORKER_BACKOFF_CAP)
-}
 
 /// Namespace UUID for deriving deterministic reactor-output event_ids
 /// via uuid v5. Hardcoded so the same identity inputs always produce
@@ -285,10 +276,10 @@ struct Core<R: Reactor> {
     /// subject history — the terminal path is mandatory; there is no
     /// retry-forever mode.
     failure_mapper:  Option<TerminalFailureMapper>,
-    /// Retry budget for domain-class / unclassified errors. Transient
-    /// errors are governed by [`TRANSIENT_CEILING`] (liveness time);
-    /// poison parks immediately.
-    max_attempts: u32,
+    /// Retry budget and backoff shape for domain-class / unclassified
+    /// errors. Transient errors are governed by [`TRANSIENT_CEILING`]
+    /// (liveness time); poison parks immediately.
+    retry_policy: crate::reactor::RetryPolicy,
     /// Inspector / telemetry hook. Default `None` = zero overhead.
     observer:    Option<Arc<dyn ReactorObserver>>,
     /// Reaction-result cache. Surfaced to the reactor body via
@@ -344,6 +335,11 @@ where
         log: Arc<dyn EventLogBackend>,
         checkpoint: Arc<dyn ReactorCheckpoint>,
     ) -> Self {
+        let retry_policy = reactor
+            .retry_policy()
+            .unwrap_or_else(|| crate::reactor::RetryPolicy::from_max_attempts(
+                crate::engine::DEFAULT_MAX_ATTEMPTS,
+            ));
         let (completions_tx, completions_rx) = mpsc::unbounded_channel();
         Self {
             core: Arc::new(Core {
@@ -353,7 +349,7 @@ where
                 checkpoint,
                 fold_registry: None,
                 failure_mapper: None,
-                max_attempts: crate::engine::DEFAULT_MAX_ATTEMPTS,
+                retry_policy,
                 observer: None,
                 effect_store: None,
                 engine_aggregators: None,
@@ -470,10 +466,18 @@ where
         self
     }
 
-    /// Retry budget for domain-class / unclassified errors (default
-    /// [`crate::engine::DEFAULT_MAX_ATTEMPTS`]).
+    /// Override the retry policy for this runner. Replaces both the
+    /// attempt budget and the backoff shape. Called by the engine builder
+    /// after resolving the effective policy (per-reactor override →
+    /// engine-wide default → `DEFAULT_MAX_ATTEMPTS`).
+    pub(crate) fn with_retry_policy(mut self, p: crate::reactor::RetryPolicy) -> Self {
+        self.core_mut().retry_policy = p;
+        self
+    }
+
+    /// Convenience shim: set only `max_attempts`, keep existing backoff shape.
     pub(crate) fn with_max_attempts(mut self, n: u32) -> Self {
-        self.core_mut().max_attempts = n;
+        self.core_mut().retry_policy = crate::reactor::RetryPolicy::from_max_attempts(n);
         self
     }
 
@@ -858,10 +862,10 @@ where
                             None
                         }
                     }
-                    Some(ErrorClass::Domain) if attempts >= self.max_attempts => {
+                    Some(ErrorClass::Domain) if attempts >= self.retry_policy.max_attempts => {
                         Some(FailureClass::Domain)
                     }
-                    None if attempts >= self.max_attempts => {
+                    None if attempts >= self.retry_policy.max_attempts => {
                         Some(FailureClass::Unclassified)
                     }
                     _ => None,
@@ -910,7 +914,7 @@ where
             local_attempt += 1;
             tokio::select! {
                 _ = self.stop_notify.notified() => return None,
-                _ = tokio::time::sleep(backoff_for(local_attempt)) => {}
+                _ = tokio::time::sleep(self.retry_policy.backoff_for(local_attempt)) => {}
             }
         }
     }
@@ -2283,6 +2287,49 @@ mod tests {
         assert_eq!(parked.payload["consumer"], "no-mapper-parks");
         assert!(store.get("no-mapper-parks").await.unwrap().is_some(),
                 "floor advanced past the parked trigger");
+        runner.halt();
+    }
+
+    struct AlwaysFailsOneAttempt(std::sync::Arc<AtomicUsize>);
+    #[async_trait]
+    impl Reactor for AlwaysFailsOneAttempt {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "always-fails-one-attempt";
+        async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("boom"))
+        }
+        fn retry_policy(&self) -> Option<crate::reactor::RetryPolicy> {
+            Some(crate::reactor::RetryPolicy::fixed(1, 0))
+        }
+    }
+
+    #[tokio::test]
+    async fn per_reactor_retry_policy_overrides_engine_default_max_attempts() {
+        // A reactor that declares max_attempts = 1 via retry_policy() must
+        // park after a single failure, regardless of the engine-wide default
+        // (DEFAULT_MAX_ATTEMPTS = 3).
+        let store = Arc::new(MemoryStore::new());
+        let payload = OrderPlaced {
+            order_id:    Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        };
+        append_trigger(&store, &payload);
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let runner = ReactorRunner::new(
+            AlwaysFailsOneAttempt(calls.clone()),
+            "always-fails-one-attempt",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        );
+
+        runner.quiesce().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst), 1,
+            "reactor's own retry_policy (max_attempts=1) must take precedence over engine default of {}",
+            crate::engine::DEFAULT_MAX_ATTEMPTS,
+        );
         runner.halt();
     }
 

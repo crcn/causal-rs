@@ -379,7 +379,11 @@ impl<'a> Ctx<'a> {
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
         let cache = self.effect_store
-            .expect("effect_store is always Some — EngineBuilder defaults to InMemoryEffectStore");
+            .expect(
+                "ctx.effect() is only available in reactor bodies — \
+                 projectors are side-effect-free by contract \
+                 (effect_store is None in projector Ctx)"
+            );
         self.claim_label("effect", label)?;
         let key =
             crate::effect_store::EffectKey::new(self.consumer, self.event_id, label);
@@ -416,7 +420,11 @@ impl<'a> Ctx<'a> {
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
         let cache = self.effect_store
-            .expect("effect_store is always Some — EngineBuilder defaults to InMemoryEffectStore");
+            .expect(
+                "ctx.effect() is only available in reactor bodies — \
+                 projectors are side-effect-free by contract \
+                 (effect_store is None in projector Ctx)"
+            );
         // Claim all labels atomically upfront — fail fast before I/O.
         for (label, _) in &effects {
             self.claim_label("effect", label)?;

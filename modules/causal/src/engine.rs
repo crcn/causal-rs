@@ -828,8 +828,11 @@ impl EngineBuilder {
         let log = self.log.clone();
         let reactor_checkpoint = self.reactor_checkpoint.clone();
         self.consumers.push(Box::new(move |w: ConsumerWiring| {
+            let effective_policy = r
+                .retry_policy()
+                .unwrap_or_else(|| crate::reactor::RetryPolicy::from_max_attempts(w.max_attempts));
             let mut runner = ReactorRunner::new(r, R::NAME, log, reactor_checkpoint)
-                .with_max_attempts(w.max_attempts)
+                .with_retry_policy(effective_policy)
                 .with_clock(w.clock);
             if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
             if let Some(mapper) = w.failure_mapper {
