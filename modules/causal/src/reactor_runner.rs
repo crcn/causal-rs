@@ -323,6 +323,13 @@ struct Core<R: Reactor> {
     /// workers also check it on each loop boundary for already-queued
     /// triggers. Cancel markers in the log are ingested inline.
     cancelled_workflows: Option<crate::engine::CancelledWorkflows>,
+    /// Optional exclusive-lease provider. When set, `ensure_started` calls
+    /// `leasor.acquire(consumer_id)` before reading the checkpoint — the
+    /// lease prevents two servers from processing this consumer simultaneously.
+    leasor: Option<Arc<dyn crate::consumer_lease::ConsumerLeasor>>,
+    /// The held lease guard. Non-None while the runner is active.
+    /// Dropping it releases the lease (and the underlying connection).
+    lease: parking_lot::Mutex<Option<Box<dyn crate::consumer_lease::LeaseGuard>>>,
 }
 
 impl<R: Reactor + 'static> ReactorRunner<R>
@@ -380,6 +387,8 @@ where
                 stopped: AtomicBool::new(false),
                 stop_notify: tokio::sync::Notify::new(),
                 cancelled_workflows: None,
+                leasor: None,
+                lease: parking_lot::Mutex::new(None),
             }),
         }
     }
@@ -484,6 +493,19 @@ where
     /// Inject the calendar clock for runner-stamped timestamps.
     pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.core_mut().clock = clock;
+        self
+    }
+
+    /// Attach an exclusive-lease provider. Before the runner's first
+    /// `step()`, it acquires `leasor.acquire(consumer_id)` — blocking
+    /// until any current holder releases or crashes. The guard is held
+    /// for the runner's lifetime; dropping it releases the lease so
+    /// another server can take over.
+    pub fn with_consumer_leasor(
+        mut self,
+        leasor: Arc<dyn crate::consumer_lease::ConsumerLeasor>,
+    ) -> Self {
+        self.core_mut().leasor = Some(leasor);
         self
     }
 
@@ -632,9 +654,17 @@ where
     }
 
     /// Seed `ingest_pos` / `floor` from the durable checkpoint, once.
+    /// If a `ConsumerLeasor` is configured, acquires the exclusive lease
+    /// first — blocking until the current holder releases or crashes.
     async fn ensure_started(&self) -> Result<()> {
         if self.dispatch.lock().started {
             return Ok(());
+        }
+        // Acquire the lease before touching the checkpoint so no second
+        // server can start reading from the same cursor concurrently.
+        if let Some(leasor) = &self.leasor {
+            let guard = leasor.acquire(&self.consumer_id).await?;
+            *self.lease.lock() = Some(guard);
         }
         let cursor = self.checkpoint.get(&self.consumer_id).await?
             .unwrap_or(LogCursor::ZERO);

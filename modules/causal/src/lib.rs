@@ -111,6 +111,7 @@ pub mod reactor;
 pub mod snapshot_store;
 pub mod types;
 
+pub mod consumer_lease;
 pub mod memory_store;
 
 #[cfg(any(test, feature = "testing"))]
@@ -171,6 +172,10 @@ pub use reactor_observer::{NoopObserver, ReactorObserver};
 // Reactor idempotency (Phase 4 foundation): memoize side-effecting
 // reactions so at-least-once delivery is safe; deterministic emit ids.
 pub use effect_store::{remember, InMemoryEffectStore, EffectStore, EffectKey};
+
+// Consumer lease: exclusive per-consumer claim preventing two servers from
+// processing the same consumer's triggers simultaneously.
+pub use consumer_lease::{ConsumerLeasor, LeaseGuard};
 
 // Backend traits (users typically cast `Arc<dyn ...>` at builder time)
 pub use checkpoint_store::{CheckpointStore, ReactorCheckpoint};

@@ -1256,3 +1256,123 @@ pub fn scenario_names() -> &'static [&'static str] {
         "reactor_attempts_clear_resets",
     ]
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// EffectStore conformance (ES1–ES10)
+// ─────────────────────────────────────────────────────────────────────
+
+/// ES1: a fresh store has no entry for a never-seen key.
+pub async fn effect_store_get_miss<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let key = causal::EffectKey::new("es1", uuid::Uuid::new_v4(), "call");
+    assert_eq!(s.get(&key).await?, None, "ES1: miss on unknown key");
+    Ok(())
+}
+
+/// ES2: `put` then `get` returns the stored value.
+pub async fn effect_store_put_and_get_round_trips<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let key = causal::EffectKey::new("es2", uuid::Uuid::new_v4(), "call");
+    let v = serde_json::json!({"x": 42});
+    let stored = s.put(&key, v.clone()).await?;
+    assert_eq!(stored, v, "ES2: put returns the inserted value");
+    let got = s.get(&key).await?;
+    assert_eq!(got, Some(v), "ES2: get returns the stored value");
+    Ok(())
+}
+
+/// ES3: first-write-wins — a second `put` is ignored; both callers
+/// receive the original value.
+pub async fn effect_store_first_write_wins<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let key = causal::EffectKey::new("es3", uuid::Uuid::new_v4(), "call");
+    let first = s.put(&key, serde_json::json!("first")).await?;
+    assert_eq!(first, serde_json::json!("first"), "ES3: first write returns its own value");
+    let second = s.put(&key, serde_json::json!("second")).await?;
+    assert_eq!(second, serde_json::json!("first"), "ES3: second write returns the canonical (first) value");
+    let got = s.get(&key).await?;
+    assert_eq!(got, Some(serde_json::json!("first")), "ES3: stored value is the first write's");
+    Ok(())
+}
+
+/// ES4: `remove` makes the entry absent.
+pub async fn effect_store_remove_makes_entry_absent<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let key = causal::EffectKey::new("es4", uuid::Uuid::new_v4(), "call");
+    s.put(&key, serde_json::json!(99)).await?;
+    s.remove(&key).await?;
+    assert_eq!(s.get(&key).await?, None, "ES4: entry absent after remove");
+    Ok(())
+}
+
+/// ES5: `remove` on an absent key is a no-op (idempotent).
+pub async fn effect_store_remove_is_idempotent<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let key = causal::EffectKey::new("es5", uuid::Uuid::new_v4(), "call");
+    s.remove(&key).await?;
+    s.remove(&key).await?;
+    Ok(())
+}
+
+/// ES6: keys are isolated by `consumer`.
+pub async fn effect_store_keys_isolated_by_consumer<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let trigger = uuid::Uuid::new_v4();
+    let ka = causal::EffectKey::new("consumer-a", trigger, "call");
+    let kb = causal::EffectKey::new("consumer-b", trigger, "call");
+    s.put(&ka, serde_json::json!("a-val")).await?;
+    assert_eq!(s.get(&kb).await?, None, "ES6: consumer-b must not see consumer-a's entry");
+    Ok(())
+}
+
+/// ES7: keys are isolated by `trigger_event_id`.
+pub async fn effect_store_keys_isolated_by_trigger<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let k1 = causal::EffectKey::new("es7", uuid::Uuid::new_v4(), "call");
+    let k2 = causal::EffectKey::new("es7", uuid::Uuid::new_v4(), "call");
+    s.put(&k1, serde_json::json!("t1")).await?;
+    assert_eq!(s.get(&k2).await?, None, "ES7: different trigger must have its own slot");
+    Ok(())
+}
+
+/// ES8: keys are isolated by `label`.
+pub async fn effect_store_keys_isolated_by_label<S: causal::EffectStore>(s: &S) -> Result<()> {
+    let trigger = uuid::Uuid::new_v4();
+    let ka = causal::EffectKey::new("es8", trigger, "label-a");
+    let kb = causal::EffectKey::new("es8", trigger, "label-b");
+    s.put(&ka, serde_json::json!("va")).await?;
+    assert_eq!(s.get(&kb).await?, None, "ES8: different label must have its own slot");
+    Ok(())
+}
+
+/// ES9: `remember` invokes `compute` exactly once for a fresh key.
+pub async fn effect_store_remember_calls_compute_once<S: causal::EffectStore>(s: &S) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let key = causal::EffectKey::new("es9", uuid::Uuid::new_v4(), "call");
+    let calls = Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    let first: i64 = causal::effect_store::remember(s, &key, || async move {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(42_i64)
+    }).await?;
+    assert_eq!(first, 42, "ES9: first call returns computed value");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "ES9: compute ran exactly once");
+    Ok(())
+}
+
+/// ES10: `remember` replays the cached value on a second call without
+/// running `compute` again (redelivery scenario).
+pub async fn effect_store_remember_replays_cached_on_redelivery<S: causal::EffectStore>(s: &S) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let key = causal::EffectKey::new("es10", uuid::Uuid::new_v4(), "call");
+    let calls = Arc::new(AtomicU32::new(0));
+    let c1 = calls.clone();
+    let first: i64 = causal::effect_store::remember(s, &key, || async move {
+        c1.fetch_add(1, Ordering::SeqCst);
+        Ok(100_i64)
+    }).await?;
+    assert_eq!(first, 100, "ES10: first call computed correctly");
+    let c2 = calls.clone();
+    let second: i64 = causal::effect_store::remember(s, &key, || async move {
+        c2.fetch_add(1, Ordering::SeqCst);
+        Ok(999_i64)
+    }).await?;
+    assert_eq!(second, 100, "ES10: redelivery replays the cached result");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "ES10: compute ran exactly once across both calls");
+    Ok(())
+}

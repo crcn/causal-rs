@@ -60,6 +60,8 @@
 //! ```
 
 pub mod conformance;
+pub mod consumer_lease;
+pub mod effect_store;
 pub mod event_log;
 pub mod kurrent_event_log;
 pub mod event_projector;
@@ -100,6 +102,12 @@ pub use event_projector::PgEventProjector;
 
 #[cfg(feature = "postgres")]
 pub use snapshot_store::PgSnapshotStore;
+
+#[cfg(feature = "postgres")]
+pub use effect_store::PgEffectStore;
+
+#[cfg(feature = "postgres")]
+pub use consumer_lease::PgConsumerLeasor;
 
 #[cfg(feature = "postgres")]
 pub use tail::PgNotifyTailSource;

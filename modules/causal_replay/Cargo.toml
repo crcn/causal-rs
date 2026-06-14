@@ -84,3 +84,17 @@ required-features = ["postgres", "kurrent"]
 name = "kurrent_event_log_test"
 path = "tests/kurrent_event_log_test.rs"
 required-features = ["kurrent"]
+
+[[test]]
+name = "memory_effect_store_conformance_test"
+path = "tests/memory_effect_store_conformance_test.rs"
+
+[[test]]
+name = "pg_effect_store_conformance_test"
+path = "tests/pg_effect_store_conformance_test.rs"
+required-features = ["postgres"]
+
+[[test]]
+name = "pg_consumer_lease_test"
+path = "tests/pg_consumer_lease_test.rs"
+required-features = ["postgres"]
