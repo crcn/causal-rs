@@ -151,6 +151,7 @@ pub use failure::{domain, poison, transient, ErrorClass, FailureClass};
 // Engine + emit
 pub use engine::{
     Boundary,
+    DrainResult, RunnerConfig,
     Engine, EngineBuilder,
     EmitBuilder, EmitResult, SettledEmit,
     TerminalFailure,

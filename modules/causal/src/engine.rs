@@ -151,6 +151,49 @@ where
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// RunnerConfig — per-reactor operational config
+// ─────────────────────────────────────────────────────────────────────
+
+/// Per-reactor operational configuration supplied at engine build time.
+///
+/// Separates deployment policy from reactor logic. Pass to
+/// [`EngineBuilder::reactor_with`] alongside the reactor instance.
+#[derive(Debug, Clone, Default)]
+pub struct RunnerConfig {
+    skip_gap_on_start: bool,
+}
+
+impl RunnerConfig {
+    /// Advance this reactor's checkpoint to the log tip on startup,
+    /// abandoning any gap since the last clean drain.
+    ///
+    /// Safe only when the reactor's work re-derives from an external
+    /// re-trigger (a due-sweep, a scheduler, a webhook) on every startup.
+    /// If any trigger arrives exactly once and is never re-emitted,
+    /// those workflows will stall silently after a crash.
+    ///
+    /// A WARN is emitted at startup listing the gap that was skipped and
+    /// workflow IDs that may need external re-triggering.
+    pub fn skip_gap_on_start() -> Self {
+        Self { skip_gap_on_start: true }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// DrainResult
+// ─────────────────────────────────────────────────────────────────────
+
+/// Result of [`Engine::drain`] or [`Engine::run_until_shutdown`].
+#[derive(Debug)]
+pub struct DrainResult {
+    /// `true` if all in-flight reactions completed before the timeout.
+    pub clean: bool,
+    /// Consumer IDs that had in-flight work when the drain timeout expired.
+    /// Empty when `clean` is `true`.
+    pub timed_out_consumers: Vec<String>,
+}
+
 /// Result of a successful `emit(...).await`.
 ///
 /// `position` is the global log cursor of the last event written
@@ -850,6 +893,33 @@ impl EngineBuilder {
         self
     }
 
+    /// Register a reactor with explicit operational configuration.
+    ///
+    /// Use instead of [`with_reactor`](Self::with_reactor) when you need to
+    /// control how the reactor starts up. The [`RunnerConfig`] is a deployment
+    /// concern — the same reactor type can run with different configs in
+    /// different environments.
+    ///
+    /// ```ignore
+    /// Engine::builder()
+    ///     .reactor_with(DueSweep::new(), RunnerConfig::skip_gap_on_start())
+    ///     .reactor_with(WebScraper::new(), RunnerConfig::skip_gap_on_start())
+    ///     .reactor(MigrationReactor::new())  // default: replays gap
+    ///     .build(log, checkpoints).await?
+    ///     .run_until_shutdown().await;
+    /// ```
+    pub fn reactor_with<R: Reactor + 'static>(self, r: R, config: RunnerConfig) -> Self
+    where
+        R::Trigger: serde::de::DeserializeOwned,
+    {
+        let start = if config.skip_gap_on_start {
+            crate::projection::StartPosition::Latest
+        } else {
+            crate::projection::StartPosition::ResumeOrLatest
+        };
+        self.with_reactor_start(r, start)
+    }
+
     /// Register a [`MultiProjector`] — cross-domain projection
     /// consumer with declared subscription. The runner filters events
     /// to those whose `event_type` matches any category in
@@ -972,13 +1042,22 @@ impl EngineBuilder {
                 (ResumeOrLatest, Some(_)) => None,
                 (ResumeOrLatest, None)    => Some(self.log.latest_position().await?),
                 // Latest deliberately ignores a persisted cursor — the
-                // backlog is skipped on every (re)build. Ops escape
-                // hatch; see StartPosition::Latest docs.
+                // backlog is skipped on every (re)build. Used by
+                // reactor_with(r, RunnerConfig::skip_gap_on_start()).
                 (Latest, _)               => Some(self.log.latest_position().await?),
                 (Zero, _)                 => Some(LogCursor::ZERO),
                 (Specific(c), _)          => Some(*c),
             };
             if let Some(pos) = seed {
+                // Emit diagnostics when skip_gap_on_start (StartPosition::Latest)
+                // advances past events — so operators can see the gap and any
+                // workflows that may need external re-triggering.
+                if matches!(start, Latest) {
+                    let old = existing.unwrap_or(LogCursor::ZERO);
+                    if pos > old {
+                        emit_skip_gap_warnings(group, old, pos, self.log.as_ref()).await;
+                    }
+                }
                 self.reactor_checkpoint.set(group, pos).await?;
             }
         }
@@ -1912,15 +1991,95 @@ impl Engine {
     /// Signal shutdown; drain in-flight consumer steps; halt. Reactor
     /// partition workers stop at their next loop boundary (an in-flight
     /// `react()` completes; it is not cancelled).
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
         let _ = self.shutdown_tx.send(());
         for consumer in &self.consumers {
             consumer.halt();
         }
-        for handle in self.handles {
+        for handle in std::mem::take(&mut self.handles) {
             let _ = handle.await;
         }
         Ok(())
+    }
+
+    /// Graceful shutdown: stop accepting new activations, wait for in-flight
+    /// reactions to complete (up to `timeout`), then return.
+    ///
+    /// Returns a [`DrainResult`] describing whether the drain completed
+    /// cleanly. If the timeout expires, any remaining consumers are logged at
+    /// WARN and the engine exits.
+    ///
+    /// # Lease ordering
+    /// The consumer lease (if wired) is held until after all handles complete —
+    /// releasing it early would allow a competing instance to start from an
+    /// uncommitted checkpoint. The drain timeout must therefore be shorter than
+    /// the lease TTL.
+    pub async fn drain(mut self, timeout: Duration) -> DrainResult {
+        for consumer in &self.consumers {
+            consumer.halt();
+        }
+        let _ = self.shutdown_tx.send(());
+
+        let consumer_ids: Vec<String> = self.consumers.iter()
+            .map(|c| c.consumer_id().to_string())
+            .collect();
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut timed_out_consumers: Vec<String> = Vec::new();
+
+        for (consumer_id, handle) in consumer_ids.into_iter().zip(std::mem::take(&mut self.handles)) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                if !handle.is_finished() {
+                    timed_out_consumers.push(consumer_id);
+                }
+                continue;
+            }
+            match tokio::time::timeout(remaining, handle).await {
+                Ok(_) => {}
+                Err(_) => timed_out_consumers.push(consumer_id),
+            }
+        }
+
+        if !timed_out_consumers.is_empty() {
+            tracing::warn!(
+                ?timed_out_consumers,
+                "engine drain timed out — {} consumer(s) had in-flight work; \
+                 checkpoints may not be fully committed",
+                timed_out_consumers.len(),
+            );
+        }
+
+        DrainResult {
+            clean: timed_out_consumers.is_empty(),
+            timed_out_consumers,
+        }
+    }
+
+    /// Run until SIGTERM or SIGINT, then drain with a 30-second timeout.
+    ///
+    /// The simplest shutdown path for a standalone service. For coordinated
+    /// shutdown alongside an HTTP server, use [`Engine::drain`] directly after
+    /// receiving your own shutdown signal.
+    ///
+    /// A second signal (SIGTERM/SIGINT) during drain triggers an immediate exit.
+    pub async fn run_until_shutdown(self) -> DrainResult {
+        wait_for_shutdown_signal().await;
+        self.drain(Duration::from_secs(30)).await
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let any_running = self.handles.iter().any(|h| !h.is_finished());
+        if any_running {
+            let _ = self.shutdown_tx.send(());
+            tracing::warn!(
+                "Engine dropped without draining — consumer tasks are still running. \
+                 In-flight reactor work was abandoned and checkpoints may not be committed. \
+                 Call engine.drain() or engine.run_until_shutdown() before dropping.",
+            );
+        }
     }
 }
 
@@ -1937,6 +2096,161 @@ impl<'a> Boundary<'a> {
     /// `.await` as usual.
     pub fn emit<I: Into<EmitInput>>(&self, input: I) -> EmitBuilder<'a> {
         self.engine.emit(input).metadata("_origin", self.name)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Shutdown signal helper
+// ─────────────────────────────────────────────────────────────────────
+
+/// Wait for a process shutdown signal (SIGTERM, SIGINT / Ctrl-C).
+/// On Unix, a second signal during drain triggers immediate exit.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to install SIGTERM handler: {e}; relying on SIGINT only");
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    tokio::signal::ctrl_c().await.ok();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Skip-gap diagnostics
+// ─────────────────────────────────────────────────────────────────────
+
+/// Emit WARN diagnostics when `skip_gap_on_start` (StartPosition::Latest)
+/// advances a reactor's checkpoint past events.
+///
+/// Scans at most 10,000 events in the skipped range to identify workflows
+/// that were active in the gap and may need external re-triggering.
+async fn emit_skip_gap_warnings(
+    consumer_id: &str,
+    from: LogCursor,
+    to: LogCursor,
+    log: &dyn crate::event_log::EventLogBackend,
+) {
+    const SCAN_CAP: usize = 10_000;
+
+    let events = match log.read_all(from, SCAN_CAP).await {
+        Ok(evs) => evs
+            .into_iter()
+            .filter(|e| e.position <= to)
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(
+                consumer = consumer_id,
+                error = %e,
+                "skip_gap_on_start: failed to scan skipped range for diagnostics",
+            );
+            return;
+        }
+    };
+
+    let event_count = events.len();
+    if event_count == 0 {
+        return;
+    }
+    let scan_truncated = event_count >= SCAN_CAP;
+
+    let first_ts = events.first().map(|e| e.created_at);
+    let last_ts  = events.last().map(|e| e.created_at);
+
+    if from == LogCursor::ZERO {
+        tracing::warn!(
+            consumer = consumer_id,
+            event_count,
+            scan_truncated,
+            "skip_gap_on_start: no prior checkpoint — skipping {} events of history{}",
+            event_count,
+            if scan_truncated { " (scan capped at 10,000)" } else { "" },
+        );
+    } else {
+        tracing::warn!(
+            consumer = consumer_id,
+            event_count,
+            scan_truncated,
+            ?first_ts,
+            ?last_ts,
+            "skip_gap_on_start: {} events skipped in crash-recovery gap{}",
+            event_count,
+            if scan_truncated { " (scan capped at 10,000; actual count may be higher)" } else { "" },
+        );
+    }
+
+    // Track workflows whose last known event is in the gap. These may
+    // stall unless they are re-triggered externally.
+    struct WfInfo {
+        last_event_type: String,
+        last_position:   LogCursor,
+        // Root event type: first event with no causation_id in the scan window.
+        // None if the workflow root predates the scan window.
+        started_with:    Option<String>,
+    }
+
+    let mut workflows: std::collections::HashMap<uuid::Uuid, WfInfo> =
+        std::collections::HashMap::new();
+
+    for event in &events {
+        let entry = workflows.entry(event.workflow_id).or_insert_with(|| WfInfo {
+            last_event_type: event.event_type.clone(),
+            last_position:   event.position,
+            started_with:    if event.causation_id.is_none() {
+                Some(event.event_type.clone())
+            } else {
+                None
+            },
+        });
+        if event.position > entry.last_position {
+            entry.last_event_type = event.event_type.clone();
+            entry.last_position   = event.position;
+        }
+        if event.causation_id.is_none() && entry.started_with.is_none() {
+            entry.started_with = Some(event.event_type.clone());
+        }
+    }
+
+    if workflows.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        consumer = consumer_id,
+        workflow_count = workflows.len(),
+        "skip_gap_on_start: {} workflow(s) had events in the skipped range; \
+         they may stall if not re-triggered externally",
+        workflows.len(),
+    );
+
+    const MAX_SHOWN: usize = 20;
+    for (wf_id, info) in workflows.iter().take(MAX_SHOWN) {
+        tracing::warn!(
+            consumer = consumer_id,
+            %wf_id,
+            started_with = info.started_with.as_deref().unwrap_or("<before scan window>"),
+            last_event_type = %info.last_event_type,
+            "  stalled workflow candidate",
+        );
+    }
+    if workflows.len() > MAX_SHOWN {
+        tracing::warn!(
+            consumer = consumer_id,
+            "  ... and {} more (showing first {})",
+            workflows.len() - MAX_SHOWN,
+            MAX_SHOWN,
+        );
     }
 }
 

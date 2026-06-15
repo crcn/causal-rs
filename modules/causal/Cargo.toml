@@ -22,10 +22,10 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 uuid.workspace = true
-causal_core_macros = { version = "0.12.0", path = "../causal_core_macros", optional = true }
+causal_core_macros = { version = "0.13.0", path = "../causal_core_macros", optional = true }
 
 [dev-dependencies]
 fastrand.workspace = true
