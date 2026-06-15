@@ -393,22 +393,30 @@ impl<'a> Ctx<'a> {
     /// Run N side-effecting computations **concurrently**, each
     /// memoized under its own label. All labels are claimed before any
     /// I/O starts — a duplicate label errors immediately. Results are
-    /// returned in **input order** regardless of completion order,
-    /// making this deterministic across retries.
+    /// returned in **input order** regardless of completion order.
+    ///
+    /// **Prefer `tokio::join!` with individual [`Ctx::effect`] calls** —
+    /// it's equally memoized, handles heterogeneous return types, and
+    /// reads better at known N:
     ///
     /// ```ignore
-    /// // Use Box::pin to erase the concrete Future type.
+    /// let (html, meta) = tokio::join!(
+    ///     ctx.effect("fetch_html", || async { scrape_html(&url).await }),
+    ///     ctx.effect("fetch_meta", || async { scrape_meta(&url).await }),
+    /// );
+    /// let (html, meta) = (html?, meta?);
+    /// ```
+    ///
+    /// Use `effect_all` only when N is dynamic (a runtime-length `Vec`
+    /// of homogeneous futures). All effects must share the same return
+    /// type `T`. The `Box::pin` dance is required to erase the future type:
+    ///
+    /// ```ignore
     /// let results = ctx.effect_all(vec![
     ///     ("fetch_html", Box::new(|| Box::pin(async { scrape_html(&url).await }))),
     ///     ("fetch_meta", Box::new(|| Box::pin(async { scrape_meta(&url).await }))),
     /// ]).await?;
-    /// let (html, meta) = (&results[0], &results[1]);
     /// ```
-    ///
-    /// All effects must share the same return type `T`. For
-    /// heterogeneous return types, or when N is known at compile time,
-    /// use `tokio::join!` with separate [`Ctx::effect`] calls instead —
-    /// those are equally memoized and often more readable.
     pub async fn effect_all<T>(
         &self,
         effects: Vec<(

@@ -24,11 +24,7 @@
 //! ## Example
 //!
 //! ```
-//! use std::sync::Arc;
-//! use causal::{
-//!     CheckpointStore, Ctx, EngineBuilder, Event, EventLogBackend,
-//!     Events, MemoryStore, Reactor, ReactorCheckpoint,
-//! };
+//! use causal::{Ctx, EngineBuilder, Event, Events, Reactor};
 //! use serde::{Deserialize, Serialize};
 //! use uuid::Uuid;
 //!
@@ -62,12 +58,7 @@
 //!
 //! # fn main() -> anyhow::Result<()> {
 //! # tokio::runtime::Runtime::new()?.block_on(async {
-//! let store = Arc::new(MemoryStore::new());
-//! let engine = EngineBuilder::new(
-//!         store.clone() as Arc<dyn EventLogBackend>,
-//!         store.clone() as Arc<dyn CheckpointStore>,
-//!         store.clone() as Arc<dyn ReactorCheckpoint>,
-//!     )
+//! let engine = EngineBuilder::memory()
 //!     .with_reactor(ShipOnPlaced)
 //!     .build()
 //!     .await?;

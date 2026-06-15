@@ -587,6 +587,27 @@ pub struct EngineBuilder {
 }
 
 impl EngineBuilder {
+    /// Convenience constructor for tests and prototypes — wires a single
+    /// [`MemoryStore`](crate::MemoryStore) as the event log, checkpoint
+    /// store, and reactor checkpoint all at once.
+    ///
+    /// ```no_run
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let engine = causal::EngineBuilder::memory()
+    ///     .build()
+    ///     .await
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub fn memory() -> Self {
+        let store = Arc::new(crate::memory_store::MemoryStore::new());
+        Self::new(
+            store.clone() as Arc<dyn crate::event_log::EventLogBackend>,
+            store.clone() as Arc<dyn crate::checkpoint_store::CheckpointStore>,
+            store        as Arc<dyn crate::checkpoint_store::ReactorCheckpoint>,
+        )
+    }
+
     /// `checkpoint` stores projector/reactor cursors; `reactor_checkpoint`
     /// adds the reactor retry-attempt counters. They typically point to
     /// the same backend instance (e.g., one `Arc<MemoryStore>` cast to
