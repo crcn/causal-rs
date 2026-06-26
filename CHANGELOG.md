@@ -6,6 +6,22 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-06-25
+
+### Added
+
+- **`EmitBuilder::event_id(Uuid)`** — supply an explicit `event_id` on an emit,
+  making the append **idempotent across retries**: re-emitting a byte-identical
+  fact with the same id dedups on the backend instead of writing a second event.
+  The default still mints a fresh `Uuid::new_v4()` per emit (correct for
+  spontaneous emits; documented as "retry only on `Err`"). The setter exists for
+  at-least-once redeliverers — e.g. a job-queue worker that re-executes a
+  dequeued workflow start after a crash — which derive a stable id from a
+  business key (`v5(ns, workflow_id)`) so the retry dedups rather than forking
+  the causal chain. Valid only for a single-fact emit (a multi-fact batch with
+  one id is rejected at `.await`). Additive; no behavior change without the call.
+  See `docs/plans/2026-06-25-workflow-scheduler-seam.md`.
+
 ## [0.10.0] — 2026-06-12
 
 The "No Lying Defaults" release: every framework default that could

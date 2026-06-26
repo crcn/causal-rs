@@ -396,6 +396,7 @@ pub struct EmitBuilder<'a> {
     input:          EmitInput,
     workflow_id: Option<Uuid>,
     causation_id:      Option<Uuid>,
+    event_id:       Option<Uuid>,
     metadata:       Metadata,
 }
 
@@ -414,6 +415,35 @@ impl<'a> EmitBuilder<'a> {
     /// `event_id` here.
     pub fn causation_id(mut self, id: Uuid) -> Self {
         self.causation_id = Some(id);
+        self
+    }
+
+    /// Stamp an explicit `event_id` on the emitted event, making the
+    /// append **idempotent across retries**: re-emitting the same fact
+    /// with the same `event_id` dedups on the backend (a byte-identical
+    /// redelivery returns an equivalent [`WriteResult`] without
+    /// persisting a second event — see [`EventLogBackend::append_to_stream`]).
+    ///
+    /// The default (no call) mints a fresh `Uuid::new_v4()` per emit, so
+    /// retrying an emit that *succeeded* writes the facts again — correct
+    /// for spontaneous emits, fatal for an at-least-once redeliverer (a
+    /// crashed-and-retried job worker would otherwise duplicate a workflow
+    /// root and fork its causal chain). Supply a deterministic id derived
+    /// from a stable business key (e.g. `v5(namespace, workflow_id)`) and
+    /// the retry dedups instead.
+    ///
+    /// **The fact must be a pure function of that key.** The backend's
+    /// dedup contract requires a reused `event_id` to carry
+    /// byte-identical bytes; a divergent redelivery (e.g. a payload
+    /// timestamp rebuilt from the wall clock on retry) errors loudly
+    /// rather than silently keeping the first row. Read any
+    /// occurrence-time from a serde-visible field, never `Utc::now()`.
+    ///
+    /// Valid only for a **single-fact** emit — a multi-fact batch with one
+    /// `event_id` is ambiguous and is rejected at `.await`. Emit roots
+    /// separately.
+    pub fn event_id(mut self, id: Uuid) -> Self {
+        self.event_id = Some(id);
         self
     }
 
@@ -1284,6 +1314,7 @@ impl Engine {
             input: input.into(),
             workflow_id: None,
             causation_id: None,
+            event_id: None,
             metadata: Metadata::new(),
         }
     }
@@ -1586,6 +1617,19 @@ impl Engine {
         };
         let mut last_position = LogCursor::ZERO;
 
+        // A caller-supplied event_id identifies exactly ONE event — it is the
+        // idempotency key for an at-least-once redeliverer. A multi-fact batch
+        // with one supplied id is ambiguous; reject it up front (consistent with
+        // the "emit roots separately" rule for workflow-root batches above).
+        if b.event_id.is_some() && b.input.facts.len() > 1 {
+            anyhow::bail!(
+                "emit().event_id(..) is valid only for a single-fact emit; this \
+                 batch has {} facts. A supplied event_id must identify exactly one \
+                 event — emit them separately.",
+                b.input.facts.len(),
+            );
+        }
+
         // Merge engine defaults under per-emit metadata. Per-emit
         // overrides on key collision; non-colliding keys merge.
         let merged_metadata = {
@@ -1629,7 +1673,10 @@ impl Engine {
             let subject_id = fact.subject_id();
             let payload = fact.to_value()?;
             let event = EventData {
-                event_id:        Uuid::new_v4(),
+                // Caller-supplied id (idempotent redelivery) or a fresh one.
+                // The multi-fact guard above guarantees this loop runs once
+                // when an id was supplied, so it is never reused across facts.
+                event_id:        b.event_id.unwrap_or_else(Uuid::new_v4),
                 causation_id:    b.causation_id,
                 workflow_id:  workflow,
                 event_type,
@@ -2409,6 +2456,112 @@ mod tests {
     }
 
     fn store() -> Arc<MemoryStore> { Arc::new(MemoryStore::new()) }
+
+    /// A queue worker that crashes after `emit` commits, then retries, re-emits
+    /// the SAME root with the SAME caller-supplied `event_id`. A byte-identical
+    /// redelivery must dedup to ONE event — not fork the reactor chain. This is
+    /// the whole point of `EmitBuilder::event_id`.
+    #[tokio::test]
+    async fn emit_event_id_dedups_byte_identical_reemit() {
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .build()
+        .await
+        .unwrap();
+
+        let wf = Uuid::new_v4();
+        let eid = Uuid::new_v4();
+        let occurred = DateTime::parse_from_rfc3339("2026-06-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Same workflow_id on both emits so the envelope is byte-identical on the
+        // divergence-checked fields (payload, event_type, workflow_id, causation_id).
+        let fact = || UserCreated { user_id: Uuid::nil(), occurred_at: occurred };
+
+        engine.emit(fact()).workflow_id(wf).event_id(eid).await.unwrap();
+        engine.emit(fact()).workflow_id(wf).event_id(eid).await.unwrap();
+
+        let events = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 100)
+            .await
+            .unwrap();
+        let n = events
+            .iter()
+            .filter(|e| e.event_type.as_str() == "user_created")
+            .count();
+        assert_eq!(n, 1, "same event_id + byte-identical payload must dedup to one event");
+    }
+
+    /// A supplied `event_id` identifies exactly one event; a multi-fact batch
+    /// with one id is ambiguous and must be rejected at `.await`.
+    #[tokio::test]
+    async fn emit_event_id_rejects_multi_fact_batch() {
+        let engine = EngineBuilder::memory().build().await.unwrap();
+        let occurred = DateTime::parse_from_rfc3339("2026-06-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let batch = vec![
+            UserCreated { user_id: Uuid::new_v4(), occurred_at: occurred },
+            UserCreated { user_id: Uuid::new_v4(), occurred_at: occurred },
+        ];
+        let err = engine
+            .emit(batch)
+            .event_id(Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("single-fact"),
+            "multi-fact emit with event_id must be rejected, got: {err}",
+        );
+    }
+
+    /// The real queue-worker scenario: a workflow ROOT (declares its workflow_id
+    /// from its own payload, so the emit takes no `.workflow_id()`) re-emitted
+    /// with the same derived `event_id` after a crash. Workflow comes from the
+    /// declared field; the same `event_id` dedups the retry to one event instead
+    /// of forking a second run.
+    #[tokio::test]
+    async fn emit_event_id_dedups_workflow_root_reemit() {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct RunRequested { run_id: Uuid }
+        impl Event for RunRequested {
+            const NAME: &'static str = "run_requested";
+            fn subject_id(&self) -> Uuid { self.run_id }
+            fn declared_workflow_id(&self) -> Option<Uuid> { Some(self.run_id) }
+        }
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .build()
+        .await
+        .unwrap();
+
+        let run_id = Uuid::new_v4();
+        // event_id = derive(workflow_id), exactly as the queue worker would compute it.
+        let eid = Uuid::new_v5(&Uuid::NAMESPACE_OID, run_id.as_bytes());
+
+        let r1 = engine.emit(RunRequested { run_id }).event_id(eid).await.unwrap();
+        let r2 = engine.emit(RunRequested { run_id }).event_id(eid).await.unwrap();
+
+        assert_eq!(r1.workflow_id, run_id, "root workflow_id is the declared field");
+        assert_eq!(r2.workflow_id, run_id);
+
+        let events = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 100)
+            .await
+            .unwrap();
+        let n = events
+            .iter()
+            .filter(|e| e.event_type.as_str() == "run_requested")
+            .count();
+        assert_eq!(n, 1, "re-emitting the same root with the same event_id must dedup");
+    }
 
     /// B2: a freshly-deployed reactor against an EXISTING log must not
     /// re-fire side effects for history — its cursor seeds at
