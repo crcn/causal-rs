@@ -68,6 +68,24 @@ pub fn compose_file(ctx: &AppContext, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether the example's docker stack currently has running containers.
+fn stack_running(ctx: &AppContext, name: &str) -> bool {
+    let Some(file) = compose_file(ctx, name) else {
+        return false;
+    };
+    let Ok(output) = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(&file)
+        .args(["ps", "-q", "--status", "running"])
+        .current_dir(&ctx.repo)
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && !output.stdout.is_empty()
+}
+
 fn require_example(ctx: &AppContext, name: &str) -> Result<PathBuf> {
     let dir = ctx.repo.join("examples").join(name);
     if !dir.join("Cargo.toml").is_file() {
@@ -160,26 +178,60 @@ pub fn interactive_menu(ctx: &AppContext) -> Result<()> {
         return Ok(());
     }
 
-    let mut items: Vec<String> = examples
-        .iter()
-        .map(|name| {
-            if compose_file(ctx, name).is_some() {
-                format!("{name}  (docker)")
-            } else {
-                name.clone()
-            }
-        })
-        .collect();
-    items.push("← Back".to_string());
+    loop {
+        let mut items: Vec<String> = examples
+            .iter()
+            .map(|name| match compose_file(ctx, name) {
+                Some(_) if stack_running(ctx, name) => format!("{name}  (docker · running)"),
+                Some(_) => format!("{name}  (docker · stopped)"),
+                None => name.clone(),
+            })
+            .collect();
+        items.push("← Back".to_string());
 
-    let choice = Select::with_theme(&ctx.theme())
-        .with_prompt("Run which example?")
-        .items(&items)
-        .default(0)
-        .interact()?;
+        let choice = Select::with_theme(&ctx.theme())
+            .with_prompt("Examples")
+            .items(&items)
+            .default(0)
+            .interact()?;
 
-    if choice >= examples.len() {
-        return Ok(());
+        if choice >= examples.len() {
+            return Ok(());
+        }
+
+        let name = examples[choice].clone();
+        if compose_file(ctx, &name).is_some() {
+            example_actions(ctx, &name)?;
+        } else {
+            run_example(ctx, &name)?;
+        }
     }
-    run_example(ctx, &examples[choice])
+}
+
+/// Per-example submenu: run it, or start/stop its docker stack.
+fn example_actions(ctx: &AppContext, name: &str) -> Result<()> {
+    loop {
+        let status = if stack_running(ctx, name) {
+            "running"
+        } else {
+            "stopped"
+        };
+        let items = ["Run example", "Start containers", "Stop containers", "← Back"];
+        let choice = Select::with_theme(&ctx.theme())
+            .with_prompt(format!("{name}  (docker · {status})"))
+            .items(&items)
+            .default(0)
+            .interact()?;
+
+        let result = match choice {
+            0 => run_example(ctx, name),
+            1 => compose_up(ctx, name),
+            2 => compose_down(ctx, name),
+            _ => return Ok(()),
+        };
+        // Keep the menu alive on transient docker failures instead of unwinding.
+        if let Err(e) = result {
+            ctx.print_warning(&format!("{e:#}"));
+        }
+    }
 }
