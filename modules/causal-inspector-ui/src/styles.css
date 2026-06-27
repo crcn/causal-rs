@@ -1,0 +1,52 @@
+/*
+ * Self-contained stylesheet for embedding the Causal Inspector.
+ *
+ * This is the build SOURCE. `npm run build` compiles it (Tailwind v4) and scopes
+ * every selector under `.causal-inspector` (see postcss.config.mjs), emitting a
+ * single, standalone `dist/causal-inspector.css`.
+ *
+ * The result needs NO Tailwind in the host app and cannot clobber — or be
+ * clobbered by — the host's styles: all utilities, the preflight reset, the
+ * design tokens, and the third-party widget CSS live inside `.causal-inspector`.
+ *
+ * Host usage:
+ *   import { CausalInspector } from "causal-inspector";
+ *   import "causal-inspector/styles.css";
+ */
+
+@import "tailwindcss";
+
+/* Generate the utility classes actually used by the inspector's components. */
+@source "./**/*.{ts,tsx}";
+
+/* Bundle the widget CSS so hosts don't import (or globally pollute with) them. */
+@import "@xyflow/react/dist/style.css";
+@import "flexlayout-react/style/dark.css";
+
+/*
+ * Design tokens (shadcn-style). Defined here rather than expected from the host,
+ * so the inspector's theme is fixed regardless of the surrounding app. A host can
+ * still re-theme by overriding these custom properties on `.causal-inspector`.
+ */
+@theme {
+  --color-background: #0a0a0f;
+  --color-foreground: #f0f0f5;
+  --color-card: #0f0f14;
+  --color-card-foreground: #f0f0f5;
+  --color-popover: #111116;
+  --color-popover-foreground: #f0f0f5;
+  --color-primary: #f0f0f5;
+  --color-primary-foreground: #18181b;
+  --color-secondary: #1e1e28;
+  --color-secondary-foreground: #f0f0f5;
+  --color-muted: #1e1e28;
+  --color-muted-foreground: #9090a0;
+  --color-accent: #1e1e28;
+  --color-accent-foreground: #f0f0f5;
+  --color-destructive: #7f1d1d;
+  --color-destructive-foreground: #f0f0f5;
+  --color-border: rgba(255, 255, 255, 0.06);
+  --color-input: #1e1e28;
+  --color-ring: #6366f1;
+  --radius: 0.5rem;
+}
