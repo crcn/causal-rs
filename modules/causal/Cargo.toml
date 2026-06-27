@@ -31,3 +31,4 @@ causal_core_macros = { version = "0.14.0", path = "../causal_core_macros", optio
 fastrand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 trybuild.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

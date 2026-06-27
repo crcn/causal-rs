@@ -42,7 +42,7 @@
 //! hold another workflow's settle hostage.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -330,6 +330,17 @@ struct Core<R: Reactor> {
     /// The held lease guard. Non-None while the runner is active.
     /// Dropping it releases the lease (and the underlying connection).
     lease: parking_lot::Mutex<Option<Box<dyn crate::consumer_lease::LeaseGuard>>>,
+
+    /// Worker-level liveness for the settle wedge guard. Consecutive
+    /// non-parking failed attempts of in-flight work (a `transient`
+    /// failure backing off under the 6h ceiling, or an infra retry),
+    /// reset to zero whenever any trigger completes or parks. A reactor
+    /// stuck here keeps its supervisor `step` returning `Idle` (ingestion
+    /// is fine) so the supervisor-level [`ConsumerHealth`] never sees it —
+    /// this is how `settle` learns the workflow can't drain instead of
+    /// waiting silently for hours. The last such error rides alongside.
+    worker_stall_failures: AtomicU32,
+    worker_stall_error:    parking_lot::Mutex<Option<String>>,
 }
 
 impl<R: Reactor + 'static> ReactorRunner<R>
@@ -389,6 +400,8 @@ where
                 cancelled_workflows: None,
                 leasor: None,
                 lease: parking_lot::Mutex::new(None),
+                worker_stall_failures: AtomicU32::new(0),
+                worker_stall_error:    parking_lot::Mutex::new(None),
             }),
         }
     }
@@ -520,6 +533,14 @@ where
     }
 
     pub fn consumer_id(&self) -> &str { &self.core.consumer_id }
+
+    /// Settle wedge probe (worker level): `Some((failures, last_error))`
+    /// when an in-flight trigger is stuck retrying a non-parking failure
+    /// (transient under the 6h ceiling, or infra) and the partition is
+    /// therefore not draining. `None` when workers are healthy.
+    pub fn worker_stall(&self) -> Option<(u32, String)> {
+        self.core.worker_stall()
+    }
 
     /// Stop taking new work: workers exit at their next loop boundary
     /// (an in-flight `react()` completes; it is not cancelled).
@@ -774,6 +795,33 @@ where
         }
     }
 
+    /// A trigger completed or parked — the worker is making progress;
+    /// clear the settle wedge guard's stall run.
+    fn note_worker_progress(&self) {
+        self.worker_stall_failures.store(0, AtomicOrdering::Relaxed);
+        *self.worker_stall_error.lock() = None;
+    }
+
+    /// An attempt failed and will be retried without parking (transient
+    /// under the ceiling, or infra). Records the run so a reactor stuck
+    /// retrying — which `settle` would otherwise wait out for up to the
+    /// 6h transient ceiling — is surfaced instead.
+    fn note_worker_retry(&self, error: String) {
+        self.worker_stall_failures.fetch_add(1, AtomicOrdering::Relaxed);
+        *self.worker_stall_error.lock() = Some(error);
+    }
+
+    /// Settle wedge probe: the current consecutive non-parking-failure
+    /// run and the last such error, or `None` when the worker is healthy.
+    fn worker_stall(&self) -> Option<(u32, String)> {
+        let n = self.worker_stall_failures.load(AtomicOrdering::Relaxed);
+        if n == 0 {
+            None
+        } else {
+            Some((n, self.worker_stall_error.lock().clone().unwrap_or_default()))
+        }
+    }
+
     /// Drive one trigger to completion under the BLOCKING-2 retry
     /// taxonomy. Returns false only on halt.
     ///
@@ -862,6 +910,7 @@ where
             used_effects.extend(this_effects);
             let failure = match attempted {
                 Ok(AttemptOutcome::Done) => {
+                    self.note_worker_progress();
                     return Some(TriggerDone {
                         parked: false,
                         effect_labels: used_effects.into_iter().collect(),
@@ -915,12 +964,14 @@ where
                         .await
                     {
                         Ok(()) => {
+                            self.note_worker_progress();
                             return Some(TriggerDone {
                                 parked: true,
                                 effect_labels: used_effects.into_iter().collect(),
                             });
                         }
                         Err(e) => {
+                            self.note_worker_retry(format!("terminal-failure park I/O error: {e:#}"));
                             tracing::warn!(
                                 consumer = self.consumer_id,
                                 event_id = %event.event_id,
@@ -930,6 +981,7 @@ where
                         }
                     }
                 } else {
+                    self.note_worker_retry(format!("{error:#}"));
                     tracing::warn!(
                         consumer = self.consumer_id,
                         event_id = %event.event_id,
@@ -939,6 +991,11 @@ where
                         "reactor attempt failed; retrying in partition",
                     );
                 }
+            } else {
+                // Infra error (the `Err(e)` attempt arm above): no
+                // classification, retry indefinitely. Still a non-draining
+                // stall, so it counts toward the settle wedge guard.
+                self.note_worker_retry("reactor runner infrastructure error".to_string());
             }
 
             local_attempt += 1;

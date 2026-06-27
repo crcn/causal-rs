@@ -58,6 +58,12 @@ trait Supervisable: Send + Sync {
     /// Stop taking new work (in-flight bodies finish). Default no-op
     /// for serial consumers, whose supervisor exit is sufficient.
     fn halt(&self) {}
+    /// Worker-level wedge probe for the settle guard: `Some((failures,
+    /// last_error))` when this consumer has in-flight work stuck retrying
+    /// a non-parking failure (so it cannot drain). Default `None` —
+    /// serial consumers (projectors) have no worker tasks; their failures
+    /// surface through [`ConsumerHealth`] at the supervisor level instead.
+    fn worker_stall(&self) -> Option<(u32, String)> { None }
 }
 
 #[async_trait]
@@ -87,6 +93,7 @@ where
         ReactorRunner::drained(self, wf, hw).await
     }
     fn halt(&self) { ReactorRunner::halt(self) }
+    fn worker_stall(&self) -> Option<(u32, String)> { ReactorRunner::worker_stall(self) }
 }
 
 #[async_trait]
@@ -97,6 +104,83 @@ impl<P: MultiProjector + 'static> Supervisable for MultiProjectorRunner<P> {
     fn consumer_id(&self) -> &str { MultiProjectorRunner::consumer_id(self) }
     async fn drained(&self, _wf: Uuid, hw: LogCursor) -> Result<bool> {
         Ok(MultiProjectorRunner::cursor(self).await?.is_some_and(|c| c >= hw))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Consumer liveness — the settle wedge guard
+// ─────────────────────────────────────────────────────────────────────
+
+/// How many CONSECUTIVE failures a consumer may accrue — at the
+/// supervisor-`step` level ([`ConsumerHealth`]) or the reactor-worker
+/// retry level ([`crate::reactor_runner::ReactorRunner::worker_stall`]) —
+/// before [`Engine::settle`] stops waiting on it and surfaces the failure
+/// instead of blocking forever.
+///
+/// This is a **failure count, not a wall-clock timeout** — the counter
+/// resets to zero on *any* progress (a successful step, or a trigger that
+/// completes/parks). A consumer that is merely slow, busy, or advancing
+/// one fact at a time never accrues consecutive failures and is therefore
+/// never flagged, no matter how long `settle` waits on it. Only a
+/// consumer that is *deterministically wedged* — failing every cycle with
+/// no progress, which the runtime otherwise retries forever (supervisor
+/// step) or for up to the 6h transient ceiling (reactor worker) — trips
+/// it. The point is to convert a SILENT infinite hang (the error only
+/// reaches `tracing` at WARN/ERROR, invisible without a subscriber) into
+/// a loud, attributable `settle` error naming the stuck consumer.
+///
+/// `10` is chosen to comfortably clear a genuine transient blip while
+/// surfacing a true wedge promptly. The wall time before surfacing
+/// depends on the retry cadence of the wedged path:
+///   - supervisor step: fixed [`BACKOFF_ON_ERROR`] (250ms) ⇒ ~2.5s;
+///   - reactor worker: exponential backoff capped at 5s ⇒ ~16s.
+/// Both are bounded; tune here if a deployment wants a different point on
+/// the surface-promptly / tolerate-longer-outages tradeoff.
+const SETTLE_WEDGE_FAILURES: u32 = 10;
+
+/// Per-consumer liveness shared between its `supervise_one` task (writer)
+/// and [`Engine::settle`] (reader). Tracks the run of consecutive `step`
+/// failures and the most recent error so a wedged consumer can be
+/// surfaced rather than silently holding `settle` hostage.
+pub(crate) struct ConsumerHealth {
+    consecutive_failures: std::sync::atomic::AtomicU32,
+    last_error:           std::sync::Mutex<Option<String>>,
+}
+
+impl ConsumerHealth {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+            last_error:           std::sync::Mutex::new(None),
+        }
+    }
+
+    /// A step made progress (or idled cleanly) — the consumer is live.
+    fn note_progress(&self) {
+        self.consecutive_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A step failed (errored or panicked). Records the error and bumps
+    /// the consecutive-failure run.
+    fn note_failure(&self, error: String) {
+        self.consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.last_error.lock().unwrap() = Some(error);
+    }
+
+    /// `Some((failures, last_error))` once the consumer has failed every
+    /// step for [`SETTLE_WEDGE_FAILURES`] consecutive attempts — i.e. it
+    /// is making no progress and cannot drain.
+    fn wedged(&self) -> Option<(u32, String)> {
+        let n = self
+            .consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if n >= SETTLE_WEDGE_FAILURES {
+            Some((n, self.last_error.lock().unwrap().clone().unwrap_or_default()))
+        } else {
+            None
+        }
     }
 }
 
@@ -1202,6 +1286,10 @@ pub struct Engine {
     /// probes and for `halt` on shutdown (each also lives in its
     /// supervisor task via an Arc clone).
     consumers:             Vec<Arc<dyn Supervisable>>,
+    /// Per-consumer liveness, index-aligned with `consumers`. Each
+    /// consumer's `supervise_one` task updates its entry; `settle` reads
+    /// it to surface a wedged consumer instead of waiting on it forever.
+    consumer_health:       Vec<Arc<ConsumerHealth>>,
     default_metadata:      Metadata,
     /// Engine-level aggregator registry for out-of-band read access
     /// via `engine.state_of::<A>(subject_id).await.unwrap()`. Folded on every
@@ -1249,21 +1337,25 @@ impl Engine {
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len());
+        let mut consumer_health = Vec::with_capacity(consumers.len());
 
         // Each consumer (reactor / projector runner) is supervised; it
         // reads the log from its cursor and, for reactors, appends outputs
         // directly. No relay — reactor outputs go straight to the log.
         for consumer in &consumers {
             let consumer = consumer.clone();
+            let health = Arc::new(ConsumerHealth::new());
+            consumer_health.push(health.clone());
             let mut rx = shutdown_tx.subscribe();
             let task = tokio::spawn(async move {
-                supervise_one(consumer, &mut rx).await;
+                supervise_one(consumer, health, &mut rx).await;
             });
             handles.push(task);
         }
 
         Self {
             log, checkpoint, shutdown_tx, handles, consumers,
+            consumer_health,
             default_metadata,
             aggregators, observer,
             occ_categories,
@@ -1916,10 +2008,45 @@ impl Engine {
             // Wait for every consumer to drain THIS workflow to hw. An
             // output appended while we wait inherits this workflow_id
             // and bumps the tracker — the hw re-check below catches it.
-            for consumer in &self.consumers {
+            for (consumer, health) in self.consumers.iter().zip(&self.consumer_health) {
                 loop {
                     if consumer.drained(wf, hw).await? {
                         break;
+                    }
+                    // A consumer that can't make progress never advances
+                    // its cursor, so `drained` would be false forever and
+                    // this loop would spin until the heat death of the
+                    // universe. Two ways that happens, both retried with no
+                    // settle-relevant ceiling and logged only at WARN/ERROR
+                    // (invisible without a subscriber — hence the *silent*
+                    // hang):
+                    //   1. supervisor `step` fails/panics every cycle
+                    //      (e.g. a projector whose write deterministically
+                    //      errors) — tracked by `ConsumerHealth`;
+                    //   2. a reactor worker stuck retrying a `transient`
+                    //      failure, which has a 6h ceiling far beyond any
+                    //      settle — tracked per-runner via `worker_stall`.
+                    // Surface either: a wedged consumer is a real fault the
+                    // caller must see, not a thing to wait out. Gated on
+                    // FAILURE COUNT, never wall-clock — a slow-but-
+                    // progressing consumer resets the counter and is never
+                    // flagged no matter how long settle waits.
+                    let wedge = health.wedged().or_else(|| {
+                        consumer
+                            .worker_stall()
+                            .filter(|(failures, _)| *failures >= SETTLE_WEDGE_FAILURES)
+                    });
+                    if let Some((failures, last_error)) = wedge {
+                        return Err(anyhow::anyhow!(
+                            "settle: consumer `{}` is wedged — {} consecutive failures \
+                             with no progress, so workflow {} can never drain to \
+                             high-water {:?}. Last error: {}",
+                            consumer.consumer_id(),
+                            failures,
+                            wf,
+                            hw,
+                            last_error,
+                        ));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -2324,6 +2451,7 @@ async fn emit_skip_gap_warnings(
 
 async fn supervise_one(
     consumer: Arc<dyn Supervisable>,
+    health: Arc<ConsumerHealth>,
     shutdown: &mut broadcast::Receiver<()>,
 ) {
     loop {
@@ -2340,14 +2468,22 @@ async fn supervise_one(
             .await;
 
         match stepped {
-            Ok(Ok(StepOutcome::Progressed { .. })) => continue,
+            Ok(Ok(StepOutcome::Progressed { .. })) => { health.note_progress(); continue }
             Ok(Ok(StepOutcome::Idle)) | Ok(Ok(StepOutcome::WaitOnDep { .. })) => {
+                health.note_progress();
                 tokio::select! {
                     _ = shutdown.recv() => break,
                     _ = tokio::time::sleep(POLL_INTERVAL) => {}
                 }
             }
             Ok(Err(e)) => {
+                // Retrying forever is correct for a transient fault (a
+                // downstream DB blip must not drop the projection), but a
+                // DETERMINISTIC failure here retries with no ceiling and
+                // never advances the cursor — which is exactly what wedges
+                // `settle` (it waits on this consumer's floor forever).
+                // Record the run so `settle` can surface it.
+                health.note_failure(format!("{e:#}"));
                 tracing::warn!(
                     consumer = consumer.consumer_id(),
                     error = %e,
@@ -2359,9 +2495,11 @@ async fn supervise_one(
                 }
             }
             Err(panic_payload) => {
+                let msg = panic_payload_message(&panic_payload);
+                health.note_failure(format!("panic: {msg}"));
                 tracing::error!(
                     consumer = consumer.consumer_id(),
-                    panic = %panic_payload_message(&panic_payload),
+                    panic = %msg,
                     "supervisor step PANICKED — consumer will retry. \
                      Common cause: ctx.state_of called without aggregators \
                      registered via EngineBuilder::with_aggregators"
