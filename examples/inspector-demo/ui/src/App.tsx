@@ -22,7 +22,7 @@ import {
   LogsPane,
   AggregateTimelinePane,
   WaterfallPane,
-  CorrelationExplorerPane,
+  WorkflowExplorerPane,
   GlobalScrubber,
   type InspectorState,
   type InspectorMachineEvent,
@@ -94,7 +94,7 @@ const PANE_REGISTRY = [
   { name: "Logs", component: "logs", render: () => <LogsPane /> },
 { name: "State Timeline", component: "state-timeline", render: () => <AggregateTimelinePane /> },
   { name: "Waterfall", component: "waterfall", render: () => <WaterfallPane /> },
-  { name: "Correlations", component: "correlations", render: () => <CorrelationExplorerPane /> },
+  { name: "Workflows", component: "workflows", render: () => <WorkflowExplorerPane /> },
 ] as const;
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ function findTab(model: Model, component: string): TabNode | null {
 
 function InspectorLayout() {
   const paneLayout = useSelector<InspectorState, PaneLayout | null>((s) => s.paneLayout);
-  const flowCorrelationId = useSelector<InspectorState, string | null>((s) => s.flowCorrelationId);
+  const flowWorkflowId = useSelector<InspectorState, string | null>((s) => s.flowWorkflowId);
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const dispatch = useDispatch<InspectorMachineEvent>();
 
@@ -129,26 +129,29 @@ function InspectorLayout() {
   }
   const layoutRef = useRef<Layout>(null);
 
-  const addTab = useCallback((component: string, name: string) => {
+  // `focus` controls whether an already-open tab is brought forward. Pass
+  // false for incidental updates (e.g. selecting a timeline item refreshes the
+  // Causal Tree) so we don't yank the user away from whatever tab they're on.
+  const addTab = useCallback((component: string, name: string, focus = true) => {
     const model = modelRef.current;
     const existing = findTab(model, component);
     if (existing) {
-      model.doAction(Actions.selectTab(existing.getId()));
+      if (focus) model.doAction(Actions.selectTab(existing.getId()));
       return;
     }
     const target = model.getActiveTabset()?.getId()
       ?? model.getRoot().getChildren()[0]?.getId()
       ?? "";
-    model.doAction(Actions.addNode({ type: "tab", component, name }, target, DockLocation.CENTER, -1));
+    model.doAction(Actions.addNode({ type: "tab", component, name }, target, DockLocation.CENTER, -1, focus));
   }, []);
 
   useEffect(() => {
-    if (selectedSeq != null) addTab("causal-tree", "Causal Tree");
+    if (selectedSeq != null) addTab("causal-tree", "Causal Tree", false);
   }, [selectedSeq, addTab]);
 
   useEffect(() => {
-    if (flowCorrelationId) addTab("causal-flow", "Flow");
-  }, [flowCorrelationId, addTab]);
+    if (flowWorkflowId) addTab("causal-flow", "Flow");
+  }, [flowWorkflowId, addTab]);
 
   const factory = useCallback((node: TabNode) => {
     const component = node.getComponent();

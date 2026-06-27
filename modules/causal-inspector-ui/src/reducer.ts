@@ -15,6 +15,16 @@ function applyNavigation(
   workflowId: string | null,
   handler: string | null,
 ) {
+  // Keep the timeline filter coupled to the active workflow. `?workflow=X` is
+  // the single source of truth, whether it was set from the Workflows tab, a
+  // timeline row, the timeline filter pill, or a shared/reloaded URL — so the
+  // workflow filter chip always reflects it (previously only popstate/initial
+  // load did this, so in-session navigation left the chip out of sync).
+  draft.filters.workflowId = workflowId;
+
+  // Any navigation clears a pending error focus; flow_opened re-arms it.
+  draft.pendingErrorFocus = null;
+
   // Workflow changed → reset flow state
   if (workflowId !== draft.flowWorkflowId) {
     if (workflowId) {
@@ -54,6 +64,21 @@ function applyNavigation(
   }
 }
 
+/**
+ * Select the first errored reactor in a workflow as the active flow node
+ * (and scope the logs to it). Returns false when the workflow's outcomes
+ * haven't loaded yet or contain no error, so the caller can defer.
+ */
+function selectFirstError(draft: Draft<InspectorState>, workflowId: string): boolean {
+  const outcomes = draft.outcomes[workflowId];
+  if (!outcomes) return false;
+  const errored = outcomes.find((o) => o.status === "error");
+  if (!errored) return false;
+  draft.flowSelection = { kind: "reactor", reactorId: errored.reactorId };
+  draft.logsFilter = { scope: "reactor", reactorId: errored.reactorId, workflowId };
+  return true;
+}
+
 function applySubjectSelected(
   draft: Draft<InspectorState>,
   aggregateType: string,
@@ -67,12 +92,14 @@ function applySubjectSelected(
   draft.subjectChainCursor = null;
   draft.subjectDepthCapped = false;
   draft.subjectChainLoading = true;
-  // Mutual exclusion: clear workflow state
+  // Mutual exclusion: clear workflow state (incl. the timeline workflow filter)
   draft.flowWorkflowId = null;
+  draft.filters.workflowId = null;
   draft.flowData = [];
   draft.flowSelection = null;
   draft.causalTree = null;
   draft.logsFilter = { scope: "reactor", reactorId: null, workflowId: null };
+  draft.pendingErrorFocus = null;
 }
 
 export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
@@ -146,6 +173,11 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
     case "events/outcomes_loaded": {
       const { workflowId, outcomes } = event.payload;
       draft.outcomes[workflowId] = outcomes;
+      // Resolve a deferred error focus now that outcomes are available.
+      if (draft.pendingErrorFocus === workflowId) {
+        selectFirstError(draft, workflowId);
+        draft.pendingErrorFocus = null;
+      }
       break;
     }
     case "events/attempts_loaded": {
@@ -179,6 +211,11 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
 
     case "ui/flow_opened":
       applyNavigation(draft, event.payload.workflowId, null);
+      // Opened via the error pill: jump straight to the failed reactor. If its
+      // outcomes are already cached, select now; otherwise defer to outcomes_loaded.
+      if (event.payload.focusError && !selectFirstError(draft, event.payload.workflowId)) {
+        draft.pendingErrorFocus = event.payload.workflowId;
+      }
       break;
     case "ui/flow_closed":
       applyNavigation(draft, null, null);
@@ -192,7 +229,6 @@ export const reducer: Reducer<InspectorState, InspectorMachineEvent> = (
         applySubjectSelected(draft, subjectType, subjectId, event.payload.subjectMode ?? "both");
       } else {
         applyNavigation(draft, event.payload.workflowId, event.payload.handler);
-        draft.filters.workflowId = event.payload.workflowId;
       }
       break;
 

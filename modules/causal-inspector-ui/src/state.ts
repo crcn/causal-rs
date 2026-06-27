@@ -31,6 +31,9 @@ export type InspectorState = {
   flowWorkflowId: string | null;
   flowData: InspectorEvent[];
   flowSelection: FlowSelection;
+  /** Workflow whose first errored reactor should be auto-selected once its
+   *  outcomes load (set when a flow is opened via the Workflows error pill). */
+  pendingErrorFocus: string | null;
 
   // Time scrubber — range window into events
   scrubberStart: number | null;   // null = beginning (no lower bound)
@@ -97,6 +100,7 @@ export const initialState: InspectorState = {
   flowWorkflowId: null,
   flowData: [],
   flowSelection: null,
+  pendingErrorFocus: null,
 
   scrubberStart: null,
   scrubberEnd: null,

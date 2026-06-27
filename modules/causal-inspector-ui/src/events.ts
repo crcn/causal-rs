@@ -65,7 +65,7 @@ type AggregateLifecycleLoaded = BaseEvent<"events/aggregate_lifecycle_loaded", {
 
 type EventSelected = BaseEvent<"ui/event_selected", { seq: number }>;
 type EventDeselected = BaseEvent<"ui/event_deselected">;
-type FlowOpened = BaseEvent<"ui/flow_opened", { workflowId: string }>;
+type FlowOpened = BaseEvent<"ui/flow_opened", { workflowId: string; focusError?: boolean }>;
 type FlowClosed = BaseEvent<"ui/flow_closed">;
 type FlowNodeSelected = BaseEvent<"ui/flow_node_selected", FlowSelection>;
 type FilterChanged = BaseEvent<"ui/filter_changed", Partial<FilterState>>;

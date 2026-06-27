@@ -13,11 +13,14 @@ import { Search, ChevronRight, ChevronDown } from "lucide-react";
 function LogRow({ log, showReactor }: { log: ReactorLog; showReactor: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const levelColor = LOG_LEVEL_COLORS[log.level] ?? "bg-zinc-600/20 text-zinc-400";
+  const hasPayload = log.data != null;
 
   return (
     <div
-      onClick={() => setExpanded((v) => !v)}
-      className="px-2 py-1.5 hover:bg-white/[0.02] rounded-md transition-colors duration-100 cursor-pointer"
+      onClick={hasPayload ? () => setExpanded((v) => !v) : undefined}
+      className={`px-2 py-1.5 hover:bg-white/[0.02] rounded-md transition-colors duration-100 ${
+        hasPayload ? "cursor-pointer" : ""
+      }`}
     >
       <div className="flex items-start gap-2 min-w-0">
         <span className={`px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase shrink-0 ${levelColor}`}>
@@ -38,9 +41,11 @@ function LogRow({ log, showReactor }: { log: ReactorLog; showReactor: boolean })
         >
           {log.message}
         </span>
-        <span className="ml-auto shrink-0 text-muted-foreground/50">
-          {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-        </span>
+        {hasPayload && (
+          <span className="ml-auto shrink-0 text-muted-foreground/50">
+            {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+          </span>
+        )}
       </div>
       {expanded && log.data != null && (
         <pre className="mt-1.5 ml-4 text-[10px] font-mono text-muted-foreground/70 bg-white/[0.02] rounded-md p-2.5 max-h-32 overflow-auto whitespace-pre-wrap border border-border">

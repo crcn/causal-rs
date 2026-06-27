@@ -418,12 +418,12 @@ export function CausalTreePane({ onInvestigate }: CausalTreePaneProps = {}) {
     const rootList: InspectorEvent[] = [];
 
     for (const evt of events) {
-      if (evt.parentId == null || !idSet.has(evt.parentId)) {
+      if (evt.causationId == null || !idSet.has(evt.causationId)) {
         rootList.push(evt);
       } else {
-        const siblings = cMap.get(evt.parentId) ?? [];
+        const siblings = cMap.get(evt.causationId) ?? [];
         siblings.push(evt);
-        cMap.set(evt.parentId, siblings);
+        cMap.set(evt.causationId, siblings);
       }
     }
 

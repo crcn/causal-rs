@@ -135,12 +135,16 @@ export function WorkflowExplorerPane() {
                 {formatTs(corr.lastTs)}
               </span>
 
-              {/* Error indicator */}
+              {/* Error indicator — jumps straight to the failed reactor */}
               {corr.hasErrors && (
                 <span
-                  className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold shrink-0 bg-red-500/10 text-red-400/80 border border-red-500/20"
+                  className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold shrink-0 bg-red-500/10 text-red-400/80 border border-red-500/20 cursor-pointer hover:bg-red-500/20 hover:text-red-400 transition-colors"
                   style={{ boxShadow: "0 0 6px rgba(239, 68, 68, 0.15)" }}
-                  title="This workflow has errors"
+                  title="View error — open this workflow and select the failed reactor"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    dispatch({ type: "ui/flow_opened", payload: { workflowId: corr.workflowId, focusError: true } });
+                  }}
                 >
                   error
                 </span>

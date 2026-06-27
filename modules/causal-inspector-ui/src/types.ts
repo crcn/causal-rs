@@ -5,12 +5,12 @@ export type InspectorEvent = {
   type: string;
   name: string;
   id: string | null;
-  parentId: string | null;
+  causationId: string | null;
   workflowId: string | null;
   reactorId: string | null;
   aggregateType: string | null;
   aggregateId: string | null;
-  streamVersion: number | null;
+  streamRevision: number | null;
   summary: string | null;
   payload: string;
 };

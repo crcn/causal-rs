@@ -223,10 +223,10 @@ function buildFlowGraph(
       reactorToChildTypes.set(evt.reactorId, children);
     }
 
-    if (evt.parentId && evt.reactorId) {
-      const reactors = parentToReactor.get(evt.parentId) ?? new Set();
+    if (evt.causationId && evt.reactorId) {
+      const reactors = parentToReactor.get(evt.causationId) ?? new Set();
       reactors.add(evt.reactorId);
-      parentToReactor.set(evt.parentId, reactors);
+      parentToReactor.set(evt.causationId, reactors);
     }
   }
 
@@ -448,8 +448,8 @@ function computeVisibleIds(
     }
 
     // Parent event -> reactor edge
-    if (evt.parentId && evt.reactorId) {
-      const parentGroup = eventIdToGroup.get(evt.parentId);
+    if (evt.causationId && evt.reactorId) {
+      const parentGroup = eventIdToGroup.get(evt.causationId);
       if (parentGroup) {
         edgeIds.add(`evt:${parentGroup}->hdl:${evt.reactorId}`);
       }
@@ -458,7 +458,7 @@ function computeVisibleIds(
     // Root event -> reactor edges
     if (!evt.reactorId && evt.id) {
       for (const child of visible) {
-        if (child.parentId === evt.id && child.reactorId) {
+        if (child.causationId === evt.id && child.reactorId) {
           const rootGroup = eventIdToGroup.get(evt.id);
           if (rootGroup) {
             edgeIds.add(`evt:${rootGroup}->hdl:${child.reactorId}`);
@@ -494,9 +494,23 @@ function FitOnLoad() {
 function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: InspectorEvent[] }) {
   const selectedSeq = useSelector<InspectorState, number | null>((s) => s.selectedSeq);
   const scrubberEnd = useSelector<InspectorState, number | null>((s) => s.scrubberEnd);
+  const flowSelection = useSelector<InspectorState, FlowSelection>((s) => s.flowSelection);
   const { setCenter, getZoom } = useReactFlow();
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
+
+  const centerOnNode = useCallback((nodeId: string) => {
+    const node = nodesRef.current.find(n => n.id === nodeId);
+    if (!node) return;
+    const isReactor = node.id.startsWith("hdl:");
+    const w = isReactor ? REACTOR_WIDTH : NODE_WIDTH;
+    const h = isReactor ? estimateReactorHeight(node.data as FlowNodeData) : NODE_HEIGHT;
+    setCenter(
+      node.position.x + w / 2,
+      node.position.y + h / 2,
+      { zoom: getZoom(), duration: 400 },
+    );
+  }, [setCenter, getZoom]);
 
   useEffect(() => {
     // Don't recenter while scrubber is active
@@ -504,21 +518,16 @@ function FocusOnSelection({ nodes, flowData }: { nodes: Node[]; flowData: Inspec
     if (selectedSeq == null || !flowData.length) return;
     const evt = flowData.find(e => e.seq === selectedSeq);
     if (!evt) return;
+    centerOnNode(`evt:${evt.name}`);
+  }, [selectedSeq, scrubberEnd, flowData, centerOnNode]);
 
-    const nodeId = `evt:${evt.name}`;
-    const node = nodesRef.current.find(n => n.id === nodeId);
-    if (!node) return;
-
-    const isReactor = node.id.startsWith("hdl:");
-    const w = isReactor ? REACTOR_WIDTH : NODE_WIDTH;
-    const h = isReactor ? estimateReactorHeight(node.data as FlowNodeData) : NODE_HEIGHT;
-
-    setCenter(
-      node.position.x + w / 2,
-      node.position.y + h / 2,
-      { zoom: getZoom(), duration: 400 },
-    );
-  }, [selectedSeq, scrubberEnd, flowData, setCenter, getZoom]);
+  // Pan to a selected reactor node (e.g. the failed reactor opened from the
+  // Workflows error pill), so it isn't left off-screen in a large graph.
+  useEffect(() => {
+    if (scrubberEnd != null) return;
+    if (flowSelection?.kind !== "reactor" || !flowData.length) return;
+    centerOnNode(`hdl:${flowSelection.reactorId}`);
+  }, [flowSelection, scrubberEnd, flowData, centerOnNode]);
 
   return null;
 }
@@ -818,7 +827,7 @@ export function CausalFlowPane({ defaultHiddenReactors, headerExtra }: CausalFlo
 
   return (
     <div className="h-full flex flex-col">
-      <div className="flex items-center gap-2.5 px-3 py-2 border-b border-border shrink-0" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
+      <div className="relative z-20 flex items-center gap-2.5 px-3 py-2 border-b border-border shrink-0" style={{ background: "rgba(15, 15, 20, 0.6)", backdropFilter: "blur(8px)" }}>
         <h3 className="text-[10px] font-semibold text-muted-foreground/60 uppercase tracking-widest">
           Flow
         </h3>
