@@ -1213,35 +1213,106 @@ where
             }
             // Fold the output into the shared engine registry (folds
             // are idempotent on stream coordinates, so a deduped
-            // re-append skips instead of double-counting).
+            // re-append skips instead of double-counting). BEST-EFFORT:
+            // the durable append above already succeeded; this only warms
+            // the read cache behind `engine.state_of`, so a fold that
+            // can't converge must not fail (and retry) the attempt.
             if let Some(reg) = &self.engine_aggregators {
-                let outcome = crate::aggregator::fold_event(
-                    reg.as_ref(),
-                    self.snapshot_store.as_deref(),
-                    self.log.as_ref(),
-                    &out.durable_name,
-                    &out.payload,
-                    out.subject_id,
-                    &out.subject,
-                    write.revision,
-                    write.position,
-                    /* strict_to_event = */ false,
-                )
-                .await?;
-                if outcome.applied {
-                    if let Some(store) = self.snapshot_store.as_ref() {
-                        crate::aggregator::maybe_save_snapshots(
-                            reg.as_ref(),
-                            store.as_ref(),
-                            self.snapshot_every,
-                            &outcome.snapshots,
-                        )
-                        .await;
+                if let Some(outcome) = self
+                    .fold_output_into_engine_registry(
+                        reg.as_ref(),
+                        &out.durable_name,
+                        &out.payload,
+                        out.subject_id,
+                        &out.subject,
+                        &write,
+                    )
+                    .await
+                {
+                    if outcome.applied {
+                        if let Some(store) = self.snapshot_store.as_ref() {
+                            crate::aggregator::maybe_save_snapshots(
+                                reg.as_ref(),
+                                store.as_ref(),
+                                self.snapshot_every,
+                                &outcome.snapshots,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
         }
         Ok(AttemptOutcome::Done)
+    }
+
+    /// Best-effort fold of a just-appended output into the shared engine
+    /// registry — the in-memory cache read by
+    /// [`engine.state_of`](crate::Engine::state_of). The output is **already
+    /// durably committed** by the time this runs; this fold only keeps that
+    /// cache current.
+    ///
+    /// Returns the [`FoldOutcome`] on success (so the caller can persist
+    /// snapshots), or `None` if the fold could not be applied — in which
+    /// case the failure is **logged and swallowed**, never propagated.
+    ///
+    /// Why best-effort: a stream-aligned, restorable aggregate on a
+    /// high-fan-in stream (many aggregates' events interleave on one
+    /// `{category}-{subject_id}` stream) accrues a stale watermark — foreign
+    /// events don't advance it during normal delivery, only `repair_gap`
+    /// does. Under concurrent post-append folds on the same registry entry,
+    /// `repair_gap`'s TOCTOU back-off keeps deferring and `fold_event`
+    /// exceeds its round cap with "gap repair did not converge". That is a
+    /// failure to *warm a cache*, not a durability failure: propagating it
+    /// (the old `?`) failed and retried the whole reactor attempt — a retry
+    /// storm — even though the write was intact and the cache self-heals
+    /// (the next fold on this aggregate repairs the whole tail, including
+    /// the skipped revision, and `engine.state_of` does a read-through
+    /// restore for a cold entry). The cost is a bounded staleness window
+    /// for `engine.state_of` on the affected aggregate until then —
+    /// correct for a best-effort cache, and the intended trade.
+    ///
+    /// (TODO: advancing the stale watermark on foreign events during normal
+    /// delivery would eliminate the repair — and this whole failure mode —
+    /// entirely. Out of scope here; that touches `apply_event`/`repair_gap`.)
+    async fn fold_output_into_engine_registry(
+        &self,
+        reg: &AggregatorRegistry,
+        event_type: &str,
+        payload: &serde_json::Value,
+        subject_id: Uuid,
+        subject: &str,
+        write: &crate::types::WriteResult,
+    ) -> Option<crate::aggregator::FoldOutcome> {
+        match crate::aggregator::fold_event(
+            reg,
+            self.snapshot_store.as_deref(),
+            self.log.as_ref(),
+            event_type,
+            payload,
+            subject_id,
+            subject,
+            write.revision,
+            write.position,
+            /* strict_to_event = */ false,
+        )
+        .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                tracing::warn!(
+                    consumer = %self.consumer_id,
+                    event_type = %event_type,
+                    subject = %subject,
+                    %subject_id,
+                    revision = write.revision.raw(),
+                    error = %format!("{e:#}"),
+                    "post-append engine-registry fold deferred; durable append \
+                     intact, registry will repair on next fold / read-through restore",
+                );
+                None
+            }
+        }
     }
 
     /// Terminal-failure routing — **mandatory** (BLOCKING-2 / Primitive
@@ -1346,20 +1417,20 @@ where
             if let Some(tracker) = &self.settle_tracker {
                 tracker.lock().unwrap().bump(wf, write.position);
             }
+            // Same best-effort contract as the react()-output fold: the
+            // terminal fact is already durably appended; warming the
+            // engine registry must not fail the park (which would retry).
             if let Some(reg) = &self.engine_aggregators {
-                crate::aggregator::fold_event(
-                    reg.as_ref(),
-                    self.snapshot_store.as_deref(),
-                    self.log.as_ref(),
-                    &event_type,
-                    &payload,
-                    sid,
-                    &cat,
-                    write.revision,
-                    write.position,
-                    /* strict_to_event = */ false,
-                )
-                .await?;
+                let _ = self
+                    .fold_output_into_engine_registry(
+                        reg.as_ref(),
+                        &event_type,
+                        &payload,
+                        sid,
+                        &cat,
+                        &write,
+                    )
+                    .await;
             }
         }
         self.checkpoint
@@ -2223,6 +2294,232 @@ mod tests {
         assert_eq!(*seen.lock(), vec![(0, 1), (1, 2)],
                    "each reaction sees the fold AT ITS OWN trigger, not the log head");
         runner.halt();
+    }
+
+    #[tokio::test]
+    async fn post_append_registry_fold_failure_does_not_fail_attempt() {
+        // The post-append fold into the shared ENGINE registry is a
+        // best-effort warming of the read cache behind `engine.state_of`.
+        // The output is ALREADY durably appended before it runs. A fold
+        // that cannot converge ("gap repair did not converge") must NOT
+        // fail the reactor attempt — doing so turns a cache hiccup into a
+        // retry storm (downstream: `process_social_results_reactor` logged
+        // this 373× in 20 min while its runs completed fine).
+        //
+        // Deterministic stand-in for the real concurrency race (per the
+        // handoff: do NOT rely on timing): a log wrapper whose
+        // `read_stream` hides one revision in the middle of the tail, so
+        // gap-repair can never bridge the watermark up to the output's
+        // revision — the exact non-convergence condition.
+
+        use crate::types::{StreamRevision, WriteResult};
+        use std::sync::atomic::AtomicUsize;
+
+        // Aggregate stream-aligned (restorable) to the OUTPUT's stream:
+        // SUBJECT == the output's category "shipped_notification", keyed
+        // by order_id. This is the family of aggregate that takes the
+        // repair path in the engine registry.
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct ShipCount { n: u32 }
+        impl crate::aggregate::Aggregate for ShipCount {
+            const NAME: &'static str = "ShipCount";
+            const SUBJECT: &'static str = "shipped_notification";
+        }
+        impl crate::aggregate::Apply<ShippedNotification> for ShipCount {
+            fn apply(&mut self, _: &ShippedNotification) { self.n += 1; }
+        }
+
+        // Log wrapper: delegate every method to the inner MemoryStore, but
+        // drop one `(category, subject, revision)` from `read_stream`'s
+        // result — modelling a foreign event whose visibility lags the
+        // fold (the live TOCTOU) without any real concurrency.
+        struct GappyLog {
+            inner: Arc<MemoryStore>,
+            hide_category: String,
+            hide_subject: Uuid,
+            hide_revision: StreamRevision,
+        }
+        #[async_trait]
+        impl EventLogBackend for GappyLog {
+            async fn read_all(
+                &self, after: LogCursor, limit: usize,
+            ) -> Result<Vec<RecordedEvent>> {
+                EventLogBackend::read_all(self.inner.as_ref(), after, limit).await
+            }
+            async fn read_stream(
+                &self, category: &str, subject_id: Uuid, after: Option<StreamRevision>,
+            ) -> Result<Vec<RecordedEvent>> {
+                let tail = EventLogBackend::read_stream(
+                    self.inner.as_ref(), category, subject_id, after,
+                ).await?;
+                Ok(tail
+                    .into_iter()
+                    .filter(|e| {
+                        !(e.category == self.hide_category
+                            && e.subject_id == self.hide_subject
+                            && e.revision == self.hide_revision)
+                    })
+                    .collect())
+            }
+            async fn latest_position(&self) -> Result<LogCursor> {
+                EventLogBackend::latest_position(self.inner.as_ref()).await
+            }
+            async fn append_to_stream(
+                &self, category: &str, subject_id: Uuid,
+                expected: StreamState, events: Vec<EventData>,
+            ) -> Result<WriteResult> {
+                self.inner
+                    .append_to_stream(category, subject_id, expected, events)
+                    .await
+            }
+        }
+
+        let inner = Arc::new(MemoryStore::new());
+        let oid = Uuid::new_v4();
+        let ship_stream = <ShippedNotification as Event>::NAME; // "shipped_notification"
+
+        // Seed the OUTPUT stream so the reactor's output lands at rev 2:
+        //   rev0: shipped_notification — folded into the registry below
+        //   rev1: a foreign interleaved event — hidden by the wrapper
+        let ship0 = ShippedNotification { order_id: oid };
+        let ev0 = EventData {
+            event_id:     Uuid::new_v4(),
+            causation_id: None,
+            workflow_id:  Uuid::new_v4(),
+            event_type:   ship_stream.to_string(),
+            payload:      serde_json::to_value(&ship0).unwrap(),
+            created_at:   Utc::now(),
+            category:     Some(ship_stream.to_string()),
+            subject_id:   Some(oid),
+            metadata:     serde_json::Map::new(),
+            ephemeral:    None,
+            persistent:   true,
+        };
+        let w0 = inner
+            .append_to_stream(ship_stream, oid, StreamState::Any, vec![ev0.clone()])
+            .await
+            .unwrap();
+        assert_eq!(w0.revision, StreamRevision::ZERO);
+
+        let ev1 = EventData {
+            event_id:     Uuid::new_v4(),
+            causation_id: None,
+            workflow_id:  Uuid::new_v4(),
+            event_type:   "foreign_event".to_string(),
+            payload:      serde_json::json!({}),
+            created_at:   Utc::now(),
+            category:     Some(ship_stream.to_string()),
+            subject_id:   Some(oid),
+            metadata:     serde_json::Map::new(),
+            ephemeral:    None,
+            persistent:   true,
+        };
+        let w1 = inner
+            .append_to_stream(ship_stream, oid, StreamState::Any, vec![ev1])
+            .await
+            .unwrap();
+        assert_eq!(w1.revision, StreamRevision::from_raw(1));
+
+        // Warm the engine registry to version 1 by folding ONLY rev0: the
+        // entry now HAS state (so read-through restore is skipped) but its
+        // watermark trails the hidden rev1 and the output's rev2.
+        let mut registry = crate::aggregator::AggregatorRegistry::new();
+        registry.register(
+            crate::aggregator::Aggregator::for_type::<ShipCount, ShippedNotification>(),
+        );
+        let reg = Arc::new(registry);
+        let pre = reg
+            .apply_event(ship_stream, &ev0.payload, oid, ship_stream,
+                         StreamRevision::ZERO, w0.position)
+            .unwrap();
+        assert!(pre.applied && pre.gaps.is_empty(), "rev0 folds cleanly to version 1");
+
+        // Wrapper hides the foreign rev1, so gap-repair over the tail can
+        // never advance the watermark to rev2 → the output fold bails with
+        // "gap repair did not converge".
+        let log: Arc<dyn EventLogBackend> = Arc::new(GappyLog {
+            inner:         inner.clone(),
+            hide_category: ship_stream.to_string(),
+            hide_subject:  oid,
+            hide_revision: StreamRevision::from_raw(1),
+        });
+
+        let trigger = OrderPlaced { order_id: oid, occurred_at: Utc::now() };
+        let trigger_id = append_trigger(&inner, &trigger);
+        let trigger_event = EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_id == trigger_id)
+            .expect("trigger present in log");
+
+        let runner = ReactorRunner::new(
+            EmitOne,
+            "engine-fold-besteffort",
+            log,
+            inner.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_engine_aggregators(Some(reg.clone()));
+
+        // Count WARN-level events emitted during the attempt — the fix
+        // must LOG the deferred fold, not silently swallow it.
+        struct WarnCounter(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        use tracing_subscriber::prelude::*;
+        let warns = Arc::new(AtomicUsize::new(0));
+
+        let fold_cache = FoldOnReadCache::default();
+        let labels = LabelSet::default();
+        let outcome = {
+            let subscriber =
+                tracing_subscriber::registry().with(WarnCounter(warns.clone()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+            runner.core
+                .attempt_trigger(&trigger_event, &fold_cache, &labels)
+                .await
+        };
+
+        // The durable append committed before the fold ran; the fold's
+        // non-convergence is swallowed → the attempt completes.
+        match outcome {
+            Ok(AttemptOutcome::Done) => {}
+            Ok(AttemptOutcome::BodyFailed { error, .. }) => {
+                panic!("attempt body-failed instead of completing: {error:#}")
+            }
+            Err(e) => panic!(
+                "post-append engine-registry fold failure must not fail the attempt; \
+                 got Err: {e:#}"
+            ),
+        }
+
+        // The output is durably present at rev 2 (appended before the fold).
+        let out_id = derive_output_event_id(
+            "engine-fold-besteffort", trigger_id, "shipped_notification", oid, 0,
+        );
+        let stream = EventLogBackend::read_stream(inner.as_ref(), ship_stream, oid, None)
+            .await
+            .unwrap();
+        let out = stream
+            .iter()
+            .find(|e| e.event_id == out_id)
+            .expect("reactor output durably appended despite the deferred fold");
+        assert_eq!(out.revision, StreamRevision::from_raw(2));
+
+        // And the deferral was observable, not silent.
+        assert!(
+            warns.load(Ordering::SeqCst) >= 1,
+            "a warning must be emitted when the engine-registry fold is deferred",
+        );
     }
 
     #[tokio::test]

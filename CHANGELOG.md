@@ -6,6 +6,38 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.2] — 2026-06-27
+
+### Fixed
+
+- **Post-append engine-registry fold is now best-effort.** After a reactor
+  output (or terminal-failure fact) is durably appended, the runner folds it
+  into the shared engine registry — the in-memory cache behind
+  `engine.state_of`. That fold previously propagated its error with `?`, so a
+  fold that *couldn't converge* failed the whole reactor attempt and triggered
+  a retry. For a **stream-aligned, restorable** aggregate on a **high-fan-in**
+  stream (many aggregates' events interleave on one `{category}-{subject_id}`
+  stream), the watermark goes stale during normal delivery and every matching
+  event drives a full `repair_gap`; under concurrent post-append folds on the
+  same entry, `repair_gap`'s TOCTOU back-off keeps deferring past the round cap
+  and `fold_event` bails with *"gap repair did not converge"*. The append had
+  already committed, so this was a failure to **warm a cache** masquerading as
+  an infrastructure error — a retry storm (observed downstream:
+  `process_social_results_reactor`, 373 retries in 20 min on completing runs).
+  The fold's failure is now **logged and swallowed**; the durable write is the
+  source of truth, and the cache self-heals (the next fold on the aggregate
+  repairs the tail, and `engine.state_of` does a read-through restore for a cold
+  entry). Introduces a bounded staleness window for `engine.state_of` on the
+  affected aggregate until then — the intended trade for a best-effort cache.
+  Applied at **every** post-append engine-registry fold: both `reactor_runner`
+  sites (`react()` outputs and the terminal-failure park) and both `Engine`
+  command-path sites (`Engine::append`'s OCC decide and `Engine::emit`). The
+  load-bearing **consumer/projection** folds (`ProjectionRunner`,
+  `MultiProjector` — `strict_to_event = true`, where a fold failure correctly
+  blocks the checkpoint) are deliberately left strict. Durable
+  `append_to_stream` errors still propagate. Internal change only — no public
+  API change.
+
 ## [0.14.0] — 2026-06-25
 
 ### Added

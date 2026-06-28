@@ -1606,25 +1606,27 @@ impl Engine {
                             let revision = crate::types::StreamRevision::from_raw(
                                 result.revision.raw() - (n - 1 - i as u64),
                             );
-                            let outcome = crate::aggregator::fold_event(
-                                reg.as_ref(),
-                                self.snapshot_store.as_deref(),
-                                self.log.as_ref(),
-                                event_type,
-                                payload,
-                                id,
-                                F::SUBJECT,
+                            let fact_write = crate::types::WriteResult {
+                                position: result.position,
                                 revision,
-                                result.position,
-                                /* strict_to_event = */ false,
-                            )
-                            .await?;
-                            if outcome.applied {
-                                if let Some(obs) = self.observer.as_ref() {
-                                    reg.notify_observer(
-                                        &outcome.snapshots, obs.as_ref(), workflow,
-                                        result.position, *event_id,
-                                    );
+                            };
+                            // BEST-EFFORT: the batch already committed
+                            // durably above; warming the engine registry
+                            // must not fail the append (see the helper).
+                            if let Some(outcome) = self
+                                .fold_committed_fact_into_registry(
+                                    reg.as_ref(), event_type, payload, id,
+                                    F::SUBJECT, &fact_write,
+                                )
+                                .await
+                            {
+                                if outcome.applied {
+                                    if let Some(obs) = self.observer.as_ref() {
+                                        reg.notify_observer(
+                                            &outcome.snapshots, obs.as_ref(), workflow,
+                                            result.position, *event_id,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1850,37 +1852,35 @@ impl Engine {
                 // Idempotent on stream coordinates; gap repair orders
                 // racing concurrent emits to the same aggregate stream.
                 if let Some(reg) = &self.aggregators {
-                    let outcome = crate::aggregator::fold_event(
-                        reg.as_ref(),
-                        self.snapshot_store.as_deref(),
-                        self.log.as_ref(),
-                        &agg_event_type,
-                        &agg_payload,
-                        subject_id,
-                        &subject,
-                        fact_write.revision,
-                        fact_write.position,
-                        /* strict_to_event = */ false,
-                    )
-                    .await?;
-                    if outcome.applied {
-                        if let Some(obs) = self.observer.as_ref() {
-                            reg.notify_observer(
-                                &outcome.snapshots,
-                                obs.as_ref(),
-                                workflow,
-                                fact_write.position,
-                                event_id,
-                            );
-                        }
-                        if let Some(store) = self.snapshot_store.as_ref() {
-                            crate::aggregator::maybe_save_snapshots(
-                                reg.as_ref(),
-                                store.as_ref(),
-                                self.snapshot_every,
-                                &outcome.snapshots,
-                            )
-                            .await;
+                    // BEST-EFFORT: the run already committed durably above;
+                    // warming the engine registry must not fail the emit
+                    // (see the helper).
+                    if let Some(outcome) = self
+                        .fold_committed_fact_into_registry(
+                            reg.as_ref(), &agg_event_type, &agg_payload,
+                            subject_id, &subject, &fact_write,
+                        )
+                        .await
+                    {
+                        if outcome.applied {
+                            if let Some(obs) = self.observer.as_ref() {
+                                reg.notify_observer(
+                                    &outcome.snapshots,
+                                    obs.as_ref(),
+                                    workflow,
+                                    fact_write.position,
+                                    event_id,
+                                );
+                            }
+                            if let Some(store) = self.snapshot_store.as_ref() {
+                                crate::aggregator::maybe_save_snapshots(
+                                    reg.as_ref(),
+                                    store.as_ref(),
+                                    self.snapshot_every,
+                                    &outcome.snapshots,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -1891,6 +1891,68 @@ impl Engine {
             position: last_position,
             workflow_id: workflow,
         })
+    }
+
+    /// Best-effort fold of a just-committed fact into the shared engine
+    /// registry — the in-memory cache read by [`Engine::state_of`]. The
+    /// fact is **already durably appended** by the time this runs; this
+    /// only keeps that cache current.
+    ///
+    /// Returns the [`FoldOutcome`](crate::aggregator::FoldOutcome) on
+    /// success (so the caller can notify observers / persist snapshots),
+    /// or `None` if the fold could not be applied — in which case the
+    /// failure is **logged and swallowed**, never propagated.
+    ///
+    /// Why best-effort: a stream-aligned, restorable aggregate on a
+    /// high-fan-in stream accrues a stale watermark (foreign events don't
+    /// advance it during normal delivery, only `repair_gap` does). Under
+    /// concurrent post-append folds on the same registry entry,
+    /// `repair_gap`'s TOCTOU back-off keeps deferring and `fold_event`
+    /// exceeds its round cap with "gap repair did not converge". That is a
+    /// failure to *warm a cache*, not a durability failure: propagating it
+    /// (the old `?`) failed the whole `append`/`emit` even though the write
+    /// was intact and the cache self-heals (the next fold on the aggregate
+    /// repairs the tail, and `state_of` does a read-through restore for a
+    /// cold entry). The cost is a bounded staleness window for `state_of`
+    /// on the affected aggregate until then — the intended trade. Mirrors
+    /// `ReactorRunner`'s post-append fold.
+    async fn fold_committed_fact_into_registry(
+        &self,
+        reg: &AggregatorRegistry,
+        event_type: &str,
+        payload: &serde_json::Value,
+        subject_id: Uuid,
+        subject: &str,
+        write: &crate::types::WriteResult,
+    ) -> Option<crate::aggregator::FoldOutcome> {
+        match crate::aggregator::fold_event(
+            reg,
+            self.snapshot_store.as_deref(),
+            self.log.as_ref(),
+            event_type,
+            payload,
+            subject_id,
+            subject,
+            write.revision,
+            write.position,
+            /* strict_to_event = */ false,
+        )
+        .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = %event_type,
+                    subject = %subject,
+                    %subject_id,
+                    revision = write.revision.raw(),
+                    error = %format!("{e:#}"),
+                    "post-append engine-registry fold deferred; durable append \
+                     intact, registry will repair on next fold / read-through restore",
+                );
+                None
+            }
+        }
     }
 
     /// Read a subject's current state, **restoring it from durable
@@ -2699,6 +2761,139 @@ mod tests {
             .filter(|e| e.event_type.as_str() == "run_requested")
             .count();
         assert_eq!(n, 1, "re-emitting the same root with the same event_id must dedup");
+    }
+
+    #[tokio::test]
+    async fn emit_post_append_registry_fold_failure_does_not_fail_emit() {
+        // Same best-effort contract as the reactor runner, on the
+        // command path: `engine.emit` durably appends the fact, THEN
+        // folds it into the shared engine registry (the cache behind
+        // `engine.state_of`). A fold that can't converge ("gap repair
+        // did not converge") must NOT fail the emit — the write is the
+        // source of truth and the cache self-heals.
+        //
+        // Deterministic stand-in for the concurrency race: a log wrapper
+        // whose `read_stream` hides one revision in the middle of the
+        // tail, so gap-repair can never bridge the watermark to the
+        // freshly-appended fact's revision.
+        use crate::types::{RecordedEvent, StreamState, WriteResult};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Ping { id: Uuid }
+        impl Event for Ping {
+            const NAME: &'static str = "ping";
+            fn subject_id(&self) -> Uuid { self.id }
+        }
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct PingCount { n: u32 }
+        impl Aggregate for PingCount {
+            const NAME: &'static str = "PingCount";
+            const SUBJECT: &'static str = "ping";
+        }
+        impl Apply<Ping> for PingCount {
+            fn apply(&mut self, _: &Ping) { self.n += 1; }
+        }
+
+        struct GappyLog {
+            inner: Arc<MemoryStore>,
+            hide_category: String,
+            hide_subject: Uuid,
+            hide_revision: StreamRevision,
+        }
+        #[async_trait]
+        impl EventLogBackend for GappyLog {
+            async fn read_all(
+                &self, after: LogCursor, limit: usize,
+            ) -> Result<Vec<RecordedEvent>> {
+                EventLogBackend::read_all(self.inner.as_ref(), after, limit).await
+            }
+            async fn read_stream(
+                &self, category: &str, subject_id: Uuid, after: Option<StreamRevision>,
+            ) -> Result<Vec<RecordedEvent>> {
+                let tail = EventLogBackend::read_stream(
+                    self.inner.as_ref(), category, subject_id, after,
+                ).await?;
+                Ok(tail
+                    .into_iter()
+                    .filter(|e| {
+                        !(e.category == self.hide_category
+                            && e.subject_id == self.hide_subject
+                            && e.revision == self.hide_revision)
+                    })
+                    .collect())
+            }
+            async fn latest_position(&self) -> Result<LogCursor> {
+                EventLogBackend::latest_position(self.inner.as_ref()).await
+            }
+            async fn append_to_stream(
+                &self, category: &str, subject_id: Uuid,
+                expected: StreamState, events: Vec<EventData>,
+            ) -> Result<WriteResult> {
+                self.inner.append_to_stream(category, subject_id, expected, events).await
+            }
+        }
+
+        let inner = store();
+        let oid = Uuid::new_v4();
+        let log: Arc<dyn EventLogBackend> = Arc::new(GappyLog {
+            inner:         inner.clone(),
+            hide_category: "ping".to_string(),
+            hide_subject:  oid,
+            hide_revision: StreamRevision::from_raw(1),
+        });
+        let engine = EngineBuilder::new(
+            log,
+            inner.clone() as Arc<dyn CheckpointStore>,
+            inner.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregators([Aggregator::for_type::<PingCount, Ping>()])
+        .build()
+        .await
+        .unwrap();
+
+        // rev0: emit through the engine → folds cleanly to version 1 (the
+        // registry entry is now warm, so read-through restore is skipped).
+        engine.emit(Ping { id: oid }).await.unwrap();
+
+        // rev1: a foreign interleaved event on the SAME stream, appended
+        // out-of-band and hidden by the wrapper — gap-repair can never
+        // see it, so it can never advance the watermark past it.
+        let foreign = EventData {
+            event_id:     Uuid::new_v4(),
+            causation_id: None,
+            workflow_id:  Uuid::new_v4(),
+            event_type:   "foreign_event".to_string(),
+            payload:      serde_json::json!({}),
+            created_at:   Utc::now(),
+            category:     Some("ping".to_string()),
+            subject_id:   Some(oid),
+            metadata:     serde_json::Map::new(),
+            ephemeral:    None,
+            persistent:   true,
+        };
+        let w1 = inner
+            .append_to_stream("ping", oid, StreamState::Any, vec![foreign])
+            .await
+            .unwrap();
+        assert_eq!(w1.revision, StreamRevision::from_raw(1));
+
+        // rev2: emit again. The fact appends durably at revision 2, then
+        // its post-append fold cannot converge (rev1 hidden). The emit
+        // must still succeed.
+        let result = engine.emit(Ping { id: oid }).await;
+        let result = result.expect(
+            "post-append engine-registry fold failure must not fail the emit",
+        );
+
+        // The fact is durably present at revision 2.
+        let stream = EventLogBackend::read_stream(inner.as_ref(), "ping", oid, None)
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 3, "rev0 ping, rev1 foreign, rev2 ping all durable");
+        assert_eq!(stream[2].revision, StreamRevision::from_raw(2));
+        assert_eq!(stream[2].event_type, "ping");
+        // The returned position matches the durable append.
+        assert_eq!(result.position, stream[2].position);
     }
 
     /// B2: a freshly-deployed reactor against an EXISTING log must not
