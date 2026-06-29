@@ -114,6 +114,11 @@ pub struct ReactorOutcomeEntry {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub triggering_event_ids: Vec<String>,
+    /// True when this reactor accepted a divergent redelivery for the
+    /// workflow — a nondeterministic output whose canonical row was kept.
+    /// Orthogonal to `status` (which stays `completed`): the reaction ran,
+    /// but its re-emission diverged. Never an error/dead_letter.
+    pub diverged: bool,
 }
 
 /// Per-attempt execution record for a reactor.

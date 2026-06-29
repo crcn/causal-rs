@@ -158,6 +158,21 @@ CREATE INDEX idx_reactor_exec_corr  ON causal_reactor_executions (correlation_id
 CREATE INDEX idx_reactor_exec_failed ON causal_reactor_executions (status)
     WHERE status IN ('failed', 'dead_letter');
 
+-- Accepted divergent redeliveries. A nondeterministic reactor re-derives the
+-- same identity-keyed event_id with a different payload on redelivery; the store
+-- keeps the persisted row and the runner accepts it (advances, never parks).
+-- This is NOT a failure, so it is recorded apart from the lifecycle statuses
+-- above and surfaced as a `diverged` flag — never an error/dead_letter.
+CREATE TABLE causal_reactor_divergences (
+    event_id        UUID NOT NULL,
+    reactor_id      TEXT NOT NULL,
+    correlation_id  UUID NOT NULL,
+    diff            TEXT NOT NULL,
+    at              TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (event_id, reactor_id)
+);
+CREATE INDEX idx_reactor_diverg_corr ON causal_reactor_divergences (correlation_id);
+
 CREATE TABLE causal_reactor_logs (
     event_id        UUID NOT NULL,
     reactor_id      TEXT NOT NULL,

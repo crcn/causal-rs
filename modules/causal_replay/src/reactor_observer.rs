@@ -52,6 +52,13 @@ mod pg {
             error: String,
             at: DateTime<Utc>,
         },
+        Divergence {
+            event_id: Uuid,
+            reactor_id: String,
+            workflow_id: Uuid,
+            diff: String,
+            at: DateTime<Utc>,
+        },
         Aggregate {
             event_id: Uuid,
             aggregate_key: String,
@@ -178,6 +185,27 @@ mod pg {
             });
         }
 
+        fn reactor_divergence(
+            &self,
+            event_id: Uuid,
+            reactor_id: &str,
+            workflow_id: Uuid,
+            diff: &str,
+        ) {
+            // Recorded in a table apart from causal_reactor_executions: a
+            // divergent redelivery is NOT a failure status (the canonical
+            // output stands, the runner advanced), it's a determinism
+            // warning surfaced as a `diverged` flag. The hook carries no
+            // timestamp, so stamp at send.
+            self.send(Rec::Divergence {
+                event_id,
+                reactor_id: reactor_id.to_string(),
+                workflow_id,
+                diff: diff.to_string(),
+                at: Utc::now(),
+            });
+        }
+
         fn aggregate_folded(
             &self,
             workflow_id: Uuid,
@@ -280,6 +308,18 @@ mod pg {
                                completed_at = EXCLUDED.completed_at",
                     )
                     .bind(event_id).bind(reactor_id).bind(attempts).bind(workflow_id).bind(error).bind(at)
+                    .execute(&mut *tx).await?;
+                }
+                Rec::Divergence { event_id, reactor_id, workflow_id, diff, at } => {
+                    sqlx::query(
+                        "INSERT INTO causal_reactor_divergences
+                            (event_id, reactor_id, correlation_id, diff, at)
+                         VALUES ($1, $2, $3, $4, $5)
+                         ON CONFLICT (event_id, reactor_id) DO UPDATE
+                           SET diff = EXCLUDED.diff,
+                               at = EXCLUDED.at",
+                    )
+                    .bind(event_id).bind(reactor_id).bind(workflow_id).bind(diff).bind(at)
                     .execute(&mut *tx).await?;
                 }
                 Rec::Aggregate { event_id, aggregate_key, workflow_id, state } => {

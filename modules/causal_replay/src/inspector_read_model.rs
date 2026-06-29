@@ -230,7 +230,11 @@ mod pg {
                         COUNT(*) AS attempts,
                         MIN(started_at) AS started_at,
                         MAX(completed_at) AS completed_at,
-                        array_agg(DISTINCT event_id::text) AS event_ids
+                        array_agg(DISTINCT event_id::text) AS event_ids,
+                        EXISTS (SELECT 1 FROM causal_reactor_divergences d
+                                 WHERE d.correlation_id = $1
+                                   AND d.reactor_id = causal_reactor_executions.reactor_id)
+                            AS diverged
                    FROM causal_reactor_executions
                   WHERE correlation_id = $1
                   GROUP BY reactor_id",
@@ -251,6 +255,7 @@ mod pg {
                         started_at: r.try_get("started_at")?,
                         completed_at: r.try_get("completed_at")?,
                         triggering_event_ids: r.try_get("event_ids")?,
+                        diverged: r.try_get("diverged")?,
                     })
                 })
                 .collect()

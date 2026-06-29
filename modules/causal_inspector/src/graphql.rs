@@ -453,6 +453,7 @@ impl<D: EventDisplay + 'static> CausalInspectorQuery<D> {
                 started_at: r.started_at,
                 completed_at: r.completed_at,
                 triggering_event_ids: r.triggering_event_ids,
+                diverged: r.diverged,
             })
             .collect())
     }

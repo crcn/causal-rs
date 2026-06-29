@@ -107,6 +107,14 @@ pub struct MemoryStore {
     /// `(wf, position, event_id, reactor_id, description_json)`.
     reactor_description_snapshots:
         Arc<Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>>>,
+    /// Accepted divergent redeliveries: `(event_id, reactor_id)` → `(wf,
+    /// diff, at)`. Recorded apart from `reactor_executions` because a
+    /// divergence is NOT a lifecycle status — the reactor's output was a
+    /// nondeterministic redelivery that the runner accepted (the canonical
+    /// row stands), so it is surfaced as a `diverged` flag, never as an
+    /// error. Mirrors the PG `causal_reactor_divergences` table.
+    reactor_divergences:
+        Arc<DashMap<(Uuid, String), (Uuid, String, DateTime<Utc>)>>,
 }
 
 impl MemoryStore {
@@ -123,6 +131,7 @@ impl MemoryStore {
             reactor_log_entries: Arc::new(Mutex::new(Vec::new())),
             aggregate_state_snapshots: Arc::new(Mutex::new(Vec::new())),
             reactor_description_snapshots: Arc::new(Mutex::new(Vec::new())),
+            reactor_divergences: Arc::new(DashMap::new()),
         }
     }
 
@@ -174,6 +183,15 @@ impl MemoryStore {
         &self,
     ) -> &Mutex<Vec<(Uuid, u64, Uuid, String, serde_json::Value)>> {
         &self.reactor_description_snapshots
+    }
+
+    /// Accepted divergent redeliveries keyed by `(event_id, reactor_id)` →
+    /// `(workflow_id, diff, at)`. The inspector surfaces these as a
+    /// `diverged` flag distinct from the reactor's lifecycle status.
+    pub fn reactor_divergences(
+        &self,
+    ) -> &DashMap<(Uuid, String), (Uuid, String, DateTime<Utc>)> {
+        &self.reactor_divergences
     }
 }
 
@@ -286,6 +304,23 @@ impl ReactorObserver for MemoryStore {
             entry.4 = Some(error.to_string());
             entry.5 = attempts as i32;
         }
+    }
+
+    fn reactor_divergence(
+        &self,
+        event_id: Uuid,
+        reactor_id: &str,
+        workflow_id: Uuid,
+        diff: &str,
+    ) {
+        // Record apart from the execution's lifecycle status: a divergent
+        // redelivery is not a failure (the canonical output stands), it's a
+        // nondeterminism warning surfaced as a `diverged` flag. The hook
+        // gives no timestamp, so stamp on receipt.
+        self.reactor_divergences.insert(
+            (event_id, reactor_id.to_string()),
+            (workflow_id, diff.to_string(), Utc::now()),
+        );
     }
 
     fn aggregate_folded(

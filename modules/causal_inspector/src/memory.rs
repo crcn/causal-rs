@@ -271,9 +271,20 @@ impl InspectorReadModel for MemoryInspectorReadModel {
             row.5.push(event_id.to_string());
         }
 
+        // Reactors that accepted a divergent redelivery in this workflow —
+        // surfaced as a `diverged` flag, orthogonal to lifecycle status.
+        let diverged_reactors: std::collections::HashSet<String> = self
+            .store
+            .reactor_divergences()
+            .iter()
+            .filter(|e| e.value().0 == cid)
+            .map(|e| e.key().1.clone())
+            .collect();
+
         Ok(by_reactor
             .into_iter()
             .map(|(reactor_id, (status, error, attempts, started_at, completed_at, triggering_event_ids))| {
+                let diverged = diverged_reactors.contains(&reactor_id);
                 ReactorOutcomeEntry {
                     reactor_id,
                     status,
@@ -282,6 +293,7 @@ impl InspectorReadModel for MemoryInspectorReadModel {
                     started_at,
                     completed_at,
                     triggering_event_ids,
+                    diverged,
                 }
             })
             .collect())
@@ -811,6 +823,42 @@ mod tests {
             .append_to_stream(category, subject_id, StreamState::Any, vec![mk_event(category, subject_id, event_id, workflow_id, causation_id, payload)])
             .await
             .unwrap();
+    }
+
+    // ── reactor_outcomes: divergence flag ────────────────────────────────────
+
+    #[tokio::test]
+    async fn reactor_outcomes_surfaces_divergence_orthogonal_to_status() {
+        use causal::ReactorObserver;
+        let store = Arc::new(causal::MemoryStore::new());
+        let wf = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        // r.nd: reacted, completed, then its redelivery diverged (accepted).
+        let trig_nd = Uuid::new_v4();
+        store.reactor_started(trig_nd, "r.nd", wf, 1, now);
+        store.reactor_completed(trig_nd, "r.nd", wf, 1, now, now, &[]);
+        store.reactor_divergence(trig_nd, "r.nd", wf, "payload at `nonce`");
+
+        // r.clean: completed, no divergence.
+        let trig_clean = Uuid::new_v4();
+        store.reactor_started(trig_clean, "r.clean", wf, 1, now);
+        store.reactor_completed(trig_clean, "r.clean", wf, 1, now, now, &[]);
+
+        let model = MemoryInspectorReadModel::new(store);
+        let outcomes = model.reactor_outcomes(&wf.to_string()).await.unwrap();
+
+        let nd = outcomes.iter().find(|o| o.reactor_id == "r.nd").expect("r.nd present");
+        assert!(nd.diverged, "the divergent reactor is flagged");
+        assert_eq!(
+            nd.status, "completed",
+            "divergence is orthogonal to status — react() completed, it is NOT an error",
+        );
+        assert!(nd.error.is_none(), "divergence is not surfaced as an error");
+
+        let clean = outcomes.iter().find(|o| o.reactor_id == "r.clean").expect("r.clean present");
+        assert!(!clean.diverged, "a non-divergent reactor is not flagged");
+        assert_eq!(clean.status, "completed");
     }
 
     // ── list_aggregate_types ─────────────────────────────────────────────────

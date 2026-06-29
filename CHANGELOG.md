@@ -6,6 +6,32 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.1] — 2026-06-28
+
+### Added
+
+- **Durable, queryable divergence observability.** Completes the 0.15.0
+  divergent-redelivery fix: an accepted divergence is now surfaced in the
+  inspector instead of only the `tracing::error!` log, so a nondeterministic
+  reactor doesn't read as a clean `completed` (its output was discarded as a
+  redelivery — the inspector would otherwise mislead). Implemented via the
+  existing `ReactorObserver::reactor_divergence` hook (no API change to it):
+    - New `causal_reactor_divergences` table (Postgres) — `(event_id,
+      reactor_id, correlation_id, diff, at)` — written best-effort by
+      `PgReactorObserver`, **separate** from `causal_reactor_executions` so a
+      divergence is never recorded as a lifecycle status. `PgInspectorReadModel`
+      surfaces it as a new `diverged` flag on reactor outcomes.
+    - `MemoryStore` records divergences in-memory (new
+      `MemoryStore::reactor_divergences()` accessor) for the in-memory inspector
+      backend, at parity with the Postgres path.
+    - New `diverged: bool` on `ReactorOutcomeEntry` / the GraphQL
+      `ReactorOutcome`. It is **orthogonal to `status`**: a divergent reactor
+      still reads `completed` (the reaction ran) with `diverged = true` — never
+      `failed`/`dead_letter`. Divergence is a determinism warning, not a domain
+      failure.
+  Surfacing the flag in the inspector UI is a follow-up. Additive: no breaking
+  API change; the `reactor_divergence` hook signature is unchanged from 0.15.0.
+
 ## [0.15.0] — 2026-06-28
 
 ### Fixed
