@@ -74,6 +74,22 @@ mod pg {
             .await?;
             Ok(())
         }
+
+        async fn clamp_ahead_of(&self, tip: LogCursor) -> Result<u64> {
+            // Clamp DOWN TO the tip — never to 0. KurrentDB is append-only, so
+            // events <= tip are byte-identical to what each consumer already
+            // processed; only > tip is gone. Resetting to 0 would force a full
+            // replay over all history (a divergence storm); clamping resumes
+            // each cursor at the tip and re-processes nothing.
+            let r = sqlx::query(
+                "UPDATE causal_checkpoints SET position = $1, updated_at = now() \
+                 WHERE position > $1",
+            )
+            .bind(tip.raw() as i64)
+            .execute(&self.pool)
+            .await?;
+            Ok(r.rows_affected())
+        }
     }
 
     #[async_trait]

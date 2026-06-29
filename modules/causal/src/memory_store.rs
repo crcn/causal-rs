@@ -618,6 +618,18 @@ impl crate::checkpoint_store::CheckpointStore for MemoryStore {
         }
         Ok(())
     }
+
+    async fn clamp_ahead_of(&self, tip: LogCursor) -> Result<u64> {
+        let mut clamped = 0u64;
+        for mut e in self.projection_cursors.iter_mut() {
+            let entry = e.value_mut();
+            if entry.cursor > tip {
+                entry.cursor = tip;
+                clamped += 1;
+            }
+        }
+        Ok(clamped)
+    }
 }
 
 // ── ReactorCheckpoint implementation (C12 atomicity) ────────────────────
@@ -767,4 +779,23 @@ mod checkpoint_tests {
         );
     }
 
+    #[tokio::test]
+    async fn clamp_ahead_of_clamps_only_cursors_past_the_tip() {
+        let store = MemoryStore::new();
+        CheckpointStore::set(&store, "behind", LogCursor::from_raw(50)).await.unwrap();
+        CheckpointStore::set(&store, "at_tip", LogCursor::from_raw(100)).await.unwrap();
+        CheckpointStore::set(&store, "ahead_a", LogCursor::from_raw(150)).await.unwrap();
+        CheckpointStore::set(&store, "ahead_b", LogCursor::from_raw(999)).await.unwrap();
+
+        let tip = LogCursor::from_raw(100);
+        let clamped = CheckpointStore::clamp_ahead_of(&store, tip).await.unwrap();
+        assert_eq!(clamped, 2, "only the two cursors strictly past the tip are clamped");
+
+        // Behind and at-tip are untouched; ahead ones clamp DOWN TO the tip
+        // (never to zero — that's the whole point).
+        assert_eq!(CheckpointStore::get(&store, "behind").await.unwrap(), Some(LogCursor::from_raw(50)));
+        assert_eq!(CheckpointStore::get(&store, "at_tip").await.unwrap(), Some(tip));
+        assert_eq!(CheckpointStore::get(&store, "ahead_a").await.unwrap(), Some(tip));
+        assert_eq!(CheckpointStore::get(&store, "ahead_b").await.unwrap(), Some(tip));
+    }
 }

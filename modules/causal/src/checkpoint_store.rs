@@ -20,6 +20,30 @@ use crate::types::LogCursor;
 pub trait CheckpointStore: Send + Sync {
     async fn get(&self, consumer_id: &str) -> Result<Option<LogCursor>>;
     async fn set(&self, consumer_id: &str, pos: LogCursor) -> Result<()>;
+
+    /// Clamp every stored checkpoint whose position is strictly **ahead of**
+    /// `tip` down to `tip`, returning how many were clamped.
+    ///
+    /// A crash-recovery primitive for the case where a consumer's durable
+    /// cursor ran *past* the event log's tip — e.g. the event store was
+    /// restored to an earlier point, so positions beyond `tip` no longer
+    /// exist. The log is append-only, so events at or below `tip` are
+    /// byte-identical to what the consumer already processed; only events
+    /// beyond it are gone. **Clamping to `tip`** lets each affected consumer
+    /// resume exactly there and process only genuinely-new events.
+    ///
+    /// Prefer this over resetting such cursors to zero: a reset forces a full
+    /// replay that re-runs every reactor over all history, and any
+    /// nondeterministic reactor then re-emits divergently on every historical
+    /// output — a divergence storm. Clamping re-processes nothing.
+    ///
+    /// The default is a **no-op** returning `0`; durable backends override it.
+    /// (A generic default can't enumerate consumers through this trait, and a
+    /// silent no-op is the safe degradation for stores that don't support it.)
+    async fn clamp_ahead_of(&self, tip: LogCursor) -> Result<u64> {
+        let _ = tip;
+        Ok(0)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

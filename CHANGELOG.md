@@ -6,6 +6,25 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.3] — 2026-06-28
+
+### Added
+
+- **`CheckpointStore::clamp_ahead_of(tip)`** — a crash-recovery primitive that
+  clamps every stored checkpoint whose position is strictly past `tip` **down to
+  `tip`**, returning how many were clamped. For the case where a consumer's
+  durable cursor ran *past* the event-store tip (e.g. the store was restored to
+  an earlier point): the log is append-only, so events `<= tip` are
+  byte-identical to what each consumer already processed and only `> tip` is
+  gone — clamping resumes each cursor at the tip and re-processes nothing.
+  Prefer this over resetting such cursors to zero, which forces a full replay
+  that re-runs every reactor over all history (a divergence storm for any
+  nondeterministic reactor). Default impl is a no-op; `MemoryStore` and the
+  Postgres `PgReactorCheckpoint` override it. Lets a host replace a hand-written
+  `UPDATE causal_checkpoints SET position = 0 WHERE position > $1` boot-heal with
+  a tested `checkpoint.clamp_ahead_of(tip)`. Additive: defaulted trait method,
+  no breaking change.
+
 ## [0.15.2] — 2026-06-28
 
 ### Added
