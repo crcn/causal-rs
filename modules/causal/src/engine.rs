@@ -375,6 +375,63 @@ pub(crate) const WORKFLOW_CANCELLED_KIND: &str = "causal:workflow_cancelled";
 /// markers are persisted (one stream, nil id, infinite retention needed).
 pub(crate) const CONTROL_STREAM_SUBJECT: &str = "causal:control";
 
+/// Namespace UUID for deriving a cancel marker's deterministic `event_id`
+/// via uuid v5, keyed by the target `workflow_id`. Hardcoded so seeding the
+/// same run's marker again — on a later boot, or via both the boot path and
+/// the runtime [`Engine::cancel_workflow`] — collapses to ONE durable row
+/// (an idempotent log dedup-hit), never a duplicate marker. Because the
+/// payload is a pure function of the target, the re-append is byte-identical
+/// and so never trips the divergence check.
+pub(crate) const CONTROL_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x9b, 0x3c, 0x1f, 0x7a, 0x2d, 0x44, 0x4e, 0x61,
+    0x8c, 0x05, 0x6f, 0x91, 0xa2, 0xb7, 0xd3, 0x4e,
+]);
+
+/// Append a `WORKFLOW_CANCELLED` marker to the global control stream using
+/// only a log handle — **no built [`Engine`] required**.
+///
+/// This is the seam that makes boot-time cancellation race-free. A host that
+/// must cancel orphaned runs (e.g. runs left open by a previous process) can
+/// drop their markers here **before** it calls [`EngineBuilder::build`]; the
+/// builder's fence-rebuild scans this same stream and seeds the cancel fence,
+/// so every reactor runner spawns already fenced. No new fence logic, and no
+/// window where a runner could dispatch a doomed trigger.
+///
+/// The marker's `event_id` is **deterministic** (uuid v5 of the target
+/// `workflow_id`), so re-seeding the same run is an idempotent log dedup-hit
+/// rather than a duplicate marker. The caller supplies `created_at` — core
+/// never reads the wall clock itself. The fence-rebuild matches on
+/// `event_type` + `payload.target`, never `event_id`, so the deterministic id
+/// is purely an idempotency property and changes no fence behavior.
+pub async fn append_workflow_cancelled(
+    log: &dyn EventLogBackend,
+    workflow_id: Uuid,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let nil = Uuid::from_bytes([0; 16]);
+    let event = crate::types::EventData {
+        event_id:     Uuid::new_v5(&CONTROL_NAMESPACE, workflow_id.as_bytes()),
+        causation_id: None,
+        workflow_id:  nil,
+        event_type:   WORKFLOW_CANCELLED_KIND.to_string(),
+        payload:      serde_json::json!({ "target": workflow_id }),
+        created_at,
+        category:     Some(CONTROL_STREAM_SUBJECT.to_string()),
+        subject_id:   Some(nil),
+        metadata:     crate::contexts::Metadata::new(),
+        ephemeral:    None,
+        persistent:   true,
+    };
+    log.append_to_stream(
+        CONTROL_STREAM_SUBJECT,
+        nil,
+        crate::types::StreamState::Any,
+        vec![event],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Metadata about a reactor that has exhausted its retry budget,
 /// passed to the [`EngineBuilder::on_terminal_failure`] mapper. The mapper
 /// decides whether to synthesize a terminal-failure Event and append
@@ -1433,26 +1490,11 @@ impl Engine {
     /// Idempotent: cancelling an already-cancelled or already-drained
     /// workflow is a no-op at the runner level.
     pub async fn cancel_workflow(&self, workflow_id: Uuid) -> Result<()> {
-        use crate::types::StreamState;
-        // Durable marker — must succeed before we set the in-memory
-        // fence, so a write failure never leaves a ghost fence.
-        let nil = Uuid::from_bytes([0; 16]);
-        let event = crate::types::EventData {
-            event_id:     Uuid::new_v4(),
-            causation_id: None,
-            workflow_id:  nil,
-            event_type:   WORKFLOW_CANCELLED_KIND.to_string(),
-            payload:      serde_json::json!({ "target": workflow_id }),
-            created_at:   self.clock.now(),
-            category:     Some(CONTROL_STREAM_SUBJECT.to_string()),
-            subject_id:   Some(nil),
-            metadata:     crate::contexts::Metadata::new(),
-            ephemeral:    None,
-            persistent:   true,
-        };
-        self.log
-            .append_to_stream(CONTROL_STREAM_SUBJECT, nil, StreamState::Any, vec![event])
-            .await?;
+        // Durable marker — must succeed before we set the in-memory fence, so
+        // a write failure never leaves a ghost fence. Shares the standalone
+        // [`append_workflow_cancelled`] the boot path uses, so the runtime and
+        // boot cancel paths produce byte-identical, idempotent markers.
+        append_workflow_cancelled(&*self.log, workflow_id, self.clock.now()).await?;
         self.cancelled_workflows.lock().unwrap().insert(workflow_id);
         Ok(())
     }
@@ -2656,6 +2698,78 @@ mod tests {
     }
 
     fn store() -> Arc<MemoryStore> { Arc::new(MemoryStore::new()) }
+
+    /// The standalone control-marker append (the seam rootsignal uses to seed
+    /// cancel markers before `build_engine`) derives a DETERMINISTIC event_id,
+    /// so re-seeding the same run collapses to one durable marker.
+    #[tokio::test]
+    async fn append_workflow_cancelled_is_deterministic_and_idempotent() {
+        let store = store();
+        let wf = Uuid::new_v4();
+        let t = DateTime::parse_from_rfc3339("2026-06-28T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let log = store.clone() as Arc<dyn EventLogBackend>;
+
+        append_workflow_cancelled(log.as_ref(), wf, t).await.unwrap();
+        append_workflow_cancelled(log.as_ref(), wf, t).await.unwrap();
+
+        let nil = Uuid::from_bytes([0; 16]);
+        let markers =
+            EventLogBackend::read_stream(store.as_ref(), CONTROL_STREAM_SUBJECT, nil, None)
+                .await
+                .unwrap();
+        let cancels: Vec<_> = markers
+            .iter()
+            .filter(|e| e.event_type == WORKFLOW_CANCELLED_KIND)
+            .collect();
+        assert_eq!(cancels.len(), 1, "re-seeding the same workflow dedups to ONE marker");
+        assert_eq!(
+            cancels[0].event_id,
+            Uuid::new_v5(&CONTROL_NAMESPACE, wf.as_bytes()),
+            "event_id is the deterministic v5 of the target workflow",
+        );
+        let wf_s = wf.to_string();
+        assert_eq!(
+            cancels[0].payload.get("target").and_then(|v| v.as_str()),
+            Some(wf_s.as_str()),
+            "payload names the target workflow",
+        );
+    }
+
+    /// A marker seeded BEFORE `build()` (the orphaned-run boot scenario) is
+    /// picked up by the builder's fence-rebuild, so runners spawn fenced.
+    #[tokio::test]
+    async fn pre_build_cancel_marker_seeds_the_fence() {
+        let store = store();
+        let wf = Uuid::new_v4();
+        let t = DateTime::parse_from_rfc3339("2026-06-28T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Seed the marker with only a log handle — no engine exists yet.
+        append_workflow_cancelled(
+            &*(store.clone() as Arc<dyn EventLogBackend>),
+            wf,
+            t,
+        )
+        .await
+        .unwrap();
+
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .build()
+        .await
+        .unwrap();
+
+        assert!(
+            engine.cancelled_workflows.lock().unwrap().contains(&wf),
+            "build()'s fence-rebuild must seed the pre-build cancel marker",
+        );
+    }
 
     /// A queue worker that crashes after `emit` commits, then retries, re-emits
     /// the SAME root with the SAME caller-supplied `event_id`. A byte-identical

@@ -141,6 +141,7 @@ pub use failure::{domain, poison, transient, ErrorClass, FailureClass};
 
 // Engine + emit
 pub use engine::{
+    append_workflow_cancelled,
     Boundary,
     DrainResult, RunnerConfig,
     Engine, EngineBuilder,

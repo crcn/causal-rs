@@ -6,6 +6,31 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.2] — 2026-06-28
+
+### Added
+
+- **`causal::append_workflow_cancelled(log, workflow_id, created_at)`** — a
+  standalone control-stream marker append callable with just a log handle, **no
+  built `Engine` required**. This is the seam for race-free boot-time
+  cancellation: a host can seed cancel markers for orphaned runs (e.g. runs left
+  open by a previous process) **before** it calls `EngineBuilder::build`, and the
+  builder's existing fence-rebuild — which scans the same control stream — picks
+  them up, so every reactor runner spawns already fenced. No new fence logic and
+  no window where a runner could dispatch a doomed trigger. The caller supplies
+  `created_at` (core never reads the wall clock itself).
+
+### Changed
+
+- **Cancel markers now have a deterministic `event_id`** (uuid v5 of the target
+  `workflow_id`) instead of a random one. Re-seeding the same run — on a later
+  boot, or via both the boot path and the runtime `Engine::cancel_workflow` —
+  collapses to a single durable marker (an idempotent log dedup-hit) instead of
+  piling up duplicates, and being byte-identical it never trips the
+  divergent-redelivery check. `Engine::cancel_workflow` now delegates to
+  `append_workflow_cancelled`; fence behavior is unchanged — the rebuild matches
+  on `event_type` + `payload.target`, never `event_id`.
+
 ## [0.15.1] — 2026-06-28
 
 ### Added
