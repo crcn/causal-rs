@@ -651,16 +651,16 @@ mod kurrent {
                     && c.causation_id == e.causation_id
             });
             if !identical {
-                anyhow::bail!(
-                    "append_to_stream: divergent redelivery for event_id {} — \
-                     the persisted row differs from this batch's event \
-                     (payload/event_type/workflow/causation). A dedup-hit \
-                     must be byte-identical; a differing re-emission means the \
-                     producer is nondeterministic under redelivery (wall \
-                     clock, rand, or an external call not under ctx.effect). \
-                     The persisted row is kept unchanged.",
-                    e.event_id,
-                );
+                // Typed so the reactor runner can tell this apart from
+                // genuine I/O by downcast (it accepts the persisted row and
+                // shouts rather than retrying forever). Mirrors the
+                // ConflictError construction elsewhere in this backend.
+                return Err(anyhow::Error::new(
+                    causal::event_log::DivergentRedelivery {
+                        event_id: e.event_id,
+                        diff:     "payload/event_type/workflow/causation".to_string(),
+                    },
+                ));
             }
         }
         Ok(())

@@ -6,6 +6,53 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-06-28
+
+### Fixed
+
+- **A nondeterministic reactor no longer wedges in an infinite infra-retry
+  loop on a divergent redelivery.** When a reactor's `react()` output is
+  nondeterministic (bad emission order, `Uuid::new_v4()`, an un-`effect`'d
+  clock/RNG, `HashMap` iteration order), a redelivery — a crash between
+  append and ack, or the common case of a full replay / cursor rewind —
+  re-derives the output's deterministic, identity-keyed `event_id` but with
+  a *different* payload. `append_to_stream` detects the mismatch, keeps the
+  persisted row, and errors. The runner previously treated that as a runner-
+  infrastructure error, which it retries forever and never parks — so the
+  reactor wedged, hammering the DB (constant `causal_checkpoints` writes,
+  pool exhaustion), untouchable by pause/cancel/stop. The runner now treats
+  divergence as the idempotent redelivery it is: the persisted output is
+  canonical and already consumed, so it **accepts the persisted row,
+  advances the ack-floor, and surfaces a loud diagnostic** — it does not
+  retry (every retry re-diverges) and does not park (parking would emit a
+  terminal failure for work that *succeeded* and turn every full replay of a
+  nondeterministic reactor into a failure storm, breaking replay's
+  idempotent-no-op contract). Genuine infrastructure errors at the append
+  are unchanged — still retried, never parked. The fix is always upstream:
+  make the producer deterministic.
+
+### Added
+
+- **`causal::event_log::DivergentRedelivery`** — a typed error
+  (`{ event_id, diff }`) returned by `EventLogBackend::append_to_stream`
+  when a redelivered event's `event_id` is already persisted but its content
+  differs. Lets the reactor runner distinguish divergence from genuine I/O
+  by `downcast_ref` rather than string-matching. `diff` names where the rows
+  differ (a JSON path where the backend computes one).
+- **`ReactorObserver::reactor_divergence(event_id, reactor_id, workflow_id,
+  diff)`** — a non-fatal observer hook (default no-op) fired once per trigger
+  when a divergence is accepted, so divergences can be made durable and
+  queryable (e.g. in the Postgres inspector read-model) without emitting a
+  domain-failure fact.
+
+### Changed
+
+- **All three event-log backends** (`MemoryStore`, Postgres, KurrentDB) now
+  return the typed `DivergentRedelivery` from their divergence branch instead
+  of a bare `anyhow::bail!`. The store contract is unchanged — they still
+  error loudly on divergence (the conformance suite stays valid); only the
+  error's *type* changed (its `Display` still names the violation).
+
 ## [0.14.2] — 2026-06-27
 
 ### Fixed

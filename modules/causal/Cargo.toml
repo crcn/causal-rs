@@ -25,7 +25,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 uuid.workspace = true
-causal_core_macros = { version = "0.14.0", path = "../causal_core_macros", optional = true }
+causal_core_macros = { version = "0.15", path = "../causal_core_macros", optional = true }
 
 [dev-dependencies]
 fastrand.workspace = true

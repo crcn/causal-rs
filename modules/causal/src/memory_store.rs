@@ -449,15 +449,16 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                     } else {
                         "causation_id".to_string()
                     };
-                    anyhow::bail!(
-                        "append_to_stream: divergent redelivery for event_id {} — \
-                         the persisted row differs from this batch's event at {}. \
-                         A dedup-hit must be byte-identical; a differing \
-                         re-emission means the producer is nondeterministic under \
-                         redelivery (wall clock, rand, or an external call not \
-                         under ctx.effect). The persisted row is kept unchanged.",
-                        e.event_id, where_,
-                    );
+                    // Typed so the reactor runner can tell this apart from
+                    // genuine I/O by downcast (it accepts the persisted row
+                    // and shouts rather than retrying forever). The message
+                    // is preserved on the error's Display.
+                    return Err(anyhow::Error::new(
+                        crate::event_log::DivergentRedelivery {
+                            event_id: e.event_id,
+                            diff:     where_,
+                        },
+                    ));
                 }
             }
             let existing = &log[existing_at];

@@ -1165,6 +1165,9 @@ where
         //    deterministic identity-keyed event_id (idempotent under
         //    redelivery via the log's append-dedup, C1).
         let mut nth: HashMap<(&str, Uuid), u32> = HashMap::new();
+        // Divergence is reported at most once per trigger — a reactor that
+        // diverges on several outputs has one nondeterminism bug, not N.
+        let mut divergence_reported = false;
         for out in emitted.iter() {
             let n = nth
                 .entry((out.durable_name.as_str(), out.subject_id))
@@ -1198,11 +1201,57 @@ where
                 ephemeral: None,
                 persistent: true,
             };
-            let write = self.log
+            let write = match self.log
                 .append_to_stream(
                     &out.subject, out.subject_id, StreamState::Any, vec![out_event],
                 )
-                .await?;
+                .await
+            {
+                Ok(w) => w,
+                Err(e) => match e.downcast_ref::<crate::event_log::DivergentRedelivery>() {
+                    Some(d) => {
+                        // Idempotent redelivery of a nondeterministic reactor.
+                        // Divergence fires only on a dedup-hit, so the persisted
+                        // output is canonical and already consumed downstream:
+                        // accept it, let the loop reach `Done` so the ack-floor
+                        // advances, and shout. We do NOT retry (the store keeps
+                        // the original row, so every retry re-diverges forever)
+                        // and do NOT park (parking emits a terminal failure for
+                        // work that SUCCEEDED, and would turn every full replay
+                        // of a nondeterministic reactor into a failure storm —
+                        // breaking the replay-is-an-idempotent-no-op contract a
+                        // byte-identical redelivery already honours). Surface,
+                        // don't fail; the fix is always upstream determinism.
+                        if !divergence_reported {
+                            divergence_reported = true;
+                            if let Some(obs) = self.observer.as_ref() {
+                                obs.reactor_divergence(
+                                    event.event_id,
+                                    &self.consumer_id,
+                                    event.workflow_id,
+                                    &d.diff,
+                                );
+                            }
+                            tracing::error!(
+                                consumer = self.consumer_id,
+                                event_id = %event.event_id,
+                                diff = %d.diff,
+                                "DIVERGENT REDELIVERY — nondeterministic reactor; \
+                                 accepted the persisted output and advanced. Fix \
+                                 the producer's determinism (wall clock, rand, \
+                                 HashMap iteration order, emission order, or an \
+                                 external call not under ctx.effect).",
+                            );
+                        }
+                        continue; // skip this output; the persisted row stands
+                    }
+                    // Genuine infrastructure error → unchanged: propagate so
+                    // the worker's infra-retry path handles it (retry forever,
+                    // never park). The downcast is exact, so only divergence
+                    // takes the accept path above.
+                    None => return Err(e),
+                },
+            };
             // Advance the OUTPUT's workflow high-water. For a chain
             // member that's the trigger's run; for a workflow root it
             // seeds the CHILD's — the parent's settle does not wait for
@@ -1871,6 +1920,352 @@ mod tests {
         let last = appended.last().unwrap().position;
         assert_eq!(cursor, last, "ack-floor caught up after recovery");
         runner.halt();
+    }
+
+    // ── Divergent-redelivery fixtures ──
+
+    /// Output fact whose payload the reactor varies per invocation.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Reminder {
+        order_id: Uuid,
+        nonce:    u64,
+    }
+    impl Event for Reminder {
+        const NAME: &'static str = "reminder";
+        fn subject_id(&self) -> Uuid { self.order_id }
+    }
+
+    /// A nondeterministic producer: emits the SAME kind/subject output on
+    /// every invocation (so its identity-keyed `event_id` is stable) but a
+    /// DIFFERENT payload each time (`nonce` from a call counter). A re-run
+    /// therefore derives the same `event_id` with a different payload — a
+    /// divergent redelivery. Stands in for `Uuid::new_v4()`, an un-effect'd
+    /// clock/RNG, or HashMap iteration order leaking into a payload.
+    struct NondeterministicEmit { calls: Arc<AtomicUsize> }
+    #[async_trait]
+    impl Reactor for NondeterministicEmit {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "nondeterministic-emit";
+        async fn react(
+            &self,
+            trigger: &OrderPlaced,
+            _ctx: Ctx<'_>,
+        ) -> Result<Events> {
+            let nonce = self.calls.fetch_add(1, Ordering::SeqCst) as u64;
+            let mut out = Events::new();
+            out.push(Reminder { order_id: trigger.order_id, nonce });
+            Ok(out)
+        }
+    }
+
+    /// Deterministic counterpart that also counts invocations, so a replay
+    /// test can assert react() re-ran while the output stays byte-identical.
+    struct CountingEmit { calls: Arc<AtomicUsize> }
+    #[async_trait]
+    impl Reactor for CountingEmit {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "counting-emit";
+        async fn react(
+            &self,
+            trigger: &OrderPlaced,
+            _ctx: Ctx<'_>,
+        ) -> Result<Events> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut out = Events::new();
+            out.push(ShippedNotification { order_id: trigger.order_id });
+            Ok(out)
+        }
+    }
+
+    /// Observer that counts the non-fatal divergence hook and the terminal-
+    /// failure hook — the two outcomes a divergent redelivery must produce
+    /// exactly one and zero of, respectively.
+    #[derive(Default)]
+    struct CountingObserver {
+        divergences:       AtomicUsize,
+        terminal_failures: AtomicUsize,
+    }
+    impl ReactorObserver for CountingObserver {
+        fn reactor_divergence(
+            &self,
+            _event_id: Uuid,
+            _reactor_id: &str,
+            _workflow_id: Uuid,
+            _diff: &str,
+        ) {
+            self.divergences.fetch_add(1, Ordering::SeqCst);
+        }
+        fn reactor_terminal_failure(
+            &self,
+            _event_id: Uuid,
+            _reactor_id: &str,
+            _workflow_id: Uuid,
+            _attempts: u32,
+            _error: &str,
+            _at: DateTime<Utc>,
+        ) {
+            self.terminal_failures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Log wrapper that injects a fixed number of NON-divergence append
+    /// failures for the reactor's output kind, then delegates. Lets a test
+    /// prove a genuine infra error keeps the retry path (not the accept
+    /// path) — the divergence interception must be exact.
+    struct FailFirstAppend {
+        inner:          Arc<MemoryStore>,
+        fail_remaining: AtomicUsize,
+    }
+    #[async_trait]
+    impl EventLogBackend for FailFirstAppend {
+        async fn read_all(
+            &self,
+            after: LogCursor,
+            limit: usize,
+        ) -> Result<Vec<RecordedEvent>> {
+            EventLogBackend::read_all(self.inner.as_ref(), after, limit).await
+        }
+        async fn read_stream(
+            &self,
+            category: &str,
+            subject_id: Uuid,
+            after: Option<crate::types::StreamRevision>,
+        ) -> Result<Vec<RecordedEvent>> {
+            EventLogBackend::read_stream(self.inner.as_ref(), category, subject_id, after).await
+        }
+        async fn latest_position(&self) -> Result<LogCursor> {
+            EventLogBackend::latest_position(self.inner.as_ref()).await
+        }
+        async fn append_to_stream(
+            &self,
+            category: &str,
+            subject_id: Uuid,
+            expected: StreamState,
+            events: Vec<EventData>,
+        ) -> Result<crate::types::WriteResult> {
+            let is_output = events.iter().any(|e| e.event_type == "shipped_notification");
+            if is_output && self.fail_remaining.load(Ordering::SeqCst) > 0 {
+                self.fail_remaining.fetch_sub(1, Ordering::SeqCst);
+                anyhow::bail!("simulated transient append I/O failure");
+            }
+            EventLogBackend::append_to_stream(
+                self.inner.as_ref(), category, subject_id, expected, events,
+            )
+            .await
+        }
+    }
+
+    /// Drive a fresh runner over `store` with the cursor at the given
+    /// position (rewinding emulates a full replay / crash redelivery): a
+    /// new runner has fresh in-memory dispatch state, so `ensure_started`
+    /// re-seeds from the checkpoint and re-ingests from there.
+    async fn replay<R: Reactor + 'static>(
+        store: &Arc<MemoryStore>,
+        reactor: R,
+        consumer: &str,
+        observer: Arc<dyn ReactorObserver>,
+    ) where R::Trigger: DeserializeOwned {
+        store.set(consumer, LogCursor::ZERO).await.unwrap();
+        let runner = ReactorRunner::new(
+            reactor,
+            consumer,
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_observer(observer);
+        runner.quiesce().await.unwrap();
+        runner.halt();
+    }
+
+    #[tokio::test]
+    async fn divergent_redelivery_is_accepted_advances_and_shouts_never_parks() {
+        // The core backstop: a reactor whose payload differs on its 2nd
+        // invocation. First delivery persists P1; a replay re-runs react(),
+        // derives the same identity-keyed event_id with a different payload,
+        // and the store reports a divergent redelivery. The runner must
+        // accept the persisted P1, advance its cursor, fire the divergence
+        // diagnostic exactly once — and must NOT loop and NOT park.
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let order_id = trigger.order_id;
+        let trigger_event_id = append_trigger(&store, &trigger);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(CountingObserver::default());
+
+        // First delivery (nonce = 0): P1 persisted.
+        {
+            let runner = ReactorRunner::new(
+                NondeterministicEmit { calls: calls.clone() },
+                "r.nd",
+                store.clone() as Arc<dyn EventLogBackend>,
+                store.clone() as Arc<dyn ReactorCheckpoint>,
+            )
+            .with_observer(observer.clone() as Arc<dyn ReactorObserver>);
+            runner.quiesce().await.unwrap();
+            runner.halt();
+        }
+        let p1_payload = {
+            let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+                .await.unwrap();
+            all.iter().find(|e| e.event_type == "reminder")
+                .map(|e| e.payload.clone())
+                .expect("P1 persisted on first delivery")
+        };
+        assert_eq!(
+            p1_payload,
+            serde_json::to_value(Reminder { order_id, nonce: 0 }).unwrap(),
+            "first delivery persisted nonce 0",
+        );
+
+        // Replay (nonce = 1): divergence. A regression to retry-forever
+        // would hang here and trip quiesce's 10s deadline.
+        replay(
+            &store,
+            NondeterministicEmit { calls: calls.clone() },
+            "r.nd",
+            observer.clone() as Arc<dyn ReactorObserver>,
+        ).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "react() re-ran on replay");
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap();
+
+        // P1 unchanged — the divergent re-emission was NOT written.
+        let reminders: Vec<_> =
+            all.iter().filter(|e| e.event_type == "reminder").collect();
+        assert_eq!(reminders.len(), 1, "no second/divergent output written");
+        assert_eq!(
+            reminders[0].payload,
+            serde_json::to_value(Reminder { order_id, nonce: 0 }).unwrap(),
+            "persisted P1 (nonce 0) stands; the canonical output is kept",
+        );
+
+        // Cursor advanced to the log head (the trigger completed, not wedged).
+        let head = all.iter().map(|e| e.position).max().unwrap();
+        let cursor = store.get("r.nd").await.unwrap().unwrap();
+        assert_eq!(cursor, head, "ack-floor advanced past the divergent trigger");
+
+        // Shouted exactly once; never parked.
+        assert_eq!(
+            observer.divergences.load(Ordering::SeqCst), 1,
+            "divergence diagnostic fired exactly once",
+        );
+        assert_eq!(
+            observer.terminal_failures.load(Ordering::SeqCst), 0,
+            "divergence must never emit a terminal failure",
+        );
+        assert!(
+            !all.iter().any(|e| e.event_type == REACTION_FAILED_KIND),
+            "no terminal-failure fact in the log",
+        );
+        let _ = trigger_event_id;
+    }
+
+    #[tokio::test]
+    async fn replay_of_deterministic_reactor_is_idempotent_noop() {
+        // The contrast case that park-as-poison would break: replaying a
+        // DETERMINISTIC reactor re-appends byte-identically → dedup-hit →
+        // Ok → advance. No divergence, no terminal failure — replay is a
+        // safe no-op, exactly as a byte-identical redelivery is. Same
+        // advance behaviour as the divergent case above (cursor moves,
+        // nothing parks); the only difference is zero divergence reports.
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        append_trigger(&store, &trigger);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(CountingObserver::default());
+
+        {
+            let runner = ReactorRunner::new(
+                CountingEmit { calls: calls.clone() },
+                "r.det",
+                store.clone() as Arc<dyn EventLogBackend>,
+                store.clone() as Arc<dyn ReactorCheckpoint>,
+            )
+            .with_observer(observer.clone() as Arc<dyn ReactorObserver>);
+            runner.quiesce().await.unwrap();
+            runner.halt();
+        }
+
+        replay(
+            &store,
+            CountingEmit { calls: calls.clone() },
+            "r.det",
+            observer.clone() as Arc<dyn ReactorObserver>,
+        ).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "react() re-ran on replay");
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.event_type == "shipped_notification").count(),
+            1,
+            "byte-identical re-append deduped — exactly one output",
+        );
+        let head = all.iter().map(|e| e.position).max().unwrap();
+        assert_eq!(
+            store.get("r.det").await.unwrap().unwrap(), head,
+            "ack-floor advanced on idempotent replay",
+        );
+        assert_eq!(observer.divergences.load(Ordering::SeqCst), 0, "no divergence");
+        assert_eq!(
+            observer.terminal_failures.load(Ordering::SeqCst), 0,
+            "no terminal failure on idempotent replay",
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_infra_error_at_append_still_retries_not_accepted() {
+        // The divergence accept-path is exact: a NON-divergence error at the
+        // output append keeps the existing infra-retry behaviour. One
+        // injected failure → the attempt retries → the output lands. Were it
+        // mis-caught as divergence, the output would be skipped and never
+        // appear (and divergence would be reported); were it parked, a
+        // terminal fact would appear.
+        let inner = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        append_trigger(&inner, &trigger);
+
+        let log = Arc::new(FailFirstAppend {
+            inner:          inner.clone(),
+            fail_remaining: AtomicUsize::new(1),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(CountingObserver::default());
+
+        let runner = ReactorRunner::new(
+            CountingEmit { calls: calls.clone() },
+            "r.infra",
+            log.clone() as Arc<dyn EventLogBackend>,
+            inner.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_observer(observer.clone() as Arc<dyn ReactorObserver>);
+
+        runner.quiesce().await.unwrap();
+        runner.halt();
+
+        let all = EventLogBackend::read_all(inner.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap();
+        assert!(
+            all.iter().any(|e| e.event_type == "shipped_notification"),
+            "output landed after the injected append failure retried",
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the attempt retried at least once (genuine infra error, not accepted)",
+        );
+        assert_eq!(
+            observer.divergences.load(Ordering::SeqCst), 0,
+            "an infra error is not a divergence",
+        );
+        assert!(
+            !all.iter().any(|e| e.event_type == REACTION_FAILED_KIND),
+            "infra retry never parks",
+        );
     }
 
     #[tokio::test]

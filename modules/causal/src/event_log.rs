@@ -122,6 +122,39 @@ pub struct ConflictError {
     pub current:  Option<StreamRevision>,
 }
 
+/// Returned by [`EventLogBackend::append_to_stream`] when a redelivered
+/// event's `event_id` is already persisted but its content differs from
+/// the stored row — the divergent-redelivery case of the idempotency
+/// contract above. The backend keeps the persisted row and returns this.
+///
+/// It exists as a *typed* error (rather than a bare message) so the
+/// reactor runner can tell divergence apart from genuine I/O failure by
+/// `downcast_ref`, without string-matching. The distinction matters: a
+/// divergent redelivery is, by construction, a dedup-hit — the producer's
+/// canonical output already exists and was already consumed — so the
+/// runner accepts the persisted row and shouts, where it would retry a
+/// real infra error forever. Retrying divergence can never succeed (the
+/// store keeps the original row, so every retry re-diverges), and parking
+/// it would emit a terminal failure for work that *succeeded* and turn
+/// every full replay of a nondeterministic reactor into a failure storm.
+///
+/// `diff` names where the rows differ — a JSON path like
+/// `outputs[1].candidates[0].signal_id` where the backend computes one,
+/// or the set of compared fields otherwise. The nondeterminism is usually
+/// in a dependency far from the reactor body, and this is the difference
+/// between a grep and a debugging session.
+#[derive(Debug, thiserror::Error)]
+#[error("append_to_stream: divergent redelivery for event_id {event_id} — \
+         the persisted row differs from this batch's event ({diff}). A \
+         dedup-hit must be byte-identical; a differing re-emission means the \
+         producer is nondeterministic under redelivery (wall clock, rand, or \
+         an external call not under ctx.effect). The persisted row is kept \
+         unchanged.")]
+pub struct DivergentRedelivery {
+    pub event_id: Uuid,
+    pub diff:     String,
+}
+
 /// Convenience over the single [`EventLogBackend::append_to_stream`]
 /// primitive: append `event` to its own stream with [`StreamState::Any`]
 /// (append-only, no concurrency check; idempotency rests on `event_id`).

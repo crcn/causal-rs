@@ -71,6 +71,26 @@ pub trait ReactorObserver: Send + Sync + 'static {
         _at: DateTime<Utc>,
     ) {}
 
+    /// Called when a reactor's output diverged from the row already
+    /// persisted under the same identity-keyed `event_id` on redelivery
+    /// (a full replay, or a crash between append and ack) — the producer
+    /// is nondeterministic under redelivery.
+    ///
+    /// **This is NOT a failure.** The persisted output is canonical and
+    /// already durable (divergence fires only on a dedup-hit), so the
+    /// runner accepts it, advances its cursor, and calls this so the
+    /// divergence is surfaced — durable and queryable — without emitting a
+    /// domain failure fact. Fired **once per trigger** (a multi-output
+    /// divergence is one nondeterminism bug). `diff` names where the rows
+    /// differ. The fix is always upstream: make the producer deterministic.
+    fn reactor_divergence(
+        &self,
+        _event_id: Uuid,
+        _reactor_id: &str,
+        _workflow_id: Uuid,
+        _diff: &str,
+    ) {}
+
     /// Called once per aggregator fold (every `AggregatorRegistry::apply_event`).
     /// `state` is the JSON-serialized post-fold aggregate state.
     fn aggregate_folded(
