@@ -6,6 +6,80 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-06-29
+
+Production-hardening release. Two breaking changes (both pre-1.0
+corrections of production-unsafe defaults); everything else is additive.
+
+### Changed
+
+- **BREAKING — `EngineBuilder::build()` now errors when reactors are registered
+  without a durable effect store.** Previously it silently defaulted to
+  `InMemoryEffectStore` and only logged a `tracing::warn!`. In-memory effect
+  memoization is lost on restart, so every `ctx.effect()` re-executes after a
+  crash or redeploy — a production-unsafe default that a missed log line let
+  through. Build now fails fast instead. **Migration:** wire a durable store
+  with `.with_effect_store(<backend>)` for production, or call
+  `.allow_in_memory_effect_store_for_tests()` to accept the in-memory store
+  explicitly. `EngineBuilder::memory()` applies the opt-in automatically, so
+  test/prototype code that uses it is unaffected.
+- **BREAKING — `#[event(ephemeral)]` is now a compile error.** The attribute was
+  parsed but never affected codegen (a "lying default"). Subject-less-ness is
+  inferred from shape — a struct with no scalar `Uuid` fields is subject-less
+  automatically — so the keyword was redundant. **Migration:** delete
+  `ephemeral`; a reference-carrying fact that is still subject-less opts out
+  explicitly with `no_subject`.
+
+### Added
+
+- **`EngineBuilder::with_consumer_leasor(...)`** — wires an exclusive-consumer
+  lease through the builder to **every** consumer it registers (reactors,
+  projectors, multi-projectors), each acquiring `leasor.acquire(consumer_id)`
+  before its first step. Two engines built with the same leasor and consumer
+  names can no longer drive the same consumer concurrently, so a multi-engine
+  deployment can't silently race cursors or duplicate side effects. Previously
+  leasing existed only on `ReactorRunner` and was not reachable from the
+  builder.
+- **`ProjectionRunner::with_consumer_leasor(...)`** and
+  **`MultiProjectorRunner::with_consumer_leasor(...)`** — leasing parity for the
+  serial runners (mirrors `ReactorRunner`: acquire-once before the first
+  cursor read, guard held for the runner's lifetime).
+- **`EngineBuilder::allow_in_memory_effect_store_for_tests()`** — explicit
+  opt-in to the non-durable effect store (see the breaking change above).
+
+### Fixed
+
+- **`Engine::append` rejects a decided fact whose `subject_id` differs from the
+  targeted aggregate id, at runtime.** This was a `debug_assert!`, compiled out
+  in release builds — so a decision emitting a foreign-subject fact silently
+  placed it under the wrong subject in production ("debug caught it, prod ate
+  it"). It now returns an error without consuming an OCC retry.
+- **Redelivery divergence detection now includes placement.** A redelivered
+  `event_id` that targets a different stream (`category` / `subject_id`) than
+  the persisted row is a divergence, not a dedup-hit — the producer routed one
+  logical event to two subjects. Memory and Postgres backends reject it
+  (`DivergentRedelivery`) instead of silently deduping to the original
+  placement. Kurrent dedups per-stream and cannot observe cross-stream
+  `event_id` reuse without a global index; that remains a documented, accepted
+  limitation (the reaction-keyed `EffectStore` is the idempotency mechanism for
+  Kurrent deployments).
+- **`settle()` no longer returns early under fire-and-forget load.** An
+  actively-settling workflow's high-water entry is now pinned against the
+  `SETTLE_TRACKER_CAP` eviction. Previously a burst of >cap un-settled emits
+  could evict a settling run's entry, dropping `settle` back to its emit-floor
+  and letting it return before the causal chain drained.
+
+### Docs
+
+- Both READMEs migrated from the pre-0.10 `CATEGORY` / `stream_id()` /
+  `event_type()` / `GROUP_NAME` API to the current `NAME` / `SUBJECT` /
+  `subject_id`. The workspace README quickstart now mirrors the CI-built
+  `examples/order_walkthrough.rs`, so it cannot silently drift from the API
+  again.
+- Kurrent backend docs corrected: event metadata uses `$correlationId` (read by
+  the `$by_correlation_id` system projection), not the previously-documented
+  `$workflowId`/`$by_workflow_id` (which is not a Kurrent built-in).
+
 ## [0.15.3] — 2026-06-28
 
 ### Added

@@ -13,15 +13,18 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use causal::checkpoint_store::ReactorCheckpoint;
+use causal::checkpoint_store::{CheckpointStore, ReactorCheckpoint};
 use causal::consumer_lease::{ConsumerLeasor, LeaseGuard};
 use causal::contexts::Ctx;
 use causal::event::Event;
 use causal::event_log::EventLogBackend;
 use causal::memory_store::MemoryStore;
+use causal::projection_runner::ProjectionRunner;
+use causal::projector::Projector;
 use causal::reactor::{Events, Reactor};
 use causal::reactor_runner::ReactorRunner;
 use causal::types::EventData;
+use causal::EngineBuilder;
 
 // ── Trigger fact ──────────────────────────────────────────────────────
 
@@ -34,6 +37,21 @@ impl Event for Ping {
     const NAME: &'static str = "lease_ping";
     fn subject_id(&self) -> Uuid { self.id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
+}
+
+// ── Simple projector ──────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct PingProjector(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Projector for PingProjector {
+    type Event = Ping;
+    const NAME: &'static str = "lease-projector";
+    async fn project(&self, _p: &Ping, _ctx: Ctx<'_>) -> Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 // ── Simple reactor ────────────────────────────────────────────────────
@@ -304,5 +322,140 @@ async fn second_runner_blocks_until_first_drops_lease() -> Result<()> {
         .expect("runner B must unblock after A releases the lease")
         .expect("channel should not be dropped");
 
+    Ok(())
+}
+
+/// `EngineBuilder::with_consumer_leasor` must thread the leasor to EVERY
+/// consumer it builds — reactors AND projectors. Each consumer acquires
+/// its own lease (one per distinct consumer_id) on its first supervised
+/// step. Before this wiring existed the builder dropped the leasor on the
+/// floor and the count stayed 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn builder_threads_leasor_to_projector_and_reactor() -> Result<()> {
+    let store = make_store();
+    let (leasor, acquired) = MockLeasor::new();
+
+    let _engine = EngineBuilder::new(
+        store.clone() as Arc<dyn EventLogBackend>,
+        store.clone() as Arc<dyn CheckpointStore>,
+        store.clone() as Arc<dyn ReactorCheckpoint>,
+    )
+    .with_projector(PingProjector(Arc::new(AtomicUsize::new(0))))
+    .with_reactor(Counter(Arc::new(AtomicUsize::new(0))))
+    .allow_in_memory_effect_store_for_tests()
+    .with_consumer_leasor(leasor as Arc<dyn ConsumerLeasor>)
+    .build()
+    .await?;
+
+    // Both consumers acquire their lease on the first supervised step,
+    // even with no events in the log (ensure_leased runs before the
+    // cursor read). Poll until both have, with a bounded timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while acquired.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected both consumers to acquire a lease; got {}",
+            acquired.load(Ordering::SeqCst),
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        acquired.load(Ordering::SeqCst),
+        2,
+        "exactly one acquire per consumer (projector + reactor)",
+    );
+    Ok(())
+}
+
+/// Acceptance: two engines with the same projector consumer name cannot
+/// process concurrently. Driven at the runner level with a BlockingLeasor
+/// (the engine-level wiring is covered above): the second
+/// `ProjectionRunner` blocks on `step` until the first releases its lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn second_projector_blocks_until_first_drops_lease() -> Result<()> {
+    use tokio::sync::{oneshot, Notify};
+
+    struct BlockingLeasor {
+        held:   Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+    struct BlockingGuard {
+        held:   Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+    impl LeaseGuard for BlockingGuard {}
+    impl Drop for BlockingGuard {
+        fn drop(&mut self) {
+            self.held.store(false, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+    }
+    #[async_trait]
+    impl ConsumerLeasor for BlockingLeasor {
+        async fn acquire(&self, _: &str) -> Result<Box<dyn LeaseGuard>> {
+            while self.held.load(Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+            self.held.store(true, Ordering::SeqCst);
+            Ok(Box::new(BlockingGuard {
+                held:   self.held.clone(),
+                notify: self.notify.clone(),
+            }))
+        }
+    }
+
+    let held = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(Notify::new());
+    let leasor: Arc<dyn ConsumerLeasor> = Arc::new(BlockingLeasor {
+        held:   held.clone(),
+        notify: notify.clone(),
+    });
+
+    let store = make_store();
+    append_ping(&store);
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let runner_a = ProjectionRunner::new(
+        PingProjector(count_a.clone()),
+        "lease-projector",
+        store.clone() as Arc<dyn EventLogBackend>,
+        store.clone() as Arc<dyn CheckpointStore>,
+    )
+    .with_consumer_leasor(leasor.clone());
+
+    // Runner A acquires the lease and processes the ping.
+    runner_a.step(256).await?;
+    assert_eq!(count_a.load(Ordering::SeqCst), 1, "A processed the ping");
+    assert!(held.load(Ordering::SeqCst), "A holds the lease");
+
+    // Runner B (same consumer name) must block on step until A releases.
+    let store2 = store.clone();
+    let leasor2 = leasor.clone();
+    let count_b = Arc::new(AtomicUsize::new(0));
+    let count_b2 = count_b.clone();
+    let (tx, rx) = oneshot::channel::<()>();
+    let runner_b = ProjectionRunner::new(
+        PingProjector(count_b2),
+        "lease-projector",
+        store2.clone() as Arc<dyn EventLogBackend>,
+        store2.clone() as Arc<dyn CheckpointStore>,
+    )
+    .with_consumer_leasor(leasor2);
+    tokio::spawn(async move {
+        runner_b.step(256).await.expect("B step after lease acquired");
+        let _ = tx.send(());
+    });
+
+    // While A holds, B must not have acquired/processed.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(count_b.load(Ordering::SeqCst), 0, "B blocked while A holds");
+
+    // Drop A → guard drops → lease released.
+    drop(runner_a);
+
+    timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("B must unblock after A releases the lease")
+        .expect("channel should not be dropped");
     Ok(())
 }

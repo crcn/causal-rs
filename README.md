@@ -56,22 +56,21 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-// 1. Events are plain data. `CATEGORY` groups a type's streams;
-//    `stream_id` picks which stream this value belongs to.
+// 1. Events are plain data. `NAME` is the wire event-type; `SUBJECT` is the
+//    subject history a fact joins (stream `{SUBJECT}-{subject_id}`, defaults
+//    to `NAME`); `subject_id` picks which subject this value is about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced { order_id: Uuid, total: f64 }
 impl Event for OrderPlaced {
-    const CATEGORY: &'static str = "order";
-    fn event_type(&self) -> &str { "placed" }
-    fn stream_id(&self) -> Uuid { self.order_id }
+    const NAME: &'static str = "placed";
+    fn subject_id(&self) -> Uuid { self.order_id }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShipmentRequested { order_id: Uuid }
 impl Event for ShipmentRequested {
-    const CATEGORY: &'static str = "shipment";
-    fn event_type(&self) -> &str { "requested" }
-    fn stream_id(&self) -> Uuid { self.order_id }
+    const NAME: &'static str = "requested";
+    fn subject_id(&self) -> Uuid { self.order_id }
 }
 
 // 2. An aggregate is read-model state folded from events. `Apply<E>`
@@ -114,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
             Aggregator::for_type::<Order, ShipmentRequested>(),
         ])
         .with_reactor(ShipOnPlaced)
+        // MemoryStore effect memoization is lost on restart, so reactors
+        // require an explicit choice: tests opt in here; production wires a
+        // durable `.with_effect_store(...)` instead.
+        .allow_in_memory_effect_store_for_tests()
         .build()             // async + fallible: seeds reactor cursors
         .await?;
 
@@ -243,9 +246,9 @@ let engine = EngineBuilder::new(
 |---|---|
 | Event (write) | `EventData` |
 | Event (read) | `RecordedEvent` |
-| Category | `Event::CATEGORY` |
-| Stream id | `Event::stream_id() -> Uuid` |
-| Stream name | `{CATEGORY}-{stream_id}` (composed automatically; `causal::stream_name_for::<F>(id)` exposes it) |
+| Category | `Event::SUBJECT` |
+| Stream id | `Event::subject_id() -> Uuid` |
+| Stream name | `{SUBJECT}-{subject_id}` (composed automatically; `causal::stream_name_for::<F>(id)` exposes it) |
 | Stream revision | `StreamRevision` (0-indexed) |
 | `$all` commit position | `LogCursor` |
 | `StreamState` for OCC | `causal::types::StreamState` (same variants) |
@@ -262,11 +265,12 @@ purpose:
 
 - `Reactor` vs Kurrent's `PersistentSubscription` — Reactor adds atomic
   emit on top of the subscription contract.
-- **Stored `event_type`** is composed as `{Event::CATEGORY}:{event.event_type()}`
-  (e.g. `order:placed`), not a plain event-type name. Kurrent uses bare
-  event-type names; causal-rs keeps the `{CATEGORY}:{name}` form so two
-  different event enums can each have, say, `OrderPlaced` without
-  colliding in the `$et-` streams or in typed routing.
+- **Identity is split across two declarations.** `Event::NAME` is the wire
+  `event_type` (written verbatim, matched by consumers by equality), while
+  `Event::SUBJECT` is the stream category (`{SUBJECT}-{subject_id}`). Kurrent
+  has only the stream name; causal-rs keeps `NAME` and `SUBJECT` separate so
+  several fact families can co-locate in one subject history (shared
+  `SUBJECT`) while still routing on distinct `NAME`s.
 
 The rest of the vocabulary is aligned 1:1.
 

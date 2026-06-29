@@ -462,10 +462,18 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                     );
                 };
                 let row = &log[at];
+                // Placement is part of identity: the persisted row's
+                // (category, subject_id) is the stream it lives in. The
+                // same event_id redelivered to a DIFFERENT stream means the
+                // producer routed one logical event to two subjects —
+                // divergence, not a dedup-hit. `category`/`subject_id` come
+                // from the call's stream-key params, not per-event.
                 if row.payload != e.payload
                     || row.event_type != e.event_type
                     || row.workflow_id != e.workflow_id
                     || row.causation_id != e.causation_id
+                    || row.category != category
+                    || row.subject_id != subject_id
                 {
                     // Name WHERE it diverged — the nondeterminism is
                     // usually in a dependency far from the reactor, and
@@ -481,8 +489,15 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                         format!("event_type ({} vs {})", row.event_type, e.event_type)
                     } else if row.workflow_id != e.workflow_id {
                         "workflow_id".to_string()
-                    } else {
+                    } else if row.causation_id != e.causation_id {
                         "causation_id".to_string()
+                    } else if row.category != category {
+                        format!("placement category ({} vs {category})", row.category)
+                    } else {
+                        format!(
+                            "placement subject_id ({} vs {subject_id})",
+                            row.subject_id,
+                        )
                     };
                     // Typed so the reactor runner can tell this apart from
                     // genuine I/O by downcast (it accepts the persisted row

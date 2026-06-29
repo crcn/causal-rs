@@ -21,6 +21,7 @@ use tokio::sync::OnceCell;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::CheckpointStore;
+use crate::consumer_lease::{ConsumerLeasor, LeaseGuard};
 use crate::contexts::Ctx;
 use crate::event_log::EventLogBackend;
 use crate::event::Event;
@@ -55,6 +56,14 @@ pub struct ProjectionRunner<M: Projector> {
     aggregators:  Option<Arc<AggregatorRegistry>>,
     hydrated:     OnceCell<()>,
     observer:     Option<Arc<dyn ReactorObserver>>,
+    /// Optional exclusive-lease provider. When set, `step` acquires
+    /// `leasor.acquire(consumer_id)` once before its first cursor read —
+    /// preventing two engines from driving the same projector concurrently.
+    leasor:       Option<Arc<dyn ConsumerLeasor>>,
+    /// The held lease guard; dropping it (when the runner drops) releases
+    /// the lease. `leased` gates acquisition to exactly once.
+    lease:        parking_lot::Mutex<Option<Box<dyn LeaseGuard>>>,
+    leased:       OnceCell<()>,
 }
 
 impl<M: Projector> ProjectionRunner<M>
@@ -75,7 +84,38 @@ where
             aggregators: None,
             hydrated: OnceCell::new(),
             observer: None,
+            leasor: None,
+            lease: parking_lot::Mutex::new(None),
+            leased: OnceCell::new(),
         }
+    }
+
+    /// Attach an exclusive-lease provider. Before the runner's first
+    /// `step`, it acquires `leasor.acquire(consumer_id)` — blocking until
+    /// any current holder releases or crashes. The guard is held for the
+    /// runner's lifetime; dropping the runner releases the lease so another
+    /// engine can take over. Mirrors
+    /// [`ReactorRunner::with_consumer_leasor`](crate::reactor_runner::ReactorRunner::with_consumer_leasor).
+    pub fn with_consumer_leasor(mut self, leasor: Arc<dyn ConsumerLeasor>) -> Self {
+        self.leasor = Some(leasor);
+        self
+    }
+
+    /// Acquire the exclusive consumer lease once, before the first cursor
+    /// read. No-op when no leasor is configured. On acquire failure the
+    /// cell stays uninitialised so a later `step` retries.
+    async fn ensure_leased(&self) -> Result<()> {
+        let Some(leasor) = self.leasor.as_ref() else {
+            return Ok(());
+        };
+        self.leased
+            .get_or_try_init(|| async {
+                let guard = leasor.acquire(&self.consumer_id).await?;
+                *self.lease.lock() = Some(guard);
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// Attach a per-runner [`AggregatorRegistry`] copy. The runner folds
@@ -105,6 +145,11 @@ where
     /// Per C2: cursor advances per-fact, only after `project`
     /// returns `Ok`. Per C2b: refuses to advance if any dep is behind.
     pub async fn step(&self, batch: usize) -> Result<StepOutcome> {
+        // Acquire the exclusive lease before reading the cursor, so a
+        // second engine driving the same consumer can't read from the same
+        // position concurrently.
+        self.ensure_leased().await?;
+
         let cursor = self.checkpoint.get(&self.consumer_id).await?
             .unwrap_or(LogCursor::ZERO);
 

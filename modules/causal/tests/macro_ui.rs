@@ -21,6 +21,7 @@ fn event_macro_ui() {
     t.compile_fail("tests/ui/event_struct_missing_subject_id.rs");
     t.compile_fail("tests/ui/event_enum_retracted.rs");
     t.compile_fail("tests/ui/event_subject_id_no_subject_conflict.rs");
+    t.compile_fail("tests/ui/event_ephemeral_is_rejected.rs");
     t.compile_fail("tests/ui/event_struct_subject_id_typo.rs");
     t.compile_fail("tests/ui/event_explicit_occurred_at_field_missing.rs");
     t.compile_fail("tests/ui/event_workflow_root_missing_field.rs");

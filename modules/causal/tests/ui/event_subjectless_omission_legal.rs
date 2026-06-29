@@ -6,7 +6,7 @@
 use causal::Event;
 use uuid::Uuid;
 
-#[causal::event(name = "tick_recorded", ephemeral)]
+#[causal::event(name = "tick_recorded")]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct TickRecorded {
     n: u64,

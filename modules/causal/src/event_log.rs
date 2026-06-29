@@ -38,6 +38,16 @@ use crate::types::{
 /// from intent. `created_at` and `metadata` are exempt: both are
 /// documented hints that legitimate redeliveries may re-stamp.
 ///
+/// **Placement is part of identity.** The same `event_id` redelivered to
+/// a different stream — a different `category` or `subject_id` from the
+/// persisted row — is also divergent (the producer routed one logical
+/// event to two subjects, e.g. a reactor whose output `SUBJECT` changed)
+/// and MUST error. Backends with a global `event_id` index (Memory,
+/// Postgres) enforce this. Backends that dedup *per-stream* (Kurrent,
+/// whose idempotency scan reads only the target stream's tail) cannot see
+/// a cross-stream `event_id` reuse without a global index, so they do not
+/// yet enforce placement identity — tracked by the idempotency-index work.
+///
 /// **`EventData::created_at` is a hint, not authoritative.** Backends MAY
 /// override with a server-assigned timestamp on write (KurrentDB does this
 /// unconditionally; `MemoryStore` preserves the client value). Consumers

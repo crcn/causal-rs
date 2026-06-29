@@ -1,0 +1,5 @@
+error: #[event]: `ephemeral` does nothing and has been removed. A fact's subject-less-ness is inferred from its shape — a struct with no scalar `Uuid` fields is subject-less automatically (`subject_id()` returns `Uuid::nil()`), so just drop the keyword: `#[event(name = "...")]`. A fact that carries reference `Uuid`s but is still subject-less must opt out explicitly with `no_subject`.
+ --> tests/ui/event_ephemeral_is_rejected.rs:8:8
+  |
+8 | struct TickRecorded {
+  |        ^^^^^^^^^^^^

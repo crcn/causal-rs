@@ -39,6 +39,7 @@ fn backend(store: &Arc<MemoryStore>) -> EngineBuilder {
         store.clone() as Arc<dyn CheckpointStore>,
         store.clone() as Arc<dyn ReactorCheckpoint>,
     )
+    .allow_in_memory_effect_store_for_tests()
 }
 
 /// Independent from-scratch fold of `A`'s own stream straight from the log.

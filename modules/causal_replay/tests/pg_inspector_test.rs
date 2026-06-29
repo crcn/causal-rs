@@ -119,6 +119,7 @@ async fn pg_inspector_round_trip() -> Result<()> {
         Aggregator::for_type::<Pings, Pinged>(),
     ])
     .with_reactor(PongReactor::default())
+    .allow_in_memory_effect_store_for_tests()
     .build().await.unwrap();
 
     let id = Uuid::new_v4();

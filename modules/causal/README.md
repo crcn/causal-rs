@@ -22,15 +22,15 @@ use causal::{
     MemoryStore, Reactor, ReactorCheckpoint,
 };
 
-// 1. Define events. CATEGORY + stream_id() route each event to its stream
-//    `{CATEGORY}-{stream_id}`; event_type() names it within the stream.
+// 1. Define events. NAME is the wire event-type; SUBJECT + subject_id() route
+//    each event to its stream `{SUBJECT}-{subject_id}`. SUBJECT defaults to NAME.
 #[derive(Clone, Serialize, Deserialize)]
 struct OrderPlaced { order_id: Uuid, occurred_at: DateTime<Utc> }
 
 impl Event for OrderPlaced {
-    const CATEGORY: &'static str = "order";
-    fn event_type(&self) -> &str { "placed" }
-    fn stream_id(&self) -> Uuid { self.order_id }
+    const NAME: &'static str = "order_placed";
+    const SUBJECT: &'static str = "order";
+    fn subject_id(&self) -> Uuid { self.order_id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -38,9 +38,9 @@ impl Event for OrderPlaced {
 struct ShipmentQueued { order_id: Uuid, occurred_at: DateTime<Utc> }
 
 impl Event for ShipmentQueued {
-    const CATEGORY: &'static str = "shipment";
-    fn event_type(&self) -> &str { "queued" }
-    fn stream_id(&self) -> Uuid { self.order_id }
+    const NAME: &'static str = "shipment_queued";
+    const SUBJECT: &'static str = "shipment";
+    fn subject_id(&self) -> Uuid { self.order_id }
     fn occurred_at(&self) -> Option<DateTime<Utc>> { Some(self.occurred_at) }
 }
 
@@ -52,7 +52,7 @@ struct ShipOnPlaced;
 #[async_trait]
 impl Reactor for ShipOnPlaced {
     type Trigger = OrderPlaced;
-    const GROUP_NAME: &'static str = "ship_on_placed";
+    const NAME: &'static str = "ship_on_placed";
 
     async fn react(&self, trigger: &OrderPlaced, _ctx: Ctx<'_>) -> Result<Events> {
         Ok(Events::new().add(ShipmentQueued {
@@ -72,6 +72,9 @@ async fn run() -> Result<()> {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor(ShipOnPlaced)
+        // MemoryStore effect memoization is lost on restart; tests opt in,
+        // production wires a durable `.with_effect_store(...)`.
+        .allow_in_memory_effect_store_for_tests()
         .build()
         .await?;
 
@@ -90,7 +93,7 @@ async fn run() -> Result<()> {
 
 | Trait | Purpose |
 |---|---|
-| `Event` | A logged fact. `CATEGORY` + `stream_id()` define its stream; `event_type()` names it. |
+| `Event` | A logged fact. `NAME` is its wire event-type; `SUBJECT` + `subject_id()` define its stream `{SUBJECT}-{subject_id}`. |
 | `Aggregate` + `Apply<F>` | Write-side consistency boundary. Folded from its stream; mutated only via the OCC command path. |
 | `Reactor` | Pure decision triggered by one event type, emitting new events. At-least-once, idempotent. |
 | `Projector` / `MultiProjector` | Idempotent at-least-once read-model / external-state consumer. |
@@ -101,7 +104,7 @@ async fn run() -> Result<()> {
   concurrency check (idempotency rests on `event_id`). Rejects categories
   registered as OCC-required.
 - **`engine.append::<A, F>(id, |agg| decide)`** — the OCC command path
-  (load-decide-append). Folds aggregate `A` from `{F::CATEGORY}-{id}`, runs
+  (load-decide-append). Folds aggregate `A` from `{F::SUBJECT}-{id}`, runs
   the pure `decide` closure, and appends the whole decision as **one atomic
   batch** at the expected revision; on a concurrent write it reloads,
   re-decides, and retries.

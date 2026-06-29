@@ -102,16 +102,21 @@ mod pg {
 
     /// A dedup-hit must be a **byte-identical** redelivery (see the
     /// `EventLogBackend` idempotency contract): a persisted row whose
-    /// `payload` / `event_type` / `workflow_id` / `causation_id`
-    /// differs from the redelivered batch means the producer re-decided
-    /// differently on redelivery — error loudly instead of silently
-    /// keeping the old row. `created_at` and `metadata` are exempt
-    /// (documented hints that redeliveries re-stamp).
+    /// `payload` / `event_type` / `workflow_id` / `causation_id` — or
+    /// placement (`aggregate_type` / `aggregate_id`) — differs from the
+    /// redelivered batch means the producer re-decided differently on
+    /// redelivery — error loudly instead of silently keeping the old row.
+    /// `created_at` and `metadata` are exempt (documented hints that
+    /// redeliveries re-stamp).
     ///
     /// One round-trip: UNNEST the batch, join on `event_id`, return the
-    /// first divergent id (if any).
+    /// first divergent id (if any). The global `UNIQUE(event_id)` is what
+    /// makes a cross-stream id reuse reachable here (Postgres can enforce
+    /// placement identity where the per-stream Kurrent scan cannot).
     async fn ensure_redelivery_identical<'e, E>(
         executor: E,
+        aggregate_type: &str,
+        aggregate_id: Uuid,
         event_ids: &[Uuid],
         event_types: &[String],
         payloads: &[serde_json::Value],
@@ -121,6 +126,11 @@ mod pg {
     where
         E: sqlx::PgExecutor<'e>,
     {
+        // Placement (aggregate_type/aggregate_id) is part of identity: the
+        // batch's target stream is scalar, so the same event_id persisted
+        // under a DIFFERENT stream means the producer routed one logical
+        // event to two subjects — divergence, not a dedup-hit. The global
+        // UNIQUE(event_id) makes the cross-stream reuse reachable here.
         let divergent: Option<Uuid> = sqlx::query_scalar(
             "SELECT b.event_id
                FROM UNNEST($1::uuid[], $2::text[], $3::jsonb[],
@@ -132,6 +142,8 @@ mod pg {
                  OR e.payload        IS DISTINCT FROM b.payload
                  OR e.correlation_id IS DISTINCT FROM b.correlation_id
                  OR e.causation_id   IS DISTINCT FROM b.causation_id
+                 OR e.aggregate_type IS DISTINCT FROM $6
+                 OR e.aggregate_id   IS DISTINCT FROM $7
               LIMIT 1",
         )
         .bind(event_ids)
@@ -139,6 +151,8 @@ mod pg {
         .bind(payloads)
         .bind(workflow_ids)
         .bind(causation_ids)
+        .bind(aggregate_type)
+        .bind(aggregate_id)
         .fetch_optional(executor)
         .await?;
         if let Some(id) = divergent {
@@ -148,7 +162,7 @@ mod pg {
             // id, not the field; name the compared set on the error.
             return Err(anyhow::Error::new(DivergentRedelivery {
                 event_id: id,
-                diff:     "payload/event_type/workflow/causation".to_string(),
+                diff:     "payload/event_type/workflow/causation/placement".to_string(),
             }));
         }
         Ok(())
@@ -258,6 +272,8 @@ mod pg {
                                 // the event_id-dedup lookup below.
                                 ensure_redelivery_identical(
                                     &mut *tx,
+                                    aggregate_type,
+                                    aggregate_id,
                                     &event_ids,
                                     &event_types,
                                     &payloads,
@@ -418,6 +434,8 @@ mod pg {
                         // RowNotFound a `fetch_one` would raise.
                         ensure_redelivery_identical(
                             &self.pool,
+                            aggregate_type,
+                            aggregate_id,
                             &event_ids,
                             &event_types,
                             &payloads,

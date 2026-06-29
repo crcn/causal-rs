@@ -29,16 +29,17 @@
 //!   Postgres' `UNIQUE(event_id)` and MemoryStore provide. (Closes the
 //!   former best-effort gap; see the 2026-06-10 audit remediation, B3.)
 //! - **Q2 stream naming.** Every event lands in `{category}-{subject_id}`
-//!   (`Event::CATEGORY` + `Event::subject_id`). `category` and `subject_id`
+//!   (`Event::SUBJECT` + `Event::subject_id`). `category` and `subject_id`
 //!   are recovered on read by parsing the stream name (the trailing 36
 //!   chars are the canonical UUID) — no metadata round-trip needed.
 //! - **Q3 metadata.** Mapped to Kurrent's `custom_metadata` slot.
-//!   System keys (`$workflowId`, `$causationId`) use Kurrent's
-//!   `$`-prefix convention. The `$by_workflow_id` system projection
-//!   reads `$workflowId` (when configured + projections are running)
-//!   and uses `$causationId` to build the causation tree. There is NO
+//!   System keys (`$correlationId`, `$causationId`) use Kurrent's
+//!   `$`-prefix convention — the domain's `workflow_id` maps to Kurrent's
+//!   `$correlationId`. The `$by_correlation_id` system projection reads
+//!   `$correlationId` (when configured + projections are running) and uses
+//!   `$causationId` to build the causation tree. There is NO
 //!   `$by_causation_id` system projection — the five built-ins are
-//!   `$by_category`, `$by_event_type`, `$by_workflow_id`,
+//!   `$by_category`, `$by_event_type`, `$by_correlation_id`,
 //!   `$stream_by_category`, `$streams`. The one causal-specific key
 //!   (`_persistent`) keeps the `_` prefix to mark "framework-internal";
 //!   it's stamped on write and stripped on read.
@@ -476,12 +477,12 @@ mod kurrent {
     fn build_metadata(event: &EventData) -> Map<String, Value> {
         let mut m = event.metadata.clone();
         // KurrentDB convention: system metadata keys are `$`-prefixed
-        // camelCase. The `$by_workflow_id` system projection reads
-        // `$workflowId` (once configured + projections running) and
-        // uses `$causationId` to build the causation tree. There is no
-        // `$by_causation_id` projection. Using these exact names is the
-        // difference between the native projection working and silently
-        // returning nothing.
+        // camelCase. The domain's `workflow_id` maps to Kurrent's
+        // `$correlationId`, which the `$by_correlation_id` system projection
+        // reads (once configured + projections running); `$causationId`
+        // builds the causation tree. There is no `$by_causation_id`
+        // projection. Using these exact names is the difference between the
+        // native projection working and silently returning nothing.
         m.insert(
             "$correlationId".to_string(),
             Value::String(event.workflow_id.to_string()),
@@ -636,6 +637,14 @@ mod kurrent {
     /// (documented hints that redeliveries re-stamp). Pure; called on
     /// the `Redelivery` reconciliation branches, where every batch id
     /// is known to be present in the window.
+    ///
+    /// NOTE: placement (`category`/`subject_id`) is intentionally NOT
+    /// compared here. Kurrent's dedup is per-stream — this window is the
+    /// *target stream's* tail, so a cross-stream `event_id` reuse never
+    /// appears in `window` and cannot be detected without a global
+    /// `event_id`→stream index. Unlike Memory/Postgres, this backend does
+    /// not yet enforce the placement-identity clause of the
+    /// `EventLogBackend` contract; see the idempotency-index work.
     fn ensure_redelivery_identical(
         batch: &[EventData],
         window: &[WindowEvent],

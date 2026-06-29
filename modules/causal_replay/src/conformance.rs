@@ -141,6 +141,74 @@ pub async fn divergent_redelivery_is_rejected<B: EventLogBackend>(b: &B) -> Resu
     Ok(())
 }
 
+/// C1c: a dedup-hit must also match **placement**. The same `event_id`
+/// redelivered to a DIFFERENT stream — a different `subject_id` or
+/// `category`, but otherwise byte-identical content — is not a
+/// legitimate redelivery: the producer routed one logical event to two
+/// different subjects (e.g. a reactor whose output `SUBJECT` changed
+/// across a redelivery). Silently deduping to the original placement
+/// would let the second decision believe it landed where it asked. The
+/// backend MUST reject it loudly and leave the original row untouched.
+///
+/// **Not universal.** Backends that dedup per-stream cannot enforce this:
+/// Kurrent's idempotency scan reads only the *target stream's* tail, so a
+/// cross-stream `event_id` reuse is invisible to it without a global
+/// `event_id`→stream index (see the idempotency-index work). Only wire
+/// this scenario into backends with a global `event_id` dedup — Memory
+/// and Postgres.
+pub async fn placement_divergence_is_rejected<B: EventLogBackend>(b: &B) -> Result<()> {
+    let workflow = Uuid::new_v4();
+    let subject_a = Uuid::new_v4();
+    let category = "conformance:c1c";
+
+    let event = fresh_event(workflow, "conformance:c1c", Some(category), Some(subject_a));
+    let event_id = event.event_id;
+    b.append_to_stream(category, subject_a, StreamState::Any, vec![event.clone()])
+        .await?;
+
+    // Same event_id + identical content, redelivered to a DIFFERENT
+    // subject (different stream placement): must be rejected.
+    let subject_b = Uuid::new_v4();
+    let mut moved = event.clone();
+    moved.subject_id = Some(subject_b);
+    let err = b
+        .append_to_stream(category, subject_b, StreamState::Any, vec![moved])
+        .await
+        .expect_err(
+            "C1c: same event_id to a different subject must error, not dedup silently",
+        );
+    anyhow::ensure!(
+        err.to_string().contains("divergent"),
+        "C1c: the error should name the divergence (got: {err:#})",
+    );
+
+    // The original placement is untouched and still the only copy.
+    let count = count_event_id_in_log(b, event_id).await?;
+    anyhow::ensure!(count == 1, "C1c: placement divergence must not write a second copy");
+    let row = find_event_in_log(b, event_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("C1c: original row missing"))?;
+    anyhow::ensure!(
+        row.subject_id == subject_a,
+        "C1c: original placement (subject {subject_a}) must win (got: {})",
+        row.subject_id,
+    );
+
+    // Same id + same subject, but a DIFFERENT category: also rejected.
+    let other_category = "conformance:c1c-other";
+    let mut recat = event.clone();
+    recat.category = Some(other_category.to_string());
+    let err = b
+        .append_to_stream(other_category, subject_a, StreamState::Any, vec![recat])
+        .await
+        .expect_err("C1c: same event_id under a different category must error");
+    anyhow::ensure!(
+        err.to_string().contains("divergent"),
+        "C1c: category divergence should error (got: {err:#})",
+    );
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Scenarios — `append_to_stream` (CAS path)
 // ──────────────────────────────────────────────────────────────────

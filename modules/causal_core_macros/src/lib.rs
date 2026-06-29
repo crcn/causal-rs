@@ -388,8 +388,8 @@ fn expand_aggregators_module(
 /// #[event(name = "job_billed", subject_id = "job_id", subject = "job")]
 /// pub struct JobBilled { pub job_id: Uuid, pub cents: u64 }
 ///
-/// // provably subject-less (no Uuid fields): omission is legal
-/// #[event(name = "tick", ephemeral)]
+/// // provably subject-less (no Uuid fields): omission is legal, no keyword
+/// #[event(name = "tick")]
 /// pub struct TickRecorded { pub n: u64 }
 ///
 /// // reference-carrying subject-less: explicit opt-out
@@ -680,8 +680,22 @@ fn expand_event_struct(
     input: &DeriveInput,
 ) -> Result<TokenStream2, syn::Error> {
     let name = &input.ident;
+    // `ephemeral` was parsed but never did anything (a "lying default" — see
+    // docs/plans/2026-06-12-design-0.10-no-lying-defaults.md). Subject-less-ness
+    // is INFERRED from shape, not declared with a keyword, so reject it with a
+    // teaching error rather than silently ignoring it.
+    if args.ephemeral {
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[event]: `ephemeral` does nothing and has been removed. A fact's \
+             subject-less-ness is inferred from its shape — a struct with no \
+             scalar `Uuid` fields is subject-less automatically (`subject_id()` \
+             returns `Uuid::nil()`), so just drop the keyword: \
+             `#[event(name = \"...\")]`. A fact that carries reference `Uuid`s \
+             but is still subject-less must opt out explicitly with `no_subject`.",
+        ));
+    }
     require_subject_identity(&args, name, input)?;
-    let ephemeral = args.ephemeral;
 
     // `name` is REQUIRED: the wire event_type is a format you pick
     // once. Deriving it from the type name would turn a rename
@@ -859,7 +873,6 @@ fn expand_event_struct(
         }
     };
 
-    let _ = ephemeral;
     Ok(quote! {
         #input
 

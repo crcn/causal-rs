@@ -31,6 +31,7 @@ use tokio::sync::OnceCell;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::CheckpointStore;
+use crate::consumer_lease::{ConsumerLeasor, LeaseGuard};
 use crate::contexts::Ctx;
 use crate::event_log::EventLogBackend;
 use crate::projection_runner::StepOutcome;
@@ -92,6 +93,11 @@ pub struct MultiProjectorRunner<P: MultiProjector> {
     aggregators:  Option<Arc<AggregatorRegistry>>,
     hydrated:     OnceCell<()>,
     observer:     Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
+    /// Optional exclusive-lease provider — see
+    /// [`ProjectionRunner`](crate::projection_runner::ProjectionRunner).
+    leasor:       Option<Arc<dyn ConsumerLeasor>>,
+    lease:        parking_lot::Mutex<Option<Box<dyn LeaseGuard>>>,
+    leased:       OnceCell<()>,
 }
 
 impl<P: MultiProjector> MultiProjectorRunner<P> {
@@ -120,7 +126,35 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             aggregators: None,
             hydrated: OnceCell::new(),
             observer: None,
+            leasor: None,
+            lease: parking_lot::Mutex::new(None),
+            leased: OnceCell::new(),
         }
+    }
+
+    /// Attach an exclusive-lease provider. Before the runner's first
+    /// `step`, it acquires `leasor.acquire(consumer_id)` — blocking until
+    /// any current holder releases or crashes. See
+    /// [`ProjectionRunner::with_consumer_leasor`](crate::projection_runner::ProjectionRunner::with_consumer_leasor).
+    pub fn with_consumer_leasor(mut self, leasor: Arc<dyn ConsumerLeasor>) -> Self {
+        self.leasor = Some(leasor);
+        self
+    }
+
+    /// Acquire the exclusive consumer lease once, before the first cursor
+    /// read. No-op when no leasor is configured.
+    async fn ensure_leased(&self) -> Result<()> {
+        let Some(leasor) = self.leasor.as_ref() else {
+            return Ok(());
+        };
+        self.leased
+            .get_or_try_init(|| async {
+                let guard = leasor.acquire(&self.consumer_id).await?;
+                *self.lease.lock() = Some(guard);
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// Attach a per-runner [`AggregatorRegistry`] copy. See
@@ -150,6 +184,10 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
     }
 
     pub async fn step(&self, batch: usize) -> Result<StepOutcome> {
+        // Acquire the exclusive lease before reading the cursor (see
+        // ProjectionRunner::step).
+        self.ensure_leased().await?;
+
         let cursor = self.checkpoint.get(&self.consumer_id).await?
             .unwrap_or(LogCursor::ZERO);
 

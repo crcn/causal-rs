@@ -67,6 +67,12 @@ async fn divergent_redelivery_is_rejected() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires local DATABASE_URL + migration 054"]
+async fn placement_divergence_is_rejected() -> Result<()> {
+    conformance::placement_divergence_is_rejected(&backend().await).await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
 async fn fresh_stream_first_event_lands_at_revision_zero() -> Result<()> {
     conformance::fresh_stream_first_event_lands_at_revision_zero(&backend().await).await
 }

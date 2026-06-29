@@ -189,6 +189,7 @@ async fn settle_flood_scenario(total: u64, conc: u64) -> Result<()> {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor(Echo)
+        .allow_in_memory_effect_store_for_tests()
         .build()
         .await?,
     );
@@ -279,6 +280,7 @@ async fn chase_scenario(n: u64) -> Result<()> {
     .with_reactor(Echo)
     .with_projector(counter)
     .with_projector(pong_counter)
+    .allow_in_memory_effect_store_for_tests()
     .build()
     .await?;
 

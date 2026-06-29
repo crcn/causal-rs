@@ -372,6 +372,7 @@ async fn reactor_output_lands_in_its_own_stream_not_global() {
         mem.clone() as Arc<dyn ReactorCheckpoint>,
     )
     .with_reactor(DoFetch)
+    .allow_in_memory_effect_store_for_tests()
     .build().await.unwrap();
 
     let id = Uuid::new_v4();

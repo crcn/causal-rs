@@ -313,6 +313,11 @@ pub struct EmitResult {
 /// `settle`. A multi-engine deployment would need a backend-queried high-water.
 pub(crate) struct SettleTracker {
     hw:  std::collections::HashMap<Uuid, LogCursor>,
+    /// Workflows with an in-flight `settle()` call. Their high-water
+    /// entries MUST NOT be evicted: dropping one mid-settle would make
+    /// `settle` fall back to its emit-position floor and return before the
+    /// chain drained. Pinned on `settle` entry, unpinned on exit.
+    pinned: std::collections::HashSet<Uuid>,
 }
 
 /// Cap on tracked in-flight workflows. Generous — never approached when
@@ -322,7 +327,10 @@ const SETTLE_TRACKER_CAP: usize = 65_536;
 
 impl SettleTracker {
     fn new() -> Self {
-        Self { hw: std::collections::HashMap::new() }
+        Self {
+            hw: std::collections::HashMap::new(),
+            pinned: std::collections::HashSet::new(),
+        }
     }
 
     /// Record a chain event's position for `wf`, keeping the max.
@@ -334,11 +342,13 @@ impl SettleTracker {
             return;
         }
         if self.hw.len() >= SETTLE_TRACKER_CAP {
-            // Bound memory under fire-and-forget load. Evicting a currently
-            // settling run's entry makes that settle fall back to its emit-
-            // position floor (possible early return) — acceptable only under
-            // >CAP un-settled concurrent runs.
-            if let Some(&victim) = self.hw.keys().next() {
+            // Bound memory under fire-and-forget load — but NEVER evict a
+            // run that is actively settling (that would silently regress its
+            // high-water to the emit floor → early return). Pick the first
+            // non-pinned victim; if every tracked run is pinned (≥CAP
+            // concurrent settles — pathological), skip eviction and let the
+            // map grow, bounded by the number of concurrent settle callers.
+            if let Some(&victim) = self.hw.keys().find(|k| !self.pinned.contains(k)) {
                 self.hw.remove(&victim);
             }
         }
@@ -352,11 +362,38 @@ impl SettleTracker {
     fn forget(&mut self, wf: &Uuid) {
         self.hw.remove(wf);
     }
+
+    /// Protect `wf`'s high-water entry from eviction for the duration of a
+    /// `settle()` call.
+    fn pin(&mut self, wf: Uuid) {
+        self.pinned.insert(wf);
+    }
+
+    /// Release the eviction protection from [`pin`](Self::pin).
+    fn unpin(&mut self, wf: &Uuid) {
+        self.pinned.remove(wf);
+    }
 }
 
 /// Shared handle to the per-workflow high-water tracker, threaded from the
 /// engine into each reactor runner.
 pub(crate) type WorkflowHighWater = Arc<std::sync::Mutex<SettleTracker>>;
+
+/// RAII guard that pins a workflow's high-water entry against eviction for
+/// the lifetime of a `settle()` call. Unpins on drop — covering every exit
+/// path (success, the wedged-consumer error, and any future early return).
+struct SettlePin {
+    hw: WorkflowHighWater,
+    wf: Uuid,
+}
+
+impl Drop for SettlePin {
+    fn drop(&mut self) {
+        if let Ok(mut tracker) = self.hw.lock() {
+            tracker.unpin(&self.wf);
+        }
+    }
+}
 
 /// Shared cancel fence: workflow_ids for which new triggers must be
 /// acked without dispatch. Set by [`Engine::cancel_workflow`]; checked
@@ -688,6 +725,9 @@ pub(crate) struct ConsumerWiring {
     pub snapshot_every: u64,
     pub clock: Arc<dyn crate::clock::Clock>,
     pub cancelled_workflows: CancelledWorkflows,
+    /// Exclusive-consumer-lease provider, applied to every runner. `None`
+    /// = no leasing (single-engine ownership).
+    pub leasor: Option<Arc<dyn crate::consumer_lease::ConsumerLeasor>>,
 }
 
 /// Constructs an `Arc<dyn Supervisable>` runner at `build()` time,
@@ -755,6 +795,18 @@ pub struct EngineBuilder {
     /// Used to emit a production durability warning at build time when
     /// reactors are registered but only the in-memory default is wired.
     explicit_effect_store: bool,
+    /// `true` when the caller accepted the in-memory effect store via
+    /// [`allow_in_memory_effect_store_for_tests`](Self::allow_in_memory_effect_store_for_tests)
+    /// (or implicitly via [`memory`](Self::memory)). Lets `build()` reject
+    /// reactors-without-a-durable-store in production while keeping
+    /// tests/prototypes ergonomic.
+    allow_in_memory_effect_store: bool,
+    /// Optional exclusive-lease provider, applied to EVERY consumer
+    /// (reactors, projectors, multi-projectors) at build time. Each
+    /// consumer acquires `leasor.acquire(consumer_id)` before its first
+    /// step, so two engines sharing one leasor and consumer name cannot
+    /// process concurrently. `None` = no leasing (single-engine default).
+    leasor:                Option<Arc<dyn crate::consumer_lease::ConsumerLeasor>>,
 }
 
 impl EngineBuilder {
@@ -777,6 +829,9 @@ impl EngineBuilder {
             store.clone() as Arc<dyn crate::checkpoint_store::CheckpointStore>,
             store        as Arc<dyn crate::checkpoint_store::ReactorCheckpoint>,
         )
+        // memory() is the test/prototype constructor — accept the in-memory
+        // effect store so `build()` doesn't require an explicit opt-in here.
+        .allow_in_memory_effect_store_for_tests()
     }
 
     /// `checkpoint` stores projector/reactor cursors; `reactor_checkpoint`
@@ -811,7 +866,43 @@ impl EngineBuilder {
             cancelled_workflows: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            leasor: None,
+            allow_in_memory_effect_store: false,
         }
+    }
+
+    /// Accept the in-memory [`InMemoryEffectStore`](crate::effect_store::InMemoryEffectStore)
+    /// explicitly, suppressing the `build()` error that otherwise fires when
+    /// reactors are registered without a durable effect store.
+    ///
+    /// For tests and prototypes only: in-memory effect memoization is lost on
+    /// restart, so side effects re-execute after a crash/redeploy. Production
+    /// deployments must call [`with_effect_store`](Self::with_effect_store)
+    /// with a durable backend instead. [`memory`](Self::memory) sets this
+    /// automatically.
+    pub fn allow_in_memory_effect_store_for_tests(mut self) -> Self {
+        self.allow_in_memory_effect_store = true;
+        self
+    }
+
+    /// Attach an exclusive-consumer-lease provider to the engine. Every
+    /// consumer this builder registers — reactors, projectors, and
+    /// multi-projectors — acquires `leasor.acquire(consumer_id)` before its
+    /// first step, blocking until any current holder releases or crashes.
+    ///
+    /// This is what makes a multi-engine deployment safe: two engines built
+    /// with the same leasor and the same consumer names cannot drive the
+    /// same consumer concurrently, so cursors don't race and side effects
+    /// aren't duplicated. The canonical production implementation is
+    /// `PgConsumerLeasor` (Postgres session advisory locks, auto-released on
+    /// process crash). Without a leasor, the engine assumes single-engine
+    /// ownership (the default).
+    pub fn with_consumer_leasor(
+        mut self,
+        leasor: Arc<dyn crate::consumer_lease::ConsumerLeasor>,
+    ) -> Self {
+        self.leasor = Some(leasor);
+        self
     }
 
     /// Inject the calendar clock. Every timestamp the framework stamps
@@ -1046,6 +1137,7 @@ impl EngineBuilder {
             let mut runner = ProjectionRunner::new(p, P::NAME, log, checkpoint);
             if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
+            if let Some(leasor) = w.leasor { runner = runner.with_consumer_leasor(leasor); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -1080,6 +1172,7 @@ impl EngineBuilder {
             runner = runner.with_snapshot_persistence(w.snapshot_store, w.snapshot_every);
             runner = runner.with_occ_categories(w.occ);
             runner = runner.with_cancelled_workflows(w.cancelled_workflows);
+            if let Some(leasor) = w.leasor { runner = runner.with_consumer_leasor(leasor); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -1134,6 +1227,7 @@ impl EngineBuilder {
             let mut runner = MultiProjectorRunner::new(p, P::NAME, log, checkpoint);
             if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
+            if let Some(leasor) = w.leasor { runner = runner.with_consumer_leasor(leasor); }
             Arc::new(runner) as Arc<dyn Supervisable>
         }));
         self
@@ -1203,14 +1297,27 @@ impl EngineBuilder {
     /// `LogCursor::ZERO` and want full history. The defaults differ on
     /// purpose — side effects must not replay; read models must.
     pub async fn build(self) -> Result<Engine> {
-        // Warn when reactors are wired but no durable EffectStore was configured.
-        // InMemoryEffectStore survives retries within one process lifetime but is
-        // lost on restart — the next redelivery re-runs every ctx.effect() call.
-        if !self.reactor_seeds.is_empty() && !self.explicit_effect_store {
-            tracing::warn!(
-                "EffectStore not configured — using InMemoryEffectStore. \
-                 Side effects will re-execute across process restarts. \
-                 Call with_effect_store() with a durable backend before deploying to production.",
+        // Production-unsafe default is opt-in, not a swallowed warning:
+        // reactors registered with only the in-memory EffectStore lose all
+        // effect memoization on restart, so every `ctx.effect()` re-runs
+        // after a crash/redeploy. Refuse to build unless the caller either
+        // wired a durable store (`with_effect_store`) or explicitly accepted
+        // the in-memory one (`allow_in_memory_effect_store_for_tests`, which
+        // `EngineBuilder::memory()` sets automatically).
+        if !self.reactor_seeds.is_empty()
+            && !self.explicit_effect_store
+            && !self.allow_in_memory_effect_store
+        {
+            anyhow::bail!(
+                "EngineBuilder::build: {} reactor(s) registered but no durable \
+                 EffectStore is configured. The default InMemoryEffectStore loses \
+                 effect memoization on restart, so every ctx.effect() re-executes \
+                 after a crash or redeploy — unsafe in production. Fix by either:\n  \
+                 - .with_effect_store(<durable backend>), or\n  \
+                 - .allow_in_memory_effect_store_for_tests() to accept the \
+                 in-memory store explicitly.\n\
+                 (EngineBuilder::memory() opts in automatically for tests/prototypes.)",
+                self.reactor_seeds.len(),
             );
         }
 
@@ -1310,6 +1417,7 @@ impl EngineBuilder {
                     snapshot_every: self.snapshot_every,
                     clock: self.clock.clone(),
                     cancelled_workflows: self.cancelled_workflows.clone(),
+                    leasor: self.leasor.clone(),
                 })
             })
             .collect();
@@ -1607,13 +1715,22 @@ impl Engine {
             for fact in &facts {
                 // The whole decision is written to the (F::NAME, id)
                 // aggregate stream — every fact must belong to aggregate `id`.
-                debug_assert_eq!(
-                    fact.subject_id(), id,
-                    "Engine::append: decided fact has subject_id {} but the \
-                     command targets aggregate {id}; a decision may only emit \
-                     facts for its own aggregate",
-                    fact.subject_id(),
-                );
+                // A fact whose subject_id != id would be physically placed
+                // under `id` while its payload claims another subject: the
+                // envelope and body disagree and a durable restore reads it
+                // back under the wrong subject. That's a programming error in
+                // the decide closure, not a transient conflict, so fail hard
+                // and do NOT consume an OCC retry. (Was a debug_assert!, which
+                // is compiled out in release — promoted to a real runtime error
+                // so it can't slip through a production build.)
+                if fact.subject_id() != id {
+                    anyhow::bail!(
+                        "Engine::append: decided fact has subject_id {} but the \
+                         command targets aggregate {id}; a decision may only emit \
+                         facts for its own aggregate",
+                        fact.subject_id(),
+                    );
+                }
                 let event_type = crate::event::event_type_for(fact);
                 let payload = serde_json::to_value(fact)?;
                 let event = EventData {
@@ -2097,6 +2214,14 @@ impl Engine {
     /// on consumer batch size + supervisor poll interval.
     pub async fn settle(&self, result: EmitResult) -> Result<()> {
         let wf = result.workflow_id;
+        // Pin this run's high-water against eviction for the whole settle.
+        // Without this, a burst of fire-and-forget emits at the tracker cap
+        // could evict this run's entry mid-wait, dropping `hw` back to the
+        // emit floor and returning before the chain finished draining.
+        let _pin = {
+            self.workflow_hw.lock().unwrap().pin(wf);
+            SettlePin { hw: self.workflow_hw.clone(), wf }
+        };
         loop {
             // High-water = the furthest position any event in THIS run's chain
             // has reached. Floor it at the emit position so we always wait for
@@ -2737,6 +2862,192 @@ mod tests {
         );
     }
 
+    /// `Engine::append` must REJECT a decided fact whose `subject_id`
+    /// differs from the targeted aggregate id. The whole batch is written
+    /// to the `(F::SUBJECT, id)` stream, so a foreign-subject fact would
+    /// land under `id` while its payload claims another subject — envelope
+    /// and body disagree, and a durable restore reads it back under the
+    /// wrong subject. This must be a real runtime error, not a
+    /// `debug_assert!` that vanishes in release: the test asserts on `Err`
+    /// (a release build with the old code returned `Ok` silently; a debug
+    /// build panicked — both fail this test, only the fix passes it).
+    #[tokio::test]
+    async fn append_rejects_fact_for_foreign_subject() {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Thing { id: Uuid }
+        impl Event for Thing {
+            const NAME: &'static str = "thing";
+            fn subject_id(&self) -> Uuid { self.id }
+        }
+        #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+        struct ThingCount { n: u32 }
+        impl Aggregate for ThingCount {
+            const NAME: &'static str = "ThingCount";
+            const SUBJECT: &'static str = "thing";
+        }
+        impl Apply<Thing> for ThingCount {
+            fn apply(&mut self, _: &Thing) { self.n += 1; }
+        }
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_aggregators([Aggregator::for_type::<ThingCount, Thing>()])
+        .build()
+        .await
+        .unwrap();
+
+        let target = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+
+        // The decide closure emits a fact whose subject_id (foreign) != the
+        // targeted aggregate id — a programming error the engine must catch.
+        let result = engine
+            .append::<ThingCount, Thing, _>(target, move |_agg| {
+                Ok(vec![Thing { id: foreign }])
+            })
+            .await;
+
+        let err = result.expect_err(
+            "append must reject a fact whose subject_id != the targeted aggregate id",
+        );
+        assert!(
+            err.to_string().contains("subject_id")
+                || err.to_string().contains("own aggregate"),
+            "error should name the foreign-subject violation (got: {err:#})",
+        );
+
+        // A rejected decision must write nothing — to either stream.
+        let target_stream =
+            EventLogBackend::read_stream(store.as_ref(), Thing::SUBJECT, target, None)
+                .await
+                .unwrap();
+        let foreign_stream =
+            EventLogBackend::read_stream(store.as_ref(), Thing::SUBJECT, foreign, None)
+                .await
+                .unwrap();
+        assert!(
+            target_stream.is_empty() && foreign_stream.is_empty(),
+            "a rejected decision must not append any events",
+        );
+    }
+
+    /// `settle()` pins its run's high-water against eviction. Under a burst
+    /// of fire-and-forget emits past `SETTLE_TRACKER_CAP`, an actively-
+    /// settling run's entry must NOT be evicted — otherwise `settle` regresses
+    /// to its emit floor and can return before the chain drains. Stress test
+    /// over the cap; also exercises the "all tracked runs pinned" path.
+    #[test]
+    fn settle_tracker_eviction_never_drops_a_pinned_workflow() {
+        let mut t = SettleTracker::new();
+
+        // Fill to the cap with runs that are ALL actively settling (pinned),
+        // each at a distinct, recoverable high-water.
+        let mut pinned = Vec::with_capacity(SETTLE_TRACKER_CAP);
+        for i in 0..SETTLE_TRACKER_CAP {
+            let wf = Uuid::new_v4();
+            t.pin(wf);
+            t.bump(wf, LogCursor::from_raw(i as u64));
+            pinned.push(wf);
+        }
+
+        // A burst of fire-and-forget (unpinned) emits well past the cap.
+        // Eviction must skip every pinned entry; with all entries pinned it
+        // skips eviction entirely and the map grows.
+        for _ in 0..1_000 {
+            t.bump(Uuid::new_v4(), LogCursor::from_raw(0));
+        }
+
+        // Every actively-settling run's high-water survived intact.
+        for (i, wf) in pinned.iter().enumerate() {
+            assert_eq!(
+                t.get(wf),
+                Some(LogCursor::from_raw(i as u64)),
+                "pinned workflow {wf} was evicted mid-settle (would regress settle to its floor)",
+            );
+        }
+    }
+
+    // ── Production-safety: reactors require an explicit effect-store choice ──
+
+    fn builder_with_reactor(store: &Arc<MemoryStore>) -> EngineBuilder {
+        EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_reactor(WelcomeReactor)
+    }
+
+    /// `build()` REJECTS reactors registered with only the in-memory effect
+    /// store and no explicit opt-in — the production footgun (effect
+    /// memoization lost on restart) is now a hard error, not a swallowed warn.
+    #[tokio::test]
+    async fn build_rejects_reactor_without_durable_effect_store() {
+        let store = store();
+        // (Engine is not Debug, so match rather than expect_err.)
+        let err = match builder_with_reactor(&store).build().await {
+            Ok(_) => panic!("reactors + in-memory effect store must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("EffectStore"),
+            "error should name the missing durable EffectStore (got: {err:#})",
+        );
+    }
+
+    /// The explicit test opt-in lets the same configuration build.
+    #[tokio::test]
+    async fn build_allows_reactor_with_explicit_in_memory_opt_in() {
+        let store = store();
+        builder_with_reactor(&store)
+            .allow_in_memory_effect_store_for_tests()
+            .build()
+            .await
+            .expect("explicit in-memory opt-in must build");
+    }
+
+    /// `EngineBuilder::memory()` opts in automatically — tests/prototypes
+    /// using it are unaffected by the new gate.
+    #[tokio::test]
+    async fn memory_builder_auto_allows_in_memory_effect_store() {
+        EngineBuilder::memory()
+            .with_reactor(WelcomeReactor)
+            .build()
+            .await
+            .expect("memory() must auto-allow the in-memory effect store");
+    }
+
+    /// A durable effect store satisfies the gate without the test opt-in.
+    #[tokio::test]
+    async fn build_allows_reactor_with_durable_effect_store() {
+        let store = store();
+        let durable: Arc<dyn crate::effect_store::EffectStore> =
+            Arc::new(crate::effect_store::InMemoryEffectStore::new());
+        builder_with_reactor(&store)
+            .with_effect_store(durable)
+            .build()
+            .await
+            .expect("an explicit effect store must build");
+    }
+
+    /// No reactors → the gate does not fire (effect store is irrelevant).
+    #[tokio::test]
+    async fn build_without_reactors_needs_no_effect_store_optin() {
+        let store = store();
+        EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .build()
+        .await
+        .expect("no reactors means no effect-store requirement");
+    }
+
     /// A marker seeded BEFORE `build()` (the orphaned-run boot scenario) is
     /// picked up by the builder's fence-rebuild, so runners spawn fenced.
     #[tokio::test]
@@ -3052,6 +3363,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor(CountingReactor)
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         // A new trigger fires exactly once.
@@ -3134,6 +3446,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor_start(CountingReactorZero, crate::projection::StartPosition::Zero)
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
@@ -3214,6 +3527,7 @@ mod tests {
         )
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter))
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated {
@@ -3280,6 +3594,7 @@ mod tests {
             Aggregator::for_type::<ChainCount, WelcomeQueued>(),
         ])
         .with_reactor(WelcomeReactor)
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
@@ -3906,6 +4221,7 @@ mod tests {
         })
         .with_max_attempts(1)
         .with_reactor(EmitsIntoOcc)
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
@@ -4246,6 +4562,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_reactor(EffectReactor { calls: calls.clone() })
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         engine
@@ -4843,6 +5160,7 @@ mod tests {
         }))
         .with_max_attempts(2)
         .with_reactor(AlwaysFails)
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
@@ -4919,6 +5237,7 @@ mod tests {
         )
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter_c))
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
@@ -4983,6 +5302,7 @@ mod tests {
                 store.clone() as Arc<dyn ReactorCheckpoint>,
             )
             .with_reactor(WelcomeReactor)
+            .allow_in_memory_effect_store_for_tests()
             .build()
             .await
             .unwrap(),
@@ -5139,6 +5459,7 @@ mod tests {
         .with_observer(store.clone())
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .with_reactor(EchoReactor { calls: calls.clone() })
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
@@ -5492,6 +5813,7 @@ mod tests {
         )
         .with_aggregators(vec![tick_aggregator()])
         .with_reactor(cap)
+        .allow_in_memory_effect_store_for_tests()
         .build().await.unwrap();
 
         for i in 0..3 {

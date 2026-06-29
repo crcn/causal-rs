@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-// 1. Events are plain data. `CATEGORY` groups a type's streams;
-//    `subject_id` picks which stream this value belongs to.
+// 1. Events are plain data. `NAME` is the wire event-type; `SUBJECT` is the
+//    subject history a fact joins (stream `{SUBJECT}-{subject_id}`, defaults
+//    to `NAME`); `subject_id` picks which subject this value is about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPlaced {
     order_id: Uuid,
@@ -86,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         Aggregator::for_type::<Order, ShipmentRequested>(),
     ])
     .with_reactor(ShipOnPlaced)
+    .allow_in_memory_effect_store_for_tests()
     .build() // async + fallible: seeds reactor cursors
     .await?;
 
