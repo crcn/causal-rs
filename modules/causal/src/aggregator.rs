@@ -994,6 +994,34 @@ async fn repair_gap(
         return Ok(());
     }
 
+    // STRICT-ONLY seed. `advance_watermark` below is a silent no-op on a
+    // vacant entry (it only mutates an existing one), so a mixed-root stream
+    // — one whose lead revisions belong to events this aggregate does NOT
+    // fold — traps repair in a non-converging loop: nothing folds the entry
+    // into existence, nothing can advance it. Seed the empty base (default
+    // state, version ZERO) so the tail fold/advance carries the watermark
+    // forward. ZERO == fold(log[..0]), so the strict
+    // `state == fold(log[..cursor])` invariant holds; a genuinely missing
+    // revision still fails to converge (read_stream won't return it).
+    //
+    // The `upto.is_some()` guard keeps this on the strict (consumer) path.
+    // The non-strict engine path must NOT seed: it fills vacant entries via
+    // the `restore_aggregate` fast-path above, and seeding the shared engine
+    // registry would defeat `engine.state_of`, which uses `!has_state` both
+    // to trigger restore-on-read and to return `None` for an absent aggregate
+    // — a version-ZERO default seed there returns an empty aggregate for one
+    // that has events.
+    if upto.is_some() && !reg.has_state(&key) {
+        if let Some(agg) = reg.find_first_by_aggregate_type(&gap.aggregate_type) {
+            reg.set_state(
+                &key,
+                Arc::from(agg.default_state()),
+                StreamRevision::ZERO,
+                StreamRevision::ZERO,
+            );
+        }
+    }
+
     let after = if gap.expected == StreamRevision::ZERO {
         None
     } else {
@@ -1008,19 +1036,25 @@ async fn repair_gap(
         }
         let repair_outcome =
             reg.apply_event(&e.event_type, &e.payload, e.subject_id, &e.category, e.revision, e.position)?;
-        if repair_outcome.gaps.is_empty() {
-            // A stream event that matched no aggregator (or folded/skipped)
-            // — advance the watermark so the next matching event doesn't
-            // re-detect the same gap forever (mixed streams: foreign events
-            // interleaved with the aggregate's own).
+        // Advance THIS aggregate's watermark unless THIS aggregate itself
+        // gapped on the event. `apply_event` runs every aggregator matching
+        // the event type, so `gaps` can hold a *peer* aggregate's gap when a
+        // mixed-root stream carries an event foreign to us but meaningful to
+        // another aggregate on the same stream. A peer's gap is not ours: the
+        // event is an identity fold for this aggregate, so advancing the
+        // watermark is correct (and necessary — otherwise the peer's gap
+        // would wedge our repair forever). Only a gap on OUR OWN key signals
+        // a concurrent restore/fold mid-flight on this entry, where advancing
+        // would jump past an unfolded event and drop a fold (the TOCTOU
+        // defect) — so we keep that suppressed and let the outer loop
+        // re-detect and re-repair once the racing writer settles.
+        let self_gapped = repair_outcome
+            .gaps
+            .iter()
+            .any(|g| g.aggregate_type == gap.aggregate_type && g.id == gap.id);
+        if !self_gapped {
             reg.advance_watermark(&key, e.revision, e.position);
         }
-        // If `apply_event` reported a gap here, a concurrent restore/fold
-        // is mid-flight on this entry; do NOT advance past it. Leave the
-        // watermark and let `fold_event`'s outer loop re-detect and
-        // re-repair on the next round (bounded; converges once the racing
-        // writer settles). Advancing here would jump past an unfolded
-        // event and drop a fold — the original TOCTOU defect.
     }
     Ok(())
 }
@@ -1480,5 +1514,251 @@ mod tests {
         ).err().expect("misaligned fold must error");
         assert!(err.to_string().contains("must fold exactly its own stream"),
                 "unexpected error: {err:#}");
+    }
+
+    // ── Mixed-root stream fixtures ───────────────────────────────────
+    // An aligned aggregate `B` over subject `s`, folding only event `b`.
+    // Event `a` shares the stream but folds into no aggregator.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct EventB { id: Uuid }
+    impl Event for EventB {
+        const NAME: &'static str = "b";
+        fn subject_id(&self) -> Uuid { self.id }
+    }
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct BCount { n: u32 }
+    impl Aggregate for BCount {
+        const NAME: &'static str = "B";
+        const SUBJECT: &'static str = "s";
+    }
+    impl Apply<EventB> for BCount {
+        fn apply(&mut self, _: &EventB) { self.n += 1; }
+    }
+
+    // A second aligned aggregate `C` over the SAME subject `s`, folding only
+    // event `c`. Used to exercise mixed-root streams that co-locate two
+    // aggregate roots (event `c` is foreign to B but meaningful to C).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct EventC { id: Uuid }
+    impl Event for EventC {
+        const NAME: &'static str = "c";
+        fn subject_id(&self) -> Uuid { self.id }
+    }
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct CCount { n: u32 }
+    impl Aggregate for CCount {
+        const NAME: &'static str = "C";
+        const SUBJECT: &'static str = "s";
+    }
+    impl Apply<EventC> for CCount {
+        fn apply(&mut self, _: &EventC) { self.n += 1; }
+    }
+
+    async fn append_raw(store: &MemoryStore, id: Uuid, event_type: &str, payload: serde_json::Value) {
+        let ev = EventData {
+            event_id: Uuid::new_v4(),
+            causation_id: None,
+            workflow_id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            payload,
+            created_at: Utc::now(),
+            category: Some("s".into()),
+            subject_id: Some(id),
+            metadata: serde_json::Map::new(),
+            ephemeral: None,
+            persistent: true,
+        };
+        crate::append_event(store, ev).await.unwrap();
+    }
+
+    /// Mixed-root stream: revision 0 is an event NO aggregator folds, and
+    /// revision 1 is the aggregate's own first folded event. In strict
+    /// mode the snapshot-restore fast-path is skipped, so repair relies on
+    /// the tail fold/`advance_watermark` — but `advance_watermark` is a
+    /// silent no-op on a vacant entry, so without seeding the empty base,
+    /// repair re-detects the same gap every round and bails after 8.
+    ///
+    /// This is the `scout_run` re-extract wedge: a stream whose lead
+    /// revision (`enrichment:reextract_completed`) the aggregate doesn't
+    /// fold trapped repair in a non-converging loop.
+    #[tokio::test]
+    async fn strict_repair_seeds_mixed_root_stream() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        // rev 0: an event this aggregate does not fold.
+        append_raw(&store, id, "a", serde_json::json!({})).await;
+        // rev 1: the aggregate's own first event.
+        append_raw(&store, id, "b", serde_json::to_value(EventB { id }).unwrap()).await;
+
+        let events = crate::event_log::EventLogBackend::read_all(
+            &store, LogCursor::ZERO, 10,
+        ).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let eb = &events[1];
+        assert_eq!(eb.event_type, "b");
+        assert_eq!(eb.revision.raw(), 1);
+
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<BCount, EventB>());
+
+        // Deliver revision 1 strictly. The aggregate is vacant; revision 1
+        // against version 0 is a gap whose lead revision (0) folds into
+        // nothing.
+        let outcome = fold_event(
+            &reg, None, &store,
+            &eb.event_type, &eb.payload, eb.subject_id, &eb.category,
+            eb.revision, eb.position,
+            /* strict_to_event = */ true,
+        ).await.expect("mixed-root repair must converge, not bail");
+
+        assert!(outcome.applied, "the delivered event `b` was folded");
+        let key = format!("B:{id}");
+        assert_eq!(reg.get_version(&key).raw(), 2,
+                   "watermark advanced past the delivered revision 1");
+        let state = reg.get_state(&key).unwrap();
+        assert_eq!(state.downcast_ref::<BCount>().unwrap().n, 1,
+                   "exactly event `b` folded — event `a` is not its event");
+    }
+
+    /// Multiple contiguous foreign lead revisions: the seed + per-event
+    /// advance must carry the watermark across all of them.
+    #[tokio::test]
+    async fn strict_repair_seeds_all_foreign_lead_run() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_raw(&store, id, "a", serde_json::json!({})).await;       // rev 0
+        append_raw(&store, id, "a", serde_json::json!({})).await;       // rev 1
+        append_raw(&store, id, "b", serde_json::to_value(EventB { id }).unwrap()).await; // rev 2
+
+        let events = crate::event_log::EventLogBackend::read_all(
+            &store, LogCursor::ZERO, 10,
+        ).await.unwrap();
+        let eb = &events[2];
+        assert_eq!((eb.event_type.as_str(), eb.revision.raw()), ("b", 2));
+
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<BCount, EventB>());
+
+        let outcome = fold_event(
+            &reg, None, &store,
+            &eb.event_type, &eb.payload, eb.subject_id, &eb.category,
+            eb.revision, eb.position, true,
+        ).await.expect("two foreign lead revisions must still converge");
+
+        assert!(outcome.applied);
+        let key = format!("B:{id}");
+        assert_eq!(reg.get_version(&key).raw(), 3, "watermark crossed rev0,rev1 to fold rev2");
+        assert_eq!(reg.get_state(&key).unwrap().downcast_ref::<BCount>().unwrap().n, 1);
+    }
+
+    /// Regression: a foreign event interleaved AFTER a real fold (entry
+    /// already exists) — the seed must be a no-op and the pre-existing
+    /// advance path must still carry the watermark.
+    #[tokio::test]
+    async fn strict_repair_foreign_event_after_real_fold() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_raw(&store, id, "b", serde_json::to_value(EventB { id }).unwrap()).await; // rev 0
+        append_raw(&store, id, "a", serde_json::json!({})).await;                        // rev 1
+        append_raw(&store, id, "b", serde_json::to_value(EventB { id }).unwrap()).await; // rev 2
+
+        let events = crate::event_log::EventLogBackend::read_all(
+            &store, LogCursor::ZERO, 10,
+        ).await.unwrap();
+
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<BCount, EventB>());
+
+        // Fold rev0 first so the entry exists at version 1.
+        let e0 = &events[0];
+        fold_event(&reg, None, &store, &e0.event_type, &e0.payload,
+                   e0.subject_id, &e0.category, e0.revision, e0.position, true)
+            .await.unwrap();
+        let key = format!("B:{id}");
+        assert_eq!(reg.get_version(&key).raw(), 1);
+
+        // Now deliver rev2; the gap (expected 1) repairs over the foreign rev1.
+        let e2 = &events[2];
+        fold_event(&reg, None, &store, &e2.event_type, &e2.payload,
+                   e2.subject_id, &e2.category, e2.revision, e2.position, true)
+            .await.expect("interleaved foreign event must not wedge an existing entry");
+
+        assert_eq!(reg.get_version(&key).raw(), 3);
+        assert_eq!(reg.get_state(&key).unwrap().downcast_ref::<BCount>().unwrap().n, 2,
+                   "two `b` events folded; the interleaved `a` is not B's");
+    }
+
+    /// Two aggregate roots on one stream, peer caught up (6a). During B's
+    /// repair the foreign-to-B `c` event is an idempotent skip for C, so it
+    /// contributes no gap and B advances normally.
+    #[tokio::test]
+    async fn strict_repair_shared_stream_peer_caught_up() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_raw(&store, id, "c", serde_json::to_value(EventC { id }).unwrap()).await; // rev 0
+        append_raw(&store, id, "b", serde_json::to_value(EventB { id }).unwrap()).await; // rev 1
+
+        let events = crate::event_log::EventLogBackend::read_all(
+            &store, LogCursor::ZERO, 10,
+        ).await.unwrap();
+
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<BCount, EventB>());
+        reg.register(Aggregator::for_type::<CCount, EventC>());
+
+        // In-order processing: fold c@0 (C catches up), then deliver b@1.
+        let ec = &events[0];
+        fold_event(&reg, None, &store, &ec.event_type, &ec.payload,
+                   ec.subject_id, &ec.category, ec.revision, ec.position, true)
+            .await.unwrap();
+        let eb = &events[1];
+        fold_event(&reg, None, &store, &eb.event_type, &eb.payload,
+                   eb.subject_id, &eb.category, eb.revision, eb.position, true)
+            .await.expect("B converges when peer C is caught up");
+
+        assert_eq!(reg.get_version(&format!("B:{id}")).raw(), 2);
+        assert_eq!(reg.get_state(&format!("B:{id}")).unwrap().downcast_ref::<BCount>().unwrap().n, 1);
+        assert_eq!(reg.get_state(&format!("C:{id}")).unwrap().downcast_ref::<CCount>().unwrap().n, 1);
+    }
+
+    /// Two aggregate roots on one stream, peer BEHIND and gapping mid-tail
+    /// (6b). This is the latent hazard change (b) closes: under the old
+    /// global `gaps.is_empty()` gate, C's mid-tail gap would suppress B's
+    /// advance and B would bail. Under the per-key gate, C's gap is not B's,
+    /// so B advances past the foreign `c` events and converges. (The real
+    /// runners never deliver in this order — they fold every event in
+    /// position order — so this manufactures the state directly.)
+    #[tokio::test]
+    async fn strict_repair_shared_stream_peer_behind_converges() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_raw(&store, id, "c", serde_json::to_value(EventC { id }).unwrap()).await; // rev 0
+        append_raw(&store, id, "d", serde_json::json!({})).await;                        // rev 1 (foreign to all)
+        append_raw(&store, id, "c", serde_json::to_value(EventC { id }).unwrap()).await; // rev 2
+        append_raw(&store, id, "b", serde_json::to_value(EventB { id }).unwrap()).await; // rev 3
+
+        let events = crate::event_log::EventLogBackend::read_all(
+            &store, LogCursor::ZERO, 10,
+        ).await.unwrap();
+        let eb = &events[3];
+        assert_eq!((eb.event_type.as_str(), eb.revision.raw()), ("b", 3));
+
+        let mut reg = AggregatorRegistry::new();
+        reg.register(Aggregator::for_type::<BCount, EventB>());
+        reg.register(Aggregator::for_type::<CCount, EventC>());
+
+        // Deliver b@3 to a COLD registry — C is never pre-folded, so during
+        // B's repair the tail's c@2 gaps C (C is at version 1 after c@0).
+        let outcome = fold_event(
+            &reg, None, &store,
+            &eb.event_type, &eb.payload, eb.subject_id, &eb.category,
+            eb.revision, eb.position, true,
+        ).await.expect("a PEER's gap must not wedge B's repair (per-key advance gate)");
+
+        assert!(outcome.applied);
+        assert_eq!(reg.get_version(&format!("B:{id}")).raw(), 4,
+                   "B advanced across c@0, d@1, c@2 and folded b@3");
+        assert_eq!(reg.get_state(&format!("B:{id}")).unwrap().downcast_ref::<BCount>().unwrap().n, 1,
+                   "only `b` folded into B");
     }
 }
