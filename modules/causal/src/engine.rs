@@ -145,6 +145,15 @@ const SETTLE_WEDGE_FAILURES: u32 = 10;
 pub(crate) struct ConsumerHealth {
     consecutive_failures: std::sync::atomic::AtomicU32,
     last_error:           std::sync::Mutex<Option<String>>,
+    /// Monotonic heartbeat: the last time `supervise_one` completed a cycle
+    /// (progress, idle, or failure) for this consumer. A *live* supervisor
+    /// stamps this every poll — even when idle — so staleness means the
+    /// supervisor is not cycling at all: its task died/never spawned, or it
+    /// is blocked *inside* a step (e.g. a dead peer's lease, an external
+    /// call that never returns). The failure counter cannot see those cases
+    /// because no `step` ever returns to be counted. Real monotonic time,
+    /// never the injected calendar clock (Primitive 6's two-clock rule).
+    last_activity:        std::sync::Mutex<std::time::Instant>,
 }
 
 impl ConsumerHealth {
@@ -152,6 +161,7 @@ impl ConsumerHealth {
         Self {
             consecutive_failures: std::sync::atomic::AtomicU32::new(0),
             last_error:           std::sync::Mutex::new(None),
+            last_activity:        std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -159,6 +169,7 @@ impl ConsumerHealth {
     fn note_progress(&self) {
         self.consecutive_failures
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        *self.last_activity.lock().unwrap() = std::time::Instant::now();
     }
 
     /// A step failed (errored or panicked). Records the error and bumps
@@ -167,6 +178,15 @@ impl ConsumerHealth {
         self.consecutive_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.last_error.lock().unwrap() = Some(error);
+        *self.last_activity.lock().unwrap() = std::time::Instant::now();
+    }
+
+    /// How long since this consumer's supervisor last completed a cycle.
+    /// Grows without bound when the supervisor is dead or blocked inside a
+    /// step — the signal `settle` uses to surface an *absent* consumer that
+    /// accrues no failures (so [`wedged`](Self::wedged) stays `None`).
+    fn idle_for(&self) -> std::time::Duration {
+        self.last_activity.lock().unwrap().elapsed()
     }
 
     /// `Some((failures, last_error))` once the consumer has failed every
@@ -1361,6 +1381,32 @@ impl EngineBuilder {
             }
         }
 
+        // Heal any consumer cursor left AHEAD of the log tip — the
+        // point-in-time-restore case. If the event store was restored to an
+        // earlier point, a durable cursor past the new tip points at a
+        // position that no longer exists: the consumer reads `read_all(cursor)`
+        // → empty and SILENTLY SKIPS every genuinely-new event appended after
+        // the restore. The log is append-only, so events ≤ tip are
+        // byte-identical to what was already processed; clamping each stale
+        // cursor down to the tip lets the consumer resume exactly there and
+        // re-process nothing (vs. a reset-to-zero divergence storm). Runs after
+        // seeding so it heals whatever the seed left in place, and uses the
+        // dedicated downward-clamp path (NOT `set`, which is the absolute
+        // setter). See CheckpointStore::clamp_ahead_of.
+        {
+            let tip = self.log.latest_position().await?;
+            let clamped = self.checkpoint.clamp_ahead_of(tip).await?
+                + self.reactor_checkpoint.clamp_ahead_of(tip).await?;
+            if clamped > 0 {
+                tracing::warn!(
+                    %clamped, tip = tip.raw(),
+                    "clamped consumer cursor(s) that were ahead of the log tip \
+                     (event store restored to an earlier point?) — resuming at tip; \
+                     events beyond the old cursor are gone, events at/below tip are intact"
+                );
+            }
+        }
+
         // Rebuild cancel fence from the control stream so it survives restart.
         // Errors (stream absent, storage blip) are benign — fence starts empty.
         {
@@ -1482,6 +1528,19 @@ pub struct Engine {
     /// Cancel fence shared with every reactor runner (see
     /// [`Engine::cancel_workflow`]).
     cancelled_workflows:   CancelledWorkflows,
+    /// Optional liveness ceiling for [`Engine::settle`]. When `Some(d)`,
+    /// `settle` surfaces a typed error if the consumer it is blocked on has
+    /// not completed a supervisor cycle for longer than `d` — catching an
+    /// *absent* consumer (dead/never-spawned supervisor, or one blocked
+    /// inside a step) that accrues no failures and so escapes the
+    /// failure-count wedge guard. `None` (default) preserves the legacy
+    /// behavior: `settle` waits indefinitely on a non-failing consumer.
+    /// Opt-in because the right value is deployment-specific — it must
+    /// exceed the longest legitimate single step (e.g. a slow reactor doing
+    /// a multi-minute external call blocks its supervisor cycle for that
+    /// whole call, which is alive, not absent). Set it above your slowest
+    /// step. Real monotonic time, never the calendar clock.
+    settle_liveness_ceiling: Option<std::time::Duration>,
 }
 
 impl Engine {
@@ -1529,7 +1588,19 @@ impl Engine {
             snapshot_every,
             clock,
             cancelled_workflows,
+            settle_liveness_ceiling: None,
         }
+    }
+
+    /// Set the [`settle`](Self::settle) liveness ceiling (see the
+    /// `settle_liveness_ceiling` field). `Some(d)` makes `settle` surface a
+    /// typed error when the consumer it is blocked on has not completed a
+    /// supervisor cycle for longer than `d` (an absent consumer that the
+    /// failure-count wedge guard cannot see); `None` restores the legacy
+    /// wait-forever behavior. Choose `d` above your slowest single step.
+    pub fn with_settle_liveness_ceiling(mut self, ceiling: Option<std::time::Duration>) -> Self {
+        self.settle_liveness_ceiling = ceiling;
+        self
     }
 
     /// Emit one or more Facts to the log.
@@ -2276,6 +2347,28 @@ impl Engine {
                             hw,
                             last_error,
                         ));
+                    }
+                    // Liveness failsafe for an *absent* consumer: one whose
+                    // supervisor is dead/never-spawned or blocked inside a
+                    // step never completes a cycle, so it accrues no failures
+                    // (wedge guard above stays silent) yet never drains — a
+                    // SILENT infinite hang. If a ceiling is configured and the
+                    // blocked consumer's supervisor has not heartbeat within
+                    // it, surface it instead of waiting forever. Opt-in: the
+                    // ceiling must exceed the slowest legitimate step.
+                    if let Some(ceiling) = self.settle_liveness_ceiling {
+                        let idle = health.idle_for();
+                        if idle > ceiling {
+                            return Err(anyhow::anyhow!(
+                                "settle: consumer `{}` is unresponsive — its supervisor \
+                                 has not completed a cycle for {:?} (ceiling {:?}), so \
+                                 workflow {} can never drain to high-water {:?}. The \
+                                 consumer is not failing (no error to report) — its \
+                                 supervisor task is likely dead, never spawned, or \
+                                 blocked inside a step (e.g. a held lease).",
+                                consumer.consumer_id(), idle, ceiling, wf, hw,
+                            ));
+                        }
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -3186,6 +3279,108 @@ mod tests {
             .filter(|e| e.event_type.as_str() == "run_requested")
             .count();
         assert_eq!(n, 1, "re-emitting the same root with the same event_id must dedup");
+    }
+
+    /// H3 — point-in-time-restore cursor heal. A consumer's durable cursor left
+    /// AHEAD of the log tip (the event store was restored to an earlier point)
+    /// must be clamped down to the tip at build, or the consumer reads
+    /// `read_all(staleCursor)` → empty and SILENTLY SKIPS every genuinely-new
+    /// event appended after the restore. `clamp_ahead_of` exists for exactly
+    /// this but was never wired into the lifecycle.
+    #[tokio::test]
+    async fn build_clamps_consumer_cursor_left_ahead_of_tip() {
+        let store = store();
+        let occurred = DateTime::parse_from_rfc3339("2026-06-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Put real events in the log so the tip is a concrete, low position.
+        {
+            let engine = EngineBuilder::new(
+                store.clone() as Arc<dyn EventLogBackend>,
+                store.clone() as Arc<dyn CheckpointStore>,
+                store.clone() as Arc<dyn ReactorCheckpoint>,
+            ).build().await.unwrap();
+            engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: occurred })
+                .await.unwrap();
+            engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: occurred })
+                .await.unwrap();
+        }
+        let tip = EventLogBackend::latest_position(store.as_ref()).await.unwrap();
+        assert!(tip > LogCursor::ZERO, "log has a real tip");
+
+        // Simulate a post-restore stale cursor far AHEAD of the tip.
+        let stale = LogCursor::from_raw(tip.raw() + 1000);
+        CheckpointStore::set(store.as_ref(), "ghost-consumer", stale).await.unwrap();
+
+        // Rebuilding the engine over the restored store must heal the cursor.
+        let _engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        ).build().await.unwrap();
+
+        let healed = CheckpointStore::get(store.as_ref(), "ghost-consumer").await.unwrap();
+        assert_eq!(
+            healed, Some(tip),
+            "a cursor ahead of the tip must be clamped to the tip at build — \
+             otherwise post-restore events are silently skipped",
+        );
+    }
+
+    /// H4 — settle liveness failsafe. A consumer whose supervisor is blocked
+    /// *inside* a step (here: a projector that blocks forever) never completes
+    /// a cycle, so it accrues no failures — the failure-count wedge guard stays
+    /// silent and `settle` would poll `drained` forever (silent infinite hang).
+    /// With a configured liveness ceiling, `settle` must instead SURFACE the
+    /// unresponsive consumer as a typed error.
+    #[tokio::test]
+    async fn settle_surfaces_absent_consumer_via_liveness_ceiling() {
+        use std::time::Duration;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct HangTrigger { id: Uuid }
+        impl Event for HangTrigger {
+            const NAME: &'static str = "hang_trigger";
+            fn subject_id(&self) -> Uuid { self.id }
+        }
+        #[derive(Default, Clone)]
+        struct HangProjector;
+        #[async_trait]
+        impl Projector for HangProjector {
+            type Event = HangTrigger;
+            const NAME: &'static str = "hang.projector";
+            async fn project(&self, _f: &HangTrigger, _ctx: Ctx<'_>) -> Result<()> {
+                // Block forever inside the step: the supervisor never returns
+                // to record progress or failure — "absent", not "wedged".
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        }
+
+        let store = store();
+        let engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_projector(HangProjector)
+        .build()
+        .await
+        .unwrap()
+        .with_settle_liveness_ceiling(Some(Duration::from_millis(300)));
+
+        let id = Uuid::new_v4();
+        let r = engine.emit(HangTrigger { id }).workflow_id(id).await.unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(10), engine.settle(r))
+            .await
+            .expect("settle must return via the liveness ceiling, not hang forever");
+        let err = res.expect_err("an absent consumer must surface as a settle error");
+        assert!(
+            err.to_string().contains("unresponsive"),
+            "expected an unresponsive-consumer liveness error, got: {err}",
+        );
     }
 
     #[tokio::test]
