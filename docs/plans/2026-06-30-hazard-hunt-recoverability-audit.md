@@ -1,8 +1,12 @@
 # Hazard hunt: recoverability & event-sourcing fail-safes (causal 0.16.0)
 
-**Status:** audit complete; no code changed. Findings below are from five parallel adversarial
-hunts, each spot-checked against source. Goal: survive a "nuclear" situation (crash, PITR
-restore, schema drift, poison data, failover) with **correctness** as the non-negotiable.
+**Status:** original hunt record. Since authoring, **H3/H4/H5 have shipped** and **H9 was found
+already-fixed** (branch `hardening/recoverability-hazards`); H1/H2/H6/H7/H8/H10 are tracked as
+living gaps in `docs/gaps/`. The per-finding prose below is the as-discovered record; the
+**status matrix at the end** and `docs/gaps/README.md` reflect current state. Findings are from
+five parallel adversarial hunts, each spot-checked against source. Goal: survive a "nuclear"
+situation (crash, PITR restore, schema drift, poison data, failover) with **correctness** as the
+non-negotiable.
 
 **Headline:** the *core event-sourcing engine is genuinely robust* — Postgres ordering, OCC,
 exactly-once reactor emission, dual-write atomicity, and checkpoint↔state consistency are all
@@ -18,12 +22,12 @@ event-versioning layer. Two findings are correctness-critical; the rest are reco
 | Area | Why it holds | Evidence |
 |---|---|---|
 | **Postgres catch-up ordering** (the #1 black swan) | Global `pg_advisory_xact_lock(0xCA05,0xA1)` taken by both & only the two `causal_log` writers before position assignment, held to commit → position order == commit order. The allocate-before-commit skip is structurally impossible. | `event_log.rs:25-51,212`, `event_projector.rs:92`; stress test `conformance::concurrent_appends_are_tailable_without_loss` |
-| **OCC / append** | Typed `ConflictError`, reload+re-decide, bounded `MAX_OCC_RETRIES=16` w/ jittered backoff; atomic check-and-write under mutex. No lost update, no livelock. | `engine.rs:1668-1826`; conformance `append_to_stream_rejects_stale_expected`, `expected_revision_ahead_of_head_is_rejected` |
+| **OCC / append** | Typed `ConflictError`, reload+re-decide, bounded `MAX_OCC_RETRIES=16` w/ jittered backoff; atomic check-and-write under mutex. No lost update, no livelock. | `engine.rs:1743-1901`; conformance `append_to_stream_rejects_stale_expected`, `expected_revision_ahead_of_head_is_rejected` |
 | **Exactly-once reactor emission** | Output `event_id = v5(consumer∥trigger∥kind∥subject∥nth)`; log dedups on it. Emission idempotency does NOT depend on a durable checkpoint. | `reactor_runner.rs:123-144`; `memory_store.rs:454-518`, `event_log.rs:134-168` |
 | **Divergent redelivery** | Nondeterministic re-decision under same `event_id` is detected; original row authoritative, accepted + shouted, never overwritten, never retried-forever. | `memory_store.rs:471-512`, `reactor_runner.rs:1211-1253` |
-| **Dual-write atomicity** | Log append is sole truth; per-stream batch is one atomic append; reactor output is itself the log entry (no outbox needed). | `engine.rs:1668-1826,1755`; `memory_store.rs:437-589` |
+| **Dual-write atomicity** | Log append is sole truth; per-stream batch is one atomic append; reactor output is itself the log entry (no outbox needed). | `engine.rs:1743-1901,1755`; `memory_store.rs:437-589` |
 | **Checkpoint↔state consistency** | Aggregate state never persisted with checkpoint; recomputed from log on restart; cursor advances only post-fold; `set_state` monotonic. | `projection_runner.rs:244`, `aggregator.rs:718-738` |
-| **Boot-cancel race (0.15.2)** | Standalone `append_workflow_cancelled` + fence rebuilt before any consumer spawns; deterministic idempotent marker. | `engine.rs:443-470,1364-1384` |
+| **Boot-cancel race (0.15.2)** | Standalone `append_workflow_cancelled` + fence rebuilt before any consumer spawns; deterministic idempotent marker. | `engine.rs:463-490,1364-1384` |
 | **No truncation** | No delete/scavenge/`$tb`/retention anywhere; streams dense from 0; conformance forbids sparse writes. | grep-confirmed; `conformance.rs` ordering tests |
 
 ---
@@ -33,7 +37,7 @@ event-versioning layer. Two findings are correctness-critical; the rest are reco
 ### H1 — CRITICAL (correctness). Projector / multi-projector poison wedge; no park/skip.
 A poison event (payload that no longer deserializes into the registered type, or a `project()`
 that deterministically errors) makes `ProjectionRunner::step` / `MultiProjectorRunner::step`
-return `Err` **before advancing the checkpoint**. The supervisor (`engine.rs:2700-2743`) retries
+return `Err` **before advancing the checkpoint**. The supervisor (`engine.rs:2778-2825`) retries
 a *deterministic* failure **forever, no ceiling, cursor never moves** → the projection is wedged
 permanently, and **replay-from-zero re-poisons on the same event**. This is by explicit design:
 the runner header says failure handling is "`BlockUntilFixed` only … `AdvanceAfter` (park-and-skip)
@@ -74,7 +78,7 @@ empty → **silently skips every event between the real tip and the stale cursor
 events appended after restore. `clamp_ahead_of(tip)` exists precisely to fix this (clamp cursors
 down to tip, never to 0, avoiding a divergence storm) — but it has **zero production callers**
 (verified: only the trait default, two backend impls, one unit test). `build()` already reads
-`latest_position()` during seeding (`engine.rs:1342`), so the heal is one call away.
+`latest_position()` during seeding (`engine.rs:1392`), so the heal is one call away.
 - **Fix (BOUNDED):** in `build()`, call `clamp_ahead_of(latest_position())` for each consumer
   cursor (or behind a `RunnerConfig` flag), and at minimum emit a loud diagnostic when any stored
   cursor > tip. Low risk, high recovery value.
@@ -86,7 +90,7 @@ down to tip, never to 0, avoiding a divergence storm) — but it has **zero prod
 ### H4 — MEDIUM (liveness/recovery). `settle()` hangs forever on an *absent* (not-failing,
 not-running) consumer.
 The wedge guard fires only on *counted failures* (`SETTLE_WEDGE_FAILURES`, no wall-clock —
-`engine.rs:2259-2279`). A consumer whose supervisor task panicked at the framework level and
+`engine.rs:2335-2360`). A consumer whose supervisor task panicked at the framework level and
 wasn't respawned, was never spawned, or is blocked on a dead peer's lease increments no failure
 counter → `wedged()` returns `None` → `settle` polls `drained` indefinitely. Tests wrap settle in
 `tokio::time::timeout`, implying production callers must too — there is no built-in liveness ceiling.
@@ -100,7 +104,7 @@ counter → `wedged()` returns `None` → `settle` polls `drained` indefinitely.
 (no CAS) → backwards regression on misconfigured multi-node.
 `reactor_checkpoint.rs:60-76` does `ON CONFLICT DO UPDATE SET position = EXCLUDED.position`. Safe
 *only* because the consumer is the single writer — which rests entirely on the `ConsumerLeasor`,
-which is **opt-in** (`engine.rs:869` defaults `None`; "Without a leasor, the engine assumes
+which is **opt-in** (`engine.rs:889` defaults `None`; "Without a leasor, the engine assumes
 single-engine"). A two-node deploy that forgets `with_consumer_leasor` gets two live workers; a
 lagging worker's `set` overwrites a more-advanced cursor **backwards** → reprocessing + (for
 nondeterministic reactors) a divergence storm.
@@ -152,7 +156,7 @@ state, no error, no self-heal (self-heal triggers only on *deserialize failure*)
 
 ### H9 — ALREADY FIXED (audit correction). Side-effecting reactor + default in-memory effect store.
 **The dual-write hunt recommended a builder guard for this — but the guard already exists.**
-`EngineBuilder::build()` hard-`bail!`s (`engine.rs:1307-1322`) when any reactor is registered and
+`EngineBuilder::build()` hard-`bail!`s (`engine.rs:1327-1352`) when any reactor is registered and
 neither `with_effect_store(<durable>)` nor `allow_in_memory_effect_store_for_tests()` was called
 (the latter is what `EngineBuilder::memory()` sets). So a production engine with a reactor and the
 in-memory default **cannot build**. The agent read the `contexts.rs:372` default but missed the
@@ -180,7 +184,7 @@ fail if the lock were removed.
 | H6 | Reactor multi-output non-atomic | MEDIUM | Correctness (gated) | Bounded (delicate) | ⏳ next — delicate refactor of the divergence-handling emission loop |
 | H7 | No causal-cycle failsafe | MEDIUM | Availability/safety | Design (DECIDED: depth ceiling) | ⏳ Tier-2 |
 | H8 | Stale-but-valid snapshot | MEDIUM | Correctness | Bounded-ish | ⏳ Tier-2 |
-| H9 | In-memory effect-store trap | LOW-MED | Correctness (config) | — | ✅ **already fixed** (build() hard-bails, engine.rs:1307) |
+| H9 | In-memory effect-store trap | LOW-MED | Correctness (config) | — | ✅ **already fixed** (build() hard-bails, engine.rs:1327) |
 | H10 | PG-lock regression guard | LOW | Observability | Test-only | ⏳ pending |
 
 ---

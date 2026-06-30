@@ -1352,6 +1352,36 @@ impl EngineBuilder {
             }
         }
 
+        // Heal any consumer cursor left AHEAD of the log tip — the
+        // point-in-time-restore case. If the event store was restored to an
+        // earlier point, a durable cursor past the new tip points at a
+        // position that no longer exists: the consumer reads `read_all(cursor)`
+        // → empty and SILENTLY SKIPS every genuinely-new event appended after
+        // the restore. The log is append-only, so events ≤ tip are
+        // byte-identical to what was already processed; clamping each stale
+        // cursor down to the tip lets the consumer resume exactly there and
+        // re-process nothing (vs. a reset-to-zero divergence storm). Uses the
+        // dedicated downward-clamp path (NOT `set`, the absolute setter).
+        //
+        // Runs BEFORE seeding so it heals only PERSISTED cursors: an explicit
+        // `StartPosition::Specific(c)` seed below is the operator's intent and
+        // is applied afterwards, so a deliberate forward position is respected
+        // rather than silently clamped. `ResumeOrLatest` then resumes at the
+        // healed (clamped) cursor. See CheckpointStore::clamp_ahead_of.
+        {
+            let tip = self.log.latest_position().await?;
+            let clamped = self.checkpoint.clamp_ahead_of(tip).await?
+                + self.reactor_checkpoint.clamp_ahead_of(tip).await?;
+            if clamped > 0 {
+                tracing::warn!(
+                    %clamped, tip = tip.raw(),
+                    "clamped consumer cursor(s) that were ahead of the log tip \
+                     (event store restored to an earlier point?) — resuming at tip; \
+                     events beyond the old cursor are gone, events at/below tip are intact"
+                );
+            }
+        }
+
         // Seed reactor cursors per their StartPosition, before any
         // consumer can take a step.
         for (group, start) in &self.reactor_seeds {
@@ -1378,32 +1408,6 @@ impl EngineBuilder {
                     }
                 }
                 self.reactor_checkpoint.set(group, pos).await?;
-            }
-        }
-
-        // Heal any consumer cursor left AHEAD of the log tip — the
-        // point-in-time-restore case. If the event store was restored to an
-        // earlier point, a durable cursor past the new tip points at a
-        // position that no longer exists: the consumer reads `read_all(cursor)`
-        // → empty and SILENTLY SKIPS every genuinely-new event appended after
-        // the restore. The log is append-only, so events ≤ tip are
-        // byte-identical to what was already processed; clamping each stale
-        // cursor down to the tip lets the consumer resume exactly there and
-        // re-process nothing (vs. a reset-to-zero divergence storm). Runs after
-        // seeding so it heals whatever the seed left in place, and uses the
-        // dedicated downward-clamp path (NOT `set`, which is the absolute
-        // setter). See CheckpointStore::clamp_ahead_of.
-        {
-            let tip = self.log.latest_position().await?;
-            let clamped = self.checkpoint.clamp_ahead_of(tip).await?
-                + self.reactor_checkpoint.clamp_ahead_of(tip).await?;
-            if clamped > 0 {
-                tracing::warn!(
-                    %clamped, tip = tip.raw(),
-                    "clamped consumer cursor(s) that were ahead of the log tip \
-                     (event store restored to an earlier point?) — resuming at tip; \
-                     events beyond the old cursor are gone, events at/below tip are intact"
-                );
             }
         }
 

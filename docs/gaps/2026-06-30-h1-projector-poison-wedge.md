@@ -8,7 +8,7 @@ A poison event — a payload that no longer deserializes into the registered
 type, or a `project()` that deterministically errors — makes
 `ProjectionRunner::step` / `MultiProjectorRunner::step` return `Err` **before
 advancing the checkpoint**. The supervisor (`engine.rs` `supervise_one`,
-~`:2700-2743`) retries a *deterministic* failure **forever, no ceiling, cursor
+~`:2778-2825`) retries a *deterministic* failure **forever, no ceiling, cursor
 never moves** → the projection is wedged permanently, and **replay-from-zero
 re-poisons on the same event**. By explicit design: the runner header says
 failure handling is "`BlockUntilFixed` only … `AdvanceAfter` (park-and-skip)
@@ -24,7 +24,7 @@ the codebase — it was never extended to projectors.
 - `projection_runner.rs:11-14` (BlockUntilFixed-only design note; `AdvanceAfter` is a TODO).
 - `projection_runner.rs:189-256` (fold/project `?` before checkpoint set).
 - `multi_projector.rs:221-285` (same shape).
-- `engine.rs:2700-2743` (infinite-retry supervisor; comment names the hazard).
+- `engine.rs:2778-2825` (infinite-retry supervisor; comment names the hazard).
 - Contrast (correct): `reactor_runner.rs:1028-1040`, `:931-951`, `failure.rs`.
 
 ## Reproduction / RED test
