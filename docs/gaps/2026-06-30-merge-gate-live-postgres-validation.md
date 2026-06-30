@@ -1,10 +1,21 @@
 # Merge gate — live-Postgres validation (branch `hardening/recoverability-hazards`)
 
-**Status:** REQUIRED before merging this branch to `main`. The shipped fixes
-include a Postgres-specific code path that was authored and reviewed but **could
-not be executed** in the environment where the work was done (no live database).
-The MemoryStore equivalents are verified; the PG path rests on code review until
-this gate is cleared.
+**Status: ✅ CLEARED (2026-06-30).** Ran `./dev.sh test pg` against a live
+Postgres 16 (docker compose, `postgres://causal:causal@localhost:5433/causal_dev`,
+all `migrations/` applied). `checkpoint_advance_is_monotonic` GREEN, plus the full
+PG suite: checkpoint conformance (7), event-log conformance (20, incl.
+`concurrent_appends_are_tailable_without_loss` and
+`expected_revision_ahead_of_head_is_rejected`), event-log (8, incl.
+`append_queues_behind_the_advisory_lock`), snapshot (5). H5's atomic `GREATEST`
+advance is now verified, not just reviewed. Released in 0.17.0.
+
+---
+
+_Original gate (for the record):_ REQUIRED before merging this branch to `main`.
+The shipped fixes include a Postgres-specific code path that was authored and
+reviewed but **could not be executed** in the environment where the work was done
+(no live database). The MemoryStore equivalents are verified; the PG path rests
+on code review until this gate is cleared.
 
 ## Why this gate exists
 H5 (`fix(checkpoint): monotonic advance() split from absolute set()`,

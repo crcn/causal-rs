@@ -6,6 +6,53 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-06-30
+
+Recoverability-hardening release. Fully additive — no breaking changes.
+A correctness fix for mixed-root streams plus three lifecycle/recovery
+fail-safes surfaced by a recoverability hazard hunt
+(`docs/plans/2026-06-30-hazard-hunt-recoverability-audit.md`; remaining
+findings tracked in `docs/gaps/`).
+
+### Added
+
+- **`CheckpointStore::advance(consumer_id, pos)`** — a **monotonic** cursor
+  writer (moves forward only) split from the existing absolute `set`. The
+  per-event hot path (projector/multi-projector cursor, reactor ack-floor, PG
+  mirror tailer) now uses `advance`. Postgres implements it as an atomic
+  `GREATEST` upsert; MemoryStore is atomic under its entry guard; the trait
+  default is a single-writer-correct get→compare→set. So a lagging concurrent
+  writer (a two-node deploy without a `ConsumerLeasor`) can no longer regress a
+  more-advanced checkpoint backwards. `set` remains the absolute setter used by
+  seeding and the clamp heal. Custom `CheckpointStore` impls keep compiling
+  (they inherit the default), but should override `advance` atomically for
+  multi-writer correctness.
+- **`Engine::with_settle_liveness_ceiling(Option<Duration>)`** — opt-in liveness
+  failsafe for `settle()`. When set, `settle` surfaces a typed error if the
+  consumer it is blocked on has not completed a supervisor cycle within the
+  ceiling — catching an *absent* consumer (dead/never-spawned supervisor, or one
+  blocked inside a step) that accrues no failures and so escapes the
+  failure-count wedge guard. Default `None` preserves the prior behavior; set it
+  above your slowest single step.
+
+### Fixed
+
+- **Mixed-root gap-repair convergence.** A consumer folding an event whose
+  aggregate stream begins with a foreign event (one no registered aggregator
+  folds — e.g. a `scout_run` stream whose revision 0 is
+  `enrichment:reextract_completed`) trapped gap-repair in a non-converging loop
+  and bailed after 8 rounds, wedging the consumer permanently. `repair_gap` now
+  seeds the vacant aggregate entry at the empty base (strict path only) and
+  gates the watermark advance per-key, so a peer aggregate's gap on a shared
+  stream no longer suppresses convergence. Preserves the strict
+  `state == fold(log[..cursor])` invariant.
+- **Point-in-time-restore cursor skip.** After the event store is restored to an
+  earlier point, a consumer cursor left ahead of the new tip would read an empty
+  range and silently skip every event appended after the restore.
+  `EngineBuilder::build()` now clamps such cursors down to the tip (via
+  `clamp_ahead_of`, which had no production caller), before seeding so explicit
+  `StartPosition::Specific` seeds are respected, with an operator warning.
+
 ## [0.16.0] — 2026-06-29
 
 Production-hardening release. Two breaking changes (both pre-1.0
