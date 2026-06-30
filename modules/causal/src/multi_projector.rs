@@ -251,7 +251,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 .iter()
                 .any(|k| is_subscribed_kind(&event.event_type, k));
             if !matches_subscription {
-                self.checkpoint.set(&self.consumer_id, event.position).await?;
+                self.checkpoint.advance(&self.consumer_id, event.position).await?;
                 continue;
             }
 
@@ -274,7 +274,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             };
             match self.projector.project(&event, ctx).await {
                 Ok(()) => {
-                    self.checkpoint.set(&self.consumer_id, event.position).await?;
+                    self.checkpoint.advance(&self.consumer_id, event.position).await?;
                     applied += 1;
                 }
                 Err(e) => {

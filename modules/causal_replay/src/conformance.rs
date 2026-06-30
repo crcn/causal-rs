@@ -1241,6 +1241,33 @@ pub async fn checkpoint_set_then_get_round_trips<C: CheckpointStore>(c: &C) -> R
     Ok(())
 }
 
+/// K2b: `advance` is MONOTONIC — moves a cursor forward only, never
+/// regresses it (the no-leasor concurrent-writer guard). A lagging worker's
+/// advance is a no-op. Contrast `set`, which is absolute (used by seeding and
+/// the downward clamp heal). A backend that interleaves two racing advances
+/// into a regression fails here.
+pub async fn checkpoint_advance_is_monotonic<C: CheckpointStore>(c: &C) -> Result<()> {
+    let id = format!("conf.k2b.{}", Uuid::new_v4());
+    c.advance(&id, LogCursor::from_raw(100)).await?;
+    assert_eq!(c.get(&id).await?, Some(LogCursor::from_raw(100)), "first advance installs");
+    // A lagging advance must NOT regress the cursor.
+    c.advance(&id, LogCursor::from_raw(40)).await?;
+    assert_eq!(
+        c.get(&id).await?, Some(LogCursor::from_raw(100)),
+        "advance is monotonic: a lower position is a no-op, not a regression",
+    );
+    // A higher advance moves it forward.
+    c.advance(&id, LogCursor::from_raw(150)).await?;
+    assert_eq!(c.get(&id).await?, Some(LogCursor::from_raw(150)), "advance moves forward");
+    // `set` is still absolute — the seeding/clamp path can legitimately move down.
+    c.set(&id, LogCursor::from_raw(5)).await?;
+    assert_eq!(
+        c.get(&id).await?, Some(LogCursor::from_raw(5)),
+        "set is absolute (seeding/clamp), distinct from monotonic advance",
+    );
+    Ok(())
+}
+
 /// K3: consumers are isolated — one consumer's floor never bleeds into
 /// another's.
 pub async fn checkpoint_consumers_are_isolated<C: CheckpointStore>(c: &C) -> Result<()> {
@@ -1318,6 +1345,7 @@ pub fn scenario_names() -> &'static [&'static str] {
         "concurrent_any_appends_all_succeed",
         "checkpoint_unknown_consumer_is_none",
         "checkpoint_set_then_get_round_trips",
+        "checkpoint_advance_is_monotonic",
         "checkpoint_consumers_are_isolated",
         "reactor_attempts_count_monotonically",
         "reactor_attempts_are_isolated",

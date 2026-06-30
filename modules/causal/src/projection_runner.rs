@@ -216,7 +216,7 @@ where
             // cursor but don't trigger project — the consumer
             // legitimately doesn't handle them.
             if !crate::event_type::matches_kind(&event.event_type, prefix) {
-                self.checkpoint.set(&self.consumer_id, event.position).await?;
+                self.checkpoint.advance(&self.consumer_id, event.position).await?;
                 continue;
             }
 
@@ -241,7 +241,7 @@ where
             match self.projector.project(&fact, ctx).await {
                 Ok(()) => {
                     // C2: advance cursor ONLY after Ok.
-                    self.checkpoint.set(&self.consumer_id, event.position).await?;
+                    self.checkpoint.advance(&self.consumer_id, event.position).await?;
                     applied += 1;
                 }
                 Err(e) => {

@@ -634,6 +634,24 @@ impl crate::checkpoint_store::CheckpointStore for MemoryStore {
         Ok(())
     }
 
+    async fn advance(&self, consumer_id: &str, pos: LogCursor) -> Result<()> {
+        // Atomic monotonic advance under the entry guard — the check and the
+        // write happen without releasing the lock, so two concurrent advances
+        // can't interleave into a regression (the default get→set would).
+        use dashmap::mapref::entry::Entry;
+        match self.projection_cursors.entry(consumer_id.to_string()) {
+            Entry::Occupied(mut slot) => {
+                if pos > slot.get().cursor {
+                    slot.get_mut().cursor = pos;
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(ProjectionCursorEntry { cursor: pos });
+            }
+        }
+        Ok(())
+    }
+
     async fn clamp_ahead_of(&self, tip: LogCursor) -> Result<u64> {
         let mut clamped = 0u64;
         for mut e in self.projection_cursors.iter_mut() {

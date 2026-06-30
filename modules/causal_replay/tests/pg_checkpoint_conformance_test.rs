@@ -42,6 +42,12 @@ async fn checkpoint_set_then_get_round_trips() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires local DATABASE_URL + migration 054"]
+async fn checkpoint_advance_is_monotonic() -> Result<()> {
+    conformance::checkpoint_advance_is_monotonic(&backend().await).await
+}
+
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL + migration 054"]
 async fn checkpoint_consumers_are_isolated() -> Result<()> {
     conformance::checkpoint_consumers_are_isolated(&backend().await).await
 }

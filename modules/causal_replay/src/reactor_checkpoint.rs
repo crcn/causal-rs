@@ -58,14 +58,35 @@ mod pg {
         }
 
         async fn set(&self, consumer_id: &str, pos: LogCursor) -> Result<()> {
-            // Unconditional upsert: the caller (the consumer runner) is the
-            // single writer of its own cursor and only advances it after a
-            // successful step, so a plain set is correct — no CAS needed.
+            // ABSOLUTE upsert — installs `pos` verbatim, including backwards.
+            // Used only by lifecycle wiring that legitimately moves a cursor
+            // down (build-time seeding, the clamp heal). The per-event hot
+            // path uses `advance` (monotonic) instead, so a lagging
+            // concurrent writer cannot regress a cursor through this method.
             sqlx::query(
                 "INSERT INTO causal_checkpoints (consumer_id, position)
                  VALUES ($1, $2)
                  ON CONFLICT (consumer_id) DO UPDATE
                    SET position = EXCLUDED.position,
+                       updated_at = now()",
+            )
+            .bind(consumer_id)
+            .bind(pos.raw() as i64)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        }
+
+        async fn advance(&self, consumer_id: &str, pos: LogCursor) -> Result<()> {
+            // Atomic monotonic advance: GREATEST collapses two racing writers
+            // (the no-leasor two-node case) so a lagging worker can never
+            // regress a more-advanced cursor. A single SQL statement — no
+            // read-modify-write window.
+            sqlx::query(
+                "INSERT INTO causal_checkpoints (consumer_id, position)
+                 VALUES ($1, $2)
+                 ON CONFLICT (consumer_id) DO UPDATE
+                   SET position = GREATEST(causal_checkpoints.position, EXCLUDED.position),
                        updated_at = now()",
             )
             .bind(consumer_id)

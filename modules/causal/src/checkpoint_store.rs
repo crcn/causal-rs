@@ -19,7 +19,41 @@ use crate::types::LogCursor;
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
     async fn get(&self, consumer_id: &str) -> Result<Option<LogCursor>>;
+
+    /// **Absolute** write — installs `pos` verbatim, even backwards. The
+    /// authoritative setter used by lifecycle wiring that legitimately moves a
+    /// cursor *down*: build-time seeding (e.g. `StartPosition::Zero` resets to
+    /// 0; `Specific` to an arbitrary point) and the downward
+    /// [`clamp_ahead_of`](Self::clamp_ahead_of) heal. **Not** for the
+    /// per-event hot path — use [`advance`](Self::advance) there, which is
+    /// monotonic.
     async fn set(&self, consumer_id: &str, pos: LogCursor) -> Result<()>;
+
+    /// **Monotonic** advance — moves a cursor forward only; a `pos` at or
+    /// behind the stored value is a no-op. This is the per-event hot-path
+    /// writer (projector/multi-projector cursor, reactor ack-floor, PG mirror
+    /// tailer).
+    ///
+    /// Why monotonic and not [`set`](Self::set): a consumer's single-writer
+    /// guarantee rests on the (opt-in) `ConsumerLeasor`. Without a leasor, a
+    /// two-node deployment can run two live workers for one consumer; an
+    /// absolute `set` lets a *lagging* worker overwrite a more-advanced cursor
+    /// **backwards**, replaying already-processed events (and, for a
+    /// nondeterministic reactor, triggering a divergence storm). A monotonic
+    /// advance makes the lagging write a no-op, so checkpoint correctness no
+    /// longer depends on remembering the lease.
+    ///
+    /// The default is a non-atomic get→compare→set, correct for a single
+    /// writer; **concurrent-safe backends MUST override** with an atomic
+    /// maximum (e.g. SQL `GREATEST`) so two racing advances can't interleave
+    /// into a regression.
+    async fn advance(&self, consumer_id: &str, pos: LogCursor) -> Result<()> {
+        let current = self.get(consumer_id).await?;
+        if current.map_or(true, |c| pos > c) {
+            self.set(consumer_id, pos).await?;
+        }
+        Ok(())
+    }
 
     /// Clamp every stored checkpoint whose position is strictly **ahead of**
     /// `tip` down to `tip`, returning how many were clamped.

@@ -1557,7 +1557,7 @@ where
             }
         };
         if let Some(pos) = to_persist {
-            self.checkpoint.set(&self.consumer_id, pos).await?;
+            self.checkpoint.advance(&self.consumer_id, pos).await?;
             let mut d = self.dispatch.lock();
             if d.persisted_floor.map_or(true, |p| p < pos) {
                 d.persisted_floor = Some(pos);

@@ -64,7 +64,7 @@ mod pg {
                     match insert_batch(&pool, &events).await {
                         Ok(()) => {
                             let last = events.last().expect("non-empty").position;
-                            let _ = checkpoint.set(CONSUMER_ID, last).await;
+                            let _ = checkpoint.advance(CONSUMER_ID, last).await;
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, "PgEventProjector: batch insert failed");

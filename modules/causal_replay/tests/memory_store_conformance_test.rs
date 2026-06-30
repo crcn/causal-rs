@@ -125,6 +125,11 @@ async fn checkpoint_set_then_get_round_trips() -> Result<()> {
 }
 
 #[tokio::test]
+async fn checkpoint_advance_is_monotonic() -> Result<()> {
+    conformance::checkpoint_advance_is_monotonic(&b()).await
+}
+
+#[tokio::test]
 async fn checkpoint_consumers_are_isolated() -> Result<()> {
     conformance::checkpoint_consumers_are_isolated(&b()).await
 }
