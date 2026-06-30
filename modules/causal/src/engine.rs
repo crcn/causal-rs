@@ -3332,6 +3332,56 @@ mod tests {
         );
     }
 
+    /// H3 companion — the clamp must NOT override an *explicit* forward start.
+    /// `clamp_ahead_of` heals UNINTENTIONAL stale cursors (persisted from before
+    /// a restore); a `StartPosition::Specific(c)` with `c > tip` is the
+    /// operator's deliberate intent. The clamp runs BEFORE seeding so the
+    /// explicit seed is applied afterwards and survives. (Pre-review the clamp
+    /// ran after seeding and silently overrode this.)
+    #[tokio::test]
+    async fn build_respects_explicit_specific_start_ahead_of_tip() {
+        use crate::projection::StartPosition;
+
+        let store = store();
+        let occurred = DateTime::parse_from_rfc3339("2026-06-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Establish a low tip.
+        {
+            let engine = EngineBuilder::new(
+                store.clone() as Arc<dyn EventLogBackend>,
+                store.clone() as Arc<dyn CheckpointStore>,
+                store.clone() as Arc<dyn ReactorCheckpoint>,
+            ).build().await.unwrap();
+            engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: occurred })
+                .await.unwrap();
+        }
+        let tip = EventLogBackend::latest_position(store.as_ref()).await.unwrap();
+        let ahead = LogCursor::from_raw(tip.raw() + 500);
+
+        // Register a reactor pinned to an explicit Specific position BEYOND the
+        // current tip (a deliberate forward skip).
+        let _engine = EngineBuilder::new(
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .allow_in_memory_effect_store_for_tests()
+        .with_reactor_start(WelcomeReactor, StartPosition::Specific(ahead))
+        .build()
+        .await
+        .unwrap();
+
+        let seeded = CheckpointStore::get(store.as_ref(), WelcomeReactor::NAME).await.unwrap();
+        assert_eq!(
+            seeded, Some(ahead),
+            "an explicit Specific(c > tip) start is the operator's intent and must \
+             be respected — the PITR clamp heals persisted cursors only, never an \
+             explicit seed",
+        );
+    }
+
     /// H4 — settle liveness failsafe. A consumer whose supervisor is blocked
     /// *inside* a step (here: a projector that blocks forever) never completes
     /// a cycle, so it accrues no failures — the failure-count wedge guard stays

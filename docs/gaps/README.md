@@ -10,6 +10,11 @@ RED-test sketch, and the recommended/decided fix. Pick up independently.
 split from absolute `set`), H9 (in-memory effect-store build guard — was
 already present). See branch `hardening/recoverability-hazards`.
 
+**⚠ MERGE GATE:** before merging this branch to `main`, clear
+[the live-Postgres validation](2026-06-30-merge-gate-live-postgres-validation.md)
+— H5's atomic `GREATEST` advance was authored/reviewed but not executed against a
+real database (none available at authoring time).
+
 **What is solid (verified, no gap):** Postgres catch-up ordering (advisory-lock
 mitigation), OCC, exactly-once reactor emission, divergent-redelivery handling,
 dual-write atomicity (log is sole truth), checkpoint↔state consistency,
