@@ -1829,6 +1829,16 @@ impl Engine {
 
             match self.log.append_to_stream(F::SUBJECT, id, expected, events_data).await {
                 Ok(result) => {
+                    tracing::debug!(
+                        aggregate = %F::NAME,
+                        subject = %F::SUBJECT,
+                        id = %id,
+                        facts = folds.len(),
+                        attempt,
+                        position = result.position.raw(),
+                        revision = result.revision.raw(),
+                        "append committed to aggregate stream",
+                    );
                     // Fold each fact into the engine registry so
                     // `engine.state_of::<A>(id).await.unwrap()` reflects the write. The
                     // batch committed atomically at one position;
@@ -1872,6 +1882,12 @@ impl Engine {
                 }
                 Err(e) => {
                     if e.downcast_ref::<crate::event_log::ConflictError>().is_some() {
+                        tracing::trace!(
+                            aggregate = %F::NAME,
+                            id = %id,
+                            attempt,
+                            "append hit OCC conflict; reloading and re-deciding",
+                        );
                         last_conflict = Some(e);
                         // Jittered exponential backoff before reload +
                         // re-decide, so concurrent losers don't all retry
@@ -2056,6 +2072,14 @@ impl Engine {
                 )
                 .await?;
             last_position = result.position;
+            tracing::debug!(
+                subject = %subject,
+                subject_id = %subject_id,
+                facts = n,
+                position = result.position.raw(),
+                revision = result.revision.raw(),
+                "emit appended run to stream",
+            );
 
             // Fold each fact of the run into the engine registry. The
             // run committed atomically; `result.revision` is the LAST

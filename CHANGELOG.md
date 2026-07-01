@@ -6,6 +6,34 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.1] — 2026-07-01
+
+Observability release. Fully additive — no behavior changes, no API changes.
+Adds structured `tracing` instrumentation across the event/reactor lifecycle
+so operators can see which reactors activate per event, and follow fold,
+snapshot, append, and replay flow from a log pipeline.
+
+### Added
+
+- **Reactor lifecycle tracing** (`causal`, `reactor_runner`). `debug`-level
+  events for reactor activation (`reactor`, `event_id`, `event_type`,
+  `position`, `workflow_id`, `attempt`), completion (with emitted count), body
+  failure, and terminal-failure park; `trace`-level for each appended output and
+  for trigger match/enqueue (partition key included). Both workflow-cancellation
+  gates now log at `debug`, explaining a reaction that did *not* fire.
+- **Aggregator tracing** (`causal`, `aggregator`). `trace` for folded and
+  idempotent-skip events; `debug` for gap detection, `trace` for gap repair, and
+  `debug` for durable restore and snapshot save.
+- **Engine ingestion tracing** (`causal`, `engine`). `debug` for emit runs and
+  OCC-append commits; `trace` for OCC conflict/re-decide.
+- **Replay tracing** (`causal_replay`, `stream`). `trace` per-event apply in
+  replay, live catch-up, and live tail — complementing the existing `info`
+  lifecycle milestones.
+
+All new output is `debug`/`trace` and silent by default; opt in with, e.g.,
+`RUST_LOG=causal=debug,causal_replay=trace`. Existing `warn`/`error` failure
+logging is unchanged.
+
 ## [0.17.0] — 2026-06-30
 
 Recoverability-hardening release. Fully additive — no breaking changes.

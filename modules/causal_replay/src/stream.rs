@@ -242,6 +242,12 @@ impl<'a> ProjectionStream<'a> {
 
             for event in &events {
                 // Fail-fast in replay mode — bugs should stop before promotion.
+                tracing::trace!(
+                    position = event.position.raw(),
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    "replay applying event",
+                );
                 apply(event).await?;
                 position = event.position;
                 count += 1;
@@ -340,6 +346,12 @@ impl<'a> ProjectionStream<'a> {
 
             for event in &events {
                 // Log and continue in live mode.
+                tracing::trace!(
+                    position = event.position.raw(),
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    "live catch-up applying event",
+                );
                 if let Err(e) = apply(event).await {
                     tracing::warn!(
                         position = event.position.raw(),
@@ -378,6 +390,12 @@ impl<'a> ProjectionStream<'a> {
 
             let events = self.log.read_all(position, self.batch_size).await?;
             for event in &events {
+                tracing::trace!(
+                    position = event.position.raw(),
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    "live tail applying event",
+                );
                 if let Err(e) = apply(event).await {
                     tracing::warn!(
                         position = event.position.raw(),

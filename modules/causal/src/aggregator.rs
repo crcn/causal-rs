@@ -565,6 +565,14 @@ impl AggregatorRegistry {
                             snapshot_at_version: StreamRevision::ZERO,
                         },
                     );
+                    tracing::trace!(
+                        aggregate_type = %agg.aggregate_type,
+                        aggregate_id = %aggregate_id,
+                        event_type = %event_type,
+                        revision = revision.raw(),
+                        position = position.raw(),
+                        "aggregator folded event",
+                    );
                     outcome.applied = true;
                     outcome.snapshots.insert(key, pre, post);
                 }
@@ -587,9 +595,25 @@ impl AggregatorRegistry {
                     } else {
                         curr.clone()
                     };
+                    tracing::trace!(
+                        aggregate_type = %agg.aggregate_type,
+                        aggregate_id = %aggregate_id,
+                        event_type = %event_type,
+                        revision = revision.raw(),
+                        exact_prev,
+                        "aggregator skipped event (idempotent replay)",
+                    );
                     outcome.snapshots.insert(key, prev, curr);
                 }
                 Action::Gap { expected } => {
+                    tracing::debug!(
+                        aggregate_type = %agg.aggregate_type,
+                        aggregate_id = %aggregate_id,
+                        event_type = %event_type,
+                        revision = revision.raw(),
+                        expected = expected.raw(),
+                        "aggregator detected gap; repair needed",
+                    );
                     outcome.gaps.push(FoldGap {
                         aggregate_type: agg.aggregate_type.clone(),
                         subject: agg.subject.clone(),
@@ -978,6 +1002,13 @@ async fn repair_gap(
     gap: &FoldGap,
     upto: Option<StreamRevision>,
 ) -> Result<()> {
+    tracing::trace!(
+        aggregate_type = %gap.aggregate_type,
+        aggregate_id = %gap.id,
+        expected = gap.expected.raw(),
+        upto = ?upto.map(|r| r.raw()),
+        "repairing aggregate gap",
+    );
     let key = format!("{}:{}", gap.aggregate_type, gap.id);
     if upto.is_none()
         && !reg.has_state(&key)
@@ -1139,6 +1170,14 @@ pub(crate) async fn restore_aggregate(
         .map(|s| StreamRevision::from_raw(s.revision.raw() + 1))
         .unwrap_or(StreamRevision::ZERO);
     reg.set_state(&key, Arc::from(state), version, snapshot_at);
+    tracing::debug!(
+        aggregate_type = %aggregate_type,
+        %id,
+        had_snapshot,
+        folded_tail = tail.len(),
+        version = version.raw(),
+        "aggregate restored from durable store",
+    );
     Ok(true)
 }
 
@@ -1192,7 +1231,15 @@ pub(crate) async fn maybe_save_snapshots(
             created_at: Utc::now(),
         };
         match snapshot_store.save_snapshot(snapshot).await {
-            Ok(()) => reg.update_snapshot_at_version(key, version),
+            Ok(()) => {
+                tracing::debug!(
+                    aggregate_type = %aggregate_type,
+                    %id,
+                    version = version.raw(),
+                    "snapshot saved",
+                );
+                reg.update_snapshot_at_version(key, version);
+            }
             Err(e) => tracing::warn!(aggregate_key = %key, error = %e, "save_snapshot failed; will retry"),
         }
     }

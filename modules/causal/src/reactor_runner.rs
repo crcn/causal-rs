@@ -160,7 +160,7 @@ fn reactor_output_metadata(reactor_id: &str) -> serde_json::Map<String, serde_js
 // ─────────────────────────────────────────────────────────────────────
 
 /// Partition identity per the reactor's declared `Ordering`.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum PartitionKey {
     /// `Ordering::PerSubject` — the trigger's placement stream.
     Subject(String, Uuid),
@@ -579,6 +579,13 @@ where
                     if fenced {
                         // Dispatch-gate: ack at the gate without entering
                         // pending or wf_pending — the floor catches up naturally.
+                        tracing::debug!(
+                            reactor = %self.core.consumer_id,
+                            event_id = %event.event_id,
+                            workflow_id = %event.workflow_id,
+                            position = event.position.raw(),
+                            "trigger skipped at dispatch gate (workflow cancelled)",
+                        );
                         d.ingest_pos = event.position;
                     } else {
                         d.pending.insert(
@@ -593,6 +600,14 @@ where
                         *d.wf_pending.entry(event.workflow_id).or_insert(0) += 1;
                         d.ingest_pos = event.position;
                         let key = partition_key_for(R::ORDERING, &event);
+                        tracing::trace!(
+                            reactor = %self.core.consumer_id,
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            position = event.position.raw(),
+                            partition = ?key,
+                            "trigger matched and enqueued",
+                        );
                         Core::enqueue(&self.core, &mut d, key, event);
                     }
                 } else {
@@ -768,6 +783,13 @@ where
             // triggers whose workflow was cancelled after dispatch.
             if let Some(fence) = &core.cancelled_workflows {
                 if fence.lock().unwrap().contains(&event.workflow_id) {
+                    tracing::debug!(
+                        reactor = %core.consumer_id,
+                        event_id = %event.event_id,
+                        workflow_id = %event.workflow_id,
+                        position = event.position.raw(),
+                        "queued trigger acked without processing (workflow cancelled)",
+                    );
                     let _ = core.completions_tx.send(Completion {
                         position: event.position,
                         workflow: event.workflow_id,
@@ -964,6 +986,13 @@ where
                         .await
                     {
                         Ok(()) => {
+                            tracing::debug!(
+                                reactor = %self.consumer_id,
+                                event_id = %event.event_id,
+                                attempts,
+                                class = ?failure_class,
+                                "trigger parked (terminal failure)",
+                            );
                             self.note_worker_progress();
                             return Some(TriggerDone {
                                 parked: true,
@@ -1039,6 +1068,16 @@ where
             }
         };
 
+        tracing::debug!(
+            reactor = %self.consumer_id,
+            event_id = %event.event_id,
+            event_type = %event.event_type,
+            position = event.position.raw(),
+            workflow_id = %event.workflow_id,
+            attempt = attempt_seq,
+            "reactor activated",
+        );
+
         if let Some(obs) = self.observer.as_ref() {
             obs.reactor_started(
                 event.event_id,
@@ -1100,6 +1139,13 @@ where
         let emitted = match reacted {
             Ok(events) => {
                 let completed_at = self.clock.now();
+                tracing::debug!(
+                    reactor = %self.consumer_id,
+                    event_id = %event.event_id,
+                    attempt = attempt_seq,
+                    emitted = events.len(),
+                    "reactor completed",
+                );
                 if let Some(obs) = self.observer.as_ref() {
                     let drained = log_sink.into_inner();
                     obs.reactor_completed(
@@ -1121,6 +1167,13 @@ where
             }
             Err(e) => {
                 let completed_at = self.clock.now();
+                tracing::debug!(
+                    reactor = %self.consumer_id,
+                    event_id = %event.event_id,
+                    attempt = attempt_seq,
+                    error = %format!("{e:#}"),
+                    "reactor body failed",
+                );
                 if let Some(obs) = self.observer.as_ref() {
                     let drained = log_sink.into_inner();
                     obs.reactor_failed(
@@ -1201,6 +1254,7 @@ where
                 ephemeral: None,
                 persistent: true,
             };
+            let out_event_id = out_event.event_id;
             let write = match self.log
                 .append_to_stream(
                     &out.subject, out.subject_id, StreamState::Any, vec![out_event],
@@ -1252,6 +1306,16 @@ where
                     None => return Err(e),
                 },
             };
+            tracing::trace!(
+                reactor = %self.consumer_id,
+                trigger_event_id = %event.event_id,
+                fact_kind = %out.durable_name,
+                subject_id = %out.subject_id,
+                nth = this_nth,
+                output_event_id = %out_event_id,
+                position = write.position.raw(),
+                "reactor output appended",
+            );
             // Advance the OUTPUT's workflow high-water. For a chain
             // member that's the trigger's run; for a workflow root it
             // seeds the CHILD's — the parent's settle does not wait for
