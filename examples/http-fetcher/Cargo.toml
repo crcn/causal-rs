@@ -1,6 +1,6 @@
 [package]
 name = "http-fetcher-example"
-version = "0.4.0"
+version = "0.18.0"
 edition = "2021"
 publish = false
 
