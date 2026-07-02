@@ -82,6 +82,14 @@ mod kurrent {
     /// decisions.
     pub struct KurrentEventLogBackend {
         client: Client,
+        /// Optional authoritative global `event_id` index (A2). When set,
+        /// `Any` appends consult it first, so a redelivery is recognized even
+        /// when the original output is buried past the tail-window scan —
+        /// required for the 0.19 decision-record completion path to be safe on
+        /// Kurrent. When `None`, `Any` falls back to the window-only scan
+        /// (legacy behavior; safe only within the window).
+        event_id_registry:
+            Option<std::sync::Arc<dyn causal::event_id_registry::EventIdRegistry>>,
     }
 
     impl KurrentEventLogBackend {
@@ -96,13 +104,50 @@ mod kurrent {
                 .map_err(|e| anyhow!("invalid Kurrent connection string: {e}"))?;
             let client = Client::new(settings)
                 .map_err(|e| anyhow!("kurrentdb client construction failed: {e}"))?;
-            Ok(Self { client })
+            Ok(Self { client, event_id_registry: None })
         }
 
         /// Build from an already-constructed `kurrentdb::Client`.
         /// Useful for tests that share one client across fixtures.
         pub fn from_client(client: Client) -> Self {
-            Self { client }
+            Self { client, event_id_registry: None }
+        }
+
+        /// Attach the authoritative global `event_id` registry (A2). Required
+        /// for the decision-record completion path to be safe on Kurrent —
+        /// without it, a redelivery whose original output is deeper than the
+        /// tail-window scan re-appends a duplicate. The canonical impl is
+        /// `PgEventIdRegistry`.
+        pub fn with_event_id_registry(
+            mut self,
+            registry: std::sync::Arc<dyn causal::event_id_registry::EventIdRegistry>,
+        ) -> Self {
+            self.event_id_registry = Some(registry);
+            self
+        }
+
+        /// Register a just-appended (or window-recognized) batch in the
+        /// global registry, all ids sharing the batch `WriteResult` (A2).
+        /// No-op when no registry is attached. Registration errors propagate
+        /// so the caller retries: the append is already durable, so a retry
+        /// re-recognizes it (window or registry) and re-registers idempotently.
+        async fn register_batch(
+            &self,
+            batch_ids: &[Uuid],
+            result: WriteResult,
+        ) -> Result<()> {
+            if let Some(reg) = &self.event_id_registry {
+                let entries: Vec<causal::event_id_registry::EventIdEntry> = batch_ids
+                    .iter()
+                    .map(|id| causal::event_id_registry::EventIdEntry {
+                        event_id: *id,
+                        stream_position: result.position,
+                        stream_revision: result.revision,
+                    })
+                    .collect();
+                reg.register(&entries).await?;
+            }
+            Ok(())
         }
 
         /// Idempotent `Any` append: scan-then-CAS so a duplicate cannot
@@ -125,6 +170,31 @@ mod kurrent {
             batch_ids: &[Uuid],
             events: &[EventData],
         ) -> Result<WriteResult> {
+            // A2: consult the authoritative global registry FIRST. It is
+            // unbounded, so it recognizes a redelivery even when the original
+            // output is buried far past the tail-window scan below (the exact
+            // case the decision-record completion path hits). Absent ⇒ fall
+            // through to the window scan + append, which registers on success.
+            if let Some(reg) = &self.event_id_registry {
+                use causal::event_id_registry::{classify_batch, BatchPresence};
+                match classify_batch(reg.as_ref(), batch_ids).await? {
+                    BatchPresence::Redelivery { last } => {
+                        return Ok(WriteResult {
+                            position: last.stream_position,
+                            revision: last.stream_revision,
+                        });
+                    }
+                    BatchPresence::PartialOverlap => {
+                        return Err(anyhow!(
+                            "append_to_stream on {stream}: batch partially overlaps an \
+                             earlier append (per the global event_id registry) — \
+                             event_ids must be all-new or all-already-persisted"
+                        ));
+                    }
+                    BatchPresence::Absent => {}
+                }
+            }
+
             // Window must cover any plausible interleaving of foreign
             // events between the original append and this redelivery.
             let window_size = (batch_ids.len() * 4).max(64);
@@ -140,6 +210,9 @@ mod kurrent {
                             .find(|w| &w.id == last)
                             .expect("Redelivery ⇒ every batch id is in the window")
                             .result;
+                        // Heal the crash-before-register case: a redelivery
+                        // the window recognized but the registry missed.
+                        self.register_batch(batch_ids, result).await?;
                         return Ok(result);
                     }
                     Reconciliation::PartialOverlap => {
@@ -165,12 +238,16 @@ mod kurrent {
                         let options = AppendToStreamOptions::default().stream_state(expected);
                         match self.client.append_to_stream(stream, &options, event_data).await {
                             Ok(write) => {
-                                return Ok(WriteResult {
+                                let wr = WriteResult {
                                     position: LogCursor::from_raw(write.position.commit),
                                     revision: StreamRevision::from_raw(
                                         write.next_expected_version,
                                     ),
-                                })
+                                };
+                                // A2: record the batch so a future redelivery
+                                // deeper than the window is still recognized.
+                                self.register_batch(batch_ids, wr).await?;
+                                return Ok(wr);
                             }
                             // Head moved between scan and append — re-scan.
                             Err(kurrentdb::Error::WrongExpectedVersion { .. }) => continue,

@@ -373,6 +373,7 @@ async fn reactor_output_lands_in_its_own_stream_not_global() {
     )
     .with_reactor(DoFetch)
     .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
     .build().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -393,4 +394,66 @@ async fn reactor_output_lands_in_its_own_stream_not_global() {
     assert!(out[0].causation_id.is_some(), "output carries the trigger as causation");
 
     engine.shutdown().await.unwrap();
+}
+
+// ── A2 / D2: global event_id registry vs. deep redelivery ─────────────
+//
+// The decision-record completion path re-appends a sealed output on
+// redelivery. If the original output is buried past the tail-window scan
+// (max(4*batch, 64) events), Kurrent's window-only dedup misses it and the
+// re-append lands a DUPLICATE. These tests pin the dependency executably
+// (D2): without a registry the duplicate reproduces; with one it dedups.
+
+/// Bury one Any output under >64 later events on its stream, then re-append
+/// it. WITHOUT a registry the window scan misses the buried original and a
+/// DUPLICATE lands. This documents the hazard the registry closes.
+#[tokio::test]
+#[ignore = "requires running Kurrent on KURRENT_URL"]
+async fn deep_redelivery_without_registry_duplicates() -> Result<()> {
+    let backend = connect();
+    let subject = Uuid::new_v4();
+    let output = mk_event(Uuid::new_v4(), "reminder", Some("reminder"), Some(subject));
+
+    // Original Any append.
+    backend.append_to_stream("reminder", subject, StreamState::Any, vec![output.clone()]).await?;
+    // Bury it past the 64-event window with foreign events on the SAME stream.
+    for _ in 0..70 {
+        let filler = mk_event(Uuid::new_v4(), "reminder", Some("reminder"), Some(subject));
+        backend.append_to_stream("reminder", subject, StreamState::Any, vec![filler]).await?;
+    }
+    // Redelivery of the ORIGINAL output (same event_id).
+    backend.append_to_stream("reminder", subject, StreamState::Any, vec![output.clone()]).await?;
+
+    let stream = backend.read_stream("reminder", subject, None).await?;
+    let copies = stream.iter().filter(|e| e.event_id == output.event_id).count();
+    // The hazard: the buried original is re-appended as a duplicate.
+    assert_eq!(copies, 2, "without a registry, a deep redelivery duplicates");
+    Ok(())
+}
+
+/// The same scenario WITH a global event_id registry: the buried original is
+/// recognized and the re-append dedups to a single copy (A2 fix).
+#[tokio::test]
+#[ignore = "requires running Kurrent on KURRENT_URL"]
+async fn deep_redelivery_with_registry_dedups() -> Result<()> {
+    use std::sync::Arc;
+    let registry = Arc::new(causal::InMemoryEventIdRegistry::new());
+    let backend = connect().with_event_id_registry(
+        registry as Arc<dyn causal::event_id_registry::EventIdRegistry>,
+    );
+    let subject = Uuid::new_v4();
+    let output = mk_event(Uuid::new_v4(), "reminder", Some("reminder"), Some(subject));
+
+    backend.append_to_stream("reminder", subject, StreamState::Any, vec![output.clone()]).await?;
+    for _ in 0..70 {
+        let filler = mk_event(Uuid::new_v4(), "reminder", Some("reminder"), Some(subject));
+        backend.append_to_stream("reminder", subject, StreamState::Any, vec![filler]).await?;
+    }
+    // Redelivery beyond the window — recognized by the registry.
+    backend.append_to_stream("reminder", subject, StreamState::Any, vec![output.clone()]).await?;
+
+    let stream = backend.read_stream("reminder", subject, None).await?;
+    let copies = stream.iter().filter(|e| e.event_id == output.event_id).count();
+    assert_eq!(copies, 1, "with a registry, a deep redelivery dedups to one copy");
+    Ok(())
 }

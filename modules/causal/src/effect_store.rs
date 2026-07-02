@@ -97,6 +97,12 @@ pub trait EffectStore: Send + Sync {
     /// terminal failures are exempted by the runner (their entries
     /// must survive for failure replay).
     async fn remove(&self, key: &EffectKey) -> Result<()>;
+
+    /// Distinct consumer ids with cached effects. Powers boot-time orphan
+    /// detection (D4). Best-effort — default empty.
+    async fn list_consumers(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Run `compute` only if `key` has no cached result; otherwise return
@@ -174,6 +180,13 @@ impl EffectStore for InMemoryEffectStore {
     async fn remove(&self, key: &EffectKey) -> Result<()> {
         self.inner.lock().unwrap().remove(key);
         Ok(())
+    }
+
+    async fn list_consumers(&self) -> Result<Vec<String>> {
+        let map = self.inner.lock().unwrap();
+        let set: std::collections::HashSet<&str> =
+            map.keys().map(|k| k.consumer.as_str()).collect();
+        Ok(set.into_iter().map(String::from).collect())
     }
 }
 

@@ -266,23 +266,87 @@ where
 #[derive(Debug, Clone, Default)]
 pub struct RunnerConfig {
     skip_gap_on_start: bool,
+    attempt_timeout: Option<std::time::Duration>,
 }
 
 impl RunnerConfig {
     /// Advance this reactor's checkpoint to the log tip on startup,
-    /// abandoning any gap since the last clean drain.
+    /// **dropping every trigger in the gap** since the last clean drain.
     ///
-    /// Safe only when the reactor's work re-derives from an external
-    /// re-trigger (a due-sweep, a scheduler, a webhook) on every startup.
-    /// If any trigger arrives exactly once and is never re-emitted,
-    /// those workflows will stall silently after a crash.
+    /// The name says the trade plainly (A7): this is not an optimization, it
+    /// *loses data on restart*. Safe only when the reactor's work re-derives
+    /// from an external re-trigger (a due-sweep, a scheduler, a webhook) on
+    /// every startup. If any trigger arrives exactly once and is never
+    /// re-emitted, those workflows stall silently after a crash.
     ///
-    /// A WARN is emitted at startup listing the gap that was skipped and
-    /// workflow IDs that may need external re-triggering.
+    /// **Decision records do NOT protect a skipped gap.** Records make a
+    /// *delivered* trigger replay its decision; a gap trigger is never
+    /// delivered, so there is nothing to replay. A WARN is emitted at startup
+    /// listing the skipped range and workflow IDs that may need external
+    /// re-triggering.
+    pub fn start_at_latest_dropping_gap() -> Self {
+        Self { skip_gap_on_start: true, attempt_timeout: None }
+    }
+
+    /// Deprecated alias for [`start_at_latest_dropping_gap`](Self::start_at_latest_dropping_gap).
+    /// The old name reads as an optimization; it means *drop data on
+    /// restart*. Kept one release for migration.
+    #[deprecated(
+        since = "0.19.0",
+        note = "renamed to start_at_latest_dropping_gap — the old name hid that it drops gap triggers on restart"
+    )]
     pub fn skip_gap_on_start() -> Self {
-        Self { skip_gap_on_start: true }
+        Self::start_at_latest_dropping_gap()
+    }
+
+    /// Set a per-attempt `react()` timeout for this reactor (D3). A body
+    /// exceeding it fails TRANSIENT (retries under the transient ceiling),
+    /// never poison. Default is unbounded — set a generous value for a
+    /// reactor doing legitimately long-running work (e.g. multi-minute LLM
+    /// effects). Chainable with the start-position constructors.
+    pub fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.attempt_timeout = Some(timeout);
+        self
     }
 }
+
+/// [`Engine::settle`] gave up waiting because the consumer it was blocked on
+/// stopped making progress for longer than the configured
+/// [`with_settle_liveness_ceiling`](EngineBuilder::with_settle_liveness_ceiling)
+/// (D3). **This does not mean the work failed** — the consumer is still
+/// running (or its supervisor is absent/blocked); it simply did not drain
+/// within the ceiling. Callers can downcast the `anyhow::Error` from
+/// `settle` to this type to distinguish "still running" from a genuine
+/// wedge (which stays a plain error carrying the consumer's last failure).
+#[derive(Debug, Clone)]
+pub struct SettleTimeout {
+    /// The workflow that had not drained.
+    pub workflow_id: Uuid,
+    /// How long the blocking consumer's supervisor had been idle (no
+    /// completed cycle) when settle gave up — i.e. time since last progress.
+    pub last_progress: std::time::Duration,
+    /// The configured liveness ceiling that was exceeded.
+    pub ceiling: std::time::Duration,
+    /// The consumer settle was blocked on.
+    pub consumer: String,
+}
+
+impl std::fmt::Display for SettleTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "settle: consumer `{}` is unresponsive — its supervisor has not \
+             completed a cycle for {:?} (ceiling {:?}), so workflow {} has not \
+             drained. The consumer is not failing (no error to report); its \
+             supervisor task is likely dead, never spawned, or blocked inside a \
+             step (e.g. a held lease). NOTE: the work may still be running — \
+             this is a liveness timeout, not a failure.",
+            self.consumer, self.last_progress, self.ceiling, self.workflow_id,
+        )
+    }
+}
+
+impl std::error::Error for SettleTimeout {}
 
 // ─────────────────────────────────────────────────────────────────────
 // DrainResult
@@ -741,6 +805,12 @@ pub(crate) struct ConsumerWiring {
     pub causation_depth_ceiling: Option<u32>,
     pub observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     pub effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
+    /// Durable decision store, plumbed into every reactor runner (same
+    /// ordering rule as `effect_store`). Reactors seal one decision per
+    /// trigger and replay it on redelivery.
+    pub decision_store: Option<Arc<dyn crate::decision_store::DecisionStore>>,
+    /// Whether reactors seal empty (zero-output) decision records (A6).
+    pub seal_empty_decisions: bool,
     pub workflow_hw: WorkflowHighWater,
     pub snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
     pub snapshot_every: u64,
@@ -790,6 +860,25 @@ pub struct EngineBuilder {
     /// registered *after* this is set (same ordering rule as `observer`),
     /// surfaced to reactor bodies via `ctx.effect_store()`.
     effect_store:        Option<Arc<dyn crate::effect_store::EffectStore>>,
+    /// Durable decision store (Phase 5). Plumbed into every reactor runner
+    /// registered *after* this is set. Reactors seal one decision per
+    /// trigger and replay it on redelivery instead of re-running the body.
+    decision_store:      Option<Arc<dyn crate::decision_store::DecisionStore>>,
+    /// Whether a zero-output reaction seals an empty decision record.
+    /// Default `true`; disable to elide empty-seal write traffic in fan-out
+    /// no-op topologies (A6). Applied to every reactor.
+    seal_empty_decisions: bool,
+    /// Retention window for decision records (A1). A background sweep deletes
+    /// records sealed longer ago than this. Age-driven, never floor-driven.
+    /// Default 7 days.
+    decision_retention: std::time::Duration,
+    /// D5: fold-determinism self-check. Set by test constructors
+    /// (`memory` / `in_memory_for_tests`); off in production.
+    fold_self_check: bool,
+    /// D4: when `true`, a boot-time orphaned-consumer finding is a hard build
+    /// error instead of a WARN. For CI, where a rename that stranded a
+    /// checkpoint/decision/effect row should fail the pipeline.
+    orphan_detection_strict: bool,
     /// Per-workflow high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
@@ -824,6 +913,14 @@ pub struct EngineBuilder {
     /// reactors-without-a-durable-store in production while keeping
     /// tests/prototypes ergonomic.
     allow_in_memory_effect_store: bool,
+    /// `true` when the caller explicitly called
+    /// [`with_decision_store`](Self::with_decision_store).
+    explicit_decision_store: bool,
+    /// `true` when the caller accepted the in-memory decision store via
+    /// [`allow_in_memory_decision_store_for_tests`](Self::allow_in_memory_decision_store_for_tests)
+    /// (or implicitly via [`memory`](Self::memory) /
+    /// [`in_memory_for_tests`](Self::in_memory_for_tests)).
+    allow_in_memory_decision_store: bool,
     /// Optional exclusive-lease provider, applied to EVERY consumer
     /// (reactors, projectors, multi-projectors) at build time. Each
     /// consumer acquires `leasor.acquire(consumer_id)` before its first
@@ -853,8 +950,43 @@ impl EngineBuilder {
             store        as Arc<dyn crate::checkpoint_store::ReactorCheckpoint>,
         )
         // memory() is the test/prototype constructor — accept the in-memory
-        // effect store so `build()` doesn't require an explicit opt-in here.
+        // effect + decision stores so `build()` doesn't require an explicit
+        // opt-in here.
         .allow_in_memory_effect_store_for_tests()
+        .allow_in_memory_decision_store_for_tests()
+        .with_fold_self_check(true)
+    }
+
+    /// Wire a single [`MemoryStore`](crate::MemoryStore) into *every* durable
+    /// slot at once — event log, checkpoint, reactor checkpoint, snapshot
+    /// store, and observer — and accept the in-memory effect and decision
+    /// stores. The one-call test/prototype harness (D1).
+    ///
+    /// Prefer this over [`memory`](Self::memory) when a test also wants
+    /// aggregate snapshots or the in-memory inspector read model: it
+    /// satisfies both `allow_in_memory_*_for_tests` gates and saves the
+    /// recital of wiring each optional store by hand.
+    ///
+    /// ```no_run
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let engine = causal::EngineBuilder::in_memory_for_tests()
+    ///     .build()
+    ///     .await
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub fn in_memory_for_tests() -> Self {
+        let store = Arc::new(crate::memory_store::MemoryStore::new());
+        Self::new(
+            store.clone() as Arc<dyn crate::event_log::EventLogBackend>,
+            store.clone() as Arc<dyn crate::checkpoint_store::CheckpointStore>,
+            store.clone() as Arc<dyn crate::checkpoint_store::ReactorCheckpoint>,
+        )
+        .with_snapshot_store(store.clone() as Arc<dyn crate::snapshot_store::SnapshotStore>)
+        .with_observer(store as Arc<dyn crate::reactor_observer::ReactorObserver>)
+        .allow_in_memory_effect_store_for_tests()
+        .allow_in_memory_decision_store_for_tests()
+        .with_fold_self_check(true)
     }
 
     /// `checkpoint` stores projector/reactor cursors; `reactor_checkpoint`
@@ -882,6 +1014,13 @@ impl EngineBuilder {
             observer: None,
             effect_store: Some(Arc::new(crate::effect_store::InMemoryEffectStore::new())),
             explicit_effect_store: false,
+            decision_store: Some(Arc::new(crate::decision_store::InMemoryDecisionStore::new())),
+            explicit_decision_store: false,
+            allow_in_memory_decision_store: false,
+            seal_empty_decisions: true,
+            decision_retention: std::time::Duration::from_secs(7 * 24 * 3600),
+            fold_self_check: false,
+            orphan_detection_strict: false,
             workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
@@ -906,6 +1045,80 @@ impl EngineBuilder {
     /// automatically.
     pub fn allow_in_memory_effect_store_for_tests(mut self) -> Self {
         self.allow_in_memory_effect_store = true;
+        self
+    }
+
+    /// Attach a durable [`DecisionStore`](crate::decision_store::DecisionStore).
+    ///
+    /// A reactor seals one decision per trigger — the whole output batch —
+    /// and replays it on redelivery instead of re-running the body. Only a
+    /// *durable* store makes that survive a crash/redeploy; the in-memory
+    /// default loses every decision on restart, which reopens the chimera
+    /// hazard the store exists to close. Call this in production.
+    pub fn with_decision_store(
+        mut self,
+        store: Arc<dyn crate::decision_store::DecisionStore>,
+    ) -> Self {
+        self.decision_store = Some(store);
+        self.explicit_decision_store = true;
+        self
+    }
+
+    /// Accept the in-memory
+    /// [`InMemoryDecisionStore`](crate::decision_store::InMemoryDecisionStore)
+    /// explicitly, suppressing the `build()` error that otherwise fires when
+    /// reactors are registered without a durable decision store.
+    ///
+    /// For tests and prototypes only: in-memory decisions are lost on
+    /// restart. [`memory`](Self::memory) and
+    /// [`in_memory_for_tests`](Self::in_memory_for_tests) set this
+    /// automatically.
+    pub fn allow_in_memory_decision_store_for_tests(mut self) -> Self {
+        self.allow_in_memory_decision_store = true;
+        self
+    }
+
+    /// Whether a zero-output reaction seals an empty decision record
+    /// (default `true`). An empty record preserves the
+    /// processed-vs-never-ran distinction; disabling it elides the
+    /// write+GC for no-op deliveries, which can dominate the causal-infra
+    /// write path in fan-out topologies where most deliveries no-op (A6).
+    /// Applies to every reactor the builder registers.
+    pub fn seal_empty_decisions(mut self, seal: bool) -> Self {
+        self.seal_empty_decisions = seal;
+        self
+    }
+
+    /// Set the decision-record retention window (default 7 days). A
+    /// background sweep deletes records sealed longer ago than this. GC is
+    /// age-driven (A1), so the window must comfortably exceed the longest
+    /// realistic gap between a first delivery and its last possible
+    /// redelivery (crash-restart, deploy overlap, lease handoff) — a record
+    /// GC'd while a redelivery is still possible would re-decide.
+    pub fn with_decision_retention(mut self, window: std::time::Duration) -> Self {
+        self.decision_retention = window;
+        self
+    }
+
+    /// Enable the fold-determinism self-check (D5): every fold-on-read folds
+    /// its events twice and asserts the states match, catching a
+    /// nondeterministic `apply`. On automatically for `memory()` /
+    /// `in_memory_for_tests()`; leave off in production (the double fold has
+    /// cost). Fold purity stays load-bearing even after decision records
+    /// demoted *reactor* determinism, so this guards the contract that still
+    /// matters for state reconstruction.
+    pub fn with_fold_self_check(mut self, on: bool) -> Self {
+        self.fold_self_check = on;
+        self
+    }
+
+    /// Make boot-time orphan detection (D4) a hard build error rather than a
+    /// WARN. A checkpoint/decision/effect row whose consumer id is not a
+    /// registered consumer usually means a rename stranded durable state;
+    /// enable this in CI to fail on it. Off by default (warn only), since a
+    /// legitimately-decommissioned consumer leaves orphan rows until GC.
+    pub fn with_strict_orphan_detection(mut self, strict: bool) -> Self {
+        self.orphan_detection_strict = strict;
         self
     }
 
@@ -1188,7 +1401,22 @@ impl EngineBuilder {
         self
     }
 
-    pub fn with_reactor<R: Reactor + 'static>(mut self, r: R) -> Self
+    pub fn with_reactor<R: Reactor + 'static>(self, r: R) -> Self
+    where
+        R::Trigger: DeserializeOwned,
+    {
+        self.register_reactor(r, None)
+    }
+
+    /// Shared reactor registration. `attempt_timeout` is the per-reactor
+    /// `react()` timeout (D3), captured into the runner factory. Seeds at
+    /// `ResumeOrLatest`; `with_reactor_start` / `reactor_with` adjust the
+    /// seed afterward.
+    fn register_reactor<R: Reactor + 'static>(
+        mut self,
+        r: R,
+        attempt_timeout: Option<std::time::Duration>,
+    ) -> Self
     where
         R::Trigger: DeserializeOwned,
     {
@@ -1213,6 +1441,9 @@ impl EngineBuilder {
             }
             if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
             if let Some(rc) = w.effect_store { runner = runner.with_effect_store(rc); }
+            if let Some(ds) = w.decision_store { runner = runner.with_decision_store(ds); }
+            runner = runner.with_seal_empty_decisions(w.seal_empty_decisions);
+            if let Some(t) = attempt_timeout { runner = runner.with_attempt_timeout(t); }
             runner = runner.with_engine_aggregators(w.engine_aggs);
             runner = runner.with_settle_tracker(w.workflow_hw);
             runner = runner.with_snapshot_persistence(w.snapshot_store, w.snapshot_every);
@@ -1233,8 +1464,8 @@ impl EngineBuilder {
     ///
     /// ```ignore
     /// Engine::builder()
-    ///     .reactor_with(DueSweep::new(), RunnerConfig::skip_gap_on_start())
-    ///     .reactor_with(WebScraper::new(), RunnerConfig::skip_gap_on_start())
+    ///     .reactor_with(DueSweep::new(), RunnerConfig::start_at_latest_dropping_gap())
+    ///     .reactor_with(WebScraper::new(), RunnerConfig::start_at_latest_dropping_gap())
     ///     .reactor(MigrationReactor::new())  // default: replays gap
     ///     .build(log, checkpoints).await?
     ///     .run_until_shutdown().await;
@@ -1248,7 +1479,11 @@ impl EngineBuilder {
         } else {
             crate::projection::StartPosition::ResumeOrLatest
         };
-        self.with_reactor_start(r, start)
+        let mut b = self.register_reactor(r, config.attempt_timeout);
+        if let Some(seed) = b.reactor_seeds.last_mut() {
+            seed.1 = start;
+        }
+        b
     }
 
     /// Register a [`MultiProjector`] — cross-domain projection
@@ -1370,6 +1605,31 @@ impl EngineBuilder {
             );
         }
 
+        // Same "No Lying Defaults" gate for the decision store: reactors
+        // seal one decision per trigger and replay it on redelivery. The
+        // in-memory default loses every decision on restart, so a crash
+        // between seal and cursor-advance would re-decide — reopening the
+        // chimera hazard the store exists to close. Refuse to build unless
+        // a durable store is wired or the in-memory one is explicitly
+        // accepted.
+        if !self.reactor_seeds.is_empty()
+            && !self.explicit_decision_store
+            && !self.allow_in_memory_decision_store
+        {
+            anyhow::bail!(
+                "EngineBuilder::build: {} reactor(s) registered but no durable \
+                 DecisionStore is configured. The default InMemoryDecisionStore loses \
+                 every sealed decision on restart, so a redelivery after a crash or \
+                 redeploy re-runs the reactor body — reopening the chimera-log hazard \
+                 decision records exist to close. Fix by either:\n  \
+                 - .with_decision_store(<durable backend>), or\n  \
+                 - .allow_in_memory_decision_store_for_tests() to accept the \
+                 in-memory store explicitly.\n\
+                 (EngineBuilder::memory() / in_memory_for_tests() opt in automatically.)",
+                self.reactor_seeds.len(),
+            );
+        }
+
         // Reject categories that can't participate in the
         // `{category}:{name}` format before anything runs — a colon in a
         // category silently desyncs reactor matching from aggregate
@@ -1421,7 +1681,7 @@ impl EngineBuilder {
                 (ResumeOrLatest, None)    => Some(self.log.latest_position().await?),
                 // Latest deliberately ignores a persisted cursor — the
                 // backlog is skipped on every (re)build. Used by
-                // reactor_with(r, RunnerConfig::skip_gap_on_start()).
+                // reactor_with(r, RunnerConfig::start_at_latest_dropping_gap()).
                 (Latest, _)               => Some(self.log.latest_position().await?),
                 (Zero, _)                 => Some(LogCursor::ZERO),
                 (Specific(c), _)          => Some(*c),
@@ -1462,10 +1722,56 @@ impl EngineBuilder {
             }
         }
 
+        // D4: boot-time orphan detection. A checkpoint/decision/effect row
+        // whose consumer id is not a registered consumer usually means a
+        // rename stranded durable state (cursors that never advance,
+        // decisions/effects that never GC) — the likeliest brittleness in a
+        // fast-renaming pre-1.0 codebase. Warn, or fail in strict mode.
+        // Best-effort: backends that don't enumerate return empty and no-op.
+        {
+            let registered = &self.consumer_names;
+            let mut orphans: Vec<String> = Vec::new();
+            let mut scan = |source: &str, ids: Vec<String>, out: &mut Vec<String>| {
+                for id in ids {
+                    if !registered.contains(&id) {
+                        out.push(format!("{source} consumer `{id}`"));
+                    }
+                }
+            };
+            scan("checkpoint", self.checkpoint.list_consumers().await.unwrap_or_default(), &mut orphans);
+            if let Some(ds) = &self.decision_store {
+                scan("decision-store", ds.list_consumers().await.unwrap_or_default(), &mut orphans);
+            }
+            if let Some(es) = &self.effect_store {
+                scan("effect-store", es.list_consumers().await.unwrap_or_default(), &mut orphans);
+            }
+            if !orphans.is_empty() {
+                let list = orphans.join(", ");
+                if self.orphan_detection_strict {
+                    anyhow::bail!(
+                        "EngineBuilder::build: orphaned durable state — persisted rows \
+                         whose consumer id is not a registered consumer (did you rename \
+                         a reactor/projector?): {list}. Remove the stale rows or restore \
+                         the name. (Disable this hard failure by not calling \
+                         with_strict_orphan_detection.)"
+                    );
+                }
+                tracing::warn!(
+                    orphans = %list,
+                    "orphaned durable state: persisted checkpoint/decision/effect rows \
+                     whose consumer id is not a registered consumer — did you rename a \
+                     reactor/projector? Their state is stranded (cursors won't advance, \
+                     decisions/effects won't GC). Remove the rows or restore the name.",
+                );
+            }
+        }
+
         let aggregators = self.aggregators;
+        let fold_self_check = self.fold_self_check;
         let make_registry = || -> Option<Arc<AggregatorRegistry>> {
             if aggregators.is_empty() { return None; }
             let mut reg = AggregatorRegistry::new();
+            reg.set_self_check(fold_self_check);
             for agg in &aggregators {
                 reg.register(agg.clone());
             }
@@ -1492,6 +1798,8 @@ impl EngineBuilder {
                     causation_depth_ceiling: self.causation_depth_ceiling,
                     observer: self.observer.clone(),
                     effect_store: self.effect_store.clone(),
+                    decision_store: self.decision_store.clone(),
+                    seal_empty_decisions: self.seal_empty_decisions,
                     workflow_hw: self.workflow_hw.clone(),
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_every: self.snapshot_every,
@@ -1514,6 +1822,8 @@ impl EngineBuilder {
             self.snapshot_every,
             self.clock,
             self.cancelled_workflows,
+            self.decision_store,
+            self.decision_retention,
         ))
     }
 }
@@ -1592,6 +1902,8 @@ impl Engine {
         snapshot_every: u64,
         clock: Arc<dyn crate::clock::Clock>,
         cancelled_workflows: CancelledWorkflows,
+        decision_store: Option<Arc<dyn crate::decision_store::DecisionStore>>,
+        decision_retention: std::time::Duration,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len());
@@ -1609,6 +1921,81 @@ impl Engine {
                 supervise_one(consumer, health, &mut rx).await;
             });
             handles.push(task);
+        }
+
+        // Retention GC (A1): a background sweep of decision records that
+        // reclaims a record only when it is BOTH aged past the retention
+        // window AND its trigger's ack-floor has passed (no redelivery
+        // expected). Age bounds the zombie-reseal window; the floor-minimum
+        // bound ensures a still-redeliverable record is never dropped — age
+        // alone would let a lost ack / short window / wedged partition delete
+        // a record while a redelivery could still re-decide, reopening the
+        // chimera. Per-consumer floors come from `checkpoint`; in the common
+        // setup it is the same store the reactor ack-floor is written to, and
+        // when it is not, a missing floor is treated conservatively (skip,
+        // never reclaim). Spawned only with a decision store + reactors.
+        if let Some(store) = decision_store {
+            if !consumers.is_empty() {
+                let clock = clock.clone();
+                let floor_source = checkpoint.clone();
+                let consumer_ids: Vec<String> =
+                    consumers.iter().map(|c| c.consumer_id().to_string()).collect();
+                let mut rx = shutdown_tx.subscribe();
+                // Sweep ~10× per retention window, clamped to a sane cadence.
+                let interval = (decision_retention / 10).clamp(
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(3600),
+                );
+                let task = tokio::spawn(async move {
+                    let window = chrono::Duration::from_std(decision_retention)
+                        .unwrap_or_else(|_| chrono::Duration::days(7));
+                    loop {
+                        tokio::select! {
+                            _ = rx.recv() => break,
+                            _ = tokio::time::sleep(interval) => {
+                                let aged_before = clock.now() - window;
+                                let mut total = 0u64;
+                                for consumer in &consumer_ids {
+                                    let floor = match floor_source.get(consumer).await {
+                                        // Floor-minimum bound: only reclaim
+                                        // records the ack-floor has passed.
+                                        Ok(Some(f)) => f,
+                                        // Nothing acked (or floor not visible
+                                        // here) → nothing reclaimable. Safe.
+                                        Ok(None) => continue,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                consumer = %consumer, error = %e,
+                                                "decision GC: floor lookup failed; skipping",
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    match store
+                                        .remove_reclaimable(consumer, aged_before, floor)
+                                        .await
+                                    {
+                                        Ok(n) => total += n,
+                                        Err(e) => tracing::warn!(
+                                            consumer = %consumer, error = %e,
+                                            "decision-record retention GC failed; \
+                                             retrying next sweep",
+                                        ),
+                                    }
+                                }
+                                if total > 0 {
+                                    tracing::debug!(
+                                        removed = total,
+                                        "decision-record retention GC swept aged, \
+                                         floor-passed records",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                handles.push(task);
+            }
         }
 
         Self {
@@ -2417,15 +2804,15 @@ impl Engine {
                     if let Some(ceiling) = self.settle_liveness_ceiling {
                         let idle = health.idle_for();
                         if idle > ceiling {
-                            return Err(anyhow::anyhow!(
-                                "settle: consumer `{}` is unresponsive — its supervisor \
-                                 has not completed a cycle for {:?} (ceiling {:?}), so \
-                                 workflow {} can never drain to high-water {:?}. The \
-                                 consumer is not failing (no error to report) — its \
-                                 supervisor task is likely dead, never spawned, or \
-                                 blocked inside a step (e.g. a held lease).",
-                                consumer.consumer_id(), idle, ceiling, wf, hw,
-                            ));
+                            // Typed (D3): "still running", not "failed" — the
+                            // caller can downcast to distinguish this from a
+                            // genuine wedge.
+                            return Err(anyhow::Error::new(SettleTimeout {
+                                workflow_id: wf,
+                                last_progress: idle,
+                                ceiling,
+                                consumer: consumer.consumer_id().to_string(),
+                            }));
                         }
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
@@ -3156,6 +3543,7 @@ mod tests {
         let store = store();
         builder_with_reactor(&store)
             .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
             .build()
             .await
             .expect("explicit in-memory opt-in must build");
@@ -3180,9 +3568,94 @@ mod tests {
             Arc::new(crate::effect_store::InMemoryEffectStore::new());
         builder_with_reactor(&store)
             .with_effect_store(durable)
+            .allow_in_memory_decision_store_for_tests()
             .build()
             .await
             .expect("an explicit effect store must build");
+    }
+
+    /// `build()` REJECTS reactors registered without a durable decision
+    /// store and no explicit opt-in — the chimera hazard is a hard build
+    /// error, not a silent in-memory default.
+    #[tokio::test]
+    async fn engine_with_reactors_and_no_decision_store_refuses_to_build() {
+        let store = store();
+        let err = match builder_with_reactor(&store)
+            // Satisfy the effect gate so the decision gate is what fires.
+            .allow_in_memory_effect_store_for_tests()
+            .build()
+            .await
+        {
+            Ok(_) => panic!("reactors + in-memory decision store must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("DecisionStore"),
+            "error should name the missing durable DecisionStore (got: {err:#})",
+        );
+    }
+
+    /// A durable decision store satisfies the gate without the test opt-in.
+    #[tokio::test]
+    async fn build_allows_reactor_with_durable_decision_store() {
+        let store = store();
+        let durable: Arc<dyn crate::decision_store::DecisionStore> =
+            Arc::new(crate::decision_store::InMemoryDecisionStore::new());
+        builder_with_reactor(&store)
+            .allow_in_memory_effect_store_for_tests()
+            .with_decision_store(durable)
+            .build()
+            .await
+            .expect("an explicit decision store must build");
+    }
+
+    /// `in_memory_for_tests()` opts in to both stores automatically.
+    #[tokio::test]
+    async fn in_memory_for_tests_builder_auto_allows_both_stores() {
+        EngineBuilder::in_memory_for_tests()
+            .with_reactor(WelcomeReactor)
+            .build()
+            .await
+            .expect("in_memory_for_tests() must auto-allow effect + decision stores");
+    }
+
+    /// D4: a persisted cursor under an unregistered consumer id fails a
+    /// strict build (the rename-orphan trap).
+    #[tokio::test]
+    async fn orphaned_consumer_fails_strict_build() {
+        use crate::checkpoint_store::CheckpointStore;
+        let store = store();
+        // Strand a cursor under a name no registered consumer owns.
+        CheckpointStore::set(store.as_ref(), "renamed-away-reactor", LogCursor::ZERO)
+            .await
+            .unwrap();
+        let err = match builder_with_reactor(&store)
+            .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
+            .with_strict_orphan_detection(true)
+            .build()
+            .await
+        {
+            Ok(_) => panic!("strict orphan detection must fail the build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("renamed-away-reactor"),
+            "error should name the orphaned consumer (got: {err:#})",
+        );
+    }
+
+    /// D4: without stray rows, a strict build is clean.
+    #[tokio::test]
+    async fn no_orphans_builds_clean_under_strict_detection() {
+        let store = store();
+        builder_with_reactor(&store)
+            .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
+            .with_strict_orphan_detection(true)
+            .build()
+            .await
+            .expect("no orphaned state → strict build succeeds");
     }
 
     /// No reactors → the gate does not fire (effect store is irrelevant).
@@ -3422,6 +3895,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .with_reactor_start(WelcomeReactor, StartPosition::Specific(ahead))
         .build()
         .await
@@ -3667,6 +4141,7 @@ mod tests {
         )
         .with_reactor(CountingReactor)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         // A new trigger fires exactly once.
@@ -3750,6 +4225,7 @@ mod tests {
         )
         .with_reactor_start(CountingReactorZero, crate::projection::StartPosition::Zero)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
@@ -3831,6 +4307,7 @@ mod tests {
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter))
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated {
@@ -3898,6 +4375,7 @@ mod tests {
         ])
         .with_reactor(WelcomeReactor)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
@@ -4525,6 +5003,7 @@ mod tests {
         .with_max_attempts(1)
         .with_reactor(EmitsIntoOcc)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
@@ -4792,6 +5271,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_effect_store(cache.clone() as Arc<dyn EffectStore>)
+        .allow_in_memory_decision_store_for_tests()
         .with_reactor(CachedSideEffect {
             external_calls: external_calls.clone(),
             attempts: attempts.clone(),
@@ -4866,6 +5346,7 @@ mod tests {
         )
         .with_reactor(EffectReactor { calls: calls.clone() })
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine
@@ -5464,6 +5945,7 @@ mod tests {
         .with_max_attempts(2)
         .with_reactor(AlwaysFails)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
@@ -5541,6 +6023,7 @@ mod tests {
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter_c))
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
@@ -5606,6 +6089,7 @@ mod tests {
             )
             .with_reactor(WelcomeReactor)
             .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
             .build()
             .await
             .unwrap(),
@@ -5763,6 +6247,7 @@ mod tests {
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .with_reactor(EchoReactor { calls: calls.clone() })
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
@@ -6117,6 +6602,7 @@ mod tests {
         .with_aggregators(vec![tick_aggregator()])
         .with_reactor(cap)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         for i in 0..3 {

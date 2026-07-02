@@ -105,6 +105,14 @@ mod pg {
             .await?;
             Ok(())
         }
+
+        async fn list_consumers(&self) -> Result<Vec<String>> {
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT DISTINCT consumer FROM causal_effect_store")
+                    .fetch_all(&self.pool)
+                    .await?;
+            Ok(rows.into_iter().map(|(c,)| c).collect())
+        }
     }
 
 }

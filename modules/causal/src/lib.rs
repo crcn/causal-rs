@@ -97,6 +97,8 @@ pub mod projection_failure;
 pub mod projection_runner;
 pub mod projector;
 pub mod effect_store;
+pub mod decision_store;
+pub mod event_id_registry;
 pub mod reactor_observer;
 pub mod reactor_runner;
 pub mod reactor;
@@ -147,6 +149,7 @@ pub use engine::{
     DrainResult, RunnerConfig,
     Engine, EngineBuilder,
     EmitBuilder, EmitResult, SettledEmit,
+    SettleTimeout,
     TerminalFailure,
     MultiProjectorRegistration, ProjectorRegistration, ReactorRegistration,
 };
@@ -166,6 +169,10 @@ pub use reactor_observer::{NoopObserver, ReactorObserver};
 // Reactor idempotency (Phase 4 foundation): memoize side-effecting
 // reactions so at-least-once delivery is safe; deterministic emit ids.
 pub use effect_store::{remember, InMemoryEffectStore, EffectStore, EffectKey};
+pub use decision_store::{DecisionRecord, DecisionStore, InMemoryDecisionStore};
+pub use event_id_registry::{
+    classify_batch, BatchPresence, EventIdEntry, EventIdRegistry, InMemoryEventIdRegistry,
+};
 
 // Consumer lease: exclusive per-consumer claim preventing two servers from
 // processing the same consumer's triggers simultaneously.

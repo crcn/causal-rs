@@ -1472,3 +1472,288 @@ pub async fn effect_store_remember_replays_cached_on_redelivery<S: causal::Effec
     assert_eq!(calls.load(Ordering::SeqCst), 1, "ES10: compute ran exactly once across both calls");
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// DecisionStore conformance (DS1–DS8)
+// ─────────────────────────────────────────────────────────────────────
+
+use causal::{DecisionRecord, DecisionStore};
+
+/// A stock output envelope for decision-record scenarios.
+fn decision_output(event_type: &str, payload: serde_json::Value) -> EventData {
+    EventData {
+        event_id:     Uuid::new_v4(),
+        causation_id: Some(Uuid::new_v4()),
+        workflow_id:  Uuid::new_v4(),
+        event_type:   event_type.to_string(),
+        payload,
+        created_at:   Utc::now(),
+        category:     Some(event_type.to_string()),
+        subject_id:   Some(Uuid::new_v4()),
+        metadata:     serde_json::Map::new(),
+        ephemeral:    None,
+        persistent:   true,
+    }
+}
+
+/// DS1: a fresh store has no record for a never-sealed trigger.
+pub async fn decision_store_get_miss<S: DecisionStore>(s: &S) -> Result<()> {
+    assert!(
+        s.get("ds1", Uuid::new_v4()).await?.is_none(),
+        "DS1: miss on unsealed trigger"
+    );
+    Ok(())
+}
+
+/// DS2: `seal` then `get` round-trips the output batch, preserving durable
+/// envelope fields (event_id, payload, subject, category, causation).
+pub async fn decision_store_seal_then_get_round_trips<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let outputs = vec![
+        decision_output("Out", serde_json::json!({"n": 1})),
+        decision_output("Out", serde_json::json!({"n": 2})),
+    ];
+    let sealed = s
+        .seal(DecisionRecord::new("ds2", trigger, LogCursor::ZERO, outputs.clone(), Utc::now()))
+        .await?;
+    assert_eq!(sealed.outputs.len(), 2, "DS2: seal returns the full batch");
+
+    let got = s.get("ds2", trigger).await?.expect("DS2: record present after seal");
+    assert_eq!(got.outputs.len(), 2);
+    for (a, b) in got.outputs.iter().zip(outputs.iter()) {
+        assert_eq!(a.event_id, b.event_id, "DS2: event_id preserved");
+        assert_eq!(a.payload, b.payload, "DS2: payload preserved");
+        assert_eq!(a.subject_id, b.subject_id, "DS2: subject preserved");
+        assert_eq!(a.category, b.category, "DS2: category preserved");
+        assert_eq!(a.causation_id, b.causation_id, "DS2: causation preserved");
+    }
+    Ok(())
+}
+
+/// DS3: seal is first-write-wins — a racing second seal with different
+/// outputs adopts the first sealed batch. This is the invariant that lets
+/// racing executions append identical batches.
+pub async fn decision_store_seal_is_first_write_wins<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let first = DecisionRecord::new(
+        "ds3",
+        trigger,
+        LogCursor::ZERO,
+        vec![decision_output("Out", serde_json::json!("first"))],
+        Utc::now(),
+    );
+    let first_id = first.outputs[0].event_id;
+    s.seal(first).await?;
+
+    let second = DecisionRecord::new(
+        "ds3",
+        trigger,
+        LogCursor::ZERO,
+        vec![decision_output("Out", serde_json::json!("second"))],
+        Utc::now(),
+    );
+    let canonical = s.seal(second).await?;
+    assert_eq!(canonical.outputs.len(), 1);
+    assert_eq!(canonical.outputs[0].event_id, first_id, "DS3: first write wins");
+    assert_eq!(
+        canonical.outputs[0].payload,
+        serde_json::json!("first"),
+        "DS3: second seal adopts the first batch"
+    );
+
+    // A subsequent get also returns the first batch.
+    let got = s.get("ds3", trigger).await?.expect("DS3: record present");
+    assert_eq!(got.outputs[0].event_id, first_id);
+    Ok(())
+}
+
+/// DS4: a zero-output reaction seals an empty record — present, not absent
+/// (distinguishing "processed, decided nothing" from "never ran").
+pub async fn decision_store_empty_record_is_present<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let sealed = s.seal(DecisionRecord::new("ds4", trigger, LogCursor::ZERO, vec![], Utc::now())).await?;
+    assert!(sealed.outputs.is_empty(), "DS4: sealed empty batch stays empty");
+    let got = s.get("ds4", trigger).await?;
+    assert!(got.is_some(), "DS4: empty record is present, not absent");
+    assert!(got.unwrap().outputs.is_empty());
+    Ok(())
+}
+
+/// DS5: `remove` makes a record absent.
+pub async fn decision_store_remove_makes_record_absent<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    s.seal(DecisionRecord::new("ds5", trigger, LogCursor::ZERO, vec![], Utc::now())).await?;
+    s.remove("ds5", trigger).await?;
+    assert!(s.get("ds5", trigger).await?.is_none(), "DS5: absent after remove");
+    Ok(())
+}
+
+/// DS6: `remove` on an absent record is a no-op (idempotent).
+pub async fn decision_store_remove_is_idempotent<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    s.remove("ds6", trigger).await?;
+    s.remove("ds6", trigger).await?;
+    Ok(())
+}
+
+/// DS7: records are isolated by `consumer`.
+pub async fn decision_store_isolated_by_consumer<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    s.seal(DecisionRecord::new("ds7-a", trigger, LogCursor::ZERO, vec![], Utc::now())).await?;
+    assert!(
+        s.get("ds7-b", trigger).await?.is_none(),
+        "DS7: consumer-b must not see consumer-a's record"
+    );
+    Ok(())
+}
+
+/// DS8: records are isolated by `trigger_event_id`.
+pub async fn decision_store_isolated_by_trigger<S: DecisionStore>(s: &S) -> Result<()> {
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    s.seal(DecisionRecord::new("ds8", t1, LogCursor::ZERO, vec![], Utc::now())).await?;
+    assert!(
+        s.get("ds8", t2).await?.is_none(),
+        "DS8: a different trigger has its own slot"
+    );
+    Ok(())
+}
+
+/// DS9: ` ` in payload strings is stripped at seal (JSONB safety) — a
+/// seal of scraped content must not fail, and the stored payload has no
+/// NUL codepoint.
+pub async fn decision_store_strips_nul_bytes<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let dirty = decision_output("Out", serde_json::json!({"text": "a\u{0}b"}));
+    s.seal(DecisionRecord::new("ds9", trigger, LogCursor::ZERO, vec![dirty], Utc::now())).await?;
+    let got = s.get("ds9", trigger).await?.expect("DS9: record present");
+    assert_eq!(
+        got.outputs[0].payload["text"],
+        serde_json::json!("ab"),
+        "DS9: NUL stripped from payload string"
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// EventIdRegistry conformance (ER1–ER4)
+// ─────────────────────────────────────────────────────────────────────
+
+use causal::event_id_registry::{
+    classify_batch, BatchPresence, EventIdEntry, EventIdRegistry,
+};
+
+fn id_entry(pos: u64) -> EventIdEntry {
+    EventIdEntry {
+        event_id: Uuid::new_v4(),
+        stream_position: causal::types::LogCursor::from_raw(pos),
+        stream_revision: causal::types::StreamRevision::from_raw(pos),
+    }
+}
+
+/// ER1: an unregistered batch classifies Absent.
+pub async fn event_id_registry_absent_batch<R: EventIdRegistry>(r: &R) -> Result<()> {
+    let e = id_entry(1);
+    assert_eq!(
+        classify_batch(r, &[e.event_id]).await?,
+        BatchPresence::Absent,
+        "ER1: unregistered batch is Absent",
+    );
+    Ok(())
+}
+
+/// ER2: after register, the same batch classifies Redelivery with the stored
+/// coordinates — the property that makes a deep redelivery recognizable.
+pub async fn event_id_registry_redelivery_after_register<R: EventIdRegistry>(
+    r: &R,
+) -> Result<()> {
+    let e = id_entry(42);
+    r.register(&[e]).await?;
+    assert_eq!(
+        classify_batch(r, &[e.event_id]).await?,
+        BatchPresence::Redelivery { last: e },
+        "ER2: registered batch is a Redelivery carrying its coordinates",
+    );
+    Ok(())
+}
+
+/// ER3: a batch where only some ids are registered is a PartialOverlap.
+pub async fn event_id_registry_partial_overlap<R: EventIdRegistry>(r: &R) -> Result<()> {
+    let a = id_entry(1);
+    let b = id_entry(2);
+    r.register(&[a]).await?;
+    assert_eq!(
+        classify_batch(r, &[a.event_id, b.event_id]).await?,
+        BatchPresence::PartialOverlap,
+        "ER3: mixed present/absent batch is a PartialOverlap",
+    );
+    Ok(())
+}
+
+/// ER4: register is first-write-wins — re-registering an id keeps the
+/// original coordinates.
+pub async fn event_id_registry_register_first_write_wins<R: EventIdRegistry>(
+    r: &R,
+) -> Result<()> {
+    let id = Uuid::new_v4();
+    let first = EventIdEntry {
+        event_id: id,
+        stream_position: causal::types::LogCursor::from_raw(10),
+        stream_revision: causal::types::StreamRevision::from_raw(0),
+    };
+    let second = EventIdEntry {
+        stream_position: causal::types::LogCursor::from_raw(999),
+        ..first
+    };
+    r.register(&[first]).await?;
+    r.register(&[second]).await?;
+    let got = r.lookup(&[id]).await?[0].expect("ER4: id present");
+    assert_eq!(
+        got.stream_position,
+        causal::types::LogCursor::from_raw(10),
+        "ER4: first write wins",
+    );
+    Ok(())
+}
+
+/// DS10: retention GC reclaims a record only when it is BOTH aged past the
+/// cutoff AND floor-passed (A1's age + floor-minimum bound). Three records
+/// exercise the corners.
+pub async fn decision_store_retention_gc_by_age<S: DecisionStore>(s: &S) -> Result<()> {
+    use causal::types::LogCursor;
+    use chrono::Duration;
+    let now = Utc::now();
+    let aged_and_passed = Uuid::new_v4(); // aged + below floor  → reclaimed
+    let fresh = Uuid::new_v4(); //           below floor but new → kept (age)
+    let aged_unpassed = Uuid::new_v4(); //   aged but above floor→ kept (floor)
+
+    s.seal(DecisionRecord::new(
+        "ds10", aged_and_passed, LogCursor::from_raw(5), vec![], now - Duration::days(10),
+    )).await?;
+    s.seal(DecisionRecord::new(
+        "ds10", fresh, LogCursor::from_raw(5), vec![], now,
+    )).await?;
+    s.seal(DecisionRecord::new(
+        "ds10", aged_unpassed, LogCursor::from_raw(100), vec![], now - Duration::days(10),
+    )).await?;
+
+    // Floor at position 10: has passed positions <= 10, not 100.
+    let removed = s
+        .remove_reclaimable("ds10", now - Duration::days(1), LogCursor::from_raw(10))
+        .await?;
+    assert_eq!(removed, 1, "DS10: exactly the aged, floor-passed record is reclaimed");
+    assert!(
+        s.get("ds10", aged_and_passed).await?.is_none(),
+        "DS10: aged AND floor-passed record removed",
+    );
+    assert!(
+        s.get("ds10", fresh).await?.is_some(),
+        "DS10: record newer than the retention cutoff survives (age bound)",
+    );
+    assert!(
+        s.get("ds10", aged_unpassed).await?.is_some(),
+        "DS10: aged record whose trigger the floor has NOT passed survives \
+         (floor-minimum bound — still redeliverable)",
+    );
+    Ok(())
+}
