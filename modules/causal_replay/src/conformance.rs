@@ -1514,7 +1514,7 @@ pub async fn decision_store_seal_then_get_round_trips<S: DecisionStore>(s: &S) -
         decision_output("Out", serde_json::json!({"n": 2})),
     ];
     let sealed = s
-        .seal(DecisionRecord::new("ds2", trigger, outputs.clone(), Utc::now()))
+        .seal(DecisionRecord::new("ds2", trigger, LogCursor::ZERO, outputs.clone(), Utc::now()))
         .await?;
     assert_eq!(sealed.outputs.len(), 2, "DS2: seal returns the full batch");
 
@@ -1538,6 +1538,7 @@ pub async fn decision_store_seal_is_first_write_wins<S: DecisionStore>(s: &S) ->
     let first = DecisionRecord::new(
         "ds3",
         trigger,
+        LogCursor::ZERO,
         vec![decision_output("Out", serde_json::json!("first"))],
         Utc::now(),
     );
@@ -1547,6 +1548,7 @@ pub async fn decision_store_seal_is_first_write_wins<S: DecisionStore>(s: &S) ->
     let second = DecisionRecord::new(
         "ds3",
         trigger,
+        LogCursor::ZERO,
         vec![decision_output("Out", serde_json::json!("second"))],
         Utc::now(),
     );
@@ -1569,7 +1571,7 @@ pub async fn decision_store_seal_is_first_write_wins<S: DecisionStore>(s: &S) ->
 /// (distinguishing "processed, decided nothing" from "never ran").
 pub async fn decision_store_empty_record_is_present<S: DecisionStore>(s: &S) -> Result<()> {
     let trigger = Uuid::new_v4();
-    let sealed = s.seal(DecisionRecord::new("ds4", trigger, vec![], Utc::now())).await?;
+    let sealed = s.seal(DecisionRecord::new("ds4", trigger, LogCursor::ZERO, vec![], Utc::now())).await?;
     assert!(sealed.outputs.is_empty(), "DS4: sealed empty batch stays empty");
     let got = s.get("ds4", trigger).await?;
     assert!(got.is_some(), "DS4: empty record is present, not absent");
@@ -1580,7 +1582,7 @@ pub async fn decision_store_empty_record_is_present<S: DecisionStore>(s: &S) -> 
 /// DS5: `remove` makes a record absent.
 pub async fn decision_store_remove_makes_record_absent<S: DecisionStore>(s: &S) -> Result<()> {
     let trigger = Uuid::new_v4();
-    s.seal(DecisionRecord::new("ds5", trigger, vec![], Utc::now())).await?;
+    s.seal(DecisionRecord::new("ds5", trigger, LogCursor::ZERO, vec![], Utc::now())).await?;
     s.remove("ds5", trigger).await?;
     assert!(s.get("ds5", trigger).await?.is_none(), "DS5: absent after remove");
     Ok(())
@@ -1597,7 +1599,7 @@ pub async fn decision_store_remove_is_idempotent<S: DecisionStore>(s: &S) -> Res
 /// DS7: records are isolated by `consumer`.
 pub async fn decision_store_isolated_by_consumer<S: DecisionStore>(s: &S) -> Result<()> {
     let trigger = Uuid::new_v4();
-    s.seal(DecisionRecord::new("ds7-a", trigger, vec![], Utc::now())).await?;
+    s.seal(DecisionRecord::new("ds7-a", trigger, LogCursor::ZERO, vec![], Utc::now())).await?;
     assert!(
         s.get("ds7-b", trigger).await?.is_none(),
         "DS7: consumer-b must not see consumer-a's record"
@@ -1609,7 +1611,7 @@ pub async fn decision_store_isolated_by_consumer<S: DecisionStore>(s: &S) -> Res
 pub async fn decision_store_isolated_by_trigger<S: DecisionStore>(s: &S) -> Result<()> {
     let t1 = Uuid::new_v4();
     let t2 = Uuid::new_v4();
-    s.seal(DecisionRecord::new("ds8", t1, vec![], Utc::now())).await?;
+    s.seal(DecisionRecord::new("ds8", t1, LogCursor::ZERO, vec![], Utc::now())).await?;
     assert!(
         s.get("ds8", t2).await?.is_none(),
         "DS8: a different trigger has its own slot"
@@ -1623,7 +1625,7 @@ pub async fn decision_store_isolated_by_trigger<S: DecisionStore>(s: &S) -> Resu
 pub async fn decision_store_strips_nul_bytes<S: DecisionStore>(s: &S) -> Result<()> {
     let trigger = Uuid::new_v4();
     let dirty = decision_output("Out", serde_json::json!({"text": "a\u{0}b"}));
-    s.seal(DecisionRecord::new("ds9", trigger, vec![dirty], Utc::now())).await?;
+    s.seal(DecisionRecord::new("ds9", trigger, LogCursor::ZERO, vec![dirty], Utc::now())).await?;
     let got = s.get("ds9", trigger).await?.expect("DS9: record present");
     assert_eq!(
         got.outputs[0].payload["text"],
@@ -1714,27 +1716,44 @@ pub async fn event_id_registry_register_first_write_wins<R: EventIdRegistry>(
     Ok(())
 }
 
-/// DS10: retention GC removes records sealed before the cutoff and leaves
-/// newer ones (age-driven, A1).
+/// DS10: retention GC reclaims a record only when it is BOTH aged past the
+/// cutoff AND floor-passed (A1's age + floor-minimum bound). Three records
+/// exercise the corners.
 pub async fn decision_store_retention_gc_by_age<S: DecisionStore>(s: &S) -> Result<()> {
+    use causal::types::LogCursor;
     use chrono::Duration;
     let now = Utc::now();
-    let old_trigger = Uuid::new_v4();
-    let new_trigger = Uuid::new_v4();
-    // An old record (sealed 10 days ago) and a fresh one (sealed now).
-    s.seal(DecisionRecord::new("ds10", old_trigger, vec![], now - Duration::days(10)))
-        .await?;
-    s.seal(DecisionRecord::new("ds10", new_trigger, vec![], now)).await?;
+    let aged_and_passed = Uuid::new_v4(); // aged + below floor  → reclaimed
+    let fresh = Uuid::new_v4(); //           below floor but new → kept (age)
+    let aged_unpassed = Uuid::new_v4(); //   aged but above floor→ kept (floor)
 
-    let removed = s.remove_sealed_before(now - Duration::days(1)).await?;
-    assert!(removed >= 1, "DS10: at least the aged record was swept");
+    s.seal(DecisionRecord::new(
+        "ds10", aged_and_passed, LogCursor::from_raw(5), vec![], now - Duration::days(10),
+    )).await?;
+    s.seal(DecisionRecord::new(
+        "ds10", fresh, LogCursor::from_raw(5), vec![], now,
+    )).await?;
+    s.seal(DecisionRecord::new(
+        "ds10", aged_unpassed, LogCursor::from_raw(100), vec![], now - Duration::days(10),
+    )).await?;
+
+    // Floor at position 10: has passed positions <= 10, not 100.
+    let removed = s
+        .remove_reclaimable("ds10", now - Duration::days(1), LogCursor::from_raw(10))
+        .await?;
+    assert_eq!(removed, 1, "DS10: exactly the aged, floor-passed record is reclaimed");
     assert!(
-        s.get("ds10", old_trigger).await?.is_none(),
-        "DS10: aged record removed",
+        s.get("ds10", aged_and_passed).await?.is_none(),
+        "DS10: aged AND floor-passed record removed",
     );
     assert!(
-        s.get("ds10", new_trigger).await?.is_some(),
-        "DS10: record newer than the cutoff survives",
+        s.get("ds10", fresh).await?.is_some(),
+        "DS10: record newer than the retention cutoff survives (age bound)",
+    );
+    assert!(
+        s.get("ds10", aged_unpassed).await?.is_some(),
+        "DS10: aged record whose trigger the floor has NOT passed survives \
+         (floor-minimum bound — still redeliverable)",
     );
     Ok(())
 }

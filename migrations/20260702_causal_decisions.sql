@@ -9,6 +9,9 @@
 CREATE TABLE IF NOT EXISTS causal_decisions (
     consumer          TEXT        NOT NULL,
     trigger_event_id  UUID        NOT NULL,
+    -- Trigger's log position; retention GC never removes a record whose
+    -- position the consumer's ack-floor has not yet passed (A1 floor-min).
+    trigger_position  BIGINT      NOT NULL,
     outputs           JSONB       NOT NULL,
     sealed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (consumer, trigger_event_id)

@@ -1923,15 +1923,23 @@ impl Engine {
             handles.push(task);
         }
 
-        // Retention GC (A1): an age-driven background sweep of decision
-        // records. Age-driven, never floor-driven — a floor-based sweep would
-        // let a zombie lease-holder re-seal a just-GC'd decision and
-        // resurrect the chimera. Spawned only when a decision store is wired
-        // and reactors exist (nothing else seals). Best-effort: a failed
-        // sweep just retries next tick; records are bounded by the window.
+        // Retention GC (A1): a background sweep of decision records that
+        // reclaims a record only when it is BOTH aged past the retention
+        // window AND its trigger's ack-floor has passed (no redelivery
+        // expected). Age bounds the zombie-reseal window; the floor-minimum
+        // bound ensures a still-redeliverable record is never dropped — age
+        // alone would let a lost ack / short window / wedged partition delete
+        // a record while a redelivery could still re-decide, reopening the
+        // chimera. Per-consumer floors come from `checkpoint`; in the common
+        // setup it is the same store the reactor ack-floor is written to, and
+        // when it is not, a missing floor is treated conservatively (skip,
+        // never reclaim). Spawned only with a decision store + reactors.
         if let Some(store) = decision_store {
             if !consumers.is_empty() {
                 let clock = clock.clone();
+                let floor_source = checkpoint.clone();
+                let consumer_ids: Vec<String> =
+                    consumers.iter().map(|c| c.consumer_id().to_string()).collect();
                 let mut rx = shutdown_tx.subscribe();
                 // Sweep ~10× per retention window, clamped to a sane cadence.
                 let interval = (decision_retention / 10).clamp(
@@ -1945,17 +1953,42 @@ impl Engine {
                         tokio::select! {
                             _ = rx.recv() => break,
                             _ = tokio::time::sleep(interval) => {
-                                let cutoff = clock.now() - window;
-                                match store.remove_sealed_before(cutoff).await {
-                                    Ok(n) if n > 0 => tracing::debug!(
-                                        removed = n,
-                                        "decision-record retention GC swept aged records",
-                                    ),
-                                    Ok(_) => {}
-                                    Err(e) => tracing::warn!(
-                                        error = %e,
-                                        "decision-record retention GC failed; retrying next sweep",
-                                    ),
+                                let aged_before = clock.now() - window;
+                                let mut total = 0u64;
+                                for consumer in &consumer_ids {
+                                    let floor = match floor_source.get(consumer).await {
+                                        // Floor-minimum bound: only reclaim
+                                        // records the ack-floor has passed.
+                                        Ok(Some(f)) => f,
+                                        // Nothing acked (or floor not visible
+                                        // here) → nothing reclaimable. Safe.
+                                        Ok(None) => continue,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                consumer = %consumer, error = %e,
+                                                "decision GC: floor lookup failed; skipping",
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    match store
+                                        .remove_reclaimable(consumer, aged_before, floor)
+                                        .await
+                                    {
+                                        Ok(n) => total += n,
+                                        Err(e) => tracing::warn!(
+                                            consumer = %consumer, error = %e,
+                                            "decision-record retention GC failed; \
+                                             retrying next sweep",
+                                        ),
+                                    }
+                                }
+                                if total > 0 {
+                                    tracing::debug!(
+                                        removed = total,
+                                        "decision-record retention GC swept aged, \
+                                         floor-passed records",
+                                    );
                                 }
                             }
                         }

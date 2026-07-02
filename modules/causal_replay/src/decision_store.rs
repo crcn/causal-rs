@@ -35,6 +35,7 @@ mod pg {
     use sqlx::PgPool;
     use uuid::Uuid;
 
+    use causal::types::LogCursor;
     use causal::{DecisionRecord, DecisionStore};
 
     /// Postgres-backed [`DecisionStore`].
@@ -71,9 +72,9 @@ mod pg {
             &self,
             consumer: &str,
             trigger_event_id: Uuid,
-        ) -> Result<Option<(serde_json::Value, DateTime<Utc>)>> {
-            let row: Option<(serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
-                "SELECT outputs, sealed_at FROM causal_decisions \
+        ) -> Result<Option<(serde_json::Value, DateTime<Utc>, i64)>> {
+            let row: Option<(serde_json::Value, DateTime<Utc>, i64)> = sqlx::query_as(
+                "SELECT outputs, sealed_at, trigger_position FROM causal_decisions \
                  WHERE consumer = $1 AND trigger_event_id = $2",
             )
             .bind(consumer)
@@ -92,22 +93,23 @@ mod pg {
             // Atomic first-write-wins via CTE: INSERT wins → RETURNING our
             // row; conflict → UNION ALL SELECT the winner's. `sealed_at` is
             // read back so the returned record reflects the canonical row.
-            let row: Option<(serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+            let row: Option<(serde_json::Value, DateTime<Utc>, i64)> = sqlx::query_as(
                 "WITH ins AS ( \
                      INSERT INTO causal_decisions \
-                         (consumer, trigger_event_id, outputs, sealed_at) \
-                     VALUES ($1, $2, $3, $4) \
+                         (consumer, trigger_event_id, trigger_position, outputs, sealed_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
                      ON CONFLICT (consumer, trigger_event_id) DO NOTHING \
-                     RETURNING outputs, sealed_at \
+                     RETURNING outputs, sealed_at, trigger_position \
                  ) \
-                 SELECT outputs, sealed_at FROM ins \
+                 SELECT outputs, sealed_at, trigger_position FROM ins \
                  UNION ALL \
-                 SELECT outputs, sealed_at FROM causal_decisions \
+                 SELECT outputs, sealed_at, trigger_position FROM causal_decisions \
                  WHERE consumer = $1 AND trigger_event_id = $2 \
                  LIMIT 1",
             )
             .bind(&rec.consumer)
             .bind(rec.trigger_event_id)
+            .bind(rec.trigger_position.raw() as i64)
             .bind(&outputs)
             .bind(rec.sealed_at)
             .fetch_optional(&self.pool)
@@ -116,7 +118,7 @@ mod pg {
             // Zero-row race (A4b): our insert did nothing and the winner's
             // row is not yet visible. Retry the plain SELECT until the
             // committed winner appears.
-            let (canonical_outputs, sealed_at) = match row {
+            let (canonical_outputs, sealed_at, position) = match row {
                 Some(r) => r,
                 None => {
                     let mut found = None;
@@ -143,6 +145,7 @@ mod pg {
             Ok(DecisionRecord {
                 consumer: rec.consumer,
                 trigger_event_id: rec.trigger_event_id,
+                trigger_position: LogCursor::from_raw(position as u64),
                 outputs: DecisionRecord::outputs_from_json(canonical_outputs)?,
                 sealed_at,
             })
@@ -154,9 +157,10 @@ mod pg {
             trigger_event_id: Uuid,
         ) -> Result<Option<DecisionRecord>> {
             match self.fetch(consumer, trigger_event_id).await? {
-                Some((outputs, sealed_at)) => Ok(Some(DecisionRecord {
+                Some((outputs, sealed_at, position)) => Ok(Some(DecisionRecord {
                     consumer: consumer.to_string(),
                     trigger_event_id,
+                    trigger_position: LogCursor::from_raw(position as u64),
                     outputs: DecisionRecord::outputs_from_json(outputs)?,
                     sealed_at,
                 })),
@@ -176,14 +180,24 @@ mod pg {
             Ok(())
         }
 
-        /// Age-driven retention GC (A1) — never keyed to the ack-floor, which
-        /// carries no fencing token and would let a zombie holder re-seal a
-        /// GC'd decision. Uses the `sealed_at` index.
-        async fn remove_sealed_before(&self, cutoff: DateTime<Utc>) -> Result<u64> {
-            let res = sqlx::query("DELETE FROM causal_decisions WHERE sealed_at < $1")
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await?;
+        /// Retention GC honoring A1's age AND floor-minimum bound: reclaim a
+        /// record only when it is aged past `aged_before` AND its
+        /// `trigger_position` is at or below the consumer's ack-`floor`.
+        async fn remove_reclaimable(
+            &self,
+            consumer: &str,
+            aged_before: DateTime<Utc>,
+            floor: LogCursor,
+        ) -> Result<u64> {
+            let res = sqlx::query(
+                "DELETE FROM causal_decisions \
+                 WHERE consumer = $1 AND sealed_at < $2 AND trigger_position <= $3",
+            )
+            .bind(consumer)
+            .bind(aged_before)
+            .bind(floor.raw() as i64)
+            .execute(&self.pool)
+            .await?;
             Ok(res.rows_affected())
         }
 

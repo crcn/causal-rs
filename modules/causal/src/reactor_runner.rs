@@ -1401,6 +1401,7 @@ where
                 let rec = crate::decision_store::DecisionRecord::new(
                     self.consumer_id.clone(),
                     event.event_id,
+                    event.position,
                     outputs,
                     self.clock.now(),
                 );
@@ -4291,7 +4292,7 @@ mod tests {
             ephemeral: None,
             persistent: true,
         };
-        ds.seal(DecisionRecord::new("r.race", trigger_id, vec![sealed_out], Utc::now()))
+        ds.seal(DecisionRecord::new("r.race", trigger_id, LogCursor::ZERO, vec![sealed_out], Utc::now()))
             .await.unwrap();
 
         // This reactor would emit nonce 0 — but its body must never run.
@@ -4406,7 +4407,7 @@ mod tests {
                 persistent: true,
             }
         };
-        ds.seal(DecisionRecord::new("r.integ", trigger_id, vec![record_out], Utc::now()))
+        ds.seal(DecisionRecord::new("r.integ", trigger_id, LogCursor::ZERO, vec![record_out], Utc::now()))
             .await.unwrap();
 
         let obs = Arc::new(CountingObserver::default());
