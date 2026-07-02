@@ -343,6 +343,7 @@ async fn builder_threads_leasor_to_projector_and_reactor() -> Result<()> {
     .with_projector(PingProjector(Arc::new(AtomicUsize::new(0))))
     .with_reactor(Counter(Arc::new(AtomicUsize::new(0))))
     .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
     .with_consumer_leasor(leasor as Arc<dyn ConsumerLeasor>)
     .build()
     .await?;

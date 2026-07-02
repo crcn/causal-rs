@@ -309,6 +309,12 @@ struct Core<R: Reactor> {
     /// `ctx.effect_store()` so side-effecting reactors memoize their
     /// external call under the reaction key — safe under retry/redelivery.
     effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
+    /// Durable decision store. One decision per `(consumer, trigger)` — the
+    /// whole output batch — is sealed on first delivery and replayed on
+    /// redelivery instead of re-running the body. `None` = legacy behavior
+    /// (re-decide on redelivery; only reachable in tests, since `build()`
+    /// gates a durable store for production reactors).
+    decision_store: Option<Arc<dyn crate::decision_store::DecisionStore>>,
     /// Engine-level aggregator registry. Reactor outputs are folded into
     /// it after they're appended, so `engine.state_of::<A>(id)` reflects
     /// reactor-emitted events (not just caller-emitted ones).
@@ -399,6 +405,7 @@ where
                 retry_policy,
                 observer: None,
                 effect_store: None,
+                decision_store: None,
                 engine_aggregators: None,
                 settle_tracker: None,
                 snapshot_store: None,
@@ -477,6 +484,16 @@ where
         cache: Arc<dyn crate::effect_store::EffectStore>,
     ) -> Self {
         self.core_mut().effect_store = Some(cache);
+        self
+    }
+
+    /// Attach the durable decision store. The runner seals one decision per
+    /// trigger and replays it on redelivery instead of re-running the body.
+    pub fn with_decision_store(
+        mut self,
+        store: Arc<dyn crate::decision_store::DecisionStore>,
+    ) -> Self {
+        self.core_mut().decision_store = Some(store);
         self
     }
 

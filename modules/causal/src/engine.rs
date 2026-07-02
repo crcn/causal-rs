@@ -741,6 +741,10 @@ pub(crate) struct ConsumerWiring {
     pub causation_depth_ceiling: Option<u32>,
     pub observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     pub effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
+    /// Durable decision store, plumbed into every reactor runner (same
+    /// ordering rule as `effect_store`). Reactors seal one decision per
+    /// trigger and replay it on redelivery.
+    pub decision_store: Option<Arc<dyn crate::decision_store::DecisionStore>>,
     pub workflow_hw: WorkflowHighWater,
     pub snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
     pub snapshot_every: u64,
@@ -790,6 +794,10 @@ pub struct EngineBuilder {
     /// registered *after* this is set (same ordering rule as `observer`),
     /// surfaced to reactor bodies via `ctx.effect_store()`.
     effect_store:        Option<Arc<dyn crate::effect_store::EffectStore>>,
+    /// Durable decision store (Phase 5). Plumbed into every reactor runner
+    /// registered *after* this is set. Reactors seal one decision per
+    /// trigger and replay it on redelivery instead of re-running the body.
+    decision_store:      Option<Arc<dyn crate::decision_store::DecisionStore>>,
     /// Per-workflow high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
@@ -824,6 +832,14 @@ pub struct EngineBuilder {
     /// reactors-without-a-durable-store in production while keeping
     /// tests/prototypes ergonomic.
     allow_in_memory_effect_store: bool,
+    /// `true` when the caller explicitly called
+    /// [`with_decision_store`](Self::with_decision_store).
+    explicit_decision_store: bool,
+    /// `true` when the caller accepted the in-memory decision store via
+    /// [`allow_in_memory_decision_store_for_tests`](Self::allow_in_memory_decision_store_for_tests)
+    /// (or implicitly via [`memory`](Self::memory) /
+    /// [`in_memory_for_tests`](Self::in_memory_for_tests)).
+    allow_in_memory_decision_store: bool,
     /// Optional exclusive-lease provider, applied to EVERY consumer
     /// (reactors, projectors, multi-projectors) at build time. Each
     /// consumer acquires `leasor.acquire(consumer_id)` before its first
@@ -853,8 +869,41 @@ impl EngineBuilder {
             store        as Arc<dyn crate::checkpoint_store::ReactorCheckpoint>,
         )
         // memory() is the test/prototype constructor — accept the in-memory
-        // effect store so `build()` doesn't require an explicit opt-in here.
+        // effect + decision stores so `build()` doesn't require an explicit
+        // opt-in here.
         .allow_in_memory_effect_store_for_tests()
+        .allow_in_memory_decision_store_for_tests()
+    }
+
+    /// Wire a single [`MemoryStore`](crate::MemoryStore) into *every* durable
+    /// slot at once — event log, checkpoint, reactor checkpoint, snapshot
+    /// store, and observer — and accept the in-memory effect and decision
+    /// stores. The one-call test/prototype harness (D1).
+    ///
+    /// Prefer this over [`memory`](Self::memory) when a test also wants
+    /// aggregate snapshots or the in-memory inspector read model: it
+    /// satisfies both `allow_in_memory_*_for_tests` gates and saves the
+    /// recital of wiring each optional store by hand.
+    ///
+    /// ```no_run
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let engine = causal::EngineBuilder::in_memory_for_tests()
+    ///     .build()
+    ///     .await
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub fn in_memory_for_tests() -> Self {
+        let store = Arc::new(crate::memory_store::MemoryStore::new());
+        Self::new(
+            store.clone() as Arc<dyn crate::event_log::EventLogBackend>,
+            store.clone() as Arc<dyn crate::checkpoint_store::CheckpointStore>,
+            store.clone() as Arc<dyn crate::checkpoint_store::ReactorCheckpoint>,
+        )
+        .with_snapshot_store(store.clone() as Arc<dyn crate::snapshot_store::SnapshotStore>)
+        .with_observer(store as Arc<dyn crate::reactor_observer::ReactorObserver>)
+        .allow_in_memory_effect_store_for_tests()
+        .allow_in_memory_decision_store_for_tests()
     }
 
     /// `checkpoint` stores projector/reactor cursors; `reactor_checkpoint`
@@ -882,6 +931,9 @@ impl EngineBuilder {
             observer: None,
             effect_store: Some(Arc::new(crate::effect_store::InMemoryEffectStore::new())),
             explicit_effect_store: false,
+            decision_store: Some(Arc::new(crate::decision_store::InMemoryDecisionStore::new())),
+            explicit_decision_store: false,
+            allow_in_memory_decision_store: false,
             workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
@@ -906,6 +958,36 @@ impl EngineBuilder {
     /// automatically.
     pub fn allow_in_memory_effect_store_for_tests(mut self) -> Self {
         self.allow_in_memory_effect_store = true;
+        self
+    }
+
+    /// Attach a durable [`DecisionStore`](crate::decision_store::DecisionStore).
+    ///
+    /// A reactor seals one decision per trigger — the whole output batch —
+    /// and replays it on redelivery instead of re-running the body. Only a
+    /// *durable* store makes that survive a crash/redeploy; the in-memory
+    /// default loses every decision on restart, which reopens the chimera
+    /// hazard the store exists to close. Call this in production.
+    pub fn with_decision_store(
+        mut self,
+        store: Arc<dyn crate::decision_store::DecisionStore>,
+    ) -> Self {
+        self.decision_store = Some(store);
+        self.explicit_decision_store = true;
+        self
+    }
+
+    /// Accept the in-memory
+    /// [`InMemoryDecisionStore`](crate::decision_store::InMemoryDecisionStore)
+    /// explicitly, suppressing the `build()` error that otherwise fires when
+    /// reactors are registered without a durable decision store.
+    ///
+    /// For tests and prototypes only: in-memory decisions are lost on
+    /// restart. [`memory`](Self::memory) and
+    /// [`in_memory_for_tests`](Self::in_memory_for_tests) set this
+    /// automatically.
+    pub fn allow_in_memory_decision_store_for_tests(mut self) -> Self {
+        self.allow_in_memory_decision_store = true;
         self
     }
 
@@ -1213,6 +1295,7 @@ impl EngineBuilder {
             }
             if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
             if let Some(rc) = w.effect_store { runner = runner.with_effect_store(rc); }
+            if let Some(ds) = w.decision_store { runner = runner.with_decision_store(ds); }
             runner = runner.with_engine_aggregators(w.engine_aggs);
             runner = runner.with_settle_tracker(w.workflow_hw);
             runner = runner.with_snapshot_persistence(w.snapshot_store, w.snapshot_every);
@@ -1370,6 +1453,31 @@ impl EngineBuilder {
             );
         }
 
+        // Same "No Lying Defaults" gate for the decision store: reactors
+        // seal one decision per trigger and replay it on redelivery. The
+        // in-memory default loses every decision on restart, so a crash
+        // between seal and cursor-advance would re-decide — reopening the
+        // chimera hazard the store exists to close. Refuse to build unless
+        // a durable store is wired or the in-memory one is explicitly
+        // accepted.
+        if !self.reactor_seeds.is_empty()
+            && !self.explicit_decision_store
+            && !self.allow_in_memory_decision_store
+        {
+            anyhow::bail!(
+                "EngineBuilder::build: {} reactor(s) registered but no durable \
+                 DecisionStore is configured. The default InMemoryDecisionStore loses \
+                 every sealed decision on restart, so a redelivery after a crash or \
+                 redeploy re-runs the reactor body — reopening the chimera-log hazard \
+                 decision records exist to close. Fix by either:\n  \
+                 - .with_decision_store(<durable backend>), or\n  \
+                 - .allow_in_memory_decision_store_for_tests() to accept the \
+                 in-memory store explicitly.\n\
+                 (EngineBuilder::memory() / in_memory_for_tests() opt in automatically.)",
+                self.reactor_seeds.len(),
+            );
+        }
+
         // Reject categories that can't participate in the
         // `{category}:{name}` format before anything runs — a colon in a
         // category silently desyncs reactor matching from aggregate
@@ -1492,6 +1600,7 @@ impl EngineBuilder {
                     causation_depth_ceiling: self.causation_depth_ceiling,
                     observer: self.observer.clone(),
                     effect_store: self.effect_store.clone(),
+                    decision_store: self.decision_store.clone(),
                     workflow_hw: self.workflow_hw.clone(),
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_every: self.snapshot_every,
@@ -3156,6 +3265,7 @@ mod tests {
         let store = store();
         builder_with_reactor(&store)
             .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
             .build()
             .await
             .expect("explicit in-memory opt-in must build");
@@ -3180,9 +3290,55 @@ mod tests {
             Arc::new(crate::effect_store::InMemoryEffectStore::new());
         builder_with_reactor(&store)
             .with_effect_store(durable)
+            .allow_in_memory_decision_store_for_tests()
             .build()
             .await
             .expect("an explicit effect store must build");
+    }
+
+    /// `build()` REJECTS reactors registered without a durable decision
+    /// store and no explicit opt-in — the chimera hazard is a hard build
+    /// error, not a silent in-memory default.
+    #[tokio::test]
+    async fn engine_with_reactors_and_no_decision_store_refuses_to_build() {
+        let store = store();
+        let err = match builder_with_reactor(&store)
+            // Satisfy the effect gate so the decision gate is what fires.
+            .allow_in_memory_effect_store_for_tests()
+            .build()
+            .await
+        {
+            Ok(_) => panic!("reactors + in-memory decision store must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("DecisionStore"),
+            "error should name the missing durable DecisionStore (got: {err:#})",
+        );
+    }
+
+    /// A durable decision store satisfies the gate without the test opt-in.
+    #[tokio::test]
+    async fn build_allows_reactor_with_durable_decision_store() {
+        let store = store();
+        let durable: Arc<dyn crate::decision_store::DecisionStore> =
+            Arc::new(crate::decision_store::InMemoryDecisionStore::new());
+        builder_with_reactor(&store)
+            .allow_in_memory_effect_store_for_tests()
+            .with_decision_store(durable)
+            .build()
+            .await
+            .expect("an explicit decision store must build");
+    }
+
+    /// `in_memory_for_tests()` opts in to both stores automatically.
+    #[tokio::test]
+    async fn in_memory_for_tests_builder_auto_allows_both_stores() {
+        EngineBuilder::in_memory_for_tests()
+            .with_reactor(WelcomeReactor)
+            .build()
+            .await
+            .expect("in_memory_for_tests() must auto-allow effect + decision stores");
     }
 
     /// No reactors → the gate does not fire (effect store is irrelevant).
@@ -3422,6 +3578,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .with_reactor_start(WelcomeReactor, StartPosition::Specific(ahead))
         .build()
         .await
@@ -3667,6 +3824,7 @@ mod tests {
         )
         .with_reactor(CountingReactor)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         // A new trigger fires exactly once.
@@ -3750,6 +3908,7 @@ mod tests {
         )
         .with_reactor_start(CountingReactorZero, crate::projection::StartPosition::Zero)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
@@ -3831,6 +3990,7 @@ mod tests {
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter))
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated {
@@ -3898,6 +4058,7 @@ mod tests {
         ])
         .with_reactor(WelcomeReactor)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
@@ -4525,6 +4686,7 @@ mod tests {
         .with_max_attempts(1)
         .with_reactor(EmitsIntoOcc)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine.emit(UserCreated { user_id: Uuid::new_v4(), occurred_at: Utc::now() })
@@ -4792,6 +4954,7 @@ mod tests {
             store.clone() as Arc<dyn ReactorCheckpoint>,
         )
         .with_effect_store(cache.clone() as Arc<dyn EffectStore>)
+        .allow_in_memory_decision_store_for_tests()
         .with_reactor(CachedSideEffect {
             external_calls: external_calls.clone(),
             attempts: attempts.clone(),
@@ -4866,6 +5029,7 @@ mod tests {
         )
         .with_reactor(EffectReactor { calls: calls.clone() })
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         engine
@@ -5464,6 +5628,7 @@ mod tests {
         .with_max_attempts(2)
         .with_reactor(AlwaysFails)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
@@ -5541,6 +5706,7 @@ mod tests {
         .with_reactor(WelcomeReactor)
         .with_projector(WelcomeCounter(counter_c))
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let result = engine.emit(UserCreated {
@@ -5606,6 +5772,7 @@ mod tests {
             )
             .with_reactor(WelcomeReactor)
             .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
             .build()
             .await
             .unwrap(),
@@ -5763,6 +5930,7 @@ mod tests {
         .with_aggregators([Aggregator::for_type::<UserAgg, UserCreated>()])
         .with_reactor(EchoReactor { calls: calls.clone() })
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         let user_id = Uuid::new_v4();
@@ -6117,6 +6285,7 @@ mod tests {
         .with_aggregators(vec![tick_aggregator()])
         .with_reactor(cap)
         .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
         .build().await.unwrap();
 
         for i in 0..3 {

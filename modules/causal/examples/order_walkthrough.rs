@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     ])
     .with_reactor(ShipOnPlaced)
     .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
     .build() // async + fallible: seeds reactor cursors
     .await?;
 

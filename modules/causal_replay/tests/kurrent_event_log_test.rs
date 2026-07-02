@@ -373,6 +373,7 @@ async fn reactor_output_lands_in_its_own_stream_not_global() {
     )
     .with_reactor(DoFetch)
     .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
     .build().await.unwrap();
 
     let id = Uuid::new_v4();
