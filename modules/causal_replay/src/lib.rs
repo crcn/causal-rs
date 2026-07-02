@@ -63,6 +63,7 @@ pub mod conformance;
 pub mod consumer_lease;
 pub mod decision_store;
 pub mod effect_store;
+pub mod event_id_registry;
 pub mod event_log;
 pub mod kurrent_event_log;
 pub mod event_projector;
@@ -110,6 +111,10 @@ pub use effect_store::PgEffectStore;
 pub use decision_store::DECISION_SCHEMA_SQL;
 #[cfg(feature = "postgres")]
 pub use decision_store::PgDecisionStore;
+
+pub use event_id_registry::EVENT_ID_REGISTRY_SCHEMA_SQL;
+#[cfg(feature = "postgres")]
+pub use event_id_registry::PgEventIdRegistry;
 
 #[cfg(feature = "postgres")]
 pub use consumer_lease::PgConsumerLeasor;

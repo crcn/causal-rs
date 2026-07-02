@@ -1633,6 +1633,87 @@ pub async fn decision_store_strips_nul_bytes<S: DecisionStore>(s: &S) -> Result<
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// EventIdRegistry conformance (ER1–ER4)
+// ─────────────────────────────────────────────────────────────────────
+
+use causal::event_id_registry::{
+    classify_batch, BatchPresence, EventIdEntry, EventIdRegistry,
+};
+
+fn id_entry(pos: u64) -> EventIdEntry {
+    EventIdEntry {
+        event_id: Uuid::new_v4(),
+        stream_position: causal::types::LogCursor::from_raw(pos),
+        stream_revision: causal::types::StreamRevision::from_raw(pos),
+    }
+}
+
+/// ER1: an unregistered batch classifies Absent.
+pub async fn event_id_registry_absent_batch<R: EventIdRegistry>(r: &R) -> Result<()> {
+    let e = id_entry(1);
+    assert_eq!(
+        classify_batch(r, &[e.event_id]).await?,
+        BatchPresence::Absent,
+        "ER1: unregistered batch is Absent",
+    );
+    Ok(())
+}
+
+/// ER2: after register, the same batch classifies Redelivery with the stored
+/// coordinates — the property that makes a deep redelivery recognizable.
+pub async fn event_id_registry_redelivery_after_register<R: EventIdRegistry>(
+    r: &R,
+) -> Result<()> {
+    let e = id_entry(42);
+    r.register(&[e]).await?;
+    assert_eq!(
+        classify_batch(r, &[e.event_id]).await?,
+        BatchPresence::Redelivery { last: e },
+        "ER2: registered batch is a Redelivery carrying its coordinates",
+    );
+    Ok(())
+}
+
+/// ER3: a batch where only some ids are registered is a PartialOverlap.
+pub async fn event_id_registry_partial_overlap<R: EventIdRegistry>(r: &R) -> Result<()> {
+    let a = id_entry(1);
+    let b = id_entry(2);
+    r.register(&[a]).await?;
+    assert_eq!(
+        classify_batch(r, &[a.event_id, b.event_id]).await?,
+        BatchPresence::PartialOverlap,
+        "ER3: mixed present/absent batch is a PartialOverlap",
+    );
+    Ok(())
+}
+
+/// ER4: register is first-write-wins — re-registering an id keeps the
+/// original coordinates.
+pub async fn event_id_registry_register_first_write_wins<R: EventIdRegistry>(
+    r: &R,
+) -> Result<()> {
+    let id = Uuid::new_v4();
+    let first = EventIdEntry {
+        event_id: id,
+        stream_position: causal::types::LogCursor::from_raw(10),
+        stream_revision: causal::types::StreamRevision::from_raw(0),
+    };
+    let second = EventIdEntry {
+        stream_position: causal::types::LogCursor::from_raw(999),
+        ..first
+    };
+    r.register(&[first]).await?;
+    r.register(&[second]).await?;
+    let got = r.lookup(&[id]).await?[0].expect("ER4: id present");
+    assert_eq!(
+        got.stream_position,
+        causal::types::LogCursor::from_raw(10),
+        "ER4: first write wins",
+    );
+    Ok(())
+}
+
 /// DS10: retention GC removes records sealed before the cutoff and leaves
 /// newer ones (age-driven, A1).
 pub async fn decision_store_retention_gc_by_age<S: DecisionStore>(s: &S) -> Result<()> {
