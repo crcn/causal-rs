@@ -227,3 +227,20 @@ CREATE TABLE IF NOT EXISTS causal_effect_store (
 CREATE INDEX IF NOT EXISTS idx_causal_log_causation
     ON causal_log (causation_id)
     WHERE causation_id IS NOT NULL;
+
+-- ── causal_decisions: one durable decision per (consumer, trigger) ───
+--
+-- Backs `PgDecisionStore`. Stores the full output batch a reaction
+-- produced, sealed first-write-wins via INSERT ... ON CONFLICT DO NOTHING.
+-- Redelivery replays this row instead of re-running the reactor body,
+-- making partial-append completion idempotent and the chimera log
+-- impossible. GC is retention-based (age-driven) via the sealed_at index.
+CREATE TABLE IF NOT EXISTS causal_decisions (
+    consumer          TEXT        NOT NULL,
+    trigger_event_id  UUID        NOT NULL,
+    outputs           JSONB       NOT NULL,
+    sealed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (consumer, trigger_event_id)
+);
+CREATE INDEX IF NOT EXISTS causal_decisions_sealed_at_idx
+    ON causal_decisions (sealed_at);

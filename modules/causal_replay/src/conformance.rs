@@ -1472,3 +1472,163 @@ pub async fn effect_store_remember_replays_cached_on_redelivery<S: causal::Effec
     assert_eq!(calls.load(Ordering::SeqCst), 1, "ES10: compute ran exactly once across both calls");
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// DecisionStore conformance (DS1–DS8)
+// ─────────────────────────────────────────────────────────────────────
+
+use causal::{DecisionRecord, DecisionStore};
+
+/// A stock output envelope for decision-record scenarios.
+fn decision_output(event_type: &str, payload: serde_json::Value) -> EventData {
+    EventData {
+        event_id:     Uuid::new_v4(),
+        causation_id: Some(Uuid::new_v4()),
+        workflow_id:  Uuid::new_v4(),
+        event_type:   event_type.to_string(),
+        payload,
+        created_at:   Utc::now(),
+        category:     Some(event_type.to_string()),
+        subject_id:   Some(Uuid::new_v4()),
+        metadata:     serde_json::Map::new(),
+        ephemeral:    None,
+        persistent:   true,
+    }
+}
+
+/// DS1: a fresh store has no record for a never-sealed trigger.
+pub async fn decision_store_get_miss<S: DecisionStore>(s: &S) -> Result<()> {
+    assert!(
+        s.get("ds1", Uuid::new_v4()).await?.is_none(),
+        "DS1: miss on unsealed trigger"
+    );
+    Ok(())
+}
+
+/// DS2: `seal` then `get` round-trips the output batch, preserving durable
+/// envelope fields (event_id, payload, subject, category, causation).
+pub async fn decision_store_seal_then_get_round_trips<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let outputs = vec![
+        decision_output("Out", serde_json::json!({"n": 1})),
+        decision_output("Out", serde_json::json!({"n": 2})),
+    ];
+    let sealed = s
+        .seal(DecisionRecord::new("ds2", trigger, outputs.clone(), Utc::now()))
+        .await?;
+    assert_eq!(sealed.outputs.len(), 2, "DS2: seal returns the full batch");
+
+    let got = s.get("ds2", trigger).await?.expect("DS2: record present after seal");
+    assert_eq!(got.outputs.len(), 2);
+    for (a, b) in got.outputs.iter().zip(outputs.iter()) {
+        assert_eq!(a.event_id, b.event_id, "DS2: event_id preserved");
+        assert_eq!(a.payload, b.payload, "DS2: payload preserved");
+        assert_eq!(a.subject_id, b.subject_id, "DS2: subject preserved");
+        assert_eq!(a.category, b.category, "DS2: category preserved");
+        assert_eq!(a.causation_id, b.causation_id, "DS2: causation preserved");
+    }
+    Ok(())
+}
+
+/// DS3: seal is first-write-wins — a racing second seal with different
+/// outputs adopts the first sealed batch. This is the invariant that lets
+/// racing executions append identical batches.
+pub async fn decision_store_seal_is_first_write_wins<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let first = DecisionRecord::new(
+        "ds3",
+        trigger,
+        vec![decision_output("Out", serde_json::json!("first"))],
+        Utc::now(),
+    );
+    let first_id = first.outputs[0].event_id;
+    s.seal(first).await?;
+
+    let second = DecisionRecord::new(
+        "ds3",
+        trigger,
+        vec![decision_output("Out", serde_json::json!("second"))],
+        Utc::now(),
+    );
+    let canonical = s.seal(second).await?;
+    assert_eq!(canonical.outputs.len(), 1);
+    assert_eq!(canonical.outputs[0].event_id, first_id, "DS3: first write wins");
+    assert_eq!(
+        canonical.outputs[0].payload,
+        serde_json::json!("first"),
+        "DS3: second seal adopts the first batch"
+    );
+
+    // A subsequent get also returns the first batch.
+    let got = s.get("ds3", trigger).await?.expect("DS3: record present");
+    assert_eq!(got.outputs[0].event_id, first_id);
+    Ok(())
+}
+
+/// DS4: a zero-output reaction seals an empty record — present, not absent
+/// (distinguishing "processed, decided nothing" from "never ran").
+pub async fn decision_store_empty_record_is_present<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let sealed = s.seal(DecisionRecord::new("ds4", trigger, vec![], Utc::now())).await?;
+    assert!(sealed.outputs.is_empty(), "DS4: sealed empty batch stays empty");
+    let got = s.get("ds4", trigger).await?;
+    assert!(got.is_some(), "DS4: empty record is present, not absent");
+    assert!(got.unwrap().outputs.is_empty());
+    Ok(())
+}
+
+/// DS5: `remove` makes a record absent.
+pub async fn decision_store_remove_makes_record_absent<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    s.seal(DecisionRecord::new("ds5", trigger, vec![], Utc::now())).await?;
+    s.remove("ds5", trigger).await?;
+    assert!(s.get("ds5", trigger).await?.is_none(), "DS5: absent after remove");
+    Ok(())
+}
+
+/// DS6: `remove` on an absent record is a no-op (idempotent).
+pub async fn decision_store_remove_is_idempotent<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    s.remove("ds6", trigger).await?;
+    s.remove("ds6", trigger).await?;
+    Ok(())
+}
+
+/// DS7: records are isolated by `consumer`.
+pub async fn decision_store_isolated_by_consumer<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    s.seal(DecisionRecord::new("ds7-a", trigger, vec![], Utc::now())).await?;
+    assert!(
+        s.get("ds7-b", trigger).await?.is_none(),
+        "DS7: consumer-b must not see consumer-a's record"
+    );
+    Ok(())
+}
+
+/// DS8: records are isolated by `trigger_event_id`.
+pub async fn decision_store_isolated_by_trigger<S: DecisionStore>(s: &S) -> Result<()> {
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    s.seal(DecisionRecord::new("ds8", t1, vec![], Utc::now())).await?;
+    assert!(
+        s.get("ds8", t2).await?.is_none(),
+        "DS8: a different trigger has its own slot"
+    );
+    Ok(())
+}
+
+/// DS9: ` ` in payload strings is stripped at seal (JSONB safety) — a
+/// seal of scraped content must not fail, and the stored payload has no
+/// NUL codepoint.
+pub async fn decision_store_strips_nul_bytes<S: DecisionStore>(s: &S) -> Result<()> {
+    let trigger = Uuid::new_v4();
+    let dirty = decision_output("Out", serde_json::json!({"text": "a\u{0}b"}));
+    s.seal(DecisionRecord::new("ds9", trigger, vec![dirty], Utc::now())).await?;
+    let got = s.get("ds9", trigger).await?.expect("DS9: record present");
+    assert_eq!(
+        got.outputs[0].payload["text"],
+        serde_json::json!("ab"),
+        "DS9: NUL stripped from payload string"
+    );
+    Ok(())
+}
