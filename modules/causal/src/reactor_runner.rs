@@ -58,7 +58,7 @@ use crate::clock::Clock;
 use crate::contexts::{Ctx, LabelSet, StateSource};
 use crate::effect_store::EffectKey;
 use crate::engine::{TerminalFailure, TerminalFailureMapper};
-use crate::failure::{classify, poison, ErrorClass, FailureClass};
+use crate::failure::{bounded_error_chain, classify, poison, ErrorClass, FailureClass};
 use crate::event_log::EventLogBackend;
 use crate::event::Event;
 use crate::projection_runner::StepOutcome;
@@ -72,17 +72,23 @@ use crate::types::{EventData, LogCursor, RecordedEvent, StreamState};
 /// never by how far the log head ran ahead of a slow partition.
 const MAX_PENDING: usize = 4096;
 
-/// The transient-class retry ceiling (BLOCKING-2): how long a
-/// transient-classified failure may back off before parking as
-/// `transient_exhausted`. Measured in **liveness time** (tokio
-/// `Instant` — virtualizable under `start_paused`), never chrono:
-/// a wall-clock ceiling would make this machinery testable only in
-/// production. Hours, not attempts — a ten-minute infra outage must
-/// self-heal instead of mass-parking every graph-touching trigger.
-/// Ceilinged rather than unbounded because misclassification is
-/// inevitable, and an unbounded-transient partition is a silent
-/// permanent wedge.
-const TRANSIENT_CEILING: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+/// Default causation-depth ceiling (H7). A reaction whose trigger is at or
+/// beyond this depth parks instead of emitting — a runtime failsafe against
+/// reactive cycles (a reactor whose output kind feeds its own trigger kind,
+/// directly or through a multi-hop chain) that identity-keyed dedup cannot
+/// catch (each generation has a fresh `event_id`). Generous: real reactive
+/// fan-out is shallow; a chain 256 deep is a cycle or a modeling error.
+/// Raise or disable via
+/// [`EngineBuilder::with_causation_depth_ceiling`](crate::EngineBuilder::with_causation_depth_ceiling).
+pub const DEFAULT_CAUSATION_DEPTH_CEILING: u32 = 256;
+
+/// Event-metadata key carrying the causation depth — the number of reactive
+/// generations from a caller-emitted root. Absent ⇒ 0 (caller-emitted events
+/// root a fresh chain); each reactor output is stamped `trigger_depth + 1`.
+pub const CAUSATION_DEPTH_KEY: &str = "causal:causation_depth";
+
+/// The transient-class retry ceiling — see [`crate::failure::TRANSIENT_CEILING`].
+use crate::failure::TRANSIENT_CEILING;
 
 /// The built-in terminal fact's kind, appended when no
 /// `on_terminal_failure` mapper is registered. The colon namespaces it
@@ -145,14 +151,31 @@ pub fn derive_output_event_id(
 
 /// Metadata stamped on every reactor output so consumers (the inspector in
 /// particular) can attribute the emitted event to the reactor that produced
-/// it. Read back via `metadata["reactor_id"]`.
-fn reactor_output_metadata(reactor_id: &str) -> serde_json::Map<String, serde_json::Value> {
+/// it (`metadata["reactor_id"]`) and follow the causation depth
+/// (`metadata[CAUSATION_DEPTH_KEY]`, used by the H7 depth ceiling).
+fn reactor_output_metadata(
+    reactor_id: &str,
+    causation_depth: u64,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut m = serde_json::Map::new();
     m.insert(
         "reactor_id".to_string(),
         serde_json::Value::String(reactor_id.to_string()),
     );
+    m.insert(
+        CAUSATION_DEPTH_KEY.to_string(),
+        serde_json::Value::Number(causation_depth.into()),
+    );
     m
+}
+
+/// Read the causation depth from a trigger's metadata — absent ⇒ 0 (a
+/// caller-emitted event roots a fresh reactive chain).
+fn causation_depth_of(metadata: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    metadata
+        .get(CAUSATION_DEPTH_KEY)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -307,6 +330,12 @@ struct Core<R: Reactor> {
     /// it (those are tokio time).
     clock: Arc<dyn Clock>,
 
+    /// Causation-depth ceiling (H7). When `Some(n)`, a reaction whose trigger
+    /// sits at depth `>= n` parks instead of emitting — a runtime cycle
+    /// failsafe. `None` disables the check. Defaults to
+    /// [`DEFAULT_CAUSATION_DEPTH_CEILING`].
+    causation_depth_ceiling: Option<u32>,
+
     /// `Reactor::MAX_IN_FLIGHT` enforcement: workers acquire a permit
     /// around each executing attempt (not around backoff waits — a
     /// sleeping retry holds no external resource). `None` = unbounded.
@@ -376,6 +405,7 @@ where
                 snapshot_every: 0,
                 occ_categories: Arc::new(std::collections::HashSet::new()),
                 clock: Arc::new(crate::clock::SystemClock),
+                causation_depth_ceiling: Some(DEFAULT_CAUSATION_DEPTH_CEILING),
                 in_flight: (R::MAX_IN_FLIGHT != usize::MAX).then(|| {
                     Arc::new(tokio::sync::Semaphore::new(
                         // Semaphore's permit ceiling is below usize::MAX;
@@ -500,6 +530,14 @@ where
     /// Convenience shim: set only `max_attempts`, keep existing backoff shape.
     pub(crate) fn with_max_attempts(mut self, n: u32) -> Self {
         self.core_mut().retry_policy = crate::reactor::RetryPolicy::from_max_attempts(n);
+        self
+    }
+
+    /// Set the causation-depth ceiling (H7). `Some(n)` parks any reaction
+    /// whose trigger is at depth `>= n`; `None` disables the failsafe.
+    /// Defaults to [`DEFAULT_CAUSATION_DEPTH_CEILING`].
+    pub(crate) fn with_causation_depth_ceiling(mut self, ceiling: Option<u32>) -> Self {
+        self.core_mut().causation_depth_ceiling = ceiling;
         self
     }
 
@@ -943,7 +981,7 @@ where
                     tracing::warn!(
                         consumer = self.consumer_id,
                         event_id = %event.event_id,
-                        error = %format!("{e:#}"),
+                        error = %bounded_error_chain(&e),
                         "reactor runner infrastructure error; retrying in partition",
                     );
                     None // infra: backoff + retry, never park
@@ -979,7 +1017,7 @@ where
                         .park_terminal_failure(
                             event,
                             attempts,
-                            format!("{:#}", error),
+                            bounded_error_chain(&error),
                             failure_class,
                             self.clock.now(),
                         )
@@ -1000,23 +1038,26 @@ where
                             });
                         }
                         Err(e) => {
-                            self.note_worker_retry(format!("terminal-failure park I/O error: {e:#}"));
+                            self.note_worker_retry(format!(
+                                "terminal-failure park I/O error: {}",
+                                bounded_error_chain(&e)
+                            ));
                             tracing::warn!(
                                 consumer = self.consumer_id,
                                 event_id = %event.event_id,
-                                error = %format!("{e:#}"),
+                                error = %bounded_error_chain(&e),
                                 "terminal-failure park hit an infrastructure error; retrying",
                             );
                         }
                     }
                 } else {
-                    self.note_worker_retry(format!("{error:#}"));
+                    self.note_worker_retry(bounded_error_chain(&error));
                     tracing::warn!(
                         consumer = self.consumer_id,
                         event_id = %event.event_id,
                         attempts,
                         class = ?class,
-                        error = %format!("{error:#}"),
+                        error = %bounded_error_chain(&error),
                         "reactor attempt failed; retrying in partition",
                     );
                 }
@@ -1171,7 +1212,7 @@ where
                     reactor = %self.consumer_id,
                     event_id = %event.event_id,
                     attempt = attempt_seq,
-                    error = %format!("{e:#}"),
+                    error = %bounded_error_chain(&e),
                     "reactor body failed",
                 );
                 if let Some(obs) = self.observer.as_ref() {
@@ -1183,7 +1224,7 @@ where
                         attempt_seq,
                         started_at,
                         completed_at,
-                        &format!("{:#}", e),
+                        &bounded_error_chain(&e),
                         &drained,
                     );
                 }
@@ -1209,6 +1250,37 @@ where
                 );
                 return Ok(AttemptOutcome::BodyFailed {
                     error: poison(anyhow::anyhow!(msg)),
+                    attempts: attempt_seq,
+                });
+            }
+        }
+
+        // ── H7 causation-depth ceiling. A reaction whose trigger already
+        //    sits at/beyond the ceiling would emit at `depth + 1` — a
+        //    deterministic policy violation (a reactive cycle: the reactor's
+        //    output kind feeds its own trigger kind, directly or multi-hop).
+        //    Park it as poison rather than emit. Checked post-react so a
+        //    reactor that legitimately emits nothing at depth never parks;
+        //    only when it WOULD emit. The terminal fact itself is stamped
+        //    `depth + 1` (see park_terminal_failure), and the cycle-guard
+        //    there stops the park fact from perpetuating the loop.
+        let trigger_depth = causation_depth_of(&event.metadata);
+        if let Some(ceiling) = self.causation_depth_ceiling {
+            if !emitted.is_empty() && trigger_depth >= u64::from(ceiling) {
+                return Ok(AttemptOutcome::BodyFailed {
+                    error: poison(anyhow::anyhow!(
+                        "causation-depth ceiling exceeded: reactor '{}' triggered by \
+                         '{}' (event {}, depth {trigger_depth}) would emit at depth {} \
+                         past the ceiling {ceiling} — likely a reactive cycle (an output \
+                         kind feeds this reactor's own trigger kind, directly or through \
+                         a multi-hop chain). Raise or disable via \
+                         EngineBuilder::with_causation_depth_ceiling if this chain is \
+                         intentional.",
+                        self.consumer_id,
+                        event.event_type,
+                        event.event_id,
+                        trigger_depth + 1,
+                    )),
                     attempts: attempt_seq,
                 });
             }
@@ -1250,7 +1322,7 @@ where
                 // `event_type` (durable_name). Equal unless overridden.
                 category: Some(out.subject.clone()),
                 subject_id: Some(out.subject_id),
-                metadata: reactor_output_metadata(&self.consumer_id),
+                metadata: reactor_output_metadata(&self.consumer_id, trigger_depth + 1),
                 ephemeral: None,
                 persistent: true,
             };
@@ -1419,7 +1491,7 @@ where
                     subject = %subject,
                     %subject_id,
                     revision = write.revision.raw(),
-                    error = %format!("{e:#}"),
+                    error = %bounded_error_chain(&e),
                     "post-append engine-registry fold deferred; durable append \
                      intact, registry will repair on next fold / read-through restore",
                 );
@@ -1455,6 +1527,22 @@ where
                 &error,
                 completed_at,
             );
+        }
+
+        // H7 cycle guard: if the trigger already sits STRICTLY beyond the
+        // ceiling, appending a terminal fact (stamped deeper still) would let
+        // a reactor subscribed to the park fact perpetuate the very cycle we
+        // are trying to break. Park silently — the observer hook + error log
+        // already fired and the ack-floor still advances — so each chain emits
+        // at most one durable park fact at the boundary, then terminates.
+        let trigger_depth = causation_depth_of(&event.metadata);
+        if let Some(ceiling) = self.causation_depth_ceiling {
+            if trigger_depth > u64::from(ceiling) {
+                self.checkpoint
+                    .clear_reactor_attempts(&self.consumer_id, event.event_id)
+                    .await?;
+                return Ok(());
+            }
         }
         // (kind, subject placement, subject_id, workflow, payload) of
         // the terminal fact to append — mapper's fact, the built-in,
@@ -1519,7 +1607,7 @@ where
                 created_at: self.clock.now(),
                 category: Some(cat.clone()),
                 subject_id: Some(sid),
-                metadata: reactor_output_metadata(&self.consumer_id),
+                metadata: reactor_output_metadata(&self.consumer_id, trigger_depth + 1),
                 ephemeral: None,
                 persistent: true,
             };
@@ -1634,7 +1722,7 @@ where
                 if let Err(e) = store.remove(&key).await {
                     tracing::warn!(
                         consumer = self.consumer_id,
-                        error = %format!("{e:#}"),
+                        error = %bounded_error_chain(&e),
                         "effect-store GC failed; entry leaked",
                     );
                 }
@@ -2703,6 +2791,81 @@ mod tests {
         runner.halt();
     }
 
+    #[test]
+    fn repeated_identical_failures_never_overflow_a_small_stack() {
+        // Regression guard for the downstream crash-loop: when a step fails
+        // identically every pass, the drive/retry/park path must stay
+        // iterative and its error formatting must stay bounded. We drive many
+        // identical deep-chain failures on a deliberately small stack; a
+        // reintroduced unbounded recursion in the drive path (or an unbounded
+        // error-chain walk) would overflow it. We also assert the parked
+        // payloads are bounded — the concrete lock on `bounded_error_chain`.
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .name("small-stack".into())
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    struct DeepChainFails;
+                    #[async_trait]
+                    impl Reactor for DeepChainFails {
+                        type Trigger = OrderPlaced;
+                        const NAME: &'static str = "overflow.guard";
+                        async fn react(&self, _t: &OrderPlaced, _: Ctx<'_>) -> Result<Events> {
+                            // Unclassified error with a chain far deeper than
+                            // MAX_CHAIN_HOPS, so the bounded formatter must elide.
+                            let mut e = anyhow::anyhow!("root infra failure");
+                            for i in 0..60 {
+                                e = e.context(format!("frame {i}"));
+                            }
+                            Err(e)
+                        }
+                    }
+
+                    let store = Arc::new(MemoryStore::new());
+                    for _ in 0..30 {
+                        append_trigger(
+                            &store,
+                            &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() },
+                        );
+                    }
+                    let runner = ReactorRunner::new(
+                        DeepChainFails,
+                        "overflow.guard",
+                        store.clone() as Arc<dyn EventLogBackend>,
+                        store.clone() as Arc<dyn ReactorCheckpoint>,
+                    )
+                    .with_retry_policy(crate::reactor::RetryPolicy::fixed(2, 0));
+
+                    runner.quiesce().await.unwrap();
+                    runner.halt();
+
+                    let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 200)
+                        .await
+                        .unwrap();
+                    let parked: Vec<_> = all
+                        .iter()
+                        .filter(|e| e.event_type == REACTION_FAILED_KIND)
+                        .collect();
+                    assert_eq!(parked.len(), 30, "every trigger parked, none wedged");
+                    for p in &parked {
+                        let msg = p.payload["error"].as_str().unwrap();
+                        assert!(
+                            msg.len() <= 8 * 1024 + 8,
+                            "park payload must be bounded, got {} bytes",
+                            msg.len(),
+                        );
+                        assert!(msg.contains('…'), "hop cap engaged on the deep chain");
+                    }
+                });
+            })
+            .unwrap();
+        handle.join().expect("drive/format path overflowed a small stack");
+    }
+
     #[tokio::test]
     async fn fold_on_read_state_is_bounded_at_trigger() {
         // ctx.state_of in a reactor folds the subject history bounded
@@ -3626,5 +3789,98 @@ mod tests {
             .expect("built-in terminal fact");
         assert_eq!(parked.payload["class"], "poison");
         runner.halt();
+    }
+
+    // ── H7: causation-depth ceiling ───────────────────────────────────
+
+    /// Emits an `order_placed` on a FRESH subject each generation, so its
+    /// output re-triggers itself and identity-keyed dedup can never break the
+    /// loop — a direct reactive cycle. Only the depth ceiling bounds it.
+    struct SelfTrigger;
+    #[async_trait]
+    impl Reactor for SelfTrigger {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "self-trigger";
+        async fn react(&self, _t: &OrderPlaced, _ctx: Ctx<'_>) -> Result<Events> {
+            let mut out = Events::new();
+            out.push(OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn self_trigger_cycle_is_bounded_by_causation_depth_ceiling() {
+        let store = Arc::new(MemoryStore::new());
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+        let observer = Arc::new(CountingObserver::default());
+
+        let runner = ReactorRunner::new(
+            SelfTrigger,
+            "self.trig",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_observer(observer.clone() as Arc<dyn ReactorObserver>)
+        .with_causation_depth_ceiling(Some(8));
+
+        // quiesce terminates precisely because the ceiling bounds the cycle;
+        // without it this would run until MAX_PENDING backpressure / OOM.
+        runner.quiesce().await.unwrap();
+        runner.halt();
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 1000)
+            .await
+            .unwrap();
+
+        // Seed (depth 0) + 8 generations (depths 1..=8) = 9 order_placed
+        // events. The depth-8 event would emit at depth 9 → it parks instead.
+        let orders: Vec<_> = all.iter().filter(|e| e.event_type == "order_placed").collect();
+        assert_eq!(orders.len(), 9, "cycle bounded: seed + 8 generations, no runaway");
+
+        // Depth metadata increments per generation (max stamped depth == 8).
+        let max_depth = orders
+            .iter()
+            .map(|e| causation_depth_of(&e.metadata))
+            .max()
+            .unwrap();
+        assert_eq!(max_depth, 8, "output depth increments trigger+1 up to the ceiling");
+
+        // Exactly one terminal-failure park, with the ceiling diagnostic.
+        assert_eq!(observer.terminal_failures.load(Ordering::SeqCst), 1);
+        let parked = all
+            .iter()
+            .find(|e| e.event_type == REACTION_FAILED_KIND)
+            .expect("depth-ceiling park fact");
+        assert_eq!(parked.payload["class"], "poison");
+        let err = parked.payload["error"].as_str().unwrap();
+        assert!(err.contains("causation-depth ceiling"), "diagnostic names the cause: {err}");
+        assert!(err.contains("self.trig"), "diagnostic names the reactor (consumer id): {err}");
+    }
+
+    #[tokio::test]
+    async fn causation_depth_ceiling_none_disables_the_failsafe() {
+        // With the ceiling disabled, the same reactor is NOT parked at depth;
+        // drive a bounded number of passes and confirm no reaction_failed fact
+        // appears (the loop would run forever if we quiesced — so we don't).
+        let store = Arc::new(MemoryStore::new());
+        append_trigger(&store, &OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() });
+        let observer = Arc::new(CountingObserver::default());
+        let runner = ReactorRunner::new(
+            SelfTrigger,
+            "self.trig.off",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_observer(observer.clone() as Arc<dyn ReactorObserver>)
+        .with_causation_depth_ceiling(None);
+
+        // A few bounded steps — generations well past any accidental default.
+        for _ in 0..20 {
+            let _ = runner.step(64).await;
+        }
+        runner.halt();
+
+        assert_eq!(observer.terminal_failures.load(Ordering::SeqCst), 0,
+                   "no depth-based park when the ceiling is disabled");
     }
 }

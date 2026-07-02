@@ -31,10 +31,15 @@ use tokio::sync::OnceCell;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::CheckpointStore;
+use crate::clock::{Clock, SystemClock};
 use crate::consumer_lease::{ConsumerLeasor, LeaseGuard};
 use crate::contexts::Ctx;
+use crate::engine::{WorkflowHighWater, DEFAULT_MAX_ATTEMPTS};
 use crate::event_log::EventLogBackend;
+use crate::failure::{bounded_error_chain, classify_structural, ErrorClass};
+use crate::projection_failure::{FailureDecision, FailureState};
 use crate::projection_runner::StepOutcome;
+use crate::reactor::RetryPolicy;
 use crate::types::{LogCursor, RecordedEvent};
 
 /// Cross-domain projection consumer with a declared subscription set.
@@ -98,6 +103,9 @@ pub struct MultiProjectorRunner<P: MultiProjector> {
     leasor:       Option<Arc<dyn ConsumerLeasor>>,
     lease:        parking_lot::Mutex<Option<Box<dyn LeaseGuard>>>,
     leased:       OnceCell<()>,
+    /// Poison-park failure policy + retry accounting (mirrors the reactor
+    /// taxonomy) — a deterministically-failing fold/body parks and advances.
+    failure:      FailureState,
 }
 
 impl<P: MultiProjector> MultiProjectorRunner<P> {
@@ -129,6 +137,10 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             leasor: None,
             lease: parking_lot::Mutex::new(None),
             leased: OnceCell::new(),
+            failure: FailureState::new(
+                RetryPolicy::from_max_attempts(DEFAULT_MAX_ATTEMPTS),
+                Arc::new(SystemClock),
+            ),
         }
     }
 
@@ -138,6 +150,26 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
     /// [`ProjectionRunner::with_consumer_leasor`](crate::projection_runner::ProjectionRunner::with_consumer_leasor).
     pub fn with_consumer_leasor(mut self, leasor: Arc<dyn ConsumerLeasor>) -> Self {
         self.leasor = Some(leasor);
+        self
+    }
+
+    /// Override the retry policy (bounded attempts before parking
+    /// domain/unclassified failures). Defaults to [`DEFAULT_MAX_ATTEMPTS`].
+    pub(crate) fn with_retry_policy(mut self, p: RetryPolicy) -> Self {
+        self.failure.retry_policy = p;
+        self
+    }
+
+    /// Override the clock used to stamp parked terminal facts (test clocks).
+    pub(crate) fn with_clock(mut self, c: Arc<dyn Clock>) -> Self {
+        self.failure.clock = c;
+        self
+    }
+
+    /// Wire the engine's settle high-water tracker so a parked
+    /// `causal:projection_failed` fact is accounted for by `settle`.
+    pub(crate) fn with_settle_tracker(mut self, t: WorkflowHighWater) -> Self {
+        self.failure.settle_tracker = Some(t);
         self
     }
 
@@ -218,7 +250,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             // stream coordinates — a failing body retried by the
             // supervisor re-delivers harmlessly. Mirrors ProjectionRunner.
             if let Some(reg) = self.aggregators.as_ref() {
-                let outcome = crate::aggregator::fold_event(
+                match crate::aggregator::fold_event(
                     reg,
                     None,
                     self.log.as_ref(),
@@ -230,16 +262,26 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                     event.position,
                     /* strict_to_event = */ true,
                 )
-                .await?;
-                if outcome.applied {
-                    if let Some(obs) = self.observer.as_ref() {
-                        reg.notify_observer(
-                            &outcome.snapshots,
-                            obs.as_ref(),
-                            event.workflow_id,
-                            event.position,
-                            event.event_id,
-                        );
+                .await
+                {
+                    Ok(outcome) => {
+                        if outcome.applied {
+                            if let Some(obs) = self.observer.as_ref() {
+                                reg.notify_observer(
+                                    &outcome.snapshots,
+                                    obs.as_ref(),
+                                    event.workflow_id,
+                                    event.position,
+                                    event.event_id,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Deterministic fold failure (poison payload) parks +
+                        // advances; transient / under-budget propagates to retry.
+                        self.park_or_propagate(&event, e).await?;
+                        continue;
                     }
                 }
             }
@@ -274,18 +316,55 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
             };
             match self.projector.project(&event, ctx).await {
                 Ok(()) => {
+                    self.failure.clear(event.event_id);
                     self.checkpoint.advance(&self.consumer_id, event.position).await?;
                     applied += 1;
                 }
                 Err(e) => {
                     // The fold above is NOT rolled back — registry state
-                    // reflects the log regardless of body success.
-                    return Err(e);
+                    // reflects the log regardless of body success. A
+                    // deterministic (poison) body failure parks + advances;
+                    // transient / under-budget propagates to retry.
+                    self.park_or_propagate(&event, e).await?;
+                    continue;
                 }
             }
         }
 
         Ok(StepOutcome::Progressed { applied })
+    }
+
+    /// On a per-event failure: **park** (append `causal:projection_failed` +
+    /// advance — returns `Ok`, caller `continue`s) or **propagate** (retry).
+    /// Mirrors [`ProjectionRunner::park_or_propagate`](crate::projection_runner).
+    async fn park_or_propagate(&self, event: &RecordedEvent, err: anyhow::Error) -> Result<()> {
+        match self.failure.on_failure(event.event_id, &err) {
+            FailureDecision::Park { class, attempts } => {
+                self.failure
+                    .park(
+                        self.log.as_ref(),
+                        &self.consumer_id,
+                        event,
+                        class,
+                        attempts,
+                        bounded_error_chain(&err),
+                        self.observer.as_deref(),
+                    )
+                    .await?;
+                self.checkpoint
+                    .advance(&self.consumer_id, event.position)
+                    .await?;
+                tracing::warn!(
+                    consumer = %self.consumer_id,
+                    event_id = %event.event_id,
+                    class = %class,
+                    attempts,
+                    "multi-projector parked a deterministically-failing event and advanced",
+                );
+                Ok(())
+            }
+            FailureDecision::Retry => Err(err),
+        }
     }
 
     async fn ensure_hydrated(&self, cursor: LogCursor) -> Result<()> {
@@ -305,7 +384,7 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                 let mut hit_cursor = false;
                 for event in batch {
                     if event.position > cursor { hit_cursor = true; break; }
-                    crate::aggregator::fold_event(
+                    if let Err(e) = crate::aggregator::fold_event(
                         reg,
                         None,
                         self.log.as_ref(),
@@ -317,7 +396,22 @@ impl<P: MultiProjector> MultiProjectorRunner<P> {
                         event.position,
                         /* strict_to_event = */ true,
                     )
-                    .await?;
+                    .await
+                    {
+                        // A deterministic fold error at position <= cursor means
+                        // the event was parked in a prior life — skip it rather
+                        // than re-wedge on every boot. Backend errors propagate.
+                        if classify_structural(&e) == Some(ErrorClass::Poison) {
+                            tracing::warn!(
+                                consumer = %self.consumer_id,
+                                event_id = %event.event_id,
+                                error = %bounded_error_chain(&e),
+                                "skipping a previously-parked poison event during hydration",
+                            );
+                            continue;
+                        }
+                        return Err(e);
+                    }
                 }
                 if hit_cursor || last_pos >= cursor { break; }
                 from = last_pos;
@@ -521,5 +615,72 @@ mod tests {
             store.clone() as Arc<dyn EventLogBackend>,
             store.clone() as Arc<dyn CheckpointStore>,
         );
+    }
+
+    // ── H1: poison-park for the multi-projector ───────────────────────
+    async fn append_thing(store: &MemoryStore, subject: Uuid, payload: serde_json::Value) -> Uuid {
+        let event_id = Uuid::new_v4();
+        crate::append_event(store, EventData {
+            event_id,
+            causation_id: None,
+            workflow_id: Uuid::new_v4(),
+            event_type: "thing_happened".into(),
+            payload,
+            created_at: Utc::now(),
+            category: Some("thing_happened".into()),
+            subject_id: Some(subject),
+            metadata: serde_json::Map::new(),
+            ephemeral: None,
+            persistent: true,
+        })
+        .await
+        .unwrap();
+        event_id
+    }
+
+    #[tokio::test]
+    async fn multi_projector_poison_body_parks_and_advances() {
+        /// Poisons any event whose payload carries `{"poison": true}`.
+        struct PoisonOnFlag {
+            seen: Arc<Mutex<Vec<Uuid>>>,
+        }
+        #[async_trait]
+        impl MultiProjector for PoisonOnFlag {
+            const NAME: &'static str = "poison-on-flag";
+            const KINDS: &'static [&'static str] = &["thing_happened"];
+            async fn project(&self, event: &RecordedEvent, _ctx: Ctx<'_>) -> Result<()> {
+                if event.payload.get("poison").is_some() {
+                    return Err(crate::failure::poison(anyhow::anyhow!("poisoned event")));
+                }
+                self.seen.lock().push(event.event_id);
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let poison_subject = Uuid::new_v4();
+        let poison_id = append_thing(&store, poison_subject, serde_json::json!({"poison": true})).await;
+        let good_id = append_thing(&store, Uuid::new_v4(), serde_json::json!({"ok": true})).await;
+
+        let proj = PoisonOnFlag { seen: Arc::new(Mutex::new(Vec::new())) };
+        let seen = proj.seen.clone();
+        let runner = MultiProjectorRunner::new(
+            proj,
+            "mp.poison",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        );
+
+        let outcome = runner.step(10).await.unwrap();
+        assert!(matches!(outcome, StepOutcome::Progressed { applied: 1 }));
+        assert_eq!(seen.lock().as_slice(), &[good_id], "healthy event delivered");
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        let parked = all.iter()
+            .find(|e| e.event_type == crate::projection_failure::PROJECTION_FAILED_KIND)
+            .expect("built-in projection_failed fact for the poison body");
+        assert_eq!(parked.payload["class"], "poison");
+        assert_eq!(parked.payload["event_id"], poison_id.to_string());
+        assert_eq!(parked.subject_id, poison_subject);
     }
 }

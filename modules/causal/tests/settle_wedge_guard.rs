@@ -342,16 +342,22 @@ impl Reactor for Kicker {
     }
 }
 
-/// Projector on Boom that ALWAYS errors — models an infra/pg-backed
-/// projector failing in a test with no backend. `supervise_one` retries
-/// it forever; its cursor never passes Boom.
+/// Projector on Boom that ALWAYS errors with a TRANSIENT-classified
+/// failure — models an infra/pg-backed projector failing in a test with no
+/// backend. A transient error retries up to the liveness ceiling (hours),
+/// so within the test window its cursor never passes Boom and it stays
+/// wedged. (A bare/unclassified error would instead park after
+/// `max_attempts` under the H1 poison-park policy — self-healing, which is
+/// NOT what "infra failure with no backend" models.)
 struct FailingBoomProjector;
 #[async_trait]
 impl Projector for FailingBoomProjector {
     type Event = Boom;
     const NAME: &'static str = "failing.boom.projector";
     async fn project(&self, _fact: &Boom, _ctx: Ctx<'_>) -> Result<()> {
-        anyhow::bail!("simulated infra projector failure (no backend)")
+        Err(causal::transient(anyhow::anyhow!(
+            "simulated infra projector failure (no backend)"
+        )))
     }
 }
 

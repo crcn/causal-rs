@@ -73,6 +73,8 @@ fn pg(ctx: &AppContext) -> Result<()> {
             "--test", "pg_event_log_conformance_test",
             "--test", "pg_checkpoint_conformance_test",
             "--test", "pg_snapshot_store_test",
+            "--test", "pg_inspector_test",
+            "--test", "pg_reactor_observer_test",
             "--", "--ignored",
         ],
         &[("DATABASE_URL", DEV_PG_URL)],

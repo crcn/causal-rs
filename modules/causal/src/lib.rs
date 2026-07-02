@@ -93,6 +93,7 @@ pub mod event;
 pub mod failure;
 pub mod multi_projector;
 pub mod projection;
+pub mod projection_failure;
 pub mod projection_runner;
 pub mod projector;
 pub mod effect_store;

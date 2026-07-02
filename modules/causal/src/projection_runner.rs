@@ -8,10 +8,17 @@
 //!     cursor; returns `WaitOnDep` so the supervisor task can pause
 //!     this consumer until the dep catches up).
 //!
-//! Failure handling is `BlockUntilFixed` only (per the impl plan):
-//! `project` errors stop cursor advance and propagate up; the
-//! supervisor decides retry timing. `AdvanceAfter` (park-and-skip) lands
-//! in a later phase together with the runner-level `RetryPolicy`.
+//! Failure handling mirrors the reactor taxonomy ([`crate::failure`],
+//! [`crate::projection_failure`]): a `project`/fold error is classified.
+//! Poison (deterministic — a payload that no longer deserializes, or an
+//! explicit `causal::poison`) is **parked** — a built-in
+//! [`PROJECTION_FAILED_KIND`](crate::projection_failure::PROJECTION_FAILED_KIND)
+//! fact is appended to the poison event's own subject history and the cursor
+//! advances past it, so one poison event no longer wedges the consumer
+//! forever (and replay-from-zero no longer re-poisons). Transient errors
+//! retry up to a liveness-time ceiling; domain/unclassified errors retry up
+//! to `max_attempts` — in both cases the error propagates so the supervisor
+//! backs off, until the budget is spent and the event parks.
 
 use std::sync::Arc;
 
@@ -21,13 +28,18 @@ use tokio::sync::OnceCell;
 
 use crate::aggregator::AggregatorRegistry;
 use crate::checkpoint_store::CheckpointStore;
+use crate::clock::{Clock, SystemClock};
 use crate::consumer_lease::{ConsumerLeasor, LeaseGuard};
 use crate::contexts::Ctx;
+use crate::engine::{WorkflowHighWater, DEFAULT_MAX_ATTEMPTS};
 use crate::event_log::EventLogBackend;
 use crate::event::Event;
+use crate::failure::{bounded_error_chain, classify_structural, ErrorClass};
+use crate::projection_failure::{FailureDecision, FailureState};
 use crate::projector::Projector;
+use crate::reactor::RetryPolicy;
 use crate::reactor_observer::ReactorObserver;
-use crate::types::LogCursor;
+use crate::types::{LogCursor, RecordedEvent};
 
 /// Outcome of a single `step()` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +76,10 @@ pub struct ProjectionRunner<M: Projector> {
     /// the lease. `leased` gates acquisition to exactly once.
     lease:        parking_lot::Mutex<Option<Box<dyn LeaseGuard>>>,
     leased:       OnceCell<()>,
+    /// Poison-park failure policy + in-flight retry accounting (mirrors the
+    /// reactor taxonomy). A deterministically-failing `project`/fold parks
+    /// and advances instead of wedging the consumer.
+    failure:      FailureState,
 }
 
 impl<M: Projector> ProjectionRunner<M>
@@ -87,7 +103,31 @@ where
             leasor: None,
             lease: parking_lot::Mutex::new(None),
             leased: OnceCell::new(),
+            failure: FailureState::new(
+                RetryPolicy::from_max_attempts(DEFAULT_MAX_ATTEMPTS),
+                Arc::new(SystemClock),
+            ),
         }
+    }
+
+    /// Override the retry policy (bounded attempts for domain/unclassified
+    /// errors before parking). Defaults to [`DEFAULT_MAX_ATTEMPTS`].
+    pub(crate) fn with_retry_policy(mut self, p: RetryPolicy) -> Self {
+        self.failure.retry_policy = p;
+        self
+    }
+
+    /// Override the clock used to stamp parked terminal facts (test clocks).
+    pub(crate) fn with_clock(mut self, c: Arc<dyn Clock>) -> Self {
+        self.failure.clock = c;
+        self
+    }
+
+    /// Wire the engine's settle high-water tracker so a parked
+    /// `causal:projection_failed` fact is accounted for by `settle`.
+    pub(crate) fn with_settle_tracker(mut self, t: WorkflowHighWater) -> Self {
+        self.failure.settle_tracker = Some(t);
+        self
     }
 
     /// Attach an exclusive-lease provider. Before the runner's first
@@ -186,7 +226,7 @@ where
             // log, not body success (replaces the old capture/restore
             // rollback discipline).
             if let Some(reg) = self.aggregators.as_ref() {
-                let outcome = crate::aggregator::fold_event(
+                match crate::aggregator::fold_event(
                     reg,
                     None,
                     self.log.as_ref(),
@@ -198,16 +238,28 @@ where
                     event.position,
                     /* strict_to_event = */ true,
                 )
-                .await?;
-                if outcome.applied {
-                    if let Some(obs) = self.observer.as_ref() {
-                        reg.notify_observer(
-                            &outcome.snapshots,
-                            obs.as_ref(),
-                            event.workflow_id,
-                            event.position,
-                            event.event_id,
-                        );
+                .await
+                {
+                    Ok(outcome) => {
+                        if outcome.applied {
+                            if let Some(obs) = self.observer.as_ref() {
+                                reg.notify_observer(
+                                    &outcome.snapshots,
+                                    obs.as_ref(),
+                                    event.workflow_id,
+                                    event.position,
+                                    event.event_id,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // A deterministically-failing fold (e.g. a payload that
+                        // no longer deserializes into a registered aggregate) is
+                        // poison: park + advance instead of wedging. Transient /
+                        // under-budget failures propagate so the supervisor retries.
+                        self.park_or_propagate(&event, e).await?;
+                        continue;
                     }
                 }
             }
@@ -220,7 +272,15 @@ where
                 continue;
             }
 
-            let fact: M::Event = serde_json::from_value(event.payload.clone())?;
+            let fact: M::Event = match serde_json::from_value(event.payload.clone()) {
+                Ok(f) => f,
+                Err(e) => {
+                    // The registered payload no longer deserializes — structural
+                    // poison. Park + advance rather than propagate forever.
+                    self.park_or_propagate(&event, anyhow::Error::new(e)).await?;
+                    continue;
+                }
+            };
             let ctx = Ctx {
                 event_id:       event.event_id,
                 log_position:   event.position,
@@ -241,18 +301,58 @@ where
             match self.projector.project(&fact, ctx).await {
                 Ok(()) => {
                     // C2: advance cursor ONLY after Ok.
+                    self.failure.clear(event.event_id);
                     self.checkpoint.advance(&self.consumer_id, event.position).await?;
                     applied += 1;
                 }
                 Err(e) => {
                     // The fold above is NOT rolled back — registry state
-                    // reflects the log regardless of body success.
-                    return Err(e);
+                    // reflects the log regardless of body success. A
+                    // deterministic (poison) project failure parks + advances;
+                    // transient / under-budget propagates to retry.
+                    self.park_or_propagate(&event, e).await?;
+                    continue;
                 }
             }
         }
 
         Ok(StepOutcome::Progressed { applied })
+    }
+
+    /// On a per-event failure, apply the failure policy: either **park**
+    /// (append the built-in `causal:projection_failed` fact + advance past
+    /// the poison event — returns `Ok`, and the caller `continue`s), or
+    /// **propagate** the error (transient within the ceiling, or still under
+    /// the attempt budget) so the supervisor backs off and retries the same
+    /// event. Park I/O errors propagate too, so a failed park is retried.
+    async fn park_or_propagate(&self, event: &RecordedEvent, err: anyhow::Error) -> Result<()> {
+        match self.failure.on_failure(event.event_id, &err) {
+            FailureDecision::Park { class, attempts } => {
+                self.failure
+                    .park(
+                        self.log.as_ref(),
+                        &self.consumer_id,
+                        event,
+                        class,
+                        attempts,
+                        bounded_error_chain(&err),
+                        self.observer.as_deref(),
+                    )
+                    .await?;
+                self.checkpoint
+                    .advance(&self.consumer_id, event.position)
+                    .await?;
+                tracing::warn!(
+                    consumer = %self.consumer_id,
+                    event_id = %event.event_id,
+                    class = %class,
+                    attempts,
+                    "projector parked a deterministically-failing event and advanced",
+                );
+                Ok(())
+            }
+            FailureDecision::Retry => Err(err),
+        }
     }
 
     /// Replay log[ZERO..cursor] into the aggregator registry once per
@@ -289,7 +389,7 @@ where
                 let mut hit_cursor = false;
                 for event in batch {
                     if event.position > cursor { hit_cursor = true; break; }
-                    crate::aggregator::fold_event(
+                    if let Err(e) = crate::aggregator::fold_event(
                         reg,
                         None,
                         self.log.as_ref(),
@@ -301,7 +401,26 @@ where
                         event.position,
                         /* strict_to_event = */ true,
                     )
-                    .await?;
+                    .await
+                    {
+                        // Any event at position <= cursor was, in a prior life,
+                        // either folded Ok or parked (the only ways the cursor
+                        // passes an event under the poison-park policy). So a
+                        // deterministic fold error here means "previously
+                        // parked" — skip it to reproduce the original registry
+                        // state, rather than re-wedging on every boot. Non-poison
+                        // (backend) errors still propagate.
+                        if classify_structural(&e) == Some(ErrorClass::Poison) {
+                            tracing::warn!(
+                                consumer = %self.consumer_id,
+                                event_id = %event.event_id,
+                                error = %bounded_error_chain(&e),
+                                "skipping a previously-parked poison event during hydration",
+                            );
+                            continue;
+                        }
+                        return Err(e);
+                    }
                 }
                 if hit_cursor || last_pos >= cursor { break; }
                 from = last_pos;
@@ -729,5 +848,242 @@ mod tests {
 
         assert_eq!(*snap.lock(), Some(pinned),
                    "ctx.time() falls back to event.created_at when Event::occurred_at is None");
+    }
+
+    // ── H1: poison-park (mirror the reactor taxonomy) ─────────────────
+    use crate::projection_failure::PROJECTION_FAILED_KIND;
+
+    /// Append an event of the `recorded` kind with the given raw payload and
+    /// explicit subject placement (so a park fact has a stream to land in).
+    async fn append_recorded(
+        store: &MemoryStore,
+        subject: Uuid,
+        payload: serde_json::Value,
+    ) -> Uuid {
+        let event_id = Uuid::new_v4();
+        crate::append_event(store, EventData {
+            event_id,
+            causation_id: None,
+            workflow_id: Uuid::new_v4(),
+            event_type: <Recorded as Event>::NAME.to_string(),
+            payload,
+            created_at: Utc::now(),
+            category: Some(<Recorded as Event>::NAME.to_string()),
+            subject_id: Some(subject),
+            metadata: serde_json::Map::new(),
+            ephemeral: None,
+            persistent: true,
+        })
+        .await
+        .unwrap();
+        event_id
+    }
+
+    /// Projector that always fails with a chosen classification.
+    struct AlwaysFails {
+        class: &'static str,
+    }
+    #[async_trait]
+    impl Projector for AlwaysFails {
+        type Event = Recorded;
+        const NAME: &'static str = "always-fails";
+        async fn project(&self, _fact: &Recorded, _ctx: Ctx<'_>) -> Result<()> {
+            let e = anyhow!("boom");
+            Err(match self.class {
+                "transient" => crate::failure::transient(e),
+                "domain" => crate::failure::domain(e),
+                _ => e, // unclassified
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn poison_payload_parks_and_advances_instead_of_wedging() {
+        let store = Arc::new(MemoryStore::new());
+        let poison_subject = Uuid::new_v4();
+        // A payload that does NOT deserialize into `Recorded` (structural poison).
+        let poison_id =
+            append_recorded(&store, poison_subject, serde_json::json!({ "not": "a recorded" }))
+                .await;
+        // A healthy event after the poison.
+        let good = Recorded { id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let good_id =
+            append_recorded(&store, good.id, serde_json::to_value(&good).unwrap()).await;
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let runner = ProjectionRunner::new(
+            CollectingProjector { seen: seen.clone() },
+            "poison.proj",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        );
+
+        // Pre-fix: this returned Err with a frozen cursor. Now it parks the
+        // poison, applies the healthy event, and stays live.
+        let outcome = runner.step(10).await.unwrap();
+        assert!(matches!(outcome, StepOutcome::Progressed { applied: 1 }));
+        assert_eq!(seen.lock().as_slice(), &[good_id], "healthy event processed");
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await
+            .unwrap();
+        let parked = all
+            .iter()
+            .find(|e| e.event_type == PROJECTION_FAILED_KIND)
+            .expect("built-in projection_failed fact for the poison");
+        assert_eq!(parked.payload["class"], "poison");
+        assert_eq!(parked.payload["consumer"], "poison.proj");
+        assert_eq!(parked.payload["event_id"], poison_id.to_string());
+        assert_eq!(parked.payload["attempts"], 1, "poison parks on the first attempt");
+        assert_eq!(parked.subject_id, poison_subject,
+                   "park fact lands in the poison event's own subject history");
+
+        // Cursor advanced past the poison (a further step drains the park
+        // fact itself, which the consumer skips as a non-matching kind).
+        runner.step(10).await.unwrap();
+        let cursor = store.get("poison.proj").await.unwrap().unwrap();
+        let last = all.last().unwrap().position;
+        assert!(cursor >= last, "cursor advanced past the poison — consumer live");
+    }
+
+    #[tokio::test]
+    async fn replay_from_zero_reparks_without_duplicate_fact() {
+        let store = Arc::new(MemoryStore::new());
+        let poison_subject = Uuid::new_v4();
+        append_recorded(&store, poison_subject, serde_json::json!({ "bad": true })).await;
+
+        let mk = || ProjectionRunner::new(
+            CollectingProjector { seen: Arc::new(parking_lot::Mutex::new(Vec::new())) },
+            "replay.proj",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        );
+        // First life: park.
+        mk().step(10).await.unwrap();
+        // Replay from zero (fresh runner, cursor rewound): must re-park, not
+        // wedge, and the deterministic id must dedupe — exactly one fact.
+        store.set("replay.proj", LogCursor::ZERO).await.unwrap();
+        mk().step(10).await.unwrap();
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await
+            .unwrap();
+        let parked = all.iter().filter(|e| e.event_type == PROJECTION_FAILED_KIND).count();
+        assert_eq!(parked, 1, "replay re-parks idempotently (deterministic event_id)");
+    }
+
+    #[tokio::test]
+    async fn transient_failure_does_not_park_and_propagates() {
+        let store = Arc::new(MemoryStore::new());
+        append_recorded(&store, Uuid::new_v4(), serde_json::to_value(
+            &Recorded { id: Uuid::new_v4(), occurred_at: Utc::now() }).unwrap()).await;
+
+        let runner = ProjectionRunner::new(
+            AlwaysFails { class: "transient" },
+            "transient.proj",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        );
+        // Transient within the ceiling: propagate Err (supervisor retries),
+        // cursor frozen, no park fact.
+        assert!(runner.step(10).await.is_err(), "transient propagates, does not park");
+        assert!(store.get("transient.proj").await.unwrap().is_none(), "cursor frozen");
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        assert!(!all.iter().any(|e| e.event_type == PROJECTION_FAILED_KIND),
+                "no premature park on a transient error");
+    }
+
+    #[tokio::test]
+    async fn unclassified_failure_parks_after_attempt_budget() {
+        let store = Arc::new(MemoryStore::new());
+        let subject = Uuid::new_v4();
+        append_recorded(&store, subject, serde_json::to_value(
+            &Recorded { id: subject, occurred_at: Utc::now() }).unwrap()).await;
+
+        let runner = ProjectionRunner::new(
+            AlwaysFails { class: "unclassified" },
+            "budget.proj",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        )
+        .with_retry_policy(RetryPolicy::from_max_attempts(2));
+
+        // Attempt 1: under budget → Err (retry).
+        assert!(runner.step(10).await.is_err());
+        assert!(store.get("budget.proj").await.unwrap().is_none(), "still frozen at attempt 1");
+        // Attempt 2: budget exhausted → park + advance.
+        runner.step(10).await.unwrap();
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        let parked = all.iter().find(|e| e.event_type == PROJECTION_FAILED_KIND)
+            .expect("parked after the attempt budget");
+        assert_eq!(parked.payload["class"], "unclassified");
+        assert_eq!(parked.payload["attempts"], 2);
+    }
+
+    #[tokio::test]
+    async fn previously_parked_poison_is_skipped_during_hydration() {
+        use crate::aggregate::{Aggregate, Apply};
+        use crate::aggregator::{Aggregator, AggregatorRegistry};
+
+        #[derive(Default, Clone, Serialize, Deserialize)]
+        struct Ping { id: Uuid }
+        impl Event for Ping {
+            const NAME: &'static str = "ping";
+            fn subject_id(&self) -> Uuid { self.id }
+        }
+        #[derive(Default, Clone, Serialize, Deserialize)]
+        struct PingCount { n: u32 }
+        impl Aggregate for PingCount {
+            const NAME: &'static str = "PingCount";
+            const SUBJECT: &'static str = "ping";
+        }
+        impl Apply<Ping> for PingCount {
+            fn apply(&mut self, _: &Ping) { self.n += 1; }
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let poison_subject = Uuid::new_v4();
+        crate::append_event(store.as_ref(), EventData {
+            event_id: Uuid::new_v4(),
+            causation_id: None,
+            workflow_id: Uuid::new_v4(),
+            event_type: "ping".into(),
+            payload: serde_json::json!({ "not": "a ping" }),
+            created_at: Utc::now(),
+            category: Some("ping".into()),
+            subject_id: Some(poison_subject),
+            metadata: serde_json::Map::new(),
+            ephemeral: None,
+            persistent: true,
+        }).await.unwrap();
+
+        let mk_reg = || {
+            let mut reg = AggregatorRegistry::new();
+            reg.register(Aggregator::for_type::<PingCount, Ping>());
+            Arc::new(reg)
+        };
+
+        // First life: fold poison → park + advance past it.
+        let r1 = ProjectionRunner::new(
+            CollectingProjector { seen: Arc::new(parking_lot::Mutex::new(Vec::new())) },
+            "hydrate.proj",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        ).with_aggregators(mk_reg());
+        r1.step(10).await.unwrap();
+        let cursor = store.get("hydrate.proj").await.unwrap();
+        assert!(cursor.is_some_and(|c| c > LogCursor::ZERO), "advanced past the poison fold");
+
+        // Second life: a fresh runner at the advanced cursor hydrates
+        // [ZERO..cursor], re-hits the poison fold — and must SKIP it, not
+        // wedge. Pre-fix, ensure_hydrated `?`'d and errored on every boot.
+        let r2 = ProjectionRunner::new(
+            CollectingProjector { seen: Arc::new(parking_lot::Mutex::new(Vec::new())) },
+            "hydrate.proj",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn CheckpointStore>,
+        ).with_aggregators(mk_reg());
+        r2.step(10).await.expect("hydration skips the previously-parked poison");
     }
 }

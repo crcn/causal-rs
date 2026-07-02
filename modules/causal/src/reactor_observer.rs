@@ -71,6 +71,23 @@ pub trait ReactorObserver: Send + Sync + 'static {
         _at: DateTime<Utc>,
     ) {}
 
+    /// Called after a projector/multi-projector parked a poison event as a
+    /// terminal failure — a deterministically-failing `project`/fold that
+    /// exhausted its policy. The runner advances past the event (emitting a
+    /// built-in `causal:projection_failed` fact) instead of wedging. Mirrors
+    /// [`reactor_terminal_failure`](Self::reactor_terminal_failure) for the
+    /// serial projection runners.
+    fn projection_terminal_failure(
+        &self,
+        _event_id: Uuid,
+        _consumer_id: &str,
+        _workflow_id: Uuid,
+        _attempts: u32,
+        _error: &str,
+        _at: DateTime<Utc>,
+    ) {
+    }
+
     /// Called when a reactor's output diverged from the row already
     /// persisted under the same identity-keyed `event_id` on redelivery
     /// (a full replay, or a crash between append and ack) — the producer

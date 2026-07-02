@@ -1,6 +1,18 @@
 # H1 — Projector / multi-projector poison wedge (CRITICAL, correctness)
 
-**Status:** open. **Decided direction:** mirror the reactor failure taxonomy
+**Status: ✅ RESOLVED (0.18.0, 2026-07-02).** Both serial runners now classify
+per-event failures via the shared reactor taxonomy (`crate::projection_failure`
++ `crate::failure::classify_structural`): poison parks a built-in
+`causal:projection_failed` fact (deterministic id → replay-idempotent) on the
+event's subject history and advances; transient retries to the liveness
+ceiling; domain/unclassified to `max_attempts`. Hydration skips a
+previously-parked poison instead of re-wedging. Tests in `projection_runner.rs`
+and `multi_projector.rs`. H2 (upcaster) stays open — parking is containment,
+not recovery.
+
+_Original finding below._
+
+**Decided direction:** mirror the reactor failure taxonomy
 (poison parks + advances; transient retries; domain budget).
 
 ## Finding

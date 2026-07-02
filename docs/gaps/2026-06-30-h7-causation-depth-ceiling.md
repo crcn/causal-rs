@@ -1,6 +1,21 @@
 # H7 — No causal-cycle / causation-depth failsafe (MEDIUM, availability/safety)
 
-**Status:** open. **Decided direction:** causation-depth ceiling.
+**Status: ✅ RESOLVED (0.18.0, 2026-07-02).** Reactor outputs carry
+`metadata["causal:causation_depth"]` (trigger+1; caller-emitted = 0). A
+reaction whose trigger sits at depth `>= ceiling` parks as a terminal failure
+(class `poison`, diagnostic naming reactor/trigger/depth/ceiling) via the
+existing park path, instead of emitting. Default ceiling **256**
+(`DEFAULT_CAUSATION_DEPTH_CEILING`), configurable via
+`EngineBuilder::with_causation_depth_ceiling(impl Into<Option<u32>>)` /
+`ReactorRunner::with_causation_depth_ceiling` (`None` disables). A cycle guard
+in `park_terminal_failure` skips the park-fact append when the trigger is
+already strictly beyond the ceiling, so a reactor keyed on the park fact can't
+storm. Tests in `reactor_runner.rs`. Behavioral breaking change (default-on);
+migration note in CHANGELOG 0.18.0.
+
+_Original finding below._
+
+**Decided direction:** causation-depth ceiling.
 
 ## Finding
 A reactor whose output kind matches its own trigger kind (or a multi-hop cycle

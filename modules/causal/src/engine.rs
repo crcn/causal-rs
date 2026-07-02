@@ -738,6 +738,7 @@ pub(crate) struct ConsumerWiring {
     pub occ: Arc<std::collections::HashSet<String>>,
     pub failure_mapper: Option<TerminalFailureMapper>,
     pub max_attempts: u32,
+    pub causation_depth_ceiling: Option<u32>,
     pub observer: Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     pub effect_store: Option<Arc<dyn crate::effect_store::EffectStore>>,
     pub workflow_hw: WorkflowHighWater,
@@ -782,6 +783,8 @@ pub struct EngineBuilder {
     default_metadata:      Metadata,
     failure_mapper:            Option<TerminalFailureMapper>,
     max_attempts:          u32,
+    /// H7 causation-depth ceiling applied to every reactor. `None` disables.
+    causation_depth_ceiling:   Option<u32>,
     observer:              Option<Arc<dyn crate::reactor_observer::ReactorObserver>>,
     /// Reaction-result cache (Phase 4). Plumbed into every `ReactorRunner`
     /// registered *after* this is set (same ordering rule as `observer`),
@@ -875,6 +878,7 @@ impl EngineBuilder {
             default_metadata: Metadata::new(),
             failure_mapper: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            causation_depth_ceiling: Some(crate::reactor_runner::DEFAULT_CAUSATION_DEPTH_CEILING),
             observer: None,
             effect_store: Some(Arc::new(crate::effect_store::InMemoryEffectStore::new())),
             explicit_effect_store: false,
@@ -1034,6 +1038,24 @@ impl EngineBuilder {
         self
     }
 
+    /// Set the **causation-depth ceiling** (H7) for every reactor: a runtime
+    /// failsafe against reactive cycles. A reaction whose trigger sits at
+    /// depth `>= ceiling` parks as a terminal failure (class `poison`,
+    /// diagnostic naming the reactor / trigger kind / depth) instead of
+    /// emitting. Depth rides output metadata (`causal:causation_depth`):
+    /// caller-emitted events are depth 0, and each reactor output is one
+    /// deeper than its trigger. Identity-keyed dedup cannot break a cycle
+    /// (each generation has a fresh `event_id`), so this is the backstop.
+    ///
+    /// Defaults to `Some(`[`DEFAULT_CAUSATION_DEPTH_CEILING`]`)`
+    /// (`crate::reactor_runner::DEFAULT_CAUSATION_DEPTH_CEILING`, 256). Pass a
+    /// larger value for a legitimately deep reactive chain, or `None` to
+    /// disable the failsafe entirely.
+    pub fn with_causation_depth_ceiling(mut self, ceiling: impl Into<Option<u32>>) -> Self {
+        self.causation_depth_ceiling = ceiling.into();
+        self
+    }
+
     /// Wire a durable [`SnapshotStore`](crate::snapshot_store::SnapshotStore)
     /// so folded aggregate state survives restart. With it set, an aggregate
     /// that declares an
@@ -1154,7 +1176,10 @@ impl EngineBuilder {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         self.consumers.push(Box::new(move |w: ConsumerWiring| {
-            let mut runner = ProjectionRunner::new(p, P::NAME, log, checkpoint);
+            let mut runner = ProjectionRunner::new(p, P::NAME, log, checkpoint)
+                .with_retry_policy(crate::reactor::RetryPolicy::from_max_attempts(w.max_attempts))
+                .with_clock(w.clock)
+                .with_settle_tracker(w.workflow_hw);
             if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
             if let Some(leasor) = w.leasor { runner = runner.with_consumer_leasor(leasor); }
@@ -1180,7 +1205,8 @@ impl EngineBuilder {
                 .unwrap_or_else(|| crate::reactor::RetryPolicy::from_max_attempts(w.max_attempts));
             let mut runner = ReactorRunner::new(r, R::NAME, log, reactor_checkpoint)
                 .with_retry_policy(effective_policy)
-                .with_clock(w.clock);
+                .with_clock(w.clock)
+                .with_causation_depth_ceiling(w.causation_depth_ceiling);
             if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
             if let Some(mapper) = w.failure_mapper {
                 runner = runner.with_terminal_failure(mapper);
@@ -1244,7 +1270,10 @@ impl EngineBuilder {
         let log = self.log.clone();
         let checkpoint = self.checkpoint.clone();
         self.consumers.push(Box::new(move |w: ConsumerWiring| {
-            let mut runner = MultiProjectorRunner::new(p, P::NAME, log, checkpoint);
+            let mut runner = MultiProjectorRunner::new(p, P::NAME, log, checkpoint)
+                .with_retry_policy(crate::reactor::RetryPolicy::from_max_attempts(w.max_attempts))
+                .with_clock(w.clock)
+                .with_settle_tracker(w.workflow_hw);
             if let Some(aggs) = w.aggs { runner = runner.with_aggregators(aggs); }
             if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
             if let Some(leasor) = w.leasor { runner = runner.with_consumer_leasor(leasor); }
@@ -1460,6 +1489,7 @@ impl EngineBuilder {
                     occ: occ_shared.clone(),
                     failure_mapper: self.failure_mapper.clone(),
                     max_attempts: self.max_attempts,
+                    causation_depth_ceiling: self.causation_depth_ceiling,
                     observer: self.observer.clone(),
                     effect_store: self.effect_store.clone(),
                     workflow_hw: self.workflow_hw.clone(),
@@ -2204,7 +2234,7 @@ impl Engine {
                     subject = %subject,
                     %subject_id,
                     revision = write.revision.raw(),
-                    error = %format!("{e:#}"),
+                    error = %crate::failure::bounded_error_chain(&e),
                     "post-append engine-registry fold deferred; durable append \
                      intact, registry will repair on next fold / read-through restore",
                 );
@@ -2833,7 +2863,7 @@ async fn supervise_one(
                 // never advances the cursor — which is exactly what wedges
                 // `settle` (it waits on this consumer's floor forever).
                 // Record the run so `settle` can surface it.
-                health.note_failure(format!("{e:#}"));
+                health.note_failure(crate::failure::bounded_error_chain(&e));
                 tracing::warn!(
                     consumer = consumer.consumer_id(),
                     error = %e,

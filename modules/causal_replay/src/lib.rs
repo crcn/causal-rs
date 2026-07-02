@@ -92,7 +92,7 @@ pub use pointer::PgPointerStore;
 pub use reactor_checkpoint::PgReactorCheckpoint;
 
 #[cfg(feature = "postgres")]
-pub use reactor_observer::PgReactorObserver;
+pub use reactor_observer::{PgReactorObserver, INSPECTOR_SCHEMA_SQL};
 
 #[cfg(feature = "postgres")]
 pub use inspector_read_model::PgInspectorReadModel;

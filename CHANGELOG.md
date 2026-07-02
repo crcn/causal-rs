@@ -6,6 +6,75 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-07-02
+
+Wedge-class + observability hardening surfaced by a downstream (rootsignal)
+incident. One behavioral breaking change (H7, default-on cycle failsafe); the
+rest is additive or internal.
+
+### Added
+
+- **`EngineBuilder::with_causation_depth_ceiling(impl Into<Option<u32>>)` and
+  `ReactorRunner::with_causation_depth_ceiling`** — configure the H7 causation
+  depth failsafe (see BREAKING below). Pass a larger value for a legitimately
+  deep reactive chain, or `None` to disable.
+- **Projector/multi-projector failure policy** — `ProjectionRunner` and
+  `MultiProjectorRunner` now classify per-event failures (shared reactor
+  taxonomy) and, on a deterministic (poison) failure, park a built-in
+  `causal:projection_failed` fact on the event's own subject history and
+  advance past it. Wired through the engine builder with the same
+  `max_attempts`/clock/settle defaults as reactors. New default-no-op
+  `ReactorObserver::projection_terminal_failure` hook.
+- **`PgReactorObserver::ensure_schema(pool)` / `new_with_ensure_schema(pool)`**
+  — idempotent `CREATE TABLE IF NOT EXISTS` provisioning for all five inspector
+  read-model tables the observer writes. `ensure_schema` is never run
+  implicitly by `new`. For consumers with a migration pipeline the same DDL is
+  exported as `causal_replay::INSPECTOR_SCHEMA_SQL`. Fixes a footgun where a
+  consumer's database could be missing `causal_reactor_divergences` (whose
+  migration shipped after 0.16) because the crate never owned its own DDL.
+
+### Changed
+
+- **BREAKING (behavioral) — causation-depth ceiling, default 256 (H7).**
+  Reactor outputs now carry `metadata["causal:causation_depth"]` (trigger
+  depth + 1; caller-emitted events are depth 0). A reaction whose trigger sits
+  at depth `>= 256` **parks** as a terminal failure (`causal:reaction_failed`,
+  class `poison`, diagnostic naming the reactor / trigger kind / depth /
+  ceiling) instead of emitting — a runtime failsafe against reactive cycles
+  (an output kind feeding its own trigger kind, directly or multi-hop) that
+  identity-keyed dedup cannot catch. **Migration:** a chain legitimately
+  deeper than 256 generations must raise the ceiling via
+  `EngineBuilder::with_causation_depth_ceiling(n)` or disable with `None`. The
+  `causal:causation_depth` metadata key is reserved.
+
+### Fixed
+
+- **Projector poison wedge (H1).** A poison event — a payload that no longer
+  deserializes into the registered type, or a deterministically-erroring
+  `project`/fold — previously made `ProjectionRunner`/`MultiProjectorRunner`
+  return `Err` forever with a frozen cursor (the supervisor retried a
+  deterministic failure indefinitely; replay-from-zero re-poisoned). It now
+  parks and advances, mirroring the reactor taxonomy, and hydration skips a
+  previously-parked poison instead of re-wedging on every boot. Transient
+  errors still retry to a liveness ceiling; domain/unclassified to
+  `max_attempts`.
+- **Bounded error-chain rendering on the reactor retry/park/supervisor paths.**
+  Error chains formatted into logs, worker-stall strings, observer callbacks,
+  and `causal:reaction_failed` payloads are now capped (32 causes / 8 KiB,
+  `…`-truncated). A downstream error type with a recursive/pathologically deep
+  `source()` chain could otherwise drive `format!("{e:#}")` to a stack
+  overflow when a step failed identically every pass. Classification and retry
+  semantics are unchanged — log/diagnostic formatting only. Adds a small-stack
+  regression guard.
+- **`PgReactorObserver` no longer drops a whole batch when one record class
+  fails.** The batch is still written in one transaction on the fast path; on
+  failure the writer now falls back to per-record transactions, so e.g. a
+  missing `causal_reactor_divergences` table no longer silently discards
+  co-batched execution/log rows. A missing table (SQLSTATE 42P01) is logged
+  once per table with a remediation hint pointing at `ensure_schema` /
+  `INSPECTOR_SCHEMA_SQL`. Best-effort/lossy semantics and the hot path
+  (`try_send`) are unchanged.
+
 ## [0.17.1] — 2026-07-01
 
 Observability release. Fully additive — no behavior changes, no API changes.
