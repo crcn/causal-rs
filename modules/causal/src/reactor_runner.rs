@@ -337,6 +337,9 @@ struct Core<R: Reactor> {
     /// (full processed-vs-never-ran signal). Set `false` to elide empty
     /// seals where fan-out no-op traffic would dominate the write path (A6).
     seal_empty_decisions: bool,
+    /// Optional per-attempt `react()` timeout (D3). `None` = unbounded. A
+    /// body exceeding it fails TRANSIENT (retries), never poison.
+    attempt_timeout: Option<std::time::Duration>,
     /// Engine-level aggregator registry. Reactor outputs are folded into
     /// it after they're appended, so `engine.state_of::<A>(id)` reflects
     /// reactor-emitted events (not just caller-emitted ones).
@@ -429,6 +432,7 @@ where
                 effect_store: None,
                 decision_store: None,
                 seal_empty_decisions: true,
+                attempt_timeout: None,
                 engine_aggregators: None,
                 settle_tracker: None,
                 snapshot_store: None,
@@ -524,6 +528,15 @@ where
     /// (default `true`). See [`Core::seal_empty_decisions`].
     pub fn with_seal_empty_decisions(mut self, seal: bool) -> Self {
         self.core_mut().seal_empty_decisions = seal;
+        self
+    }
+
+    /// Set a per-attempt `react()` timeout (D3). A body exceeding it fails
+    /// TRANSIENT (retries under the transient ceiling), never poison. Default
+    /// is unbounded — set a generous value for reactors doing legitimately
+    /// long-running work (e.g. multi-minute LLM effects).
+    pub fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.core_mut().attempt_timeout = Some(timeout);
         self
     }
 
@@ -1229,15 +1242,34 @@ where
         // ── Decision. A panic is caught and treated as an attempt
         //    failure (worker-local retry), mirroring the serial
         //    supervisor's catch_unwind.
-        let reacted = AssertUnwindSafe(self.reactor.react(&trigger, ctx))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|panic| {
+        let react_fut =
+            AssertUnwindSafe(self.reactor.react(&trigger, ctx)).catch_unwind();
+        let unwrap_panic = |res: std::result::Result<Result<crate::reactor::Events>, _>| {
+            res.unwrap_or_else(|panic| {
                 Err(anyhow::anyhow!(
                     "reactor panicked: {}",
                     crate::engine::panic_payload_message(&panic),
                 ))
-            });
+            })
+        };
+        // D3: an optional per-reactor attempt timeout. A body that exceeds it
+        // is TRANSIENT (retry under the transient ceiling), never poison — a
+        // slow external call is "still running took too long", not a
+        // deterministic failure. Downstream reactors doing multi-minute LLM
+        // effects set a generous override; the default (`None`) is unbounded.
+        let reacted = match self.attempt_timeout {
+            Some(limit) => match tokio::time::timeout(limit, react_fut).await {
+                Ok(res) => unwrap_panic(res),
+                Err(_elapsed) => Err(crate::failure::transient(anyhow::anyhow!(
+                    "reactor '{}' attempt exceeded its {:?} timeout — retrying \
+                     (raise via .with_attempt_timeout if this work is legitimately \
+                     long-running)",
+                    self.consumer_id,
+                    limit,
+                ))),
+            },
+            None => unwrap_panic(react_fut.await),
+        };
 
         let emitted = match reacted {
             Ok(events) => {
@@ -4460,6 +4492,52 @@ mod tests {
         assert_eq!(
             all.iter().filter(|e| e.event_type == "shipped_notification").count(),
             2, "both outputs present — the batch completed from the record",
+        );
+    }
+
+    /// Reactor that sleeps past the attempt timeout on its first call, then
+    /// is fast — so a per-reactor timeout fails the first attempt (transient)
+    /// and the retry succeeds.
+    struct SlowFirstThenFast { calls: Arc<AtomicUsize> }
+    #[async_trait]
+    impl Reactor for SlowFirstThenFast {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "slow-first";
+        async fn react(&self, trigger: &OrderPlaced, _c: Ctx<'_>) -> Result<Events> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            let mut out = Events::new();
+            out.push(ShippedNotification { order_id: trigger.order_id });
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn attempt_timeout_fails_transient_then_retry_succeeds() {
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        append_trigger(&store, &trigger);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+
+        let runner = ReactorRunner::new(
+            SlowFirstThenFast { calls: calls.clone() },
+            "r.timeout",
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_decision_store(ds)
+        .with_attempt_timeout(Duration::from_millis(30));
+        runner.quiesce().await.unwrap();
+        runner.halt();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "first attempt timed out; retry ran");
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.event_type == "shipped_notification").count(), 1,
+            "the retry's output landed exactly once",
         );
     }
 

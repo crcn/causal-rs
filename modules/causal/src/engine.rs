@@ -266,6 +266,7 @@ where
 #[derive(Debug, Clone, Default)]
 pub struct RunnerConfig {
     skip_gap_on_start: bool,
+    attempt_timeout: Option<std::time::Duration>,
 }
 
 impl RunnerConfig {
@@ -284,7 +285,7 @@ impl RunnerConfig {
     /// listing the skipped range and workflow IDs that may need external
     /// re-triggering.
     pub fn start_at_latest_dropping_gap() -> Self {
-        Self { skip_gap_on_start: true }
+        Self { skip_gap_on_start: true, attempt_timeout: None }
     }
 
     /// Deprecated alias for [`start_at_latest_dropping_gap`](Self::start_at_latest_dropping_gap).
@@ -296,6 +297,16 @@ impl RunnerConfig {
     )]
     pub fn skip_gap_on_start() -> Self {
         Self::start_at_latest_dropping_gap()
+    }
+
+    /// Set a per-attempt `react()` timeout for this reactor (D3). A body
+    /// exceeding it fails TRANSIENT (retries under the transient ceiling),
+    /// never poison. Default is unbounded — set a generous value for a
+    /// reactor doing legitimately long-running work (e.g. multi-minute LLM
+    /// effects). Chainable with the start-position constructors.
+    pub fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.attempt_timeout = Some(timeout);
+        self
     }
 }
 
@@ -1357,7 +1368,22 @@ impl EngineBuilder {
         self
     }
 
-    pub fn with_reactor<R: Reactor + 'static>(mut self, r: R) -> Self
+    pub fn with_reactor<R: Reactor + 'static>(self, r: R) -> Self
+    where
+        R::Trigger: DeserializeOwned,
+    {
+        self.register_reactor(r, None)
+    }
+
+    /// Shared reactor registration. `attempt_timeout` is the per-reactor
+    /// `react()` timeout (D3), captured into the runner factory. Seeds at
+    /// `ResumeOrLatest`; `with_reactor_start` / `reactor_with` adjust the
+    /// seed afterward.
+    fn register_reactor<R: Reactor + 'static>(
+        mut self,
+        r: R,
+        attempt_timeout: Option<std::time::Duration>,
+    ) -> Self
     where
         R::Trigger: DeserializeOwned,
     {
@@ -1384,6 +1410,7 @@ impl EngineBuilder {
             if let Some(rc) = w.effect_store { runner = runner.with_effect_store(rc); }
             if let Some(ds) = w.decision_store { runner = runner.with_decision_store(ds); }
             runner = runner.with_seal_empty_decisions(w.seal_empty_decisions);
+            if let Some(t) = attempt_timeout { runner = runner.with_attempt_timeout(t); }
             runner = runner.with_engine_aggregators(w.engine_aggs);
             runner = runner.with_settle_tracker(w.workflow_hw);
             runner = runner.with_snapshot_persistence(w.snapshot_store, w.snapshot_every);
@@ -1419,7 +1446,11 @@ impl EngineBuilder {
         } else {
             crate::projection::StartPosition::ResumeOrLatest
         };
-        self.with_reactor_start(r, start)
+        let mut b = self.register_reactor(r, config.attempt_timeout);
+        if let Some(seed) = b.reactor_seeds.last_mut() {
+            seed.1 = start;
+        }
+        b
     }
 
     /// Register a [`MultiProjector`] — cross-domain projection
