@@ -1,0 +1,24 @@
+# Reactor-authoring guardrail (D7).
+#
+# Copy this into a `clippy.toml` at your crate root (or merge the
+# `disallowed-methods` entries into an existing one) to make the reactor
+# determinism contract enforce itself instead of living as folklore.
+#
+# A reactor body must be replayable: its outputs are keyed by an
+# identity-derived event_id, and — as of 0.19 — sealed into a decision record
+# on first delivery and replayed verbatim afterwards. Nondeterministic inputs
+# (a fresh UUID, the wall clock, an RNG, HashMap iteration order) leaking into
+# an output payload break replay parity. Route them through `ctx` instead:
+#   - identifiers / timestamps: derive from the trigger, or `ctx.time()`
+#   - external calls: wrap in `ctx.effect(label, ..)` so they memoize
+#
+# These lints fire everywhere by default; if a non-reactor module legitimately
+# needs `Uuid::new_v4()` / `Utc::now()`, `#[allow(clippy::disallowed_methods)]`
+# it locally with a comment, or scope this file to your reactor modules.
+
+disallowed-methods = [
+    { path = "uuid::Uuid::new_v4", reason = "nondeterministic in a reactor body; derive ids from the trigger or use ctx" },
+    { path = "chrono::Utc::now", reason = "nondeterministic in a reactor body; use ctx.time() / an injected Clock" },
+    { path = "std::time::SystemTime::now", reason = "nondeterministic in a reactor body; use ctx.time() / an injected Clock" },
+    { path = "rand::random", reason = "nondeterministic in a reactor body; memoize randomness via ctx.effect(label, ..)" },
+]

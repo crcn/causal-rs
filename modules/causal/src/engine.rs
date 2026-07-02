@@ -270,19 +270,72 @@ pub struct RunnerConfig {
 
 impl RunnerConfig {
     /// Advance this reactor's checkpoint to the log tip on startup,
-    /// abandoning any gap since the last clean drain.
+    /// **dropping every trigger in the gap** since the last clean drain.
     ///
-    /// Safe only when the reactor's work re-derives from an external
-    /// re-trigger (a due-sweep, a scheduler, a webhook) on every startup.
-    /// If any trigger arrives exactly once and is never re-emitted,
-    /// those workflows will stall silently after a crash.
+    /// The name says the trade plainly (A7): this is not an optimization, it
+    /// *loses data on restart*. Safe only when the reactor's work re-derives
+    /// from an external re-trigger (a due-sweep, a scheduler, a webhook) on
+    /// every startup. If any trigger arrives exactly once and is never
+    /// re-emitted, those workflows stall silently after a crash.
     ///
-    /// A WARN is emitted at startup listing the gap that was skipped and
-    /// workflow IDs that may need external re-triggering.
-    pub fn skip_gap_on_start() -> Self {
+    /// **Decision records do NOT protect a skipped gap.** Records make a
+    /// *delivered* trigger replay its decision; a gap trigger is never
+    /// delivered, so there is nothing to replay. A WARN is emitted at startup
+    /// listing the skipped range and workflow IDs that may need external
+    /// re-triggering.
+    pub fn start_at_latest_dropping_gap() -> Self {
         Self { skip_gap_on_start: true }
     }
+
+    /// Deprecated alias for [`start_at_latest_dropping_gap`](Self::start_at_latest_dropping_gap).
+    /// The old name reads as an optimization; it means *drop data on
+    /// restart*. Kept one release for migration.
+    #[deprecated(
+        since = "0.19.0",
+        note = "renamed to start_at_latest_dropping_gap — the old name hid that it drops gap triggers on restart"
+    )]
+    pub fn skip_gap_on_start() -> Self {
+        Self::start_at_latest_dropping_gap()
+    }
 }
+
+/// [`Engine::settle`] gave up waiting because the consumer it was blocked on
+/// stopped making progress for longer than the configured
+/// [`with_settle_liveness_ceiling`](EngineBuilder::with_settle_liveness_ceiling)
+/// (D3). **This does not mean the work failed** — the consumer is still
+/// running (or its supervisor is absent/blocked); it simply did not drain
+/// within the ceiling. Callers can downcast the `anyhow::Error` from
+/// `settle` to this type to distinguish "still running" from a genuine
+/// wedge (which stays a plain error carrying the consumer's last failure).
+#[derive(Debug, Clone)]
+pub struct SettleTimeout {
+    /// The workflow that had not drained.
+    pub workflow_id: Uuid,
+    /// How long the blocking consumer's supervisor had been idle (no
+    /// completed cycle) when settle gave up — i.e. time since last progress.
+    pub last_progress: std::time::Duration,
+    /// The configured liveness ceiling that was exceeded.
+    pub ceiling: std::time::Duration,
+    /// The consumer settle was blocked on.
+    pub consumer: String,
+}
+
+impl std::fmt::Display for SettleTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "settle: consumer `{}` is unresponsive — its supervisor has not \
+             completed a cycle for {:?} (ceiling {:?}), so workflow {} has not \
+             drained. The consumer is not failing (no error to report); its \
+             supervisor task is likely dead, never spawned, or blocked inside a \
+             step (e.g. a held lease). NOTE: the work may still be running — \
+             this is a liveness timeout, not a failure.",
+            self.consumer, self.last_progress, self.ceiling, self.workflow_id,
+        )
+    }
+}
+
+impl std::error::Error for SettleTimeout {}
 
 // ─────────────────────────────────────────────────────────────────────
 // DrainResult
@@ -1351,8 +1404,8 @@ impl EngineBuilder {
     ///
     /// ```ignore
     /// Engine::builder()
-    ///     .reactor_with(DueSweep::new(), RunnerConfig::skip_gap_on_start())
-    ///     .reactor_with(WebScraper::new(), RunnerConfig::skip_gap_on_start())
+    ///     .reactor_with(DueSweep::new(), RunnerConfig::start_at_latest_dropping_gap())
+    ///     .reactor_with(WebScraper::new(), RunnerConfig::start_at_latest_dropping_gap())
     ///     .reactor(MigrationReactor::new())  // default: replays gap
     ///     .build(log, checkpoints).await?
     ///     .run_until_shutdown().await;
@@ -1564,7 +1617,7 @@ impl EngineBuilder {
                 (ResumeOrLatest, None)    => Some(self.log.latest_position().await?),
                 // Latest deliberately ignores a persisted cursor — the
                 // backlog is skipped on every (re)build. Used by
-                // reactor_with(r, RunnerConfig::skip_gap_on_start()).
+                // reactor_with(r, RunnerConfig::start_at_latest_dropping_gap()).
                 (Latest, _)               => Some(self.log.latest_position().await?),
                 (Zero, _)                 => Some(LogCursor::ZERO),
                 (Specific(c), _)          => Some(*c),
@@ -2608,15 +2661,15 @@ impl Engine {
                     if let Some(ceiling) = self.settle_liveness_ceiling {
                         let idle = health.idle_for();
                         if idle > ceiling {
-                            return Err(anyhow::anyhow!(
-                                "settle: consumer `{}` is unresponsive — its supervisor \
-                                 has not completed a cycle for {:?} (ceiling {:?}), so \
-                                 workflow {} can never drain to high-water {:?}. The \
-                                 consumer is not failing (no error to report) — its \
-                                 supervisor task is likely dead, never spawned, or \
-                                 blocked inside a step (e.g. a held lease).",
-                                consumer.consumer_id(), idle, ceiling, wf, hw,
-                            ));
+                            // Typed (D3): "still running", not "failed" — the
+                            // caller can downcast to distinguish this from a
+                            // genuine wedge.
+                            return Err(anyhow::Error::new(SettleTimeout {
+                                workflow_id: wf,
+                                last_progress: idle,
+                                ceiling,
+                                consumer: consumer.consumer_id().to_string(),
+                            }));
                         }
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;

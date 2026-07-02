@@ -148,6 +148,7 @@ pub use engine::{
     DrainResult, RunnerConfig,
     Engine, EngineBuilder,
     EmitBuilder, EmitResult, SettledEmit,
+    SettleTimeout,
     TerminalFailure,
     MultiProjectorRegistration, ProjectorRegistration, ReactorRegistration,
 };
