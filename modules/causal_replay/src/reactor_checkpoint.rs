@@ -111,6 +111,14 @@ mod pg {
             .await?;
             Ok(r.rows_affected())
         }
+
+        async fn list_consumers(&self) -> Result<Vec<String>> {
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT consumer_id FROM causal_checkpoints")
+                    .fetch_all(&self.pool)
+                    .await?;
+            Ok(rows.into_iter().map(|(c,)| c).collect())
+        }
     }
 
     #[async_trait]

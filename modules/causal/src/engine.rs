@@ -875,6 +875,10 @@ pub struct EngineBuilder {
     /// D5: fold-determinism self-check. Set by test constructors
     /// (`memory` / `in_memory_for_tests`); off in production.
     fold_self_check: bool,
+    /// D4: when `true`, a boot-time orphaned-consumer finding is a hard build
+    /// error instead of a WARN. For CI, where a rename that stranded a
+    /// checkpoint/decision/effect row should fail the pipeline.
+    orphan_detection_strict: bool,
     /// Per-workflow high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
@@ -1016,6 +1020,7 @@ impl EngineBuilder {
             seal_empty_decisions: true,
             decision_retention: std::time::Duration::from_secs(7 * 24 * 3600),
             fold_self_check: false,
+            orphan_detection_strict: false,
             workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
@@ -1104,6 +1109,16 @@ impl EngineBuilder {
     /// matters for state reconstruction.
     pub fn with_fold_self_check(mut self, on: bool) -> Self {
         self.fold_self_check = on;
+        self
+    }
+
+    /// Make boot-time orphan detection (D4) a hard build error rather than a
+    /// WARN. A checkpoint/decision/effect row whose consumer id is not a
+    /// registered consumer usually means a rename stranded durable state;
+    /// enable this in CI to fail on it. Off by default (warn only), since a
+    /// legitimately-decommissioned consumer leaves orphan rows until GC.
+    pub fn with_strict_orphan_detection(mut self, strict: bool) -> Self {
+        self.orphan_detection_strict = strict;
         self
     }
 
@@ -1704,6 +1719,50 @@ impl EngineBuilder {
                         }
                     }
                 }
+            }
+        }
+
+        // D4: boot-time orphan detection. A checkpoint/decision/effect row
+        // whose consumer id is not a registered consumer usually means a
+        // rename stranded durable state (cursors that never advance,
+        // decisions/effects that never GC) — the likeliest brittleness in a
+        // fast-renaming pre-1.0 codebase. Warn, or fail in strict mode.
+        // Best-effort: backends that don't enumerate return empty and no-op.
+        {
+            let registered = &self.consumer_names;
+            let mut orphans: Vec<String> = Vec::new();
+            let mut scan = |source: &str, ids: Vec<String>, out: &mut Vec<String>| {
+                for id in ids {
+                    if !registered.contains(&id) {
+                        out.push(format!("{source} consumer `{id}`"));
+                    }
+                }
+            };
+            scan("checkpoint", self.checkpoint.list_consumers().await.unwrap_or_default(), &mut orphans);
+            if let Some(ds) = &self.decision_store {
+                scan("decision-store", ds.list_consumers().await.unwrap_or_default(), &mut orphans);
+            }
+            if let Some(es) = &self.effect_store {
+                scan("effect-store", es.list_consumers().await.unwrap_or_default(), &mut orphans);
+            }
+            if !orphans.is_empty() {
+                let list = orphans.join(", ");
+                if self.orphan_detection_strict {
+                    anyhow::bail!(
+                        "EngineBuilder::build: orphaned durable state — persisted rows \
+                         whose consumer id is not a registered consumer (did you rename \
+                         a reactor/projector?): {list}. Remove the stale rows or restore \
+                         the name. (Disable this hard failure by not calling \
+                         with_strict_orphan_detection.)"
+                    );
+                }
+                tracing::warn!(
+                    orphans = %list,
+                    "orphaned durable state: persisted checkpoint/decision/effect rows \
+                     whose consumer id is not a registered consumer — did you rename a \
+                     reactor/projector? Their state is stranded (cursors won't advance, \
+                     decisions/effects won't GC). Remove the rows or restore the name.",
+                );
             }
         }
 
@@ -3525,6 +3584,45 @@ mod tests {
             .build()
             .await
             .expect("in_memory_for_tests() must auto-allow effect + decision stores");
+    }
+
+    /// D4: a persisted cursor under an unregistered consumer id fails a
+    /// strict build (the rename-orphan trap).
+    #[tokio::test]
+    async fn orphaned_consumer_fails_strict_build() {
+        use crate::checkpoint_store::CheckpointStore;
+        let store = store();
+        // Strand a cursor under a name no registered consumer owns.
+        CheckpointStore::set(store.as_ref(), "renamed-away-reactor", LogCursor::ZERO)
+            .await
+            .unwrap();
+        let err = match builder_with_reactor(&store)
+            .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
+            .with_strict_orphan_detection(true)
+            .build()
+            .await
+        {
+            Ok(_) => panic!("strict orphan detection must fail the build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("renamed-away-reactor"),
+            "error should name the orphaned consumer (got: {err:#})",
+        );
+    }
+
+    /// D4: without stray rows, a strict build is clean.
+    #[tokio::test]
+    async fn no_orphans_builds_clean_under_strict_detection() {
+        let store = store();
+        builder_with_reactor(&store)
+            .allow_in_memory_effect_store_for_tests()
+            .allow_in_memory_decision_store_for_tests()
+            .with_strict_orphan_detection(true)
+            .build()
+            .await
+            .expect("no orphaned state → strict build succeeds");
     }
 
     /// No reactors → the gate does not fire (effect store is irrelevant).

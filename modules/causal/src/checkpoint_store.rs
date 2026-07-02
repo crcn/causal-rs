@@ -20,6 +20,15 @@ use crate::types::LogCursor;
 pub trait CheckpointStore: Send + Sync {
     async fn get(&self, consumer_id: &str) -> Result<Option<LogCursor>>;
 
+    /// Every consumer id with a persisted cursor. Powers boot-time orphan
+    /// detection (D4): the engine warns when a cursor's consumer id is not a
+    /// registered consumer ("did you rename?"). Best-effort — the default is
+    /// empty, so a backend that can't cheaply enumerate simply opts out of
+    /// detection rather than blocking it.
+    async fn list_consumers(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// **Absolute** write — installs `pos` verbatim, even backwards. The
     /// authoritative setter used by lifecycle wiring that legitimately moves a
     /// cursor *down*: build-time seeding (e.g. `StartPosition::Zero` resets to

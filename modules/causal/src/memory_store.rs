@@ -663,6 +663,10 @@ impl crate::checkpoint_store::CheckpointStore for MemoryStore {
         }
         Ok(clamped)
     }
+
+    async fn list_consumers(&self) -> Result<Vec<String>> {
+        Ok(self.projection_cursors.iter().map(|e| e.key().clone()).collect())
+    }
 }
 
 // ── ReactorCheckpoint implementation (C12 atomicity) ────────────────────
