@@ -1632,3 +1632,28 @@ pub async fn decision_store_strips_nul_bytes<S: DecisionStore>(s: &S) -> Result<
     );
     Ok(())
 }
+
+/// DS10: retention GC removes records sealed before the cutoff and leaves
+/// newer ones (age-driven, A1).
+pub async fn decision_store_retention_gc_by_age<S: DecisionStore>(s: &S) -> Result<()> {
+    use chrono::Duration;
+    let now = Utc::now();
+    let old_trigger = Uuid::new_v4();
+    let new_trigger = Uuid::new_v4();
+    // An old record (sealed 10 days ago) and a fresh one (sealed now).
+    s.seal(DecisionRecord::new("ds10", old_trigger, vec![], now - Duration::days(10)))
+        .await?;
+    s.seal(DecisionRecord::new("ds10", new_trigger, vec![], now)).await?;
+
+    let removed = s.remove_sealed_before(now - Duration::days(1)).await?;
+    assert!(removed >= 1, "DS10: at least the aged record was swept");
+    assert!(
+        s.get("ds10", old_trigger).await?.is_none(),
+        "DS10: aged record removed",
+    );
+    assert!(
+        s.get("ds10", new_trigger).await?.is_some(),
+        "DS10: record newer than the cutoff survives",
+    );
+    Ok(())
+}

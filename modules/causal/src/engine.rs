@@ -804,6 +804,10 @@ pub struct EngineBuilder {
     /// Default `true`; disable to elide empty-seal write traffic in fan-out
     /// no-op topologies (A6). Applied to every reactor.
     seal_empty_decisions: bool,
+    /// Retention window for decision records (A1). A background sweep deletes
+    /// records sealed longer ago than this. Age-driven, never floor-driven.
+    /// Default 7 days.
+    decision_retention: std::time::Duration,
     /// Per-workflow high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
@@ -941,6 +945,7 @@ impl EngineBuilder {
             explicit_decision_store: false,
             allow_in_memory_decision_store: false,
             seal_empty_decisions: true,
+            decision_retention: std::time::Duration::from_secs(7 * 24 * 3600),
             workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
@@ -1006,6 +1011,17 @@ impl EngineBuilder {
     /// Applies to every reactor the builder registers.
     pub fn seal_empty_decisions(mut self, seal: bool) -> Self {
         self.seal_empty_decisions = seal;
+        self
+    }
+
+    /// Set the decision-record retention window (default 7 days). A
+    /// background sweep deletes records sealed longer ago than this. GC is
+    /// age-driven (A1), so the window must comfortably exceed the longest
+    /// realistic gap between a first delivery and its last possible
+    /// redelivery (crash-restart, deploy overlap, lease handoff) — a record
+    /// GC'd while a redelivery is still possible would re-decide.
+    pub fn with_decision_retention(mut self, window: std::time::Duration) -> Self {
+        self.decision_retention = window;
         self
     }
 
@@ -1643,6 +1659,8 @@ impl EngineBuilder {
             self.snapshot_every,
             self.clock,
             self.cancelled_workflows,
+            self.decision_store,
+            self.decision_retention,
         ))
     }
 }
@@ -1721,6 +1739,8 @@ impl Engine {
         snapshot_every: u64,
         clock: Arc<dyn crate::clock::Clock>,
         cancelled_workflows: CancelledWorkflows,
+        decision_store: Option<Arc<dyn crate::decision_store::DecisionStore>>,
+        decision_retention: std::time::Duration,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut handles = Vec::with_capacity(consumers.len());
@@ -1738,6 +1758,48 @@ impl Engine {
                 supervise_one(consumer, health, &mut rx).await;
             });
             handles.push(task);
+        }
+
+        // Retention GC (A1): an age-driven background sweep of decision
+        // records. Age-driven, never floor-driven — a floor-based sweep would
+        // let a zombie lease-holder re-seal a just-GC'd decision and
+        // resurrect the chimera. Spawned only when a decision store is wired
+        // and reactors exist (nothing else seals). Best-effort: a failed
+        // sweep just retries next tick; records are bounded by the window.
+        if let Some(store) = decision_store {
+            if !consumers.is_empty() {
+                let clock = clock.clone();
+                let mut rx = shutdown_tx.subscribe();
+                // Sweep ~10× per retention window, clamped to a sane cadence.
+                let interval = (decision_retention / 10).clamp(
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(3600),
+                );
+                let task = tokio::spawn(async move {
+                    let window = chrono::Duration::from_std(decision_retention)
+                        .unwrap_or_else(|_| chrono::Duration::days(7));
+                    loop {
+                        tokio::select! {
+                            _ = rx.recv() => break,
+                            _ = tokio::time::sleep(interval) => {
+                                let cutoff = clock.now() - window;
+                                match store.remove_sealed_before(cutoff).await {
+                                    Ok(n) if n > 0 => tracing::debug!(
+                                        removed = n,
+                                        "decision-record retention GC swept aged records",
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "decision-record retention GC failed; retrying next sweep",
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                });
+                handles.push(task);
+            }
         }
 
         Self {

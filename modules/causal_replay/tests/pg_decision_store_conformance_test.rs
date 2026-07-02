@@ -86,6 +86,12 @@ async fn decision_store_strips_nul_bytes() -> Result<()> {
     conformance::decision_store_strips_nul_bytes(&backend().await).await
 }
 
+#[tokio::test]
+#[ignore = "requires local DATABASE_URL"]
+async fn decision_store_retention_gc_by_age() -> Result<()> {
+    conformance::decision_store_retention_gc_by_age(&backend().await).await
+}
+
 // ── Crash scenario ────────────────────────────────────────────────────
 
 /// A sealed decision survives a process restart — the property that lets

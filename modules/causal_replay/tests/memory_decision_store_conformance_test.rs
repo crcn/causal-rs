@@ -56,3 +56,8 @@ async fn decision_store_isolated_by_trigger() -> Result<()> {
 async fn decision_store_strips_nul_bytes() -> Result<()> {
     conformance::decision_store_strips_nul_bytes(&s()).await
 }
+
+#[tokio::test]
+async fn decision_store_retention_gc_by_age() -> Result<()> {
+    conformance::decision_store_retention_gc_by_age(&s()).await
+}

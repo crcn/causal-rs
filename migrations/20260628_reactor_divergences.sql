@@ -1,5 +1,11 @@
 -- Divergent-redelivery observability (PgReactorObserver → PgInspectorReadModel).
 --
+-- DEPRECATED (0.19): decision records (causal_decisions) make the reactor body
+-- replay from a sealed batch instead of re-deciding, so first-delivery
+-- divergence now fires only on the rare re-decide of a GC'd record. Replay
+-- divergence is instead an integrity PARK (a terminal failure), not a row here.
+-- Retained for that residual first-delivery signal; slated for drop in 0.20.
+--
 -- A reactor whose react() output is nondeterministic (bad emission order,
 -- Uuid::new_v4(), an un-effect'd clock/RNG, HashMap iteration order) re-derives
 -- the same identity-keyed event_id with a DIFFERENT payload on redelivery (a

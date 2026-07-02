@@ -1709,29 +1709,39 @@ where
         class: FailureClass,
         completed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        if let Some(obs) = self.observer.as_ref() {
-            obs.reactor_terminal_failure(
-                event.event_id,
-                &self.consumer_id,
-                event.workflow_id,
-                attempts,
-                &error,
-                completed_at,
-            );
-        }
+        // The observer's terminal-failure hook is an external, non-idempotent
+        // side effect (typically a DLQ write). Fire it ONCE, at the end, after
+        // the failure is durably committed and attempts are cleared — never at
+        // the top, where every infra-retry of the park would re-fire it and
+        // duplicate the DLQ entry. `error` is moved into the terminal fact
+        // below, so keep a copy for the hook.
+        let error_for_obs = error.clone();
+        let notify_observer = |this: &Self| {
+            if let Some(obs) = this.observer.as_ref() {
+                obs.reactor_terminal_failure(
+                    event.event_id,
+                    &this.consumer_id,
+                    event.workflow_id,
+                    attempts,
+                    &error_for_obs,
+                    completed_at,
+                );
+            }
+        };
 
         // H7 cycle guard: if the trigger already sits STRICTLY beyond the
         // ceiling, appending a terminal fact (stamped deeper still) would let
         // a reactor subscribed to the park fact perpetuate the very cycle we
-        // are trying to break. Park silently — the observer hook + error log
-        // already fired and the ack-floor still advances — so each chain emits
-        // at most one durable park fact at the boundary, then terminates.
+        // are trying to break. Park silently — the ack-floor still advances —
+        // so each chain emits at most one durable park fact at the boundary,
+        // then terminates. Clear attempts, THEN notify (commit before signal).
         let trigger_depth = causation_depth_of(&event.metadata);
         if let Some(ceiling) = self.causation_depth_ceiling {
             if trigger_depth > u64::from(ceiling) {
                 self.checkpoint
                     .clear_reactor_attempts(&self.consumer_id, event.event_id)
                     .await?;
+                notify_observer(self);
                 return Ok(());
             }
         }
@@ -1828,6 +1838,9 @@ where
         self.checkpoint
             .clear_reactor_attempts(&self.consumer_id, event.event_id)
             .await?;
+        // Durable state committed (terminal fact appended, attempts cleared);
+        // now signal the outside world exactly once.
+        notify_observer(self);
         Ok(())
     }
 

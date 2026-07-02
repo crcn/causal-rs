@@ -67,18 +67,6 @@ mod pg {
             Ok(Self::new(pool))
         }
 
-        /// Retention-based GC: delete every record sealed strictly before
-        /// `cutoff`. Age-driven (A1) — never keyed to the ack-floor, which
-        /// carries no fencing token and would let a zombie holder re-seal a
-        /// GC'd decision. Returns the number of rows removed.
-        pub async fn remove_sealed_before(&self, cutoff: DateTime<Utc>) -> Result<u64> {
-            let res = sqlx::query("DELETE FROM causal_decisions WHERE sealed_at < $1")
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await?;
-            Ok(res.rows_affected())
-        }
-
         async fn fetch(
             &self,
             consumer: &str,
@@ -186,6 +174,17 @@ mod pg {
             .execute(&self.pool)
             .await?;
             Ok(())
+        }
+
+        /// Age-driven retention GC (A1) — never keyed to the ack-floor, which
+        /// carries no fencing token and would let a zombie holder re-seal a
+        /// GC'd decision. Uses the `sealed_at` index.
+        async fn remove_sealed_before(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+            let res = sqlx::query("DELETE FROM causal_decisions WHERE sealed_at < $1")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?;
+            Ok(res.rows_affected())
         }
     }
 }
