@@ -264,6 +264,24 @@ enum AttemptOutcome {
     BodyFailed { error: anyhow::Error, attempts: u32 },
 }
 
+/// A decision replay found the log disagreeing with a sealed record — an
+/// existing output row carries a different payload than the record says it
+/// should. Under decision records, replay appends are byte-identical by
+/// construction, so this means corruption or a genuine bug, not reactor
+/// nondeterminism. Carries the backend's diff; the runner parks it as
+/// poison (A3). Distinguished from `DivergentRedelivery` (accepted on the
+/// first-delivery path) by being raised only when replaying a record.
+#[derive(Debug)]
+struct RecordIntegrityError(String);
+
+impl std::fmt::Display for RecordIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decision-record integrity violation: {}", self.0)
+    }
+}
+
+impl std::error::Error for RecordIntegrityError {}
+
 /// What `process_trigger` reports back to the worker loop: how the
 /// trigger finished, and which effect labels it used (the floor-GC's
 /// deletion list).
@@ -315,6 +333,10 @@ struct Core<R: Reactor> {
     /// (re-decide on redelivery; only reachable in tests, since `build()`
     /// gates a durable store for production reactors).
     decision_store: Option<Arc<dyn crate::decision_store::DecisionStore>>,
+    /// Whether a zero-output reaction seals an empty record. Default `true`
+    /// (full processed-vs-never-ran signal). Set `false` to elide empty
+    /// seals where fan-out no-op traffic would dominate the write path (A6).
+    seal_empty_decisions: bool,
     /// Engine-level aggregator registry. Reactor outputs are folded into
     /// it after they're appended, so `engine.state_of::<A>(id)` reflects
     /// reactor-emitted events (not just caller-emitted ones).
@@ -406,6 +428,7 @@ where
                 observer: None,
                 effect_store: None,
                 decision_store: None,
+                seal_empty_decisions: true,
                 engine_aggregators: None,
                 settle_tracker: None,
                 snapshot_store: None,
@@ -494,6 +517,13 @@ where
         store: Arc<dyn crate::decision_store::DecisionStore>,
     ) -> Self {
         self.core_mut().decision_store = Some(store);
+        self
+    }
+
+    /// Whether a zero-output reaction seals an empty decision record
+    /// (default `true`). See [`Core::seal_empty_decisions`].
+    pub fn with_seal_empty_decisions(mut self, seal: bool) -> Self {
+        self.core_mut().seal_empty_decisions = seal;
         self
     }
 
@@ -1101,6 +1131,21 @@ where
         fold_cache: &FoldOnReadCache,
         labels: &LabelSet,
     ) -> Result<AttemptOutcome> {
+        // ── Decision replay gate. A sealed decision for this trigger means
+        //    the body already ran and its outputs are canonical: replay them
+        //    from the record (completing any that a crash left un-appended)
+        //    and finish — NEVER re-run the body. A get-miss is a genuine
+        //    first delivery (or a GC'd record) and falls through to the
+        //    attempt path below. Checked per-attempt on purpose: if a
+        //    first-delivery attempt seals then crashes mid-append, the
+        //    infra-retry re-enters here, now HITS, and completes the batch
+        //    idempotently. `get` errors are infra — propagate to retry.
+        if let Some(store) = self.decision_store.clone() {
+            if let Some(rec) = store.get(&self.consumer_id, event.event_id).await? {
+                return self.replay_decision(event, &rec).await;
+            }
+        }
+
         // Record the attempt FIRST (before deserialization), so a
         // poison trigger engages the terminal-failure budget instead of
         // wedging before the counter ever increments.
@@ -1303,68 +1348,203 @@ where
             }
         }
 
-        // ── Append each output directly to its own stream with a
-        //    deterministic identity-keyed event_id (idempotent under
-        //    redelivery via the log's append-dedup, C1).
+        // ── Build the output envelopes with seal-time identity-keyed
+        //    event_ids (stable across retries/deploys, C1), then SEAL the
+        //    decision. Redelivery replays this exact batch (the gate at the
+        //    top of this fn) instead of re-deciding. Even this
+        //    first-delivery execution appends from the SEALED (canonical)
+        //    batch, so two racing executions append identical outputs
+        //    regardless of which one won the seal.
+        let outputs = self.build_output_events(&emitted.outputs, event, trigger_depth);
+
+        let sealed = match self.decision_store.clone() {
+            Some(store) => {
+                // A zero-output reaction seals an empty record by default
+                // (distinguishes "processed, decided nothing" from "never
+                // ran"). Elidable via `.seal_empty_decisions(false)` (A6)
+                // where fan-out no-op traffic would dominate the write path.
+                if outputs.is_empty() && !self.seal_empty_decisions {
+                    return Ok(AttemptOutcome::Done);
+                }
+                let rec = crate::decision_store::DecisionRecord::new(
+                    self.consumer_id.clone(),
+                    event.event_id,
+                    outputs,
+                    self.clock.now(),
+                );
+                // Seal sits between body success and the append loop. A seal
+                // error is runner-INFRASTRUCTURE (retry forever under the
+                // liveness ceiling), NEVER classify()-parked: a routine PG
+                // blip must not mass-park succeeded work. Propagating `Err`
+                // routes to `process_trigger`'s infra-retry arm. (A4)
+                store.seal(rec).await?.outputs
+            }
+            // No decision store (test-only; build() gates production): append
+            // from the locally-built batch — legacy behavior.
+            None => outputs,
+        };
+
+        // First-delivery append. `from_record = false`: a divergence here
+        // means a GC'd record's stale outputs still linger in the log, so we
+        // accept-and-advance with a warn (legacy semantics — we verifiably
+        // re-decided). See `append_outputs`.
+        self.append_outputs(event, &sealed, false).await?;
+        Ok(AttemptOutcome::Done)
+    }
+
+    /// Replay a sealed decision: append any outputs a crash left
+    /// un-appended (idempotent completion) and finish, WITHOUT running the
+    /// reactor body. `from_record = true`, so a divergence is an integrity
+    /// violation (the log disagrees with a decision we durably recorded),
+    /// parked as poison per A3 — not the accept-and-advance the
+    /// first-delivery path uses.
+    async fn replay_decision(
+        self: &Arc<Self>,
+        event: &RecordedEvent,
+        rec: &crate::decision_store::DecisionRecord,
+    ) -> Result<AttemptOutcome> {
+        match self.append_outputs(event, &rec.outputs, true).await {
+            Ok(()) => {
+                tracing::debug!(
+                    reactor = %self.consumer_id,
+                    event_id = %event.event_id,
+                    outputs = rec.outputs.len(),
+                    "decision replayed from sealed record; reactor body not run",
+                );
+                Ok(AttemptOutcome::Done)
+            }
+            Err(e) => match e.downcast_ref::<RecordIntegrityError>() {
+                Some(integ) => {
+                    tracing::error!(
+                        consumer = self.consumer_id,
+                        event_id = %event.event_id,
+                        diff = %integ.0,
+                        "DECISION-RECORD INTEGRITY VIOLATION on replay — the log \
+                         disagrees with a sealed decision. Parking as poison; this \
+                         is corruption or a genuine bug, not a determinism hint.",
+                    );
+                    // Record an attempt so the terminal-failure fact carries
+                    // a count. Poison parks regardless of the value.
+                    let seq = self
+                        .checkpoint
+                        .record_reactor_attempt(&self.consumer_id, event.event_id)
+                        .await
+                        .unwrap_or(1);
+                    Ok(AttemptOutcome::BodyFailed {
+                        error: poison(anyhow::anyhow!(
+                            "decision-record integrity violation on replay: {}",
+                            integ.0,
+                        )),
+                        attempts: seq,
+                    })
+                }
+                // Infra error → propagate to the worker's infra-retry path.
+                None => Err(e),
+            },
+        }
+    }
+
+    /// Build the durable output envelopes for `emitted`, deriving each
+    /// event_id at seal time (identity-keyed: kind + subject + nth-of-pair,
+    /// stable across retries and deploys — C1). Stamped once here and stored
+    /// in the record, so completion appends byte-identical outputs.
+    fn build_output_events(
+        &self,
+        emitted: &[crate::reactor::EventOutput],
+        event: &RecordedEvent,
+        trigger_depth: u64,
+    ) -> Vec<EventData> {
+        let now = self.clock.now();
         let mut nth: HashMap<(&str, Uuid), u32> = HashMap::new();
+        emitted
+            .iter()
+            .map(|out| {
+                let n = nth
+                    .entry((out.durable_name.as_str(), out.subject_id))
+                    .or_insert(0);
+                let this_nth = *n;
+                *n += 1;
+                // Which workflow this output belongs to: a workflow-ROOT
+                // fact roots the one its own payload field names; a chain
+                // member inherits the trigger's. Causation links either way.
+                let out_workflow = out.workflow.unwrap_or(event.workflow_id);
+                EventData {
+                    event_id: derive_output_event_id(
+                        &self.consumer_id,
+                        event.event_id,
+                        &out.durable_name,
+                        out.subject_id,
+                        this_nth,
+                    ),
+                    causation_id: Some(event.event_id),
+                    workflow_id: out_workflow,
+                    event_type: out.durable_name.clone(),
+                    payload: out.payload.clone(),
+                    created_at: now,
+                    // Placement uses the STREAM category; routing stays on
+                    // `event_type` (durable_name). Equal unless overridden.
+                    category: Some(out.subject.clone()),
+                    subject_id: Some(out.subject_id),
+                    metadata: reactor_output_metadata(&self.consumer_id, trigger_depth + 1),
+                    ephemeral: None,
+                    persistent: true,
+                }
+            })
+            .collect()
+    }
+
+    /// Append a decision's output envelopes to their streams, idempotently
+    /// (the log's append-dedup collapses already-present outputs on
+    /// redelivery, C1), then bump the settle high-water and fold each into
+    /// the engine registry. Shared by the first-delivery seal path and the
+    /// replay/completion path.
+    ///
+    /// Divergence handling is gated on `from_record` (A3): a divergence is
+    /// the log rejecting an append because an existing row with the same
+    /// event_id carries a different payload.
+    /// - `from_record = false` (first delivery): a GC'd record's stale
+    ///   outputs may linger, so accept-and-advance with a warn.
+    /// - `from_record = true` (replay): the log disagrees with a decision we
+    ///   durably sealed — an integrity violation, surfaced as
+    ///   [`RecordIntegrityError`] for the caller to park.
+    async fn append_outputs(
+        self: &Arc<Self>,
+        event: &RecordedEvent,
+        outputs: &[EventData],
+        from_record: bool,
+    ) -> Result<()> {
         // Divergence is reported at most once per trigger — a reactor that
         // diverges on several outputs has one nondeterminism bug, not N.
         let mut divergence_reported = false;
-        for out in emitted.iter() {
-            let n = nth
-                .entry((out.durable_name.as_str(), out.subject_id))
-                .or_insert(0);
-            let this_nth = *n;
-            *n += 1;
-            // Which workflow this output belongs to: a workflow-ROOT
-            // fact roots the one its own payload field names (the 0.8
-            // always-inherit hardcode is deleted, not escaped); a chain
-            // member inherits the trigger's. Causation links either
-            // way — it's how settle_tree discovers the boundary.
-            let out_workflow = out.workflow.unwrap_or(event.workflow_id);
-            let out_event = EventData {
-                event_id: derive_output_event_id(
-                    &self.consumer_id,
-                    event.event_id,
-                    &out.durable_name,
-                    out.subject_id,
-                    this_nth,
-                ),
-                causation_id: Some(event.event_id),
-                workflow_id: out_workflow,
-                event_type: out.durable_name.clone(),
-                payload: out.payload.clone(),
-                created_at: self.clock.now(),
-                // Placement uses the STREAM category; routing stays on
-                // `event_type` (durable_name). Equal unless overridden.
-                category: Some(out.subject.clone()),
-                subject_id: Some(out.subject_id),
-                metadata: reactor_output_metadata(&self.consumer_id, trigger_depth + 1),
-                ephemeral: None,
-                persistent: true,
-            };
-            let out_event_id = out_event.event_id;
-            let write = match self.log
+        for out in outputs.iter() {
+            let category = out.category.as_deref().unwrap_or(&out.event_type);
+            let subject_id = out.subject_id.unwrap_or(event.workflow_id);
+            let out_workflow = out.workflow_id;
+            let out_event_id = out.event_id;
+            let write = match self
+                .log
                 .append_to_stream(
-                    &out.subject, out.subject_id, StreamState::Any, vec![out_event],
+                    category,
+                    subject_id,
+                    StreamState::Any,
+                    vec![out.clone()],
                 )
                 .await
             {
                 Ok(w) => w,
                 Err(e) => match e.downcast_ref::<crate::event_log::DivergentRedelivery>() {
+                    Some(d) if from_record => {
+                        // Replay path: the log's canonical row disagrees with
+                        // our sealed record. This is corruption, not
+                        // nondeterminism — surface for a loud park (A3).
+                        return Err(anyhow::Error::new(RecordIntegrityError(d.diff.clone())));
+                    }
                     Some(d) => {
-                        // Idempotent redelivery of a nondeterministic reactor.
-                        // Divergence fires only on a dedup-hit, so the persisted
-                        // output is canonical and already consumed downstream:
-                        // accept it, let the loop reach `Done` so the ack-floor
-                        // advances, and shout. We do NOT retry (the store keeps
-                        // the original row, so every retry re-diverges forever)
-                        // and do NOT park (parking emits a terminal failure for
-                        // work that SUCCEEDED, and would turn every full replay
-                        // of a nondeterministic reactor into a failure storm —
-                        // breaking the replay-is-an-idempotent-no-op contract a
-                        // byte-identical redelivery already honours). Surface,
-                        // don't fail; the fix is always upstream determinism.
+                        // First-delivery path: a GC'd record's stale output
+                        // still stands. Accept it, advance, and shout — do NOT
+                        // retry (the row is canonical; retry re-diverges
+                        // forever) and do NOT park (parking a SUCCEEDED
+                        // reaction would storm terminal facts on every replay).
                         if !divergence_reported {
                             divergence_reported = true;
                             if let Some(obs) = self.observer.as_ref() {
@@ -1379,54 +1559,48 @@ where
                                 consumer = self.consumer_id,
                                 event_id = %event.event_id,
                                 diff = %d.diff,
-                                "DIVERGENT REDELIVERY — nondeterministic reactor; \
-                                 accepted the persisted output and advanced. Fix \
-                                 the producer's determinism (wall clock, rand, \
-                                 HashMap iteration order, emission order, or an \
-                                 external call not under ctx.effect).",
+                                "DIVERGENT REDELIVERY — a re-decided trigger (record \
+                                 GC'd) disagrees with a lingering output; accepted the \
+                                 persisted row and advanced. Fix the producer's \
+                                 determinism (wall clock, rand, HashMap iteration \
+                                 order, emission order, or an external call not under \
+                                 ctx.effect).",
                             );
                         }
                         continue; // skip this output; the persisted row stands
                     }
-                    // Genuine infrastructure error → unchanged: propagate so
-                    // the worker's infra-retry path handles it (retry forever,
-                    // never park). The downcast is exact, so only divergence
-                    // takes the accept path above.
+                    // Genuine infrastructure error → propagate to infra-retry.
                     None => return Err(e),
                 },
             };
             tracing::trace!(
                 reactor = %self.consumer_id,
                 trigger_event_id = %event.event_id,
-                fact_kind = %out.durable_name,
-                subject_id = %out.subject_id,
-                nth = this_nth,
+                fact_kind = %out.event_type,
+                subject_id = %subject_id,
                 output_event_id = %out_event_id,
                 position = write.position.raw(),
                 "reactor output appended",
             );
-            // Advance the OUTPUT's workflow high-water. For a chain
-            // member that's the trigger's run; for a workflow root it
-            // seeds the CHILD's — the parent's settle does not wait for
-            // the child's chain (that's the point of rooting), only for
-            // this append, which the trigger's ack already covers.
+            // Advance the OUTPUT's workflow high-water (A5: the replay path
+            // must do this too, or settle can return before catch-up appends
+            // drain downstream). A dedup-hit returns the original
+            // coordinates, so the bump is safe.
             if let Some(tracker) = &self.settle_tracker {
                 tracker.lock().unwrap().bump(out_workflow, write.position);
             }
-            // Fold the output into the shared engine registry (folds
-            // are idempotent on stream coordinates, so a deduped
-            // re-append skips instead of double-counting). BEST-EFFORT:
-            // the durable append above already succeeded; this only warms
-            // the read cache behind `engine.state_of`, so a fold that
-            // can't converge must not fail (and retry) the attempt.
+            // Best-effort fold into the shared engine registry (A5: replicated
+            // on the replay path). The durable append already succeeded; this
+            // only warms the read cache behind `engine.state_of`, so a fold
+            // that can't converge must not fail (and retry) the attempt.
             if let Some(reg) = &self.engine_aggregators {
                 if let Some(outcome) = self
                     .fold_output_into_engine_registry(
                         reg.as_ref(),
-                        &out.durable_name,
+                        &out.event_type,
                         &out.payload,
-                        out.subject_id,
-                        &out.subject,
+                        subject_id,
+                        category,
                         &write,
                     )
                     .await
@@ -1445,7 +1619,7 @@ where
                 }
             }
         }
-        Ok(AttemptOutcome::Done)
+        Ok(())
     }
 
     /// Best-effort fold of a just-appended output into the shared engine
@@ -3899,5 +4073,397 @@ mod tests {
 
         assert_eq!(observer.terminal_failures.load(Ordering::SeqCst), 0,
                    "no depth-based park when the ceiling is disabled");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Decision records (0.19)
+    // ─────────────────────────────────────────────────────────────────
+
+    use crate::decision_store::{DecisionRecord, DecisionStore, InMemoryDecisionStore};
+
+    /// Reactor that emits nothing (a no-op reaction), counting invocations.
+    struct EmitNothing { calls: Arc<AtomicUsize> }
+    #[async_trait]
+    impl Reactor for EmitNothing {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "emit-nothing";
+        async fn react(&self, _t: &OrderPlaced, _c: Ctx<'_>) -> Result<Events> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Events::new())
+        }
+    }
+
+    /// Reactor whose body always fails (poison → parks on first attempt),
+    /// counting invocations.
+    struct AlwaysPoison { calls: Arc<AtomicUsize> }
+    #[async_trait]
+    impl Reactor for AlwaysPoison {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "always-poison";
+        async fn react(&self, _t: &OrderPlaced, _c: Ctx<'_>) -> Result<Events> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(poison(anyhow!("deliberate poison failure")))
+        }
+    }
+
+    /// Drive a fresh runner (with a shared decision store) over `store` from
+    /// the checkpoint's current position. `rewind` re-seeds the cursor to
+    /// ZERO first, emulating a crash/redelivery of the whole log.
+    async fn deliver_with_decisions<R: Reactor + 'static>(
+        store: &Arc<MemoryStore>,
+        reactor: R,
+        consumer: &str,
+        decisions: Arc<dyn DecisionStore>,
+        observer: Arc<dyn ReactorObserver>,
+        rewind: bool,
+    ) where R::Trigger: DeserializeOwned {
+        if rewind {
+            store.set(consumer, LogCursor::ZERO).await.unwrap();
+        }
+        let runner = ReactorRunner::new(
+            reactor,
+            consumer,
+            store.clone() as Arc<dyn EventLogBackend>,
+            store.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_decision_store(decisions)
+        .with_observer(observer)
+        .with_retry_policy(crate::reactor::RetryPolicy::from_max_attempts(1));
+        runner.quiesce().await.unwrap();
+        runner.halt();
+    }
+
+    fn reminders(all: &[RecordedEvent]) -> Vec<&RecordedEvent> {
+        all.iter().filter(|e| e.event_type == "reminder").collect()
+    }
+
+    #[tokio::test]
+    async fn sealed_decision_replays_without_reexecuting_the_body() {
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let trigger_id = append_trigger(&store, &trigger);
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let obs = Arc::new(CountingObserver::default());
+
+        // First delivery: body runs once, seals a decision, appends output.
+        deliver_with_decisions(&store, CountingEmit { calls: calls.clone() },
+            "r.rec", ds.clone(), obs.clone(), false).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "body ran on first delivery");
+        assert!(ds.get("r.rec", trigger_id).await.unwrap().is_some(), "decision sealed");
+
+        // Redelivery (cursor rewound): the record replays; the body must NOT
+        // run again, and the output stays a single row.
+        deliver_with_decisions(&store, CountingEmit { calls: calls.clone() },
+            "r.rec", ds.clone(), obs.clone(), true).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "body NOT re-run on redelivery");
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.event_type == "shipped_notification").count(),
+            1, "exactly one output across delivery + redelivery",
+        );
+        assert_eq!(obs.divergences.load(Ordering::SeqCst), 0, "no divergence");
+        assert_eq!(obs.terminal_failures.load(Ordering::SeqCst), 0, "no park");
+    }
+
+    #[tokio::test]
+    async fn nondeterministic_body_cannot_produce_a_chimera() {
+        // The audit's Swan #1: without records a nondeterministic body
+        // re-decides on redelivery and can grow a chimera log. With records,
+        // the body never re-runs — the sealed batch replays byte-identically.
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let order_id = trigger.order_id;
+        append_trigger(&store, &trigger);
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let obs = Arc::new(CountingObserver::default());
+
+        deliver_with_decisions(&store, NondeterministicEmit { calls: calls.clone() },
+            "r.nd.rec", ds.clone(), obs.clone(), false).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Redelivery: the body would emit nonce=1 if re-run. It must not run.
+        deliver_with_decisions(&store, NondeterministicEmit { calls: calls.clone() },
+            "r.nd.rec", ds.clone(), obs.clone(), true).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nondeterministic body NOT re-run");
+
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        let rem = reminders(&all);
+        assert_eq!(rem.len(), 1, "no chimera: exactly one reminder");
+        assert_eq!(
+            rem[0].payload,
+            serde_json::to_value(Reminder { order_id, nonce: 0 }).unwrap(),
+            "the sealed nonce-0 decision replays; nonce-1 never appears",
+        );
+        assert_eq!(obs.divergences.load(Ordering::SeqCst), 0, "records prevent divergence");
+        assert_eq!(obs.terminal_failures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_output_reaction_seals_an_empty_record_and_advances() {
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let trigger_id = append_trigger(&store, &trigger);
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+        let obs = Arc::new(CountingObserver::default());
+
+        deliver_with_decisions(&store, EmitNothing { calls: Arc::new(AtomicUsize::new(0)) },
+            "r.empty", ds.clone(), obs.clone(), false).await;
+
+        let rec = ds.get("r.empty", trigger_id).await.unwrap();
+        let rec = rec.expect("a no-op reaction still seals a record");
+        assert!(rec.outputs.is_empty(), "the sealed record is empty");
+        // Floor advanced past the trigger.
+        let head = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20)
+            .await.unwrap().iter().map(|e| e.position).max().unwrap();
+        assert_eq!(store.get("r.empty").await.unwrap().unwrap(), head, "floor advanced");
+    }
+
+    #[tokio::test]
+    async fn racing_executions_adopt_the_first_sealed_decision() {
+        // Invariant 1: outputs enter the log only from the sealed record.
+        // Pre-seal a decision with a distinctive output; a reactor that would
+        // emit something else must replay the pre-sealed batch and never run.
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let order_id = trigger.order_id;
+        let trigger_id = append_trigger(&store, &trigger);
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+
+        // The "winning" execution's sealed batch: a single reminder, nonce 7.
+        let sealed_out = EventData {
+            event_id: derive_output_event_id("r.race", trigger_id, "reminder", order_id, 0),
+            causation_id: Some(trigger_id),
+            workflow_id: Uuid::new_v4(),
+            event_type: "reminder".to_string(),
+            payload: serde_json::to_value(Reminder { order_id, nonce: 7 }).unwrap(),
+            created_at: Utc::now(),
+            category: Some("reminder".to_string()),
+            subject_id: Some(order_id),
+            metadata: serde_json::Map::new(),
+            ephemeral: None,
+            persistent: true,
+        };
+        ds.seal(DecisionRecord::new("r.race", trigger_id, vec![sealed_out], Utc::now()))
+            .await.unwrap();
+
+        // This reactor would emit nonce 0 — but its body must never run.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let obs = Arc::new(CountingObserver::default());
+        deliver_with_decisions(&store, NondeterministicEmit { calls: calls.clone() },
+            "r.race", ds.clone(), obs.clone(), false).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "body never ran — record adopted");
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        let rem = reminders(&all);
+        assert_eq!(rem.len(), 1);
+        assert_eq!(
+            rem[0].payload,
+            serde_json::to_value(Reminder { order_id, nonce: 7 }).unwrap(),
+            "the sealed (nonce 7) batch was appended, not the reactor's nonce 0",
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_before_seal_re_decides_and_that_is_correct() {
+        // No record (a crash before seal, or a GC'd one) ⇒ get-miss ⇒ the
+        // body runs. Re-deciding is correct: no decision was ever made.
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let trigger_id = append_trigger(&store, &trigger);
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let obs = Arc::new(CountingObserver::default());
+
+        deliver_with_decisions(&store, CountingEmit { calls: calls.clone() },
+            "r.crash", ds.clone(), obs.clone(), false).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Simulate "the seal never happened": drop the record, then redeliver.
+        ds.remove("r.crash", trigger_id).await.unwrap();
+        deliver_with_decisions(&store, CountingEmit { calls: calls.clone() },
+            "r.crash", ds.clone(), obs.clone(), true).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "re-decided because the record was gone");
+
+        // Still correct: the deterministic re-append dedups to one output.
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.event_type == "shipped_notification").count(), 1,
+            "deterministic re-decide dedups — no duplicate output",
+        );
+        assert_eq!(obs.terminal_failures.load(Ordering::SeqCst), 0, "re-decide never parks");
+    }
+
+    #[tokio::test]
+    async fn body_failure_retries_then_parks_without_sealing() {
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let trigger_id = append_trigger(&store, &trigger);
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let obs = Arc::new(CountingObserver::default());
+
+        deliver_with_decisions(&store, AlwaysPoison { calls: calls.clone() },
+            "r.park", ds.clone(), obs.clone(), false).await;
+
+        assert!(calls.load(Ordering::SeqCst) >= 1, "body attempted");
+        assert_eq!(obs.terminal_failures.load(Ordering::SeqCst), 1, "trigger parked");
+        assert!(
+            ds.get("r.park", trigger_id).await.unwrap().is_none(),
+            "a failed body seals NO decision",
+        );
+    }
+
+    #[tokio::test]
+    async fn divergent_redelivery_after_records_is_a_loud_integrity_error() {
+        // A3: replaying a record whose output disagrees with a row already in
+        // the log is corruption, not nondeterminism — it must PARK, loudly.
+        let store = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        let order_id = trigger.order_id;
+        let trigger_id = append_trigger(&store, &trigger);
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+
+        let out_event_id = derive_output_event_id("r.integ", trigger_id, "reminder", order_id, 0);
+        // Put a row with THIS event_id but payload nonce=1 into the log.
+        let existing = EventData {
+            event_id: out_event_id,
+            causation_id: Some(trigger_id),
+            workflow_id: Uuid::new_v4(),
+            event_type: "reminder".to_string(),
+            payload: serde_json::to_value(Reminder { order_id, nonce: 1 }).unwrap(),
+            created_at: Utc::now(),
+            category: Some("reminder".to_string()),
+            subject_id: Some(order_id),
+            metadata: serde_json::Map::new(),
+            ephemeral: None,
+            persistent: true,
+        };
+        store.append_to_stream("reminder", order_id, StreamState::Any, vec![existing])
+            .await.unwrap();
+
+        // Seal a record with the SAME event_id but a DIFFERENT payload (nonce 0).
+        let record_out = EventData {
+            payload: serde_json::to_value(Reminder { order_id, nonce: 0 }).unwrap(),
+            ..EventData {
+                event_id: out_event_id,
+                causation_id: Some(trigger_id),
+                workflow_id: Uuid::new_v4(),
+                event_type: "reminder".to_string(),
+                payload: serde_json::Value::Null,
+                created_at: Utc::now(),
+                category: Some("reminder".to_string()),
+                subject_id: Some(order_id),
+                metadata: serde_json::Map::new(),
+                ephemeral: None,
+                persistent: true,
+            }
+        };
+        ds.seal(DecisionRecord::new("r.integ", trigger_id, vec![record_out], Utc::now()))
+            .await.unwrap();
+
+        let obs = Arc::new(CountingObserver::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Body should never run (record present); replay hits divergence → park.
+        deliver_with_decisions(&store, NondeterministicEmit { calls: calls.clone() },
+            "r.integ", ds.clone(), obs.clone(), false).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "record present — body not run");
+        assert_eq!(
+            obs.terminal_failures.load(Ordering::SeqCst), 1,
+            "integrity divergence on replay PARKS (loud), unlike the accept-and-advance \
+             first-delivery path",
+        );
+    }
+
+    /// Log wrapper that fails the Nth `shipped_notification` append exactly
+    /// once (an infra error mid-batch), then delegates — simulating a crash
+    /// after a partial output append.
+    struct FailNthOutput {
+        inner:    Arc<MemoryStore>,
+        fail_on:  usize,
+        seen:     AtomicUsize,
+    }
+    #[async_trait]
+    impl EventLogBackend for FailNthOutput {
+        async fn read_all(&self, after: LogCursor, limit: usize) -> Result<Vec<RecordedEvent>> {
+            EventLogBackend::read_all(self.inner.as_ref(), after, limit).await
+        }
+        async fn read_stream(
+            &self, category: &str, subject_id: Uuid,
+            after: Option<crate::types::StreamRevision>,
+        ) -> Result<Vec<RecordedEvent>> {
+            EventLogBackend::read_stream(self.inner.as_ref(), category, subject_id, after).await
+        }
+        async fn latest_position(&self) -> Result<LogCursor> {
+            EventLogBackend::latest_position(self.inner.as_ref()).await
+        }
+        async fn append_to_stream(
+            &self, category: &str, subject_id: Uuid,
+            expected: StreamState, events: Vec<EventData>,
+        ) -> Result<crate::types::WriteResult> {
+            if events.iter().any(|e| e.event_type == "shipped_notification") {
+                let n = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.fail_on {
+                    anyhow::bail!("simulated crash after partial append");
+                }
+            }
+            EventLogBackend::append_to_stream(
+                self.inner.as_ref(), category, subject_id, expected, events,
+            ).await
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_after_partial_append_completes_the_batch_from_the_record() {
+        // A two-output reaction seals, appends output[0], then crashes before
+        // output[1]. The infra-retry re-enters, hits the sealed record, and
+        // completes the batch from it — the body never re-runs.
+        let mem = Arc::new(MemoryStore::new());
+        let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
+        append_trigger(&mem, &trigger);
+        let log: Arc<dyn EventLogBackend> = Arc::new(FailNthOutput {
+            inner: mem.clone(),
+            fail_on: 2,            // let output[0] land; fail output[1] once
+            seen: AtomicUsize::new(0),
+        });
+        let ds: Arc<dyn DecisionStore> = Arc::new(InMemoryDecisionStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let runner = ReactorRunner::new(
+            EmitNCounting { n: 2, calls: calls.clone() },
+            "r.partial",
+            log,
+            mem.clone() as Arc<dyn ReactorCheckpoint>,
+        )
+        .with_decision_store(ds.clone());
+        runner.quiesce().await.unwrap();
+        runner.halt();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "body ran exactly once despite the crash");
+        let all = EventLogBackend::read_all(mem.as_ref(), LogCursor::ZERO, 20).await.unwrap();
+        assert_eq!(
+            all.iter().filter(|e| e.event_type == "shipped_notification").count(),
+            2, "both outputs present — the batch completed from the record",
+        );
+    }
+
+    /// EmitN that counts body invocations (two distinct outputs per call).
+    struct EmitNCounting { n: usize, calls: Arc<AtomicUsize> }
+    #[async_trait]
+    impl Reactor for EmitNCounting {
+        type Trigger = OrderPlaced;
+        const NAME: &'static str = "emit-n-counting";
+        async fn react(&self, trigger: &OrderPlaced, _c: Ctx<'_>) -> Result<Events> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut out = Events::new();
+            // Distinct subjects so the two outputs get distinct event_ids.
+            for _ in 0..self.n {
+                out.push(ShippedNotification { order_id: Uuid::new_v4() });
+            }
+            Ok(out)
+        }
     }
 }

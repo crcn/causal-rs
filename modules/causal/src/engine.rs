@@ -745,6 +745,8 @@ pub(crate) struct ConsumerWiring {
     /// ordering rule as `effect_store`). Reactors seal one decision per
     /// trigger and replay it on redelivery.
     pub decision_store: Option<Arc<dyn crate::decision_store::DecisionStore>>,
+    /// Whether reactors seal empty (zero-output) decision records (A6).
+    pub seal_empty_decisions: bool,
     pub workflow_hw: WorkflowHighWater,
     pub snapshot_store: Option<Arc<dyn crate::snapshot_store::SnapshotStore>>,
     pub snapshot_every: u64,
@@ -798,6 +800,10 @@ pub struct EngineBuilder {
     /// registered *after* this is set. Reactors seal one decision per
     /// trigger and replay it on redelivery instead of re-running the body.
     decision_store:      Option<Arc<dyn crate::decision_store::DecisionStore>>,
+    /// Whether a zero-output reaction seals an empty decision record.
+    /// Default `true`; disable to elide empty-seal write traffic in fan-out
+    /// no-op topologies (A6). Applied to every reactor.
+    seal_empty_decisions: bool,
     /// Per-workflow high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
@@ -934,6 +940,7 @@ impl EngineBuilder {
             decision_store: Some(Arc::new(crate::decision_store::InMemoryDecisionStore::new())),
             explicit_decision_store: false,
             allow_in_memory_decision_store: false,
+            seal_empty_decisions: true,
             workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
@@ -988,6 +995,17 @@ impl EngineBuilder {
     /// automatically.
     pub fn allow_in_memory_decision_store_for_tests(mut self) -> Self {
         self.allow_in_memory_decision_store = true;
+        self
+    }
+
+    /// Whether a zero-output reaction seals an empty decision record
+    /// (default `true`). An empty record preserves the
+    /// processed-vs-never-ran distinction; disabling it elides the
+    /// write+GC for no-op deliveries, which can dominate the causal-infra
+    /// write path in fan-out topologies where most deliveries no-op (A6).
+    /// Applies to every reactor the builder registers.
+    pub fn seal_empty_decisions(mut self, seal: bool) -> Self {
+        self.seal_empty_decisions = seal;
         self
     }
 
@@ -1296,6 +1314,7 @@ impl EngineBuilder {
             if let Some(obs) = w.observer { runner = runner.with_observer(obs); }
             if let Some(rc) = w.effect_store { runner = runner.with_effect_store(rc); }
             if let Some(ds) = w.decision_store { runner = runner.with_decision_store(ds); }
+            runner = runner.with_seal_empty_decisions(w.seal_empty_decisions);
             runner = runner.with_engine_aggregators(w.engine_aggs);
             runner = runner.with_settle_tracker(w.workflow_hw);
             runner = runner.with_snapshot_persistence(w.snapshot_store, w.snapshot_every);
@@ -1601,6 +1620,7 @@ impl EngineBuilder {
                     observer: self.observer.clone(),
                     effect_store: self.effect_store.clone(),
                     decision_store: self.decision_store.clone(),
+                    seal_empty_decisions: self.seal_empty_decisions,
                     workflow_hw: self.workflow_hw.clone(),
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_every: self.snapshot_every,
