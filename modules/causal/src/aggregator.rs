@@ -356,6 +356,12 @@ struct StateEntry {
 pub struct AggregatorRegistry {
     aggregators: Vec<Aggregator>,
     state: DashMap<String, StateEntry>,
+    /// D5: when set, `fold_bounded` folds each hydrated stream twice and
+    /// compares — catching a nondeterministic `apply` (fold purity is still
+    /// fully load-bearing for state reconstruction; records only demoted
+    /// *reactor* determinism). Enabled only by test engines (`memory()` /
+    /// `in_memory_for_tests()`); off in production (the double fold has cost).
+    self_check: bool,
 }
 
 impl AggregatorRegistry {
@@ -363,7 +369,13 @@ impl AggregatorRegistry {
         Self {
             aggregators: Vec::new(),
             state: DashMap::new(),
+            self_check: false,
         }
+    }
+
+    /// Enable the fold-determinism self-check (D5). Test engines only.
+    pub fn set_self_check(&mut self, on: bool) {
+        self.self_check = on;
     }
 
     pub fn register(&mut self, aggregator: Aggregator) {
@@ -1370,6 +1382,14 @@ pub(crate) async fn fold_bounded(
     }
     merged.sort_by_key(|e| e.position);
 
+    // D5: keep a copy of the pre-fold state so we can re-fold the exact same
+    // events from the same start and prove `apply` is deterministic.
+    let self_check_start = if reg.self_check {
+        Some(aggs[0].clone_state(state.as_ref()))
+    } else {
+        None
+    };
+
     let mut prev: Option<Box<dyn Any + Send + Sync>> = None;
     for event in &merged {
         let Some(agg) = aggs.iter().find(|a| a.event_prefix == event.event_type) else {
@@ -1385,6 +1405,28 @@ pub(crate) async fn fold_bounded(
         agg.apply_to(state.as_mut(), event.payload.clone())?;
         tails.insert(event.category.clone(), event.revision);
         folded_to = event.position;
+    }
+
+    // D5: re-fold the identical event set from the identical start state; a
+    // nondeterministic `apply` (wall clock, RNG, HashMap iteration order in a
+    // fold) diverges here. Name the offending aggregate + subject loudly.
+    if let Some(start) = self_check_start {
+        let mut recheck = start;
+        for event in &merged {
+            if let Some(agg) = aggs.iter().find(|a| a.event_prefix == event.event_type) {
+                agg.apply_to(recheck.as_mut(), event.payload.clone())?;
+            }
+        }
+        let a = aggs[0].serialize_state(state.as_ref())?;
+        let b = aggs[0].serialize_state(recheck.as_ref())?;
+        assert!(
+            a == b,
+            "FOLD DETERMINISM VIOLATION (D5): aggregate '{aggregate_type}' subject \
+             {id} folded to two different states from the same events — apply() is \
+             nondeterministic (wall clock, RNG, HashMap iteration order, or an \
+             external read in a fold). Fold purity is load-bearing for state \
+             reconstruction. First: {a}  Second: {b}",
+        );
     }
 
     let curr_clone = aggs[0].clone_state(state.as_ref());
@@ -1807,5 +1849,89 @@ mod tests {
                    "B advanced across c@0, d@1, c@2 and folded b@3");
         assert_eq!(reg.get_state(&format!("B:{id}")).unwrap().downcast_ref::<BCount>().unwrap().n, 1,
                    "only `b` folded into B");
+    }
+
+    // ── D5: fold-determinism self-check ──
+
+    static NONDET_APPLY_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// An aggregate whose `apply` is nondeterministic: it adds a
+    /// process-global counter value, so folding the same events twice yields
+    /// different states — exactly what the D5 self-check must catch.
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct NondetCount { n: u64 }
+    impl Aggregate for NondetCount {
+        const NAME: &'static str = "NondetCount";
+        const SUBJECT: &'static str = "ping";
+    }
+    impl Apply<Ping> for NondetCount {
+        fn apply(&mut self, _: &Ping) {
+            self.n += NONDET_APPLY_COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Append `n` Ping events into the stream `fold_bounded` reads for them
+    /// — keyed by the EVENT's SUBJECT (`Ping::SUBJECT`, which defaults to its
+    /// NAME "pinged"), not the aggregate's.
+    async fn append_pings_on_subject(store: &MemoryStore, id: Uuid, n: usize) {
+        for _ in 0..n {
+            let ev = EventData {
+                event_id: Uuid::new_v4(),
+                causation_id: None,
+                workflow_id: Uuid::new_v4(),
+                event_type: <Ping as Event>::NAME.to_string(),
+                payload: serde_json::to_value(Ping { id }).unwrap(),
+                created_at: Utc::now(),
+                category: Some(<Ping as Event>::SUBJECT.to_string()),
+                subject_id: Some(id),
+                metadata: serde_json::Map::new(),
+                ephemeral: None,
+                persistent: true,
+            };
+            crate::append_event(store, ev).await.unwrap();
+        }
+    }
+
+    async fn max_position(store: &MemoryStore) -> LogCursor {
+        crate::event_log::EventLogBackend::read_all(store, LogCursor::ZERO, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.position)
+            .max()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fold_self_check_deterministic_aggregate_passes() {
+        // A deterministic aggregate with the self-check ON folds cleanly.
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_pings_on_subject(&store, id, 3).await;
+        let bound = max_position(&store).await;
+        let mut reg = AggregatorRegistry::new();
+        reg.set_self_check(true);
+        reg.register(Aggregator::for_type::<PingCount, Ping>());
+        let cache = FoldOnReadCache::default();
+        let (_prev, curr) =
+            fold_bounded(&reg, &store, "PingCount", id, bound, &cache).await.unwrap();
+        assert_eq!(curr.downcast_ref::<PingCount>().unwrap().n, 3);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "FOLD DETERMINISM VIOLATION")]
+    async fn fold_self_check_catches_nondeterministic_apply() {
+        let store = MemoryStore::new();
+        let id = Uuid::new_v4();
+        append_pings_on_subject(&store, id, 3).await;
+        let bound = max_position(&store).await;
+        let mut reg = AggregatorRegistry::new();
+        reg.set_self_check(true);
+        reg.register(Aggregator::for_type::<NondetCount, Ping>());
+        let cache = FoldOnReadCache::default();
+        // The double fold produces two different states → panic (D5).
+        let _ = fold_bounded(&reg, &store, "NondetCount", id, bound, &cache).await;
     }
 }

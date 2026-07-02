@@ -872,6 +872,9 @@ pub struct EngineBuilder {
     /// records sealed longer ago than this. Age-driven, never floor-driven.
     /// Default 7 days.
     decision_retention: std::time::Duration,
+    /// D5: fold-determinism self-check. Set by test constructors
+    /// (`memory` / `in_memory_for_tests`); off in production.
+    fold_self_check: bool,
     /// Per-workflow high-water tracker for scoped `settle`. Created eagerly
     /// (so registration order doesn't matter), shared with every reactor runner
     /// and the built engine.
@@ -947,6 +950,7 @@ impl EngineBuilder {
         // opt-in here.
         .allow_in_memory_effect_store_for_tests()
         .allow_in_memory_decision_store_for_tests()
+        .with_fold_self_check(true)
     }
 
     /// Wire a single [`MemoryStore`](crate::MemoryStore) into *every* durable
@@ -978,6 +982,7 @@ impl EngineBuilder {
         .with_observer(store as Arc<dyn crate::reactor_observer::ReactorObserver>)
         .allow_in_memory_effect_store_for_tests()
         .allow_in_memory_decision_store_for_tests()
+        .with_fold_self_check(true)
     }
 
     /// `checkpoint` stores projector/reactor cursors; `reactor_checkpoint`
@@ -1010,6 +1015,7 @@ impl EngineBuilder {
             allow_in_memory_decision_store: false,
             seal_empty_decisions: true,
             decision_retention: std::time::Duration::from_secs(7 * 24 * 3600),
+            fold_self_check: false,
             workflow_hw: Arc::new(std::sync::Mutex::new(SettleTracker::new())),
             snapshot_store: None,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
@@ -1086,6 +1092,18 @@ impl EngineBuilder {
     /// GC'd while a redelivery is still possible would re-decide.
     pub fn with_decision_retention(mut self, window: std::time::Duration) -> Self {
         self.decision_retention = window;
+        self
+    }
+
+    /// Enable the fold-determinism self-check (D5): every fold-on-read folds
+    /// its events twice and asserts the states match, catching a
+    /// nondeterministic `apply`. On automatically for `memory()` /
+    /// `in_memory_for_tests()`; leave off in production (the double fold has
+    /// cost). Fold purity stays load-bearing even after decision records
+    /// demoted *reactor* determinism, so this guards the contract that still
+    /// matters for state reconstruction.
+    pub fn with_fold_self_check(mut self, on: bool) -> Self {
+        self.fold_self_check = on;
         self
     }
 
@@ -1690,9 +1708,11 @@ impl EngineBuilder {
         }
 
         let aggregators = self.aggregators;
+        let fold_self_check = self.fold_self_check;
         let make_registry = || -> Option<Arc<AggregatorRegistry>> {
             if aggregators.is_empty() { return None; }
             let mut reg = AggregatorRegistry::new();
+            reg.set_self_check(fold_self_check);
             for agg in &aggregators {
                 reg.register(agg.clone());
             }
