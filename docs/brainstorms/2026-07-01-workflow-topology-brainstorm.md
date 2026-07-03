@@ -82,7 +82,7 @@ No I/O in the module. Two consumers:
    mermaid identifiers — use generated ids with quoted labels (`n0["scan:SourceScanRequested"]`).
 6. **No DAG assumption.** Retry/poll reactors legally produce self-loops and
    cycles; nothing may topologically sort.
-7. **Release as 0.17.2, all workspace crates aligned.** Additive-in-patch has
+7. **Release as 0.18.1, all workspace crates aligned.** Additive-in-patch has
    precedent (0.7.4, 0.17.1); every crate publishes at the same version per
    workspace convention.
 
@@ -119,5 +119,6 @@ No I/O in the module. Two consumers:
 
 ## Next Step
 
-`/workflows:plan` — implement `extract_topology` + `to_mermaid` in `causal_utils`
-(TDD, unit tests inline per crate convention), changelog entry, release 0.17.2.
+Roadmapped: see "Added 2026-07-02 — workflow topology module" in
+`docs/plans/2026-06-14-causal-next-roadmap.md` (implementation detail, TDD test
+list, and release steps live there; target 0.18.1).

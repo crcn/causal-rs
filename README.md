@@ -30,10 +30,10 @@ self-driving reaction loop with at-least-once + idempotent delivery.
 
 ```toml
 [dependencies]
-causal = "0.8"
+causal = "0.19"
 
 # Durable backends (KurrentDB event log + Postgres cursors/snapshots):
-causal_replay = { version = "0.8", features = ["postgres", "kurrent"] }
+causal_replay = { version = "0.19", features = ["postgres", "kurrent"] }
 ```
 
 The core `causal` crate runs entirely in-memory — you only need

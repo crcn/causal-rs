@@ -6,6 +6,97 @@ numbers follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-07-02
+
+**Decision records.** A trigger's outputs now enter the log only from a
+durable, first-write-wins **decision record** sealed per `(consumer, trigger)`.
+Redelivery replays the record instead of re-running the reactor body — so a
+crash-and-retry can no longer produce a *different* outcome (the "chimera").
+Reactor determinism drops from a correctness contract to hygiene; fold purity
+remains load-bearing. This is a **breaking** release.
+
+### Breaking
+
+- **A reactor-bearing engine now requires a durable decision store.** Building
+  one without `EngineBuilder::with_decision_store(...)` is a loud error, not a
+  silent in-memory default (same "No Lying Defaults" gate shape as the 0.16
+  effect store). Tests opt in with
+  `.allow_in_memory_decision_store_for_tests()`.
+- **`EventLogBackend` custom implementors:** `DivergentRedelivery` gained a
+  `canonical: Option<Box<RecordedEvent>>` field. Code that *constructs* it (a
+  custom backend's `append_to_stream`) must add the field — `None` for the safe
+  remove-only fallback, or `Some(Box::new(persisted_row))` to enable log-wins
+  reconciliation. Matching on the type is unaffected.
+- **`EngineBuilder::build()` can now return `Err`** when the `causal:control`
+  stream is unreadable after retries (previously it silently booted an empty
+  cancel fence, resurrecting cancelled workflows). Handle the `Result` — an
+  `.unwrap()` on build can now fire on persistent storage failure.
+
+### Added
+
+- **`DecisionStore` trait + `InMemoryDecisionStore` + `PgDecisionStore`**
+  (`causal_replay`), with a cross-backend conformance suite. First-write-wins
+  `seal`, `get`, `remove`, and retention `remove_reclaimable`.
+- **Global event-id registry for the Kurrent backend** (`EventIdRegistry` +
+  `PgEventIdRegistry`) — closes the bounded-dedup-window duplicate on deep
+  redelivery. Wire with `KurrentEventLogBackend::with_event_id_registry(...)`.
+- **`ReactorRunner::with_attempt_timeout` / `EngineBuilder` equivalent** (D3) —
+  per-attempt `react()` timeout; a slow body fails *transient* (retries), never
+  poison. Typed `SettleTimeout` liveness ceiling for `settle()`.
+- **Boot-time orphan detection** (D4) — `build()` warns (or fails, in strict
+  mode) on checkpoint/decision/effect rows whose consumer id is unregistered
+  (the rename trap). `EngineBuilder::with_strict_orphan_detection`.
+- **Fold-determinism self-check** in test engines (D5) — hydrates each stream
+  twice and compares, naming the first divergent subject.
+- **`clippy.toml` guardrail** shipped in-crate (`lints/`, D7) disallowing
+  `Uuid::new_v4`/`Utc::now` in reactor modules.
+
+### Fixed — decision-protocol side doors (audit Group A)
+
+An adversarial audit found five paths that produced or destroyed a trigger's
+outcome *without* going through seal→append→replay; all are closed, each with a
+regression test.
+
+- **Terminal park is now a sealed decision.** A park seals a `parked`
+  `DecisionRecord` before appending the terminal fact, so redelivery replays it
+  instead of re-running the body into a contradictory success. The DLQ observer
+  fires at-most-once.
+- **The cancel fence consults the decision store.** A decision sealed before a
+  cancel completes its (crash-interrupted) append instead of being acked away
+  as a torn batch.
+- **Fence-consulted emptiness always seals.** `.seal_empty_decisions(false)` no
+  longer elides an empty decision when the body called
+  `Ctx::is_workflow_cancelled()` — otherwise a redelivery could re-decide a
+  full batch.
+- **Cancel-fence rehydration fails loud.** See Breaking (`build()`).
+- **Divergence self-heals log-wins.** A sealed output that disagrees with the
+  log is reconciled to the log's canonical row (record re-sealed to match)
+  rather than parking a possibly-succeeded trigger; `RecordIntegrityError` and
+  the loud replay-park are removed. (This also fixes the park re-park livelock.)
+- **Retention GC exempts parked records** — a parked record is a terminal
+  marker; reclaiming it let a checkpoint regression re-decide it into a park
+  chimera.
+- **Retention GC honors the ack-floor** (A1) — a record is reclaimed only when
+  aged *and* behind the consumer's durable floor, never while still
+  redeliverable.
+
+### Migration (from 0.18.x)
+
+- **Postgres:** run `migrations/20260702_causal_decisions.sql`,
+  `migrations/20260702_causal_event_ids.sql`, and
+  `migrations/20260703_causal_decisions_parked.sql` (or call each store's
+  `ensure_schema`). The last adds `parked` and a retroactive `trigger_position`
+  ALTER for tables created by an earlier `ensure_schema`.
+- **App wiring:** add `.with_decision_store(...)` to every reactor-bearing
+  engine (or `.allow_in_memory_decision_store_for_tests()` in tests); handle
+  `build()`'s `Result`.
+- **Custom `EventLogBackend`:** add the `canonical` field where you construct
+  `DivergentRedelivery`.
+- **Custom `DecisionStore`:** persist and round-trip `DecisionRecord.parked`
+  (the trait signatures are unchanged; `seal` still returns `DecisionRecord`).
+- **Behavioral:** `.seal_empty_decisions(false)` is a no-op for reactor bodies
+  that consult the cancel fence.
+
 ## [0.18.0] — 2026-07-02
 
 Wedge-class + observability hardening surfaced by a downstream (rootsignal)

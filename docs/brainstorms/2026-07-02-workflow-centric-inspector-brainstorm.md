@@ -3,7 +3,7 @@
 **Date:** 2026-07-02
 **Status:** Design pressure-tested against code + external DX research
 **Depends on:** `2026-07-01-workflow-topology-brainstorm.md` (the pure
-`causal_utils::topology` module, shipping in 0.17.2)
+`causal_utils::topology` module, shipping in 0.18.1)
 
 ## What We're Building
 
@@ -132,7 +132,7 @@ Anti-patterns to avoid (from the same research):
 
 ## Sequencing
 
-1. **0.17.2** — pure `causal_utils::topology` module (other brainstorm).
+1. **0.18.1** — pure `causal_utils::topology` module (other brainstorm).
    Unblocks the rootsignal test gate immediately.
 2. **Follow-up causal-rs release** — the three GraphQL additions + partial
    index + memory-feature impls.

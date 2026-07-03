@@ -460,10 +460,60 @@ engine wiring, `EngineBuilder::with_default_retry_policy()`, and tests.
 
 ---
 
+## Added 2026-07-02 — workflow topology module (target 0.18.1)
+
+Pure, I/O-free `topology` module in `causal_utils`: collapse persisted envelopes
+into deduplicated parent→child event-type edges + deterministic mermaid renderer.
+The log already *is* the topology — every envelope carries `causation_id` +
+`event_type`; collapsing per workflow root yields the true observed event-flow
+graph. Design pressure-tested in
+`docs/brainstorms/2026-07-01-workflow-topology-brainstorm.md`; the follow-on
+workflow-centric inspector direction (catalog → topology + runs → run detail,
+three additive GraphQL queries) lives in
+`docs/brainstorms/2026-07-02-workflow-centric-inspector-brainstorm.md`.
+
+```rust
+// causal_utils::topology — no dep on causal; EnvelopeMeta is a field-copy
+// from RecordedEvent or StoredEvent. Only new dep: uuid (workspace).
+pub struct EnvelopeMeta { pub event_id: Uuid, pub causation_id: Option<Uuid>, pub event_type: String }
+pub struct TopologyEdge { pub from: String, pub to: String, pub count: u64 }
+pub struct Topology { pub edges: Vec<TopologyEdge>, pub roots: Vec<String>, pub orphans: Vec<String> } // all sorted
+
+pub fn extract_topology(events: impl IntoIterator<Item = EnvelopeMeta>) -> Topology;
+pub fn to_mermaid(root: &str, topology: &Topology) -> String; // byte-deterministic, no counts
+```
+
+Locked decisions: caller pre-filters to one workflow (no `workflow_id` on the
+view — forced contract); `Topology` carries `roots` + `orphans` so lost-parentage
+bugs and windowed-query boundaries stay visible; edges sorted `(from, to)` via
+`BTreeMap` tally; no DAG assumption (self-loops/cycles legal); mermaid ids
+sanitized (`n0["scan:SourceScanRequested"]`), orphans in a subgraph, root styled.
+
+Consumers: (1) rootsignal test gate — run each workflow root against
+`MemoryStore`, capture via `global_log()`, diff rendered mermaid against
+checked-in `docs/architecture/topology/<workflow>.md`; (2) inspector GraphQL
+(later release, see inspector brainstorm).
+
+Implementation (TDD, inline `#[cfg(test)]`, plain `#[test]`): tests for linear
+chain, fan-out/fan-in, duplicate-edge collapse + count, self-loop/cycle
+termination, orphan detection, multiple roots, single-run path signature, empty
+input, duplicate `event_id` (first-wins for type map), shuffled-input
+byte-identical determinism, mermaid escaping + exact-string snapshot. Then
+implement, rustdoc (pre-filter contract, observed-under-test caveat), re-export
+from `lib.rs`, CHANGELOG, release 0.18.1 all crates aligned.
+
+Risks: mermaid output format becomes a **frozen contract** once consumers check
+artifacts in — snapshot-test it now. rootsignal's bump to 0.18.x also absorbs
+0.18.0's H7 causation-depth-ceiling behavioral change — flag in release notes.
+Per release flow: verify rootsignal usage statically, publish, then bump.
+
+---
+
 ## Summary
 
 | Item | Release | Status |
 |------|---------|--------|
+| Workflow topology module (`causal_utils::topology`) | 0.18.1 | Planned (added 2026-07-02) |
 | Per-reactor retry policy (macro) | 0.12 | In |
 | `ctx.version()` schema evolution | 0.12 | In (scope: behavioral path changes only) |
 | Ack-floor durability fix | 0.12 | In (Option A — reorder; Option B deferred) |
