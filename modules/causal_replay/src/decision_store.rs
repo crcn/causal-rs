@@ -72,9 +72,9 @@ mod pg {
             &self,
             consumer: &str,
             trigger_event_id: Uuid,
-        ) -> Result<Option<(serde_json::Value, DateTime<Utc>, i64)>> {
-            let row: Option<(serde_json::Value, DateTime<Utc>, i64)> = sqlx::query_as(
-                "SELECT outputs, sealed_at, trigger_position FROM causal_decisions \
+        ) -> Result<Option<(serde_json::Value, DateTime<Utc>, i64, bool)>> {
+            let row: Option<(serde_json::Value, DateTime<Utc>, i64, bool)> = sqlx::query_as(
+                "SELECT outputs, sealed_at, trigger_position, parked FROM causal_decisions \
                  WHERE consumer = $1 AND trigger_event_id = $2",
             )
             .bind(consumer)
@@ -93,17 +93,17 @@ mod pg {
             // Atomic first-write-wins via CTE: INSERT wins → RETURNING our
             // row; conflict → UNION ALL SELECT the winner's. `sealed_at` is
             // read back so the returned record reflects the canonical row.
-            let row: Option<(serde_json::Value, DateTime<Utc>, i64)> = sqlx::query_as(
+            let row: Option<(serde_json::Value, DateTime<Utc>, i64, bool)> = sqlx::query_as(
                 "WITH ins AS ( \
                      INSERT INTO causal_decisions \
-                         (consumer, trigger_event_id, trigger_position, outputs, sealed_at) \
-                     VALUES ($1, $2, $3, $4, $5) \
+                         (consumer, trigger_event_id, trigger_position, outputs, parked, sealed_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT (consumer, trigger_event_id) DO NOTHING \
-                     RETURNING outputs, sealed_at, trigger_position \
+                     RETURNING outputs, sealed_at, trigger_position, parked \
                  ) \
-                 SELECT outputs, sealed_at, trigger_position FROM ins \
+                 SELECT outputs, sealed_at, trigger_position, parked FROM ins \
                  UNION ALL \
-                 SELECT outputs, sealed_at, trigger_position FROM causal_decisions \
+                 SELECT outputs, sealed_at, trigger_position, parked FROM causal_decisions \
                  WHERE consumer = $1 AND trigger_event_id = $2 \
                  LIMIT 1",
             )
@@ -111,6 +111,7 @@ mod pg {
             .bind(rec.trigger_event_id)
             .bind(rec.trigger_position.raw() as i64)
             .bind(&outputs)
+            .bind(rec.parked)
             .bind(rec.sealed_at)
             .fetch_optional(&self.pool)
             .await?;
@@ -118,7 +119,7 @@ mod pg {
             // Zero-row race (A4b): our insert did nothing and the winner's
             // row is not yet visible. Retry the plain SELECT until the
             // committed winner appears.
-            let (canonical_outputs, sealed_at, position) = match row {
+            let (canonical_outputs, sealed_at, position, parked) = match row {
                 Some(r) => r,
                 None => {
                     let mut found = None;
@@ -147,6 +148,7 @@ mod pg {
                 trigger_event_id: rec.trigger_event_id,
                 trigger_position: LogCursor::from_raw(position as u64),
                 outputs: DecisionRecord::outputs_from_json(canonical_outputs)?,
+                parked,
                 sealed_at,
             })
         }
@@ -157,11 +159,12 @@ mod pg {
             trigger_event_id: Uuid,
         ) -> Result<Option<DecisionRecord>> {
             match self.fetch(consumer, trigger_event_id).await? {
-                Some((outputs, sealed_at, position)) => Ok(Some(DecisionRecord {
+                Some((outputs, sealed_at, position, parked)) => Ok(Some(DecisionRecord {
                     consumer: consumer.to_string(),
                     trigger_event_id,
                     trigger_position: LogCursor::from_raw(position as u64),
                     outputs: DecisionRecord::outputs_from_json(outputs)?,
+                    parked,
                     sealed_at,
                 })),
                 None => Ok(None),
@@ -189,9 +192,15 @@ mod pg {
             aged_before: DateTime<Utc>,
             floor: LogCursor,
         ) -> Result<u64> {
+            // `AND NOT parked`: a parked record is a terminal marker; reclaiming
+            // it would let a later checkpoint regression re-deliver the trigger
+            // and re-decide it (a body that now succeeds appends outputs with
+            // event_ids disjoint from the terminal fact, so nothing reconciles
+            // them — a park chimera). Parks are rare, so retaining them is cheap.
             let res = sqlx::query(
                 "DELETE FROM causal_decisions \
-                 WHERE consumer = $1 AND sealed_at < $2 AND trigger_position <= $3",
+                 WHERE consumer = $1 AND sealed_at < $2 AND trigger_position <= $3 \
+                   AND NOT parked",
             )
             .bind(consumer)
             .bind(aged_before)

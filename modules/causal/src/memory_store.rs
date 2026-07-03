@@ -507,6 +507,11 @@ impl crate::event_log::EventLogBackend for MemoryStore {
                         crate::event_log::DivergentRedelivery {
                             event_id: e.event_id,
                             diff:     where_,
+                            // The log row IS the canonical version — hand it
+                            // to the runner so it can reconcile the record
+                            // (log-wins) rather than leave it contradicting
+                            // the log.
+                            canonical: Some(Box::new(row.clone())),
                         },
                     ));
                 }

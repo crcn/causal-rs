@@ -138,6 +138,7 @@ mod tests {
                 logs:           None,
                 effect_store: None,
                 cancelled_workflows: None,
+                fence_consulted: None,
             },
         ).await.unwrap();
 
@@ -171,6 +172,7 @@ mod tests {
                     logs:           None,
                     effect_store: None,
                     cancelled_workflows: None,
+                    fence_consulted: None,
                 },
             ).await.unwrap();
         }

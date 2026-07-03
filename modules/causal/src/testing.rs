@@ -81,6 +81,7 @@ impl TestCtx {
             logs:                None,
             effect_store:        self.effect_store.as_ref(),
             cancelled_workflows: None,
+            fence_consulted: None,
         }
     }
 }

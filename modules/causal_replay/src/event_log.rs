@@ -163,6 +163,12 @@ mod pg {
             return Err(anyhow::Error::new(DivergentRedelivery {
                 event_id: id,
                 diff:     "payload/event_type/workflow/causation/placement".to_string(),
+                // TODO(reconciliation): fetch the canonical row by event_id so
+                // the runner can reconcile the record to the log (log-wins).
+                // `None` today → the runner falls back to removing the
+                // contradicted record (safe: no lying record; body may re-run
+                // on a later redelivery). Memory backend supplies this fully.
+                canonical: None,
             }));
         }
         Ok(())

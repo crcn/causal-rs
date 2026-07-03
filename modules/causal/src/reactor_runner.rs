@@ -251,8 +251,13 @@ struct Completion {
 }
 
 enum AttemptOutcome {
-    /// Reaction succeeded; outputs are durable.
-    Done,
+    /// Reaction resolved; outputs (or the terminal park fact) are durable.
+    /// `parked` carries the canonical decision's kind: a redelivery that
+    /// replays a parked record reports `parked = true` so the floor-GC keeps
+    /// the trigger's effect entries (failure replay restores from them), and
+    /// a success execution that adopts a racer's park record reports the
+    /// racer's outcome, not its own.
+    Done { parked: bool },
     /// The reaction body failed (deserialization, `react()` error or
     /// panic, OCC-fence violation). Carries the error — classified per
     /// the BLOCKING-2 taxonomy where the failure is structurally
@@ -264,30 +269,46 @@ enum AttemptOutcome {
     BodyFailed { error: anyhow::Error, attempts: u32 },
 }
 
-/// A decision replay found the log disagreeing with a sealed record — an
-/// existing output row carries a different payload than the record says it
-/// should. Under decision records, replay appends are byte-identical by
-/// construction, so this means corruption or a genuine bug, not reactor
-/// nondeterminism. Carries the backend's diff; the runner parks it as
-/// poison (A3). Distinguished from `DivergentRedelivery` (accepted on the
-/// first-delivery path) by being raised only when replaying a record.
-#[derive(Debug)]
-struct RecordIntegrityError(String);
-
-impl std::fmt::Display for RecordIntegrityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "decision-record integrity violation: {}", self.0)
-    }
-}
-
-impl std::error::Error for RecordIntegrityError {}
-
 /// What `process_trigger` reports back to the worker loop: how the
 /// trigger finished, and which effect labels it used (the floor-GC's
 /// deletion list).
 struct TriggerDone {
     parked: bool,
     effect_labels: Vec<String>,
+}
+
+/// The first output in a decision batch whose append the log rejected as
+/// divergent (an existing row with this `event_id` carries different bytes).
+/// `append_decision` uses `canonical` to reconcile the record to the log.
+struct OutputDivergence {
+    /// Index of the diverging output within the record's `outputs`.
+    index: usize,
+    /// The backend's human diff (a JSON path or the compared field set).
+    diff: String,
+    /// The log's canonical row, when the backend supplied it. `None` →
+    /// remove-only reconciliation (drop the contradicted record).
+    canonical: Option<Box<RecordedEvent>>,
+}
+
+/// Project a persisted log row back into an [`EventData`] for re-sealing into
+/// a decision record. Re-appending the result to `(category, subject_id)`
+/// dedup-hits byte-identically (the fields the backend compares for identity —
+/// payload, event_type, workflow_id, causation_id, placement — are copied
+/// straight from the row; `created_at`/`metadata` are dedup-exempt hints).
+fn recorded_to_output(r: &RecordedEvent) -> EventData {
+    EventData {
+        event_id: r.event_id,
+        causation_id: r.causation_id,
+        workflow_id: r.workflow_id,
+        event_type: r.event_type.clone(),
+        payload: r.payload.clone(),
+        created_at: r.created_at,
+        category: Some(r.category.clone()),
+        subject_id: Some(r.subject_id),
+        metadata: r.metadata.clone(),
+        ephemeral: None,
+        persistent: true,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -336,6 +357,14 @@ struct Core<R: Reactor> {
     /// Whether a zero-output reaction seals an empty record. Default `true`
     /// (full processed-vs-never-ran signal). Set `false` to elide empty
     /// seals where fan-out no-op traffic would dominate the write path (A6).
+    ///
+    /// **Caveat:** elision does NOT apply when the body consulted the cancel
+    /// fence via [`Ctx::is_workflow_cancelled`](crate::Ctx::is_workflow_cancelled).
+    /// Fence-consulted emptiness is fence-dependent, not deterministic — a
+    /// redelivery where the fence reads differently would re-decide a full
+    /// batch (two outcomes for one trigger), so it always seals. Bodies using
+    /// the documented `is_workflow_cancelled` early-exit therefore seal every
+    /// no-op decision regardless of this flag.
     seal_empty_decisions: bool,
     /// Optional per-attempt `react()` timeout (D3). `None` = unbounded. A
     /// body exceeding it fails TRANSIENT (retries), never poison.
@@ -674,9 +703,16 @@ where
                     let fenced = self.core.cancelled_workflows.as_ref()
                         .map(|f| f.lock().unwrap().contains(&event.workflow_id))
                         .unwrap_or(false);
-                    if fenced {
-                        // Dispatch-gate: ack at the gate without entering
-                        // pending or wf_pending — the floor catches up naturally.
+                    if fenced && self.core.decision_store.is_none() {
+                        // Dispatch-gate (no decision store): nothing durable
+                        // could have been sealed for this trigger, so ack at
+                        // the gate without entering pending or wf_pending —
+                        // the floor catches up naturally. WITH a decision
+                        // store the trigger must flow to a worker instead:
+                        // a decision sealed BEFORE the cancel still appends
+                        // (its append loop may have been interrupted), and
+                        // consulting the store is async — impossible here
+                        // under the dispatch lock.
                         tracing::debug!(
                             reactor = %self.core.consumer_id,
                             event_id = %event.event_id,
@@ -877,27 +913,17 @@ where
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             };
-            // Worker-level fence: ack immediately for already-queued
-            // triggers whose workflow was cancelled after dispatch.
-            if let Some(fence) = &core.cancelled_workflows {
-                if fence.lock().unwrap().contains(&event.workflow_id) {
-                    tracing::debug!(
-                        reactor = %core.consumer_id,
-                        event_id = %event.event_id,
-                        workflow_id = %event.workflow_id,
-                        position = event.position.raw(),
-                        "queued trigger acked without processing (workflow cancelled)",
-                    );
-                    let _ = core.completions_tx.send(Completion {
-                        position: event.position,
-                        workflow: event.workflow_id,
-                        parked: false,
-                        effect_labels: vec![],
-                    });
-                    continue;
-                }
-            }
-            match core.process_trigger(&event, &fold_cache).await {
+            // Worker-level fence: a trigger whose workflow was cancelled is
+            // not PROCESSED — but "not processed" must still honor a decision
+            // sealed BEFORE the cancel ("a sealed record for a workflow
+            // cancelled after sealing still appends — the decision happened
+            // pre-cancel"). `process_trigger`'s fenced mode consults the
+            // decision store: a sealed record replays/completes its batch
+            // idempotently; a get-miss acks without ever running the body.
+            let fenced = core.cancelled_workflows.as_ref()
+                .map(|f| f.lock().unwrap().contains(&event.workflow_id))
+                .unwrap_or(false);
+            match core.process_trigger(&event, &fold_cache, fenced).await {
                 Some(done) => {
                     let _ = core.completions_tx.send(Completion {
                         position: event.position,
@@ -964,6 +990,7 @@ where
         self: &Arc<Self>,
         event: &RecordedEvent,
         fold_cache: &FoldOnReadCache,
+        fenced: bool,
     ) -> Option<TriggerDone> {
         let mut local_attempt: u32 = 0;
         let mut transient_since: Option<tokio::time::Instant> = None;
@@ -995,7 +1022,7 @@ where
                 }
                 None => None,
             };
-            let attempted = self.attempt_trigger(event, fold_cache, &labels).await;
+            let attempted = self.attempt_trigger(event, fold_cache, &labels, fenced).await;
             drop(permit);
             let this_effects: Vec<String> = labels
                 .into_inner()
@@ -1029,10 +1056,13 @@ where
 
             used_effects.extend(this_effects);
             let failure = match attempted {
-                Ok(AttemptOutcome::Done) => {
+                Ok(AttemptOutcome::Done { parked }) => {
                     self.note_worker_progress();
                     return Some(TriggerDone {
-                        parked: false,
+                        // A completion that replayed/adopted a PARKED record
+                        // must report parked=true so the floor-GC keeps the
+                        // trigger's effect entries.
+                        parked,
                         effect_labels: used_effects.into_iter().collect(),
                     });
                 }
@@ -1083,17 +1113,23 @@ where
                         )
                         .await
                     {
-                        Ok(()) => {
+                        // `parked` is the SEALED outcome: normally true, but
+                        // false if a racer had already sealed a SUCCESS record
+                        // for this trigger (first-write-wins) and we adopted
+                        // it — then the trigger completed successfully and its
+                        // effects GC like any success.
+                        Ok(parked) => {
                             tracing::debug!(
                                 reactor = %self.consumer_id,
                                 event_id = %event.event_id,
                                 attempts,
                                 class = ?failure_class,
-                                "trigger parked (terminal failure)",
+                                parked,
+                                "trigger terminal outcome sealed",
                             );
                             self.note_worker_progress();
                             return Some(TriggerDone {
-                                parked: true,
+                                parked,
                                 effect_labels: used_effects.into_iter().collect(),
                             });
                         }
@@ -1143,6 +1179,7 @@ where
         event: &RecordedEvent,
         fold_cache: &FoldOnReadCache,
         labels: &LabelSet,
+        fenced: bool,
     ) -> Result<AttemptOutcome> {
         // ── Decision replay gate. A sealed decision for this trigger means
         //    the body already ran and its outputs are canonical: replay them
@@ -1157,6 +1194,25 @@ where
             if let Some(rec) = store.get(&self.consumer_id, event.event_id).await? {
                 return self.replay_decision(event, &rec).await;
             }
+        }
+
+        // ── Cancel fence. A fenced delivery that reaches here has NO sealed
+        //    decision (the gate above would have replayed one — a decision
+        //    made before the cancel still appends): the body never ran to a
+        //    decision, and cancel means it never will. Ack without deciding.
+        //    Checked AFTER the replay gate so a `get` error retries as infra
+        //    instead of silently fence-acking a trigger whose sealed batch
+        //    might still be incomplete.
+        if fenced {
+            tracing::debug!(
+                reactor = %self.consumer_id,
+                event_id = %event.event_id,
+                workflow_id = %event.workflow_id,
+                position = event.position.raw(),
+                "fenced trigger acked without processing \
+                 (workflow cancelled; no sealed decision)",
+            );
+            return Ok(AttemptOutcome::Done { parked: false });
         }
 
         // Record the attempt FIRST (before deserialization), so a
@@ -1225,6 +1281,10 @@ where
             },
             None => StateSource::None,
         };
+        // Whether the body consulted the cancel fence this attempt — read
+        // after the body returns; gates empty-seal elision (fence-consulted
+        // emptiness is fence-dependent, so it must seal — A6 caveat).
+        let fence_consulted = std::sync::atomic::AtomicBool::new(false);
         let ctx = Ctx {
             event_id:       event.event_id,
             log_position:   event.position,
@@ -1237,6 +1297,7 @@ where
             logs:           Some(&log_sink),
             effect_store: self.effect_store.as_ref(),
             cancelled_workflows: self.cancelled_workflows.as_ref(),
+            fence_consulted: Some(&fence_consulted),
         };
 
         // ── Decision. A panic is caught and treated as an attempt
@@ -1388,93 +1449,81 @@ where
         //    batch, so two racing executions append identical outputs
         //    regardless of which one won the seal.
         let outputs = self.build_output_events(&emitted.outputs, event, trigger_depth);
+        let base = crate::decision_store::DecisionRecord::new(
+            self.consumer_id.clone(),
+            event.event_id,
+            event.position,
+            outputs,
+            self.clock.now(),
+        );
 
         let sealed = match self.decision_store.clone() {
             Some(store) => {
                 // A zero-output reaction seals an empty record by default
                 // (distinguishes "processed, decided nothing" from "never
                 // ran"). Elidable via `.seal_empty_decisions(false)` (A6)
-                // where fan-out no-op traffic would dominate the write path.
-                if outputs.is_empty() && !self.seal_empty_decisions {
-                    return Ok(AttemptOutcome::Done);
+                // where fan-out no-op traffic would dominate the write path —
+                // EXCEPT when the body consulted the cancel fence: fence-
+                // consulted emptiness is fence-dependent, not deterministic
+                // (a redelivery where the fence reads false would re-decide a
+                // FULL batch — two outcomes for one trigger), so it always
+                // seals. Bodies using the documented is_workflow_cancelled
+                // early-exit therefore seal every no-op decision; elision and
+                // that pattern are mutually exclusive.
+                if base.outputs.is_empty()
+                    && !self.seal_empty_decisions
+                    && !fence_consulted.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Ok(AttemptOutcome::Done { parked: false });
                 }
-                let rec = crate::decision_store::DecisionRecord::new(
-                    self.consumer_id.clone(),
-                    event.event_id,
-                    event.position,
-                    outputs,
-                    self.clock.now(),
-                );
                 // Seal sits between body success and the append loop. A seal
                 // error is runner-INFRASTRUCTURE (retry forever under the
                 // liveness ceiling), NEVER classify()-parked: a routine PG
                 // blip must not mass-park succeeded work. Propagating `Err`
                 // routes to `process_trigger`'s infra-retry arm. (A4)
-                store.seal(rec).await?.outputs
+                store.seal(base).await?
             }
             // No decision store (test-only; build() gates production): append
             // from the locally-built batch — legacy behavior.
-            None => outputs,
+            None => base,
         };
 
-        // First-delivery append. `from_record = false`: a divergence here
-        // means a GC'd record's stale outputs still linger in the log, so we
-        // accept-and-advance with a warn (legacy semantics — we verifiably
-        // re-decided). See `append_outputs`.
-        self.append_outputs(event, &sealed, false).await?;
-        Ok(AttemptOutcome::Done)
+        // First-delivery append, reconciling to the log on divergence
+        // (log-wins): a GC'd record's re-decide that disagrees with a lingering
+        // output re-seals the record to match the log, so a later redelivery
+        // replays a byte-identical batch instead of false-parking. See
+        // `append_decision`.
+        let final_rec = self.append_decision(event, sealed).await?;
+        Ok(AttemptOutcome::Done { parked: final_rec.parked })
     }
 
-    /// Replay a sealed decision: append any outputs a crash left
-    /// un-appended (idempotent completion) and finish, WITHOUT running the
-    /// reactor body. `from_record = true`, so a divergence is an integrity
-    /// violation (the log disagrees with a decision we durably recorded),
-    /// parked as poison per A3 — not the accept-and-advance the
-    /// first-delivery path uses.
+    /// Replay a sealed decision: append any outputs a crash left un-appended
+    /// (idempotent completion) and finish, WITHOUT running the reactor body.
+    /// Divergence self-heals log-wins inside [`append_decision`], so a replay
+    /// never parks — a redelivered success completes as a success, a
+    /// redelivered park replays its terminal fact.
     async fn replay_decision(
         self: &Arc<Self>,
         event: &RecordedEvent,
         rec: &crate::decision_store::DecisionRecord,
     ) -> Result<AttemptOutcome> {
-        match self.append_outputs(event, &rec.outputs, true).await {
-            Ok(()) => {
-                tracing::debug!(
-                    reactor = %self.consumer_id,
-                    event_id = %event.event_id,
-                    outputs = rec.outputs.len(),
-                    "decision replayed from sealed record; reactor body not run",
-                );
-                Ok(AttemptOutcome::Done)
-            }
-            Err(e) => match e.downcast_ref::<RecordIntegrityError>() {
-                Some(integ) => {
-                    tracing::error!(
-                        consumer = self.consumer_id,
-                        event_id = %event.event_id,
-                        diff = %integ.0,
-                        "DECISION-RECORD INTEGRITY VIOLATION on replay — the log \
-                         disagrees with a sealed decision. Parking as poison; this \
-                         is corruption or a genuine bug, not a determinism hint.",
-                    );
-                    // Record an attempt so the terminal-failure fact carries
-                    // a count. Poison parks regardless of the value.
-                    let seq = self
-                        .checkpoint
-                        .record_reactor_attempt(&self.consumer_id, event.event_id)
-                        .await
-                        .unwrap_or(1);
-                    Ok(AttemptOutcome::BodyFailed {
-                        error: poison(anyhow::anyhow!(
-                            "decision-record integrity violation on replay: {}",
-                            integ.0,
-                        )),
-                        attempts: seq,
-                    })
-                }
-                // Infra error → propagate to the worker's infra-retry path.
-                None => Err(e),
-            },
-        }
+        let final_rec = self.append_decision(event, rec.clone()).await?;
+        tracing::debug!(
+            reactor = %self.consumer_id,
+            event_id = %event.event_id,
+            outputs = final_rec.outputs.len(),
+            parked = final_rec.parked,
+            "decision replayed from sealed record; reactor body not run",
+        );
+        // Best-effort: clear the durable attempt counter on completion. The
+        // seal→clear window (first delivery) can leave the counter behind if a
+        // crash lands there; a replay is the natural place to retire it. A
+        // failure here just leaves a harmless stale row.
+        let _ = self
+            .checkpoint
+            .clear_reactor_attempts(&self.consumer_id, event.event_id)
+            .await;
+        Ok(AttemptOutcome::Done { parked: final_rec.parked })
     }
 
     /// Build the durable output envelopes for `emitted`, deriving each
@@ -1526,30 +1575,119 @@ where
             .collect()
     }
 
-    /// Append a decision's output envelopes to their streams, idempotently
-    /// (the log's append-dedup collapses already-present outputs on
-    /// redelivery, C1), then bump the settle high-water and fold each into
-    /// the engine registry. Shared by the first-delivery seal path and the
-    /// replay/completion path.
+    /// Append a sealed decision's outputs to their streams, idempotently (the
+    /// log's append-dedup collapses already-present outputs on redelivery,
+    /// C1), then bump the settle high-water and fold each into the engine
+    /// registry. Reconciles the record to the log on divergence (log-wins) and
+    /// returns the possibly-reconciled record (its outputs now match the log).
+    /// Shared by the first-delivery, replay, and park paths.
     ///
-    /// Divergence handling is gated on `from_record` (A3): a divergence is
-    /// the log rejecting an append because an existing row with the same
-    /// event_id carries a different payload.
-    /// - `from_record = false` (first delivery): a GC'd record's stale
-    ///   outputs may linger, so accept-and-advance with a warn.
-    /// - `from_record = true` (replay): the log disagrees with a decision we
-    ///   durably sealed — an integrity violation, surfaced as
-    ///   [`RecordIntegrityError`] for the caller to park.
-    async fn append_outputs(
+    /// **Log-wins reconciliation.** A divergence is the log rejecting an
+    /// append because an existing row with this `event_id` carries different
+    /// bytes — a re-decided trigger (record GC'd + checkpoint regression) or a
+    /// legacy pre-0.19 terminal fact whose run-varying payload differs. The
+    /// log is the source of truth: the record is re-sealed to match the log's
+    /// canonical row, so a future redelivery replays a byte-identical batch
+    /// instead of re-diverging (or, pre-fix, false-parking a succeeded
+    /// trigger). Requires the backend to attach `DivergentRedelivery.canonical`
+    /// (Memory does; PG/Kurrent fall back to removing the contradicted record
+    /// — no lying record persists, but the body may re-run on a later
+    /// redelivery). With no decision store (test-only), a divergence is simply
+    /// accepted and the loop stops.
+    async fn append_decision(
+        self: &Arc<Self>,
+        event: &RecordedEvent,
+        mut rec: crate::decision_store::DecisionRecord,
+    ) -> Result<crate::decision_store::DecisionRecord> {
+        // Each diverging output reconciles at most once (log rows are
+        // immutable; after reconciliation the append is a byte-identical
+        // dedup-hit), so this bounds the loop well above any real batch.
+        let max_passes = rec.outputs.len() + 2;
+        let mut divergence_reported = false;
+        for _ in 0..max_passes {
+            match self.append_outputs_once(event, &rec.outputs).await? {
+                None => return Ok(rec), // all appended / dedup-hit
+                Some(div) => {
+                    if !divergence_reported {
+                        divergence_reported = true;
+                        if let Some(obs) = self.observer.as_ref() {
+                            obs.reactor_divergence(
+                                event.event_id,
+                                &self.consumer_id,
+                                event.workflow_id,
+                                &div.diff,
+                            );
+                        }
+                        tracing::error!(
+                            consumer = self.consumer_id,
+                            event_id = %event.event_id,
+                            diff = %div.diff,
+                            "DIVERGENT REDELIVERY — a sealed output disagrees with the \
+                             log; the log is canonical, reconciling the record to it. \
+                             Fix the producer's determinism (wall clock, rand, HashMap \
+                             iteration order, emission order, or an external call not \
+                             under ctx.effect).",
+                        );
+                    }
+                    let Some(store) = self.decision_store.clone() else {
+                        // No store to re-seal (test-only path): accept the
+                        // log's row and stop — nothing durably contradicts it.
+                        return Ok(rec);
+                    };
+                    let Some(canonical) = div.canonical else {
+                        // Backend didn't supply the canonical row (PG/Kurrent
+                        // today — tracked TODO(reconciliation)) → remove the
+                        // contradicted record so it can never false-park a
+                        // later redelivery, and stop. KNOWN LIMITATION of this
+                        // fallback: outputs AFTER the diverging one in this
+                        // batch are not appended this pass, and with the record
+                        // gone + the trigger acked they only re-materialize on
+                        // an external checkpoint regression. Only reachable for
+                        // a NONDETERMINISTIC body (the user bug the divergence
+                        // machinery degrades) on a canonical-less backend; the
+                        // memory reference reconciles and appends all outputs.
+                        // Never a lying record, never a chimera.
+                        store
+                            .remove(&rec.consumer, rec.trigger_event_id)
+                            .await?;
+                        return Ok(rec);
+                    };
+                    // Reconcile: replace the diverged output with the log's
+                    // canonical row, then remove + re-seal so the store agrees
+                    // with the log. Restart the append loop — the prefix
+                    // dedup-hits idempotently. (A crash between remove and
+                    // re-seal leaves record-less state = re-decide on the next
+                    // redelivery, the safe direction; never a false park.)
+                    let mut outs = rec.outputs.clone();
+                    outs[div.index] = recorded_to_output(&canonical);
+                    let reconciled = crate::decision_store::DecisionRecord {
+                        outputs: outs,
+                        ..rec.clone()
+                    };
+                    store.remove(&rec.consumer, rec.trigger_event_id).await?;
+                    rec = store.seal(reconciled).await?;
+                }
+            }
+        }
+        anyhow::bail!(
+            "decision reconciliation did not converge for trigger {} after {} passes",
+            event.event_id,
+            max_passes,
+        )
+    }
+
+    /// One append pass over a record's outputs. Appends each to its stream
+    /// (bumping settle + folding the engine registry per success); on the
+    /// FIRST divergence, returns its index + the backend's diff + canonical
+    /// row without appending further — the caller ([`append_decision`])
+    /// reconciles and restarts. `Ok(None)` means every output landed (or
+    /// dedup-hit). Infra errors propagate.
+    async fn append_outputs_once(
         self: &Arc<Self>,
         event: &RecordedEvent,
         outputs: &[EventData],
-        from_record: bool,
-    ) -> Result<()> {
-        // Divergence is reported at most once per trigger — a reactor that
-        // diverges on several outputs has one nondeterminism bug, not N.
-        let mut divergence_reported = false;
-        for out in outputs.iter() {
+    ) -> Result<Option<OutputDivergence>> {
+        for (index, out) in outputs.iter().enumerate() {
             let category = out.category.as_deref().unwrap_or(&out.event_type);
             let subject_id = out.subject_id.unwrap_or(event.workflow_id);
             let out_workflow = out.workflow_id;
@@ -1566,41 +1704,12 @@ where
             {
                 Ok(w) => w,
                 Err(e) => match e.downcast_ref::<crate::event_log::DivergentRedelivery>() {
-                    Some(d) if from_record => {
-                        // Replay path: the log's canonical row disagrees with
-                        // our sealed record. This is corruption, not
-                        // nondeterminism — surface for a loud park (A3).
-                        return Err(anyhow::Error::new(RecordIntegrityError(d.diff.clone())));
-                    }
                     Some(d) => {
-                        // First-delivery path: a GC'd record's stale output
-                        // still stands. Accept it, advance, and shout — do NOT
-                        // retry (the row is canonical; retry re-diverges
-                        // forever) and do NOT park (parking a SUCCEEDED
-                        // reaction would storm terminal facts on every replay).
-                        if !divergence_reported {
-                            divergence_reported = true;
-                            if let Some(obs) = self.observer.as_ref() {
-                                obs.reactor_divergence(
-                                    event.event_id,
-                                    &self.consumer_id,
-                                    event.workflow_id,
-                                    &d.diff,
-                                );
-                            }
-                            tracing::error!(
-                                consumer = self.consumer_id,
-                                event_id = %event.event_id,
-                                diff = %d.diff,
-                                "DIVERGENT REDELIVERY — a re-decided trigger (record \
-                                 GC'd) disagrees with a lingering output; accepted the \
-                                 persisted row and advanced. Fix the producer's \
-                                 determinism (wall clock, rand, HashMap iteration \
-                                 order, emission order, or an external call not under \
-                                 ctx.effect).",
-                            );
-                        }
-                        continue; // skip this output; the persisted row stands
+                        return Ok(Some(OutputDivergence {
+                            index,
+                            diff: d.diff.clone(),
+                            canonical: d.canonical.clone(),
+                        }));
                     }
                     // Genuine infrastructure error → propagate to infra-retry.
                     None => return Err(e),
@@ -1615,17 +1724,17 @@ where
                 position = write.position.raw(),
                 "reactor output appended",
             );
-            // Advance the OUTPUT's workflow high-water (A5: the replay path
-            // must do this too, or settle can return before catch-up appends
-            // drain downstream). A dedup-hit returns the original
-            // coordinates, so the bump is safe.
+            // Advance the OUTPUT's workflow high-water (A5: every path must do
+            // this, or settle can return before catch-up appends drain
+            // downstream). A dedup-hit returns the original coordinates, so the
+            // bump is safe.
             if let Some(tracker) = &self.settle_tracker {
                 tracker.lock().unwrap().bump(out_workflow, write.position);
             }
-            // Best-effort fold into the shared engine registry (A5: replicated
-            // on the replay path). The durable append already succeeded; this
-            // only warms the read cache behind `engine.state_of`, so a fold
-            // that can't converge must not fail (and retry) the attempt.
+            // Best-effort fold into the shared engine registry. The durable
+            // append already succeeded; this only warms the read cache behind
+            // `engine.state_of`, so a fold that can't converge must not fail
+            // (and retry) the attempt.
             if let Some(reg) = &self.engine_aggregators {
                 if let Some(outcome) = self
                     .fold_output_into_engine_registry(
@@ -1652,7 +1761,7 @@ where
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Best-effort fold of a just-appended output into the shared engine
@@ -1724,16 +1833,25 @@ where
         }
     }
 
-    /// Terminal-failure routing — **mandatory** (BLOCKING-2 / Primitive
-    /// 5): with a mapper, its synthesized fact (if any) appends to that
-    /// fact's own stream; without one, the built-in
-    /// [`REACTION_FAILED_KIND`] fact appends to the **trigger's own
-    /// subject history**, so a completion fold over that subject can
-    /// fold the failure as completion-with-error. Folds into the engine
-    /// registry, then clears the attempt counter **last** (so a failed
-    /// park can't reset the budget). The caller acks the trigger
-    /// afterwards — the ack-floor, not this function, moves the
-    /// durable cursor.
+    /// Terminal-failure routing, as a SEALED decision (park-as-decision, #3):
+    /// a park is "the decision was: fail terminally", sealed durably before
+    /// the terminal fact appends, so a redelivery replays the record instead
+    /// of re-running the body and possibly producing a contradictory success.
+    ///
+    /// With a mapper, its synthesized fact (if any) appends to that fact's own
+    /// stream; without one, the built-in [`REACTION_FAILED_KIND`] fact appends
+    /// to the **trigger's own subject history** (a completion fold over that
+    /// subject folds it as completion-with-error). The H7 cycle-guard and a
+    /// mapper returning `None` seal an EMPTY parked record — the outcome is
+    /// still durable, but no fact is appended.
+    ///
+    /// Returns the SEALED outcome's `parked`: normally `true`, but `false`
+    /// when a racer had already sealed a SUCCESS record for this trigger
+    /// (first-write-wins) and we adopted it — the trigger then completed
+    /// successfully. The DLQ observer fires at-most-once, only on the
+    /// execution that actually sealed a park (`won && parked`), never on a
+    /// replay/adoption. The caller acks the trigger afterwards; the ack-floor,
+    /// not this function, moves the durable cursor.
     async fn park_terminal_failure(
         self: &Arc<Self>,
         event: &RecordedEvent,
@@ -1741,13 +1859,10 @@ where
         error: String,
         class: FailureClass,
         completed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // The observer's terminal-failure hook is an external, non-idempotent
-        // side effect (typically a DLQ write). Fire it ONCE, at the end, after
-        // the failure is durably committed and attempts are cleared — never at
-        // the top, where every infra-retry of the park would re-fire it and
-        // duplicate the DLQ entry. `error` is moved into the terminal fact
-        // below, so keep a copy for the hook.
+        // side effect (typically a DLQ write). `error` is moved into the
+        // terminal fact below, so keep a copy for the hook.
         let error_for_obs = error.clone();
         let notify_observer = |this: &Self| {
             if let Some(obs) = this.observer.as_ref() {
@@ -1765,116 +1880,149 @@ where
         // H7 cycle guard: if the trigger already sits STRICTLY beyond the
         // ceiling, appending a terminal fact (stamped deeper still) would let
         // a reactor subscribed to the park fact perpetuate the very cycle we
-        // are trying to break. Park silently — the ack-floor still advances —
-        // so each chain emits at most one durable park fact at the boundary,
-        // then terminates. Clear attempts, THEN notify (commit before signal).
+        // are trying to break. Seal a silent (empty) parked record — the
+        // outcome stays durable and the ack-floor advances, but no fact lands,
+        // so each chain emits at most one durable park fact at the boundary.
         let trigger_depth = causation_depth_of(&event.metadata);
-        if let Some(ceiling) = self.causation_depth_ceiling {
-            if trigger_depth > u64::from(ceiling) {
-                self.checkpoint
-                    .clear_reactor_attempts(&self.consumer_id, event.event_id)
-                    .await?;
-                notify_observer(self);
-                return Ok(());
-            }
-        }
-        // (kind, subject placement, subject_id, workflow, payload) of
-        // the terminal fact to append — mapper's fact, the built-in,
-        // or nothing (mapper returned None: park silently). A mapper
-        // fact that declares a workflow root keeps that declaration
-        // (the named-mailbox pattern: a per-run HandlerFailed joins
-        // its run's workflow); the built-in inherits the trigger's.
-        let terminal: Option<(String, String, Uuid, Uuid, serde_json::Value)> =
-            match self.failure_mapper.as_ref() {
-                Some(mapper) => {
-                    let info = TerminalFailure {
-                        consumer:        self.consumer_id.clone(),
-                        trigger_id:   event.event_id,
-                        trigger_event_type: event.event_type.clone(),
-                        subject:         event.category.clone(),
-                        subject_id:      event.subject_id,
-                        class,
-                        error,
-                        attempts,
-                        workflow_id:    event.workflow_id,
-                    };
-                    match mapper(info) {
-                        Some(fact) => Some((
-                            fact.name().to_string(),
-                            fact.subject().to_string(),
-                            fact.subject_id(),
-                            fact.declared_workflow_id().unwrap_or(event.workflow_id),
-                            fact.to_value()?,
-                        )),
-                        None => None,
-                    }
-                }
-                None => Some((
-                    REACTION_FAILED_KIND.to_string(),
-                    // The trigger's own subject history — where its
-                    // completion fold reads.
-                    event.category.clone(),
-                    event.subject_id,
-                    event.workflow_id,
-                    serde_json::json!({
-                        "consumer": self.consumer_id,
-                        "trigger_id": event.event_id,
-                        "trigger_event_type": event.event_type,
-                        "class": class.as_str(),
-                        "error": error,
-                        "attempts": attempts,
-                    }),
-                )),
-            };
+        let h7_silent = self
+            .causation_depth_ceiling
+            .is_some_and(|c| trigger_depth > u64::from(c));
 
-        // `nth = u32::MAX` keeps the terminal fact's deterministic id
-        // distinct from react() outputs of the same identity.
-        if let Some((event_type, cat, sid, wf, payload)) = terminal {
-            let out_event = EventData {
+        // The terminal fact to append (mapper's fact, the built-in, or none:
+        // H7-silent or mapper-`None`). `nth = u32::MAX` keeps its deterministic
+        // id distinct from react() outputs of the same identity. A mapper fact
+        // that declares a workflow root keeps that declaration (named-mailbox
+        // pattern); the built-in inherits the trigger's.
+        let terminal_fact: Option<EventData> = if h7_silent {
+            None
+        } else {
+            let parts: Option<(String, String, Uuid, Uuid, serde_json::Value)> =
+                match self.failure_mapper.as_ref() {
+                    Some(mapper) => {
+                        let info = TerminalFailure {
+                            consumer:        self.consumer_id.clone(),
+                            trigger_id:   event.event_id,
+                            trigger_event_type: event.event_type.clone(),
+                            subject:         event.category.clone(),
+                            subject_id:      event.subject_id,
+                            class,
+                            error,
+                            attempts,
+                            workflow_id:    event.workflow_id,
+                        };
+                        mapper(info)
+                            .map(|fact| -> Result<_> {
+                                Ok((
+                                    fact.name().to_string(),
+                                    fact.subject().to_string(),
+                                    fact.subject_id(),
+                                    fact.declared_workflow_id()
+                                        .unwrap_or(event.workflow_id),
+                                    fact.to_value()?,
+                                ))
+                            })
+                            .transpose()?
+                    }
+                    None => Some((
+                        REACTION_FAILED_KIND.to_string(),
+                        event.category.clone(),
+                        event.subject_id,
+                        event.workflow_id,
+                        serde_json::json!({
+                            "consumer": self.consumer_id,
+                            "trigger_id": event.event_id,
+                            "trigger_event_type": event.event_type,
+                            "class": class.as_str(),
+                            "error": error,
+                            "attempts": attempts,
+                        }),
+                    )),
+                };
+            parts.map(|(event_type, cat, sid, wf, payload)| EventData {
                 event_id: derive_output_event_id(
                     &self.consumer_id, event.event_id, &event_type, sid, u32::MAX,
                 ),
                 causation_id: Some(event.event_id),
                 workflow_id: wf,
-                event_type: event_type.clone(),
-                payload: payload.clone(),
+                event_type,
+                payload,
                 created_at: self.clock.now(),
-                category: Some(cat.clone()),
+                category: Some(cat),
                 subject_id: Some(sid),
                 metadata: reactor_output_metadata(&self.consumer_id, trigger_depth + 1),
                 ephemeral: None,
                 persistent: true,
-            };
-            let write = self
-                .log
-                .append_to_stream(&cat, sid, StreamState::Any, vec![out_event])
-                .await?;
-            if let Some(tracker) = &self.settle_tracker {
-                tracker.lock().unwrap().bump(wf, write.position);
+            })
+        };
+        let terminal_outputs: Vec<EventData> = terminal_fact.into_iter().collect();
+
+        let (final_parked, won) = match self.decision_store.clone() {
+            Some(store) => {
+                // Seal the PARK decision first (parked = true), then append the
+                // terminal fact FROM the sealed record via the shared
+                // reconciling appender. A legacy pre-0.19 terminal fact with a
+                // run-varying payload (drifted attempts/error) reconciles
+                // log-wins instead of livelocking. Seal errors propagate as
+                // infra (retry re-enters via the gate; a landed seal completes
+                // from the record).
+                let park_rec = crate::decision_store::DecisionRecord::new(
+                    self.consumer_id.clone(),
+                    event.event_id,
+                    event.position,
+                    terminal_outputs,
+                    self.clock.now(),
+                )
+                .with_parked(true);
+                // "Won the race" == the canonical row is byte-identical to what
+                // we sealed (same outputs + parked). A racer that sealed a
+                // SUCCESS, or a DIFFERENT park payload, makes this false and we
+                // stay silent (that execution fires, or it's a success).
+                let want_json = park_rec.outputs_to_json()?;
+                let want_parked = park_rec.parked;
+                let sealed = store.seal(park_rec).await?;
+                let won = sealed.outputs_to_json()? == want_json
+                    && sealed.parked == want_parked;
+                let final_rec = self.append_decision(event, sealed).await?;
+                (final_rec.parked, won)
             }
-            // Same best-effort contract as the react()-output fold: the
-            // terminal fact is already durably appended; warming the
-            // engine registry must not fail the park (which would retry).
-            if let Some(reg) = &self.engine_aggregators {
-                let _ = self
-                    .fold_output_into_engine_registry(
-                        reg.as_ref(),
-                        &event_type,
-                        &payload,
-                        sid,
-                        &cat,
-                        &write,
-                    )
-                    .await;
+            // No decision store (test-only; build() gates production): there
+            // is no replay gate to short-circuit a re-park, so a crash between
+            // the terminal-fact append and the ack re-runs the body and
+            // re-derives the fact. Route the append through the SAME
+            // reconciling appender: a re-derived terminal fact whose
+            // run-varying payload (attempts/error drift) diverges from the
+            // lingering one is accepted log-wins instead of propagating an
+            // error and livelocking the partition forever (audit #15). With no
+            // store there is nothing to re-seal — the log's row stands.
+            None => {
+                let park_rec = crate::decision_store::DecisionRecord::new(
+                    self.consumer_id.clone(),
+                    event.event_id,
+                    event.position,
+                    terminal_outputs,
+                    self.clock.now(),
+                )
+                .with_parked(true);
+                let final_rec = self.append_decision(event, park_rec).await?;
+                (final_rec.parked, true)
             }
+        };
+
+        // Signal the DLQ hook once, after the failure is durably committed
+        // (seal + append) but BEFORE clearing attempts — a clear failure then
+        // retries via the gate/replay path, which never re-fires the hook, so
+        // the loss window is just the seal→append crash. Only the sealing
+        // execution of an actual park fires; an adopted success does not.
+        if won && final_parked {
+            notify_observer(self);
         }
+        // Clear the attempt counter LAST (a failed park must not reset the
+        // budget). Best-effort on the completion side; here it is part of the
+        // park's durable commit, so propagate a failure to infra-retry.
         self.checkpoint
             .clear_reactor_attempts(&self.consumer_id, event.event_id)
             .await?;
-        // Durable state committed (terminal fact appended, attempts cleared);
-        // now signal the outside world exactly once.
-        notify_observer(self);
-        Ok(())
+        Ok(final_parked)
     }
 
     /// Drain the completion channel, mark acks, advance + persist the
@@ -3344,14 +3492,14 @@ mod tests {
                 tracing_subscriber::registry().with(WarnCounter(warns.clone()));
             let _guard = tracing::subscriber::set_default(subscriber);
             runner.core
-                .attempt_trigger(&trigger_event, &fold_cache, &labels)
+                .attempt_trigger(&trigger_event, &fold_cache, &labels, false)
                 .await
         };
 
         // The durable append committed before the fold ran; the fold's
         // non-convergence is swallowed → the attempt completes.
         match outcome {
-            Ok(AttemptOutcome::Done) => {}
+            Ok(AttemptOutcome::Done { .. }) => {}
             Ok(AttemptOutcome::BodyFailed { error, .. }) => {
                 panic!("attempt body-failed instead of completing: {error:#}")
             }
@@ -4343,7 +4491,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_failure_retries_then_parks_without_sealing() {
+    async fn body_failure_retries_then_parks_sealing_a_parked_record() {
+        // Park-as-decision (#3): a terminal failure seals a PARKED decision so
+        // a redelivery replays it (never re-runs the body into a contradictory
+        // success). The record is present and `parked`.
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
         let trigger_id = append_trigger(&store, &trigger);
@@ -4355,17 +4506,21 @@ mod tests {
             "r.park", ds.clone(), obs.clone(), false).await;
 
         assert!(calls.load(Ordering::SeqCst) >= 1, "body attempted");
-        assert_eq!(obs.terminal_failures.load(Ordering::SeqCst), 1, "trigger parked");
+        assert_eq!(obs.terminal_failures.load(Ordering::SeqCst), 1, "trigger parked once");
+        let rec = ds.get("r.park", trigger_id).await.unwrap();
         assert!(
-            ds.get("r.park", trigger_id).await.unwrap().is_none(),
-            "a failed body seals NO decision",
+            rec.as_ref().is_some_and(|r| r.parked),
+            "a terminal park seals a PARKED decision record (got {rec:?})",
         );
     }
 
     #[tokio::test]
-    async fn divergent_redelivery_after_records_is_a_loud_integrity_error() {
-        // A3: replaying a record whose output disagrees with a row already in
-        // the log is corruption, not nondeterminism — it must PARK, loudly.
+    async fn divergent_redelivery_after_records_reconciles_log_wins() {
+        // A3 (re-scoped): replaying a record whose output disagrees with a row
+        // already in the log is resolved LOG-WINS — the record is reconciled to
+        // the log's canonical row and the trigger completes, NOT a loud park
+        // (which would false-park a succeeded trigger and storm terminal facts
+        // on every checkpoint regression).
         let store = Arc::new(MemoryStore::new());
         let trigger = OrderPlaced { order_id: Uuid::new_v4(), occurred_at: Utc::now() };
         let order_id = trigger.order_id;
@@ -4412,15 +4567,30 @@ mod tests {
 
         let obs = Arc::new(CountingObserver::default());
         let calls = Arc::new(AtomicUsize::new(0));
-        // Body should never run (record present); replay hits divergence → park.
+        // Body should never run (record present); replay hits divergence →
+        // reconcile log-wins (warn), NOT park.
         deliver_with_decisions(&store, NondeterministicEmit { calls: calls.clone() },
             "r.integ", ds.clone(), obs.clone(), false).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 0, "record present — body not run");
         assert_eq!(
-            obs.terminal_failures.load(Ordering::SeqCst), 1,
-            "integrity divergence on replay PARKS (loud), unlike the accept-and-advance \
-             first-delivery path",
+            obs.terminal_failures.load(Ordering::SeqCst), 0,
+            "log-wins reconciliation must NOT park a succeeded trigger",
+        );
+        assert_eq!(
+            obs.divergences.load(Ordering::SeqCst), 1,
+            "the divergence is reported (loudly) exactly once",
+        );
+        // The log kept its canonical nonce=1 row (single reminder), and the
+        // record was reconciled to match it — a redelivery now dedup-hits.
+        let all = EventLogBackend::read_all(store.as_ref(), LogCursor::ZERO, 50).await.unwrap();
+        let reminders: Vec<_> = all.iter().filter(|e| e.event_type == "reminder").collect();
+        assert_eq!(reminders.len(), 1, "log holds the single canonical row");
+        assert_eq!(reminders[0].payload["nonce"], serde_json::json!(1), "log-wins: nonce=1 stands");
+        let rec = ds.get("r.integ", trigger_id).await.unwrap().expect("record reconciled, not removed");
+        assert_eq!(
+            rec.outputs[0].payload["nonce"], serde_json::json!(1),
+            "record reconciled to the log's canonical payload",
         );
     }
 

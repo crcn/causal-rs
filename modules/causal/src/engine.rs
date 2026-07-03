@@ -1084,6 +1084,14 @@ impl EngineBuilder {
     /// write+GC for no-op deliveries, which can dominate the causal-infra
     /// write path in fan-out topologies where most deliveries no-op (A6).
     /// Applies to every reactor the builder registers.
+    ///
+    /// **No effect for fence-consulting bodies:** a reactor that calls
+    /// [`Ctx::is_workflow_cancelled`](crate::Ctx::is_workflow_cancelled)
+    /// (e.g. the recommended cancel early-exit) always seals its empty
+    /// decisions regardless of this setting — fence-consulted emptiness is
+    /// fence-dependent and must be durable, or a redelivery could re-decide
+    /// a different outcome. Elision only helps bodies that never touch the
+    /// fence.
     pub fn seal_empty_decisions(mut self, seal: bool) -> Self {
         self.seal_empty_decisions = seal;
         self
@@ -1701,22 +1709,59 @@ impl EngineBuilder {
         }
 
         // Rebuild cancel fence from the control stream so it survives restart.
-        // Errors (stream absent, storage blip) are benign — fence starts empty.
+        // Cancel markers are DURABLE (`cancel_workflow`'s contract), and runners
+        // only learn markers ABOVE their persisted checkpoint from the live
+        // scan — so booting with a silently-empty fence would resurrect every
+        // cancelled workflow whose marker sits below a cursor, for the whole
+        // process lifetime. A read error here is retried briefly (boot-time
+        // blips on cold pools are routine), then FAILS the build: a loud boot
+        // error, never a fence that lies. An ABSENT stream is not an error —
+        // every backend reads a missing stream as `Ok(empty)` (the fresh-boot
+        // path).
         {
-            let mut fence = self.cancelled_workflows.lock().unwrap();
-            if let Ok(markers) = self.log.read_stream(
-                CONTROL_STREAM_SUBJECT,
-                Uuid::from_bytes([0; 16]),
-                None,
-            ).await {
-                for event in markers {
-                    if event.event_type == WORKFLOW_CANCELLED_KIND {
-                        if let Some(target) = event.payload.get("target")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<Uuid>().ok())
-                        {
-                            fence.insert(target);
+            let markers = {
+                let mut attempt: u32 = 0;
+                loop {
+                    match self
+                        .log
+                        .read_stream(CONTROL_STREAM_SUBJECT, Uuid::from_bytes([0; 16]), None)
+                        .await
+                    {
+                        Ok(markers) => break markers,
+                        Err(e) if attempt < 4 => {
+                            attempt += 1;
+                            tracing::warn!(
+                                attempt,
+                                error = %e,
+                                "cancel-fence rehydration read failed; retrying",
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                50 * u64::from(attempt),
+                            ))
+                            .await;
                         }
+                        Err(e) => {
+                            return Err(e.context(
+                                "cancel-fence rehydration failed: could not read the \
+                                 causal:control stream after retries. Refusing to boot \
+                                 with an empty fence — cancelled workflows would be \
+                                 silently resurrected (cancellation is durable across \
+                                 restarts). Retry the boot once storage recovers.",
+                            ));
+                        }
+                    }
+                }
+            };
+            // Lock only after the read: the fence guard must never be held
+            // across an await.
+            let mut fence = self.cancelled_workflows.lock().unwrap();
+            for event in markers {
+                if event.event_type == WORKFLOW_CANCELLED_KIND {
+                    if let Some(target) = event.payload.get("target")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok())
+                    {
+                        fence.insert(target);
                     }
                 }
             }

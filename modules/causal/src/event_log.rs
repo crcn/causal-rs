@@ -163,6 +163,15 @@ pub struct ConflictError {
 pub struct DivergentRedelivery {
     pub event_id: Uuid,
     pub diff:     String,
+    /// The canonical persisted row (the log's version of `event_id`) when the
+    /// backend can supply it cheaply. Lets the reactor runner reconcile a
+    /// sealed decision record to the log — the log is the source of truth, so
+    /// on divergence the record is re-sealed to match, and a future redelivery
+    /// replays a byte-identical (dedup-hit) batch instead of re-diverging.
+    /// `None` when unavailable — the runner falls back to removing the
+    /// contradicted record (no lying record persists; the body may re-run on a
+    /// later redelivery). Boxed to keep the error type small.
+    pub canonical: Option<Box<RecordedEvent>>,
 }
 
 /// Convenience over the single [`EventLogBackend::append_to_stream`]

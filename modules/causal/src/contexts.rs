@@ -155,6 +155,14 @@ pub struct Ctx<'a> {
     /// `None` in projector bodies and hand-constructed Ctx values.
     pub(crate) cancelled_workflows:
         Option<&'a crate::engine::CancelledWorkflows>,
+    /// Set by [`is_workflow_cancelled`](Ctx::is_workflow_cancelled) so the
+    /// runner knows the body CONSULTED the fence. Fence-consulted emptiness
+    /// is fence-dependent, not deterministic — the runner must seal it even
+    /// under `.seal_empty_decisions(false)`, or a redelivery where the fence
+    /// reads differently re-decides a different outcome. `None` outside
+    /// reactor bodies.
+    pub(crate) fence_consulted:
+        Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl<'a> std::fmt::Debug for Ctx<'a> {
@@ -197,7 +205,22 @@ impl<'a> Ctx<'a> {
     ///     // ...
     /// }
     /// ```
+    ///
+    /// **Interaction with `seal_empty_decisions(false)`:** calling this method
+    /// marks the reaction as fence-consulted, which forces its empty decision
+    /// to seal even when empty-seal elision is enabled — the cancel outcome
+    /// must be durable so a redelivery (where the fence may read differently)
+    /// replays it instead of re-deciding. A body using the early-exit above
+    /// therefore seals every no-op decision; elision only benefits bodies that
+    /// never consult the fence.
     pub fn is_workflow_cancelled(&self) -> bool {
+        // Record the consult itself (not just a `true` answer): a body that
+        // BRANCHES on the fence produces fence-dependent output either way —
+        // `false` here with an empty return elided from the decision store
+        // would let a fence-`true` redelivery decide a different batch.
+        if let Some(flag) = self.fence_consulted {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.cancelled_workflows
             .map(|f| f.lock().unwrap().contains(&self.workflow_id))
             .unwrap_or(false)
@@ -482,6 +505,7 @@ mod tests {
             logs:           None,
             effect_store: None,
             cancelled_workflows: None,
+            fence_consulted: None,
         }
     }
 

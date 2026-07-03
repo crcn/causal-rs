@@ -442,6 +442,7 @@ mod tests {
             logs:           None,
             effect_store: None,
             cancelled_workflows: None,
+            fence_consulted: None,
         };
 
         let events = r.react(&trigger, ctx).await.unwrap();

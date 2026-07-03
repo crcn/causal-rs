@@ -70,8 +70,15 @@ pub struct DecisionRecord {
     pub trigger_position: LogCursor,
     /// The full output envelopes, in emit order. May be empty — a
     /// zero-output reaction seals an empty batch, distinguishing
-    /// "processed, decided nothing" from "never ran".
+    /// "processed, decided nothing" from "never ran". For a PARKED decision
+    /// (`parked = true`) this is the terminal-failure fact (or empty, for a
+    /// silently-parked reaction: cycle-guard / mapper-`None`).
     pub outputs: Vec<EventData>,
+    /// Whether this decision is a terminal PARK (the reaction failed and was
+    /// sent to the DLQ) rather than a success. A parked record replays its
+    /// terminal fact on redelivery and keeps the trigger's effect entries at
+    /// floor-GC (failure replay restores from them). Default `false`.
+    pub parked: bool,
     /// When the decision was sealed.
     pub sealed_at: DateTime<Utc>,
 }
@@ -162,8 +169,16 @@ impl DecisionRecord {
             trigger_event_id,
             trigger_position,
             outputs,
+            parked: false,
             sealed_at,
         }
+    }
+
+    /// Mark this record as a terminal PARK (builder-style). See
+    /// [`parked`](Self::parked).
+    pub fn with_parked(mut self, parked: bool) -> Self {
+        self.parked = parked;
+        self
     }
 
     /// Serialize `outputs` to the canonical durable JSON array, with
@@ -255,6 +270,7 @@ struct StoredDecision {
     outputs_json: serde_json::Value,
     sealed_at: DateTime<Utc>,
     trigger_position: LogCursor,
+    parked: bool,
 }
 
 impl InMemoryDecisionStore {
@@ -268,6 +284,7 @@ impl InMemoryDecisionStore {
             trigger_event_id: trigger,
             trigger_position: s.trigger_position,
             outputs: DecisionRecord::outputs_from_json(s.outputs_json.clone())?,
+            parked: s.parked,
             sealed_at: s.sealed_at,
         })
     }
@@ -283,6 +300,7 @@ impl DecisionStore for InMemoryDecisionStore {
             outputs_json,
             sealed_at: rec.sealed_at,
             trigger_position: rec.trigger_position,
+            parked: rec.parked,
         });
         self.load(&rec.consumer, rec.trigger_event_id, canonical)
     }
@@ -313,8 +331,17 @@ impl DecisionStore for InMemoryDecisionStore {
         let mut map = self.inner.lock().unwrap();
         let before = map.len();
         map.retain(|(c, _), s| {
-            // Keep unless: this consumer AND aged out AND floor has passed.
-            !(c == consumer && s.sealed_at < aged_before && s.trigger_position <= floor)
+            // Keep unless: this consumer AND aged out AND floor has passed AND
+            // NOT parked. A parked record is a terminal marker — reclaiming it
+            // lets a later checkpoint regression re-deliver the trigger, whose
+            // body may now SUCCEED and append outputs (disjoint event_ids from
+            // the terminal fact, so no divergence reconciles them) alongside
+            // the terminal fact: a park chimera. Parks are rare/exceptional, so
+            // retaining them indefinitely is cheap and keeps the outcome final.
+            !(c == consumer
+                && s.sealed_at < aged_before
+                && s.trigger_position <= floor
+                && !s.parked)
         });
         Ok((before - map.len()) as u64)
     }
@@ -430,6 +457,44 @@ mod tests {
         store.remove("c", trigger).await.unwrap();
         assert!(store.get("c", trigger).await.unwrap().is_none());
         store.remove("c", trigger).await.unwrap(); // idempotent
+    }
+
+    #[tokio::test]
+    async fn retention_gc_never_reclaims_a_parked_record() {
+        // A parked record is a terminal marker: retention GC must keep it even
+        // when it is aged AND the floor has passed, or a later checkpoint
+        // regression re-decides the trigger into a park chimera. A success
+        // record in the identical age/floor position IS reclaimed.
+        let store = InMemoryDecisionStore::new();
+        let aged = Utc::now() - chrono::Duration::days(30);
+        let park = Uuid::new_v4();
+        let win = Uuid::new_v4();
+        store
+            .seal(
+                DecisionRecord::new("c", park, LogCursor::from_raw(1), vec![], aged)
+                    .with_parked(true),
+            )
+            .await
+            .unwrap();
+        store
+            .seal(DecisionRecord::new("c", win, LogCursor::from_raw(1), vec![], aged))
+            .await
+            .unwrap();
+
+        // Window fully elapsed and floor well past both triggers.
+        let removed = store
+            .remove_reclaimable("c", Utc::now(), LogCursor::from_raw(100))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "only the success record is reclaimed");
+        assert!(
+            store.get("c", park).await.unwrap().is_some_and(|r| r.parked),
+            "parked record survives retention GC (terminal marker)",
+        );
+        assert!(
+            store.get("c", win).await.unwrap().is_none(),
+            "success record aged past the floor is reclaimed",
+        );
     }
 
     #[tokio::test]

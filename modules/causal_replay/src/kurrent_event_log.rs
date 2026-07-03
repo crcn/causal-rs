@@ -745,6 +745,12 @@ mod kurrent {
                     causal::event_log::DivergentRedelivery {
                         event_id: e.event_id,
                         diff:     "payload/event_type/workflow/causation".to_string(),
+                        // TODO(reconciliation): the window row carries the
+                        // canonical content but not as a RecordedEvent; map it
+                        // so the runner can reconcile log-wins. `None` today →
+                        // remove-only fallback (safe). Memory backend supplies
+                        // this fully.
+                        canonical: None,
                     },
                 ));
             }
